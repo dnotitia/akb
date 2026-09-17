@@ -3,16 +3,31 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 
 const putDocument = vi.fn();
+const getDocument = vi.fn();
+const discardAsset = vi.fn();
+const ASSET_ID = "123e4567-e89b-42d3-a456-426614174000";
+const vaultTreeState = vi.hoisted(() => ({ tree: [] as unknown[] }));
 
 vi.mock("@/lib/api", () => ({
-  ApiError: class ApiError extends Error {},
+  ApiError: class ApiError extends Error {
+    status: number;
+    detail: unknown;
+    constructor(message: string, status: number, detail: unknown) {
+      super(message);
+      this.status = status;
+      this.detail = detail;
+    }
+  },
   putDocument: (...args: unknown[]) => putDocument(...args),
+  getDocument: (...args: unknown[]) => getDocument(...args),
+  discardAsset: (...args: unknown[]) => discardAsset(...args),
 }));
 
 vi.mock("@/hooks/use-vault-tree", () => ({
-  useVaultTree: () => ({ tree: [] }),
+  useVaultTree: () => ({ tree: vaultTreeState.tree }),
 }));
 
 vi.mock("@/contexts/vault-refresh-context", () => ({
@@ -21,15 +36,18 @@ vi.mock("@/contexts/vault-refresh-context", () => ({
 
 vi.mock("@/components/markdown-editor", () => ({
   default: ({
+    value,
     onChange,
     onUploadingChange,
   }: {
+    value: string;
     onChange: (body: string, ids: string[]) => void;
     onUploadingChange?: (uploading: boolean) => void;
   }) => (
     <>
       <textarea
         aria-label="Document body"
+        value={value}
         onChange={(event) => onChange(event.target.value, [])}
       />
       <input
@@ -39,7 +57,8 @@ vi.mock("@/components/markdown-editor", () => ({
         onChange={(event) => {
           if (!event.currentTarget.files?.length) return;
           onUploadingChange?.(true);
-          onChange("![Local image](/api/assets/pending)", []);
+          onChange(`![Local image](/api/assets/${ASSET_ID})`, [ASSET_ID]);
+          onUploadingChange?.(false);
         }}
       />
     </>
@@ -51,13 +70,18 @@ function renderPage(initialCollection = "overview") {
   const onCreated = vi.fn();
   const result = render(
     <MemoryRouter>
-      <DocumentCreateDialog
-        open
-        vault="my-v"
-        initialCollection={initialCollection}
-        onOpenChange={onOpenChange}
-        onCreated={onCreated}
-      />
+      <CurrentUserProvider user={{
+        user_id: "composer-user", username: "composer", email: "composer@example.test",
+        display_name: "Composer", is_admin: false, auth_method: "jwt", key_class: null,
+      }}>
+        <DocumentCreateDialog
+          open
+          vault="my-v"
+          initialCollection={initialCollection}
+          onOpenChange={onOpenChange}
+          onCreated={onCreated}
+        />
+      </CurrentUserProvider>
     </MemoryRouter>,
   );
   return { ...result, onOpenChange, onCreated };
@@ -66,6 +90,8 @@ function renderPage(initialCollection = "overview") {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vaultTreeState.tree = [];
+  window.localStorage.clear();
 });
 
 describe("DocumentCreateDialog reserved collection feedback", () => {
@@ -168,9 +194,93 @@ describe("DocumentCreateDialog reserved collection feedback", () => {
           title: "A note",
           content: "Knowledge worth keeping",
           type: "note",
+          title_conflict_policy: "reject",
         }),
       );
       expect(onCreated).toHaveBeenCalledWith("notes/a-note.md");
     });
+  });
+
+  it("blocks an exact same-Collection title until duplicate creation is explicit", async () => {
+    vaultTreeState.tree = [
+      {
+        kind: "collection",
+        name: "notes",
+        path: "notes",
+        children: [
+          {
+            kind: "document",
+            name: "A note",
+            path: "notes/a-note.md",
+          },
+        ],
+      },
+    ];
+    getDocument.mockResolvedValueOnce({ content: "Same body" });
+    putDocument.mockResolvedValueOnce({ path: "notes/a-note-abcd1234.md" });
+    const user = userEvent.setup();
+    const { onCreated } = renderPage("notes");
+
+    await user.type(screen.getByLabelText(/^title/i), "A note");
+    await user.type(screen.getByLabelText(/document body/i), "Same body");
+
+    expect(screen.getByRole("alert")).toHaveTextContent("already exists here");
+    expect(putDocument).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: /create document/i }));
+    expect(await screen.findByText("This document already exists")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Create duplicate" }));
+
+    await waitFor(() =>
+      expect(putDocument).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "A note",
+          collection: "notes",
+          title_conflict_policy: "allow",
+        }),
+      ),
+    );
+    expect(onCreated).toHaveBeenCalledWith("notes/a-note-abcd1234.md");
+  });
+
+  it("restores an autosaved local draft and clears it on explicit discard", async () => {
+    const user = userEvent.setup();
+    const first = renderPage("notes");
+    await user.type(screen.getByLabelText(/^title/i), "Recovered note");
+    await user.type(screen.getByLabelText(/document body/i), "Recovered body");
+    await screen.findByText(/draft saved locally/i);
+    first.unmount();
+
+    const second = renderPage("notes");
+    expect(screen.getByLabelText(/^title/i)).toHaveValue("Recovered note");
+    expect(screen.getByText(/local draft restored/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /close document composer/i }));
+    await user.click(screen.getByRole("button", { name: /discard draft/i }));
+    expect(second.onOpenChange).toHaveBeenCalledWith(false);
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it("restores temporary image ids and discards them with the saved draft", async () => {
+    const user = userEvent.setup();
+    const first = renderPage("notes");
+    await user.type(screen.getByLabelText(/^title/i), "Draft with image");
+    fireEvent.change(screen.getByLabelText(/local image/i), {
+      target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] },
+    });
+    await screen.findByText(/draft saved locally/i);
+    first.unmount();
+
+    const second = renderPage("notes");
+    expect(screen.getByLabelText(/document body/i)).toHaveValue(
+      `![Local image](/api/assets/${ASSET_ID})`,
+    );
+
+    await user.click(screen.getByRole("button", { name: /close document composer/i }));
+    await user.click(screen.getByRole("button", { name: /discard draft/i }));
+    await waitFor(() => {
+      expect(discardAsset).toHaveBeenCalledWith("my-v", ASSET_ID);
+      expect(second.onOpenChange).toHaveBeenCalledWith(false);
+    });
+    expect(window.localStorage.length).toBe(0);
   });
 });

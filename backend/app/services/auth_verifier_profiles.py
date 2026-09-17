@@ -147,6 +147,13 @@ def verify_local_session_rs256_v2(token: str) -> VerifiedPrincipal | None:
         or not_before < issued_at
         or claims.get("profile") != LOCAL_SESSION_RS256_V2
         or claims.get("token_use") != "session"
+        or (
+            "session_generation" in claims
+            and (
+                type(claims["session_generation"]) is not int
+                or claims["session_generation"] < 0
+            )
+        )
     ):
         return None
     try:

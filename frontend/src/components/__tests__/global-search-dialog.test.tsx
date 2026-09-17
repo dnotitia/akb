@@ -87,6 +87,23 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("GlobalSearchDialog", () => {
+  it("does not expose or activate hidden partial results during a degraded response", async () => {
+    const response = await searchDocsMock("postgres");
+    searchDocsMock.mockResolvedValue({ ...response, degraded: true });
+    const user = userEvent.setup();
+    renderDialog();
+    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    const input = screen.getByRole("combobox");
+    await user.type(input, "postgres");
+    await screen.findByText(/Search is incomplete/);
+    expect(input).toHaveAttribute("aria-expanded", "false");
+    expect(input).not.toHaveAttribute("aria-controls");
+    expect(input).not.toHaveAttribute("aria-activedescendant");
+    await user.keyboard("{ArrowDown}{Enter}");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
   it("opens in place, focuses the search field, and returns focus on Escape", async () => {
     const user = userEvent.setup();
     renderDialog();
@@ -121,7 +138,7 @@ describe("GlobalSearchDialog", () => {
     const input = screen.getByRole("combobox", { name: "Search all accessible vaults" });
     await user.type(input, "postgres");
 
-    await waitFor(() => expect(searchDocsMock).toHaveBeenCalledWith("postgres", [], 12));
+    await waitFor(() => expect(searchDocsMock).toHaveBeenCalledWith("postgres", [], 12, expect.any(Object)));
     expect(await screen.findByRole("option", { name: /PostgreSQL tuning/i })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -158,7 +175,7 @@ describe("GlobalSearchDialog", () => {
     await user.click(screen.getByRole("button", { name: /postgres tuning/i }));
 
     await waitFor(() =>
-      expect(searchDocsMock).toHaveBeenCalledWith("postgres tuning", [], 12),
+      expect(searchDocsMock).toHaveBeenCalledWith("postgres tuning", [], 12, expect.any(Object)),
     );
   });
 
@@ -193,7 +210,7 @@ describe("GlobalSearchDialog", () => {
     );
   });
 
-  it("filters mixed top matches locally and cleans indexed context", async () => {
+  it("filters mixed top matches on the server and cleans indexed context", async () => {
     searchDocsMock.mockResolvedValue({
       query: "platform",
       total: 2,
@@ -234,7 +251,11 @@ describe("GlobalSearchDialog", () => {
     expect(await screen.findByText("Worker and API responsibilities.")).toBeInTheDocument();
     expect(screen.queryByText(/\[# Platform guide/)).toBeNull();
 
+    searchDocsMock.mockResolvedValueOnce({ query: "platform", total: 1, returned: 1, total_matches: 1,
+      results: [{ source_type: "table", uri: "akb://alpha/table/services", vault: "alpha", path: "services", title: "Services", score: 1 }] });
     await user.click(screen.getByRole("button", { name: /Tables, 1 result/i }));
+    await waitFor(() => expect(searchDocsMock).toHaveBeenLastCalledWith("platform", [], 12, { source_type: "table" }));
+    await screen.findByRole("option", { name: /Services/i });
     expect(screen.getByRole("option", { name: /Services/i })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /Platform guide/i })).toBeNull();
   });
@@ -244,20 +265,21 @@ describe("GlobalSearchDialog", () => {
     renderDialog();
 
     await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    searchDocsMock.mockResolvedValueOnce({ query: "postgres", total: 0, returned: 0, total_matches: 0, results: [] });
     await user.click(screen.getByRole("button", { name: "Tables" }));
     await user.type(
       screen.getByRole("combobox", { name: "Search all accessible vaults" }),
       "postgres",
     );
 
-    expect(await screen.findByText("No tables in these matches")).toBeInTheDocument();
+    expect(await screen.findByText(/No results for/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Tables, 0 results/ })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
     await user.click(screen.getByRole("button", { name: "Show all results" }));
     expect(
-      screen.getByRole("option", { name: /PostgreSQL tuning/i }),
+      await screen.findByRole("option", { name: /PostgreSQL tuning/i }),
     ).toBeInTheDocument();
   });
 });

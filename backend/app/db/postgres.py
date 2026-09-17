@@ -87,6 +87,33 @@ async def close_pool() -> None:
         await pool.close()
 
 
+@asynccontextmanager
+async def _migration_pool():
+    """Use one dedicated connection without request-path query timeouts.
+
+    Data migrations can legitimately scan or rewrite an existing corpus for
+    longer than the 30-second request budget.  They still run under the
+    migration runner's bounded ``lock_timeout``, so waiting to acquire a table
+    lock remains fail-fast while work performed after the lock is acquired can
+    finish atomically.
+    """
+    pool = await asyncpg.create_pool(
+        dsn=settings.asyncpg_dsn,
+        min_size=1,
+        max_size=1,
+        command_timeout=None,
+        server_settings={
+            "application_name": "akb-schema-migration",
+            "idle_in_transaction_session_timeout": "60000",
+            "statement_timeout": "0",
+        },
+    )
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
 async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
     """Run init.sql to create tables, then apply pending migrations.
     Retries on connection failure.
@@ -103,7 +130,8 @@ async def init_db(max_retries: int = 10, delay: float = 2.0) -> None:
             sql = init_sql.read_text()
             async with pool.acquire() as conn:
                 await conn.execute(sql)
-            await _apply_migrations()
+            async with _migration_pool() as migration_pool:
+                await _apply_migrations(migration_pool)
             return
         except ConnectionRefusedError, asyncpg.CannotConnectNowError, OSError:
             if attempt < max_retries - 1:
@@ -149,12 +177,12 @@ async def _run_one_migration(pool_or_conn, filename: str, module, *, retries: in
 
     Migrations that ALTER `chunks` need an ACCESS EXCLUSIVE lock. During a
     rolling deploy the outgoing pod's workers may still hold an open
-    transaction on that table; without a bound the ALTER would block until
-    the connection's 30s statement_timeout cancels it (QueryCanceledError),
-    crashing startup. A short lock_timeout makes us fail fast and retry
-    until the lock clears (the server also kills idle-in-transaction holders
-    at 60s). The pooled connection's state is reset on release, so the
-    per-migration `SET lock_timeout` does not leak to other callers.
+    transaction on that table. A short lock_timeout makes us fail fast and
+    retry until the lock clears (the server also kills idle-in-transaction
+    holders at 60s). Once acquired, the dedicated migration pool allows a
+    large atomic data rewrite to exceed the request path's 30-second budget.
+    The pooled connection's state is reset on release, so the per-migration
+    `SET lock_timeout` does not leak to other callers.
     """
     import logging
 
@@ -198,7 +226,7 @@ async def _run_one_migration(pool_or_conn, filename: str, module, *, retries: in
                 raise
 
 
-async def _apply_migrations() -> None:
+async def _apply_migrations(pool=None) -> None:
     """Apply migration scripts once each, in order. Safe to call repeatedly.
 
     A `schema_migrations` ledger records applied files so steady-state boots
@@ -207,7 +235,8 @@ async def _apply_migrations() -> None:
     live workers during a rolling deploy). Unrecorded migrations run via
     :func:`_run_one_migration` (bounded lock_timeout + retry).
     """
-    pool = await get_pool()
+    if pool is None:
+        pool = await get_pool()
     async with pool.acquire() as conn:
         # Session lock serializes the read-of-ledger + apply + ledger-write
         # sequence across API/worker pods during a rolling deployment.
@@ -308,6 +337,27 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "083_edge_vault_boundary.py",  # graph edges are vault-local: owner/source/target authorities agree; legacy rows stay hidden pending reviewed cleanup
         "084_bm25_corpus_revision.py",  # mutation revision replaces mismatched chunk-count/eligible-doc BM25 refresh gate
         "085_vault_access_contributions.py",  # why a pair holds the role it holds: independent grant bases behind the effective vault_access row, backfilled as 'direct' so nothing moves
+        "086_dynamic_table_rows_changed.py",  # statement-level transition-table wake-up events for dynamic table DML
+        "087_tenant_activity_daily.py",  # closed-once daily activity windows served by /stats; NULL counts mean "not computable", never 0
+        "088_native_revision_existing_cutover.py",  # group existing vault-scoped Native backfills for fixture-led cutover verification
+        "089_native_file_projection_outbox.py",  # durable S3 File mutation reconciliation into Native text projection
+        "090_native_revision_vault_purge_fence.py",  # allow an authorized exact-vault lifecycle purge after cutover authority commits
+        "091_native_revision_committed_receipt_guard.py",  # freeze a committed cutover's durable authority receipt set
+        "092_native_revision_plan_supersession.py",  # release never-applied aborted-plan reservations for a fresh coverage version
+        "093_external_git_retirement.py",  # durable offline retirement receipt for a Collector-adopted external Git mirror
+        "094_native_revision_completed_reservation_transfer.py",  # let a fresh coverage run adopt completed work from an aborted pre-authority cutover
+        "095_app_release_manifest_v2.py",  # strict app release manifest v2 registry shape
+        "096_native_revision_cutover_fence.py",  # short durable two-phase authority fence
+        "097_native_revision_migration_inventory.py",  # one immutable fixed-ref inventory per run
+        "098_native_revision_nul_payload.py",  # permit UTF-8 NUL bytes in Native text payloads while retaining DB validation
+        "099_personal_notifications.py",  # independent durable personal inbox and watches
+        "100_native_revision_cutover_file_applied_path.py",  # record the native path each cutover File was published at
+        "101_local_session_generation.py",  # monotonic local session revocation
+        "102_account_self_lifecycle.py",  # independent deletion cleanup and confirmation budget
+        "103_sso_account_lifecycle.py",  # SSO browser logout and managed account sync
+        "104_file_write_capability_key.py",  # the one object key a file write capability grants
+        "105_bridge_body_digest.py",  # a bridged revision body readable without the git volume
+        "106_native_document_publications.py",  # bind Native public links to vault-scoped Document identity
     ):
         if filename in applied:
             continue

@@ -133,6 +133,31 @@ describe("Activity page redesign", () => {
     ).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("keeps the current ledger visible while an author filter refreshes", async () => {
+    const user = userEvent.setup();
+    let resolveFiltered: ((value: { vault: string; total: number; activity: ReturnType<typeof activity>[] }) => void) | undefined;
+    getVaultActivityMock
+      .mockResolvedValueOnce({
+        vault: "platform-docs",
+        total: 2,
+        activity: [activity(0), activity(1, "codex")],
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveFiltered = resolve;
+      }));
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: "Filter by JY Kim (1 change)" }));
+    expect(await screen.findByText("Refreshing activity")).toBeInTheDocument();
+    expect(screen.getByText("Change 1")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Vault activity" }).closest("section")?.parentElement).toHaveAttribute("aria-busy", "true");
+
+    resolveFiltered?.({ vault: "platform-docs", total: 1, activity: [activity(0)] });
+    await waitFor(() => {
+      expect(screen.queryByText("Refreshing activity")).not.toBeInTheDocument();
+    });
+  });
+
   it("keeps empty and error states inside the same registry surface", async () => {
     getVaultActivityMock.mockResolvedValue({
       vault: "platform-docs",

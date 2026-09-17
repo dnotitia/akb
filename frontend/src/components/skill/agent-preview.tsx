@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getVaultSkillPreview } from "@/lib/api";
 import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingState } from "@/components/ui/loading-state";
 
 /**
  * The vault guide exactly as an agent receives it — the server-composed
@@ -15,7 +16,13 @@ export function AgentPreview({ vault }: { vault: string }) {
     queryFn: () => getVaultSkillPreview(vault),
     retry: false,
   });
-  if (helpQuery.isLoading) return <div className="p-4"><Skeleton className="h-64 w-full" /></div>;
+  if (helpQuery.isLoading) {
+    return (
+      <LoadingState label="Loading agent preview" className="p-4">
+        <Skeleton className="h-64 w-full rounded-[var(--radius-lg)]" />
+      </LoadingState>
+    );
+  }
   if (helpQuery.isError)
     return (
       <Alert variant="destructive" className="m-4">

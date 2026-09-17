@@ -1,3 +1,8 @@
+# The single-node shape: one pod running the API and the workers as two
+# containers. It is what a straightforward Kubernetes install wants, and it is
+# not what every deployment runs — a larger one splits the two into separate
+# Deployments so they scale and restart independently.
+#
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -41,6 +46,7 @@ data:
     # Required canonical human-login mode. This base deployment is local.
     auth_mode: local
     jwt_algorithm: RS256
+    local_session_issuer: https://akb.example.com
     local_session_private_key_path: /etc/akb/local-session/private.pem
     local_session_jwks_path: /etc/akb/local-session/jwks.json
 
@@ -55,7 +61,7 @@ data:
     vector_collection: chunks
 
     # Set to your public ingress URL for absolute /p/{slug} publication URLs.
-    public_base_url: ""
+    public_base_url: https://akb.example.com
 
     # Event stream (optional Redis fanout). Leave blank to disable —
     # PG `events` outbox still works.
@@ -64,8 +70,9 @@ data:
     redis_stream_maxlen: 100000
 
 ---
-# akb-secret-config — managed manually (kubectl edit / sealed-secrets / vault),
-# never committed. Mounted at /etc/akb/secret.yaml. Expected shape:
+# akb-secret — provisioned by the operator and never committed. Its
+# `secret.yaml` key is mounted at /etc/akb/secret.yaml.
+# Expected configuration payload:
 #
 #   stringData:
 #     secret.yaml: |
@@ -93,6 +100,17 @@ spec:
   # avoids the race. Caught when an AWS demo rollout left the new pod
   # Pending for 10+ minutes while the old one held the volume.
   strategy:
+    # Recreate, not RollingUpdate, and deliberately: the vault volume is
+    # ReadWriteOnce, so a surge pod cannot mount it while the old one still
+    # holds it. On EBS that surfaces as a Multi-Attach error and the rollout
+    # stalls; on a shared filesystem it would work, but this manifest cannot
+    # know which it got.
+    #
+    # The cost is real — a deploy that fails to start has already stopped the
+    # old pod, so a bad image or an unreadable config is downtime rather than
+    # a stalled rollout. A deployment on shared storage can take
+    # `RollingUpdate` with `maxUnavailable: 0` and avoid that; one on EBS
+    # cannot.
     type: Recreate
   selector:
     matchLabels:
@@ -102,6 +120,9 @@ spec:
       labels:
         app: akb-backend
     spec:
+      # AKB consumes mounted configuration only. The application Pod does not
+      # need Kubernetes API access to read its Secret volume.
+      automountServiceAccountToken: false
       # All worker stop signals are broadcast together and joined under the
       # 35-second application deadline. The remaining 10 seconds cover DB/HTTP
       # client close, audit drain, and interpreter teardown before SIGKILL.
@@ -230,11 +251,18 @@ spec:
             name: akb-app-config
         - name: secret-config
           secret:
-            secretName: akb-secret-config
+            # Shared contract with akb-platform-managed workspaces. The
+            # operator owns how this Kubernetes Secret is provisioned.
+            secretName: akb-secret # pragma: allowlist secret
         - name: local-session-keys
           secret:
-            secretName: akb-local-session-keys # pragma: allowlist secret
+            secretName: akb-secret # pragma: allowlist secret
             defaultMode: 0400
+            items:
+              - key: local-session-private.pem
+                path: private.pem
+              - key: local-session-jwks.json
+                path: jwks.json
         - name: vaultdata
           persistentVolumeClaim:
             claimName: akb-vaultdata

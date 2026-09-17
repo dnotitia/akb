@@ -54,6 +54,10 @@ async def seeded():
     ).read_text()
     async with pool.acquire() as conn:
         await conn.execute(init_sql)
+    from app.db import postgres as pg_mod
+    prev = pg_mod._pool
+    pg_mod._pool = pool
+    await pg_mod._apply_migrations()
     vname = f"race_{uuid.uuid4().hex[:8]}"
     tname = "people"
     pg_name = table_data_repo.pg_table_name(vname, tname)
@@ -68,13 +72,17 @@ async def seeded():
             "INSERT INTO vault_tables (vault_id, name, columns) VALUES ($1, $2, $3::jsonb)",
             vid, tname, '[{"name": "email", "type": "text"}]',
         )
-        await table_data_repo.create_dynamic_table(conn, pg_name, cols)
+        await table_data_repo.create_dynamic_table(
+            conn,
+            pg_name,
+            cols,
+            vault_name=vname,
+            vault_id=vid,
+            resource_uri=f"akb://{vname}/table/{tname}",
+        )
         # seed a single (non-duplicate) row so the preflight is genuinely clean
         await conn.execute(f"INSERT INTO {pg_name} (email) VALUES ('seed@x')")
-    # wire the module-global pool that alter_table's get_pool() returns
-    from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
+    # Keep the module-global pool wired for alter_table's get_pool().
     try:
         yield {"vid": vid, "vname": vname, "tname": tname, "pg_name": pg_name, "pool": pool}
     finally:

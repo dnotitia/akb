@@ -848,6 +848,7 @@ class TestAkbSqlDualEnforcement:
             result = await table_service.execute_sql(
                 vault_names=[vault_name],
                 user_id=str(owner_id),
+                actor_id="tester",
                 sql="UPDATE t SET x = 1",
                 is_admin=False,
             )
@@ -879,6 +880,7 @@ class TestAkbSqlDualEnforcement:
             result = await table_service.execute_sql(
                 vault_names=[vault_name],
                 user_id=str(admin_id),
+                actor_id="tester",
                 sql="UPDATE t SET x = 1",
                 is_admin=True,
             )
@@ -921,6 +923,7 @@ class TestAkbSqlDualEnforcement:
             result = await table_service.execute_sql(
                 vault_names=[ok_vault_name, blocked_vault_name],
                 user_id=str(blocked_owner_id),
+                actor_id="tester",
                 sql="UPDATE t SET x = 1",
                 is_admin=False,
             )

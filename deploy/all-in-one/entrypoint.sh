@@ -2,7 +2,7 @@
 # AKB all-in-one entrypoint. Initializes (idempotent):
 #   * Postgres cluster at /data/pgsql + pgvector extension
 #   * MinIO root credentials + akb-files bucket
-#   * Secret file from env-var template
+#   * YAML configuration from persistent state and optional operator overrides
 # Then hands off to supervisord.
 set -euo pipefail
 
@@ -14,20 +14,7 @@ mkdir -p "${LOG_DIR}"
 # --- Secret generation (stable across restarts; persisted under /var/lib/akb) ---
 SECRET_STATE=/var/lib/akb/state.env
 mkdir -p /var/lib/akb
-if [ ! -f "${SECRET_STATE}" ]; then
-  cat > "${SECRET_STATE}" <<EOF
-DB_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
-SYSTEM_HMAC_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
-S3_ACCESS_KEY=akb-allinone
-S3_SECRET_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
-DEMO_USERNAME=demo
-DEMO_EMAIL=demo@akb.local
-DEMO_PASSWORD=$(python3 -c 'import secrets;print(secrets.token_urlsafe(16))')
-DEMO_VAULT=demo
-DEMO_PAT=akb_$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
-EOF
-  chmod 600 "${SECRET_STATE}"
-fi
+/opt/venv/bin/python /usr/local/bin/akb-demo-configure.py state
 # shellcheck disable=SC1090
 . "${SECRET_STATE}"
 
@@ -75,17 +62,10 @@ if [ ! -f /var/lib/akb/.pat-printed ]; then
   touch /var/lib/akb/.pat-printed
 fi
 
-# Render /etc/akb/secret.yaml from template via envsubst-equivalent.
-python3 - <<'PY'
-import os, pathlib
-tpl = pathlib.Path("/etc/akb/secret.yaml.template").read_text()
-out = tpl
-for key in ("DB_PASSWORD", "SYSTEM_HMAC_SECRET", "EMBED_API_KEY", "LLM_API_KEY",
-            "RERANK_API_KEY", "S3_ACCESS_KEY", "S3_SECRET_KEY"):
-    out = out.replace("${" + key + "}", os.environ.get(key, ""))
-pathlib.Path("/etc/akb/secret.yaml").write_text(out)
-os.chmod("/etc/akb/secret.yaml", 0o600)
-PY
+# Render the same app.yaml + secret.yaml contract consumed by Kubernetes.
+/opt/venv/bin/python /usr/local/bin/akb-demo-configure.py render
+# Validate all supplied setting names, types and cross-field constraints.
+/opt/venv/bin/python -c "from app.config import settings"
 
 # Generate the local-session signer exactly once on persistent storage.  The
 # CLI is non-overwriting, so a partial or conflicting keyset fails the boot
@@ -96,28 +76,6 @@ if [ ! -d "${LOCAL_SESSION_KEY_DIR}" ]; then
     --output-dir "${LOCAL_SESSION_KEY_DIR}"
 fi
 
-# Override app.yaml fields the user supplied via ENV.
-python3 - <<'PY'
-import os, pathlib, re
-path = pathlib.Path("/etc/akb/app.yaml")
-text = path.read_text()
-overrides = {
-    "embed_base_url": os.environ.get("EMBED_BASE_URL", ""),
-    "embed_model":    os.environ.get("EMBED_MODEL", ""),
-    "embed_dimensions": os.environ.get("EMBED_DIMENSIONS", ""),
-    "llm_base_url":   os.environ.get("LLM_BASE_URL", ""),
-    "llm_model":      os.environ.get("LLM_MODEL", ""),
-    # Origin for absolute publication share URLs. Defaults in app.yaml to
-    # http://localhost:8080; override when the container is exposed behind
-    # a real host so share_url links resolve.
-    "public_base_url": os.environ.get("PUBLIC_BASE_URL", ""),
-}
-for key, val in overrides.items():
-    if not val:
-        continue
-    text = re.sub(rf"^{key}:.*$", f"{key}: {val}", text, count=1, flags=re.MULTILINE)
-path.write_text(text)
-PY
 
 # --- Postgres: initdb on first boot, then create role/db + vector ext ---
 if [ ! -s "${PGDATA}/PG_VERSION" ]; then

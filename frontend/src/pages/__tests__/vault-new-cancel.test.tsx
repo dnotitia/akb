@@ -5,6 +5,7 @@ import VaultNewPage from "../vault-new";
 
 vi.mock("@/lib/api", () => ({
   createVault: vi.fn(),
+  listVaults: vi.fn().mockResolvedValue({ vaults: [] }),
   listVaultTemplates: vi.fn().mockResolvedValue([]),
 }));
 

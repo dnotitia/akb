@@ -1,6 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowRight, GitBranch } from "lucide-react";
-import { createVault, listVaultTemplates, type VaultTemplateSummary } from "@/lib/api";
+import {
+  createVault,
+  listVaults,
+  listVaultTemplates,
+  type VaultTemplateSummary,
+} from "@/lib/api";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,11 +15,13 @@ import { cn } from "@/lib/utils";
 
 export function VaultCreateForm({
   onCreated,
+  onOpenExisting,
   onCancel,
   onBusyChange,
   className,
 }: {
   onCreated: (name: string) => void;
+  onOpenExisting?: (name: string) => void;
   onCancel?: () => void;
   onBusyChange?: (busy: boolean) => void;
   className?: string;
@@ -28,11 +35,13 @@ export function VaultCreateForm({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
+  const [accessibleConflict, setAccessibleConflict] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [templates, setTemplates] = useState<VaultTemplateSummary[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState("");
   const nameRef = useRef<HTMLInputElement>(null);
-  const nameValid = /^[a-z0-9-]+$/.test(name.trim());
+  const conflictCheckGeneration = useRef(0);
+  const nameValid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name.trim());
 
   useEffect(() => {
     listVaultTemplates()
@@ -42,6 +51,13 @@ export function VaultCreateForm({
         setTemplates([]);
       });
   }, []);
+
+  useEffect(
+    () => () => {
+      conflictCheckGeneration.current += 1;
+    },
+    [],
+  );
 
   const selectedSummary = useMemo(
     () => templates.find((template) => template.name === selectedTemplate) || null,
@@ -56,13 +72,15 @@ export function VaultCreateForm({
       nameRef.current?.focus();
       return;
     }
-    if (!/^[a-z0-9-]+$/.test(trimmed)) {
-      setError("Use lowercase letters, digits, and hyphens only.");
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(trimmed)) {
+      setError("Use lowercase letters and digits, with single hyphens between words.");
       nameRef.current?.focus();
       return;
     }
 
     setError("");
+    setAccessibleConflict(null);
+    conflictCheckGeneration.current += 1;
     setCreating(true);
     onBusyChange?.(true);
     try {
@@ -72,8 +90,40 @@ export function VaultCreateForm({
         selectedTemplate || undefined,
       );
       onCreated(trimmed);
-    } catch (cause: any) {
-      setError(cause?.message || "Failed to create vault");
+    } catch (cause: unknown) {
+      const detail =
+        typeof cause === "object" && cause !== null && "detail" in cause
+          ? (cause as { detail?: unknown }).detail
+          : null;
+      const code =
+        typeof detail === "object" && detail !== null && "code" in detail
+          ? (detail as { code?: unknown }).code
+          : null;
+
+      if (code === "vault_name_unavailable") {
+        setError("Vault name is unavailable. Choose a different name.");
+        if (onOpenExisting) {
+          const generation = ++conflictCheckGeneration.current;
+          void listVaults()
+            .then((result) => {
+              if (conflictCheckGeneration.current !== generation) return;
+              const isAccessible = result.vaults.some(
+                (vault) =>
+                  typeof vault === "object" &&
+                  vault !== null &&
+                  "name" in vault &&
+                  vault.name === trimmed,
+              );
+              if (isAccessible) setAccessibleConflict(trimmed);
+            })
+            .catch(() => {
+              // The recovery action is optional. Keep the original conflict
+              // visible if the access-filtered list cannot be refreshed.
+            });
+        }
+      } else {
+        setError(cause instanceof Error ? cause.message : "Failed to create vault");
+      }
       setCreating(false);
       onBusyChange?.(false);
     }
@@ -91,7 +141,9 @@ export function VaultCreateForm({
           value={name}
           onChange={(event) => {
             setName(event.target.value);
+            conflictCheckGeneration.current += 1;
             if (error) setError("");
+            if (accessibleConflict) setAccessibleConflict(null);
           }}
           placeholder="e.g. engineering"
           required
@@ -103,7 +155,7 @@ export function VaultCreateForm({
           aria-describedby={error ? `${errorId} ${nameHintId}` : nameHintId}
         />
         <div id={nameHintId} className="coord">
-          Lowercase letters, digits, hyphens · becomes /vault/&lt;name&gt;
+          Lowercase letters, digits, single hyphens · unique across this AKB installation · becomes akb://&lt;name&gt;
         </div>
       </div>
 
@@ -163,8 +215,24 @@ export function VaultCreateForm({
 
       {error && (
         <Alert variant="destructive" id={errorId}>
-          {error}
+          <p>{error}</p>
         </Alert>
+      )}
+      {accessibleConflict && onOpenExisting && (
+        <>
+          <p role="status" className="sr-only">
+            An accessible vault with this name can be opened.
+          </p>
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              variant="link"
+              onClick={() => onOpenExisting(accessibleConflict)}
+            >
+              Open existing vault
+            </Button>
+          </div>
+        </>
       )}
 
       <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">

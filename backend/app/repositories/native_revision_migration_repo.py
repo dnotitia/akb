@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 import secrets
+import json
+import hashlib
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -71,6 +73,14 @@ class MigrationItem:
     error_code: str | None
 
 
+class LegacyMappingAlreadyMigratedError(RuntimeError):
+    """Raised when a mapping's body was moved by another pass in between."""
+
+
+class BridgeBodyIntegrityError(RuntimeError):
+    """A stored bridged body does not hash to the digest it is filed under."""
+
+
 @dataclass(frozen=True, slots=True)
 class LegacyRevisionMapping:
     namespace_id: uuid.UUID
@@ -82,6 +92,9 @@ class LegacyRevisionMapping:
     run_id: uuid.UUID
     lineage_ordinal: int
     fixed_git_oid: str
+    # Set once this revision's body has been copied into the payload store.
+    # While it is None the body is only in git, and the read falls back there.
+    body_digest: str | None = None
 
 
 def _require_oid(value: str, field: str) -> str:
@@ -138,6 +151,8 @@ def _mapping(row: asyncpg.Record) -> LegacyRevisionMapping:
         run_id=row["run_id"],
         lineage_ordinal=row["lineage_ordinal"],
         fixed_git_oid=row["fixed_git_oid"],
+        # Absent from the older projections that do not select it.
+        body_digest=(row["body_digest"] if "body_digest" in row.keys() else None),
     )
 
 
@@ -148,7 +163,10 @@ class NativeRevisionMigrationRepository:
         self.pool = pool
 
     async def get_manual_vault(
-        self, namespace_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        namespace_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> dict | None:
         sql = """
             SELECT v.id, v.name, v.git_path,
@@ -156,7 +174,7 @@ class NativeRevisionMigrationRepository:
               FROM vaults v
              LEFT JOIN vault_external_git eg ON eg.vault_id = v.id
              WHERE v.id = $1
-               AND v.status = 'active'
+               AND v.status <> 'deleted'
         """
         if conn is not None:
             row = await conn.fetchrow(sql, namespace_id)
@@ -167,7 +185,8 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def list_documents(
-        conn: asyncpg.Connection, namespace_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
     ) -> list[dict]:
         rows = await conn.fetch(
             """
@@ -182,7 +201,9 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def list_document_aliases(
-        conn: asyncpg.Connection, namespace_id: uuid.UUID, resource_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
     ) -> list[dict]:
         rows = await conn.fetch(
             """
@@ -198,8 +219,28 @@ class NativeRevisionMigrationRepository:
         )
         return [dict(row) for row in rows]
 
+    @staticmethod
+    async def list_namespace_document_aliases(
+        conn: asyncpg.Connection,
+        namespace_id: uuid.UUID,
+    ) -> list[dict]:
+        rows = await conn.fetch(
+            """
+            SELECT resource_id, old_ref, created_at
+              FROM resource_aliases
+             WHERE vault_id = $1
+               AND resource_type = 'document'
+             ORDER BY resource_id, created_at, old_ref
+            """,
+            namespace_id,
+        )
+        return [dict(row) for row in rows]
+
     async def get_run(
-        self, run_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> MigrationRun | None:
         sql = """
             SELECT run_id, namespace_id, fixed_git_oid, coverage_version,
@@ -214,6 +255,99 @@ class NativeRevisionMigrationRepository:
             async with self.pool.acquire() as acquired:
                 row = await acquired.fetchrow(sql, run_id)
         return _run(row) if row is not None else None
+
+    async def store_inventory_snapshot(
+        self,
+        run: MigrationRun,
+        payload: dict[str, Any],
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> None:
+        """Persist the canonical fixed-ref inventory once for later phases."""
+
+        async def _store(acquired: asyncpg.Connection) -> None:
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            await acquired.execute(
+                """
+                INSERT INTO native_revision_migration_inventories (
+                    run_id, namespace_id, fixed_git_oid, coverage_version,
+                    inventory_digest, payload
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                ON CONFLICT (run_id) DO NOTHING
+                """,
+                run.run_id,
+                run.namespace_id,
+                run.fixed_git_oid,
+                run.coverage_version,
+                run.inventory_digest,
+                encoded,
+            )
+            observed = await acquired.fetchrow(
+                """
+                SELECT namespace_id, fixed_git_oid, coverage_version,
+                       inventory_digest, payload
+                  FROM native_revision_migration_inventories
+                 WHERE run_id = $1
+                """,
+                run.run_id,
+            )
+            if observed is None:
+                raise MigrationIntegrityError("migration inventory snapshot disappeared")
+            observed_payload = observed["payload"]
+            if isinstance(observed_payload, str):
+                observed_payload = json.loads(observed_payload)
+            if (
+                observed["namespace_id"] != run.namespace_id
+                or observed["fixed_git_oid"] != run.fixed_git_oid
+                or observed["coverage_version"] != run.coverage_version
+                or observed["inventory_digest"] != run.inventory_digest
+                or observed_payload != payload
+            ):
+                raise MigrationInventoryDriftError("persisted fixed-ref migration inventory drifted")
+
+        if conn is not None:
+            await _store(conn)
+            return
+        async with self.pool.acquire() as acquired:
+            async with acquired.transaction():
+                await _store(acquired)
+
+    async def get_inventory_snapshot(
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT namespace_id, fixed_git_oid, coverage_version,
+                   inventory_digest, payload
+              FROM native_revision_migration_inventories
+             WHERE run_id = $1
+        """
+        if conn is not None:
+            row = await conn.fetchrow(sql, run_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await acquired.fetchrow(sql, run_id)
+        if row is None:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise MigrationIntegrityError("migration inventory snapshot is not an object")
+        return {
+            "namespace_id": row["namespace_id"],
+            "fixed_git_oid": row["fixed_git_oid"],
+            "coverage_version": row["coverage_version"],
+            "inventory_digest": row["inventory_digest"],
+            "payload": payload,
+        }
 
     async def get_or_create_run(
         self,
@@ -278,6 +412,8 @@ class NativeRevisionMigrationRepository:
                 raise MigrationIntegrityError("migration run disappeared during creation")
             if row["inventory_digest"] != inventory_digest:
                 raise MigrationInventoryDriftError()
+            if row["status"] == "superseded":
+                raise MigrationIntegrityError("migration run was superseded; plan with a new coverage version")
             return _run(row)
 
         if conn is not None:
@@ -285,6 +421,215 @@ class NativeRevisionMigrationRepository:
         async with self.pool.acquire() as acquired:
             async with acquired.transaction():
                 return await _get_or_create(acquired)
+
+    @staticmethod
+    async def _adopt_aborted_completed_reservation(
+        conn: asyncpg.Connection,
+        *,
+        run: MigrationRun,
+        legacy_document_id: uuid.UUID,
+        captured_path: str,
+        legacy_head_oid: str,
+        body_digest: str,
+        byte_size: int,
+    ) -> bool:
+        """Move one completed reservation from an aborted cutover to ``run``.
+
+        The old completed run and its immutable Legacy mappings remain audit and
+        selector authority.  Only its partial-index reservation is released,
+        then the replacement run records the exact already-published native
+        head as complete.  This is intentionally narrower than a generic
+        duplicate-resource escape hatch: the source must be fully complete and
+        linked only to an aborted, pre-authority applied/verified cutover.
+        """
+        source = await conn.fetchrow(
+            """
+            SELECT item.run_id, item.namespace_id, item.legacy_document_id,
+                   item.native_resource_id, item.captured_path,
+                   item.legacy_head_oid, item.native_head_revision_id,
+                   item.body_digest, item.byte_size, item.status,
+                   source_run.status AS run_status
+              FROM native_revision_migration_items item
+              JOIN native_revision_migration_runs source_run
+                ON source_run.run_id = item.run_id
+               AND source_run.namespace_id = item.namespace_id
+             WHERE item.native_resource_id = $1
+               AND item.legacy_head_oid = $2
+               AND item.reservation_active
+             FOR UPDATE OF item, source_run
+            """,
+            legacy_document_id,
+            legacy_head_oid,
+        )
+        if source is None:
+            return False
+        expected_source = (
+            run.namespace_id,
+            legacy_document_id,
+            legacy_document_id,
+            captured_path,
+            legacy_head_oid,
+            body_digest,
+            byte_size,
+        )
+        observed_source = (
+            source["namespace_id"],
+            source["legacy_document_id"],
+            source["native_resource_id"],
+            source["captured_path"],
+            source["legacy_head_oid"],
+            source["body_digest"],
+            source["byte_size"],
+        )
+        native_head_revision_id = source["native_head_revision_id"]
+        if (
+            source["run_status"] != "complete"
+            or source["status"] != "complete"
+            or observed_source != expected_source
+            or not isinstance(native_head_revision_id, str)
+            or _OID_RE.fullmatch(native_head_revision_id) is None
+        ):
+            return False
+        if not await conn.fetchval(
+            """
+            SELECT NOT EXISTS (
+                SELECT 1
+                  FROM native_revision_migration_items
+                 WHERE run_id = $1 AND status <> 'complete'
+            )
+            """,
+            source["run_id"],
+        ):
+            return False
+        cutover_context = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS cutover_count,
+                   bool_and(
+                       cutover.status = 'aborted'
+                       AND cutover.aborted_from_status IN ('applied', 'verified')
+                   ) AS all_aborted_completed
+              FROM native_revision_cutover_vaults cutover_vault
+              JOIN native_revision_cutover_runs cutover
+                ON cutover.cutover_id = cutover_vault.cutover_id
+             WHERE cutover_vault.migration_run_id = $1
+            """,
+            source["run_id"],
+        )
+        if (
+            cutover_context is None
+            or cutover_context["cutover_count"] != 1
+            or cutover_context["all_aborted_completed"] is not True
+        ):
+            return False
+
+        released = await conn.execute(
+            """
+            UPDATE native_revision_migration_items
+               SET reservation_active = FALSE,
+                   updated_at = NOW()
+             WHERE run_id = $1
+               AND legacy_document_id = $2
+               AND reservation_active
+            """,
+            source["run_id"],
+            source["legacy_document_id"],
+        )
+        if released != "UPDATE 1":
+            raise MigrationIntegrityError("completed migration reservation changed during transfer")
+        await conn.execute(
+            """
+            INSERT INTO native_revision_migration_items
+                (run_id, namespace_id, legacy_document_id, native_resource_id,
+                 captured_path, legacy_head_oid, native_head_revision_id,
+                 body_digest, byte_size, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'complete')
+            """,
+            run.run_id,
+            run.namespace_id,
+            legacy_document_id,
+            legacy_document_id,
+            captured_path,
+            legacy_head_oid,
+            native_head_revision_id,
+            body_digest,
+            byte_size,
+        )
+        return True
+
+    async def supersede_unlinked_pending_runs(
+        self,
+        run_ids: Iterable[uuid.UUID],
+    ) -> tuple[uuid.UUID, ...]:
+        """Compensate only all-pending runs not yet linked to a cutover."""
+
+        ordered = sorted(set(run_ids), key=str)
+        superseded: list[uuid.UUID] = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for run_id in ordered:
+                    run = await conn.fetchrow(
+                        """
+                        SELECT run_id, status
+                          FROM native_revision_migration_runs
+                         WHERE run_id = $1
+                         FOR UPDATE
+                        """,
+                        run_id,
+                    )
+                    if run is None or run["status"] != "planned":
+                        continue
+                    if await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM native_revision_cutover_vaults
+                             WHERE migration_run_id = $1
+                        )
+                        """,
+                        run_id,
+                    ):
+                        continue
+                    items = await conn.fetch(
+                        """
+                        SELECT status, reservation_active
+                          FROM native_revision_migration_items
+                         WHERE run_id = $1
+                         FOR UPDATE
+                        """,
+                        run_id,
+                    )
+                    if any(item["status"] != "pending" or not item["reservation_active"] for item in items):
+                        continue
+                    await conn.execute(
+                        """
+                        UPDATE native_revision_migration_items
+                           SET reservation_active = FALSE,
+                               updated_at = NOW()
+                         WHERE run_id = $1
+                           AND status = 'pending'
+                           AND reservation_active
+                        """,
+                        run_id,
+                    )
+                    changed = await conn.fetchval(
+                        """
+                        UPDATE native_revision_migration_runs
+                           SET status = 'superseded'
+                         WHERE run_id = $1
+                           AND status = 'planned'
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM native_revision_cutover_vaults
+                                WHERE migration_run_id = $1
+                           )
+                        RETURNING run_id
+                        """,
+                        run_id,
+                    )
+                    if changed is None:
+                        raise MigrationIntegrityError("orphan migration run became linked during compensation")
+                    superseded.append(run_id)
+        return tuple(superseded)
 
     async def ensure_pending_items(
         self,
@@ -296,6 +641,19 @@ class NativeRevisionMigrationRepository:
         """Insert the pre-authority inventory, preserving completed work."""
 
         async def _ensure(acquired: asyncpg.Connection) -> list[MigrationItem]:
+            persisted_run = await acquired.fetchrow(
+                """
+                SELECT status
+                  FROM native_revision_migration_runs
+                 WHERE run_id = $1
+                 FOR UPDATE
+                """,
+                run.run_id,
+            )
+            if persisted_run is None:
+                raise MigrationIntegrityError("migration run disappeared during inventory insertion")
+            if persisted_run["status"] == "superseded":
+                raise MigrationIntegrityError("superseded migration run cannot receive inventory")
             result: list[MigrationItem] = []
             for observed in items:
                 document_id = observed["legacy_document_id"]
@@ -323,16 +681,35 @@ class NativeRevisionMigrationRepository:
                     document_id,
                 )
                 if row is None:
-                    await acquired.execute(
-                        """
-                        INSERT INTO native_revision_migration_items
-                            (run_id, namespace_id, legacy_document_id,
-                             native_resource_id, captured_path, legacy_head_oid,
-                             body_digest, byte_size, status)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-                        """,
-                        *expected,
-                    )
+                    try:
+                        # Isolate the uniqueness failure in a savepoint so a
+                        # completed reservation may be transferred without
+                        # aborting the caller's larger frozen-inventory txn.
+                        async with acquired.transaction():
+                            await acquired.execute(
+                                """
+                                INSERT INTO native_revision_migration_items
+                                    (run_id, namespace_id, legacy_document_id,
+                                     native_resource_id, captured_path, legacy_head_oid,
+                                     body_digest, byte_size, status)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+                                """,
+                                *expected,
+                            )
+                    except asyncpg.UniqueViolationError as exc:
+                        if exc.constraint_name != "native_revision_migration_items_active_resource_head_key":
+                            raise
+                        adopted = await self._adopt_aborted_completed_reservation(
+                            acquired,
+                            run=run,
+                            legacy_document_id=document_id,
+                            captured_path=observed["captured_path"],
+                            legacy_head_oid=observed["legacy_head_oid"],
+                            body_digest=observed["body_digest"],
+                            byte_size=observed["byte_size"],
+                        )
+                        if not adopted:
+                            raise
                 else:
                     observed_identity = (
                         row["run_id"],
@@ -345,9 +722,7 @@ class NativeRevisionMigrationRepository:
                         row["byte_size"],
                     )
                     if observed_identity != expected:
-                        raise MigrationInventoryDriftError(
-                            "migration item facts differ from the frozen inventory"
-                        )
+                        raise MigrationInventoryDriftError("migration item facts differ from the frozen inventory")
                     if row["status"] == "failed":
                         await acquired.execute(
                             """
@@ -383,7 +758,10 @@ class NativeRevisionMigrationRepository:
                 return await _ensure(acquired)
 
     async def list_items(
-        self, run_id: uuid.UUID, *, conn: asyncpg.Connection | None = None,
+        self,
+        run_id: uuid.UUID,
+        *,
+        conn: asyncpg.Connection | None = None,
     ) -> list[MigrationItem]:
         sql = """
             SELECT run_id, namespace_id, legacy_document_id, native_resource_id,
@@ -400,6 +778,75 @@ class NativeRevisionMigrationRepository:
                 rows = await acquired.fetch(sql, run_id)
         return [_item(row) for row in rows]
 
+    async def is_completed_reservation_transfer(
+        self,
+        *,
+        owner_run_id: uuid.UUID,
+        replacement_run_id: uuid.UUID,
+        legacy_document_id: uuid.UUID,
+        native_head_revision_id: str,
+    ) -> bool:
+        """Prove that a completed item only transferred its active reservation.
+
+        Immutable Legacy mappings stay owned by ``owner_run_id``.  The
+        replacement may reference the already-published Native head only when
+        the source cutover was explicitly aborted after apply/verify and every
+        frozen item fact is byte-for-byte identical.
+        """
+        _require_oid(native_head_revision_id, "native_head_revision_id")
+        async with self.pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM native_revision_migration_items source
+                          JOIN native_revision_migration_items replacement
+                            ON replacement.run_id = $2
+                           AND replacement.legacy_document_id = source.legacy_document_id
+                          JOIN native_revision_migration_runs source_run
+                            ON source_run.run_id = source.run_id
+                           AND source_run.namespace_id = source.namespace_id
+                          JOIN native_revision_migration_runs replacement_run
+                            ON replacement_run.run_id = replacement.run_id
+                           AND replacement_run.namespace_id = replacement.namespace_id
+                         WHERE source.run_id = $1
+                           AND source.legacy_document_id = $3
+                           AND source.status = 'complete'
+                           AND replacement.status = 'complete'
+                           AND NOT source.reservation_active
+                           AND replacement.reservation_active
+                           AND source_run.status = 'complete'
+                           AND replacement_run.status = 'complete'
+                           AND source.namespace_id = replacement.namespace_id
+                           AND source.legacy_document_id = replacement.legacy_document_id
+                           AND source.native_resource_id = replacement.native_resource_id
+                           AND source.captured_path = replacement.captured_path
+                           AND source.legacy_head_oid = replacement.legacy_head_oid
+                           AND source.native_head_revision_id = replacement.native_head_revision_id
+                           AND source.native_head_revision_id = $4
+                           AND source.body_digest = replacement.body_digest
+                           AND source.byte_size = replacement.byte_size
+                           AND (
+                               SELECT COUNT(*) = 1
+                                      AND bool_and(
+                                          cutover.status = 'aborted'
+                                          AND cutover.aborted_from_status IN ('applied', 'verified')
+                                      )
+                                 FROM native_revision_cutover_vaults cutover_vault
+                                 JOIN native_revision_cutover_runs cutover
+                                   ON cutover.cutover_id = cutover_vault.cutover_id
+                                WHERE cutover_vault.migration_run_id = source.run_id
+                           )
+                    )
+                    """,
+                    owner_run_id,
+                    replacement_run_id,
+                    legacy_document_id,
+                    native_head_revision_id,
+                )
+            )
+
     async def get_item(
         self,
         run_id: uuid.UUID,
@@ -409,13 +856,16 @@ class NativeRevisionMigrationRepository:
         for_update: bool = False,
     ) -> MigrationItem | None:
         suffix = " FOR UPDATE" if for_update else ""
-        sql = """
+        sql = (
+            """
             SELECT run_id, namespace_id, legacy_document_id, native_resource_id,
                    captured_path, legacy_head_oid, native_head_revision_id,
                    body_digest, byte_size, status, error_code
               FROM native_revision_migration_items
              WHERE run_id = $1 AND legacy_document_id = $2
-        """ + suffix
+        """
+            + suffix
+        )
         if conn is not None:
             row = await conn.fetchrow(sql, run_id, legacy_document_id)
         else:
@@ -503,6 +953,8 @@ class NativeRevisionMigrationRepository:
                 raise MigrationIntegrityError("migration run disappeared during status update")
             if row["status"] == "complete":
                 return _run(row)
+            if row["status"] == "superseded":
+                raise MigrationIntegrityError("superseded migration run cannot change status")
             await acquired.execute(
                 """
                 UPDATE native_revision_migration_runs
@@ -544,7 +996,8 @@ class NativeRevisionMigrationRepository:
 
     @staticmethod
     async def all_items_complete(
-        conn: asyncpg.Connection, run_id: uuid.UUID,
+        conn: asyncpg.Connection,
+        run_id: uuid.UUID,
     ) -> bool:
         return bool(
             await conn.fetchval(
@@ -588,7 +1041,7 @@ class NativeRevisionMigrationRepository:
             """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -630,14 +1083,12 @@ class NativeRevisionMigrationRepository:
                 row["lineage_ordinal"],
             )
             if observed != expected:
-                raise MigrationIntegrityError(
-                    "legacy revision mapping conflicts with frozen lineage"
-                )
+                raise MigrationIntegrityError("legacy revision mapping conflicts with frozen lineage")
         row = await conn.fetchrow(
             """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -667,7 +1118,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -694,7 +1145,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -702,6 +1153,32 @@ class NativeRevisionMigrationRepository:
                AND m.lineage_ordinal = 0
                AND r.status = 'complete'
              ORDER BY m.resource_id, m.legacy_git_oid
+        """
+        if conn is not None:
+            rows = await conn.fetch(sql, namespace_id)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, namespace_id)
+        return [_mapping(row) for row in rows]
+
+    async def list_namespace_completed_mappings(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """List the complete published Legacy selector closure for one vault."""
+
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.namespace_id = $1
+               AND r.status = 'complete'
+             ORDER BY m.resource_id, m.lineage_ordinal, m.legacy_git_oid
         """
         if conn is not None:
             rows = await conn.fetch(sql, namespace_id)
@@ -729,7 +1206,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -769,7 +1246,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -801,7 +1278,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -901,7 +1378,7 @@ class NativeRevisionMigrationRepository:
         select_sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid, r.status
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid, r.status
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1036,7 +1513,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
              JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1065,7 +1542,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
               JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1113,7 +1590,7 @@ class NativeRevisionMigrationRepository:
         sql = """
             SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
                    m.path_at_revision, m.resolution, m.native_revision_id,
-                   m.run_id, m.lineage_ordinal, r.fixed_git_oid
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
               FROM legacy_revision_mappings m
              JOIN native_revision_migration_runs r
                 ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
@@ -1128,3 +1605,181 @@ class NativeRevisionMigrationRepository:
             async with self.pool.acquire() as acquired:
                 rows = await acquired.fetch(sql, resource_id, legacy_git_prefix)
         return [_mapping(row) for row in rows]
+
+    # ── bridged bodies: from the git volume into the payload store ──────
+
+    async def claim_unmigrated_bridge_bodies(
+        self,
+        *,
+        limit: int,
+        namespace_id: uuid.UUID | None = None,
+        after: tuple[uuid.UUID, uuid.UUID, int, str] | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """Return bridged mappings whose body is still only in git.
+
+        Ordered by the partial index that exists for exactly this question, so
+        the scan does not walk the migrated majority. `namespace_id` narrows
+        it to one vault, which is how the first run is kept small enough to
+        inspect by hand.
+
+        `after` resumes from a previous page, and the backfill needs it: a row
+        it could not move stays at the head of this order forever, so without
+        a cursor one unreadable body would be re-read once per batch for the
+        rest of the run. The tuple is the full sort key, including
+        `legacy_git_oid` — the first three columns are not unique under any
+        constraint, so a shorter cursor could skip a row.
+        """
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resolution = 'bridge'
+               AND m.body_digest IS NULL
+               AND r.status = 'complete'
+               AND ($2::uuid IS NULL OR m.namespace_id = $2)
+               AND ($3::uuid IS NULL OR
+                    (m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid)
+                    > ($3::uuid, $4::uuid, $5::int, $6::text))
+             ORDER BY m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid
+             LIMIT $1
+        """
+        cursor = after or (None, None, None, None)
+        if conn is not None:
+            rows = await conn.fetch(sql, limit, namespace_id, *cursor)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
+        return [_mapping(row) for row in rows]
+
+    async def list_migrated_bridge_bodies(
+        self,
+        *,
+        limit: int,
+        namespace_id: uuid.UUID | None = None,
+        after: tuple[uuid.UUID, uuid.UUID, int, str] | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> list[LegacyRevisionMapping]:
+        """The mirror of the claim: bridged mappings whose body has moved.
+
+        This is what makes the migration checkable after the fact.  git still
+        holds every one of these bodies, so the digest a mapping was filed
+        under can be recomputed from the source at any time — and a run over
+        the whole population is the only thing that answers "did all of them
+        survive", as opposed to "did the handful I sampled".
+        """
+        sql = """
+            SELECT m.namespace_id, m.resource_id, m.legacy_git_oid,
+                   m.path_at_revision, m.resolution, m.native_revision_id,
+                   m.run_id, m.lineage_ordinal, m.body_digest, r.fixed_git_oid
+              FROM legacy_revision_mappings m
+              JOIN native_revision_migration_runs r
+                ON r.run_id = m.run_id AND r.namespace_id = m.namespace_id
+             WHERE m.resolution = 'bridge'
+               AND m.body_digest IS NOT NULL
+               AND ($2::uuid IS NULL OR m.namespace_id = $2)
+               AND ($3::uuid IS NULL OR
+                    (m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid)
+                    > ($3::uuid, $4::uuid, $5::int, $6::text))
+             ORDER BY m.namespace_id, m.resource_id, m.lineage_ordinal, m.legacy_git_oid
+             LIMIT $1
+        """
+        cursor = after or (None, None, None, None)
+        if conn is not None:
+            rows = await conn.fetch(sql, limit, namespace_id, *cursor)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, limit, namespace_id, *cursor)
+        return [_mapping(row) for row in rows]
+
+    @staticmethod
+    async def attach_bridge_body_digest(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        legacy_git_oid: str,
+        digest: str,
+    ) -> None:
+        """Point one bridged mapping at a body already in the payload store.
+
+        The payload write is the caller's, on the caller's transaction, and it
+        goes through the store that owns the placement — this only records
+        which digest that mapping's body now has.  The two halves must share a
+        transaction: a payload nothing references is waste, and a mapping
+        naming a digest that was never written is a revision that cannot be
+        read at all.
+
+        ``body_digest IS NULL`` in the predicate is the claim.  Two passes can
+        run at once and the loser finds nothing to update, which is the only
+        concurrency control this needs.
+        """
+        _require_digest(digest, "digest")
+        updated = await conn.execute(
+            """
+            UPDATE legacy_revision_mappings
+               SET body_digest = $4
+             WHERE namespace_id = $1
+               AND resource_id = $2
+               AND legacy_git_oid = $3
+               AND resolution = 'bridge'
+               AND body_digest IS NULL
+            """,
+            namespace_id, resource_id, _require_oid(legacy_git_oid, "legacy_git_oid"), digest,
+        )
+        if updated.rsplit(" ", 1)[-1] == "0":
+            # Another pass took it, or it is not a bridged mapping. Either way
+            # this transaction has nothing left to claim.
+            raise LegacyMappingAlreadyMigratedError(legacy_git_oid)
+
+    @staticmethod
+    async def read_bridge_body(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID,
+        digest: str,
+    ) -> str | None:
+        """Read a migrated bridged body back as text.
+
+        Returns None rather than raising when the payload is missing, so the
+        caller can fall back to git instead of failing a read that git could
+        still answer.  Bytes that are present but do not hash to the digest
+        they were stored under are a different thing entirely — that is
+        corruption, and it raises rather than being served.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT canonical_bytes FROM m1_reference_payloads
+             WHERE namespace_id = $1 AND digest = $2
+             LIMIT 1
+            """,
+            namespace_id, _require_digest(digest, "digest"),
+        )
+        if row is None:
+            return None
+        canonical = bytes(row["canonical_bytes"])
+        if hashlib.sha256(canonical).hexdigest() != digest:
+            raise BridgeBodyIntegrityError(digest)
+        return canonical.decode("utf-8")
+
+    @staticmethod
+    async def count_unmigrated_bridge_bodies(
+        conn: asyncpg.Connection,
+        *,
+        namespace_id: uuid.UUID | None = None,
+    ) -> tuple[int, int]:
+        """(still in git only, already in the payload store)."""
+        row = await conn.fetchrow(
+            """
+            SELECT count(*) FILTER (WHERE body_digest IS NULL) AS pending,
+                   count(*) FILTER (WHERE body_digest IS NOT NULL) AS migrated
+              FROM legacy_revision_mappings
+             WHERE resolution = 'bridge'
+               AND ($1::uuid IS NULL OR namespace_id = $1)
+            """,
+            namespace_id,
+        )
+        return int(row["pending"]), int(row["migrated"])

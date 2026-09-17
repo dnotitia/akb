@@ -15,6 +15,7 @@ from app.exceptions import (
     ForbiddenError,
     NotFoundError,
     ValidationError,
+    VaultNameUnavailableError,
 )
 from app.util.errors import (
     exception_envelope,
@@ -23,6 +24,7 @@ from app.util.errors import (
     INVALID_ARGUMENT,
     NOT_FOUND,
     PERMISSION_DENIED,
+    VAULT_NAME_UNAVAILABLE,
 )
 
 
@@ -42,6 +44,14 @@ def test_notfound_maps_to_not_found():
 
 def test_conflict_maps_to_conflict():
     assert exception_envelope(ConflictError("Table already exists: t"))["code"] == CONFLICT
+
+
+def test_vault_name_conflict_keeps_specific_non_disclosing_code():
+    env = exception_envelope(VaultNameUnavailableError())
+    assert env == {
+        "error": "Vault name is unavailable. Choose a different name.",
+        "code": VAULT_NAME_UNAVAILABLE,
+    }
 
 
 def test_validation_maps_to_invalid_argument():

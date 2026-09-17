@@ -77,9 +77,12 @@ embed_dimensions: 1536
 
 # Standalone default keeps direct-provider routing. A managed akb-platform
 # deployment sets platform_hard plus the exact gateway URL; startup then rejects
-# any active embed/LLM/rerank route that points elsewhere or lacks a credential.
+# any active embed/LLM/rerank route that points elsewhere. Managed requests read
+# the projected token for every call; all model API-key fields must be blank.
+# See docs/managed-workload-identity.md for token projection and S3 configuration.
 model_api_governance_mode: external_metering  # external_metering | platform_hard
 platform_gateway_base_url: ""
+platform_gateway_token_file: ""
 
 # === LLM (optional) ===
 # Only used by metadata_worker to auto-tag external_git imports.
@@ -137,11 +140,19 @@ search_limit_max: 50
 vault_filter_enabled: false
 
 # === S3-compatible object storage (for vault file uploads) ===
-# Leave endpoints blank to disable file storage features.
-s3_endpoint_url: ""        # internal endpoint (server → S3)
-s3_public_url: ""          # external endpoint for presigned URLs (client → S3)
+# static + blank endpoint disables object storage. default_chain enables native
+# cloud storage even without an endpoint; never set static key fields with it.
+s3_auth_mode: static # static | default_chain
+s3_endpoint_url: "http://minio:9000" # local Compose; blank disables object storage
+s3_public_url: "" # retained and ignored; nothing signs a URL for a browser any more
 s3_bucket: akb-files
 s3_region: ""
+# Explicit WebIdentity (required in platform_hard): configured token → STS only,
+# without AWS environment/profile credential fallback. The bucket must exist.
+# Standalone default_chain can leave all three blank for the native AWS chain.
+s3_web_identity_token_file: ""
+s3_role_arn: ""
+s3_sts_endpoint_url: ""
 
 # Hidden document images follow live Markdown references. Removed/deleted
 # images remain available only to matching Git revisions for this window;
@@ -243,6 +254,34 @@ app_credential_overlap_seconds: 300
 #                                         # Exact subject bindings need no email claim.
 #                                         # Set false ONLY for a trusted realm with
 #                                         # controlled emails.
+# keycloak_authoritative_email_domains_by_provider: {}  # alias -> [domains].
+#                                         # Declares one provider the authority
+#                                         # for its corporate domains on the
+#                                         # BROWSER login path only. A verified
+#                                         # login through a declared alias adopts
+#                                         # the active human account carrying that
+#                                         # address, or provisions a fresh one.
+#                                         # Empty (default) keeps today's
+#                                         # behaviour. Exact domain match only
+#                                         # (no subdomain inheritance); `local`
+#                                         # is rejected. Design:
+#                                         # docs/design/proposal/2026-09-12-provider-authoritative-email-domains/README.md
+#                                         # e.g. {workforce: ["example.com"]}
+# sso_local_realm_login_enabled: false    # offer THIS installation's own realm as a
+#                                         # login option, for a deployment with no
+#                                         # external identity provider to broker to.
+#                                         # Off by default: an installation that
+#                                         # registers no provider keeps the behaviour
+#                                         # it has rather than gaining a login. The
+#                                         # kind appears as provider_type
+#                                         # `local-realm` under the reserved alias
+#                                         # `local`, carries no broker hint, and
+#                                         # requires the identity_provider claim to be
+#                                         # ABSENT where a brokered provider requires
+#                                         # it present and matching. Registering this
+#                                         # realm as its own upstream provider stays
+#                                         # refused; that would be an authorize loop.
+# sso_local_realm_display_name: "This workspace"  # label shown for that choice
 # keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
 # to true fails canonical startup. Exact pre-binding is the only account-link path.
 # Ordinary AKB browser login uses authorization code + PKCE/nonce and a fixed
@@ -280,9 +319,9 @@ port: 8000
 
 # REQUIRED. Ingress origin used to build absolute share_url values in
 # publication responses (e.g. "https://akb.example.com" in prod,
-# "http://localhost:8000" for docker-compose dev). Backend fails to
+# "http://localhost:3000" for docker-compose dev). Backend fails to
 # start if this is empty.
-public_base_url: "http://localhost:8000"
+public_base_url: "http://localhost:3000"
 
 # === Vector store (driver-pluggable) ===
 # Drivers:
@@ -361,6 +400,10 @@ redis_url: ""              # e.g. redis://redis:6379/0
 redis_event_stream: akb:events
 redis_stream_maxlen: 100000
 
+# === Personal inbox (PostgreSQL; no Redis required) ===
+notifications_enabled: true
+notification_retention_days: 90
+
 # === Audit log (compliance-grade, producer-only) ===
 # AKB does NOT store/query/retain audit data — it emits an append-only,
 # hash-chained JSON-lines stream and (optionally) hands the daily rolled
@@ -381,6 +424,8 @@ redis_stream_maxlen: 100000
 #   # duties point these at a SEPARATE account with a WRITE-ONLY key
 #   # (PutObject, no Delete) — AKB never deletes bucket objects, so a
 #   # compromise of the primary S3 key can't erase the audit trail.
+#   # In platform_hard, access_key/secret_key must stay blank. The uploader uses
+#   # the workload session; its role must authorize PutObject on the audit bucket.
 #   endpoint_url: ""
 #   access_key: ""
 #   secret_key: ""
@@ -428,3 +473,45 @@ redis_stream_maxlen: 100000
 #   session_map_max: 10000        # bound on the (session, vault) tracking map; eviction just re-injects once
 #   vault_cache_max: 4096         # LRU bound on the per-vault cache; the TTL governs freshness, not size
 #   fetch_timeout_secs: 3.0       # ceiling on one cache-miss lookup; on timeout the call ships without a payload
+
+# ── Tenant stats listener (`/stats`) ──────────────────────────
+# A cached inventory snapshot — storage bytes, corpus counts, and the previous
+# complete UTC day's call volume — served as plain JSON on a SEPARATE port.
+#
+# The port is separate because the caller (a control plane's monitor) must be
+# able to read inventory without being able to reach tenant data, and the only
+# enforcement layer for that is a NetworkPolicy, which selects on port. For the
+# same reason the surface carries no authentication of its own: reachability is
+# the authorization, so DO NOT bind this port on a deployment whose network
+# policy does not restrict who may connect to it.
+#
+# Off by default — leave `port` unset and no socket is bound and no sampler
+# runs. `AKB_STATS_PORT` overrides `port` (the deployment-layer exception, same
+# class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE).
+#
+# Requests are served from the last sample and never recompute, so polling is
+# free; poll at half the sampler interval or faster, otherwise a phase drift
+# skips whole snapshots. Not a metrics endpoint: no Prometheus dependency, no
+# exposition format.
+#
+# One process only: the socket is bound from the API's lifespan, so every
+# worker of a multi-worker uvicorn would try to bind it and the second would
+# fail the boot. The API runs as one process per pod (Dockerfile CMD), which
+# is the supported shape.
+# stats:
+#   port: 9105                    # unset = the listener is not composed at all. Under akb-platform this is its `akb.statsPort`: one value that becomes this AKB_STATS_PORT, the port the NetworkPolicy admits, and the port the tenant-monitor polls — so the platform sets it, not this file
+#   host: "0.0.0.0"               # the NetworkPolicy, not the bind address, is what makes this safe
+#   sampler_interval_secs: 300    # the only thing that decides what this surface costs
+#   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)
+
+# Enable after the session-generation backend rollout is complete on every pod.
+# Account deletion also requires the cleanup worker heartbeat to be healthy.
+account_self_service_enabled: false
+
+# Optional Keycloak-owned account disable/delete detection (read-only management
+# client needs realm and user read access). Checks 25 existing identities per tick;
+# detection latency includes a full paginated sweep and upstream availability.
+# Suspends AKB access and revokes AKB PAT/browser sessions, preserving all Vaults.
+# Never automatically reactivates accounts or logs out other Keycloak clients.
+sso_account_sync_enabled: false
+sso_account_sync_interval_secs: 30

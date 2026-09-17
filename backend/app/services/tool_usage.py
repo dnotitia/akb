@@ -249,7 +249,8 @@ def record(
 
     Raw ``args`` are NOT stored — they carry document bodies, search queries and
     SQL. Only ``vault`` is lifted out, the same "honest, lossy" choice
-    ``audit_log`` made for its ``target``.
+    ``audit_log`` made for its ``target``. The session correlation value is a
+    one-way digest so the opaque transport session identifier is not retained.
     """
     global _dropped
     try:
@@ -276,7 +277,7 @@ def record(
             tool=_clip(name) or "",
             actor_id=_clip(getattr(user, "user_id", None)),
             actor=_clip(getattr(user, "username", None)),
-            session_id=_clip(session_id),
+            session_id=_session_ref(session_id),
             vault=_clip(vault_of_call(name, args)),
             outcome=outcome,
             code=_clip(code),
@@ -315,6 +316,15 @@ _DIGEST = 16
 # which is the event-loop stall class this service dies of. Sampling a bounded
 # prefix keeps the cost flat regardless of what a caller sends.
 _SCAN_MAX = 4096
+
+
+def _session_ref(value: Any) -> str | None:
+    """Return a stable, non-reversible correlation key for a session id."""
+    if value is None:
+        return None
+    raw = value if isinstance(value, str) else str(value)
+    digest = hashlib.sha256(f"akb-mcp-session:{raw}".encode("utf-8", "replace")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _clip(v: Any) -> str | None:
@@ -527,13 +537,17 @@ def _requeue_front(batch: list[_Row]) -> int:
     return len(batch)
 
 
-def _purge_cutoff(now: datetime | None = None) -> datetime:
+def purge_cutoff(now: datetime | None = None) -> datetime:
     """Midnight UTC, ``raw_retention_days`` back — a whole-day boundary.
 
     Truncating to the day keeps a retention pass from splitting a day across
     runs, so "this day is gone" is never half-true for a reader joining raw
     rows against the aggregate. The ``now`` argument exists so the boundary can
     be asserted deterministically in tests.
+
+    Public because it is also the line behind which raw rows can no longer be
+    counted: the stats sampler (``app/stats/sampler.py``) refuses to fold a
+    day's call volume from rows this purge may already have reached.
     """
     now = now or datetime.now(timezone.utc)
     day = (now - timedelta(days=settings.tool_usage.raw_retention_days)).date()
@@ -566,7 +580,7 @@ async def purge_once() -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         n = await conn.fetchval(
-            _PURGE_SQL, _purge_cutoff(), settings.tool_usage.maintenance_batch
+            _PURGE_SQL, purge_cutoff(), settings.tool_usage.maintenance_batch
         )
     n = int(n or 0)
     if n:

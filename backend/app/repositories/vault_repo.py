@@ -6,6 +6,8 @@ import uuid
 
 import asyncpg
 
+from app.exceptions import VaultNameUnavailableError
+
 
 async def lock_vault_for_child_write(conn, vault_id: uuid.UUID) -> bool:
     """Hold the parent vault before locking or writing child resources.
@@ -61,9 +63,19 @@ class VaultRepository:
         vault_id = uuid.uuid4()
         sql = "INSERT INTO vaults (id, name, description, git_path, owner_id, public_access) VALUES ($1, $2, $3, $4, $5, $6)"
         args = (vault_id, name, description, git_path, owner_id, public_access)
-        if conn is not None:
-            await conn.execute(sql, *args)
-        else:
-            async with self.pool.acquire() as acq:
-                await acq.execute(sql, *args)
+        try:
+            if conn is not None:
+                await conn.execute(sql, *args)
+            else:
+                async with self.pool.acquire() as acq:
+                    await acq.execute(sql, *args)
+        except asyncpg.UniqueViolationError as exc:
+            # The database is the final authority for globally unique Vault
+            # names.  Mapping here keeps standard, native, external-git, REST,
+            # and MCP create paths identical when concurrent requests both
+            # pass an advisory pre-check.  Other UNIQUE constraints remain
+            # programming/data errors and must not be mislabeled.
+            if exc.constraint_name == "vaults_name_key":
+                raise VaultNameUnavailableError() from exc
+            raise
         return vault_id

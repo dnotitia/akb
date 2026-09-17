@@ -3,9 +3,9 @@ kind: Kustomization
 
 namespace: akb
 
+# Standalone AKB plus an installation-owned Keycloak and its dedicated DB.
 resources:
-  - ../namespace.yaml
-  - akb-postgres.yaml
+  - ../postgres.yaml
   - ../backend.yaml
   - ../frontend.yaml
   - ../ingress.yaml

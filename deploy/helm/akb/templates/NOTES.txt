@@ -1,0 +1,11 @@
+AKB profile {{ .Values.profile }} was rendered for release {{ .Release.Name }}
+in namespace {{ .Release.Namespace }}.
+
+AKB consumes Secret/{{ .Values.secretContract.name }}. Helm intentionally does
+not create it or persist its values in release metadata. Create and manage the
+Secret before installing or upgrading this release.
+
+Application URL: {{ .Values.global.publicUrl }}
+{{- if .Values.sso.enabled }}
+Keycloak URL: {{ .Values.sso.keycloakPublicUrl }}
+{{- end }}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from app.config import settings
 from app.services import embed_worker, sparse_encoder
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_native_grep_service import M1NativeGrepService
+from app.services import native_derived_worker
 from app.services._backfill import MAX_RETRIES
 from app.services.native_derived_worker import (
     NATIVE_FILE_SOURCE,
@@ -62,7 +64,7 @@ async def _fresh_database():
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 53, 54, 57, 59):
+        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None
@@ -317,6 +319,35 @@ async def test_text_file_intent_applies_the_document_parity_derived_path():
             assert {row["chunk_id"] for row in queued} == prior_chunk_ids
 
 
+async def _bind_native_file_catalogue(pool, *, namespace_id, path, payload, created):
+    """Admit the native Head through the same catalogue identity grep verifies."""
+    collection, _, name = path.rpartition("/")
+    async with pool.acquire() as conn:
+        collection_id = None
+        if collection:
+            collection_id = await conn.fetchval(
+                """
+                INSERT INTO collections (vault_id, path, name) VALUES ($1, $2, $2)
+                ON CONFLICT (vault_id, path) DO UPDATE SET path = EXCLUDED.path
+                RETURNING id
+                """, namespace_id, collection,
+            )
+        await conn.execute(
+            """
+            INSERT INTO vault_files (
+                id, vault_id, collection_id, kind, upload_state, name, s3_key,
+                mime_type, size_bytes, content_hash, hash_algorithm, hash_verified_at,
+                storage_driver, storage_locator, native_resource_id, native_revision_id
+            ) VALUES ($1, $2, $3, 'file', 'confirmed', $4, $5, 'text/plain', $6,
+                      $7, 'sha256', NOW(), 'native_text', $5, $1, $8)
+            """,
+            created.resource_id, namespace_id, collection_id, name,
+            f"native-text/{created.resource_id}/{created.revision_id}",
+            len(payload.encode("utf-8")), hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            created.revision_id,
+        )
+
+
 async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
     """Derived output is never an exact-grep oracle.
 
@@ -335,6 +366,10 @@ async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
             payload="head_truth_token\n",
             actor="derived-test",
             mutation_id=uuid.uuid4(),
+        )
+        await _bind_native_file_catalogue(
+            pool, namespace_id=vault_id, path="src/main.py",
+            payload="head_truth_token\n", created=created,
         )
         assert await NativeDerivedWorker(pool).process_once() == 1
 
@@ -440,12 +475,18 @@ async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(m
             ) == 0
 
 
-async def _create_document(pool, vault_id, *, path: str = "retry.md"):
+async def _create_document(
+    pool,
+    vault_id,
+    *,
+    path: str = "retry.md",
+    payload: str = "---\ntitle: Retry\n---\n# Retry\nsearchable\n",
+):
     return await NativeRevisionService(pool, payload_store=M1PgBodyStore(pool)).create_text(
         namespace_id=vault_id,
         surface="document",
         path=path,
-        payload="---\ntitle: Retry\n---\n# Retry\nsearchable\n",
+        payload=payload,
         actor="derived-test",
         mutation_id=uuid.uuid4(),
     )
@@ -540,6 +581,86 @@ async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(
             assert terminal["last_error"] == "RuntimeError"
 
 
+async def test_a_body_the_derived_index_cannot_store_is_lost_but_counted(monkeypatch, caplog):
+    """akb#527, reproduced through the real substrate rather than a fake.
+
+    A `0x00` sits where a space belongs — what the PDF extractor emitted. The
+    payload store accepts it (its UTF-8 check is NUL-tolerant by construction,
+    migration 048), and `chunks.content` is `text`, which cannot hold one. So
+    nothing about the Resource changes between attempts and every attempt fails
+    identically until the budget is gone.
+
+    The Resource is then permanently absent from the derived index while
+    staying readable and greppable, and — this is the defect — `pending` has
+    drained to zero exactly as it would have on success. An operator watching
+    progress sees a finished backfill. What must stop that from being the whole
+    story is asserted here: the queue counts what it dropped, refuses to call
+    itself `ok` with an empty queue, and names the Resource once in a log.
+    """
+    async with _fresh_database() as pool:
+        async with pool.acquire() as conn:
+            vault_id = await conn.fetchval(
+                "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
+                f"extracted-{uuid.uuid4().hex}",
+            )
+        created = await _create_document(
+            pool,
+            vault_id,
+            path="ops/extracted.md",
+            payload="---\ntitle: Extracted\n---\n# Extracted\nword\x00word\x00word\n",
+        )
+        worker = NativeDerivedWorker(pool)
+        caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
+
+        for attempt in range(MAX_RETRIES):
+            assert await worker.process_once() == 0
+            if attempt + 1 < MAX_RETRIES:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE native_invalidation_intents SET next_attempt_at = NOW() WHERE revision_id = $1",
+                        created.revision_id,
+                    )
+
+        async with pool.acquire() as conn:
+            terminal = await conn.fetchrow(
+                """
+                SELECT retry_count, delivery_outcome, completed_at, last_error
+                  FROM native_invalidation_intents WHERE revision_id = $1
+                """,
+                created.revision_id,
+            )
+            assert terminal["retry_count"] == MAX_RETRIES
+            assert terminal["completed_at"] is not None
+            assert terminal["delivery_outcome"] == "abandoned"
+            # The class, never the message — the message quotes the body.
+            assert terminal["last_error"] == "CharacterNotInRepertoireError"
+            # Absent from the derived index: no chunk, so nothing to embed and
+            # nothing for ranked search to return.
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE source_id = $1", created.resource_id,
+            ) == 0
+
+        stats = await worker.pending_stats(vault_id)
+        assert stats["pending"] == 0        # progress says the backfill finished …
+        assert stats["abandoned"] == 1      # … and a document is missing from the index
+        assert stats["exhausted"] == 0
+        assert stats["status"] == "degraded"
+
+        # The same numbers through the module-level entry point `/health` and
+        # `/health/vault/{name}` call, so the endpoint test above is wired to
+        # this table and not merely to a shape.
+        async def _fixture_pool():
+            return pool
+
+        monkeypatch.setattr(native_derived_worker, "get_pool", _fixture_pool)
+        assert await native_derived_worker.pending_stats(vault_id) == stats
+
+        abandonment = next(r for r in caplog.records if r.levelno == logging.ERROR).getMessage()
+        assert "ABANDONED" in abandonment
+        assert "path=ops/extracted.md" in abandonment
+        assert "error=CharacterNotInRepertoireError" in abandonment
+
+
 async def test_multiworker_skip_locked_claims_intent_once():
     async with _fresh_database() as pool:
         async with pool.acquire() as conn:
@@ -615,7 +736,7 @@ async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collec
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
 
         async def create(namespace_id, surface, path):
-            return await service.create_text(
+            created = await service.create_text(
                 namespace_id=namespace_id,
                 surface=surface,
                 path=path,
@@ -623,6 +744,13 @@ async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collec
                 actor="grep-test",
                 mutation_id=uuid.uuid4(),
             )
+
+            if surface == "file":
+                await _bind_native_file_catalogue(
+                    pool, namespace_id=namespace_id, path=path,
+                    payload="needle-boundary\n", created=created,
+                )
+            return created
 
         await create(allowed_vault, "document", "src/a.md")
         await create(allowed_vault, "document", "src2/b.md")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -9,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.config import settings
-from app.exceptions import AuthenticationError
+from app.exceptions import AKBError, AuthenticationError
 from app.services.admin_auth_service import (
     ProductAdminIdentity,
     authenticate_local_product_admin,
@@ -26,6 +27,7 @@ from app.util.text import NFCModel
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 _ADMIN_SESSION_COOKIE = "__Host-akb_admin_session"
 _ADMIN_CSRF_COOKIE = "__Host-akb_admin_csrf"
@@ -203,6 +205,22 @@ def _clear_admin_oidc_binding_cookie(response: RedirectResponse) -> None:
     )
 
 
+def _admin_sign_in_failed(reason: str) -> RedirectResponse:
+    """Return a browser to a safe retry surface after any admin refusal."""
+    # `reason` is always selected by this module, never copied from the IdP or
+    # query string. Keep enough signal for operations without disclosing it to
+    # the browser.
+    logger.warning("Product-admin browser sign-in returned to retry page: %s", reason)
+    response = RedirectResponse(
+        "/admin?auth_error=sign_in_failed",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+    _clear_admin_oidc_binding_cookie(response)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @router.get("/admin/auth/config", summary="Public product-admin login configuration")
 async def admin_auth_config():
     mode = settings.require_auth_mode()
@@ -259,26 +277,32 @@ async def admin_keycloak_callback(
 ):
     _require_admin_sso()
     if error is not None or not code or not state:
-        raise AuthenticationError("Product-admin sign-in failed")
-    oidc = get_keycloak_oidc()
-    browser_binding = request.cookies.get(_admin_oidc_binding_cookie_name(), "")
-    transient = await oidc.consume_admin_state(state, browser_binding)
-    if not isinstance(transient, dict) or set(transient) != {
-        "code_verifier",
-        "nonce",
-    }:
-        raise AuthenticationError("Product-admin sign-in failed")
-    verifier = transient.get("code_verifier")
-    nonce = transient.get("nonce")
-    if not isinstance(verifier, str) or not isinstance(nonce, str):
-        raise AuthenticationError("Product-admin sign-in failed")
-    tokens = await oidc.exchange_admin_code(code, verifier)
-    id_token = tokens.get("id_token")
-    if tokens.get("token_type") != "Bearer" or not isinstance(id_token, str):
-        raise AuthenticationError("Product-admin sign-in failed")
-    claims = await oidc.verify_admin_id_token(id_token, expected_nonce=nonce)
-    identity = await resolve_prebound_sso_product_admin(claims)
-    issued = await create_sso_admin_browser_session(identity, claims)
+        return _admin_sign_in_failed("authorization_error_or_missing_parameters")
+    try:
+        oidc = get_keycloak_oidc()
+        browser_binding = request.cookies.get(_admin_oidc_binding_cookie_name(), "")
+        transient = await oidc.consume_admin_state(state, browser_binding)
+        if not isinstance(transient, dict) or set(transient) != {
+            "code_verifier",
+            "nonce",
+        }:
+            return _admin_sign_in_failed("state_missing_or_expired")
+        verifier = transient.get("code_verifier")
+        nonce = transient.get("nonce")
+        if not isinstance(verifier, str) or not isinstance(nonce, str):
+            return _admin_sign_in_failed("transient_profile_invalid")
+        tokens = await oidc.exchange_admin_code(code, verifier)
+        id_token = tokens.get("id_token")
+        if tokens.get("token_type") != "Bearer" or not isinstance(id_token, str):
+            return _admin_sign_in_failed("token_profile_invalid")
+        claims = await oidc.verify_admin_id_token(id_token, expected_nonce=nonce)
+        identity = await resolve_prebound_sso_product_admin(claims)
+        issued = await create_sso_admin_browser_session(identity, claims)
+    except AKBError as exc:
+        # The callback is a browser page, so expected application refusals must
+        # not become a serialized API error. The fixed query code deliberately
+        # discloses neither identity state nor the upstream failure detail.
+        return _admin_sign_in_failed(f"application_refusal:{type(exc).__name__}")
     response = RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
     _set_admin_cookies(
         response,

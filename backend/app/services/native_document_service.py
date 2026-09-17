@@ -1,8 +1,11 @@
-"""Measurement-only Document compatibility facade over the native ledger.
+"""Document compatibility facade over the native ledger.
 
 The public Document models intentionally keep their historical commit-shaped
-field names.  Values are native opaque Revision tokens; this service neither
-constructs a Git service nor writes the legacy document projection.
+field names. New Native revisions use opaque Revision tokens. Existing-database
+cutovers may retain frozen historical Git selectors; their Git reader is
+constructed lazily only for an immutable completed bridge mapping. Current
+heads and all new writes remain Native-only, and this service never writes the
+legacy document projection.
 """
 
 from __future__ import annotations
@@ -10,27 +13,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import NoReturn
+from app.services.search_filters import ArchiveScope
 
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import (
+    AKBError,
+    ConflictError,
+    DocumentTitleConflictError,
+    NotFoundError,
+    ValidationError,
+    VaultNameUnavailableError,
+)
 from app.models.document import (
     DOC_STATUSES,
+    BrowseContext,
     BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
+    TitleConflictPolicy,
     DocumentUpdateRequest,
 )
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
-from app.repositories.native_revision_repo import NativeRevisionRepository
+from app.repositories.native_revision_migration_repo import (
+    BridgeBodyIntegrityError,
+    LegacyRevisionMapping,
+    NativeRevisionMigrationRepository,
+)
+from app.repositories.native_revision_repo import (
+    NativeRevisionRepository,
+    NativeRevisionSelectorAmbiguousError,
+)
 from app.repositories.vault_repo import VaultRepository
-from app.services import skill_policy
+from app.services import document_counters, skill_policy
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -43,6 +65,7 @@ from app.services.document_service import (
     newest_public_slug,
     validate_vault_name,
 )
+from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.kg_service import validate_new_structured_relation_refs
 from app.services.native_revision_service import (
@@ -52,7 +75,7 @@ from app.services.native_revision_service import (
 )
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.util.text import (
     doc_path,
     like_escape,
@@ -63,6 +86,8 @@ from app.util.text import (
     to_nfc,
 )
 from app.utils import ensure_list
+
+logger = logging.getLogger("akb.native_documents")
 
 
 class NativeRevisionUnsupportedSurfaceError(AKBError):
@@ -84,15 +109,25 @@ class NativeDocumentService(DocumentService):
         *,
         pool: asyncpg.Pool | None = None,
         failpoint: Failpoint | None = None,
+        legacy_git: GitService | None = None,
     ):
         # Deliberately do not call DocumentService.__init__: that would create
         # the legacy Git adapter before a request is even served.
+        # No `super().__init__()` on purpose: the base builds a GitService
+        # and binds it to `self.git`, and this arm must not carry one. Bodies
+        # are read from PostgreSQL, with Git a fallback for bridged revisions
+        # that have not moved yet — `read_bridge_body` holds that decision.
+        # The absent attribute is the contract, not an oversight; see the note
+        # on `DocumentService.__init__`.
         self._injected_pool = pool
         # ``failpoint`` carries the native service's deterministic test-only
         # hook down to the substrate this facade composes; production
         # composition must leave it unset.  Left unset, ``_native`` builds
         # exactly the service it built before this seam existed.
         self._failpoint = failpoint
+        # Do not construct the retained-history bridge on current reads or
+        # writes. It exists only for a completed legacy selector mapping.
+        self._legacy_git = legacy_git
 
     async def _pool(self) -> asyncpg.Pool:
         return self._injected_pool or await get_pool()
@@ -104,6 +139,79 @@ class NativeDocumentService(DocumentService):
         if vault_id is None:
             raise NotFoundError("Vault", vault)
         return vault_id
+
+    @staticmethod
+    def _has_complete_native_frontmatter(frontmatter: dict) -> bool:
+        """Return whether a native payload carries the public metadata core.
+
+        Normal Native writes always produce these fields.  Existing-database
+        migration may instead preserve an external Git payload byte-for-byte;
+        those payloads can omit metadata that Legacy served from PostgreSQL.
+        """
+
+        return (
+            all(frontmatter.get(key) for key in ("title", "type", "status", "created_at", "updated_at"))
+            and "tags" in frontmatter
+        )
+
+    async def _document_frontmatter(
+        self,
+        vault_id: uuid.UUID,
+        snapshot: NativeRevisionSnapshot,
+    ) -> tuple[dict, str]:
+        """Parse one payload and restore missing frozen Legacy projection data.
+
+        Cutover deliberately retains the old ``documents`` rows while Native
+        owns revision authority.  For a migrated external-Git document, the
+        immutable body may not contain fields such as ``status`` even though
+        Legacy served them from that retained row.  Fill only absent fields;
+        explicit Native frontmatter always wins.  Complete Native payloads do
+        not pay a legacy projection read.
+        """
+
+        frontmatter, body = _parse_markdown(snapshot.text)
+        if self._has_complete_native_frontmatter(frontmatter):
+            return frontmatter, body
+
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            legacy = await conn.fetchrow(
+                """
+                SELECT title, doc_type, status, summary, domain, created_by,
+                       created_at, updated_at, tags
+                  FROM documents
+                 WHERE vault_id = $1 AND id = $2
+                """,
+                vault_id,
+                snapshot.resource_id,
+            )
+        if legacy is None:
+            return frontmatter, body
+
+        row = dict(legacy)
+        fallback = {
+            "title": row.get("title"),
+            "type": row.get("doc_type") or "note",
+            "status": row.get("status") or "draft",
+            "summary": row.get("summary"),
+            "domain": row.get("domain"),
+            "created_by": row.get("created_by"),
+            "created_at": (
+                row["created_at"].isoformat()
+                if isinstance(row.get("created_at"), datetime)
+                else row.get("created_at")
+            ),
+            "updated_at": (
+                row["updated_at"].isoformat()
+                if isinstance(row.get("updated_at"), datetime)
+                else row.get("updated_at")
+            ),
+            "tags": list(row.get("tags") or []),
+        }
+        for key, value in fallback.items():
+            if frontmatter.get(key) is None and value is not None:
+                frontmatter[key] = value
+        return frontmatter, body
 
     async def _native(self) -> NativeRevisionService:
         """Compose the substrate on the frozen P1 searchable-body placement.
@@ -154,6 +262,39 @@ class NativeDocumentService(DocumentService):
         )
         return vault_id, snapshot
 
+    async def _expected_commit_matches_current(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        resource_id: uuid.UUID,
+        expected_commit: str,
+        current_revision_id: str,
+    ) -> bool:
+        """Accept a migrated Legacy head token only while it names this Head.
+
+        Existing clients retain the public ``current_commit`` returned before
+        an in-place Native cutover. The completed migration mapping is the
+        authority that binds that Legacy Git OID to the replacement Native
+        Revision. Once a Native write advances Head, the mapping no longer
+        points at current and the old token becomes stale again.
+        """
+        if expected_commit == current_revision_id:
+            return True
+        try:
+            mapping = await NativeRevisionMigrationRepository(
+                await self._pool()
+            ).mapping_for_native_revision(
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                native_revision_id=current_revision_id,
+            )
+        except asyncpg.UndefinedTableError:
+            # Native-only test/install schemas can intentionally omit the
+            # optional migration bridge. Preserve their historical mismatch
+            # behavior instead of turning a stale token into a server error.
+            return False
+        return mapping is not None and mapping.legacy_git_oid == expected_commit
+
     async def _path_is_owned(self, vault_id: uuid.UUID, path: str) -> bool:
         repository = NativeRevisionRepository(await self._pool())
         return (
@@ -202,6 +343,54 @@ class NativeDocumentService(DocumentService):
                 return candidate
             ordinal += 1
 
+    async def _find_native_title_conflict(
+        self,
+        vault_id: uuid.UUID,
+        collection: str,
+        title: str,
+        *,
+        exclude_resource_id: uuid.UUID | None = None,
+    ) -> tuple[str, str] | None:
+        """Return ``(path, title)`` for an exact title twin in one Collection.
+
+        Native M1 deliberately has no mutable title projection; title lives in
+        immutable revision frontmatter. This compatibility check therefore
+        reads the current revision only when an interactive caller opts into
+        soft uniqueness. The default lossless write path pays no extra cost.
+        """
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT resource_id, current_path, head_revision_id
+                  FROM native_resources
+                 WHERE namespace_id = $1
+                   AND surface = 'document'
+                   AND lifecycle = 'live'
+                 ORDER BY updated_at DESC, resource_id DESC
+                """,
+                vault_id,
+            )
+        native = await self._native()
+        expected_title = to_nfc(title).strip()
+        for row in rows:
+            if exclude_resource_id is not None and row["resource_id"] == exclude_resource_id:
+                continue
+            candidate_collection, _ = split_doc_path(row["current_path"])
+            if candidate_collection != collection:
+                continue
+            snapshot = await native.get_resource_revision(
+                namespace_id=vault_id,
+                surface="document",
+                resource_id=row["resource_id"],
+                revision_id=row["head_revision_id"],
+            )
+            frontmatter, _ = await self._document_frontmatter(vault_id, snapshot)
+            candidate_title = to_nfc(str(frontmatter.get("title") or "")).strip()
+            if candidate_title == expected_title:
+                return snapshot.path, candidate_title
+        return None
+
     async def _created_by_name(self, created_by: str | None) -> str | None:
         if not created_by:
             return None
@@ -218,25 +407,10 @@ class NativeDocumentService(DocumentService):
             )
 
     async def _public_slug(
-        self, vault_id: uuid.UUID, vault: str, path: str
+        self, vault_id: uuid.UUID, vault: str, path: str,
+        native_document_id: uuid.UUID | None = None,
     ) -> str | None:
-        """Newest publication slug for the document at ``path``, or None.
-
-        Shares one query with the legacy arm (``newest_public_slug``) instead
-        of keeping a second copy — the two copies had drifted into the same
-        defect, a ``resource_uri`` match with no ``vault_id`` predicate, which
-        told a reader that another vault carries a publication for the same
-        path and handed over its slug.
-
-        ``vault_id`` is passed in rather than resolved here: every caller has
-        already resolved it through ``_current``, and ``_vault_id`` is an
-        uncached pool checkout plus a query.
-
-        ``document_id=None`` is passed deliberately. This arm does not write
-        the legacy ``documents`` projection, so there is no id to name here;
-        the vault-scoped ``resource_uri`` fallback is what answers, and it is
-        scoped either way.
-        """
+        """Find the current Resource's publication across moves and path reuse."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             return await newest_public_slug(
@@ -244,7 +418,58 @@ class NativeDocumentService(DocumentService):
                 vault_id=vault_id,
                 document_id=None,
                 resource_uri=doc_uri(vault, path),
+                native_document_id=native_document_id,
             )
+
+    async def read_bridge_body(
+        self,
+        vault: str,
+        vault_id: uuid.UUID,
+        mapping: LegacyRevisionMapping,
+        *,
+        git: GitService | None = None,
+    ) -> str | None:
+        """Read one bridged revision's body, from wherever it lives.
+
+        A mapping that names a digest has had its body copied into the
+        payload store and no longer needs the git working volume — which is
+        the point, because that volume is ReadWriteOnce and pins the serving
+        tier to a single node.
+
+        git stays the fallback in two cases, and both matter: a mapping that
+        has not been migrated yet, and one whose payload cannot be found. The
+        second should not happen — the digest and the payload are written in
+        one transaction — but a read that git could still answer must not
+        fail because a newer path came up empty.  Bytes that are present and
+        do not hash to their digest are the same decision for the same
+        reason, and both say so in the log rather than passing silently.
+        """
+        digest = mapping.body_digest
+        if digest:
+            pool = await self._pool()
+            reason = None
+            try:
+                async with pool.acquire() as conn:
+                    text = await NativeRevisionMigrationRepository.read_bridge_body(
+                        conn, namespace_id=vault_id, digest=digest,
+                    )
+                if text is not None:
+                    return text
+                reason = "names a payload that is missing"
+            except BridgeBodyIntegrityError:
+                reason = "names a payload that does not match its digest"
+            logger.warning(
+                "bridged body %s %s; reading git",
+                mapping.legacy_git_oid,
+                reason,
+            )
+        legacy_git = git or self._legacy_git or GitService()
+        return await asyncio.to_thread(
+            legacy_git.read_file,
+            vault,
+            mapping.path_at_revision,
+            mapping.legacy_git_oid,
+        )
 
     async def _response(
         self,
@@ -256,7 +481,7 @@ class NativeDocumentService(DocumentService):
         public_selector: str | None = None,
     ) -> DocumentResponse:
         selected = selected or current
-        current_fm, _ = _parse_markdown(current.text)
+        current_fm, _ = await self._document_frontmatter(vault_id, current)
         _, selected_body = _parse_markdown(selected.text)
         created_by = current_fm.get("created_by")
         # Sequential on purpose. These two reads are independent and a
@@ -267,7 +492,9 @@ class NativeDocumentService(DocumentService):
         # changes failure behaviour: under `gather` a raise in one no longer
         # stops the other, which runs on to completion with its result (or its
         # own exception) discarded. Not worth either, for zero live gain.
-        public_slug = await self._public_slug(vault_id, vault, current.path)
+        public_slug = await self._public_slug(
+            vault_id, vault, current.path, native_document_id=current.resource_id,
+        )
         created_by_name = await self._created_by_name(created_by)
         return DocumentResponse(
             uri=doc_uri(vault, current.path),
@@ -320,6 +547,19 @@ class NativeDocumentService(DocumentService):
         collection = normalize_collection_path(req.collection)
         base_path = doc_path(collection, base_slug)
         path_identity = uuid.uuid4()
+        if req.title_conflict_policy == "reject":
+            existing = await self._find_native_title_conflict(
+                vault_id,
+                collection,
+                req.title,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=collection,
+                    existing_path=existing[0],
+                    existing_title=existing[1],
+                )
         if req.slug and await self._current_path_is_owned(vault_id, base_path):
             raise ConflictError(f"Document already exists at path: {base_path}")
         final_path = (
@@ -385,6 +625,15 @@ class NativeDocumentService(DocumentService):
         vault_id, current = await self._current(vault, doc_ref)
         return await self._response(vault=vault, vault_id=vault_id, current=current)
 
+    async def get_by_resource_id(self, vault: str, resource_id: uuid.UUID) -> DocumentResponse:
+        """Read a publication's exact live Resource without resolving a path."""
+        vault_id = await self._vault_id(vault)
+        native = await self._native()
+        current = await native.get_current_resource(
+            namespace_id=vault_id, surface="document", resource_id=resource_id,
+        )
+        return await self._response(vault=vault, vault_id=vault_id, current=current)
+
     async def get_at_commit(
         self,
         vault: str,
@@ -397,12 +646,62 @@ class NativeDocumentService(DocumentService):
         # NativeRevisionService._validate_expected_revision().
         if not 7 <= len(version) <= 40 or any(ch not in "0123456789abcdef" for ch in version):
             raise NotFoundError("Document version", f"{current.path}@{version[:8]}")
-        selected = await (await self._native()).get_revision(
-            namespace_id=vault_id,
-            surface="document",
-            reference=current.path,
-            revision_id=version,
-        )
+        native = await self._native()
+        try:
+            selected = await native.get_revision(
+                namespace_id=vault_id,
+                surface="document",
+                reference=current.path,
+                revision_id=version,
+            )
+        except NotFoundError as native_miss:
+            # Existing-database cutovers preserve public Git selectors even
+            # though each migrated Revision has a new opaque Native ID. Keep
+            # ordinary Native selection first, then use only completed
+            # immutable mappings on a miss. No Git adapter is constructed.
+            mappings = NativeRevisionMigrationRepository(await self._pool())
+            try:
+                if len(version) == 40:
+                    exact = await mappings.exact_mapping(
+                        resource_id=current.resource_id,
+                        legacy_git_oid=version,
+                    )
+                    matches = [] if exact is None else [exact]
+                else:
+                    matches = await mappings.prefix_mappings(
+                        resource_id=current.resource_id,
+                        legacy_git_prefix=version,
+                    )
+            except asyncpg.UndefinedTableError:
+                # Narrow core-schema fixtures have no cutover surface.
+                raise native_miss from None
+            if len(matches) > 1:
+                raise NativeRevisionSelectorAmbiguousError(version)
+            if not matches:
+                raise NotFoundError("Legacy revision selector", version)
+            mapping = matches[0]
+            if mapping.resolution == "native" and mapping.native_revision_id is not None:
+                selected = await native.get_resource_revision(
+                    namespace_id=vault_id,
+                    surface="document",
+                    resource_id=current.resource_id,
+                    revision_id=mapping.native_revision_id,
+                )
+            elif mapping.resolution == "bridge" and mapping.legacy_git_oid is not None:
+                raw = await self.read_bridge_body(vault, vault_id, mapping)
+                if raw is None:
+                    raise NotFoundError(
+                        "Legacy bridge body",
+                        f"{mapping.path_at_revision}@{mapping.legacy_git_oid}",
+                    )
+                selected = replace(
+                    current,
+                    revision_id=mapping.legacy_git_oid,
+                    path=mapping.path_at_revision,
+                    text=raw,
+                )
+            else:
+                raise NotFoundError("Legacy revision selector", version)
         return await self._response(
             vault=vault,
             vault_id=vault_id,
@@ -424,6 +723,21 @@ class NativeDocumentService(DocumentService):
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
         skill_policy.check_update(current.path, req.type, internal=skill_internal)
+        if req.title is not None and req.title_conflict_policy == "reject":
+            collection, _ = split_doc_path(current.path)
+            existing = await self._find_native_title_conflict(
+                vault_id,
+                collection,
+                req.title,
+                exclude_resource_id=current.resource_id,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=collection,
+                    existing_path=existing[0],
+                    existing_title=existing[1],
+                )
         return await self._update_from_snapshot(
             vault=vault,
             vault_id=vault_id,
@@ -446,11 +760,17 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if req.expected_commit and req.expected_commit != current.revision_id:
+            if req.expected_commit and not await self._expected_commit_matches_current(
+                namespace_id=vault_id,
+                resource_id=resource_id,
+                expected_commit=req.expected_commit,
+                current_revision_id=current.revision_id,
+            ):
                 raise ConflictError(
                     f"current_commit moved: expected {req.expected_commit}, actual {current.revision_id}"
                 )
-            frontmatter, current_body = _parse_markdown(current.text)
+            frontmatter, current_body = await self._document_frontmatter(vault_id, current)
+            previous_status = frontmatter.get("status") or "draft"
             previous_hash = _body_content_hash(current_body)
             if req.expected_content_hash and req.expected_content_hash != previous_hash:
                 raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
@@ -504,6 +824,8 @@ class NativeDocumentService(DocumentService):
                     message=message,
                     subject=f"[update] {current.path}",
                     summary=summary,
+                    notification_previous_status=previous_status,
+                    notification_status=frontmatter.get("status") or "draft",
                 )
             except ConflictError as exc:
                 if exact_head_pinned or not str(exc).startswith(
@@ -545,6 +867,7 @@ class NativeDocumentService(DocumentService):
         slug: str | None = None,
         message: str | None = None,
         agent_id: str | None = None,
+        title_conflict_policy: TitleConflictPolicy = "allow",
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
         if collection is None and slug is None:
@@ -573,6 +896,22 @@ class NativeDocumentService(DocumentService):
             skill_policy.check_move(current.path, base_path, internal=skill_internal)
             if base_path == current.path:
                 raise ValidationError("move is a no-op: the target path equals the current path")
+            if title_conflict_policy == "reject":
+                frontmatter, _ = await self._document_frontmatter(vault_id, current)
+                current_title = str(frontmatter.get("title") or current.path.rsplit("/", 1)[-1])
+                existing = await self._find_native_title_conflict(
+                    vault_id,
+                    next_collection,
+                    current_title,
+                    exclude_resource_id=current.resource_id,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=current_title,
+                        collection=next_collection,
+                        existing_path=existing[0],
+                        existing_title=existing[1],
+                    )
             next_path = await self._resolve_native_free_path(vault_id, base_path, current.resource_id)
             if requested_slug is not None and next_path != base_path:
                 raise ConflictError(f"Document already exists at path: {base_path}")
@@ -655,7 +994,12 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if base_commit and base_commit != current.revision_id:
+            if base_commit and not await self._expected_commit_matches_current(
+                namespace_id=vault_id,
+                resource_id=resource_id,
+                expected_commit=base_commit,
+                current_revision_id=current.revision_id,
+            ):
                 raise ConflictError(f"current_commit moved: expected {base_commit}, actual {current.revision_id}")
             _, body = _parse_markdown(current.text)
             occurrences = body.count(old_string)
@@ -867,7 +1211,7 @@ class NativeDocumentService(DocumentService):
                 resource_id=row["resource_id"],
                 revision_id=row["revision_id"],
             )
-            frontmatter, body = _parse_markdown(snapshot.text)
+            frontmatter, body = await self._document_frontmatter(vault_id, snapshot)
             status = frontmatter.get("status") or "draft"
             if not include_archived and status == "archived":
                 continue
@@ -983,20 +1327,60 @@ class NativeDocumentService(DocumentService):
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
+        archive_scope: ArchiveScope | None = None,
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
+        from app.services.search_filters import resolve_archive_scope, status_matches
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         prefix = normalize_collection_path(collection) if collection is not None else ""
-        vault_id = await self._vault_id(vault)
+        pool = await self._pool()
+        vault_row = await VaultRepository(pool).get_by_name(vault)
+        if vault_row is None:
+            raise NotFoundError("Vault", vault)
+        vault_id = vault_row["id"]
+        collection_repo = CollectionRepository(pool)
+        if prefix:
+            collection_row = await collection_repo.get_by_path(vault_id, prefix)
+            context = BrowseContext(
+                type="collection",
+                uri=coll_uri(vault, prefix),
+                name=(collection_row or {}).get("name") or prefix.rsplit("/", 1)[-1],
+                path=prefix,
+                summary=(collection_row or {}).get("summary"),
+            )
+        else:
+            context = BrowseContext(
+                type="vault",
+                uri=vault_uri(vault),
+                name=vault,
+                path="",
+                description=vault_row.get("description"),
+            )
         show_docs = content_type in ("all", "documents")
-        show_tables = content_type in ("all", "tables")
-        show_files = content_type in ("all", "files")
+        show_tables = scope != "archived" and content_type in ("all", "tables")
+        show_files = scope != "archived" and content_type in ("all", "files")
 
         items: list[BrowseItem] = []
         if show_docs:
-            pool = await self._pool()
-            for row in await CollectionRepository(pool).list_by_vault(vault_id):
+            # akb#525: `collections.doc_count` / `.last_updated` are
+            # denormalised counters bumped by the LEGACY write path only
+            # (`DocumentRepository.increment_count`). Reading them here put a
+            # frozen count beside the very documents it was contradicting —
+            # both in one browse payload. Recount from the authority that
+            # actually holds the documents; a collection missing from the map
+            # holds none directly, which is a true zero, so it must not fall
+            # back to the stored column.
+            native_totals = await document_counters.collection_document_totals(
+                pool, vault_id, prefix=prefix,
+            )
+            for row in await collection_repo.list_by_vault(vault_id):
                 if prefix and not row["path"].startswith(prefix + "/"):
                     continue
+                doc_count, last_updated = row["doc_count"], row["last_updated"]
+                if native_totals is not None:
+                    doc_count, last_updated = native_totals.get(row["path"], (0, None))
                 items.append(
                     BrowseItem(
                         name=row["name"],
@@ -1004,8 +1388,8 @@ class NativeDocumentService(DocumentService):
                         type="collection",
                         uri=coll_uri(vault, row["path"]),
                         summary=row["summary"],
-                        doc_count=row["doc_count"],
-                        last_updated=row["last_updated"],
+                        doc_count=doc_count,
+                        last_updated=last_updated,
                     )
                 )
             items.extend(
@@ -1036,8 +1420,16 @@ class NativeDocumentService(DocumentService):
             )
 
         browse_path = prefix
+        items = [item for item in items if item.type != "document" or status_matches(item.status, scope)]
         hint = self._browse_hint(vault, prefix or None, items)
-        return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
+        return BrowseResponse(
+            vault=vault,
+            archive_scope=scope,
+            path=browse_path,
+            context=context,
+            items=items,
+            hint=hint,
+        )
 
     async def create_vault(
         self,
@@ -1067,7 +1459,7 @@ class NativeDocumentService(DocumentService):
         pool = await self._pool()
         vault_repo = VaultRepository(pool)
         if await vault_repo.get_by_name(name):
-            raise ConflictError(f"Vault already exists: {name}")
+            raise VaultNameUnavailableError()
         uid = uuid.UUID(owner_id) if owner_id else None
         vault_id: uuid.UUID | None = None
         # These strict same-connection hooks observe the uncommitted catalog
@@ -1097,7 +1489,7 @@ class NativeDocumentService(DocumentService):
                     )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
-                raise ConflictError(f"Vault already exists: {name}") from exc
+                raise VaultNameUnavailableError() from exc
             raise
         assert vault_id is not None
         # POST-COMMIT (the transaction above has exited). Drops any negative

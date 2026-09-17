@@ -45,6 +45,27 @@ with its token still authorizing and its old binding still beside the new one,
 and someone who signs in twice before anyone approves them produces one record
 rather than two.
 
+A third phase covers installations that must keep a small exception population
+when the runtime changes from canonical `local` mode to canonical `sso` mode.
+It creates a credentialed user in the broker's own realm (no upstream
+federation), starts with a real AKB-local account holding a PAT, an owned Vault,
+and a writer grant, proves that account can log in while the canonical mode is
+temporarily `local`, then returns to canonical `sso` and performs Authorization
+Code + PKCE against that local realm. The first login is refused by
+`invite_only` and recorded under the
+broker's exact issuer/subject. Explicit approval with `existing_user_id` binds
+that subject to the existing AKB UUID; the second login reaches the same account
+and the PAT, Vault ownership, and ACL still authorize. The brokered-provider
+claim must be absent from both real tokens, which is how AKB distinguishes this
+route from an upstream login.
+
+This exception does not restore hybrid auth. AKB still runs only in `sso` mode,
+so the old AKB password route is disabled after the binding; the unchanged hash
+is useful only for an explicit, controlled rollback to a local deployment. Use
+realm-local accounts for recovery administrators and people who genuinely
+cannot use the upstream IdP, not as a duplicate directory for every migrated or
+inactive account.
+
 Together the two are each other's control: same fixture, same run, same
 credential, one page and a token when nothing was seeded and two pages and no
 token when something was.

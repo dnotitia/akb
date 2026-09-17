@@ -31,6 +31,7 @@ class ActivityEntry(ActivityResponse):
 
 class RecentDocumentChange(ActivityResponse):
     doc_id: str
+    resource_id: str | None = None
     vault: str
     path: str
     title: str
@@ -57,6 +58,8 @@ class AkbActivityEnvelope(ActivityResponse):
 class AkbRecentChangesEnvelope(ActivityResponse):
     kind: Literal["recent_changes"]
     changes: list[RecentDocumentChange]
+    scope: Literal["all", "watching"] = "all"
+    next_cursor: str | None = None
 
 
 class AkbDocumentHistoryEnvelope(ActivityResponse):

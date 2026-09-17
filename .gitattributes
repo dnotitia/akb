@@ -1,0 +1,3 @@
+# Keep TypeScript sources reviewable as text and normalize cross-platform EOLs.
+*.ts text diff eol=lf
+*.tsx text diff eol=lf

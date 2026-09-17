@@ -66,6 +66,7 @@ async def test_execute_forwards_params_to_select_fetch() -> None:
 
     result = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="SELECT $1::int AS value",
         params=[7],
         is_admin=True,
@@ -90,6 +91,7 @@ async def test_execute_forwards_params_to_non_select_execute() -> None:
 
     result = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="UPDATE vt_demo__events SET actor = $1",
         params=["alice"],
         is_admin=True,
@@ -113,6 +115,7 @@ async def test_execute_fetch_true_returns_dml_returning_rows() -> None:
 
     result = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="INSERT INTO vt_demo__events (actor) VALUES ($1) RETURNING actor",
         params=["alice"],
         fetch=True,
@@ -145,12 +148,14 @@ async def test_execute_parses_insert_and_delete_command_tags() -> None:
 
     insert = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="INSERT INTO vt_demo__events (actor) VALUES ($1), ($2), ($3)",
         params=["a", "b", "c"],
         is_admin=True,
     )
     delete = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="DELETE FROM vt_demo__events",
         is_admin=True,
     )
@@ -168,6 +173,7 @@ async def test_execute_treats_empty_params_as_no_bindings() -> None:
 
     result = await executor.execute(
         user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester",
         sql="SELECT 1 AS value",
         params=[],
         is_admin=True,

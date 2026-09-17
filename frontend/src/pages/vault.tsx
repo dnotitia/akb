@@ -37,11 +37,10 @@ import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
 import { EmptyState } from "@/components/empty-state";
 import {
-  IndexingBadge,
   RoleBadge,
   VaultStateBadge,
 } from "@/components/status-badge";
-import { useVaultHealth } from "@/hooks/use-vault-health";
+import { VaultIndexingStatus } from "@/components/pending-indexing-badge";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { cn } from "@/lib/utils";
@@ -181,17 +180,6 @@ export default function VaultPage() {
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [activityLoading, setActivityLoading] = useState(true);
   const [activityError, setActivityError] = useState(false);
-
-  const vaultHealth = useVaultHealth(name);
-  // Same shape as the global header: `pending` from the backend includes
-  // retry-exhausted (abandoned) chunks, so subtract them to get the
-  // "actively indexing" count and surface abandoned separately.
-  const vUpsert = vaultHealth?.vector_store?.backfill?.upsert;
-  const vaultAbandoned: number = vUpsert?.abandoned || 0;
-  const vaultPending: number | null = vaultHealth
-    ? Math.max(0, (vUpsert?.pending || 0) - vaultAbandoned) +
-      (vaultHealth.metadata_backfill?.pending || 0)
-    : null;
 
   const skillQuery = useQuery({
     queryKey: ["document", name, VAULT_SKILL_PATH],
@@ -402,10 +390,7 @@ export default function VaultPage() {
               externalGit={info?.is_external_git}
               publicAccess={info?.public_access}
             />
-            <IndexingBadge
-              pending={vaultPending}
-              abandoned={vaultAbandoned}
-            />
+            <VaultIndexingStatus vaultName={name!} />
           </>
         }
         actions={

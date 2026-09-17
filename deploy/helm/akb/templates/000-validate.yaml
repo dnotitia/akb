@@ -1,0 +1,31 @@
+{{- $profiles := list "standalone" "standalone-sso" -}}
+{{- if not (has .Values.profile $profiles) -}}
+{{- fail "profile must be standalone or standalone-sso" -}}
+{{- end -}}
+{{- range $removedKey := list "secretManager" "secretSync" "openbao" "hashicorpVault" -}}
+  {{- if hasKey $.Values $removedKey -}}
+  {{- fail (printf "%s is no longer supported; provision Kubernetes Secrets outside the AKB chart" $removedKey) -}}
+  {{- end -}}
+{{- end -}}
+{{- $profileWantsSso := eq .Values.profile "standalone-sso" -}}
+{{- if ne $profileWantsSso .Values.sso.enabled -}}
+{{- fail "sso.enabled conflicts with the selected profile" -}}
+{{- end -}}
+{{- if and .Values.sso.enabled (or (not .Values.sso.keycloakPublicUrl) (not .Values.sso.productAdmin.username) (not .Values.sso.productAdmin.email)) -}}
+{{- fail "SSO profiles require keycloakPublicUrl and product-admin identity" -}}
+{{- end -}}
+{{- $secretNames := list .Values.secretContract.name "redis-credentials" -}}
+{{- if .Values.sso.enabled -}}
+  {{- $secretNames = concat $secretNames (list "akb-keycloak-db-credentials" "akb-keycloak-bootstrap" "akb-product-admin-bootstrap") -}} # pragma: allowlist secret
+{{- end -}}
+{{- range $secretName := $secretNames -}}
+  {{- $secret := lookup "v1" "Secret" $.Release.Namespace $secretName -}}
+  {{- if $secret -}}
+    {{- range $owner := (default (list) $secret.metadata.ownerReferences) -}}
+      {{- if and (eq $owner.kind "VaultStaticSecret") (hasPrefix "secrets.hashicorp.com/" $owner.apiVersion) -}}
+      {{- fail (printf "Secret/%s is still owned by VaultStaticSecret; orphan it before upgrading so Kubernetes garbage collection cannot delete AKB credentials" $secretName) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+# Validation-only template. It deliberately emits no Kubernetes object.

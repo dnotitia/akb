@@ -68,6 +68,7 @@ const provider = {
   client_id: "akb-broker",
   client_secret_configured: true,
   redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint",
+  post_logout_redirect_uri: "https://auth.akb.example.com/realms/akb/broker/workforce/endpoint/logout_response",
   capabilities: {
     supports_logout: true,
     supports_identity_migration: true,
@@ -78,17 +79,17 @@ const directCatalog = {
   schema_version: 1 as const,
   auth_mode: "sso" as const,
   control_mode: "direct" as const,
-  supported_provider_types: ["keycloak-oidc"],
+  supported_provider_types: ["keycloak-oidc", "oidc"],
   providers: [provider],
 };
 
-function renderPage() {
+function renderPage(initialEntry = "/admin") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/admin"]}>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <AdminPage />
       </MemoryRouter>
     </QueryClientProvider>,
@@ -128,6 +129,25 @@ describe("AdminPage mode boundary", () => {
     expect(await screen.findByRole("button", { name: /keycloak/i })).toBeInTheDocument();
     expect(screen.queryByLabelText("Username")).toBeNull();
     expect(screen.queryByRole("button", { name: /local/i })).toBeNull();
+  });
+
+  it("turns a failed callback into a clear retry path", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    renderPage("/admin?auth_error=sign_in_failed");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The product-admin sign-in expired or could not be completed. Start a new sign-in.",
+    );
+    expect(screen.getByRole("button", { name: /keycloak/i })).toBeInTheDocument();
+  });
+
+  it("does not echo an arbitrary callback error into the page", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    renderPage("/admin?auth_error=%3Cscript%3Ealert(1)%3C%2Fscript%3E");
+
+    expect(await screen.findByRole("button", { name: /keycloak/i })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/script/i)).toBeNull();
   });
 
   it("submits local credentials from the user action and stores the RS256 session", async () => {
@@ -239,6 +259,8 @@ describe("AdminPage mode boundary", () => {
     await user.clear(await screen.findByLabelText("Alias"));
     await user.type(screen.getByLabelText("Alias"), "partners");
     await user.type(screen.getByLabelText("Button label"), "Partner SSO");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /keycloak-oidc/ }));
     await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/realms/partners/");
     await user.type(screen.getByLabelText("Client ID"), "akb-partners");
     await user.type(screen.getByLabelText("Client secret"), "one-time-input");
@@ -252,6 +274,117 @@ describe("AdminPage mode boundary", () => {
         discovery_url: "https://id.example.com/realms/partners/.well-known/openid-configuration",
         client_id: "akb-partners",
         client_secret: "one-time-input", // pragma: allowlist secret
+      });
+    });
+  });
+
+  it("refuses to save when no supported provider type is chosen", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "unsupported-kind");
+    await user.type(screen.getByLabelText("Button label"), "Unsupported Kind");
+    await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/realms/unsupported");
+    await user.type(screen.getByLabelText("Client ID"), "akb-unsupported");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Choose a provider type this installation supports/,
+    );
+    expect(configureAdminSsoProvider).not.toHaveBeenCalled();
+  });
+
+  it("sends an explicit discovery URL when the upstream document lives elsewhere", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "custom-discovery");
+    await user.type(screen.getByLabelText("Button label"), "Custom Discovery");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /^oidc/ }));
+    await user.type(screen.getByLabelText("Upstream issuer"), "https://id.example.com/tenant");
+    await user.click(screen.getByText("Advanced: discovery URL"));
+    await user.type(
+      screen.getByLabelText("Discovery URL"),
+      "https://discovery.example.com/tenant/.well-known/openid-configuration",
+    );
+    await user.type(screen.getByLabelText("Client ID"), "akb-custom");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    await waitFor(() => {
+      expect(configureAdminSsoProvider).toHaveBeenCalledWith("custom-discovery", {
+        provider_type: "oidc",
+        display_name: "Custom Discovery",
+        issuer: "https://id.example.com/tenant",
+        discovery_url: "https://discovery.example.com/tenant/.well-known/openid-configuration",
+        client_id: "akb-custom",
+      });
+    });
+  });
+
+  it("configures Microsoft Entra through the generic OIDC provider", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(ssoConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "sso",
+      user: {
+        id: "11111111-1111-1111-1111-111111111111",
+        username: "admin",
+        email: "admin@example.com",
+        display_name: "Admin",
+        is_admin: true,
+      },
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(await screen.findByLabelText("Alias"), "entra-dn");
+    await user.type(screen.getByLabelText("Button label"), "Microsoft Teams");
+    await user.click(screen.getByLabelText("Provider type"));
+    await user.click(await screen.findByRole("menuitemradio", { name: /^oidc/ }));
+    await user.type(
+      screen.getByLabelText("Upstream issuer"),
+      "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/v2.0",
+    );
+    await user.type(screen.getByLabelText("Client ID"), "6fd50bdd-9701-4244-a489-0059e8baba49");
+    await user.type(screen.getByLabelText("Client secret"), "one-time-entra-input");
+    await user.click(screen.getByRole("button", { name: /Save disabled configuration/i }));
+
+    await waitFor(() => {
+      expect(configureAdminSsoProvider).toHaveBeenCalledWith("entra-dn", {
+        provider_type: "oidc",
+        display_name: "Microsoft Teams",
+        issuer: "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/v2.0",
+        discovery_url: (
+          "https://login.microsoftonline.com/ade9ac17-851e-48d0-ba36-ed99a8d8c07e/"
+          + "v2.0/.well-known/openid-configuration"
+        ),
+        client_id: "6fd50bdd-9701-4244-a489-0059e8baba49",
+        client_secret: "one-time-entra-input", // pragma: allowlist secret
       });
     });
   });

@@ -1,0 +1,3 @@
+profile: standalone
+sso:
+  enabled: false

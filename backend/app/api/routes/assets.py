@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import uuid
 
@@ -83,6 +84,106 @@ async def upload_document_image(
             _asset_body_slots.release()
 
 
+@router.get("/assets/{vault}/policy", summary="Get document attachment retention policy")
+async def document_attachment_policy(
+    vault: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Expose the active server retention boundary to draft adapters.
+
+    The values are policy metadata, not an authorization capability. Upload
+    responses also carry the individual unclaimed expiry so a recovered draft
+    can use the earliest real resource expiry rather than a client constant.
+    """
+    await check_vault_access(user.user_id, vault, required_role="reader")
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "kind": "attachment_policy",
+        "vault": vault,
+        "server_time": now,
+        "unclaimed_ttl_hours": settings.document_asset_unclaimed_ttl_hours,
+        "revision_retention_days": settings.document_asset_revision_retention_days,
+    }
+
+
+@router.post(
+    "/assets/{vault}/from-file/{file_id}",
+    status_code=201,
+    summary="Copy a standalone image File into a document attachment",
+)
+async def copy_file_attachment(
+    request: Request,
+    vault: str,
+    file_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    access, actor_id, _delegated_actor = await resolve_file_write_context(
+        request, vault, user,
+    )
+    return await asset_service.copy_file_to_attachment(
+        vault_id=access["vault_id"],
+        vault_name=vault,
+        file_id=file_id,
+        actor_id=actor_id,
+    )
+
+
+@router.get(
+    "/assets/{vault}/{file_id}/metadata",
+    summary="Read authorized document attachment metadata",
+)
+async def document_attachment_metadata(
+    request: Request,
+    vault: str,
+    file_id: str,
+    document: str | None = Query(None, min_length=1, max_length=1024),
+    commit: str | None = Query(None, min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$"),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Return lifecycle metadata without probing an unscoped asset id.
+
+    The query uses the same reachability predicate as byte delivery. Missing,
+    cross-vault, and unauthorized ids share one 404 so the adapter cannot use
+    metadata as an existence oracle.
+    """
+    try:
+        access = await check_vault_access(user.user_id, vault, required_role="reader")
+        actor_id = user.username
+    except (ForbiddenError, NotFoundError) as exc:
+        raise NotFoundError("Asset", file_id) from exc
+    try:
+        fid = uuid.UUID(file_id)
+    except (ValueError, AttributeError) as exc:
+        raise NotFoundError("Asset", file_id) from exc
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await vault_files_repo.find_authorized_attachment(
+            conn,
+            vault_id=access["vault_id"],
+            file_id=fid,
+            created_by=actor_id,
+            document_path=document,
+            commit_prefix=commit,
+        )
+    if row is None:
+        raise NotFoundError("Asset", file_id)
+
+    target = f"{asset_service.ASSET_URL_PREFIX}{fid}"
+    expiry = None
+    if row.get("attachment_claimed_at") is None and row.get("created_at") is not None:
+        expiry = (
+            row["created_at"]
+            + timedelta(hours=settings.document_asset_unclaimed_ttl_hours)
+        ).isoformat()
+    return {
+        "kind": "attachment",
+        "target": target,
+        "status": "claimed" if row.get("attachment_claimed_at") is not None else "unclaimed",
+        "unclaimed_expires_at": expiry,
+    }
+
+
 async def load_asset_row(file_id: str, vault_id: uuid.UUID) -> dict:
     try:
         fid = uuid.UUID(file_id)
@@ -96,10 +197,61 @@ async def load_asset_row(file_id: str, vault_id: uuid.UUID) -> dict:
     return row
 
 
-async def image_asset_response(row: dict, *, public: bool = False) -> Response:
+def _asset_cache_headers(row: dict, *, public: bool) -> dict[str, str]:
+    """Let the browser keep the bytes, but never the decision.
+
+    `no-cache` is not "do not cache" — it is "cache, and revalidate every
+    time". Every request still reaches this service and still passes the same
+    authorization it does today; what changes is that a revalidation answers
+    304 instead of re-sending the object. An asset's id names one immutable
+    upload, so its digest is a complete validator.
+
+    A longer `max-age` would drop the request too, but it would also let a
+    viewer keep reading an image after their access was revoked. Bytes are
+    the scaling problem here, not requests, so this buys the part that
+    matters and leaves permissions exact."""
+    headers = {
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-cache" if public else "private, no-cache",
+    }
+    if not public:
+        headers["Vary"] = "Authorization"
+    digest = row.get("content_hash")
+    if digest:
+        headers["ETag"] = f'"{digest}"'
+    return headers
+
+
+def _etag_matches(if_none_match: str | None, etag: str | None) -> bool:
+    """Compare per RFC 9110: a list, possibly weak, possibly `*`."""
+    if not if_none_match or not etag:
+        return False
+    candidates = [c.strip() for c in if_none_match.split(",")]
+    if "*" in candidates:
+        return True
+    # A weak validator compares equal to its strong form for If-None-Match,
+    # which is the only comparison this route needs.
+    def _normalize(value: str) -> str:
+        return value[2:] if value.startswith("W/") else value
+    return any(_normalize(c) == _normalize(etag) for c in candidates)
+
+
+async def image_asset_response(
+    row: dict, *, public: bool = False, request: Request | None = None,
+) -> Response:
     size = row.get("size_bytes")
     if size is None or size < 1 or size > asset_service.IMAGE_ASSET_MAX_BYTES:
         raise NotFoundError("Asset", str(row.get("id", "")))
+
+    headers = _asset_cache_headers(row, public=public)
+    # Answered before the object store is touched at all: a revalidation that
+    # is going to end in 304 has no reason to cost a HEAD.
+    if request is not None and _etag_matches(
+        request.headers.get("if-none-match"), headers.get("ETag"),
+    ):
+        return Response(status_code=304, headers=headers)
+
     try:
         # Fail before committing a 200 response when the immutable object is
         # missing or disagrees with its verified metadata. The body itself is
@@ -113,13 +265,6 @@ async def image_asset_response(row: dict, *, public: bool = False) -> Response:
         logger.warning("asset storage read failed for %s: %s", row.get("id"), exc)
         raise AKBError("Image content is temporarily unavailable", status_code=502) from exc
 
-    headers = {
-        "Content-Disposition": "inline",
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "no-store" if public else "private, no-store",
-    }
-    if not public:
-        headers["Vary"] = "Authorization"
     return StreamingResponse(
         file_service.iter_object_chunks(
             row["s3_key"], max_bytes=asset_service.IMAGE_ASSET_MAX_BYTES,
@@ -190,7 +335,7 @@ async def read_document_image(
             )
     if row is None:
         raise NotFoundError("Asset", file_id)
-    return await image_asset_response(row)
+    return await image_asset_response(row, request=request)
 
 
 @router.delete(

@@ -23,12 +23,16 @@ export function TitleBar({
   left,
   className,
   showBack = true,
+  breadcrumbClassName,
+  breadcrumb,
 }: {
   crumbs: Crumb[];
   right?: ReactNode;
   left?: ReactNode;
   className?: string;
   showBack?: boolean;
+  breadcrumbClassName?: string;
+  breadcrumb?: ReactNode;
 }) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -70,8 +74,8 @@ export function TitleBar({
           <ArrowLeft className="h-3 w-3" aria-hidden />
         </button>
       )}
-      {crumbs.length > 0 && (
-        <nav aria-label="Breadcrumb" className="shrink-0">
+      {breadcrumb ?? (crumbs.length > 0 && (
+        <nav aria-label="Breadcrumb" className={cn("shrink-0", breadcrumbClassName)}>
           <ol className="flex items-center gap-2">
             {crumbs.map((c, i) => {
               const isLast = i === crumbs.length - 1;
@@ -106,7 +110,7 @@ export function TitleBar({
             })}
           </ol>
         </nav>
-      )}
+      ))}
       {right && <div className="ml-auto flex shrink-0 items-center gap-1">{right}</div>}
     </div>
   );
@@ -122,7 +126,23 @@ export type VaultPageKind =
   | "publish"
   | "members"
   | "settings"
-  | "activity";
+  | "activity"
+  | "resource";
+
+// Canonical Vault destinations shared by working pages and full resource readers.
+// The current resource is identified by its breadcrumb/tree, not a false active tab.
+// eslint-disable-next-line react-refresh/only-export-components
+export function getVaultPageActions(vault: string) {
+  const base = `/vault/${encodeURIComponent(vault)}`;
+  return [
+    { key: "overview", label: "Overview", href: base, icon: Compass },
+    { key: "search", label: "Search", href: `${base}/search`, icon: SearchIcon },
+    { key: "graph", label: "Graph", href: `${base}/graph`, icon: GitGraph },
+    { key: "publish", label: "Publish", href: `${base}/publications`, icon: Share2 },
+    { key: "members", label: "Members", href: `${base}/members`, icon: Users },
+    { key: "settings", label: "Settings", href: `${base}/settings`, icon: SettingsIcon },
+  ] satisfies { key: VaultPageKind; label: string; href: string; icon: LucideIcon }[];
+}
 
 interface VaultActionsProps {
   vault: string;
@@ -130,20 +150,9 @@ interface VaultActionsProps {
 }
 
 export function VaultActions({ vault, page }: VaultActionsProps) {
-  type VaultAction = [VaultPageKind, string, string, LucideIcon];
+  const actions = getVaultPageActions(vault);
 
-  const actions: VaultAction[] = [
-    ["overview", "Overview", `/vault/${vault}`, Compass],
-    ["search", "Search", `/vault/${vault}/search`, SearchIcon],
-    ["graph", "Graph", `/vault/${vault}/graph`, GitGraph],
-    ["publish", "Publish", `/vault/${vault}/publications`, Share2],
-  ];
-  const governanceActions: VaultAction[] = [
-    ["members", "Members", `/vault/${vault}/members`, Users],
-    ["settings", "Settings", `/vault/${vault}/settings`, SettingsIcon],
-  ];
-
-  const renderAction = ([k, label, href, Icon]: (typeof actions)[number]) => {
+  const renderAction = ({ key: k, label, href, icon: Icon }: (typeof actions)[number]) => {
     const active = k === page;
     return (
       <Link
@@ -166,9 +175,9 @@ export function VaultActions({ vault, page }: VaultActionsProps) {
 
   return (
     <nav aria-label="Vault sections" className="flex items-center gap-0.5">
-      {actions.map(renderAction)}
+      {actions.slice(0, 4).map(renderAction)}
       <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
-      {governanceActions.map(renderAction)}
+      {actions.slice(4).map(renderAction)}
     </nav>
   );
 }

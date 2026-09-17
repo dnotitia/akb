@@ -1,9 +1,17 @@
-# Standalone SSO Kubernetes bundle
+# Standalone SSO Kubernetes deployment
 
-This overlay adds a Keycloak 26.7 broker and a dedicated Keycloak PostgreSQL
-database to the standalone AKB stack. It owns exactly one AKB realm and is not
+This Kustomization combines AKB with a Keycloak 26.7 broker, a dedicated
+Keycloak PostgreSQL database, SSO ingress, and AKB auth patches. It references
+the shared AKB manifests from the parent directory without copying them. It
+owns exactly one AKB realm and is not
 the deployment shape for a managed tenant that reuses a platform-owned
 Keycloak.
+
+For a customized existing namespace, first follow the
+[local-to-SSO cutover runbook](../../../docs/sso/kubernetes-cutover.md). This
+directory is a reference resource set, not an in-place migration patch: review
+resource names, selectors, StatefulSets, PVCs, Ingress, and retained companion
+workloads before applying a target-specific overlay.
 
 The bundle implements the product-administrator bootstrap and recovery slice:
 
@@ -27,10 +35,15 @@ encrypts the Keycloak refresh/ID token set and never persists an access token.
 The bootstrap maps the `identity_provider` user-session note into both ordinary
 token profiles so AKB can bind each callback and refresh to the exact enabled
 broker alias rather than trusting `kc_idp_hint`.
-It becomes ready only after the browser-session encryption key is supplied and
-an upstream provider is enabled. `/admin` uses the dedicated confidential
-client and requires a fresh native Keycloak password ceremony; a brokered
-upstream identity is not accepted as the recovery administrator.
+That custody becomes ready once its own configuration is complete — the
+browser-session encryption key is the last piece an operator supplies — and
+readiness is a property of that profile alone, never of the provider list.
+Readiness is not a way in, though: a person still needs somewhere to sign in,
+which is either an enabled upstream provider or this installation's own realm
+(see [Sign in without an upstream provider](#sign-in-without-an-upstream-provider)).
+`/admin` uses the dedicated confidential client and requires a fresh native
+Keycloak password ceremony; a brokered upstream identity is not accepted as the
+recovery administrator.
 
 The browser-facing AKB origin and Keycloak-to-AKB back-channel are separate
 deployment concerns. `keycloak_backchannel_logout_uri` is registered on the
@@ -43,25 +56,27 @@ intentionally unable to mutate clients.
 
 ## Required operator inputs
 
-Patch these public values in an operator overlay before applying:
+When using `deploy/k8s/deploy.sh` with `AKB_PROFILE=standalone-sso`, provide
+these public values as environment variables. The deployer validates them and
+replaces the public placeholders in one render before anything is applied:
 
-- `akb.example.com` in the AKB Ingress and `akb-app-config`
-- `auth.akb.example.com` in the Keycloak Ingress, `KC_HOSTNAME`, and
-  `akb-app-config`
-- `product-admin-username` and `product-admin-email` in
-  `akb-sso-bootstrap-config`
+- `SSO_AKB_PUBLIC_URL` (for example `https://akb.example.com`)
+- `SSO_KEYCLOAK_PUBLIC_URL` (for example `https://auth.akb.example.com`)
+- `SSO_PRODUCT_ADMIN_USERNAME` and `SSO_PRODUCT_ADMIN_EMAIL`
 - the immutable `akb-backend` and `akb-frontend` image references
 - TLS issuer/secret names and storage classes as needed
 
-The following Secrets are deliberately absent from Kustomize output. Create
-them with a secret manager, Sealed Secrets, or `kubectl create secret`; never
-commit their values.
+An operator-specific Kustomize overlay may still patch those fields directly,
+but it must be passed with `KUSTOMIZE_DIR` and use the same coherent origins.
+
+The following Secrets are deliberately absent from Kustomize output. Provision
+them through the cluster's operator-owned credential process; never commit
+their values.
 
 | Secret | Required keys | Lifecycle |
 |---|---|---|
-| `akb-postgres-credentials` | `POSTGRES_DB=akb`, `POSTGRES_USER=akbuser`, `POSTGRES_PASSWORD` | durable |
 | `akb-keycloak-db-credentials` | `POSTGRES_DB=keycloak`, `POSTGRES_USER=keycloak`, `POSTGRES_PASSWORD` | durable |
-| `akb-secret-config` | `secret.yaml` | durable |
+| `akb-secret` | `db_password`, `secret.yaml`, SSO runtime and stable platform projection keys | durable |
 | `akb-keycloak-bootstrap` | `client-secret` | one-time |
 | `akb-keycloak-upgrade` | `client-secret` | optional; one-time legacy-profile upgrade only |
 | `akb-product-admin-bootstrap` | `password` | one-time |
@@ -71,7 +86,7 @@ independent browser-session encryption key, and three independently generated
 confidential-client secrets:
 
 ```yaml
-db_password: <same value as akb-postgres-credentials>
+db_password: <AKB PostgreSQL password; also projected as akb-secret/db_password>
 system_hmac_secret: <independent random value>
 sso_session_epoch: <installation-owned UUID>
 sso_browser_session_encryption_key: <independent 32-byte base64url value>
@@ -86,6 +101,26 @@ temporary, must be at least 12 characters, must differ from its username and
 email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
 is not the product-admin password.
+
+After provisioning the namespace-local Secrets, the convenience deployer can
+apply the stack:
+
+```bash
+NAMESPACE=akb-sso-example \
+AKB_PROFILE=standalone-sso \
+SSO_AKB_PUBLIC_URL=https://akb.example.com \
+SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
+SSO_PRODUCT_ADMIN_USERNAME=admin \
+SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
+REGISTRY=registry.example.com \
+bash deploy/k8s/deploy.sh
+```
+
+The deployer checks that the required Secret objects exist and are not still
+owned by a legacy projection resource. Secret values remain operator-owned and
+are never generated or rewritten. It then applies AKB, the dedicated Keycloak
+database, Keycloak, and both ingresses and waits for the workloads. Authentication
+cutover remains an explicit migration.
 
 `sso_session_epoch` is not a credential. Generate it once with
 `python -c 'import uuid; print(uuid.uuid4())'` and keep it stable across normal
@@ -138,6 +173,7 @@ realm signing key.
 Render and validate the public overlay before applying:
 
 ```bash
+kubectl create namespace akb --dry-run=client -o yaml | kubectl apply -f -
 kubectl kustomize --load-restrictor=LoadRestrictionsNone \
   deploy/k8s/standalone-sso > rendered-standalone-sso.yaml
 kubectl apply --dry-run=client --validate=false \
@@ -148,6 +184,40 @@ Apply only after all durable and first-install one-time Secrets exist. Wait for 
 pod's `bootstrap-standalone-sso` init container and main container to complete,
 then inspect the init log. Its JSON report contains only IDs, key metadata, and
 the exact role names; it never contains credential values.
+
+## Sign in without an upstream provider
+
+A bundled-Keycloak install has a realm of its own, and an installation that has
+no external identity provider to broker to can use it as the place people
+authenticate:
+
+```yaml
+sso_local_realm_login_enabled: true
+sso_local_realm_display_name: "This workspace"
+```
+
+`/api/v1/auth/config` then offers one provider of type `local-realm` under the
+reserved alias `local`, whose `login_url` is `/api/v1/auth/sso/local/login`; that
+route redirects to this realm's own authorize endpoint with no broker hint
+attached. Off by default, so an installation that
+registers no provider keeps the behaviour it has rather than silently gaining a
+login.
+
+The two kinds are not interchangeable and neither accepts the other's shape. A
+brokered sign-in carries the `identity_provider` claim and it must be present
+and equal to the selected alias; a direct realm sign-in cannot carry it, because
+nothing brokered it, and it must be absent. The claim never becomes optional:
+that would let a token minted through one provider be presented for another.
+
+Registering this realm as its own upstream provider is a different thing and
+stays refused (`provider_issuer_is_broker`) -- it would be an authorize loop,
+not a login.
+
+This realm already holds a realm-local native identity: the product
+administrator is one. So enabling this does not introduce a plane that was
+absent; it decides that ordinary people also hold an account here rather than at
+an upstream. Whoever arrives this way is a pending admission and still needs an
+administrator's approval, exactly like anyone arriving through a broker.
 
 ## Upgrade an existing receipt
 

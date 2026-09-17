@@ -17,12 +17,13 @@ from PIL import Image, ImageSequence, UnidentifiedImageError
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ValidationError
+from app.exceptions import AKBError, NotFoundError, ValidationError
 from app.repositories import vault_files_repo
 from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.m1_file_measurement import measurement_enabled
 from app.services.s3_delete_worker import enqueue_delete
+from app.services.uri_service import file_uri
 
 
 ASSET_URL_PREFIX = "/api/assets/"
@@ -341,6 +342,7 @@ async def create_image_asset(
 
     await asyncio.to_thread(s3_adapter.ensure_bucket, settings.s3_bucket)
     pool = await get_pool()
+    pending_created_at: datetime | None = None
     async with pool.acquire() as conn:
         async with conn.transaction():
             # Revalidate the vault under the same lock used by the transfer
@@ -352,7 +354,7 @@ async def create_image_asset(
                     "Vault was deleted while the image upload was queued",
                     status_code=409,
                 )
-            await vault_files_repo.insert_pending_attachment(
+            pending_created_at = await vault_files_repo.insert_pending_attachment(
                 conn,
                 file_id=file_id,
                 vault_id=vault_id,
@@ -424,12 +426,82 @@ async def create_image_asset(
             )
         raise
 
+    target = f"{ASSET_URL_PREFIX}{file_id}"
+    expires_from = pending_created_at or datetime.now(timezone.utc)
+    unclaimed_expires_at = expires_from + timedelta(
+        hours=settings.document_asset_unclaimed_ttl_hours,
+    )
     return {
+        "kind": "attachment",
         "id": str(file_id),
-        "url": f"{ASSET_URL_PREFIX}{file_id}",
+        # `target` is the only durable Markdown value. `url` remains the
+        # transport field used by the existing editor upload surface and is
+        # intentionally the same stable, non-runtime target.
+        "target": target,
+        "url": target,
         "name": safe_name,
         "mime_type": actual_mime,
         "size_bytes": len(body),
         "width": width,
         "height": height,
+        "unclaimed_expires_at": unclaimed_expires_at.isoformat(),
     }
+
+
+async def copy_file_to_attachment(
+    *,
+    vault_id: uuid.UUID,
+    vault_name: str,
+    file_id: str,
+    actor_id: str,
+) -> dict:
+    """Copy one confirmed standalone File into a new immutable Attachment.
+
+    The source row is read through the standalone-file predicate and its bytes
+    are copied into a fresh attachment id/key. The original file is never
+    mutated or used as the attachment's object key, so later File replacement
+    or deletion cannot change an already-authored image.
+    """
+    try:
+        source_id = uuid.UUID(file_id)
+    except (ValueError, AttributeError) as exc:
+        raise NotFoundError("File", file_id) from exc
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await vault_files_repo.find_by_id(conn, vault_id, source_id)
+    if (
+        row is None
+        or row.get("kind") != "file"
+        or row.get("upload_state") != "confirmed"
+    ):
+        raise NotFoundError("File", file_id)
+
+    try:
+        metadata = await asyncio.to_thread(s3_adapter.head, row["s3_key"])
+        size = metadata.get("ContentLength")
+        if not isinstance(size, int) or size < 1 or size > IMAGE_ASSET_MAX_BYTES:
+            raise AKBError("Image exceeds the 10 MB limit", status_code=413)
+        body = await asyncio.to_thread(s3_adapter.get_bytes, row["s3_key"])
+    except AKBError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — storage adapters expose varied errors
+        raise AKBError("File content is temporarily unavailable", status_code=502) from exc
+
+    if len(body) != size:
+        raise AKBError("File content is temporarily unavailable", status_code=502)
+    actual_mime, _width, _height = await asyncio.to_thread(inspect_image, body)
+    attachment = await create_image_asset(
+        vault_id=vault_id,
+        vault_name=vault_name,
+        filename=row["name"],
+        declared_mime=actual_mime,
+        body=body,
+        actor_id=actor_id,
+    )
+    attachment["source_file_uri"] = file_uri(
+        vault_name,
+        str(source_id),
+        collection=row.get("collection"),
+    )
+    return attachment

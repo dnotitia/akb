@@ -16,10 +16,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import asyncpg
+
 from app.db.postgres import get_pool
 
 
-async def resolve_display_names(tokens: Iterable[str | None]) -> dict[str, str]:
+async def resolve_display_names(
+    tokens: Iterable[str | None],
+    *,
+    pool: asyncpg.Pool | None = None,
+) -> dict[str, str]:
     """Map each actor token (user UUID or username) to a display name.
 
     Returns a dict keyed by **both** the matched ``id`` and ``username`` so a
@@ -29,8 +35,8 @@ async def resolve_display_names(tokens: Iterable[str | None]) -> dict[str, str]:
     keys = [t for t in set(tokens) if t]
     if not keys:
         return {}
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    selected_pool = pool or await get_pool()
+    async with selected_pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT id::text AS id, username,

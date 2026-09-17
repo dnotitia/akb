@@ -1,3 +1,5 @@
+packages:
+  - packages/markdown-editor
 allowBuilds:
   esbuild: true
   msw: true

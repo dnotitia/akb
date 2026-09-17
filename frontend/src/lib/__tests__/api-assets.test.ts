@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   discardAsset,
   clearPrivateAssetCache,
+  copyFileToAttachment,
   configureAuthTransport,
+  getAttachmentMetadata,
+  getAttachmentRetentionPolicy,
   getAssetBlob,
   getPublication,
   publicationAssetUrl,
@@ -64,6 +67,65 @@ describe("editor image asset API", () => {
       "Content-Type": "image/png",
       Authorization: "Bearer test-token",
     });
+  });
+
+  it("keeps the canonical target and server expiry separate from runtime URLs", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        kind: "attachment",
+        id: ASSET_ID,
+        target: `/api/assets/${ASSET_ID}`,
+        url: `/api/assets/${ASSET_ID}`,
+        unclaimed_expires_at: "2026-09-10T00:00:00.000Z",
+      }),
+    );
+
+    const result = await uploadAsset(
+      "team vault",
+      new File(["image bytes"], "diagram.png", { type: "image/png" }),
+    );
+
+    expect(result.target).toBe(`/api/assets/${ASSET_ID}`);
+    expect(result.unclaimed_expires_at).toBe("2026-09-10T00:00:00.000Z");
+    expect(JSON.stringify(result)).not.toContain("signed");
+  });
+
+  it("reads attachment policy/metadata and exposes the File-copy action", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        kind: "attachment_policy",
+        vault: "team",
+        server_time: "2026-09-09T00:00:00.000Z",
+        unclaimed_ttl_hours: 7,
+        revision_retention_days: 3,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        kind: "attachment",
+        target: `/api/assets/${ASSET_ID}`,
+        status: "unclaimed",
+        unclaimed_expires_at: "2026-09-09T07:00:00.000Z",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        kind: "attachment",
+        id: ASSET_ID,
+        target: `/api/assets/${ASSET_ID}`,
+        url: `/api/assets/${ASSET_ID}`,
+      }));
+
+    await expect(getAttachmentRetentionPolicy("team")).resolves.toMatchObject({
+      unclaimed_ttl_hours: 7,
+    });
+    await expect(getAttachmentMetadata("team", ASSET_ID)).resolves.toMatchObject({
+      status: "unclaimed",
+    });
+    await expect(copyFileToAttachment("team", ASSET_ID)).resolves.toMatchObject({
+      target: `/api/assets/${ASSET_ID}`,
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/v1/assets/team/policy",
+      `/api/v1/assets/team/${ASSET_ID}/metadata`,
+      `/api/v1/assets/team/from-file/${ASSET_ID}`,
+    ]);
   });
 
   it("fetches private image bytes with Bearer auth", async () => {

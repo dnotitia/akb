@@ -13,6 +13,7 @@ Provides MCP tools for:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import sys
@@ -28,7 +29,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+)
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
@@ -41,6 +49,7 @@ from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
     authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
     revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
+    explain_vault_access,
     reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
@@ -66,12 +75,17 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.tools import TOOLS
+from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.vault_contract import project_accessible_vault
 from app.services import audit_log, tool_usage
 
 logger = logging.getLogger("akb.mcp")
+# Separate channel so per-call response sizes can be routed (or muted)
+# without touching the rest of the MCP server's logging.
+RESPONSE_SIZE_LOGGER = "akb.mcp.response"
+logger_response = logging.getLogger(RESPONSE_SIZE_LOGGER)
 
 # A non-mutating write preflight changes the result shape and requires the
 # client to retry the original operation.  Keep it behind MCP's experimental
@@ -79,13 +93,34 @@ logger = logging.getLogger("akb.mcp")
 # post-dispatch ``vault_skill`` field they already tolerate.
 VAULT_SKILL_PREFLIGHT_CAPABILITY = "io.dnotitia.akb/vault-skill-preflight"
 VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack"
+_request_context: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "akb_mcp_request_context", default=None
+)
+
+
+def _current_request_context() -> Any | None:
+    """Return the MCP 2.x context installed by the request adapter."""
+    return _request_context.get()
 
 
 def _vault_skill_preflight_version() -> int | None:
-    """Negotiated retry-contract version for this MCP session, if any."""
+    """Negotiated retry-contract version for this MCP request, if any.
+
+    Handshake transports expose the client capabilities through
+    ``client_params``. The 2026-07-28 per-request envelope exposes the same
+    fact directly as ``client_capabilities`` because clientInfo is optional.
+    The SDK keeps both views on the request session; read the direct view first
+    so modern requests do not accidentally lose the vault-guide contract.
+    """
     try:
-        params = server.request_context.session.client_params
-        experimental = params.capabilities.experimental if params else None
+        context = _current_request_context()
+        if context is None:
+            return None
+        session = context.session
+        capabilities = session.client_capabilities
+        if capabilities is None and session.client_params is not None:
+            capabilities = session.client_params.capabilities
+        experimental = capabilities.experimental if capabilities else None
         advertised = (experimental or {}).get(VAULT_SKILL_PREFLIGHT_CAPABILITY)
         if not isinstance(advertised, dict):
             return None
@@ -126,6 +161,7 @@ class _MCPUser:
         user_id: str = "00000000-0000-0000-0000-000000000000",
         username: str = "system",
         is_admin: bool = False,
+        auth_method: str = "unknown",
         oauth_scopes: list[str] | None = None,
         token_scopes: frozenset[str] | None = None,
         key_class: str | None = None,
@@ -133,6 +169,7 @@ class _MCPUser:
         self.user_id = user_id
         self.username = username
         self.is_admin = is_admin
+        self.auth_method = auth_method
         # OAuth scopes when the call came in via a Keycloak access token
         # at /mcp; None for PAT / service / fallback. The scope check in
         # `_dispatch` is no-op when this is None — current behaviour for
@@ -148,14 +185,29 @@ _FALLBACK_USER = _MCPUser()
 async def _get_user() -> _MCPUser:
     """Get authenticated user from MCP request context.
 
-    Uses the standard MCP SDK mechanism: server.request_context.request
-    contains the original HTTP Request, from which we extract the
-    Authorization header and apply the MCP credential capability.
+    The HTTP adapter resolves the AKB credential before the SDK transport
+    parses or dispatches the request and stores that result on the request
+    scope. Reading it here keeps the protocol adapters and the business core
+    on one authentication decision. The header fallback is retained for
+    direct/unit callers that construct an SDK request without the AKB adapter.
     """
     try:
-        ctx = server.request_context
+        ctx = _current_request_context()
+        if ctx is None:
+            return _FALLBACK_USER
         request = ctx.request  # Starlette Request object
         if request:
+            scoped_user = request.scope.get("akb.mcp.user")
+            if scoped_user is not None:
+                return _MCPUser(
+                    scoped_user.user_id,
+                    scoped_user.username,
+                    is_admin=scoped_user.is_admin,
+                    auth_method=scoped_user.auth_method,
+                    oauth_scopes=scoped_user.oauth_scopes,
+                    token_scopes=scoped_user.token_scopes,
+                    key_class=scoped_user.key_class,
+                )
             auth_header = request.headers.get("authorization", "")
             if auth_header:
                 user = await resolve_mcp_authorization(auth_header)
@@ -164,6 +216,7 @@ async def _get_user() -> _MCPUser:
                         user.user_id,
                         user.username,
                         is_admin=user.is_admin,
+                        auth_method=user.auth_method,
                         oauth_scopes=user.oauth_scopes,
                         token_scopes=user.token_scopes,
                         key_class=user.key_class,
@@ -191,12 +244,33 @@ def _session_id() -> str | None:
     nullable by construction and must never be treated as a required key.
     """
     try:
-        request = server.request_context.request
+        context = _current_request_context()
+        request = context.request if context is not None else None
         if request:
             return request.headers.get("mcp-session-id")
     except (LookupError, AttributeError):
         pass
     return None
+
+
+def _protocol_context(user: _MCPUser) -> dict[str, str]:
+    """Return non-sensitive protocol facts for audit/tool usage metadata."""
+    try:
+        context = _current_request_context()
+        version = context.protocol_version if context is not None else "unknown"
+    except (LookupError, AttributeError):
+        version = "unknown"
+    if version in MODERN_PROTOCOL_VERSIONS:
+        generation = "modern"
+    elif version in HANDSHAKE_PROTOCOL_VERSIONS:
+        generation = "legacy"
+    else:
+        generation = "unknown"
+    return {
+        "protocol_generation": generation,
+        "protocol_revision": version,
+        "auth_method": user.auth_method,
+    }
 revision_backend = get_revision_backend()
 doc_service = revision_backend.document_service
 search_service = SearchService()
@@ -233,6 +307,9 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_list_vaults": _READ_SCOPE,
     "akb_vault_info": _READ_SCOPE,
     "akb_vault_members": _READ_SCOPE,
+    # A read: it reports the reasons behind a role, and reporting a reason is
+    # never authority to change one.
+    "akb_explain_access": _READ_SCOPE,
     "akb_search_users": _READ_SCOPE,
     "akb_browse": _READ_SCOPE,
     "akb_get": _READ_SCOPE,
@@ -342,7 +419,7 @@ def _required_scope(name: str, args: dict) -> str:
 # time from the same TOOLS list returned via list_tools, so the
 # "what the agent saw" and "what we accept" can't drift.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
-    t.name: set((t.inputSchema or {}).get("properties", {}).keys())
+    t.name: set((t.input_schema or {}).get("properties", {}).keys())
     for t in TOOLS
 }
 
@@ -640,8 +717,10 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     req = DocumentUpdateRequest(
         content=args.get("content"),
         title=args.get("title"),
+        type=args.get("type"),
         status=args.get("status"),
         tags=args.get("tags"),
+        domain=args.get("domain"),
         summary=args.get("summary"),
         depends_on=args.get("depends_on"),
         related_to=args.get("related_to"),
@@ -732,9 +811,9 @@ async def _handle_delete(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_browse")
 async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
-    # `summary` is dropped from items by default — it's the largest
-    # field on `BrowseItem` and dominates payload size on
-    # collection-heavy vaults. Opt in with `include_summary=true`.
+    # Resource summaries are dropped by default because they dominate large
+    # browse payloads. Collection summaries remain: they explain the intent
+    # of the navigation target and are not independently indexed.
     #
     # Browse target may be specified two ways: legacy (`vault` +
     # optional `collection`) or canonical (`uri` — vault root or
@@ -764,9 +843,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         include_archived=args.get("include_archived", False),
     )
     include_summary = args.get("include_summary")
-    payload = result.model_dump(
-        exclude={"items": {"__all__": {"summary"}}} if not include_summary else None
-    )
+    payload = browse_payload(result, include_summary=bool(include_summary))
 
     needle = _filter_arg(args)
     if needle:
@@ -798,16 +875,19 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_grep")
 async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
-    # Read access check when vault is specified
-    if args.get("vault"):
-        await check_vault_access(uid, args["vault"], required_role="reader")
+    from app.services.search_service import _normalize_vault_scope
+
+    vaults = _normalize_vault_scope(args.get("vault"))
     replace = args.get("replace")
-    if replace is not None:
-        # Replace requires writer access on the target vault
-        if args.get("vault"):
-            await check_vault_access(uid, args["vault"], required_role="writer")
-        else:
-            return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    if replace is not None and not vaults:
+        return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    limit = args.get("limit", 20)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return err("limit must be between 1 and 50", code=INVALID_ARGUMENT)
+    for vault in dict.fromkeys(vaults or []):
+        await check_vault_access(
+            uid, vault, required_role="writer" if replace is not None else "reader",
+        )
     result = await search_service.grep(
         pattern=args["pattern"],
         vault=args.get("vault"),
@@ -818,11 +898,18 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         doc_service=doc_service if replace is not None else None,
         agent_id=user.username if replace is not None else None,
         user_id=uid,
-        limit=args.get("limit", 20),
+        limit=limit,
         max_replacements=args.get("max_replacements", DEFAULT_MAX_REPLACEMENTS),
         count_only=args.get("count_only", False),
         files_with_matches=args.get("files_with_matches", False),
-        measurement_include_text_files=args.get("measurement_include_text_files", False),
+        include_text_files=args.get("include_text_files"),
+        measurement_include_text_files=args.get(
+            "measurement_include_text_files", None if "include_text_files" in args else False,
+        ),
+        doc_types=args.get("doc_types"),
+        tags=args.get("tags"),
+        include_archived=args.get("include_archived", True),
+        archive_scope=args.get("archive_scope"),
     )
     return result
 
@@ -1152,6 +1239,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
     return await table_service.execute_sql(
         vault_names=vaults,
         user_id=uid,
+        actor_id=user.username,
         sql=sql,
         is_admin=user.is_admin,
     )
@@ -1383,12 +1471,33 @@ async def _handle_vault_members(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_grant")
 async def _handle_grant(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await grant_access(uid, args["vault"], args["user"], args["role"])
+    # `source_key` is forwarded only when the caller named one, so an agent that
+    # does not know about bases keeps the exact behaviour it had: the service
+    # default is `direct`. Passing None instead would override that default with
+    # a value the service never meant to receive.
+    kwargs: dict = {}
+    if args.get("source_key") is not None:
+        kwargs["source_key"] = args["source_key"]
+    return await grant_access(
+        uid, args["vault"], args["user"], args["role"],
+        revision=args.get("revision"), **kwargs,
+    )
 
 
 @_h("akb_revoke")
 async def _handle_revoke(args: dict, uid: str, user: _MCPUser) -> dict:
-    return await revoke_access(uid, args["vault"], args["user"])
+    # Here the absent key is itself the meaning — no source key is the
+    # administrator's revoke, which removes every basis — so it is passed
+    # straight through rather than being filtered out like the grant default.
+    return await revoke_access(
+        uid, args["vault"], args["user"],
+        source_key=args.get("source_key"), revision=args.get("revision"),
+    )
+
+
+@_h("akb_explain_access")
+async def _handle_explain_access(args: dict, uid: str, user: _MCPUser) -> dict:
+    return await explain_vault_access(uid, args["vault"], args["user"])
 
 
 @_h("akb_search_users")
@@ -1452,16 +1561,18 @@ async def _handle_create_collection(args: dict, uid: str, user: _MCPUser) -> dic
 
 @_h("akb_delete_collection")
 async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dict:
+    from app.services.access_contributions import role_level
     from app.services.collection_service import (
         CollectionService, CollectionNotEmptyError, InvalidPathError,
     )
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    access = await check_vault_access(uid, args["vault"], required_role="writer")
     svc = CollectionService()
     try:
         return await svc.delete(
             vault=args["vault"], path=args["path"],
             recursive=bool(args.get("recursive", False)),
             agent_id=uid,
+            allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
         )
     except InvalidPathError as exc:
         return err(str(exc), code=INVALID_PATH)
@@ -1548,7 +1659,6 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 
 # ── Tool Handlers ────────────────────────────────────────────
 
-@server.list_tools()
 async def list_tools():
     if _vault_skill_preflight_version() != 2:
         return TOOLS
@@ -1566,7 +1676,7 @@ async def list_tools():
             decorated.append(tool)
             continue
         copied = tool.model_copy(deep=True)
-        copied.inputSchema.setdefault("properties", {})[
+        copied.input_schema.setdefault("properties", {})[
             VAULT_SKILL_ACK_ARGUMENT
         ] = {
             "type": "string",
@@ -1581,8 +1691,39 @@ async def list_tools():
     return decorated
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict):
+def _log_response_size(tool: str, encoded: str, *, duration_ms: int) -> None:
+    """One line per `tools/call` carrying what the call actually cost the
+    caller: the serialised response size and how long it took.
+
+    Response size is the number an agent pays for and the one nothing
+    currently reports — `tool_calls` records the call but not its payload, and
+    adding a column there is a schema change the tenant release model wants
+    kept out of a hygiene batch. A log line needs no migration and is enough
+    to size the problem per tool before/after a payload change.
+
+    Measured on the encoded string, after `json.dumps`, so it is the wire
+    length rather than an estimate; `len(...encode())` because a byte count of
+    Korean or Japanese content is roughly three times its character count.
+    Emitted for the error envelope too — a failing tool has a payload cost as
+    well. Never raises: a logging failure must not fail a tool call.
+    """
+    try:
+        logger_response.info(
+            "tools/call tool=%s result_bytes=%d duration_ms=%d",
+            tool,
+            len(encoded.encode("utf-8")),
+            duration_ms,
+            extra={
+                "tool": tool,
+                "result_bytes": len(encoded.encode("utf-8")),
+                "duration_ms": duration_ms,
+            },
+        )
+    except Exception:  # noqa: BLE001 — measurement must never break a call
+        pass
+
+
+async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
     # schema-validated call surface.  Remove it before scope checks, auditing,
@@ -1598,6 +1739,7 @@ async def call_tool(name: str, arguments: dict):
     # Resolve the actor once and reuse it for both dispatch and the audit
     # line so the two can't disagree on who made the call.
     user = await _get_user()
+    protocol = _protocol_context(user)
     started = time.perf_counter()
     # Guards the two exits against recording the SAME invocation twice. The
     # encode below sits inside this `try`, so a `json.dumps` failure falls to
@@ -1663,7 +1805,9 @@ async def call_tool(name: str, arguments: dict):
         # lock on the event loop, and neither touches the shared to_thread pool
         # — a stalled audit disk can't freeze the loop or starve bcrypt /
         # document reads.
-        audit_log.record_tool(name, arguments, user, result, is_write=is_write)
+        audit_log.record_tool(
+            name, arguments, user, result, is_write=is_write, protocol=protocol
+        )
         # Independent sink: usage analytics go to PG so they can be grouped, and
         # must NOT inherit the audit flags (audit is off by default and
         # `log_reads` would drop most tool calls).
@@ -1714,7 +1858,15 @@ async def call_tool(name: str, arguments: dict):
         # deliberately do NOT switch this MCP encode to `to_json`: it would shift
         # datetime/enum output for ~6 tools (put/get/update/move/edit/search) and
         # raise on the odd non-UTF8 bytes that `default=str` degrades to a string.
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+        encoded = json.dumps(result, ensure_ascii=False, default=str)
+        _log_response_size(
+            name,
+            encoded,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=encoded)]
+        )
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
@@ -1734,17 +1886,55 @@ async def call_tool(name: str, arguments: dict):
         # failure lands here after a handler that actually succeeded).
         if not recorded:
             is_write = _required_scope(name, arguments) == _WRITE_SCOPE
-            audit_log.record_tool(name, arguments, user, envelope, is_write=is_write)
+            audit_log.record_tool(
+                name, arguments, user, envelope, is_write=is_write, protocol=protocol
+            )
             tool_usage.record(
                 name, arguments, user, envelope,
                 session_id=_session_id(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
-        return [TextContent(
-            type="text",
-            text=json.dumps(envelope, ensure_ascii=False, default=str),
-        )]
+        encoded = json.dumps(envelope, ensure_ascii=False, default=str)
+        _log_response_size(
+            name,
+            encoded,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=encoded,
+                )
+            ]
+        )
+
+
+async def _list_tools_request(
+    ctx: Any, params: PaginatedRequestParams
+) -> ListToolsResult:
+    """Adapt the canonical catalog to the MCP 2.x request handler API."""
+    token = _request_context.set(ctx)
+    try:
+        return ListToolsResult(tools=await list_tools())
+    finally:
+        _request_context.reset(token)
+
+
+async def _call_tool_request(
+    ctx: Any, params: CallToolRequestParams
+) -> CallToolResult:
+    """Adapt the shared tool/auth core to the MCP 2.x request handler API."""
+    token = _request_context.set(ctx)
+    try:
+        return await call_tool(params.name, params.arguments or {})
+    finally:
+        _request_context.reset(token)
+
+
+server.add_request_handler("tools/list", PaginatedRequestParams, _list_tools_request)
+server.add_request_handler("tools/call", CallToolRequestParams, _call_tool_request)
 
 
 async def _dispatch(name: str, args: dict, user: "_MCPUser"):

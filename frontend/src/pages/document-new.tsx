@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
-import { Loader2 } from "lucide-react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useOpenDocumentCreateDialog } from "@/contexts/document-create-dialog-context";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 
 /**
  * Compatibility bridge for bookmarks and older links. VaultShell owns the
@@ -24,13 +24,8 @@ export default function DocumentNewPage() {
   }, [initialCollection, name, navigate, openCreateDocument]);
 
   return (
-    <div
-      className="flex min-h-[20rem] items-center justify-center text-sm text-foreground-muted"
-      role="status"
-      aria-live="polite"
-    >
-      <Loader2 className="mr-2 h-4 w-4 animate-spin text-link" aria-hidden />
-      Opening document composer…
+    <div className="flex min-h-[20rem] items-center justify-center">
+      <InlineLoadingState label="Opening document composer…" />
     </div>
   );
 }

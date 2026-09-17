@@ -60,7 +60,7 @@ TOOLS = [
             "- limit / offset: pagination when there are many matches.\n"
             "- include_archived: include archived vaults (default false)."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "filter": {"type": "string", "description": "Substring filter against name+description (case-insensitive)."},
@@ -74,13 +74,20 @@ TOOLS = [
         name="akb_create_vault",
         description=(
             "Create a new knowledge base vault (a separate, access-controlled repository for documents). "
+            "Its name is unique across the AKB installation and becomes part of the canonical akb:// URI. "
             "Pass `external_git` to instead create a read-only mirror of an upstream git repo — the vault "
             "tracks the remote on a polling schedule and rejects user writes."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Vault name (lowercase, hyphens allowed)"},
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Globally unique Vault name: lowercase letters and digits, "
+                        "with single hyphens between words"
+                    ),
+                },
                 "description": {"type": "string", "description": "What this vault is for"},
                 "template": {
                     "type": "string",
@@ -115,7 +122,7 @@ TOOLS = [
             "that URI to address the document from every other tool. Automatically "
             "chunked and indexed for semantic search."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "parent": {
@@ -173,7 +180,7 @@ TOOLS = [
             "Use akb_browse or akb_search first to obtain the URI. "
             "Optionally pass a commit hash (from akb_history) to read a previous version."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"},
@@ -190,14 +197,16 @@ TOOLS = [
             "partial fragment such as a newly uploaded image. Use a targeted "
             "akb_edit for inline insertion or replacement."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": "string", "description": "New document body (replaces existing)"},
                 "title": {"type": "string", "description": "New title"},
+                "type": {"type": "string", "description": "New document type"},
                 "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "domain": {"type": "string", "description": "New document domain"},
                 "summary": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault dependency list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
                 "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
@@ -224,7 +233,7 @@ TOOLS = [
             "resending the complete document body. For find-and-replace across many "
             "documents, use akb_grep with replace instead."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -259,7 +268,7 @@ TOOLS = [
             "rewritten. Provide collection and/or slug (at least one must change). "
             "The title is unchanged; use akb_update to change the displayed title."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI to move"},
@@ -279,7 +288,7 @@ TOOLS = [
     Tool(
         name="akb_delete",
         description="Delete a document. Removes from Git, search index, and knowledge graph.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -300,11 +309,13 @@ TOOLS = [
             "0 = direct children only (no descent), N = descend N collection levels, "
             "-1 = entire subtree. Collection rows are always emitted as navigation "
             "aids regardless of depth.\n\n"
-            "Response is slim by default (no `summary` field) so large vaults "
-            "(70+ collections) fit in the agent's context window. Returns "
-            "{vault, path, items, total, returned, truncated?, hint?}."
+            "The response includes metadata for the current browse root in `context`, "
+            "and collection items include `summary` by default so agents understand "
+            "their intended purpose. Other resource summaries stay opt-in so large "
+            "vaults fit in the agent's context window. Returns "
+            "{vault, path, context, items, total, returned, truncated?, hint?}."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {
@@ -346,7 +357,13 @@ TOOLS = [
                 "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
-                "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
+                "include_summary": {
+                    "type": "boolean",
+                    "description": (
+                        "Include document, table, and file summaries. Collection "
+                        "summaries and browse-root context are always included."
+                    ),
+                },
                 "include_hashes": {
                     "type": "boolean",
                     "description": (
@@ -372,7 +389,9 @@ TOOLS = [
             "BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language "
             "questions and short keyword queries well. For exact string / regex matches "
             "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
-            "use akb_drill_down or akb_get with that URI for full content. "
+            "`collection_summary` and `vault_description` describe the hit's parent "
+            "context but do not affect matching or ranking. "
+            "Use akb_drill_down or akb_get with that URI for full content. "
             "Response reports `returned` (in `results`) and `total_matches` (size of the "
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
@@ -383,7 +402,7 @@ TOOLS = [
             "genuine zero-match; `degradation_reason` names the cause. Retry shortly, or fall "
             "back to akb_grep for a literal search."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Natural language search query"},
@@ -422,11 +441,14 @@ TOOLS = [
         name="akb_grep",
         description=(
             "Search for exact text or regex patterns across document content. "
-            "On the guarded native measurement backend, optionally include admitted "
-            "searchable text Files with `measurement_include_text_files=true`; binary "
+            "On a native Document backend, optionally include admitted "
+            "searchable text Files with `include_text_files=true`; binary "
             "Files remain excluded. "
             "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
+            "Native matching and replacement use per-line Python regex semantics; "
+            "case-insensitive literals use the same Unicode rules as replacement. "
+            "Native results include body-relative line numbers and searched revision identity. "
             "Returns matching documents (each with its `uri`) and matched lines. "
             "Optionally pass `replace` to find-and-replace across all matching documents; "
             "the call writes nothing if the scope exceeds `max_replacements`. "
@@ -438,13 +460,23 @@ TOOLS = [
             "safety bounds truncate snippets, the `truncation` object names the applied "
             "resource, match, and byte limits; use count_only for exact counts without snippets."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "minLength": 1, "description": "Non-empty search pattern. By default matched as literal text (ILIKE) — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true to enable PostgreSQL regex (required for alternation and wildcards)."},
-                "vault": {"type": "string", "description": "Limit to a specific vault"},
+                "pattern": {"type": "string", "minLength": 1, "description": "Non-empty search pattern. By default matched as literal text — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true for regex matching (native: Python regex per line; legacy: PostgreSQL candidate matching)."},
+                "vault": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+                    ],
+                    "description": "Limit to one or more vaults. Omit to search accessible vaults; replace requires an explicit nonempty scope with writer access to every vault.",
+                },
+                "doc_types": {"type": "array", "items": {"type": "string"}, "description": "Document types (OR); intersects other filters. Excludes Files when nonempty."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Document tags (OR); intersects other filters. Excludes Files when nonempty."},
+                "include_archived": {"type": "boolean", "default": True, "description": "Include archived Documents; defaults to true for compatibility."},
+                "archive_scope": {"type": "string", "enum": ["unarchived", "archived", "all"], "description": "Overrides include_archived. Archived scope excludes Files."},
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
-                "regex": {"type": "boolean", "default": False, "description": "Treat pattern as PostgreSQL regex. REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
+                "regex": {"type": "boolean", "default": False, "description": "Treat pattern as regex (native: Python per line; legacy: PostgreSQL candidates). REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
                 "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return; does not limit replacement writes"},
@@ -462,18 +494,25 @@ TOOLS = [
                 },
                 "count_only": {"type": "boolean", "default": False, "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."},
                 "files_with_matches": {"type": "boolean", "default": False, "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."},
-                "measurement_include_text_files": {
+                "include_text_files": {
                     "type": "boolean",
-                    "default": False,
                     "description": (
-                        "Guarded native M1 W3b measurement mode: include admitted searchable "
+                        "Native mode: include admitted searchable "
                         "text Files as well as Documents. File results include resource_type=file, "
                         "their canonical akb:// URI, revision, and content_hash; native results "
                         "also report payload_placement, the body placement their bytes were read "
-                        "from. Binary Files are "
-                        "never searchable. Rejected unless the exact native measurement backend "
-                        "and dedicated database guard are active."
+                        "from. With this option, total_resources counts all matches and "
+                        "returned_resources counts returned rows; count_only adds by_resource, "
+                        "and files_with_matches adds resources with resource_type and n_resources. "
+                        "The total_docs, returned_docs, by_doc, and files fields remain Document-only. "
+                        "Binary Files are "
+                        "never searchable. Cannot be combined with replace. Omitted means Documents only. Rejected unless postgres_native or the exact guarded "
+                        "native measurement backend is active."
                     ),
+                },
+                "measurement_include_text_files": {
+                    "type": "boolean",
+                    "description": "Native mode: deprecated alias for include_text_files. If both are supplied they must agree.",
                 },
             },
             "required": ["pattern"],
@@ -494,7 +533,7 @@ TOOLS = [
             "deciding which section to read.\n"
             "Returns {uri, sections|outline, returned, total?, truncated?, hint?}."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -517,7 +556,7 @@ TOOLS = [
             "Returns Git commit history with changed file list. "
             "Use akb_diff to see the actual content changes for a specific commit."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -536,7 +575,7 @@ TOOLS = [
             "Shows what was added/removed/modified. "
             "Use akb_history or akb_activity to find commit hashes first."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -552,7 +591,7 @@ TOOLS = [
             "Shows same-vault cross-type connections: doc→table, doc→file, table→file, etc. "
             "Each row identifies whether it is an explicit link or implicit document-derived edge."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Resource URI (akb://vault/doc/path, akb://vault/table/name, akb://vault/file/uuid)"},
@@ -569,7 +608,7 @@ TOOLS = [
             "Provide `uri` to get a subgraph centered on any resource with BFS traversal. "
             "Provide `vault` (without uri) to get the full vault graph."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Center resource URI (omit + pass vault for full vault graph)"},
@@ -597,7 +636,7 @@ TOOLS = [
             f"Relation types: {_REL_LIST}. "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "Source resource URI (e.g. akb://vault/doc/specs/api.md)"},
@@ -618,7 +657,7 @@ TOOLS = [
             "Implicit relations are removed by editing their source document. "
             "If relation type is omitted, removes all explicit relations between the two resources."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "source": {"type": "string", "description": "Source resource URI"},
@@ -638,7 +677,7 @@ TOOLS = [
             "Get provenance for a document — who created it, when, which entities were "
             "extracted, and its visible same-vault relations."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -658,7 +697,7 @@ TOOLS = [
             "groups the table under that collection so it appears beside the documents "
             "and files there in akb_browse; omit for vault root."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "parent": {
@@ -776,7 +815,7 @@ TOOLS = [
             "returned (nothing is silently truncated), so an unbounded SELECT on a large table "
             "can send back a very large response."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "sql": {"type": "string", "description": "SQL query to execute. For large tables, add a LIMIT to cap the rows returned unless you need the full set."},
@@ -793,7 +832,7 @@ TOOLS = [
     Tool(
         name="akb_drop_table",
         description="Permanently delete a table and all its rows. Cannot be undone. Requires admin role on the vault.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"},
@@ -804,7 +843,7 @@ TOOLS = [
     Tool(
         name="akb_alter_table",
         description="Modify a table's schema — add, remove, or rename columns via ALTER TABLE DDL. Requires admin role.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"},
@@ -927,7 +966,7 @@ TOOLS = [
             "Returns the canonical publication dict — `slug` is the only identifier "
             "you need; `share_url` is always an absolute URL ready to paste."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Resource URI to publish — required when resource_type is document or file. Omit for table_query."},
@@ -978,7 +1017,7 @@ TOOLS = [
             "(handy when re-publishing). table_query publications have no resource "
             "URI, so remove them by slug. Returns {deleted: N}."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Publication slug — remove exactly this publication."},
@@ -992,7 +1031,7 @@ TOOLS = [
             "List every publication in a vault. Each item is the canonical "
             "publication dict (same shape as `akb_publish` returns)."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1013,7 +1052,7 @@ TOOLS = [
             "Identified by `slug` alone — the vault is resolved from the publication. "
             "Returns the updated publication dict."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "Publication slug"},
@@ -1024,7 +1063,7 @@ TOOLS = [
     Tool(
         name="akb_vault_info",
         description="Get detailed vault information: owner, member count, document/table/file/edge counts, last activity.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1035,7 +1074,7 @@ TOOLS = [
     Tool(
         name="akb_vault_members",
         description="List all members of a vault with their roles (owner, admin, writer, reader).",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1045,8 +1084,12 @@ TOOLS = [
     ),
     Tool(
         name="akb_grant",
-        description="Grant vault access to a user. You must be owner or admin of the vault.",
-        inputSchema={
+        description=(
+            "Grant vault access to a user. You must be owner or admin of the vault. "
+            "A rule-driven grantor should name its own source_key so it can later "
+            "withdraw its own reason without deleting anybody else's."
+        ),
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1056,14 +1099,62 @@ TOOLS = [
                     "description": "Role to grant",
                     "enum": ["reader", "writer", "admin"],
                 },
+                "source_key": {
+                    "type": "string",
+                    "description": (
+                        "The basis on which the role is held, as '<namespace>:<id>'. "
+                        "Omit it and the grant is 'direct', which is what every grant "
+                        "was before bases could coexist."
+                    ),
+                },
+                "revision": {
+                    "type": "integer",
+                    "description": (
+                        "Monotonic per (vault, user, source). A retry carrying a "
+                        "revision no newer than the stored one is a no-op rather "
+                        "than an overwrite."
+                    ),
+                },
             },
             "required": ["vault", "user", "role"],
         },
     ),
     Tool(
         name="akb_revoke",
-        description="Revoke a user's vault access. You must be owner or admin.",
-        inputSchema={
+        description=(
+            "Revoke a user's vault access. You must be owner or admin. "
+            "Omit source_key and the person is out of the vault entirely; name one "
+            "and only that basis is withdrawn, which may downgrade rather than remove."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "vault": {"type": "string", "description": "Vault name"},
+                "user": {"type": "string", "description": "Target username"},
+                "source_key": {
+                    "type": "string",
+                    "description": (
+                        "Withdraw only this basis. Omit it and EVERY basis goes — "
+                        "an administrator's revoke, which must not leave the person "
+                        "holding rule-given access."
+                    ),
+                },
+                "revision": {
+                    "type": "integer",
+                    "description": "Monotonic per (vault, user, source); a stale one is a no-op.",
+                },
+            },
+            "required": ["vault", "user"],
+        },
+    ),
+    Tool(
+        name="akb_explain_access",
+        description=(
+            "Explain why a user holds the role they hold on a vault: every "
+            "independent basis, and the effective role derived from them. "
+            "A member list shows the result, never the reasons."
+        ),
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1075,7 +1166,7 @@ TOOLS = [
     Tool(
         name="akb_search_users",
         description="Search for users by username, display name, or email. Use this to find users before granting vault access.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query (name, email, etc.)"},
@@ -1086,7 +1177,7 @@ TOOLS = [
     Tool(
         name="akb_whoami",
         description="Get your current profile — username, email, display name, role. Use this to check who you are authenticated as.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {},
         },
@@ -1097,7 +1188,7 @@ TOOLS = [
             "Transfer vault ownership to another user. The current owner or "
             "a system admin can do this."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1109,7 +1200,7 @@ TOOLS = [
     Tool(
         name="akb_archive_vault",
         description="Archive a vault (makes it read-only). Only the owner can do this.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1123,7 +1214,7 @@ TOOLS = [
             "Permanently delete a vault and ALL its data — documents, chunks, tables, files, edges, Git repo. "
             "This cannot be undone. Owner or admin only."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name to delete"},
@@ -1137,7 +1228,7 @@ TOOLS = [
             "Create an empty collection (folder) inside a vault. Idempotent — "
             "returns {created: false} if the collection already exists. Writer or higher role."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1151,10 +1242,11 @@ TOOLS = [
         name="akb_delete_collection",
         description=(
             "Delete a collection. If empty, removes the metadata row. If non-empty, requires "
-            "recursive=true to cascade delete every document and file under the path. "
-            "Cascade emits one git commit for the entire batch. Writer or higher role."
+            "recursive=true to cascade delete every document, file, and table under the path. "
+            "Cascade emits one git commit for the document batch. Writer or higher role; "
+            "admin or higher when any table is included."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1171,7 +1263,7 @@ TOOLS = [
     Tool(
         name="akb_set_public",
         description="Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
@@ -1186,7 +1278,7 @@ TOOLS = [
             "Get version history of a document — who changed it, when, and why. "
             "Each entry is a Git commit. Use the commit hash with akb_get to read a previous version."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
@@ -1203,7 +1295,7 @@ TOOLS = [
             "Drill down into categories or specific tools for details and examples. "
             "START HERE if you're new to AKB."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "topic": {
@@ -1233,7 +1325,7 @@ TOOLS = [
             "`resource` pointer — the rows/bytes stay in AKB). Reader role required. "
             "For a downloadable zip, use the REST endpoint GET /api/v1/vaults/{vault}/export."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault to export"},
@@ -1259,7 +1351,7 @@ TOOLS = [
             "'overview' collection or carrying type='skill' are skipped per-record and "
             "reported in the response's 'reserved' list. Writer role required."
         ),
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Target vault"},

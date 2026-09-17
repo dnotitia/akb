@@ -343,6 +343,31 @@ and §4.7 should be read:
   both directions. Granting `reader` to somebody a rule already made a `writer`
   must not demote them in the database, and a surviving basis after a revoke is
   a downgrade rather than a removal.
+- **An administrator's *downgrade* is not a revoke, and against a stronger rule
+  basis it does nothing.** Setting somebody to `reader` writes the `direct`
+  basis; the effective role is the strongest basis; a rule holding `writer`
+  still wins. The call returns 200 and nothing moves. This is intended — a floor
+  policy says rules may raise and never lower, and an explicit *revoke* wins,
+  but a downgrade is not a revoke. Making `direct` a ceiling instead was
+  rejected: with two rule-driven grantors a ceiling from one silently caps the
+  other, which is the original defect wearing a new face, and it turns "the
+  strongest applicable basis" into an ordered policy evaluation that §1's worked
+  example no longer satisfies.
+
+  The write already reports it. `grant_access` returns the requested `role`
+  beside `effective_role`, and they differ exactly in this case. **A consumer
+  that compares against the effective role alone cannot see it** — every such
+  comparison says the rule is satisfied — so a consumer must compare *bases*
+  and say so, rather than reporting the state as in sync.
+
+  What this leaves genuinely missing is the administrator's intent: "this one
+  person is an exception to that rule" has no representation. Lowering the
+  rule's role or removing the person from its subject both change more than the
+  one person, and revoking then re-granting is undone by the next membership
+  event. A suppression basis is the primitive that would express it, and it is
+  a new axis rather than a new value — `role` admits only `reader`, `writer`
+  and `admin`. Deferred until a concrete request for a per-person exception
+  exists.
 
 **What acceptance rests on.** The seven gates of §6 as executable tests against
 live PostgreSQL, each verified to turn red when the guard it names is removed.

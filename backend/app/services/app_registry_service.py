@@ -11,6 +11,7 @@ import asyncpg
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.services.app_identity_service import record_app_audit
+from app.services.app_rollout_service import manifest_storage_projection, validate_manifest
 from app.services.auth_service import AuthenticatedUser
 from app.util.text import to_nfc_any
 
@@ -87,11 +88,16 @@ def _app_projection(row: Any, *, replayed: bool | None = None) -> dict[str, Any]
 
 
 def _release_projection(row: Any, *, replayed: bool | None = None) -> dict[str, Any]:
+    validated = validate_manifest(
+        _json_object(row["manifest"]),
+        row["manifest_checksum"],
+        version=row["version"],
+    )
     result = {
         "id": str(row["id"]),
         "app_id": str(row["app_id"]),
         "version": row["version"],
-        "manifest": _json_object(row["manifest"]),
+        "manifest": manifest_storage_projection(validated),
         "manifest_checksum": row["manifest_checksum"],
         "registered_at": row["registered_at"],
     }
@@ -275,7 +281,10 @@ async def create_app_release(
 ) -> dict[str, Any]:
     _require_admin(user)
     app_uuid = _as_uuid(app_id, field="app_id")
-    version = version.strip()
+    if not isinstance(version, str):
+        version = ""
+    else:
+        version = version.strip()
     if not version:
         _record_registry_error(
             "app.registry.release.create",
@@ -284,23 +293,18 @@ async def create_app_release(
             app_id=app_uuid,
         )
         raise ValidationError("version must not be empty")
-    checksum = manifest_checksum.lower()
-    if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+    try:
+        normalized = validate_manifest(manifest, manifest_checksum, version=version)
+    except (ConflictError, ValidationError):
         _record_registry_error(
             "app.registry.release.create",
             correlation_id=correlation_id,
             user=user,
             app_id=app_uuid,
         )
-        raise ValidationError("manifest_checksum must be a SHA-256 checksum")
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("steps"), list):
-        _record_registry_error(
-            "app.registry.release.create",
-            correlation_id=correlation_id,
-            user=user,
-            app_id=app_uuid,
-        )
-        raise ValidationError("manifest must be an object with a steps array")
+        raise
+    checksum = normalized["checksum"]
+    normalized_manifest = manifest_storage_projection(normalized)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -308,7 +312,11 @@ async def create_app_release(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"app-release:{app_uuid}:{version}",
             )
-            if not await conn.fetchval("SELECT 1 FROM app_definitions WHERE id=$1", app_uuid):
+            app = await conn.fetchrow(
+                "SELECT id, app_key FROM app_definitions WHERE id=$1",
+                app_uuid,
+            )
+            if app is None:
                 _record_registry_error(
                     "app.registry.release.create",
                     correlation_id=correlation_id,
@@ -316,15 +324,29 @@ async def create_app_release(
                     app_id=app_uuid,
                 )
                 raise NotFoundError("App", "not found")
+            if normalized_manifest["app_key"] != app["app_key"]:
+                _record_registry_error(
+                    "app.registry.release.create",
+                    correlation_id=correlation_id,
+                    user=user,
+                    app_id=app_uuid,
+                )
+                raise ConflictError("Release manifest app_key does not match the app definition")
             existing = await conn.fetchrow(
                 "SELECT * FROM app_releases WHERE app_id=$1 AND version=$2 FOR UPDATE",
                 app_uuid,
                 version,
             )
             if existing is not None:
+                existing_manifest = validate_manifest(
+                    existing["manifest"],
+                    existing["manifest_checksum"],
+                    version=existing["version"],
+                )
                 same = (
                     existing["manifest_checksum"] == checksum
-                    and _canonical(existing["manifest"]) == _canonical(manifest)
+                    and _canonical(manifest_storage_projection(existing_manifest))
+                    == _canonical(normalized_manifest)
                 )
                 if not same:
                     _record_registry_error(
@@ -344,7 +366,7 @@ async def create_app_release(
                     """,
                     app_uuid,
                     version,
-                    _canonical(manifest),
+                    _canonical(normalized_manifest),
                     checksum,
                 )
                 assert row is not None

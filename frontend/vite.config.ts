@@ -1,15 +1,482 @@
-import { defineConfig } from "vite";
+import type { AddressInfo } from "node:net";
+import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
-// Dev proxy target — the local backend started by docker-compose.
-const target = "http://localhost:8000";
+// Dev proxy target — the local backend started by docker-compose unless an
+// isolated repository runtime supplies its per-run backend origin.
+const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
+const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
+const requestedMockScenario = process.env.AKB_FE_E2E_SCENARIO || "empty";
+const mockScenario = ["document-edit-recovery", "markdown-reference-adapters"].includes(requestedMockScenario)
+  ? requestedMockScenario
+  : "empty";
+const FIXTURE_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
+let mockResetGeneration = 0;
+
+type MockFixtureDocument = {
+  title: string;
+  content: string;
+  current_commit: string;
+  updated_at: string;
+};
+
+type MockCreatedDocument = MockFixtureDocument & {
+  path: string;
+  uri: string;
+  collection: string;
+  type: string;
+  summary?: string | null;
+  domain?: string | null;
+  tags: string[];
+};
+
+type MockFixtureAsset = {
+  id: string;
+  filename: string;
+  status: "unclaimed" | "claimed" | "discarded";
+  expires_at?: string;
+};
+
+type MockFixtureState = {
+  remote_document: MockFixtureDocument | null;
+  created_documents: MockCreatedDocument[];
+  refetch_generation: number;
+  expire_draft_generation: number;
+  faults: { save: number; upload: number };
+  assets: MockFixtureAsset[];
+  asset_sequence: number;
+  commit_sequence: number;
+};
+
+const BASE_FIXTURE_DOCUMENT: MockFixtureDocument = {
+  title: "Recovery document",
+  content: "# Recovery document\n\nThe original body is safe to edit.",
+  current_commit: "fixture-base-0001",
+  updated_at: "2026-09-08T00:00:00.000Z",
+};
+
+let mockFixtureState: MockFixtureState = createMockFixtureState();
+
+function createMockFixtureState(): MockFixtureState {
+  const assets = mockScenario === "markdown-reference-adapters"
+    ? [{
+        id: "123e4567-e89b-42d3-a456-426614174000",
+        filename: "fixture.png",
+        status: "claimed" as const,
+        expires_at: "2099-01-01T00:00:00.000Z",
+      }]
+    : [];
+  return {
+    remote_document: null,
+    created_documents: [],
+    refetch_generation: 0,
+    expire_draft_generation: 0,
+    faults: { save: 0, upload: 0 },
+    assets,
+    asset_sequence: 0,
+    commit_sequence: 1,
+  };
+}
+
+function resetMockFixtureState() {
+  mockFixtureState = createMockFixtureState();
+}
+
+function currentFixtureDocument(): MockFixtureDocument {
+  if (mockFixtureState.remote_document) return mockFixtureState.remote_document;
+  if (mockScenario === "markdown-reference-adapters") {
+    return {
+      ...BASE_FIXTURE_DOCUMENT,
+      title: "Reference adapter fixture",
+      content: [
+        "# Reference adapter fixture",
+        "",
+        "[Available document](akb://fixture/doc/available.md)",
+        "",
+        "[Available file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174001)",
+        "",
+        "[Unavailable file](akb://fixture/file/123e4567-e89b-42d3-a456-426614174099)",
+        "",
+        "![Fixture attachment](/api/assets/123e4567-e89b-42d3-a456-426614174000)",
+      ].join("\n"),
+    };
+  }
+  return BASE_FIXTURE_DOCUMENT;
+}
+
+function fixtureStateSnapshot() {
+  const document = currentFixtureDocument();
+  const referenceScenario = mockScenario === "markdown-reference-adapters";
+  return {
+    scenario: mockScenario,
+    reset_generation: mockResetGeneration,
+    identity: {
+      user_id: "u-jylkim",
+      vault: "fixture",
+      document_path: referenceScenario ? "notes/references.md" : "notes/recovery.md",
+      document_uri: referenceScenario
+        ? "akb://fixture/coll/notes/doc/references.md"
+        : "akb://fixture/coll/notes/doc/recovery.md",
+      start_url: referenceScenario
+        ? "/vault/fixture/doc/notes%2Freferences.md"
+        : "/vault/fixture/doc/notes%2Frecovery.md?view=edit",
+      actors: ["editor-a", "editor-b"],
+    },
+    document,
+    created_documents: mockFixtureState.created_documents,
+    refetch_generation: mockFixtureState.refetch_generation,
+    expire_draft_generation: mockFixtureState.expire_draft_generation,
+    faults: mockFixtureState.faults,
+    assets: mockFixtureState.assets,
+    attachment_policy: {
+      unclaimed_ttl_hours: 24,
+      revision_retention_days: 30,
+    },
+  };
+}
+
+function readJsonBody(request: NodeJS.ReadableStream): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
+
+function mockDocumentFromBody(body: Record<string, unknown>): MockFixtureDocument {
+  mockFixtureState.commit_sequence += 1;
+  return {
+    title: typeof body.title === "string" ? body.title : currentFixtureDocument().title,
+    content: typeof body.content === "string" ? body.content : currentFixtureDocument().content,
+    current_commit: `fixture-commit-${String(mockFixtureState.commit_sequence).padStart(4, "0")}`,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function mockDescriptor(origin: string) {
+  const fixture = mockScenario === "document-edit-recovery"
+    ? {
+        identity: {
+          user_id: "u-jylkim",
+          vault: "fixture",
+          document_path: "notes/recovery.md",
+          document_uri: "akb://fixture/coll/notes/doc/recovery.md",
+          start_url: `${origin}/vault/fixture/doc/notes%2Frecovery.md?view=edit`,
+          actors: ["editor-a", "editor-b"],
+        },
+        operations: {
+          state: { method: "GET", url: `${origin}/__akb_mock__/fixture/state` },
+          remote_revision: {
+            method: "POST",
+            url: `${origin}/__akb_mock__/fixture/remote-revision`,
+            body: { actor: "editor-b", title: "Remote revision", content: "Remote body" },
+          },
+          refetch: {
+            method: "POST",
+            url: `${origin}/__akb_mock__/fixture/refetch`,
+            body: {},
+          },
+          retryable_save_failure: {
+            method: "POST",
+            url: `${origin}/__akb_mock__/fixture/failure`,
+            body: { operation: "save", times: 1, status: 503 },
+          },
+          retryable_upload_failure: {
+            method: "POST",
+            url: `${origin}/__akb_mock__/fixture/failure`,
+            body: { operation: "upload", times: 1, status: 503 },
+          },
+          expire_draft: {
+            method: "POST",
+            url: `${origin}/__akb_mock__/fixture/expire-draft`,
+            body: {},
+          },
+        },
+      }
+    : mockScenario === "markdown-reference-adapters"
+      ? {
+          identity: {
+            user_id: "u-jylkim",
+            vault: "fixture",
+            document_path: "notes/references.md",
+            document_uri: "akb://fixture/coll/notes/doc/references.md",
+            start_url: `${origin}/vault/fixture/doc/notes%2Freferences.md`,
+            actors: ["reader-a", "writer-a"],
+          },
+          operations: {
+            state: { method: "GET", url: `${origin}/__akb_mock__/fixture/state` },
+            expire_attachment: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/expire-attachment`,
+              body: { id: "123e4567-e89b-42d3-a456-426614174000" },
+            },
+            retryable_upload_failure: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/failure`,
+              body: { operation: "upload", times: 1, status: 503 },
+            },
+            expire_draft: {
+              method: "POST",
+              url: `${origin}/__akb_mock__/fixture/expire-draft`,
+              body: {},
+            },
+          },
+        }
+      : null;
+  return {
+    schema_version: 2,
+    status: "ready",
+    mode: "mock",
+    scenario: mockScenario,
+    services: {
+      web: {
+        origin,
+        health: { method: "GET", url: `${origin}/__akb_mock__/health` },
+        discovery: { method: "GET", url: `${origin}/__akb_mock__/discover` },
+        reset: {
+          method: "POST",
+          url: `${origin}/__akb_mock__/reset`,
+          body: { scenario: mockScenario },
+        },
+      },
+    },
+    access: { login: { method: "browser", url: `${origin}/auth` } },
+    mock: {
+      worker_url: `${origin}/mockServiceWorker.js`,
+      unhandled_api: "error",
+      fixture,
+    },
+  };
+}
+
+function mockOriginFromAddress(address: AddressInfo) {
+  const host = ["0.0.0.0", "::"].includes(address.address)
+    ? "127.0.0.1"
+    : address.address;
+  const formattedHost = host.includes(":") ? `[${host}]` : host;
+  return `http://${formattedHost}:${address.port}`;
+}
+
+function publishMockDescriptor(server: ViteDevServer) {
+  let published = false;
+  const publish = () => {
+    if (published) return;
+    const address = server.httpServer?.address();
+    if (!address || typeof address === "string") return;
+    published = true;
+    process.stdout.write(`${JSON.stringify(mockDescriptor(mockOriginFromAddress(address)))}\n`);
+  };
+
+  if (server.httpServer?.listening) publish();
+  else server.httpServer?.once("listening", publish);
+}
+
+function mockControlPlugin(): Plugin {
+  return {
+    name: "akb-mock-control",
+    configureServer(server) {
+      if (process.env.VITE_AKB_TEST_MODE !== "mock") return;
+      publishMockDescriptor(server);
+      server.middlewares.use((request, response, next) => {
+        const pathname = new URL(request.url || "/", "http://localhost").pathname;
+        if (!pathname.startsWith("/__akb_mock__/")) {
+          next();
+          return;
+        }
+
+        const origin = `http://${request.headers.host || "127.0.0.1:4173"}`;
+        response.setHeader("Content-Type", "application/json");
+        if (pathname === "/__akb_mock__/fixture/available-file.png" && request.method === "GET") {
+          response.setHeader("Content-Type", "image/png");
+          response.end(FIXTURE_PNG);
+          return;
+        }
+        if (pathname === "/__akb_mock__/health" && request.method === "GET") {
+          response.end(
+            JSON.stringify({
+              status: "ready",
+              mode: "mock",
+              scenario: mockScenario,
+              reset_generation: mockResetGeneration,
+            }),
+          );
+          return;
+        }
+        if (pathname === "/__akb_mock__/discover" && request.method === "GET") {
+          response.end(JSON.stringify(mockDescriptor(origin)));
+          return;
+        }
+        if (pathname === "/__akb_mock__/reset" && request.method === "POST") {
+          mockResetGeneration += 1;
+          resetMockFixtureState();
+          response.end(
+            JSON.stringify({
+              status: "ready",
+              mode: "mock",
+              scenario: mockScenario,
+              reset_generation: mockResetGeneration,
+            }),
+          );
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/state" && request.method === "GET") {
+          response.end(JSON.stringify(fixtureStateSnapshot()));
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/create-document" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const title = typeof body.title === "string" ? body.title.trim() : "Untitled document";
+            const collection = typeof body.collection === "string" ? body.collection.trim() : "";
+            const slug = title
+              .normalize("NFC")
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/^-+|-+$/g, "") || "untitled";
+            const path = collection ? `${collection}/${slug}.md` : `${slug}.md`;
+            const uri = collection
+              ? `akb://fixture/coll/${collection}/doc/${slug}.md`
+              : `akb://fixture/doc/${slug}.md`;
+            const document: MockCreatedDocument = {
+              ...mockDocumentFromBody(body),
+              path,
+              uri,
+              collection,
+              type: typeof body.type === "string" ? body.type : "note",
+              summary: typeof body.summary === "string" ? body.summary : null,
+              domain: typeof body.domain === "string" ? body.domain : null,
+              tags: Array.isArray(body.tags)
+                ? body.tags.filter((tag): tag is string => typeof tag === "string")
+                : [],
+            };
+            mockFixtureState.created_documents.push(document);
+            const referencedAssetIds = typeof body.content === "string"
+              ? new Set([...body.content.matchAll(/\/api\/assets\/([A-Za-z0-9-]+)/g)].map((match) => match[1]))
+              : new Set<string>();
+            for (const asset of mockFixtureState.assets) {
+              if (asset.status === "unclaimed" && referencedAssetIds.has(asset.id)) asset.status = "claimed";
+            }
+            response.end(JSON.stringify({ status: "ready", document }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/remote-revision" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            mockFixtureState.remote_document = mockDocumentFromBody(body);
+            response.end(JSON.stringify({ status: "ready", action: "remote-revision", document: currentFixtureDocument() }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/refetch" && request.method === "POST") {
+          mockFixtureState.refetch_generation += 1;
+          response.end(JSON.stringify({ status: "ready", refetch_generation: mockFixtureState.refetch_generation }));
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/failure" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const operation = body.operation === "upload" ? "upload" : "save";
+            const times = typeof body.times === "number" && Number.isInteger(body.times)
+              ? Math.max(0, Math.min(body.times, 5))
+              : 1;
+            mockFixtureState.faults[operation] = times;
+            response.end(JSON.stringify({ status: "ready", operation, times }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/expire-draft" && request.method === "POST") {
+          mockFixtureState.expire_draft_generation += 1;
+          response.end(JSON.stringify({ status: "ready", expire_draft_generation: mockFixtureState.expire_draft_generation }));
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/expire-attachment" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const id = typeof body.id === "string" ? body.id : "";
+            const asset = mockFixtureState.assets.find((candidate) => candidate.id === id);
+            if (asset) asset.status = "discarded";
+            response.end(JSON.stringify({ status: "ready", id, expired: asset?.status === "discarded" }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/consume-fault" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const operation = body.operation === "upload" ? "upload" : "save";
+            const consumed = mockFixtureState.faults[operation] > 0;
+            if (consumed) mockFixtureState.faults[operation] -= 1;
+            response.end(JSON.stringify({ status: "ready", consumed, operation }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/upload" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            mockFixtureState.asset_sequence += 1;
+            const id = typeof body.id === "string" ? body.id : `fixture-asset-${mockFixtureState.asset_sequence}`;
+            mockFixtureState.assets.push({
+              id,
+              filename: typeof body.filename === "string" ? body.filename : "fixture.png",
+              status: "unclaimed",
+              expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+            });
+            response.end(JSON.stringify({
+              status: "ready",
+              id,
+              expires_at: mockFixtureState.assets.at(-1)?.expires_at,
+            }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/commit" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const expected = typeof body.expected_commit === "string" ? body.expected_commit : "";
+            if (expected && expected !== currentFixtureDocument().current_commit) {
+              response.statusCode = 409;
+              response.end(JSON.stringify({ error: "current_commit moved", code: "conflict" }));
+              return;
+            }
+            mockFixtureState.remote_document = mockDocumentFromBody(body);
+            const assetIds = Array.isArray(body.asset_ids)
+              ? body.asset_ids.filter((assetId): assetId is string => typeof assetId === "string")
+              : [];
+            for (const asset of mockFixtureState.assets) {
+              if (asset.status === "unclaimed" && assetIds.includes(asset.id)) asset.status = "claimed";
+            }
+            response.end(JSON.stringify({ status: "ready", document: currentFixtureDocument() }));
+          });
+          return;
+        }
+        if (pathname === "/__akb_mock__/fixture/discard" && request.method === "POST") {
+          void readJsonBody(request).then((body) => {
+            const id = typeof body.id === "string" ? body.id : "";
+            const asset = mockFixtureState.assets.find((candidate) => candidate.id === id);
+            if (asset && asset.status === "unclaimed") asset.status = "discarded";
+            response.end(JSON.stringify({ status: "ready", id, discarded: asset?.status === "discarded" }));
+          });
+          return;
+        }
+        response.statusCode = 404;
+        response.end(JSON.stringify({ error: "mock_control_not_found" }));
+      });
+    },
+  };
+}
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), mockControlPlugin()],
     resolve: {
       alias: {
         "@": path.resolve(__dirname, "./src"),
@@ -23,6 +490,7 @@ export default defineConfig(() => {
     optimizeDeps: {
       include: ["react-force-graph-2d", "react-kapsule"],
     },
+    cacheDir,
     server: {
       proxy: {
         "/api": {

@@ -1,0 +1,23 @@
+# Seed question: a two-sided contract. A complete answer carries both the
+# MUST clauses and the NEVER clauses; an arm that summarises the module
+# document's opening paragraphs gets half of it.
+#
+# `must_mention` items are matched two ways — an LLM judge for meaning and a
+# normalized substring pass for provenance — so they are the shortest form
+# that still pins the fact, spelled as the source document spells it.
+id: q003
+category: module-contract
+query: >-
+  What does the akb-oss backend module's Agent contract require, and what does
+  it forbid outright?
+ground_truth:
+  must_mention:
+    - "MUST"
+    - "NEVER"
+    - "write-lane"
+    - "pgvector"
+  forbidden:
+    - "the backend implements the local file tools"
+    - "configuration is read from environment variables in app/config.py"
+  source_docs:
+    - "akb://project-akb/coll/product/akb-oss/modules/doc/backend.md"

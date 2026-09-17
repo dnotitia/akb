@@ -15,6 +15,8 @@ import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from collections.abc import Mapping
+from typing import Any
 
 import asyncpg
 import bcrypt
@@ -134,14 +136,17 @@ def create_jwt(
     username: str,
     *,
     not_before: datetime | None = None,
+    session_generation: int = 0,
 ) -> str:
     """Encode a JWT for ``user_id``.
 
-    ``not_before`` lets a caller pin the ``iat`` claim past a known
-    revocation cutoff so a token issued in the same second as a
-    revoke is born already valid (otherwise the iat-second comparison
-    during local-session account projection would reject it for up to 1s).
+    Production callers must supply the current generation while holding
+    the user's row lock; the default is for a newly created account only.
+    ``not_before`` remains a compatibility option for explicit time bounds.
+    Generation-based issuance needs no future-dated ``iat`` or ``nbf``.
     """
+    if type(session_generation) is not int or session_generation < 0:
+        raise ValueError("session_generation must be a non-negative integer")
     now = datetime.now(timezone.utc)
     iat = now if not_before is None or not_before <= now else not_before
     from app.services.local_session_keys import (
@@ -161,6 +166,7 @@ def create_jwt(
         "jti": str(uuid.uuid4()),
         "profile": LOCAL_SESSION_RS256_V2,
         "token_use": "session",
+        "session_generation": session_generation,
     }
     return jwt.encode(
         payload,
@@ -306,7 +312,7 @@ async def login(username: str, password: str) -> dict:
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, password_hash, display_name, is_admin,
-                       tokens_revoked_before, auth_provider,
+                       tokens_revoked_before, session_generation, auth_provider,
                        account_status, account_kind
                   FROM users WHERE username = $1 OR email = $1
                    FOR SHARE
@@ -323,15 +329,13 @@ async def login(username: str, password: str) -> dict:
             if not row or not await verify_password_async(password, row["password_hash"]):
                 raise AuthenticationError("Invalid credentials")
 
-            # Push iat past the revocation cutoff so a login in the same
-            # whole second as a revoke (admin reset, change_password) still
-            # yields a usable token. Local-session projection compares against
-            # CEIL(epoch) so the safe boundary is cutoff + 1s rounded up.
-            not_before = row["tokens_revoked_before"] + timedelta(seconds=1)
+            # FOR SHARE serializes issuance with revocation's row UPDATE.
+            # Generation is authoritative, so freshly issued JWTs need no
+            # future iat/nbf to escape the legacy whole-second cutoff.
             token = create_jwt(
                 str(row["id"]),
                 row["username"],
-                not_before=not_before,
+                session_generation=row["session_generation"],
             )
             return {
                 "token": token,
@@ -469,13 +473,177 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
     return refreshed
 
 
-async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
-    """Resolve exact issuer/subject, or transactionally create a fresh account.
+def _authority_domain_of(email: str, domains: tuple[str, ...]) -> str | None:
+    """Return the declared authority domain covering ``email``, or None.
 
-    Email and username are collision checks only. Canonical SSO never adopts
-    an existing account from mutable profile claims. ``invite_only`` therefore
-    accepts only an exact prebound identity, while ``open`` may create one new
-    AKB user and its exact external binding in the same transaction.
+    Exact equality on the lowercased domain half only — no subdomain
+    inheritance. The half is IDNA-encoded before comparison so a declared
+    punycode domain matches the Unicode address a directory asserts
+    (``münchen.de`` ↔ ``xn--mnchen-3ya.de``); a half that cannot encode
+    matches nothing. A malformed address (not exactly one ``@``, empty halves)
+    cannot grant domain authority.
+    """
+    if email.count("@") != 1:
+        return None
+    local, _, raw_domain = email.rpartition("@")
+    if not local or not raw_domain:
+        return None
+    try:
+        domain = raw_domain.lower().encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    return domain if domain in domains else None
+
+
+async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dict, email: str, domain: str):
+    """Bind one verified brokered identity to the account holding its address.
+
+    This is the single deliberate exception to "never adopt from mutable
+    profile claims": the operator declared this provider the authority for
+    this domain, so the address is directory-owned rather than user-chosen.
+    Every guard below is load-bearing:
+
+    - verified email per the existing setting, checked before looking up
+      an adoption target;
+    - active human target (a suspended account must not be revived by
+      signing in);
+    - no existing binding for this issuer on the target (the schema is
+      unique on (issuer, subject), not on (issuer, user_id));
+    - never the recovery admin (break-glass is not claimable by assertion).
+
+    Runs inside the caller's transaction (subject + address advisory locks
+    plus ``SELECT ... FOR UPDATE`` on the target), so concurrent adopts of
+    one address converge instead of double-binding. Uses SAVEPOINTs, never
+    a nested transaction: the binding INSERT is the only statement allowed
+    to fail, and its savepoint rolls back just that statement so the race
+    fallback below can still read. The ``UPDATE users`` runs only after the
+    INSERT succeeds, so a lost race never leaves a provider flip without
+    its binding.
+
+    Returns the resolved user, or None when no account holds the address
+    (the caller falls through to the mode's provision path). Emits
+    ``auth.user_adopted`` with the upstream-stable ``subject`` so the
+    "claimed" audit trail joins to the binding row without a lookup; the
+    payload otherwise mirrors ``auth.user_provisioned`` plus the authority
+    facts (``domain``, ``prior_auth_provider``, ``is_admin`` legibility).
+    """
+    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+        raise AuthenticationError("Identity provider has not verified this email address")
+    display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
+    async with conn.transaction():
+        targets = await conn.fetch(
+            """
+            SELECT id, username, email, display_name, is_admin,
+                   tokens_revoked_before, auth_provider,
+                   account_status, account_kind, is_recovery_admin
+              FROM users WHERE lower(email) = $1
+             ORDER BY id
+               FOR UPDATE
+            """,
+            email,
+        )
+        if not targets:
+            return None
+        # Legacy local registration preserved email casing; TEXT UNIQUE can
+        # contain multiple case variants. Never choose one implicitly.
+        if len(targets) != 1:
+            raise ExternalIdentityConflictError()
+        target = targets[0]
+        if target["account_status"] != "active":
+            raise AccountSuspendedError()
+        if target["account_kind"] != "human":
+            raise ExternalIdentityConflictError()
+        if target["is_recovery_admin"]:
+            raise ExternalIdentityConflictError()
+        has_issuer_binding = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM external_identities
+                 WHERE user_id = $1 AND issuer = $2
+            )
+            """,
+            target["id"],
+            issuer,
+        )
+        if has_issuer_binding:
+            raise ExternalIdentityConflictError()
+        prior_provider = target["auth_provider"]
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO external_identities (
+                        user_id, issuer, subject, email_snapshot
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    target["id"],
+                    issuer,
+                    subject,
+                    email,
+                )
+        except asyncpg.UniqueViolationError:
+            # Lost the race: a concurrent login bound this subject, or bound
+            # this target to this issuer, first. The savepoint rolled back
+            # only the INSERT, so re-read under the same lock and take the
+            # winner's answer.
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is None:
+                raise ExternalIdentityConflictError() from None
+            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            return _resolved_external_user(refreshed, newly_provisioned=False)
+        # The binding is written: only now flip the provider. A lost race
+        # above returns before reaching here, so a provider flip without
+        # its binding cannot commit.
+        await conn.execute(
+            """
+            UPDATE users
+               SET auth_provider = 'keycloak',
+                   display_name = COALESCE($2, display_name),
+                   updated_at = NOW()
+             WHERE id = $1
+            """,
+            target["id"],
+            display_name,
+        )
+        await emit_event(
+            conn,
+            "auth.user_adopted",
+            actor_id=str(target["id"]),
+            payload={
+                "auth_provider": "keycloak",
+                "prior_auth_provider": prior_provider,
+                "email": email,
+                "domain": domain,
+                "issuer": issuer,
+                "subject": subject,
+                "is_admin": bool(target["is_admin"]),
+            },
+        )
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, display_name, is_admin,
+               tokens_revoked_before, auth_provider,
+               account_status, account_kind
+          FROM users WHERE id = $1
+        """,
+        target["id"],
+    )
+    _assert_active_human(row)
+    return _resolved_external_user(row, newly_provisioned=False)
+
+
+async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: str | None = None) -> dict:
+    """Resolve exact issuer/subject, adopt or create on authority, or refuse.
+
+    Email and username are collision checks only — except on the one path
+    the operator explicitly opened: a browser login through a provider
+    declared authoritative for the address's domain (``provider_alias``
+    names the provider the flow selected and verified; ``None`` is the
+    non-browser projection paths, which stay on today's behaviour).
+    ``invite_only`` therefore accepts an exact prebound identity, an
+    authority adopt, or an authority provision; ``open`` additionally keeps
+    its fresh-account JIT, whose collision branch adopts on authority
+    instead of refusing when the domain is declared.
     """
     if settings.keycloak_link_by_email:
         # Keep the field readable for migration tooling, but make direct
@@ -489,96 +657,179 @@ async def _resolve_or_provision_keycloak_user(claims: dict) -> dict:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Share the exact-identity lock with administrative/periodic approval.
+        # Authority logins additionally serialize on the claimed address so
+        # different subjects cannot adopt the same account concurrently.
+        # All browser paths acquire subject, then address, then user-row locks.
+        async with conn.transaction():
+            pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
+            if provider_alias is not None:
+                pre_domain = _authority_domain_of(
+                    pre_email, settings.authoritative_email_domains_for(provider_alias)
+                )
+            else:
+                pre_domain = None
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"external-identity:{len(issuer)}:{issuer}{subject}",
+            )
+            if pre_email and pre_domain is not None:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"external-identity-authority:{len(pre_email)}:{pre_email}",
+                )
+            bound = await _bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                refreshed = await _refresh_bound_external_user(conn, bound, claims)
+                return _resolved_external_user(refreshed, newly_provisioned=False)
+
+            try:
+                # Roll back any partial account mutation on refusal, but keep
+                # the admission note in the outer transaction with the lock.
+                async with conn.transaction():
+                    return await _resolve_unbound_keycloak_user(
+                        conn, issuer, subject, claims, pre_email, pre_domain
+                    )
+            except (
+                MembershipRequiredError,
+                AccountSuspendedError,
+                ExternalIdentityConflictError,
+                AuthenticationError,
+            ) as exc:
+                if pre_domain is None and not isinstance(exc, MembershipRequiredError):
+                    raise
+                await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
+                refusal = exc
+        # Refuse only after the arrival has committed. Raising inside the
+        # transaction would discard the administrator's pending record.
+        raise refusal
+
+
+async def _resolve_unbound_keycloak_user(
+    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None
+) -> dict:
+    """Resolve an unbound identity while the caller holds its transaction lock."""
+    if email and domain is not None:
+        # Declared authority for this provider+domain: the directory owns
+        # the mailbox, so the address selects the account. Adopt when one
+        # holds it, else fall through to the mode's provision path.
+        # `disabled` never reaches here (refused above).
+        adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain)
+        if adopted is not None:
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
+            return adopted
+
+    if settings.keycloak_enrollment_mode == "invite_only" and domain is None:
+        # The caller records this exact identity before returning the refusal.
+        # Only a declared authority domain permits automatic provisioning.
+        raise MembershipRequiredError()
+
+    if not email:
+        raise AuthenticationError("Identity provider account has no email claim")
+    if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
+        raise AuthenticationError("Identity provider has not verified this email address")
+
+    raw_preferred_username = _optional_external_string(claims, "preferred_username")
+    preferred_username = (
+        raw_preferred_username.strip()
+        if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
+        else email.split("@", 1)[0]
+    )
+    display_name = _optional_external_string(claims, "name") or raw_preferred_username
+    user_id = uuid.uuid4()
+    try:
+        async with conn.transaction():
+            # Deliberately do not SELECT by email or username first. Their
+            # unique constraints are atomic collision guards, never
+            # identity resolution or account-linking inputs.
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, email, password_hash, display_name,
+                    auth_provider, is_admin, account_status, account_kind
+                )
+                VALUES ($1, $2, $3, $4, $5, 'keycloak',
+                        false, 'active', 'human')
+                """,
+                user_id,
+                preferred_username,
+                email,
+                _SSO_SENTINEL_HASH,
+                display_name,
+            )
+            await emit_event(
+                conn,
+                "auth.user_provisioned",
+                actor_id=str(user_id),
+                payload={
+                    "auth_provider": "keycloak",
+                    "email": email,
+                    "issuer": issuer,
+                },
+            )
+            await conn.execute(
+                """
+                INSERT INTO external_identities (
+                    user_id, issuer, subject, email_snapshot
+                ) VALUES ($1, $2, $3, $4)
+                """,
+                user_id,
+                issuer,
+                subject,
+                email,
+            )
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
+    except asyncpg.UniqueViolationError:
+        # Same-subject concurrent provision is idempotent: the winner's
+        # binding now exists, so return it. An email collision on a
+        # declared authority domain is an adopt the pre-check missed
+        # (a concurrent signup raced us, or the address was claimed
+        # between the check and the insert): bind the winner's account
+        # instead of refusing. Any other uniqueness collision needs
+        # explicit administrative resolution.
+        #
+        # The loser's arrival is recorded when it refuses: like every
+        # other refusal, the note below is raised whether or not the
+        # record lands.
         bound = await _bound_external_user(conn, issuer, subject)
         if bound is not None:
             refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
+                issuer,
+                subject,
+            )
             return _resolved_external_user(refreshed, newly_provisioned=False)
-
-        if settings.keycloak_enrollment_mode == "invite_only":
-            # The broker has just verified this person and minted them a stable
-            # subject in this realm. That subject is the one value an exact
-            # binding needs and the one value nobody could name in advance, so
-            # it is written down here rather than discarded with the refusal.
-            # Recording never changes the answer: the refusal below is raised
-            # whether or not the note was taken.
-            await record_arrival(conn, issuer=issuer, subject=subject, claims=claims)
-            raise MembershipRequiredError()
-
-        email = (_optional_external_string(claims, "email") or "").strip().lower()
-        if not email:
-            raise AuthenticationError("Identity provider account has no email claim")
-        if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
-            raise AuthenticationError("Identity provider has not verified this email address")
-
-        raw_preferred_username = _optional_external_string(claims, "preferred_username")
-        preferred_username = (
-            raw_preferred_username.strip()
-            if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
-            else email.split("@", 1)[0]
-        )
-        display_name = _optional_external_string(claims, "name") or raw_preferred_username
-        user_id = uuid.uuid4()
-        try:
-            async with conn.transaction():
-                # Deliberately do not SELECT by email or username first. Their
-                # unique constraints are atomic collision guards, never
-                # identity resolution or account-linking inputs.
+        if domain is not None:
+            adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
+            if adopted is not None:
                 await conn.execute(
-                    """
-                    INSERT INTO users (
-                        id, username, email, password_hash, display_name,
-                        auth_provider, is_admin, account_status, account_kind
-                    )
-                    VALUES ($1, $2, $3, $4, $5, 'keycloak',
-                            false, 'active', 'human')
-                    """,
-                    user_id,
-                    preferred_username,
-                    email,
-                    _SSO_SENTINEL_HASH,
-                    display_name,
-                )
-                await emit_event(
-                    conn,
-                    "auth.user_provisioned",
-                    actor_id=str(user_id),
-                    payload={
-                        "auth_provider": "keycloak",
-                        "email": email,
-                        "issuer": issuer,
-                    },
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO external_identities (
-                        user_id, issuer, subject, email_snapshot
-                    ) VALUES ($1, $2, $3, $4)
-                    """,
-                    user_id,
+                    "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
                     issuer,
                     subject,
-                    email,
                 )
-        except asyncpg.UniqueViolationError:
-            # Same-subject concurrent JIT is idempotent. Any other uniqueness
-            # collision needs explicit administrative resolution.
-            bound = await _bound_external_user(conn, issuer, subject)
-            if bound is None:
-                raise ExternalIdentityConflictError() from None
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+                return adopted
+        raise ExternalIdentityConflictError() from None
 
-        row = await conn.fetchrow(
-            """
-            SELECT id, username, email, display_name, is_admin,
-                   tokens_revoked_before, auth_provider,
-                   account_status, account_kind
-              FROM users WHERE id = $1
-            """,
-            user_id,
-        )
-        _assert_active_human(row)
-        return _resolved_external_user(row, newly_provisioned=True)
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, display_name, is_admin,
+               tokens_revoked_before, auth_provider,
+               account_status, account_kind
+          FROM users WHERE id = $1
+        """,
+        user_id,
+    )
+    _assert_active_human(row)
+    return _resolved_external_user(row, newly_provisioned=True)
 
 
 @dataclass(frozen=True)
@@ -602,14 +853,22 @@ class ProjectionOutcome:
 
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
+    *,
+    provider_alias: str | None = None,
 ) -> ProjectionOutcome:
-    """Project a completely verified OIDC identity onto the AKB account path."""
+    """Project a completely verified OIDC identity onto the AKB account path.
+
+    ``provider_alias`` is the provider the browser flow selected and
+    verified (``None`` on the bearer paths, which pass none and therefore
+    stay on today's behaviour). It is the only key the authority-domain
+    decision reads — never a claim reinterpreted at this layer.
+    """
     claims = dict(principal.claims)
     try:
         issuer, subject = _external_identity_key(claims)
         if (issuer, subject) != (principal.issuer, principal.subject):
             return ProjectionOutcome(None, "identity_claims_inconsistent")
-        resolved = await _resolve_or_provision_keycloak_user(claims)
+        resolved = await _resolve_or_provision_keycloak_user(claims, provider_alias=provider_alias)
     except AKBError as e:
         logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
         return ProjectionOutcome(None, getattr(e, "code", None))
@@ -675,6 +934,7 @@ async def project_verified_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
+    provider_alias: str | None = None,
 ) -> AuthenticatedUser | None:
     """Common verified-human boundary before existing AKB authorization.
 
@@ -683,10 +943,15 @@ async def project_verified_principal(
     route alone. Defaulting it to False is what keeps the refusal
     fail-closed: a future caller of this boundary is gated unless it
     deliberately asks not to be.
+
+    ``provider_alias`` carries the browser flow's verified provider into
+    the keycloak projection only. ``None`` (the default every bearer path
+    keeps) disables the authority-domain decision entirely.
     """
     outcome = await project_verified_principal_with_reason(
         principal,
         for_credential_change=for_credential_change,
+        provider_alias=provider_alias,
     )
     return outcome.user
 
@@ -695,6 +960,7 @@ async def project_verified_principal_with_reason(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
+    provider_alias: str | None = None,
 ) -> ProjectionOutcome:
     """The same boundary, carrying the reason when it refuses.
 
@@ -711,7 +977,7 @@ async def project_verified_principal_with_reason(
             )
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
-        return await _project_keycloak_principal(principal)
+        return await _project_keycloak_principal(principal, provider_alias=provider_alias)
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(
             await _project_service_authority_principal(principal)
@@ -1018,7 +1284,7 @@ async def _revoke_sessions_in_conn(
     actor_id: str,
     reason: str,
 ) -> datetime:
-    """Bump tokens_revoked_before and emit auth.sessions_revoked.
+    """Advance the local session generation and emit auth.sessions_revoked.
 
     Caller MUST be inside ``async with conn.transaction()`` so the cutoff
     and the audit event commit atomically with whatever wrapping write
@@ -1027,7 +1293,8 @@ async def _revoke_sessions_in_conn(
     row = await conn.fetchrow(
         """
         UPDATE users
-           SET tokens_revoked_before = NOW(),
+           SET session_generation = session_generation + 1,
+               tokens_revoked_before = GREATEST(tokens_revoked_before, clock_timestamp()),
                updated_at = NOW()
          WHERE id = $1
      RETURNING tokens_revoked_before
@@ -1057,10 +1324,9 @@ async def revoke_all_sessions(
 ) -> datetime:
     """Invalidate every JWT issued to ``user_id`` before the call.
 
-    Returns the cutoff timestamp. Any JWT with ``iat`` strictly less than
-    this is rejected during local-session account projection. The caller's
-    own JWT is invalidated too — the response is the last action that token
-    can take.
+    Returns the monotonic audit cutoff timestamp for compatibility. Tokens
+    from any earlier generation (including claimless legacy sessions) are
+    rejected. The caller's current JWT is invalidated too.
 
     PATs are intentionally NOT touched. Mixing them would surprise
     pipelines that store a PAT and never expect "I changed my password"
@@ -1243,20 +1509,35 @@ async def resolve_token(authorization: str) -> AuthenticatedUser | None:
     return await resolve_rest_user_authorization(authorization)
 
 
+def local_session_generation_matches(
+    claims: Mapping[str, Any], *, generation: int, revoked_epoch_ceil: int,
+) -> bool:
+    """Accept pre-migration sessions only until this account first revokes.
+
+    A present generation is an exact integer, never bool/string/float. Its
+    equality with the stored counter is authoritative even across clock skew.
+    Migration 101's cutoff trigger also advances it for legacy revokers that
+    only update tokens_revoked_before; deploy that fence before new issuers.
+    """
+    if "session_generation" not in claims:
+        return generation == 0 and int(claims["iat"]) >= revoked_epoch_ceil
+    claimed = claims["session_generation"]
+    return type(claimed) is int and claimed >= 0 and claimed == generation
+
+
 async def _project_local_session_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
 ) -> AuthenticatedUser | None:
     """Project a verified local session onto its active AKB account."""
-    iat = principal.claims["iat"]
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, display_name, is_admin,
-                       credential_change_required,
+                       credential_change_required, session_generation,
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
@@ -1268,22 +1549,11 @@ async def _project_local_session_principal(
             if not row:
                 return None
 
-            # Server-side JWT revocation. The user can void every token
-            # they have by setting tokens_revoked_before = NOW(); any JWT
-            # whose iat predates that cutoff fails here even though the
-            # signature is valid and exp has not passed. This is the only
-            # mechanism to invalidate one leaked or stale session. Replacing
-            # the local-session verification keyset is the installation-wide
-            # forced-reauth mechanism, but is intentionally not a per-user
-            # revocation tool.
-            #
-            # JWT iat is whole-second (RFC 7519). tokens_revoked_before is
-            # sub-second TIMESTAMPTZ. To make same-second writes safe we
-            # compare against CEIL(epoch) — a revoke at 100.5s yields
-            # revoked_epoch_ceil=101, so any iat≤100 fails (rejected) and
-            # iat≥101 passes (post-sleep re-login). Without CEIL, a JWT
-            # issued in the same second as revoke would survive.
-            if int(iat) < int(row["revoked_epoch_ceil"]):
+            if not local_session_generation_matches(
+                principal.claims,
+                generation=row["session_generation"],
+                revoked_epoch_ceil=row["revoked_epoch_ceil"],
+            ):
                 return None
 
             # A credential this account was handed, and has not replaced,

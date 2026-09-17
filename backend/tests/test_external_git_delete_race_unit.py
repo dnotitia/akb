@@ -36,6 +36,7 @@ class _FakeState:
         # it ran on THIS connection inside the transaction — see _FakeConn.fetch.
         self.publication_deletes: list[tuple] = []
         self.lock_order: list[str] = []
+        self.sidecar_active = True
 
 
 class _FakeConn:
@@ -75,6 +76,10 @@ class _FakeConn:
             assert self._in_tx[0], "vault lifecycle lock ran OUTSIDE the transaction"
             self.state.lock_order.append("vault")
             return args[0]
+        if "FROM vault_external_git" in s and "sync_state = 'active'" in s:
+            assert self._in_tx[0], "sidecar fence ran OUTSIDE the transaction"
+            self.state.lock_order.append("sidecar")
+            return 1 if self.state.sidecar_active else None
         if s.startswith("DELETE FROM documents") and "RETURNING" in s:
             assert self._in_tx[0]
             row_id = args[0]
@@ -202,7 +207,7 @@ async def test_delete_external_path_normal_single_delete(monkeypatch):
     assert state.relation_deletes == [("v", "a.md")]
     assert state.decrements == [row["collection_id"]]
     assert state.events == ["document.delete"]
-    assert state.lock_order[:2] == ["vault", "document"]
+    assert state.lock_order[:3] == ["vault", "sidecar", "document"]
     assert state.select_sqls and all("FOR UPDATE" in s for s in state.select_sqls)
     # The publication cascade is app-level since migration 022 dropped
     # `publications.document_id`: without it the mirrored path's slug outlives
@@ -271,6 +276,30 @@ async def test_missing_row_is_a_noop(monkeypatch):
     assert state.decrements == []
     assert state.events == []
     assert state.publication_deletes == []
+
+
+@pytest.mark.asyncio
+async def test_quarantined_sidecar_refuses_direct_external_delete(monkeypatch):
+    """A stale poller cannot delete a row after retirement quarantines its sidecar."""
+    row = _row()
+    state = _wire(monkeypatch, row)
+    state.sidecar_active = False
+
+    outcome = await _svc()._delete_external_path(
+        vault_id=uuid.uuid4(),
+        vault_name="v",
+        path="a.md",
+        expected_blob=row["external_blob"],
+    )
+
+    assert outcome == "superseded"
+    assert state.row is not None
+    assert state.chunk_deletes == []
+    assert state.relation_deletes == []
+    assert state.decrements == []
+    assert state.events == []
+    assert state.publication_deletes == []
+    assert state.lock_order == ["vault", "sidecar"]
 
 
 @pytest.mark.asyncio

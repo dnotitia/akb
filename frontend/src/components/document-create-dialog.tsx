@@ -2,6 +2,9 @@ import { useEffect, useState, type CSSProperties, type RefObject } from "react";
 import { DocumentCreateForm } from "@/components/document-create-form";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { discardAsset } from "@/lib/api";
+import { clearDocumentDraft } from "@/lib/document-draft";
+import { useCurrentUser } from "@/contexts/current-user-context";
 
 export interface DocumentCreateDialogProps {
   open: boolean;
@@ -28,10 +31,13 @@ export function DocumentCreateDialog({
   returnFocusRef,
   desktopLeftOffset = 112,
 }: DocumentCreateDialogProps) {
+  const userId = useCurrentUser()?.user_id ?? "";
   const [dirty, setDirty] = useState(false);
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const [draftAssetIds, setDraftAssetIds] = useState<readonly string[]>([]);
+  const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>([]);
 
   useEffect(() => {
     if (open) return;
@@ -39,6 +45,8 @@ export function DocumentCreateDialog({
     setCreating(false);
     setUploading(false);
     setDiscardOpen(false);
+    setDraftAssetIds([]);
+    setUnclaimedAssetIds([]);
   }, [open]);
 
   function requestClose() {
@@ -87,6 +95,7 @@ export function DocumentCreateDialog({
         >
           {open && (
             <DocumentCreateForm
+              key={userId}
               vault={vault}
               initialCollection={initialCollection}
               onCreated={onCreated}
@@ -94,6 +103,8 @@ export function DocumentCreateDialog({
               onDirtyChange={setDirty}
               onCreatingChange={setCreating}
               onUploadingChange={setUploading}
+              onAssetIdsChange={setDraftAssetIds}
+              onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
             />
           )}
         </DialogContent>
@@ -110,7 +121,16 @@ export function DocumentCreateDialog({
         }
         confirmLabel="Discard draft"
         variant="destructive"
-        onConfirm={() => onOpenChange(false)}
+        onConfirm={async () => {
+          // Keep temporary uploads alive across an unexpected reload so the
+          // local draft can recover. An explicit discard is the authoritative
+          // cleanup path; the server TTL remains the fallback for failures.
+          await Promise.allSettled(
+            [...new Set([...draftAssetIds, ...unclaimedAssetIds])].map((assetId) => discardAsset(vault, assetId)),
+          );
+          clearDocumentDraft(userId, vault);
+          onOpenChange(false);
+        }}
       />
     </>
   );

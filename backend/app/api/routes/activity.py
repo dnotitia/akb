@@ -6,13 +6,16 @@ which are read-only views over git history rather than session
 management. The file was renamed accordingly.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from app.api.deps import get_current_user
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.revision_backend import get_revision_backend
 from app.services.user_directory import resolve_display_names
+from app.services.recent_cursor import decode_cursor, encode_cursor
 from app.models.activity import (
     AkbActivityEnvelope,
     AkbDocumentDiffEnvelope,
@@ -90,19 +93,36 @@ async def recent_changes(
     vault: str | None = Query(None, description="Limit to a single vault"),
     limit: int = Query(20, ge=1, le=100),
     user: AuthenticatedUser = Depends(get_current_user),
+    scope: Literal["all", "watching"] = "all",
+    cursor: str | None = None,
+    response: Response = None,  # type: ignore[assignment]  # Direct internal calls omit the HTTP response.
 ):
     """Return recent document updates for the user.
 
-    When `vault` is given, returns docs from that vault only (after access
-    check). Otherwise, returns docs from every vault the user owns or has
-    been granted access to. Documents are sorted by `updated_at DESC`.
+    When `vault` is given, it is access-checked before querying. Otherwise
+    the feed spans currently readable vaults, including public vaults.
+    `watching` requires a human session and filters current subscriptions
+    before pagination; it is latest document state, not notification history.
+    A UUID tie-breaker makes equal update timestamps safe to paginate.
+    Reading this feed never modifies notification read state.
     """
+    if response is not None:
+        response.headers["Cache-Control"] = "private, no-store"
+    if scope == "watching":
+        from app.api.routes.notifications import human_user
+
+        await human_user(user)
+    boundary = decode_cursor(cursor, scope, vault)
     if vault:
         await check_vault_access(user.user_id, vault, required_role="reader")
     changes = await revision_backend.recent_changes(
-        user.user_id, vault=vault, limit=limit,
+        user.user_id, vault=vault, limit=limit + 1, watching=scope == "watching",
+        before=boundary,
     )
-    return {"kind": "recent_changes", "changes": changes}
+    page = changes[:limit]
+    next_cursor = encode_cursor(page[-1], scope, vault) if len(changes) > limit else None
+    return {"kind": "recent_changes", "changes": page, "scope": scope,
+            "next_cursor": next_cursor}
 
 
 @router.get(

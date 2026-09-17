@@ -73,7 +73,7 @@ itAsync("initialize falls back to a default protocol version when omitted", asyn
   assert.match(res.result.protocolVersion, /^\d{4}-\d{2}-\d{2}$/);
 });
 
-itAsync("initialize rejects an unsupported protocol version instead of echoing it", async () => {
+itAsync("initialize negotiates down to the supported version instead of echoing an unsupported one", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   const res = await proxy._initialize(1, {
@@ -81,13 +81,17 @@ itAsync("initialize rejects an unsupported protocol version instead of echoing i
     capabilities: {},
   });
 
-  assert.equal(res.error.code, -32602);
-  assert.deepEqual(res.error.data.supported, ["2025-06-18"]);
-  assert.equal(res.result, undefined);
-  assert.equal(proxy._initialized, false);
+  // Spec-compliant negotiation: respond with OUR supported revision, never
+  // echo a revision we do not implement, and never hard-error — a hard error
+  // breaks any client offering a different revision (e.g. Claude Code's
+  // 2025-11-25 initialize).
+  assert.equal(res.error, undefined);
+  assert.equal(res.result.protocolVersion, "2025-06-18");
+  assert.notEqual(res.result.protocolVersion, "2099-01-01");
+  assert.equal(proxy._initialized, true);
 });
 
-itAsync("backend initialize negotiates vault-guide preflight without dropping client capabilities", async () => {
+itAsync("backend modern discovery carries vault-guide preflight without dropping client capabilities", async () => {
   const proxy = newProxy();
   const original = {
     protocolVersion: "2025-06-18",
@@ -97,22 +101,31 @@ itAsync("backend initialize negotiates vault-guide preflight without dropping cl
     },
     clientInfo: { name: "client", version: "1" },
   };
-  proxy._clientInitParams = original;
+  proxy._clientCapabilities = original.capabilities;
+  proxy._clientInfo = original.clientInfo;
   let forwarded;
-  proxy._rpc = async (method, params) => {
-    assert.equal(method, "initialize");
-    forwarded = params;
-    return {};
+  proxy._rpc = async (method, params, options) => {
+    assert.equal(method, "server/discover");
+    assert.equal(options.protocolMode, "modern");
+    forwarded = proxy._modernizeParams(params);
+    return { supportedVersions: ["2026-07-28"] };
   };
 
   assert.equal(await proxy._ensureBackend(), true);
-  assert.deepEqual(forwarded.capabilities.roots, { listChanged: true });
   assert.deepEqual(
-    forwarded.capabilities.experimental["example.test/feature"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].roots,
+    { listChanged: true },
+  );
+  assert.deepEqual(
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "example.test/feature"
+    ],
     { version: 2 },
   );
   assert.deepEqual(
-    forwarded.capabilities.experimental["io.dnotitia.akb/vault-skill-preflight"],
+    forwarded._meta["io.modelcontextprotocol/clientCapabilities"].experimental[
+      "io.dnotitia.akb/vault-skill-preflight"
+    ],
     { version: 2 },
   );
   assert.equal(
@@ -165,6 +178,22 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
     !proxy._cachedTools.tools[0].inputSchema.properties.file,
     "cached tool schema left untouched",
   );
+});
+
+itAsync("modern tools/list cache metadata covers degraded and cached catalogs", async () => {
+  const proxy = newProxy();
+  proxy._clientGeneration = "modern";
+  proxy._startBackendMonitor = () => {};
+  proxy._ensureBackend = async () => false;
+
+  const degraded = await proxy._toolsList(4, {});
+  assert.equal(degraded.result.ttlMs, 0, "degraded catalog expires immediately");
+  assert.equal(degraded.result.cacheScope, "private", "degraded catalog is private");
+
+  proxy._cachedTools = { tools: [{ name: "akb_search", inputSchema: { type: "object" } }] };
+  const cached = await proxy._toolsList(5, {});
+  assert.equal(cached.result.ttlMs, 0, "cached catalog expires immediately");
+  assert.equal(cached.result.cacheScope, "private", "cached catalog is private");
 });
 
 // ── background monitor recovers the toolset after an outage ──────────

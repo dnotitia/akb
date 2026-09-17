@@ -19,6 +19,8 @@ import { Logo } from "@/components/logo";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 
 export default function PublicationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -94,13 +96,7 @@ export default function PublicationPage() {
   }
 
   if (!data) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background text-foreground">
-        <div className="text-sm text-foreground-muted" role="status" aria-live="polite">
-          Loading…
-        </div>
-      </div>
-    );
+    return <PublicationPageLoading />;
   }
 
   return (
@@ -174,6 +170,47 @@ export default function PublicationPage() {
         </div>
       </footer>
     </div>
+  );
+}
+
+function PublicationPageLoading() {
+  return (
+    <LoadingState label="Loading publication" className="min-h-screen bg-background text-foreground">
+      <div className="min-h-screen">
+        <header className="border-b border-border">
+          <div className="mx-auto flex max-w-[1200px] items-center justify-between gap-4 px-6 py-3">
+            <Logo size={26} subtitle />
+            <div className="flex items-center gap-3">
+              <Skeleton className="h-6 w-14 rounded-full" />
+              <Skeleton className="h-9 w-9 rounded-full" />
+            </div>
+          </div>
+        </header>
+        <main className="mx-auto grid max-w-[1200px] grid-cols-1 gap-8 px-6 py-12 lg:grid-cols-[180px_1fr]">
+          <aside className="space-y-5">
+            {[0, 1, 2].map((item) => (
+              <div key={item} className="space-y-2">
+                <Skeleton className="h-3 w-16 rounded-[var(--radius-sm)]" />
+                <Skeleton className="h-5 w-28 rounded-[var(--radius-sm)]" />
+              </div>
+            ))}
+          </aside>
+          <article className="min-w-0">
+            <Skeleton className="h-3 w-32 rounded-[var(--radius-sm)]" />
+            <Skeleton className="mt-5 h-10 w-3/5 rounded-[var(--radius-md)]" />
+            <Skeleton className="mt-3 h-4 w-44 rounded-[var(--radius-sm)]" />
+            <div className="mt-10 space-y-4">
+              <Skeleton className="h-5 w-full rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-5 w-11/12 rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-5 w-4/5 rounded-[var(--radius-sm)]" />
+              <Skeleton className="mt-8 h-7 w-2/5 rounded-[var(--radius-md)]" />
+              <Skeleton className="h-5 w-full rounded-[var(--radius-sm)]" />
+              <Skeleton className="h-5 w-5/6 rounded-[var(--radius-sm)]" />
+            </div>
+          </article>
+        </main>
+      </div>
+    </LoadingState>
   );
 }
 

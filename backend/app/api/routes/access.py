@@ -1,9 +1,11 @@
 """REST API routes for vault access management."""
 
+from datetime import datetime
 from typing import Literal
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import ConfigDict, Field, SecretStr
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from app.api.deps import get_current_user
 from app.config import settings
@@ -35,7 +37,7 @@ from app.services.access_service import (
     add_vault_write_grant,
     archive_vault,
     bootstrap_vault_write_policy,
-    delete_user_account,
+    delete_other_user_account,
     delete_vault,
     get_vault_info,
     explain_vault_access,
@@ -59,6 +61,8 @@ from app.services.admission_service import (
     list_pending_admissions,
 )
 from app.util.text import NFCModel
+from app.services import audit_log
+from app.services.workspace_summary import MAX_SAFE_COUNT, get_workspace_summary
 
 
 def _require_admin(user: AuthenticatedUser) -> None:
@@ -229,6 +233,27 @@ async def my_vaults(user: AuthenticatedUser = Depends(get_current_user)):
     return {"vaults": await list_accessible_vaults(user.user_id)}
 
 
+class WorkspaceSummaryResponse(NFCModel):
+    version: Literal[1]
+    scope: Literal["accessible"]
+    observed_at: datetime
+    vault_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    document_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    table_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+    file_count: int | None = Field(default=None, ge=0, le=MAX_SAFE_COUNT)
+
+
+@router.get(
+    "/my/workspace-summary",
+    summary="Count resources across vaults accessible to me",
+    response_model=WorkspaceSummaryResponse,
+    response_model_exclude_none=True,
+)
+async def workspace_summary(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
+    response.headers["Cache-Control"] = "private, no-store"
+    return await get_workspace_summary(user.user_id)
+
+
 @router.get("/vaults/{vault}/info", summary="Get vault details")
 async def vault_info(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
     return await get_vault_info(user.user_id, vault)
@@ -242,17 +267,36 @@ async def vault_members(vault: str, user: AuthenticatedUser = Depends(get_curren
 @router.post("/vaults/{vault}/grant", summary="Grant vault access to a user")
 async def grant(vault: str, req: GrantRequest, user: AuthenticatedUser = Depends(get_current_user)):
     kwargs = {} if req.source_key is None else {"source_key": req.source_key}
-    return await grant_access(
-        user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs,
+    return await _audited_access(
+        "akb_grant", {"vault": vault, **req.model_dump(exclude_none=True)}, user,
+        grant_access(user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs),
     )
 
 
 @router.post("/vaults/{vault}/revoke", summary="Revoke vault access from a user")
 async def revoke(vault: str, req: RevokeRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    return await revoke_access(
-        user.user_id, vault, req.user,
-        source_key=req.source_key, revision=req.revision,
+    return await _audited_access(
+        "akb_revoke", {"vault": vault, **req.model_dump()}, user,
+        revoke_access(user.user_id, vault, req.user, source_key=req.source_key, revision=req.revision),
     )
+
+
+async def _audited_access(name, args, user, operation):
+    """Use the existing API audit producer for REST's two access operations.
+
+    The canonical action matches MCP; transport metadata identifies REST.
+    Domain events remain separate. Preserve the handler's result or exception,
+    and never copy exception messages (which may contain private details).
+    """
+    result = {"error": True, "code": "interrupted"}
+    try:
+        result = await operation
+        return result
+    except Exception as error:
+        result = {"error": True, "code": getattr(error, "code", None)}
+        raise
+    finally:
+        audit_log.record_tool(name, args, user, result, is_write=True, protocol={"transport": "rest"})
 
 
 @router.get(
@@ -311,12 +355,58 @@ async def delete_vault_route(
     return await delete_vault(user.user_id, vault)
 
 
-@router.delete("/my/account", summary="Delete my account and all owned vaults")
+class SessionRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_user_id: uuid.UUID
+
+
+class AccountDeletionRequest(SessionRevocationRequest, NFCModel):
+    # Match registration/login normalization before wrapping the password in SecretStr.
+    confirm_username: str = Field(min_length=1, max_length=255)
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+
+
+@router.get("/my/account/lifecycle", summary="Inspect my account lifecycle capabilities and effects")
+async def my_account_lifecycle(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
+    from app.services.account_self_service import lifecycle
+    response.headers["Cache-Control"] = "no-store"
+    return await lifecycle(user)
+
+
+@router.get("/my/account/deletion-blockers", summary="Page through my owned vaults")
+async def my_account_deletion_blockers(
+    response: Response,
+    cursor: uuid.UUID | None = None,
+    limit: int = Query(20, ge=1, le=100),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import deletion_blockers
+    response.headers["Cache-Control"] = "no-store"
+    return await deletion_blockers(user, cursor=cursor, limit=limit)
+
+
+@router.post("/my/account/session-revocations", summary="End all my local login sessions")
+async def revoke_my_account_sessions(
+    req: SessionRevocationRequest, user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import revoke_sessions
+    return await revoke_sessions(user, req.expected_user_id)
+
+
+@router.post("/my/account/deletion", summary="Delete my account without deleting owned vaults")
+async def delete_my_account_safely(
+    req: AccountDeletionRequest, user: AuthenticatedUser = Depends(get_current_user),
+):
+    from app.services.account_self_service import delete_account
+    return await delete_account(user, req.expected_user_id, req.confirm_username, req.current_password.get_secret_value())
+
+
+@router.delete("/my/account", summary="Retired unsafe self-delete contract", deprecated=True)
 async def delete_my_account(user: AuthenticatedUser = Depends(get_current_user)):
-    """Self-delete: removes all owned vaults (cascading to chunks, Git repo,
-    the vector store, S3 files, etc.), detaches residual FK references in other
-    users' vaults, then deletes the user row."""
-    return await delete_user_account(user.user_id)
+    raise HTTPException(410, detail={
+        "code": "account_deletion_contract_required",
+        "message": "Review GET /my/account/lifecycle and confirm through POST /my/account/deletion.",
+    })
 
 
 @router.get("/users/search", summary="Search users")
@@ -800,9 +890,11 @@ async def admin_delete_user(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     _require_admin(user)
-    if user_id == user.user_id:
-        raise HTTPException(status_code=400, detail="Use DELETE /my/account to delete your own account")
-    return await delete_user_account(user_id)
+    try:
+        target_id = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(422, "Invalid user ID") from None
+    return await delete_other_user_account(str(target_id), actor_id=user.user_id)
 
 
 @router.post(

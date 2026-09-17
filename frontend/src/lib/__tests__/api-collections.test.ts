@@ -148,7 +148,7 @@ describe("deleteCollection — 409 non-empty", () => {
     }
   });
 
-  it("falls back to plain Error when detail is a string", async () => {
+  it("preserves HTTP status when detail is a string", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ detail: "boom" }, { status: 400 }),
     );
@@ -157,7 +157,8 @@ describe("deleteCollection — 409 non-empty", () => {
       throw new Error("expected throw");
     } catch (e) {
       expect(e).toBeInstanceOf(Error);
-      expect(e).not.toBeInstanceOf(ApiError);
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as ApiError).status).toBe(400);
       expect((e as Error).message).toBe("boom");
     }
   });

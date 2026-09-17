@@ -16,6 +16,10 @@ async def test_pending_stats_releases_chunk_connection_before_delete_stats(monke
                 "retrying": 2,
                 "abandoned": 3,
                 "indexed": 4,
+                # The aggregate also carries the queue head's enqueue time.
+                # NULL here (an empty queue), so `pending_stats` omits the key
+                # and this test keeps asserting only what it is about.
+                "oldest_pending": None,
             }
 
     class FakeAcquire:

@@ -13,13 +13,13 @@ from app.exceptions import ConflictError, ForbiddenError, NotFoundError, Validat
 from app.services.access_service import check_vault_access
 from app.services.app_identity_service import record_app_audit
 from app.services.app_inventory_service import expected_schema_fingerprint
+from app.services.app_rollout_service import validate_manifest
 from app.services.app_resource_service import (
     canonical_json,
     canonical_table_fingerprint,
     fetch_allowlisted_tables,
     lock_app_vault_pair,
     lock_table_mutation,
-    normalize_fingerprint,
     normalize_table_allowlist,
     table_ownership,
 )
@@ -31,7 +31,6 @@ _REASONS = {
     "ownership_conflict",
     "installation_exists",
     "release_fingerprint_missing",
-    "release_fingerprint_mismatch",
     "fingerprint_mismatch",
     "fingerprint_changed",
     "created",
@@ -90,6 +89,8 @@ def normalize_adoption_targets(targets: list[dict[str, Any]]) -> list[dict[str, 
     for target in targets:
         if not isinstance(target, dict):
             raise ValidationError("each adoption target must be an object")
+        if set(target) - {"vault_id", "table_allowlist"}:
+            raise ValidationError("adoption target contains an unsupported field")
         raw_vault_id = target.get("vault_id")
         if not isinstance(raw_vault_id, (str, uuid.UUID)):
             raise ValidationError("vault_id must be a UUID")
@@ -97,19 +98,14 @@ def normalize_adoption_targets(targets: list[dict[str, Any]]) -> list[dict[str, 
         if vault_id in seen_vaults:
             raise ValidationError("targets must contain each Vault only once")
         seen_vaults.add(vault_id)
-        raw_tables = target.get("table_allowlist", target.get("tables"))
+        raw_tables = target.get("table_allowlist")
         if not isinstance(raw_tables, list):
             raise ValidationError("table allowlist must be an array")
         tables = normalize_table_allowlist(cast(list[str], raw_tables))
-        raw_expected = target.get("expected_schema_fingerprint")
-        if not isinstance(raw_expected, str):
-            raise ValidationError("expected_schema_fingerprint must be a SHA-256 checksum")
-        expected = normalize_fingerprint(raw_expected, field="expected_schema_fingerprint")
         normalized.append(
             {
                 "vault_id": str(vault_id),
                 "table_allowlist": tables,
-                "expected_schema_fingerprint": expected,
             }
         )
     normalized.sort(key=lambda item: item["vault_id"])
@@ -264,12 +260,9 @@ async def _fetch_preflight(
         app_id,
         vault_id,
     )
-    release_expected_raw = expected_schema_fingerprint(release["manifest"])
-    # Release manifests accept the registry's case-insensitive hex form;
-    # adoption fingerprints are canonicalized to lowercase before comparison.
-    release_expected = (
-        release_expected_raw.lower() if release_expected_raw is not None else None
-    )
+    # v2 derives the expected baseline from the complete desired projection;
+    # the operator does not supply a second, independently trusted checksum.
+    release_expected = expected_schema_fingerprint(release["manifest"])
     reason: str | None = None
     if missing:
         reason = "missing_table"
@@ -279,9 +272,7 @@ async def _fetch_preflight(
         reason = "installation_exists"
     elif release_expected is None:
         reason = "release_fingerprint_missing"
-    elif release_expected != target["expected_schema_fingerprint"]:
-        reason = "release_fingerprint_mismatch"
-    elif actual_fingerprint != target["expected_schema_fingerprint"]:
+    elif actual_fingerprint != release_expected:
         reason = "fingerprint_mismatch"
 
     planned_metadata = {
@@ -301,6 +292,7 @@ async def _fetch_preflight(
         },
     }
     return {
+        "expected_schema_fingerprint": release_expected,
         "actual_schema_fingerprint": actual_fingerprint,
         "included_tables": sorted(found_names),
         "excluded_tables": [],
@@ -499,11 +491,11 @@ async def create_legacy_adoption(
                     result["replayed"] = True
                 else:
                     app = await conn.fetchrow(
-                        "SELECT id FROM app_definitions WHERE id = $1", app_uuid
+                        "SELECT id, app_key FROM app_definitions WHERE id = $1", app_uuid
                     )
                     release = await conn.fetchrow(
                         """
-                        SELECT id, app_id, version, manifest
+                        SELECT id, app_id, version, manifest, manifest_checksum
                           FROM app_releases
                          WHERE app_id = $1 AND id = $2
                         """,
@@ -512,6 +504,15 @@ async def create_legacy_adoption(
                     )
                     if app is None or release is None:
                         raise NotFoundError("App or release", "not found")
+                    validated_manifest = validate_manifest(
+                        release["manifest"],
+                        release["manifest_checksum"],
+                        version=release["version"],
+                    )
+                    if validated_manifest["app_key"] != app["app_key"]:
+                        raise ConflictError(
+                            "Release manifest app_key does not match the app definition"
+                        )
                     plan = await conn.fetchrow(
                         """
                         INSERT INTO app_legacy_adoption_plans
@@ -552,7 +553,7 @@ async def create_legacy_adoption(
                             uuid.UUID(target["vault_id"]),
                             index,
                             json.dumps(target["table_allowlist"], separators=(",", ":")),
-                            target["expected_schema_fingerprint"],
+                            preflight["expected_schema_fingerprint"],
                             preflight["actual_schema_fingerprint"],
                             json.dumps(preflight["included_tables"], separators=(",", ":")),
                             json.dumps(preflight["excluded_tables"], separators=(",", ":")),
@@ -699,7 +700,6 @@ async def _apply_target(
                 target = {
                     "vault_id": str(target_row["vault_id"]),
                     "table_allowlist": _json_list(target_row["table_allowlist"]),
-                    "expected_schema_fingerprint": target_row["expected_schema_fingerprint"],
                 }
                 preflight = await _fetch_preflight(
                     conn,

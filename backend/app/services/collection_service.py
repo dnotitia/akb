@@ -15,7 +15,7 @@ import uuid
 import asyncpg
 
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, NotFoundError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
@@ -184,6 +184,7 @@ class CollectionService:
         path: str,
         recursive: bool,
         agent_id: str | None,
+        allow_table_delete: bool = False,
     ) -> dict:
         """Delete a collection using **prefix semantics** over the path.
 
@@ -206,8 +207,10 @@ class CollectionService:
         - Cascade mode (`recursive=True`): delete everything at and
           under `P` — all sub-collection rows + all docs (one git
           commit) + all files (s3 outbox) + the row at `P` if it
-          exists. Returns `{ok, collection, deleted_docs,
-          deleted_files, deleted_sub_collections}`.
+          exists. If the prefix contains a table, the caller must pass
+          the admin-derived `allow_table_delete` capability. Returns
+          `{ok, collection, deleted_docs, deleted_files,
+          deleted_sub_collections, deleted_tables}`.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -296,6 +299,18 @@ class CollectionService:
                         len(docs), len(files), len(sub_rows), len(tables),
                     )
 
+                # A table DROP is admin-only on the dedicated table endpoint.
+                # Enforce the same boundary here *after* taking the collection
+                # snapshot and *before* any mutation so a writer cannot bypass
+                # it by recursively deleting the containing collection. The
+                # capability is resolved by the authenticated boundary; this
+                # service never trusts a client-supplied role string.
+                if recursive and tables and not allow_table_delete:
+                    raise ForbiddenError(
+                        "Deleting a collection that contains tables requires "
+                        f"'admin' role on vault '{vault}'"
+                    )
+
                 # ── PG cleanup (same TX, locks still held) ──────
                 # Git happens AFTER the TX commits — see the
                 # comment above. Doing it here would mean we hold
@@ -323,9 +338,15 @@ class CollectionService:
                     # snapshot was taken without a document row lock
                     # (`list_docs_under`), so a concurrent move could have
                     # changed the path since. See the method's docstring.
-                    await doc_repo.delete_with_publications(
+                    deleted = await doc_repo.delete_with_publications(
                         conn, doc_id=d["id"], vault_id=vault_id,
                     )
+                    if deleted:
+                        from app.services.notification_producer import enqueue_document_change
+                        await enqueue_document_change(
+                            conn, "document.delete", source_key=f"collection-delete:{uuid.uuid4()}",
+                            vault_id=vault_id, resource_id=d["id"], actor_username=agent_id,
+                        )
 
                 # Per-file cost: edges + chunk outbox + s3 outbox +
                 # vault_files row delete = ~4 round-trips. Acceptable

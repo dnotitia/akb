@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Download } from "lucide-react";
 import { JsonTree } from "@/components/json-tree";
 import { Alert } from "@/components/ui/alert";
 import { CopyButton } from "@/components/ui/copy-button";
+import { LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   publicationDownloadUrl,
   publicationRawUrl,
   type PublicationResponse,
 } from "@/lib/api";
+import {
+  effectiveFileMime,
+  filePreviewKind,
+  formatFileSize,
+} from "@/lib/file-preview";
 
 // Cap inline text/JSON previews so a multi-MB file can't freeze the tab; the
 // full file is always available via the download link.
@@ -22,10 +30,11 @@ export function FileViewer({ slug, data }: Props) {
   // application/octet-stream (legacy uploads from proxy <0.5.1), derive one
   // from the filename extension so preview still works.
   const rawMime = data.mime_type || "";
-  const mime = effectiveMime(rawMime, data.name || "");
+  const mime = effectiveFileMime(rawMime, data.name || "");
   const downloadUrl = publicationDownloadUrl(slug);
   const rawUrl = publicationRawUrl(slug);
-  const kind = pickKind(mime);
+  const kind = filePreviewKind(mime);
+  const kindLabel = kind.charAt(0).toUpperCase() + kind.slice(1);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[180px_1fr] gap-8">
@@ -38,7 +47,7 @@ export function FileViewer({ slug, data }: Props) {
         <div>
           <div className="coord mb-1">Format</div>
           <div className="text-sm font-medium font-mono break-all">
-            {kind.toUpperCase()}
+            {kindLabel}
           </div>
           <div className="coord mt-1 break-all">{mime || "—"}</div>
         </div>
@@ -46,7 +55,7 @@ export function FileViewer({ slug, data }: Props) {
           <div>
             <div className="coord mb-1">Size</div>
             <div className="font-display text-2xl font-semibold tracking-tight text-foreground">
-              {formatSize(data.size_bytes)}
+              {formatFileSize(data.size_bytes)}
             </div>
           </div>
         )}
@@ -63,16 +72,17 @@ export function FileViewer({ slug, data }: Props) {
           <a
             href={downloadUrl}
             download={data.name}
-            className="inline-block coord-spark underline rounded-[var(--radius-sm)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            className="inline-flex items-center gap-1.5 rounded-[var(--radius-sm)] text-sm font-medium text-link underline underline-offset-4 transition-token hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           >
-            ↓ Download original
+            <Download className="h-4 w-4" aria-hidden />
+            Download original
           </a>
         </div>
       </aside>
 
       {/* Main column */}
       <div className="min-w-0">
-        <div className="coord-spark mb-4">File · {kind.toUpperCase()}</div>
+        <div className="coord mb-4">File · {kindLabel}</div>
         <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground mb-2 break-words">
           {data.title || data.name}
         </h1>
@@ -86,10 +96,10 @@ export function FileViewer({ slug, data }: Props) {
               ⊞ Preview
             </span>
             <span className="coord-ink">
-              {kind.toUpperCase()}
+              {kindLabel}
             </span>
           </div>
-          <FileBody
+          <FilePreviewBody
             mime={mime}
             // Images/PDFs render inline from the same-origin proxy (not a
             // presigned S3 URL) so the vault name never leaks and the view stays
@@ -111,7 +121,7 @@ interface FileBodyProps {
   name: string;
 }
 
-function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
+export function FilePreviewBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
   if (!directUrl) {
     return (
       <div className="p-8 text-center">
@@ -125,14 +135,7 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
   }
 
   if (mime === "application/pdf") {
-    return (
-      <embed
-        src={directUrl}
-        type="application/pdf"
-        aria-label={name || "PDF preview"}
-        className="w-full h-[80vh]"
-      />
-    );
+    return <PdfFileBody directUrl={directUrl} name={name} />;
   }
 
   if (mime === "text/html") {
@@ -149,10 +152,10 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
 
   return (
     <div className="p-12 text-center">
-      <div className="coord mb-2">— Preview unavailable —</div>
+      <p className="mb-2 text-sm font-medium text-foreground">Preview unavailable</p>
       <p className="text-sm text-foreground-muted">
         No inline view for <code className="font-mono">{mime || "this format"}</code>.
-        Use the download link in the side rail.
+        Download the original file to open it locally.
       </p>
     </div>
   );
@@ -160,25 +163,54 @@ function FileBody({ mime, directUrl, rawUrl, name }: FileBodyProps) {
 
 function ImageFileBody({ directUrl, name }: { directUrl: string; name: string }) {
   const [failed, setFailed] = useState(false);
+  const [loading, setLoading] = useState(true);
   if (failed) {
     return (
       <div className="p-12 text-center">
-        <div className="coord mb-2">— Preview failed —</div>
+        <p className="mb-2 text-sm font-medium text-foreground">Preview failed</p>
         <p className="text-sm text-foreground-muted">
-          The image couldn't be loaded. Use the download link in the side rail.
+          The image couldn't be loaded. Download the original file to open it locally.
         </p>
       </div>
     );
   }
   return (
-    <div className="flex justify-center bg-surface-2 p-6 min-h-[12rem]">
+    <div className="relative flex min-h-[12rem] justify-center bg-surface-2 p-6">
+      {loading && (
+        <LoadingState label="Loading image preview" className="absolute inset-0 p-6">
+          <Skeleton className="h-full min-h-40 w-full rounded-[var(--radius-md)]" />
+        </LoadingState>
+      )}
       <img
         src={directUrl}
         alt={name || "File preview image"}
         loading="lazy"
         decoding="async"
-        onError={() => setFailed(true)}
-        className="max-w-full max-h-[80vh] object-contain"
+        onLoad={() => setLoading(false)}
+        onError={() => {
+          setLoading(false);
+          setFailed(true);
+        }}
+        className={loading ? "max-h-[80vh] max-w-full object-contain opacity-0" : "max-h-[80vh] max-w-full object-contain"}
+      />
+    </div>
+  );
+}
+
+function PdfFileBody({ directUrl, name }: { directUrl: string; name: string }) {
+  const [loading, setLoading] = useState(true);
+  return (
+    <div className="relative min-h-[80vh]">
+      {loading && (
+        <LoadingState label="Loading PDF preview" className="absolute inset-0 p-4">
+          <Skeleton className="h-full w-full rounded-[var(--radius-md)]" />
+        </LoadingState>
+      )}
+      <iframe
+        src={directUrl}
+        title={name || "PDF preview"}
+        className="h-[80vh] w-full"
+        onLoad={() => setLoading(false)}
       />
     </div>
   );
@@ -186,6 +218,7 @@ function ImageFileBody({ directUrl, name }: { directUrl: string; name: string })
 
 function HtmlFileBody({ rawUrl, name }: { rawUrl: string; name: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [loading, setLoading] = useState(true);
   // contentWidth is measured once per document load; resize just re-scales.
   const contentWidthRef = useRef<number | null>(null);
   const lastWidthRef = useRef<number>(0);
@@ -252,6 +285,7 @@ function HtmlFileBody({ rawUrl, name }: { rawUrl: string; name: string }) {
 
   // Invalidate the cached width when a new document loads (e.g. src change).
   const onLoad = useCallback(() => {
+    setLoading(false);
     contentWidthRef.current = null;
     lastWidthRef.current = 0;
     applyFit();
@@ -269,7 +303,13 @@ function HtmlFileBody({ rawUrl, name }: { rawUrl: string; name: string }) {
   }, [applyFit]);
 
   return (
-    <iframe
+    <div className="relative min-h-[80vh]">
+      {loading && (
+        <LoadingState label="Loading HTML preview" className="absolute inset-0 p-4">
+          <Skeleton className="h-full w-full rounded-[var(--radius-md)]" />
+        </LoadingState>
+      )}
+      <iframe
       ref={iframeRef}
       src={rawUrl}
       // Untrusted user-uploaded HTML. No allow-scripts (content stays inert) and
@@ -280,15 +320,16 @@ function HtmlFileBody({ rawUrl, name }: { rawUrl: string; name: string }) {
       // a soft risk — the durable fix is serving /raw from a separate sandboxed
       // origin or with CSP sandbox, backend-side.
       sandbox="allow-same-origin"
-      className="w-full h-[80vh]"
-      title={name || "HTML file preview"}
-      onLoad={onLoad}
-    />
+        className="h-[80vh] w-full"
+        title={name || "HTML file preview"}
+        onLoad={onLoad}
+      />
+    </div>
   );
 }
 
 function JsonFileBody({ url }: { url: string }) {
-  const [json, setJson] = useState<any>(null);
+  const [json, setJson] = useState<unknown>(undefined);
   const [error, setError] = useState("");
   useEffect(() => {
     let cancelled = false;
@@ -299,7 +340,7 @@ function JsonFileBody({ url }: { url: string }) {
     return () => { cancelled = true; };
   }, [url]);
   if (error) return <Alert variant="destructive" className="m-4">{error}</Alert>;
-  if (json === null) return <div className="p-4 coord" role="status" aria-live="polite">Loading…</div>;
+  if (json === undefined) return <FileBodyLoading label="Loading JSON preview" />;
   return (
     <div className="font-mono text-sm overflow-auto p-4 max-h-[80vh]">
       <JsonTree data={json} />
@@ -328,7 +369,7 @@ function TextFileBody({ url }: { url: string }) {
     return () => { cancelled = true; };
   }, [url]);
   if (error) return <Alert variant="destructive" className="m-4">{error}</Alert>;
-  if (text === null) return <div className="p-4 coord" role="status" aria-live="polite">Loading…</div>;
+  if (text === null) return <FileBodyLoading label="Loading text preview" />;
   return (
     <>
       {truncated && (
@@ -341,44 +382,16 @@ function TextFileBody({ url }: { url: string }) {
   );
 }
 
-function pickKind(mime: string): string {
-  if (mime.startsWith("image/")) return "image";
-  if (mime === "application/pdf") return "pdf";
-  if (mime === "application/json") return "json";
-  if (mime === "text/html") return "html";
-  if (mime.startsWith("text/")) return "text";
-  return "binary";
-}
-
-// Derive a usable MIME from filename extension when the stored mime_type is
-// missing or the generic application/octet-stream. Only overrides when the
-// stored value is non-informative — an explicit mime wins.
-const EXT_TO_MIME: Record<string, string> = {
-  html: "text/html", htm: "text/html",
-  pdf: "application/pdf",
-  json: "application/json", xml: "application/xml",
-  txt: "text/plain", md: "text/markdown", log: "text/plain",
-  csv: "text/csv", tsv: "text/tab-separated-values",
-  css: "text/css", js: "text/javascript", mjs: "text/javascript",
-  yaml: "application/yaml", yml: "application/yaml",
-  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-  gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
-  bmp: "image/bmp", ico: "image/x-icon",
-  mp3: "audio/mpeg", wav: "audio/wav",
-  mp4: "video/mp4", webm: "video/webm",
-};
-
-function effectiveMime(mime: string, name: string): string {
-  if (mime && mime !== "application/octet-stream") return mime;
-  const dot = name.lastIndexOf(".");
-  if (dot < 0) return mime || "application/octet-stream";
-  const ext = name.slice(dot + 1).toLowerCase();
-  return EXT_TO_MIME[ext] || mime || "application/octet-stream";
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+function FileBodyLoading({ label }: { label: string }) {
+  return (
+    <LoadingState label={label} className="min-h-52 bg-surface p-4">
+      <div className="space-y-3">
+        <Skeleton className="h-4 w-2/5 rounded-[var(--radius-sm)]" />
+        <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+        <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
+        <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
+        <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+      </div>
+    </LoadingState>
+  );
 }

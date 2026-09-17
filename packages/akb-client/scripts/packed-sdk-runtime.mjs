@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 
 import { AkbError, createClient } from "@akb/client";
@@ -208,7 +209,159 @@ assert.throws(() => unscoped.docs.createCollection({ path: "a" }), /Select a vau
 assert.throws(() => unscoped.tables.list(), /Select a vault/);
 assert.equal(missingVaultFetches, 0);
 
+await runChannelPackedProof();
+
 console.log(`Packed SDK runtime proof passed: ${contract.operations.length} data-plane + ${contract.controlPlane.length} control-plane operations.`);
+
+async function runChannelPackedProof() {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
+    requests.push({ url, headers: request.headers });
+    if (url.searchParams.get("cursor") === "ec1.invalid") {
+      writeJson(response, 400, { message: "Invalid Event Cursor", code: "invalid_event_cursor" });
+      return;
+    }
+    if (url.searchParams.get("cursor") === "ec1.gap" || request.headers["last-event-id"] === "ec1.gap") {
+      writeJson(response, 410, {
+        message: "Event cursor is outside the retained Vault tail",
+        code: "event_gap",
+        details: { earliest_cursor: "ec1.earliest", latest_cursor: "ec1.latest" },
+      });
+      return;
+    }
+    if (requests.length === 1) {
+      writeJson(response, 503, { message: "temporary", code: "temporary_failure" });
+      return;
+    }
+    response.writeHead(200, {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream",
+      connection: "keep-alive",
+    });
+    request.once("close", () => {
+      if (!response.writableEnded) response.end();
+    });
+    const liteStream = requests.length === 3;
+    const frames = liteStream
+      ? [
+        ": heartbeat\n\n",
+        "event: checkpoint\nid: ec1.lite\ndata: {\"version\":1,\"cursor\":\"ec1.lite\"}\n\n",
+        "event: change\nid: ec1.lite-change\ndata: {\"version\":1,\"cursor\":\"ec1.lite-change\",\"occurred_at\":\"2026-01-01T00:00:00Z\",\"vault\":\"packed vault\",\"kind\":\"future.kind\",\"payload\":{}}\n\n",
+      ]
+      : [
+        ": heartbeat\n\n",
+        "retry: 1\n\n",
+        "event: checkpoint\nid: ec1.checkpoint\ndata: {\"version\":1,\"cursor\":\"ec1.checkpoint\"}\n\n",
+        "event: change\nid: ec1.a\ndata: {\"version\":1,\ndata: \"cursor\":\"ec1.a\",\ndata: \"occurred_at\":\"2026-01-01T00:00:00Z\",\ndata: \"vault\":\"packed vault\",\ndata: \"kind\":\"document.put\",\ndata: \"payload\":{}}\n\n",
+        "event: change\nid: ec1.b\ndata: {\"version\":1,\"cursor\":\"ec1.b\",\"occurred_at\":\"2026-01-01T00:00:01Z\",\"vault\":\"packed vault\",\"kind\":\"table.rows_changed\",\"payload\":{}}\n\n",
+    ];
+    await writeSseChunks(response, frames);
+  });
+  await listen(server);
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}/api/v1`;
+    const claims = { sub: "packed-user", app_metadata: { org_id: "packed-org", role: "reader" } };
+    const changeEvents = [];
+    const checkpointEvents = [];
+    const main = createClient({
+      baseUrl,
+      token: () => `packed-channel-token-${requests.length + 1}`,
+    }).vault("packed vault").actingAs(claims);
+    const subscription = await main.channel()
+      .on("change", { kinds: ["table.rows_changed", "document.put", "document.put"] }, async (event) => {
+        changeEvents.push(`first:${event.kind}`);
+        await Promise.resolve();
+      })
+      .on("change", { kinds: ["table.rows_changed"] }, (event) => {
+        changeEvents.push(`second:${event.kind}`);
+      })
+      .on("checkpoint", (checkpoint) => {
+        checkpointEvents.push(checkpoint.cursor);
+      })
+      .subscribe({ cursor: "ec1.start" });
+
+    await waitFor(() => changeEvents.length === 3);
+    assert.deepEqual(changeEvents, ["first:document.put", "first:table.rows_changed", "second:table.rows_changed"]);
+    assert.deepEqual(checkpointEvents, ["ec1.checkpoint"]);
+    assert.equal(subscription.cursor, "ec1.b");
+    assert.equal(requests[0].url.searchParams.get("cursor"), "ec1.start");
+    assert.deepEqual(requests[0].url.searchParams.getAll("kind"), ["document.put", "table.rows_changed"]);
+    assert.equal(requests[1].headers["last-event-id"], "ec1.start");
+    assert.equal(requests[1].headers.authorization, "Bearer packed-channel-token-2");
+    assert.equal(requests[1].headers["x-akb-claims"], JSON.stringify(claims));
+    await subscription.unsubscribe();
+    await subscription.closed;
+
+    const liteEvents = [];
+    const lite = createLiteClient({ baseUrl, token: "packed-lite-token", defaultVault: "packed vault" });
+    const liteSubscription = await lite.channel()
+      .on("change", (event) => liteEvents.push(event.kind))
+      .subscribe({ start: "earliest" });
+    await waitFor(() => liteEvents.length === 1);
+    assert.deepEqual(liteEvents, ["future.kind"]);
+    assert.equal(requests[2].url.searchParams.get("start"), "earliest");
+    assert.deepEqual(requests[2].url.searchParams.getAll("kind"), []);
+    assert.equal(requests[2].headers.authorization, "Bearer packed-lite-token");
+    await liteSubscription.unsubscribe();
+
+    const abortController = new AbortController();
+    const abortSubscription = await lite.channel()
+      .on("change", () => undefined)
+      .subscribe({ signal: abortController.signal });
+    await waitFor(() => requests.length === 4);
+    abortController.abort();
+    await abortSubscription.closed;
+
+    await assert.rejects(
+      main.channel().subscribe({ cursor: "ec1.invalid" }),
+      (error) => error instanceof AkbError && error.code === "invalid_event_cursor",
+    );
+
+    await assert.rejects(
+      main.channel().subscribe({ cursor: "ec1.gap" }),
+      (error) => error instanceof AkbError
+        && error.code === "event_gap"
+        && error.details.earliest_cursor === "ec1.earliest"
+        && error.details.latest_cursor === "ec1.latest",
+    );
+  } finally {
+    await closeServer(server);
+  }
+}
+
+function writeJson(response, status, body) {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+async function writeSseChunks(response, chunks) {
+  for (const chunk of chunks) {
+    if (response.writableEnded) return;
+    response.write(chunk);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+async function listen(server) {
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+}
+
+async function closeServer(server) {
+  if (!server.listening) return;
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for packed channel proof");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 function payload(url, method, body) {
   if (url.pathname.endsWith("/graph")) return { kind: "graph_neighbors", nodes: [], edges: [] };

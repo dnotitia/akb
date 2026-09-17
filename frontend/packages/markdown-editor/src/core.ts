@@ -1,0 +1,224 @@
+import { Editor, type JSONContent } from '@tiptap/core'
+import { MarkdownManager } from '@tiptap/markdown'
+import { closeHistory } from '@tiptap/pm/history'
+
+import { createMarkdownExtensions } from './extensions.js'
+import { markdownTableCommands } from './table.js'
+import type {
+  MarkdownCommands,
+  MarkdownDocument,
+  MarkdownEditorConfig,
+  MarkdownHeadingLevel,
+  MarkdownParseOptions,
+  MarkdownTarget,
+  MarkdownTargetKind,
+} from './types.js'
+
+function managerFor(options: MarkdownParseOptions = {}): MarkdownManager {
+  return new MarkdownManager({
+    extensions: createMarkdownExtensions({ profile: options.profile }),
+    markedOptions: options.markedOptions,
+  })
+}
+
+export function parseMarkdown(
+  markdown: string,
+  options: MarkdownParseOptions = {},
+): MarkdownDocument {
+  return managerFor(options).parse(markdown) as MarkdownDocument
+}
+
+export function serializeMarkdown(
+  document: JSONContent,
+  options: MarkdownParseOptions = {},
+): string {
+  return managerFor(options).serialize(document)
+}
+
+/**
+ * Serialize the current editor document without persisting the empty paragraph
+ * that Tiptap keeps after a terminal atomic block for keyboard continuation.
+ */
+export function serializeEditorMarkdown(
+  editor: Editor,
+  options: MarkdownParseOptions = {},
+): string {
+  const document = editor.getJSON()
+  const content = document.content
+  const last = content?.at(-1)
+  if (
+    content &&
+    content.length > 1 &&
+    last?.type === 'paragraph' &&
+    (!last.content || last.content.length === 0)
+  ) {
+    document.content = content.slice(0, -1)
+  }
+  return serializeMarkdown(document, options)
+}
+
+export function canonicalizeMarkdown(
+  markdown: string,
+  options: MarkdownParseOptions = {},
+): string {
+  return serializeMarkdown(parseMarkdown(markdown, options), options)
+}
+
+function inferTargetKind(target: string, nodeType: string): MarkdownTargetKind | null {
+  if (nodeType === 'image') {
+    return /^\/api\/assets\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/?$/i.test(target)
+      ? 'attachment'
+      : null
+  }
+  if (!target.startsWith('akb://')) return null
+  if (/\/file\/[^/]+$/.test(target)) return 'file'
+  if (/\/doc\/[^/]+$/.test(target)) return 'document'
+  return null
+}
+
+/**
+ * Return the canonical resource targets represented by Markdown links and
+ * images. Code blocks/spans are absent from the parsed document and therefore
+ * cannot accidentally become runtime fetches.
+ */
+export function extractMarkdownTargets(markdown: string): MarkdownTarget[] {
+  const document = parseMarkdown(markdown)
+  const targets: MarkdownTarget[] = []
+  const seen = new Set<string>()
+
+  const visit = (node: JSONContent) => {
+    if (node.type === 'image') {
+      const target = typeof node.attrs?.target === 'string' ? node.attrs.target : ''
+      const kind = target ? inferTargetKind(target, 'image') : null
+      if (kind && !seen.has(target)) {
+        seen.add(target)
+        targets.push({ kind, target })
+      }
+    }
+    for (const mark of node.marks ?? []) {
+      if (mark.type !== 'link') continue
+      const target = typeof mark.attrs?.href === 'string' ? mark.attrs.href : ''
+      const kind = target ? inferTargetKind(target, 'link') : null
+      if (kind && !seen.has(target)) {
+        seen.add(target)
+        targets.push({ kind, target })
+      }
+    }
+    for (const child of node.content ?? []) visit(child)
+  }
+
+  for (const node of document.content ?? []) visit(node)
+  return targets
+}
+
+export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor {
+  const {
+    initialMarkdown = '',
+    profile = 'preserve',
+    element,
+    editable = true,
+    onChange,
+    onSlash,
+  } = options
+
+  const resolvedElement =
+    element ?? (typeof document !== 'undefined' ? document.createElement('div') : undefined)
+
+  return new Editor({
+    element: resolvedElement,
+    extensions: createMarkdownExtensions({ profile, onSlash }),
+    content: initialMarkdown,
+    contentType: 'markdown',
+    editable,
+    onUpdate: ({ editor }) => onChange?.(editor.getMarkdown(), editor),
+  })
+}
+
+export function markdownCommands(editor: Editor): MarkdownCommands {
+  return {
+    ...markdownTableCommands(editor),
+    setMarkdown: markdown => editor.commands.setContent(markdown, { contentType: 'markdown' }),
+    insertMarkdown: markdown =>
+      editor.commands.insertContent(markdown, { contentType: 'markdown' }),
+    insertImage: (target, alt = '', title) =>
+      editor.commands.insertContent({
+        type: 'image',
+        attrs: { target, alt, title: title ?? null },
+      }),
+    setImageAltAt: (position, alt) => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        typeof alt !== 'string' ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .updateAttributes('image', { alt })
+        .focus()
+        .run()
+    },
+    deleteImageAt: position => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .deleteSelection()
+        .focus()
+        .run()
+    },
+    setLink: href =>
+      editor.chain().focus().extendMarkRange('link').setLink({ href }).run(),
+    insertLink: (text, href) =>
+      editor
+        .chain()
+        .focus()
+        .insertContent({
+          type: 'text',
+          text,
+          marks: [{ type: 'link', attrs: { href } }],
+        })
+        .run(),
+    unsetLink: () => editor.chain().focus().extendMarkRange('link').unsetLink().run(),
+    setParagraph: () => editor.commands.setParagraph(),
+    toggleHeading: (level: MarkdownHeadingLevel) =>
+      editor.commands.toggleHeading({ level }),
+    toggleBold: () => editor.commands.toggleBold(),
+    toggleItalic: () => editor.commands.toggleItalic(),
+    toggleStrike: () => editor.commands.toggleStrike(),
+    toggleCode: () => editor.commands.toggleCode(),
+    toggleBulletList: () => editor.commands.toggleBulletList(),
+    toggleOrderedList: () => editor.commands.toggleOrderedList(),
+    toggleBlockquote: () => editor.commands.toggleBlockquote(),
+    toggleCodeBlock: () => editor.commands.toggleCodeBlock(),
+    setHorizontalRule: () => editor.commands.setHorizontalRule(),
+    undo: () => editor.commands.undo(),
+    redo: () => editor.commands.redo(),
+    focus: position => editor.commands.focus(position),
+  }
+}
+
+export function editorMarkdown(editor: Editor): string {
+  return editor.getMarkdown()
+}

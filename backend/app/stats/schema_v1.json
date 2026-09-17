@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dnotitia/akb/schemas/stats/v1.json",
+  "title": "AKB tenant stats snapshot, version 1",
+  "description": "Owned by akb-oss. Consumers vendor this file at a pinned version. Every numeric field is nullable and optional on purpose: a value that could not be measured is OMITTED from the payload (null is accepted for the same meaning), never defaulted to 0. Decode into a nullable type; a plain integer will turn both encodings into a measured zero.",
+  "type": "object",
+  "required": ["schema_version", "computed_at", "storage", "corpus"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Reject the whole snapshot on an unrecognised version rather than reading the fields you recognise."
+    },
+    "computed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this snapshot was assembled. Advances once per sampler interval; a value that stops moving means sampling is failing while the last good snapshot is still being served."
+    },
+    "storage": {
+      "type": "object",
+      "required": ["observed_at"],
+      "additionalProperties": false,
+      "description": "Physical and logical storage. Carries its own watermark because physical sizes are collector-maintained approximations with no relationship to the corpus transaction snapshot.",
+      "properties": {
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the storage figures were read."
+        },
+        "db_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Physical size of the whole tenant database."
+        },
+        "vector_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Physical bytes of the pgvector derived index (relations plus their indexes and TOAST). A SUBSET of db_bytes when present — never add the two. Absent when the vector index is not inside this database (a non-pgvector driver, or pgvector on its own DSN)."
+        },
+        "file_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Live logical bytes of confirmed vault files. Absent when any confirmed file has no recorded size, because a partial sum reads as a total."
+        },
+        "file_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Live confirmed vault files, standalone files and editor attachments alike."
+        }
+      }
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Live inventory counts from one repeatable-read snapshot, so subset relationships between them always hold. Live means not deleted; archived vaults and documents are counted.",
+      "properties": {
+        "vault_count": { "type": ["integer", "null"], "minimum": 0 },
+        "collection_count": { "type": ["integer", "null"], "minimum": 0 },
+        "doc_count": { "type": ["integer", "null"], "minimum": 0 },
+        "distilled_doc_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Documents produced by distillation; a subset of doc_count. Absent while the criterion for 'distilled' is undetermined in akb-oss."
+        },
+        "vector_chunk_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Chunks present in the vector index. Chunks awaiting indexing are not counted; that backlog is reported by /health."
+        }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "required": ["window_start", "window_end"],
+      "additionalProperties": false,
+      "description": "Call volume over one CLOSED UTC day. The window is finalized once and never recomputed, so a consumer may keep the first value it sees. The whole section is absent until a day has been finalized.",
+      "properties": {
+        "window_start": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Inclusive start of the window (midnight UTC)."
+        },
+        "window_end": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Exclusive end of the window (the following midnight UTC)."
+        },
+        "calls_read": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Read-classified tool calls in the window. Absent when the window closed with call volume unmeasurable — a different fact from zero calls, and permanent, since the window is never recomputed."
+        },
+        "calls_write": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Write-classified tool calls in the window."
+        },
+        "active_actors": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Distinct identified actors in the window. Calls with no authenticated actor are counted in the call totals but are not a distinct someone."
+        }
+      }
+    }
+  }
+}

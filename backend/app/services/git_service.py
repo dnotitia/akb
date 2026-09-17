@@ -26,7 +26,9 @@ environment, pins DNS, and blocks non-https transports. See
 
 from __future__ import annotations
 
+import codecs
 import fcntl
+import hashlib
 import logging
 import os
 import re
@@ -34,10 +36,11 @@ import selectors
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +97,15 @@ def _managed_repo(repo: Repo) -> Iterator[Repo]:
 # default-deny inspector.
 _MIRROR_MARKER = "akb-external-mirror"
 
+# An operator retirement moves the normal mirror marker through this
+# fail-closed tombstone before the sidecar is deleted.  A process crash cannot
+# then turn an external mirror into an ordinary GitPython-readable vault in the
+# gap between the filesystem and PostgreSQL phases: every read refuses while
+# this marker exists.  It is deliberately a sibling of ``_MIRROR_MARKER`` so
+# the transition stays under the same per-vault lock and storage containment
+# checks.
+_RETIRING_MIRROR_MARKER = "akb-external-mirror-retiring"
+
 # Slack over ``external_git_blob_max_bytes`` for the runner's STREAMING output
 # cap. The per-blob size pre-check already refuses an
 # over-cap blob, so a passed blob's streamed read is at most ``cap`` bytes; this
@@ -127,6 +139,18 @@ _PATH_AT_REVISION_MAX_ENTRIES = 10_000
 _PATH_AT_REVISION_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _PATH_AT_REVISION_READ_CHUNK_BYTES = 64 * 1024
 _PATH_AT_REVISION_DEFAULT_TIMEOUT_SECS = 30.0
+_PUBLIC_ACTIVITY_ACTIONS = frozenset({"create", "update", "move", "delete"})
+_LEGACY_ACTIVITY_ACTION_ALIASES = {"edit": "update"}
+
+
+def _canonical_legacy_activity_action(action: str) -> str:
+    """Map historical public action names onto the current wire vocabulary."""
+    return _LEGACY_ACTIVITY_ACTION_ALIASES.get(action, action)
+
+
+def _legacy_activity_matches_git_change(declared: str, inferred: str | None) -> bool:
+    """Accept Legacy resource creation when an orphan already owns the path."""
+    return not declared or declared == inferred or (declared == "create" and inferred == "update")
 
 
 def _marker_state(marker: Path) -> str:
@@ -439,7 +463,37 @@ class GitService:
         promisor/rewrite config cannot re-open lazy-fetch on a plain public
         READ; returning ``False`` on an ambiguous entry would re-open exactly
         that (fail-open), hence the raise."""
-        return _marker_state(self._bare_path(vault_name) / _MIRROR_MARKER) == "valid"
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        return _marker_state(bare / _MIRROR_MARKER) == "valid"
+
+    def _require_normal_write_allowed(self, vault_name: str) -> None:
+        """Fail closed only for an in-progress mirror retirement.
+
+        The usual mirror read-only policy remains owned by the service layer;
+        this guard deliberately does not reinterpret a normal mirror marker.
+        It closes the committed-receipt-to-tombstone-cleanup window for every
+        ordinary Git mutation, under the same vault lock used by retirement.
+        """
+        bare = self._bare_path(vault_name)
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+
+    @staticmethod
+    def _require_active_external_mirror_publication(bare: Path) -> None:
+        """Prove a staged external fetch may still publish into ``bare``.
+
+        A fetch receives objects and a namespaced temporary ref outside the
+        vault lock. Its branch-ref promotion is the persistent publication
+        boundary, so re-read both markers while the lock is held: a retirement
+        tombstone blocks the handoff window and an absent normal marker means a
+        completed retirement returned this bare to manual ownership.
+        """
+        if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+            raise MirrorMarkerError("external-git mirror retirement is incomplete")
+        if _marker_state(bare / _MIRROR_MARKER) != "valid":
+            raise MirrorMarkerError("external-git mirror is no longer active")
 
     def _use_mirror_reader(self, vault_name: str) -> bool:
         """Decide how a READ on ``vault_name`` must be served, fail-CLOSED.
@@ -516,6 +570,13 @@ class GitService:
             # resolve-under-root catches a parent-dir symlink that would redirect
             # the marker write out of storage on a restored/tampered layout.
             self._contained(bare)
+            if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                # A retirement tombstone means the operator has intentionally
+                # quiesced this mirror but has not yet committed its durable
+                # sidecar handoff. Re-stamping the normal marker would conceal
+                # that interrupted state; fail closed until the same operator
+                # command resumes it.
+                raise MirrorMarkerError("external-git mirror retirement is incomplete")
             marker = bare / _MIRROR_MARKER
             if _marker_state(marker) == "valid":
                 return False  # already a valid marker — idempotent no-op
@@ -543,6 +604,131 @@ class GitService:
                 os.close(fd)
             logger.info("Backfilled external-git mirror marker for vault %s", vault_name)
             return True
+
+    def _retirement_bare(self, vault_name: str) -> Path:
+        """Return a real, contained bare repo for an offline retirement step."""
+        bare = self._bare_path(vault_name)
+        try:
+            bare_st = os.lstat(bare)
+        except FileNotFoundError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is missing") from exc
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror bare repository is unreadable") from exc
+        if stat.S_ISLNK(bare_st.st_mode) or not stat.S_ISDIR(bare_st.st_mode):
+            raise MirrorMarkerError("external-git mirror bare repository is not a real directory")
+        self._contained(bare)
+        return bare
+
+    def _verify_retirement_ref(self, bare: Path, expected_ref: str) -> None:
+        """Check the locally materialized mirror tip without any network I/O."""
+        if re.fullmatch(r"[0-9a-f]{40}", expected_ref) is None:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref is invalid")
+        try:
+            observed = self._ext_runner.rev_parse(bare, "HEAD")
+        except Exception as exc:  # noqa: BLE001 - surface only a safe operator error
+            raise MirrorMarkerError("external-git mirror retirement fixed ref could not be read") from exc
+        if observed != expected_ref:
+            raise MirrorMarkerError("external-git mirror retirement fixed ref did not match")
+
+    @staticmethod
+    def _write_retirement_marker(marker: Path) -> None:
+        """Create the tombstone no-clobber before unlinking the old marker."""
+        try:
+            fd = os.open(
+                marker,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o644,
+            )
+        except FileExistsError:
+            # The caller re-classifies the entry below; never overwrite a
+            # concurrent/foreign marker.
+            return
+        try:
+            os.write(fd, b"akb external-git mirror retirement in progress\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _fsync_retirement_directory(bare: Path) -> None:
+        """Durably publish a marker create or unlink in the bare directory."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(bare, flags)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise MirrorMarkerError("external-git mirror retirement directory cannot be synced") from exc
+        finally:
+            os.close(fd)
+
+    def quarantine_external_mirror_marker(self, vault_name: str, *, expected_ref: str) -> None:
+        """Replace a mirror marker with a fail-closed retirement tombstone.
+
+        This is the filesystem half of the external-Git retirement protocol.
+        It is intentionally recoverable: a crash after the tombstone is created
+        but before the old marker is unlinked leaves *both* regular files, which
+        is still fail-closed and is completed on the next exact replay.  A crash
+        after unlink leaves only the tombstone, also fail-closed.  The caller
+        must persist the sidecar quarantine intent before invoking this method.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state == "absent" and tombstone_state == "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is missing")
+            self._verify_retirement_ref(bare, expected_ref)
+            if tombstone_state == "absent":
+                if marker_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement marker is invalid")
+                self._write_retirement_marker(tombstone)
+                tombstone_state = _marker_state(tombstone)
+                if tombstone_state != "valid":
+                    raise MirrorMarkerError("external-git mirror retirement tombstone was not created")
+                self._fsync_retirement_directory(bare)
+            if marker_state == "valid":
+                try:
+                    os.unlink(marker)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror marker could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "valid":
+                raise MirrorMarkerError("external-git mirror retirement marker readback failed")
+
+    def finalize_external_mirror_retirement(self, vault_name: str, *, expected_ref: str) -> None:
+        """Remove a completed retirement tombstone after the DB receipt commits.
+
+        An interrupted final cleanup leaves the tombstone in place and therefore
+        rejects every read.  Exact replay performs this small, idempotent final
+        step; no caller is allowed to turn a still-quarantined mirror writable.
+        """
+        with self._vault_write_lock(vault_name):
+            bare = self._retirement_bare(vault_name)
+            marker = bare / _MIRROR_MARKER
+            tombstone = bare / _RETIRING_MIRROR_MARKER
+            marker_state = _marker_state(marker)
+            tombstone_state = _marker_state(tombstone)
+            if marker_state != "absent":
+                raise MirrorMarkerError("external-git mirror retirement marker is still present")
+            if tombstone_state == "valid":
+                # The fixed ref is load-bearing only while the tombstone still
+                # blocks the handoff. Once both markers are absent the vault is
+                # a normal writable vault and an exact receipt replay must not
+                # reject an ordinary post-retirement commit.
+                self._verify_retirement_ref(bare, expected_ref)
+                try:
+                    os.unlink(tombstone)
+                except OSError as exc:
+                    raise MirrorMarkerError("external-git mirror retirement tombstone could not be removed") from exc
+                self._fsync_retirement_directory(bare)
+            if _marker_state(marker) != "absent" or _marker_state(tombstone) != "absent":
+                raise MirrorMarkerError("external-git mirror retirement final readback failed")
 
     @staticmethod
     def _git_author_env(author_name: str, author_email: str) -> dict[str, str]:
@@ -878,6 +1064,11 @@ class GitService:
         if bare_path.exists():
             raise FileExistsError(f"Vault already exists: {vault_name}")
         with self._vault_write_lock(vault_name):
+            # The initial existence check is only a fast failure. Re-check at
+            # the publication lock boundary so a staged clone never lands over
+            # a vault retained or created while this caller waited for the lock.
+            if bare_path.exists():
+                raise FileExistsError(f"Vault already exists: {vault_name}")
             # Age-qualified sweep INSIDE the lock: only reap leftover
             # temp clone dirs older than the clone timeout, so a concurrent
             # same-vault clone's ACTIVE temp is never deleted. Same-vault clones
@@ -900,6 +1091,8 @@ class GitService:
                 # outside storage. ``bare_path`` doesn't exist yet — ``_contained``
                 # resolves its existing parents lexically, which is what we want.
                 self._contained(bare_path)
+                if bare_path.exists():
+                    raise FileExistsError(f"Vault already exists: {vault_name}")
                 # Atomic within storage_path (same filesystem). bare_path was
                 # asserted absent above / removed by a sterile re-clone caller.
                 os.rename(tmp, bare_path)
@@ -909,6 +1102,70 @@ class GitService:
                 self._rmtree_quiet(tmp)
                 raise
         logger.info("Mirror cloned: vault=%s branch=%s", vault_name, branch)
+        return sha
+
+    def reclone_active_mirror(
+        self,
+        vault_name: str,
+        remote_url: str,
+        branch: str,
+        auth_token: str | None = None,
+        timeout: int | None = None,
+        *,
+        allow_unmarked_never_synced: bool = False,
+    ) -> str:
+        """Sterilely replace an untrusted *active* external mirror.
+
+        Network clone work is staged away from the published bare repository.
+        At the short publication boundary, the vault lock is acquired and both
+        retirement markers are re-read before the old repository is touched.
+        A poller whose health decision predates a completed retirement therefore
+        discards its staged clone instead of deleting or re-marking the retained
+        manual repository.
+        """
+        self._require_safe_vault_name(vault_name)
+        tmp = self.storage_path / f".extgit-clone-{vault_name}-{uuid.uuid4().hex}"
+        backup = self.storage_path / f".extgit-replaced-{vault_name}-{uuid.uuid4().hex}"
+        try:
+            sha = self._ext_runner.clone_bare(
+                remote_url, branch, auth_token, tmp, timeout=timeout
+            )
+            (tmp / _MIRROR_MARKER).write_text(
+                "akb external-git mirror\n", encoding="utf-8"
+            )
+            self._contained(tmp)
+            self._contained(backup)
+            with self._vault_write_lock(vault_name):
+                bare = self._retirement_bare(vault_name)
+                if allow_unmarked_never_synced:
+                    # A pre-first-sync stale directory predates publication and
+                    # legitimately has no marker. A retirement tombstone still
+                    # always wins. Abnormal marker shapes fail in _marker_state.
+                    if _marker_state(bare / _RETIRING_MIRROR_MARKER) == "valid":
+                        raise MirrorMarkerError(
+                            "external-git mirror retirement is incomplete"
+                        )
+                    _marker_state(bare / _MIRROR_MARKER)
+                else:
+                    self._require_active_external_mirror_publication(bare)
+
+                # Keep the retained repository recoverable if publication
+                # itself faults. Both renames are same-filesystem and occur
+                # while every Git mutation/retirement publication is excluded.
+                os.rename(bare, backup)
+                try:
+                    os.rename(tmp, bare)
+                except BaseException:
+                    os.rename(backup, bare)
+                    raise
+                self._rmtree_quiet(backup)
+        except BaseException:
+            self._rmtree_quiet(tmp)
+            # Never delete ``backup`` here. If publication failed and even the
+            # rollback rename faulted, it is the only retained copy of the
+            # operator's repository and must remain available for recovery.
+            raise
+        logger.info("Mirror re-cloned: vault=%s branch=%s", vault_name, branch)
         return sha
 
     def fetch_remote(
@@ -949,6 +1206,12 @@ class GitService:
 
         # Brief critical section: promote tmp ref → branch ref, read the sha.
         with self._vault_write_lock(vault_name):
+            # Network I/O above deliberately runs without this lock. Re-resolve
+            # the live bare and its mirror/retirement authority immediately
+            # before promotion, so a stale poller cannot overwrite the HEAD of
+            # a retained manual vault after retirement finishes.
+            bare_path = self._retirement_bare(vault_name)
+            self._require_active_external_mirror_publication(bare_path)
             self._ext_runner.update_ref(bare_path, f"refs/heads/{vbranch}", tmp_ref)
             self._ext_runner.delete_ref_quiet(bare_path, tmp_ref)
             return self._ext_runner.rev_parse(bare_path, f"refs/heads/{vbranch}")
@@ -1430,6 +1693,687 @@ class GitService:
         except (BadName, BadObject, FileNotFoundError, ValueError):
             return None
 
+    @staticmethod
+    def _parse_name_status_changes(output: str) -> tuple[dict[str, str | None], ...]:
+        """Parse one Git name-status stream into path changes."""
+        if "\x00" in output:
+            fields = output.split("\x00")
+            if fields and fields[-1] == "":
+                fields.pop()
+            nul_changes: list[dict[str, str | None]] = []
+            index = 0
+            while index < len(fields):
+                status = fields[index]
+                index += 1
+                if status.startswith(("R", "C")):
+                    if index + 1 >= len(fields):
+                        raise ValueError("incomplete NUL-delimited rename/copy change")
+                    nul_changes.append(
+                        {
+                            "status": status,
+                            "path_from": fields[index],
+                            "path_to": fields[index + 1],
+                        }
+                    )
+                    index += 2
+                else:
+                    if index >= len(fields):
+                        raise ValueError("incomplete NUL-delimited path change")
+                    nul_changes.append(
+                        {
+                            "status": status,
+                            "path_from": None,
+                            "path_to": fields[index],
+                        }
+                    )
+                    index += 1
+            return tuple(nul_changes)
+
+        changes: list[dict[str, str | None]] = []
+        for line in str(output).splitlines():
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status = fields[0]
+            if status.startswith(("R", "C")) and len(fields) >= 3:
+                changes.append(
+                    {
+                        "status": status,
+                        "path_from": fields[-2],
+                        "path_to": fields[-1],
+                    }
+                )
+            else:
+                changes.append(
+                    {
+                        "status": status,
+                        "path_from": None,
+                        "path_to": fields[-1],
+                    }
+                )
+        return tuple(changes)
+
+    @staticmethod
+    def _iter_nul_stream_tokens(stream: Any) -> Iterator[str]:
+        """Yield decoded NUL-delimited fields without buffering command output."""
+
+        pending = ""
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        saw_bytes = False
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            if isinstance(chunk, bytes):
+                saw_bytes = True
+                chunk = decoder.decode(chunk, final=False)
+            pending += chunk
+            while "\x00" in pending:
+                token, pending = pending.split("\x00", 1)
+                yield token
+        if saw_bytes:
+            pending += decoder.decode(b"", final=True)
+        if pending:
+            yield pending
+
+    def _stream_fixed_ref_history_log(
+        self,
+        repo: Repo,
+        fixed_ref: str,
+    ) -> Iterator[tuple[str, datetime, tuple[dict[str, str | None], ...]]]:
+        """Stream one full-ref name history with bounded parser memory."""
+
+        try:
+            process = repo.git.execute(
+                [
+                    repo.git.GIT_PYTHON_GIT_EXECUTABLE,
+                    "-c",
+                    "core.quotePath=false",
+                    "log",
+                    "-M",
+                    "--name-status",
+                    "-z",
+                    "--format=%H%x00%ct",
+                    fixed_ref,
+                    "--",
+                ],
+                as_process=True,
+            )
+        except (GitError, OSError) as exc:
+            raise FixedRefHistoryError("fixed-ref history could not be read") from exc
+
+        raw_process: Any = getattr(process, "proc", None) or process
+        stdout = getattr(raw_process, "stdout", None)
+        if stdout is None:
+            self._close_path_history_process(process, terminate=True)
+            raise FixedRefHistoryError("fixed-ref history could not be read")
+
+        completed = False
+        try:
+            tokens = iter(self._iter_nul_stream_tokens(stdout))
+            header: str | None = None
+            while True:
+                if header is None:
+                    try:
+                        header = next(tokens)
+                    except StopIteration:
+                        break
+                while header == "":
+                    try:
+                        header = next(tokens)
+                    except StopIteration:
+                        header = None
+                        break
+                if header is None:
+                    break
+                if re.fullmatch(r"[0-9a-f]{40}", header) is None:
+                    raise ValueError("fixed-ref history has a malformed commit header")
+                oid = header
+                try:
+                    epoch = next(tokens)
+                except StopIteration as exc:
+                    raise ValueError("fixed-ref history has an incomplete commit header") from exc
+                if re.fullmatch(r"-?[0-9]+", epoch) is None:
+                    raise ValueError("fixed-ref history has an invalid commit timestamp")
+                try:
+                    committed_at = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+                except (ValueError, OverflowError) as exc:
+                    raise ValueError("fixed-ref history has an invalid commit timestamp") from exc
+
+                changes: list[dict[str, str | None]] = []
+                header = None
+                while True:
+                    try:
+                        token = next(tokens)
+                    except StopIteration:
+                        break
+                    if not token:
+                        continue
+                    if re.fullmatch(r"[0-9a-f]{40}", token) is not None:
+                        header = token
+                        break
+                    status = token.lstrip("\r\n")
+                    if not status:
+                        continue
+                    if status.startswith(("R", "C")):
+                        try:
+                            path_from = next(tokens)
+                            path_to = next(tokens)
+                        except StopIteration as exc:
+                            raise ValueError("fixed-ref history has a malformed rename") from exc
+                        changes.append(
+                            {"status": status, "path_from": path_from, "path_to": path_to}
+                        )
+                    else:
+                        try:
+                            path_to = next(tokens)
+                        except StopIteration as exc:
+                            raise ValueError("fixed-ref history has a malformed path change") from exc
+                        changes.append(
+                            {"status": status, "path_from": None, "path_to": path_to}
+                        )
+                yield oid, committed_at, tuple(changes)
+
+            returncode = raw_process.wait()
+            if returncode != 0:
+                raise FixedRefHistoryError("fixed-ref history could not be read")
+            completed = True
+        except (GitError, OSError, UnicodeDecodeError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref history could not be read") from exc
+        finally:
+            self._close_path_history_process(process, terminate=not completed)
+
+    def _independent_commit_oids(
+        self,
+        repo: Repo,
+        current_oids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Resolve independent lineage tips without placing OIDs in argv.
+
+        ``git merge-base --independent`` accepts revisions only as command-line
+        arguments and exceeds ``ARG_MAX`` for large imported vaults. Feed the
+        revisions to one topological ``rev-list --stdin`` walk instead. A
+        current commit first encountered outside the ancestry already covered
+        by another current commit is an independent lineage tip.
+        """
+        current_set = set(current_oids)
+        if not current_set:
+            return ()
+        process = None
+        completed = False
+        try:
+            with tempfile.TemporaryFile(mode="w+b") as revisions:
+                revisions.write(
+                    "".join(f"{oid}\n" for oid in sorted(current_set)).encode("ascii")
+                )
+                revisions.seek(0)
+                process = repo.git.execute(
+                    [
+                        repo.git.GIT_PYTHON_GIT_EXECUTABLE,
+                        "rev-list",
+                        "--stdin",
+                        "--topo-order",
+                        "--parents",
+                    ],
+                    istream=revisions,
+                    as_process=True,
+                )  # type: ignore[call-overload]  # GitPython runtime supports istream with as_process
+                raw_process: Any = getattr(process, "proc", None) or process
+                stdout = getattr(raw_process, "stdout", None)
+                if stdout is None:
+                    raise FixedRefHistoryError(
+                        "fixed-ref history could not resolve current lineages"
+                    )
+
+                covered: set[str] = set()
+                seen_current: set[str] = set()
+                lineage_tips: list[str] = []
+                for raw_line in stdout:
+                    line = (
+                        raw_line.decode("ascii", errors="strict")
+                        if isinstance(raw_line, bytes)
+                        else raw_line
+                    )
+                    fields = line.split()
+                    if not fields:
+                        continue
+                    oid, *parents = fields
+                    is_covered = oid in covered
+                    covered.discard(oid)
+                    is_current = oid in current_set
+                    if is_current:
+                        seen_current.add(oid)
+                    is_tip = is_current and not is_covered
+                    if is_tip:
+                        lineage_tips.append(oid)
+                    if is_covered or is_tip:
+                        covered.update(parents)
+                if raw_process.wait() != 0:
+                    raise FixedRefHistoryError(
+                        "fixed-ref history could not resolve current lineages"
+                    )
+                completed = True
+        except (GitError, OSError, UnicodeDecodeError, ValueError) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve current lineages"
+            ) from exc
+        finally:
+            if process is not None:
+                self._close_path_history_process(process, terminate=not completed)
+
+        if seen_current != current_set or not lineage_tips:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve current lineages"
+            )
+        return tuple(sorted(lineage_tips))
+
+    @staticmethod
+    def _indexed_path_change(
+        changes: tuple[dict[str, str | None], ...],
+        active_path: str,
+    ) -> dict[str, str | None] | None:
+        """Project one full-ref change as ``git log --follow`` would see it."""
+        for change in changes:
+            status = change.get("status") or ""
+            path_from = change.get("path_from")
+            path_to = change.get("path_to")
+            if status.startswith("R"):
+                if path_to == active_path:
+                    return {
+                        "path_at_revision": path_to,
+                        "action": "move",
+                        "next_path": path_from,
+                    }
+                if path_from == active_path:
+                    # A path-specific log asked for the old side of a rename
+                    # sees Git's synthesized deletion rather than the R row.
+                    return {
+                        "path_at_revision": path_from,
+                        "action": "delete",
+                        "next_path": None,
+                    }
+                continue
+            if path_to != active_path:
+                continue
+            return {
+                "path_at_revision": path_to,
+                "action": {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1]),
+                "next_path": None,
+            }
+        return None
+
+    def _manual_fixed_ref_activity_from_changes(
+        self,
+        *,
+        commit_oid: str,
+        committed_at: datetime,
+        file_path: str,
+        metadata: dict[str, str],
+        changes: tuple[dict[str, str | None], ...],
+    ) -> dict:
+        """Apply the legacy activity validation to cached diff-tree rows."""
+        declared_action = _canonical_legacy_activity_action(metadata["action"])
+        if declared_action and declared_action not in _PUBLIC_ACTIVITY_ACTIONS:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has no supported public activity action"
+            )
+        if not metadata["subject"] or not metadata["agent"]:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit has incomplete activity identity"
+            )
+
+        selected_changes: list[dict[str, str | None]] = []
+        for change in changes:
+            status = change.get("status") or ""
+            path_to = change.get("path_to")
+            if status.startswith(("R", "C")) and path_to == file_path:
+                selected_changes.append(
+                    {
+                        "change": "move",
+                        "path_from": change.get("path_from"),
+                        "path_to": path_to,
+                    }
+                )
+            elif path_to == file_path:
+                change_kind = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if change_kind is not None:
+                    selected_changes.append(
+                        {
+                            "change": change_kind,
+                            "path_from": None,
+                            "path_to": file_path,
+                        }
+                    )
+        if len(selected_changes) != 1:
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
+        selected_change = selected_changes[0]
+        inferred_action = selected_change["change"]
+        action = declared_action or inferred_action
+        if not _legacy_activity_matches_git_change(declared_action, inferred_action):
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
+        return {
+            "legacy_git_oid": commit_oid,
+            "committed_at": committed_at,
+            "actor": metadata["agent"],
+            "subject": metadata["subject"],
+            "summary": metadata["summary"],
+            "action": action,
+            "path_from": selected_change["path_from"],
+            "path_to": selected_change["path_to"],
+            "changed_paths": selected_changes,
+        }
+
+    def manual_fixed_ref_history_batch(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        requests: Iterable[Mapping[str, object]],
+        *,
+        include_bodies: bool = True,
+        require_fixed_ref_current: bool = False,
+    ) -> list[dict]:
+        """Read many manual documents in one streaming lineage traversal.
+
+        ``requests`` is an iterable of mappings containing ``file_path``,
+        ``current_commit`` and optional ``since_epoch``. Results preserve input
+        order and use the exact snapshot shape returned by
+        :meth:`manual_fixed_ref_history`. Current commits are grouped by their
+        independent Git lineage tips, so imported/dangling source histories are
+        read once per lineage even when they are not ancestors of ``fixed_ref``.
+        Each lineage log is consumed once and matching path changes are routed
+        to active documents as they arrive. The full Git log and its complete
+        path-change index are never retained in memory. Body reads remain
+        intentionally per request. Callers that only need immutable inventory
+        facts may set ``include_bodies=False`` to retain only each body's digest
+        and byte size instead of all bodies.
+
+        Migration inventory callers may set ``require_fixed_ref_current`` to
+        reject a recorded current commit when the frozen ref contains a newer
+        change to that document path. Imported histories that are not reachable
+        from the frozen ref remain valid and are read from their own lineage.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref):
+            raise FixedRefHistoryError("fixed_ref must be a full lowercase 40-hex commit OID")
+
+        normalized: list[tuple[str, str, int | None]] = []
+        for request in requests:
+            if not isinstance(request, Mapping):
+                raise FixedRefHistoryError("fixed-ref history request must be a mapping")
+            file_path = request.get("file_path")
+            current_commit = request.get("current_commit")
+            since_epoch = request.get("since_epoch")
+            if not isinstance(file_path, str):
+                raise FixedRefHistoryError("fixed-ref history file_path must be a string")
+            if not isinstance(current_commit, str) or not full_oid.fullmatch(current_commit):
+                raise FixedRefHistoryError(
+                    "current_commit must be a full lowercase 40-hex commit OID"
+                )
+            if since_epoch is not None and not isinstance(since_epoch, int):
+                raise FixedRefHistoryError("fixed-ref history since_epoch must be an integer")
+            normalized.append((file_path, current_commit, since_epoch))
+
+        if not normalized:
+            return []
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref history is limited to manual vaults")
+
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.git.cat_file("-e", f"{fixed_ref}^{{commit}}")
+                fixed = repo.commit(fixed_ref)
+                if fixed.hexsha != fixed_ref:
+                    raise FixedRefHistoryError(
+                        "fixed-ref history could not resolve the requested "
+                        "commit or body"
+                    )
+                current_oids = sorted({current_commit for _path, current_commit, _since in normalized})
+                lineage_tips = self._independent_commit_oids(repo, current_oids)
+                if require_fixed_ref_current:
+                    lineage_tips = (
+                        fixed_ref,
+                        *(tip for tip in lineage_tips if tip != fixed_ref),
+                    )
+
+                positions_by_current: dict[str, list[int]] = {}
+                for position, (
+                    _path,
+                    current_commit,
+                    _since_epoch,
+                ) in enumerate(normalized):
+                    positions_by_current.setdefault(current_commit, []).append(
+                        position
+                    )
+
+                remaining = set(current_oids)
+                snapshots: list[dict[str, Any] | None] = [None] * len(normalized)
+                for lineage_tip in lineage_tips:
+                    strict_fixed_lineage = (
+                        require_fixed_ref_current and lineage_tip == fixed_ref
+                    )
+                    if not strict_fixed_lineage and lineage_tip not in remaining:
+                        continue
+                    histories: dict[int, list[dict[str, Any]]] = {}
+                    activities: dict[int, dict[str, Any]] = {}
+                    effective_since: dict[int, int | None] = {}
+                    active_path: dict[int, str] = {}
+                    positions_by_path: dict[str, set[int]] = {}
+                    lineage_currents: set[str] = set()
+                    newest_change_oid_by_path: dict[str, str] = {}
+                    requested_paths = {
+                        normalized[position][0]
+                        for positions in positions_by_current.values()
+                        for position in positions
+                    }
+
+                    for oid, committed_at, changes in self._stream_fixed_ref_history_log(repo, lineage_tip):
+                        if strict_fixed_lineage:
+                            for change in changes:
+                                path_to = change.get("path_to")
+                                if path_to in requested_paths:
+                                    newest_change_oid_by_path.setdefault(path_to, oid)
+                                if (change.get("status") or "").startswith("R"):
+                                    path_from = change.get("path_from")
+                                    if path_from in requested_paths:
+                                        newest_change_oid_by_path.setdefault(path_from, oid)
+                        activating = positions_by_current.get(oid, ()) if oid in remaining else ()
+                        commit_metadata: dict[str, Any] | None = None
+                        if activating:
+                            try:
+                                commit = repo.commit(oid)
+                                commit_metadata = {
+                                    "message": str(commit.message).strip(),
+                                    "author": str(commit.author),
+                                    "legacy": self._legacy_commit_metadata(commit),
+                                }
+                                activity_output = repo.git.diff_tree(
+                                    "--root",
+                                    "-r",
+                                    "--no-commit-id",
+                                    "--name-status",
+                                    "-z",
+                                    "-M",
+                                    oid,
+                                )
+                                activity_changes = self._parse_name_status_changes(activity_output)
+                            except (
+                                BadName,
+                                BadObject,
+                                GitError,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise FixedRefHistoryError(
+                                    "fixed-ref current commit activity could not be read"
+                                ) from exc
+                            for position in activating:
+                                file_path, _current_commit, since_epoch = normalized[position]
+                                if (
+                                    strict_fixed_lineage
+                                    and newest_change_oid_by_path.get(file_path) != oid
+                                ):
+                                    raise FixedRefHistoryError(
+                                        "fixed_ref contains a newer change than the recorded "
+                                        "current_commit"
+                                    )
+                                histories[position] = []
+                                effective_since[position] = (
+                                    since_epoch
+                                    if since_epoch is not None
+                                    and int(committed_at.timestamp()) >= since_epoch
+                                    else None
+                                )
+                                active_path[position] = file_path
+                                positions_by_path.setdefault(file_path, set()).add(position)
+                                activities[position] = self._manual_fixed_ref_activity_from_changes(
+                                    commit_oid=oid,
+                                    committed_at=committed_at,
+                                    file_path=file_path,
+                                    metadata=commit_metadata["legacy"],
+                                    changes=activity_changes,
+                                )
+                            lineage_currents.add(oid)
+
+                        candidates: set[int] = set()
+                        for change in changes:
+                            path_to = change.get("path_to")
+                            if path_to is not None:
+                                candidates.update(positions_by_path.get(path_to, ()))
+                            if (change.get("status") or "").startswith("R"):
+                                path_from = change.get("path_from")
+                                if path_from is not None:
+                                    candidates.update(positions_by_path.get(path_from, ()))
+                        if not candidates:
+                            continue
+                        if commit_metadata is None:
+                            try:
+                                commit = repo.commit(oid)
+                                commit_metadata = {
+                                    "message": str(commit.message).strip(),
+                                    "author": str(commit.author),
+                                    "legacy": self._legacy_commit_metadata(commit),
+                                }
+                            except (
+                                BadName,
+                                BadObject,
+                                GitError,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise FixedRefHistoryError(
+                                    "fixed-ref history could not read commit metadata"
+                                ) from exc
+                        for position in sorted(candidates):
+                            since_epoch = effective_since[position]
+                            if since_epoch is not None and int(committed_at.timestamp()) < since_epoch:
+                                continue
+                            path = active_path[position]
+                            selected = self._indexed_path_change(changes, path)
+                            if selected is None:
+                                continue
+                            entry: dict[str, Any] = {
+                                "legacy_git_oid": oid,
+                                "committed_at": committed_at,
+                                "path_at_revision": selected["path_at_revision"],
+                                "message": commit_metadata["message"],
+                                "author": commit_metadata["author"],
+                            }
+                            action = selected.get("action")
+                            if action is not None:
+                                entry["action"] = action
+                            declared_action = _canonical_legacy_activity_action(
+                                commit_metadata["legacy"].get("action", "")
+                            )
+                            if declared_action in _PUBLIC_ACTIVITY_ACTIONS:
+                                entry["action"] = declared_action
+                            histories[position].append(entry)
+                            next_path = selected.get("next_path")
+                            if next_path is not None and next_path != path:
+                                positions_by_path[path].discard(position)
+                                if not positions_by_path[path]:
+                                    del positions_by_path[path]
+                                active_path[position] = next_path
+                                positions_by_path.setdefault(next_path, set()).add(position)
+
+                    for current_commit in lineage_currents:
+                        for position in positions_by_current[current_commit]:
+                            file_path, _current_commit, _since_epoch = normalized[position]
+                            try:
+                                current = repo.commit(current_commit)
+                                if current.hexsha != current_commit:
+                                    raise FixedRefHistoryError(
+                                        "fixed-ref history could not resolve the requested commit or body"
+                                    )
+                                body = (current.tree / file_path).data_stream.read()
+                            except (
+                                BadName,
+                                BadObject,
+                                FileNotFoundError,
+                                GitError,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                raise FixedRefHistoryError(
+                                    "fixed-ref history could not resolve the requested commit or body"
+                                ) from exc
+                            try:
+                                body.decode("utf-8", errors="strict")
+                            except UnicodeDecodeError as exc:
+                                raise FixedRefHistoryError(
+                                    "fixed-ref body is not valid UTF-8"
+                                ) from exc
+                            snapshot: dict[str, Any] = {
+                                "fixed_ref": fixed_ref,
+                                "current_commit": current_commit,
+                                "history": histories[position],
+                                "activity": activities[position],
+                            }
+                            if include_bodies:
+                                snapshot["body"] = body
+                            else:
+                                snapshot["body_digest"] = hashlib.sha256(body).hexdigest()
+                                snapshot["byte_size"] = len(body)
+                            snapshots[position] = snapshot
+                    remaining.difference_update(lineage_currents)
+
+                if remaining or any(
+                    snapshot is None for snapshot in snapshots
+                ):
+                    raise FixedRefHistoryError(
+                        "fixed-ref history could not resolve current lineages"
+                    )
+                return [
+                    snapshot
+                    for snapshot in snapshots
+                    if snapshot is not None
+                ]
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref history could not resolve the requested commit or body"
+            ) from exc
+
     def manual_fixed_ref_history(
         self,
         vault_name: str,
@@ -1484,9 +2428,14 @@ class GitService:
     ) -> dict:
         """Implementation kept inside ``manual_fixed_ref_history``'s Repo scope."""
         try:
-            repo.commit(fixed_ref)
+            repo.git.cat_file("-e", f"{fixed_ref}^{{commit}}")
+            repo.git.cat_file("-e", f"{current_commit}^{{commit}}")
+            fixed = repo.commit(fixed_ref)
             current = repo.commit(current_commit)
-            repo.git.merge_base("--is-ancestor", current_commit, fixed_ref)
+            if fixed.hexsha != fixed_ref or current.hexsha != current_commit:
+                raise FixedRefHistoryError(
+                    "fixed-ref history could not resolve the requested commit or body"
+                )
             blob = current.tree / file_path
             body = blob.data_stream.read()
         except (
@@ -1512,9 +2461,17 @@ class GitService:
             "-M",
             "--name-status",
         ]
-        if since_epoch is not None:
+        # Imported Git documents are created in AKB after their source commit.
+        # In that case a DB-created-at lower bound would hide the very commit
+        # that anchors the imported file's lineage, so retain the complete
+        # path history. Native AKB writes keep the bounded legacy behavior.
+        if since_epoch is not None and current.committed_date >= since_epoch:
             log_args.append(f"--since=@{since_epoch}")
-        log_args.extend(["--format=%H%x00%ct", fixed_ref, "--", file_path])
+        # ``documents.current_commit`` is the Legacy document authority.  A
+        # later orphan write may reuse the same path without updating that DB
+        # row, so history must stop at the recorded document head rather than
+        # absorbing unrelated path activity between it and the vault tip.
+        log_args.extend(["--format=%H%x00%ct", current_commit, "--", file_path])
         try:
             output = repo.git.log(*log_args)
         except (GitError, ValueError) as exc:
@@ -1546,9 +2503,40 @@ class GitService:
             status = fields[0]
             if status.startswith("R") and len(fields) >= 3:
                 active["path_at_revision"] = fields[-1]
+                active["action"] = "move"
             elif len(fields) >= 2:
                 active["path_at_revision"] = fields[-1]
+                action = {
+                    "A": "create",
+                    "M": "update",
+                    "D": "delete",
+                }.get(status[:1])
+                if action is not None:
+                    active["action"] = action
         flush()
+
+        # Git commit timestamps have one-second precision while the document
+        # row's created_at has microseconds. Preserve the standard AKB action
+        # so the migration bridge can stop at the newest create commit instead
+        # of dropping that commit (or admitting an older same-path lifecycle)
+        # on timestamp comparison alone. Plain imported Git commits retain the
+        # action inferred from their exact name-status record above.
+        for entry in history:
+            try:
+                commit = repo.commit(entry["legacy_git_oid"])
+                metadata = self._legacy_commit_metadata(commit)
+            except (BadName, BadObject, GitError, KeyError, TypeError, ValueError):
+                continue
+            # Runtime cutover compatibility reuses this already-fixed-ref
+            # primitive to reconstruct the public history envelope.  Keep the
+            # display metadata beside the immutable OID/path/time facts; the
+            # migration digest intentionally continues to project only the
+            # fields it owns.
+            entry["message"] = str(commit.message).strip()
+            entry["author"] = str(commit.author)
+            action = _canonical_legacy_activity_action(metadata.get("action", ""))
+            if action in _PUBLIC_ACTIVITY_ACTIONS:
+                entry["action"] = action
 
         return {
             "fixed_ref": fixed_ref,
@@ -1561,8 +2549,8 @@ class GitService:
     def _manual_fixed_ref_activity(self, repo: Repo, commit, file_path: str) -> dict:
         """Freeze the legacy public activity projection for one file commit."""
         metadata = self._legacy_commit_metadata(commit)
-        action = metadata["action"]
-        if action not in {"create", "update", "move", "delete"}:
+        declared_action = _canonical_legacy_activity_action(metadata["action"])
+        if declared_action and declared_action not in _PUBLIC_ACTIVITY_ACTIONS:
             raise FixedRefHistoryError(
                 "fixed-ref current commit has no supported public activity action"
             )
@@ -1610,11 +2598,17 @@ class GitService:
                             "path_to": file_path,
                         }
                     )
-        if len(changes) != 1 or changes[0]["change"] != action:
+        if len(changes) != 1:
             raise FixedRefHistoryError(
                 "fixed-ref current commit activity does not match the file action"
             )
         selected_change = changes[0]
+        inferred_action = selected_change["change"]
+        action = declared_action or inferred_action
+        if not _legacy_activity_matches_git_change(declared_action, inferred_action):
+            raise FixedRefHistoryError(
+                "fixed-ref current commit activity does not match the file action"
+            )
         return {
             "legacy_git_oid": commit.hexsha,
             "committed_at": datetime.fromtimestamp(
@@ -1906,6 +2900,7 @@ class GitService:
         attach the worktree to — happens once at vault creation).
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 return self._commit_via_clone(vault_name, file_path, content, message, author_name, author_email)
@@ -1940,6 +2935,7 @@ class GitService:
     ) -> str:
         """Delete a file and commit. Returns the commit hash."""
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {file_path}")
@@ -1979,6 +2975,7 @@ class GitService:
         if old_path == new_path:
             raise ValueError("move_file: old_path and new_path are identical")
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 raise FileNotFoundError(f"File not found in vault: {old_path}")
@@ -2050,6 +3047,7 @@ class GitService:
         Returns the new commit's hex SHA, or `None` when no commit was made.
         """
         with self._vault_write_lock(vault_name):
+            self._require_normal_write_allowed(vault_name)
             wt = self._ensure_worktree(vault_name)
             if wt is None:
                 # Empty bare repo or missing vault — nothing to delete.
@@ -2238,18 +3236,60 @@ class GitService:
         with _managed_repo(self._get_repo(vault_name)) as repo:
             return self._vault_log_with_repo(repo, max_count, since, path)
 
+    def manual_fixed_ref_vault_log(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        *,
+        max_count: int,
+        since: str | None,
+        path: str | None,
+    ) -> list[dict]:
+        """Read a vault activity feed from one exact manual-vault ancestor.
+
+        Cutover activity is bound to a durable Legacy tip, not the mutable
+        repository HEAD or the set of documents that happen to survive in the
+        current catalog. This retains deleted and prior-recreate lifecycles.
+        """
+        if re.fullmatch(r"[0-9a-f]{40}", fixed_ref) is None:
+            raise FixedRefHistoryError("fixed-ref vault activity requires a full lowercase 40-hex OID")
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref vault activity is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                return self._vault_log_with_repo(
+                    repo,
+                    max_count,
+                    since,
+                    path,
+                    fixed_ref=fixed_ref,
+                )
+        except (BadName, BadObject, FileNotFoundError, GitError, TypeError, ValueError) as exc:
+            raise FixedRefHistoryError("fixed-ref vault activity could not be read") from exc
+
     def _vault_log_with_repo(
         self,
         repo: Repo,
         max_count: int,
         since: str | None,
         path: str | None,
+        *,
+        fixed_ref: str | None = None,
     ) -> list[dict]:
         try:
             # gitpython's iter_commits stub forbids **kwargs splatting
             # (each named param is typed individually). Two branches by
             # which optional flags are present — explicit, mypy-clean.
-            if since and path:
+            if fixed_ref is not None and since and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since, paths=path))
+            elif fixed_ref is not None and since:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since))
+            elif fixed_ref is not None and path:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, paths=path))
+            elif fixed_ref is not None:
+                commits = list(repo.iter_commits(fixed_ref, max_count=max_count))
+            elif since and path:
                 commits = list(repo.iter_commits(max_count=max_count, since=since, paths=path))
             elif since:
                 commits = list(repo.iter_commits(max_count=max_count, since=since))
@@ -2334,6 +3374,58 @@ class GitService:
                 lookup_path,
                 commit_hash,
             )
+
+    def manual_fixed_ref_file_diff(
+        self,
+        vault_name: str,
+        fixed_ref: str,
+        file_path: str,
+        commit_hash: str,
+    ) -> dict:
+        """Read one legacy diff without consulting the mutable vault HEAD.
+
+        Existing-database cutover mappings bind both selectors to an exact
+        frozen tip.  The normal legacy ``file_diff`` starts rename tracking at
+        HEAD, so it is not a sufficient authority after Native writes begin.
+        This narrow companion verifies the selected commit is within the
+        frozen graph and resolves its historical path from that graph only.
+        """
+        full_oid = re.compile(r"^[0-9a-f]{40}$")
+        if not full_oid.fullmatch(fixed_ref) or not full_oid.fullmatch(commit_hash):
+            raise FixedRefHistoryError(
+                "fixed-ref diff requires full lowercase 40-hex commit OIDs"
+            )
+        if self._is_mirror(vault_name):
+            raise FixedRefHistoryError("fixed-ref diff is limited to manual vaults")
+        try:
+            with _managed_repo(self._get_repo(vault_name)) as repo:
+                repo.commit(fixed_ref)
+                target = repo.commit(commit_hash).hexsha
+                repo.git.merge_base("--is-ancestor", target, fixed_ref)
+                historical_path = self._stream_path_at_revision(
+                    repo,
+                    fixed_ref,
+                    file_path,
+                    target,
+                )
+                return self._file_diff_with_repo(
+                    repo,
+                    file_path,
+                    historical_path or file_path,
+                    target,
+                )
+        except (
+            BadName,
+            BadObject,
+            FileNotFoundError,
+            GitError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise FixedRefHistoryError(
+                "fixed-ref diff could not resolve the requested commit"
+            ) from exc
 
     def _file_diff_with_repo(
         self,

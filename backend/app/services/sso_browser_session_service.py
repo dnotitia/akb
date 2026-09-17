@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import secrets
 import uuid
+import asyncpg
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from app.services.sso_session_epoch import (
     lock_active_sso_session_epoch,
 )
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+from app.sso import local_realm
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +177,18 @@ def _scope(claims: Mapping[str, object]) -> str:
 
 
 def _provider_alias(claims: Mapping[str, object]) -> str:
+    # A direct sign-in against this installation's own realm is brokered nowhere,
+    # so Keycloak mints no `identity_provider`. Absence is the local realm's
+    # signature, recorded under its reserved alias -- which no Keycloak identity
+    # provider may take, so the two can never be confused.
+    #
+    # This does not weaken the brokered case. The route already asserted the
+    # biconditional before a session exists, and every comparison below is an
+    # equality: a brokered session's custody names its provider, so a later token
+    # that lost the claim reads as `local` and fails, and a local session's
+    # custody names `local`, so a token that gained one fails too.
+    if claims.get("identity_provider") is None:
+        return local_realm.ALIAS
     value = _required_claim(claims, "identity_provider", maximum=63)
     try:
         return validate_alias(value)
@@ -205,11 +219,55 @@ def _exact_session_is_live(row) -> bool:
     )
 
 
+async def next_browser_login_sequence() -> int:
+    """Order login starts and account-wide logout without relying on clocks."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT nextval('sso_browser_login_sequence')")
+
+
+async def revoke_all_sso_browser_sessions(user: AuthenticatedUser) -> datetime:
+    try:
+        return await _revoke_all_sso_browser_sessions(user)
+    except (asyncpg.DeadlockDetectedError, asyncpg.LockNotAvailableError):
+        raise AKBError("Session state changed. Review the action and try again.", 409,
+                       code="session_state_changed") from None
+
+
+async def _revoke_all_sso_browser_sessions(user: AuthenticatedUser) -> datetime:
+    """End AKB browser handles only; keep IdP sessions and PATs untouched."""
+    if user.auth_method != "browser_session" or user.account_kind != "human":
+        raise ForbiddenError("A verified SSO browser session is required")
+    authority = current_sso_session_authority()
+    uid = uuid.UUID(user.user_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL lock_timeout='5s'")
+            await lock_active_sso_session_epoch(conn, authority)
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                               f"sso-browser-session:{authority.session_epoch}:{uid}")
+            row = await conn.fetchrow("SELECT account_status,account_kind,auth_provider FROM users WHERE id=$1 FOR UPDATE", uid)
+            if row is None or row["account_status"] != "active":
+                raise AuthenticationError("Session is no longer valid")
+            if row["account_kind"] != "human" or row["auth_provider"] != "keycloak":
+                raise ForbiddenError("This account is not an SSO human account")
+            revoked_at = await conn.fetchval("""INSERT INTO sso_browser_user_revocations(user_id,login_sequence)
+                VALUES($1,nextval('sso_browser_login_sequence')) ON CONFLICT(user_id) DO UPDATE SET
+                login_sequence=EXCLUDED.login_sequence,revoked_at=clock_timestamp() RETURNING revoked_at""", uid)
+            await conn.execute("DELETE FROM sso_browser_sessions WHERE user_id=$1", uid)
+            await emit_event(conn, "auth.sso_browser_sessions_revoked", actor_id=str(uid),
+                             payload={"scope": "sso_browser_sessions", "affects_pats": False})
+    return revoked_at
+
+
 async def create_sso_browser_session(
     user: AuthenticatedUser,
     principal: VerifiedPrincipal,
     id_claims: Mapping[str, object],
     token_response: Mapping[str, object],
+    *,
+    login_sequence: int | None = None,
 ) -> IssuedSsoBrowserSession:
     """Persist one exact-bound session after both token profiles verified."""
     if principal.profile_id != KEYCLOAK_ACCESS_V1 or user.auth_method != "oauth":
@@ -279,6 +337,13 @@ async def create_sso_browser_session(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"sso-browser-session:{session_epoch}:{user_id}",
             )
+            revoked_sequence = await conn.fetchval(
+                "SELECT login_sequence FROM sso_browser_user_revocations WHERE user_id=$1", user_id,
+            )
+            if revoked_sequence is not None and (
+                type(login_sequence) is not int or login_sequence <= revoked_sequence
+            ):
+                raise AuthenticationError("SSO login started before all browser sessions were ended; sign in again")
             # Session creation and back-channel logout share this exact lock.
             # The durable fence below then rejects a callback that resumes
             # after a verified logout event has already committed.

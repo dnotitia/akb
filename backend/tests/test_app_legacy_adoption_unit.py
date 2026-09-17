@@ -30,7 +30,6 @@ def _target(vault_id: uuid.UUID, *, tables: list[str] | None = None) -> dict:
     return {
         "vault_id": str(vault_id),
         "table_allowlist": tables or ["orders"],
-        "expected_schema_fingerprint": "A" * 64,
     }
 
 
@@ -49,7 +48,7 @@ def test_allowlist_is_sorted_deduplicated_and_rejects_non_arrays() -> None:
     )
     by_vault = {item["vault_id"]: item for item in normalized}
     assert by_vault[str(vault_b)]["table_allowlist"] == ["alpha", "zeta"]
-    assert by_vault[str(vault_b)]["expected_schema_fingerprint"] == "a" * 64
+    assert "expected_schema_fingerprint" not in by_vault[str(vault_b)]
 
     with pytest.raises(ValidationError):
         adoption.normalize_adoption_targets(
@@ -70,7 +69,6 @@ def test_digest_is_canonical_over_target_order_and_json_key_order() -> None:
     second = adoption.normalize_adoption_targets(
         [
             {
-                "expected_schema_fingerprint": "a" * 64,
                 "table_allowlist": ["users", "orders", "orders"],
                 "vault_id": str(uuid.UUID(int=2)),
             }
@@ -107,20 +105,7 @@ def test_fingerprint_is_allowlist_scoped_and_order_independent() -> None:
     assert expected == resources.canonical_table_fingerprint(list(reversed(rows)))
     assert expected == hashlib.sha256(
         resources.canonical_json(
-            [
-                {
-                    "name": "orders",
-                    "columns": [{"name": "amount", "type": "numeric"}],
-                    "unique_keys": [],
-                    "indexes": [],
-                },
-                {
-                    "name": "users",
-                    "columns": [{"name": "email", "type": "text"}],
-                    "unique_keys": [{"name": "users_email_uk", "columns": ["email"]}],
-                    "indexes": [],
-                },
-            ]
+            [resources.canonical_table_descriptor(row) for row in rows]
         )
     ).hexdigest()
 

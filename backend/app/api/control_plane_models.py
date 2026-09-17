@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal, TypeAlias
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from app.util.text import NFCModel
 
@@ -46,16 +46,121 @@ class AppUpdateRequest(ControlPlaneRequest):
     metadata: JsonObject | None = None
 
 
-class ReleaseManifest(BaseModel):
-    """Published release manifest shape shared by registry and rollout APIs."""
+class ManifestColumn(NFCModel):
+    """One logical column in a desired table projection."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
-    steps: list[JsonObject]
+    name: str = Field(min_length=1, max_length=63, pattern=r"^[a-z][a-z0-9_]*$")
+    type: str = Field(min_length=1, max_length=32)
+    required: StrictBool = False
+    default: JsonValue = None
+    check: JsonObject | None = None
+    enum: list[str] | None = None
+    references: JsonObject | None = None
+    on_delete: str | None = None
+    unique: StrictBool = False
+    index: StrictBool = False
+
+
+class ManifestUniqueKey(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=63)
+    columns: list[str] = Field(min_length=1, max_length=63)
+
+
+class ManifestIndexColumn(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=63, pattern=r"^[a-z][a-z0-9_]*$")
+    order: Literal["asc", "desc"] = "asc"
+
+
+class ManifestIndex(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=63)
+    columns: list[str | ManifestIndexColumn] = Field(min_length=1, max_length=63)
+
+
+class ManifestTable(NFCModel):
+    """The schema fields used by the shared canonical table fingerprint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=63, pattern=r"^[a-z][a-z0-9_]*$")
+    columns: list[ManifestColumn] = Field(max_length=256)
+    unique_keys: list[ManifestUniqueKey] = Field(max_length=256)
+    indexes: list[ManifestIndex] = Field(max_length=256)
+
+
+class DesiredSchemaProjection(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tables: list[ManifestTable] = Field(max_length=256)
+    fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+
+
+class TransitionSource(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    release_version: str = Field(min_length=1, max_length=256)
+    schema_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+
+
+class TransitionPlan(NFCModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["fresh"] | TransitionSource
+    steps: list[JsonObject] = Field(max_length=256)
+
+
+class ReleaseManifest(NFCModel):
+    """Strict immutable App Release Manifest v2."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_version: Literal[2]
+    app_key: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    source_revision: str = Field(
+        min_length=40,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{40,64}$",
+    )
+    image_digest: str = Field(
+        min_length=71,
+        max_length=71,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    schema_version: StrictInt = Field(ge=1)
+    schema_: DesiredSchemaProjection = Field(alias="schema")
+    transition_plans: list[TransitionPlan] = Field(min_length=1, max_length=256)
 
 
 class ReleaseCreateRequest(ControlPlaneRequest):
-    version: str = Field(min_length=1, max_length=256)
+    version: str = Field(
+        min_length=5,
+        max_length=256,
+        pattern=(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+            r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+        ),
+    )
     manifest: ReleaseManifest
     manifest_checksum: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
 
@@ -214,7 +319,12 @@ class ObservedStateRequest(ControlPlaneRequest):
     observed_at: datetime | None = None
     observed_release_id: uuid.UUID | None = None
     observed_release_version: str | None = Field(default=None, max_length=256)
-    schema_fingerprint: str | None = Field(default=None, max_length=256)
+    schema_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
     observed_grant_generation: int | None = Field(default=None, ge=0)
     checkpoint: JsonObject = Field(default_factory=dict)
     recent_error: JsonObject | None = None
@@ -347,11 +457,6 @@ class RolloutProjection(ControlPlaneModel):
 class LegacyAdoptionTargetRequest(ControlPlaneRequest):
     vault_id: uuid.UUID
     table_allowlist: list[str] = Field(min_length=1, max_length=256)
-    expected_schema_fingerprint: str = Field(
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-fA-F]{64}$",
-    )
 
 
 class LegacyAdoptionCreateRequest(ControlPlaneRequest):

@@ -35,6 +35,7 @@ async def select_rows(
     vault_id: uuid.UUID,
     table_name: str,
     user_id: uuid.UUID | str,
+    actor_id: str,
     is_admin: bool = False,
     query_params: Sequence[tuple[str, str]] = (),
     range_header: str | None = None,
@@ -66,6 +67,7 @@ async def select_rows(
     try:
         result = await get_user_sql_executor().execute(
             user_id=user_id,
+            actor_id=actor_id,
             sql=compiled["sql"],
             params=compiled["params"],
             is_admin=is_admin,
@@ -93,6 +95,7 @@ async def query_rows(
     vault_id: uuid.UUID,
     table_name: str,
     user_id: uuid.UUID | str,
+    actor_id: str,
     is_admin: bool = False,
     ast: Mapping[str, Any],
     range_header: str | None = None,
@@ -124,6 +127,7 @@ async def query_rows(
     try:
         result = await get_user_sql_executor().execute(
             user_id=user_id,
+            actor_id=actor_id,
             sql=compiled["sql"],
             params=compiled["params"],
             is_admin=is_admin,

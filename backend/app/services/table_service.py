@@ -917,19 +917,21 @@ async def create_table(
                     vault_id, collection_path, conn=conn,
                 )
 
-            pg_name = table_data_repo.pg_table_name(vault["name"], name)
-            # Refuse names whose PG identifier would overflow NAMEDATALEN.
-            # PG truncates silently, and role_sync then refuses to GRANT on
-            # the over-long name (raising deep in the stack as a 500). Catch
-            # it here as a clean 422 that names the culprit, before any DDL.
-            if len(pg_name) > table_data_repo.PG_IDENT_MAX_LEN:
+            # The caller's own name still has to fit a PostgreSQL identifier.
+            #
+            # `pg_table_name` fits an over-long PAIR rather than refusing it,
+            # because the vault side is often generated and the caller cannot
+            # shorten it. That is not true of the table name: it is theirs, it
+            # is what `pg_short_name` hands back as `sql_name`, and a name
+            # longer than any identifier can be is a mistake they can fix. So
+            # the refusal stays for this half and is gone for the other.
+            if len(name.encode()) > table_data_repo.PG_IDENT_MAX_LEN:
                 raise ValidationError(
-                    f"Table name too long: the PostgreSQL identifier "
-                    f"{pg_name!r} is {len(pg_name)} chars, over the "
-                    f"{table_data_repo.PG_IDENT_MAX_LEN}-char limit. Shorten "
-                    f"the vault name ({vault['name']!r}) or table name "
-                    f"({name!r})."
+                    f"Table name too long: {name!r} is {len(name.encode())} bytes, "
+                    f"over the {table_data_repo.PG_IDENT_MAX_LEN}-byte PostgreSQL "
+                    f"identifier limit."
                 )
+            pg_name = table_data_repo.pg_table_name(vault["name"], name)
 
             # Cross-vault physical-name fusion preflight (issue #285).
             # `_sanitize_pg_part` maps `-` → `_` and `__` is also the
@@ -970,7 +972,14 @@ async def create_table(
             try:
                 try:
                     await table_data_repo.create_dynamic_table(
-                        conn, pg_name, columns, vault_name=vault["name"],
+                        conn,
+                        pg_name,
+                        columns,
+                        vault_name=vault["name"],
+                        vault_id=vault_id,
+                        resource_uri=table_uri(
+                            vault["name"], name, collection=collection_path
+                        ),
                     )
                 except asyncpg.DuplicateTableError as e:
                     # The CREATE TABLE itself lost a create/create race past
@@ -1837,6 +1846,7 @@ async def execute_sql(
     *,
     vault_names: list[str],
     user_id: str,
+    actor_id: str,
     sql: str,
     params: list[Any] | None = None,
     is_admin: bool = False,
@@ -1967,6 +1977,7 @@ async def execute_sql(
     try:
         return await get_user_sql_executor().execute(
             user_id=user_id,
+            actor_id=actor_id,
             sql=rewritten,
             params=params,
             is_admin=is_admin,

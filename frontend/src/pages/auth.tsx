@@ -17,6 +17,7 @@ import { Alert } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Logo } from "@/components/logo";
+import { AuthCardLoading } from "@/components/auth-card-loading";
 import { cn } from "@/lib/utils";
 
 declare const PasswordCredential: {
@@ -46,11 +47,15 @@ export default function AuthPage() {
   // person back here with a reason instead, and this is where that reason
   // becomes a sentence. Unknown values fall through to the generic line rather
   // than being echoed, so the query string cannot put text on the screen.
+  const lifecycleReason = new URLSearchParams(window.location.search).get("reason");
+  const lifecycleNotice = lifecycleReason === "sso-sessions-revoked" ? "Your AKB browser sessions have been signed out. Your identity provider session and personal access tokens remain active. You can sign in again with SSO; your account and Vault data are preserved." : lifecycleReason === "sessions-revoked" ? "Your local login sessions have been signed out. Personal access tokens remain active." : lifecycleReason === "account-deleted" ? "Your account deletion request completed." : lifecycleReason === "session-unverified" ? "Sign in again to verify your account. The previous action could not be confirmed." : null;
   const ssoError = new URLSearchParams(window.location.search).get("sso_error") ?? "";
   const [loading, setLoading] = useState(false);
   // Unknown until the versioned public policy is validated. No UI capability
   // is inferred while loading or when the fetch/schema fails.
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [configError, setConfigError] = useState("");
+  const [configAttempt, setConfigAttempt] = useState(0);
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
   const localAuthEnabled =
     authConfig?.available === true &&
@@ -70,33 +75,42 @@ export default function AuthPage() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const config = await getAuthConfig();
-      if (cancelled) return;
-      if (config.available !== true || config.auth_mode === null) {
-        setAuthConfig(config);
-        return;
-      }
-      if (config.auth_mode === "sso" && getToken()) {
-        // Defense in depth for mocked/legacy config clients: a local JWT must
-        // never shadow the SSO cookie carrier.
-        setToken(null);
-      }
-      const hasSessionCandidate = config.auth_mode === "sso" || getToken() !== null;
-      if (hasSessionCandidate) {
-        try {
-          await getMe({ redirectOnUnauthorized: false });
-          if (!cancelled) navigate(next, { replace: true });
+      try {
+        setConfigError("");
+        const config = await getAuthConfig();
+        if (cancelled) return;
+        if (config.available !== true || config.auth_mode === null) {
+          setAuthConfig(config);
           return;
-        } catch {
-          // No current session: reveal only the options allowed by config.
+        }
+        if (config.auth_mode === "sso" && getToken()) {
+          // Defense in depth for mocked/legacy config clients: a local JWT must
+          // never shadow the SSO cookie carrier.
+          setToken(null);
+        }
+        const hasSessionCandidate = config.auth_mode === "sso" || getToken() !== null;
+        if (hasSessionCandidate) {
+          try {
+            await getMe({ redirectOnUnauthorized: false });
+            if (!cancelled) navigate(next, { replace: true });
+            return;
+          } catch {
+            // No current session: reveal only the options allowed by config.
+          }
+        }
+        if (!cancelled) setAuthConfig(config);
+      } catch (caught) {
+        if (!cancelled) {
+          setConfigError(
+            caught instanceof Error ? caught.message : "Authentication options could not be loaded.",
+          );
         }
       }
-      if (!cancelled) setAuthConfig(config);
     })();
     return () => {
       cancelled = true;
     };
-  }, [navigate, next]);
+  }, [configAttempt, navigate, next]);
 
   function startSso(loginUrl: string | null) {
     if (!loginUrl) return;
@@ -197,9 +211,16 @@ export default function AuthPage() {
             <Logo size={40} subtitle />
           </div>
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
-            {authConfig === null && (
-              <div className="py-8 text-center coord" role="status" aria-live="polite">
-                Loading sign-in options…
+            {authConfig === null && !configError && <AuthCardLoading label="Loading sign-in options" />}
+
+            {configError && (
+              <div className="space-y-4">
+                <Alert variant="destructive" title="Sign-in options unavailable">
+                  {configError}
+                </Alert>
+                <Button type="button" variant="outline" className="w-full" onClick={() => setConfigAttempt((value) => value + 1)}>
+                  Try again
+                </Button>
               </div>
             )}
 
@@ -243,6 +264,7 @@ export default function AuthPage() {
               </Alert>
             )}
 
+            {lifecycleNotice && <Alert variant="info">{lifecycleNotice}</Alert>}
             {ssoError && (
               <Alert variant="destructive" id="auth-sso-error">
                 {ssoError === "membership_required"

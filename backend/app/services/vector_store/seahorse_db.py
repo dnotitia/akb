@@ -483,6 +483,7 @@ class SeahorseDbStore:
         limit: int,
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[VectorHit]:
         """Coral's hybrid search takes:
 
@@ -585,7 +586,9 @@ class SeahorseDbStore:
         # ACL pre-filter as a Coral SQL WHERE clause (issue #189 Phase 2): the
         # caller sends EXACTLY ONE of vault_ids (per-vault) / source_ids (per-
         # resource). vault_filter_sql asserts that and UUID-validates each id.
-        acl = _vault_filter_sql(vault_ids, source_ids)
+        # source_types (workbench #1069) ANDs a source_type predicate onto the
+        # same filter — the column is stored on every point (schema below).
+        acl = _vault_filter_sql(vault_ids, source_ids, source_types=source_types)
         if acl is not None:
             payload["filter"] = acl
 

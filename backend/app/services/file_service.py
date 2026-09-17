@@ -1,7 +1,10 @@
 """File service — S3-backed binary file storage for vaults.
 
 AKB does not store file bytes in the application database. It:
-1. Generates presigned URLs for direct client ↔ S3 transfer.
+1. Issues capability URLs — this service plus an opaque token — that a client
+   PUTs to or GETs from with no Authorization header, the way it used to use a
+   presigned URL. Bytes stream through this service; the object store's
+   endpoint, bucket and keys stay private to it.
 2. Manages file metadata in PostgreSQL (`vault_files_repo`).
 3. Streams uploaded object bytes once at confirmation to certify sha256.
 
@@ -15,10 +18,16 @@ This module is the file-domain layer over those primitives.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
+import re
+import secrets
 import uuid
-from typing import Iterator
+from typing import Any, AsyncIterator, Iterator
 from urllib.parse import quote
+
+import anyio
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -41,6 +50,10 @@ from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
+from app.services.native_file_projection import (
+    enqueue_native_file_projection,
+    enqueue_native_file_projection_delete,
+)
 
 # Re-export so existing callers (publication_service, public routes)
 # don't break. New code should import directly from s3_adapter.
@@ -93,6 +106,20 @@ def content_disposition_attachment(filename: str) -> str:
     return f'attachment; filename="{ascii_safe}"; filename*=UTF-8\'\'{utf8_encoded}'
 
 
+def content_disposition_inline(filename: str) -> str:
+    """Same escaping, but naming the file without forcing a save.
+
+    A preview needs the browser to render the bytes; it still wants the real
+    name for the save dialog a reader may reach for afterwards."""
+    ascii_safe = (
+        filename.encode("ascii", "replace")
+        .decode("ascii")
+        .translate({ord(c): None for c in '"\r\n'})
+    )
+    utf8_encoded = quote(filename, safe="")
+    return f'inline; filename="{ascii_safe}"; filename*=UTF-8\'\'{utf8_encoded}'
+
+
 # ── Top-level S3 helpers (thin wrappers around s3_adapter) ───────
 
 
@@ -131,10 +158,13 @@ def iter_object_chunks(
     chunk_size: int = _S3_STREAM_CHUNK_SIZE,
     *,
     max_bytes: int | None = None,
+    byte_range: str | None = None,
 ) -> Iterator[bytes]:
     """Stream an object with an optional hard bound on transferred bytes."""
     transferred = 0
-    gen = s3_adapter.iter_chunks(s3_key, chunk_size=chunk_size)
+    gen = s3_adapter.iter_chunks(
+        s3_key, chunk_size=chunk_size, byte_range=byte_range,
+    )
     try:
         for chunk in gen:
             transferred += len(chunk)
@@ -259,6 +289,201 @@ def _file_version(row: dict) -> str | None:
     return row.get("storage_version") or row.get("etag")
 
 
+def _new_capability_token() -> str:
+    """256 bits of URL-safe randomness. The token IS the capability, so it is
+    never stored — only its digest is, the same way a password would be."""
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+# What `_new_capability_token` produces: base64url, no padding. Anything else
+# is not a token this service issued, and must be refused before it reaches
+# `.encode("ascii")` — which raises on non-ASCII input, and an unauthenticated
+# route that raises lets anyone write tracebacks into the log.
+_CAPABILITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _is_capability_token_shaped(token: str | None) -> bool:
+    return bool(token) and bool(_CAPABILITY_TOKEN_RE.fullmatch(token or ""))
+
+
+def _capability_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _capability_url(token: str) -> str:
+    base = (settings.public_base_url or "").rstrip("/")
+    return f"{base}/api/v1/files/download/{token}"
+
+
+def _write_capability_url(token: str) -> str:
+    base = (settings.public_base_url or "").rstrip("/")
+    return f"{base}/api/v1/files/upload/{token}"
+
+
+async def _issue_write_capability(
+    conn,
+    *,
+    file_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    object_key: str,
+    filename: str,
+    mime_type: str,
+    actor_id: str,
+    collection_id: uuid.UUID | None = None,
+    declared_content_hash: str | None = None,
+    intent_id: uuid.UUID | None = None,
+    ttl: int = _PRESIGN_UPLOAD_TTL,
+) -> str:
+    """Grant one PUT to one object key and return the bearer token.
+
+    Only the digest is stored, exactly as for a download grant: the URL handed
+    back to the caller is the only copy of the token that will ever exist.
+    Naming the key is what keeps a capability issued for a replacement's
+    staging key from being redeemable against the live object.
+    """
+    token = _new_capability_token()
+    await conn.execute(
+        """
+        INSERT INTO m1_file_transfer_intents (
+            id, file_id, vault_id, collection_id, method, filename, mime_type,
+            actor_id, declared_content_hash, object_key, token_digest, expires_at
+        ) VALUES (
+            $1, $2, $3, $4, 'PUT', $5, $6, $7, $8, $9, $10,
+            NOW() + ($11 * INTERVAL '1 second')
+        )
+        """,
+        intent_id or uuid.uuid4(), file_id, vault_id, collection_id,
+        filename, mime_type, actor_id, declared_content_hash, object_key,
+        _capability_digest(token), ttl,
+    )
+    return token
+
+
+async def store_object_stream(
+    object_key: str,
+    chunks: AsyncIterator[bytes],
+    *,
+    content_type: str,
+    max_bytes: int,
+    declared_bytes: int | None = None,
+) -> int:
+    """Write a request body of unknown length to one key; return its size.
+
+    Buffers up to one part before deciding how to store. A body that fits in
+    that buffer is a single PUT — which is the overwhelming majority of Files —
+    so the common case costs one round trip rather than three. Only a body that
+    outgrows the buffer becomes a multipart upload, and then no more than one
+    part is ever held in memory at a time. A File can be multi-gigabyte, so
+    holding the body was never an option.
+
+    Parts are sent one at a time. Overlapping them would read from the client
+    while a part is in flight, but it would also double the resident buffer
+    and leave a part in flight to reason about on the abort path; the transfer
+    is bounded by how fast the client sends in any case.
+    """
+    part_size = s3_adapter.MULTIPART_MIN_PART_BYTES
+    buf = bytearray()
+    received = 0
+    upload_id: str | None = None
+    parts: list[dict[str, Any]] = []
+
+    async def _send_part() -> None:
+        nonlocal upload_id, buf
+        if upload_id is None:
+            upload_id = await asyncio.to_thread(
+                s3_adapter.multipart_create, object_key, content_type,
+            )
+        number = len(parts) + 1
+        etag = await asyncio.to_thread(
+            s3_adapter.multipart_part, object_key, upload_id, number, bytes(buf),
+        )
+        parts.append({"PartNumber": number, "ETag": etag})
+        buf = bytearray()
+
+    try:
+        async for chunk in chunks:
+            if not chunk:
+                continue
+            received += len(chunk)
+            if received > max_bytes:
+                raise AKBError(
+                    "Upload exceeds the maximum accepted size", status_code=413,
+                )
+            buf.extend(chunk)
+            if len(buf) >= part_size:
+                await _send_part()
+        # A presigned PUT could not be short: the object store held the
+        # sender to its own Content-Length and stored nothing when the body
+        # ran out early. That guarantee moved into this service along with
+        # the bytes, so it has to be restated here — otherwise a truncated
+        # upload is stored, and `confirm_upload` certifies the truncation as
+        # the File's hash.
+        if declared_bytes is not None and received != declared_bytes:
+            raise AKBError(
+                "Upload body did not match its declared length", status_code=400,
+            )
+        if upload_id is None:
+            # Never grew past one part. A zero-byte body stores a zero-byte
+            # object, which is what a presigned PUT of the same body did.
+            await asyncio.to_thread(
+                s3_adapter.put_bytes, object_key, bytes(buf),
+                content_type=content_type,
+            )
+            return received
+        if buf:
+            await _send_part()
+        await asyncio.to_thread(
+            s3_adapter.multipart_complete, object_key, upload_id, parts,
+        )
+        return received
+    except BaseException:
+        # An abandoned multipart upload is billable storage that no object
+        # listing shows and nothing garbage-collects, so it has to be
+        # abandoned explicitly.
+        if upload_id is not None:
+            await _abandon_multipart(object_key, upload_id)
+        raise
+
+
+async def _abandon_multipart(object_key: str, upload_id: str) -> None:
+    """Abandon a multipart upload, even while being cancelled.
+
+    The exception that brings us here is most often the cancellation raised
+    when a client disconnects mid-body, and handlers run under anyio, whose
+    cancellation is level-triggered: a plain `await` here raises again before
+    the cleanup can run — measured, and only once the default executor is
+    warm, which in a serving process it always is. A shield is what lets an
+    ordinary awaited call finish inside that scope, so the abort stays
+    ordered and its failure stays observable.
+    """
+    with anyio.CancelScope(shield=True):
+        await asyncio.to_thread(s3_adapter.multipart_abort, object_key, upload_id)
+
+
+def _file_envelope(row: dict, vault_name: str) -> dict:
+    """The File metadata envelope, shared by the list and single-File reads.
+
+    Both must emit the same shape: a caller that resolves a File by id has to
+    see exactly what it would have seen had that File been inside the listing
+    window."""
+    return {
+        "kind": "file",
+        "uri": file_uri(vault_name, str(row["id"]), collection=row["collection"]),
+        "collection": row["collection"],
+        "name": row["name"],
+        "mime_type": row["mime_type"],
+        "size_bytes": row["size_bytes"],
+        "content_hash": row["content_hash"],
+        "hash_algorithm": row["hash_algorithm"],
+        "etag": row["etag"],
+        "storage_version": row["storage_version"],
+        "version": _file_version(row),
+        "description": row["description"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
 def _check_file_preconditions(
     row: dict,
     *,
@@ -291,6 +516,7 @@ async def _discard_replacement_objects(*s3_keys: str) -> None:
 
 
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
+from app.util.text import normalize_content_type as _normalize_content_type  # noqa: E402
 
 
 async def _delete_file_publications(conn, vault_id: uuid.UUID, file_id: str) -> None:
@@ -339,9 +565,9 @@ class FileService:
         description: str = "",
         content_hash: str | None = None,
     ) -> dict:
-        """Create a file record and return a presigned PUT URL.
+        """Create a file record and return the URL its bytes are PUT to.
 
-        Client (akb-mcp proxy) uploads directly to S3, then calls
+        The client PUTs the bytes to that absolute URL, then calls
         confirm_upload(). `collection` is a path string (empty / None
         for vault root); a matching `collections` row is auto-created
         if needed so files share the same FK-normalized hierarchy as
@@ -353,8 +579,8 @@ class FileService:
         the same vault/collection/filename resolves to the file that is
         already there instead of creating a second row for the same content.
         The returned envelope is unchanged in shape and still carries a usable
-        `upload_url` — an unaware client can re-PUT the identical bytes to the
-        identical key and confirm as usual; the net effect is one row, not two.
+        `upload_url` — an unaware client can re-PUT the identical bytes and
+        confirm as usual; the net effect is one row, not two.
         `deduplicated` says which happened, for clients that would rather skip
         the redundant transfer.
 
@@ -363,6 +589,7 @@ class FileService:
         were stored under. Omitting `content_hash` preserves the historical
         behaviour exactly: a random key, and one new row per call.
         """
+        mime_type = _normalize_content_type(mime_type)
         if content_hash is not None and not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
         # Ahead of the backend split: the measurement facade normalizes the
@@ -430,25 +657,39 @@ class FileService:
                     created_by=actor_id,
                     collection_id=collection_id,
                 )
-
-        presigned_url = s3_adapter.presign_put(
-            s3_key, content_type=mime_type, ttl=_PRESIGN_UPLOAD_TTL,
-        )
+                # Issued inside the same transaction as the reservation it
+                # authorizes: a capability that outlived a rolled-back
+                # reservation would name a key nothing owns.
+                token = await _issue_write_capability(
+                    conn,
+                    file_id=stored_id,
+                    vault_id=vault_id,
+                    collection_id=collection_id,
+                    object_key=s3_key,
+                    filename=filename,
+                    mime_type=mime_type,
+                    actor_id=actor_id,
+                    declared_content_hash=content_hash,
+                )
 
         deduplicated = stored_id != file_id
         file_id = stored_id
 
         logger.info(
-            "Presigned upload URL for %s/%s (file_id=%s, collection=%s, deduplicated=%s)",
-            vault_name, s3_key, file_id, collection_path or "<root>", deduplicated,
+            "Upload reserved for %s (file_id=%s, collection=%s, deduplicated=%s)",
+            vault_name, file_id, collection_path or "<root>", deduplicated,
         )
         return {
             "kind": "file",
             "uri": file_uri(vault_name, str(file_id), collection=collection_path),
             "vault": vault_name,
             "collection": collection_path or None,
-            "upload_url": presigned_url,
-            "s3_key": s3_key,
+            # Names this service and an opaque token — never the object
+            # store's endpoint, bucket or key. What a caller does with it is
+            # unchanged: PUT the bytes to this absolute URL, no Authorization
+            # header. `s3_key` is gone; it was a storage locator in a public
+            # response and nothing ever read it.
+            "upload_url": _write_capability_url(token),
             "expires_in": _PRESIGN_UPLOAD_TTL,
             "deduplicated": deduplicated,
         }
@@ -459,6 +700,7 @@ class FileService:
         vault_id: uuid.UUID,
         file_id: str,
         *,
+        actor_id: str,
         content_hash: str,
         mime_type: str | None = None,
         expected_content_hash: str | None = None,
@@ -466,9 +708,10 @@ class FileService:
     ) -> dict:
         """Prepare an isolated upload that can replace one logical file.
 
-        No live object key is exposed for PUT.  The caller uploads to a
-        replacement-specific staging key and ``confirm_replace`` publishes a
-        fresh object only after re-checking the optimistic-concurrency pins.
+        The capability is bound to a replacement-specific staging key, so it
+        cannot be redeemed against the live object.  ``confirm_replace``
+        publishes a fresh object only after re-checking the
+        optimistic-concurrency pins.
         """
         if not is_sha256_hex(content_hash):
             raise AKBError("content_hash must be a lowercase sha256 hex digest", status_code=400)
@@ -514,21 +757,31 @@ class FileService:
         s3_adapter.ensure_bucket(self._bucket)
         replacement_id = uuid.uuid4()
         staging_key = _replacement_staging_key(vault_name, fid, replacement_id)
-        upload_mime_type = mime_type or row.get("mime_type") or "application/octet-stream"
-        upload_url = s3_adapter.presign_put(
-            staging_key,
-            content_type=upload_mime_type,
-            ttl=_PRESIGN_UPLOAD_TTL,
+        upload_mime_type = _normalize_content_type(
+            mime_type or row.get("mime_type")
         )
         # An abandoned replacement has no vault_files row from which a normal
         # delete can discover its staging key.  Schedule cleanup just after the
-        # presigned URL expires; successful confirmation also enqueues an
+        # capability expires; successful confirmation also enqueues an
         # immediate delete, and duplicate S3 deletes are intentionally safe.
         async with pool.acquire() as conn:
             await _enqueue_s3_delete(
                 conn,
                 staging_key,
                 delay_seconds=_REPLACEMENT_STAGING_DELETE_DELAY,
+            )
+            # The capability names the staging key, so it cannot be redeemed
+            # against the live object this replacement is meant to supersede.
+            token = await _issue_write_capability(
+                conn,
+                file_id=fid,
+                vault_id=vault_id,
+                object_key=staging_key,
+                filename=row["name"],
+                mime_type=upload_mime_type,
+                actor_id=actor_id,
+                declared_content_hash=content_hash,
+                intent_id=replacement_id,
             )
         return {
             "kind": "file",
@@ -538,7 +791,7 @@ class FileService:
             "name": row["name"],
             "mime_type": upload_mime_type,
             "replacement_id": str(replacement_id),
-            "upload_url": upload_url,
+            "upload_url": _write_capability_url(token),
             "expires_in": _PRESIGN_UPLOAD_TTL,
             "current_content_hash": row.get("content_hash"),
             "current_version": current_version,
@@ -626,7 +879,9 @@ class FileService:
             raise ConflictError("Uploaded replacement file hash mismatch")
 
         size_bytes = final_meta["ContentLength"]
-        mime_type = final_meta.get("ContentType") or row.get("mime_type") or "application/octet-stream"
+        mime_type = _normalize_content_type(
+            final_meta.get("ContentType") or row.get("mime_type")
+        )
         etag = (final_meta.get("ETag") or "").strip('"') or None
         storage_version = final_meta.get("VersionId")
         previous_content_hash: str | None = None
@@ -697,6 +952,18 @@ class FileService:
                                 "previous_version": previous_version,
                                 **_delegated_actor_event_fields(delegated_actor),
                             },
+                        )
+                        await enqueue_native_file_projection(
+                            conn,
+                            file_id=fid,
+                            namespace_id=vault_id,
+                            collection=locked["collection"],
+                            name=locked["name"],
+                            mime_type=mime_type,
+                            content_hash=server_content_hash,
+                            byte_size=size_bytes,
+                            s3_key=final_key,
+                            actor=actor_id,
                         )
                         result_row = {
                             **locked,
@@ -886,6 +1153,18 @@ class FileService:
                         **_delegated_actor_event_fields(delegated_actor),
                     },
                 )
+                await enqueue_native_file_projection(
+                    conn,
+                    file_id=fid,
+                    namespace_id=vault_id,
+                    collection=row["collection"],
+                    name=row["name"],
+                    mime_type=row["mime_type"],
+                    content_hash=server_content_hash,
+                    byte_size=size_bytes,
+                    s3_key=row["s3_key"],
+                    actor=actor_id,
+                )
 
         # Index file metadata for hybrid search.
         try:
@@ -922,15 +1201,32 @@ class FileService:
             "version": storage_version or etag,
         }
 
-    async def get_download_url(self, vault_id: uuid.UUID, file_id: str) -> dict:
-        """Return a presigned GET URL for direct download from S3."""
+    async def get_download_url(
+        self, vault_id: uuid.UUID, file_id: str, *, actor_id: str | None = None,
+    ) -> dict:
+        """Issue a capability URL for these bytes.
+
+        The URL names this service and an opaque token — never the object
+        store's endpoint, bucket or key. A holder still GETs it with no
+        Authorization header, which is what every non-browser consumer is
+        written against.
+
+        `actor_id` is recorded with the grant. Nothing enforces it, but a
+        capability is a bearer credential and who was handed one is the only
+        thing left to record: the fetch no longer reaches the object store, so
+        its access log no longer sees any of this."""
         if self._measurement is not None:
             return await self._measurement.get_download_url(vault_id, file_id)
+        # A malformed id is a client error, not a missing File — same boundary
+        # the single-file read draws.
         try:
             fid = uuid.UUID(file_id)
         except (ValueError, AttributeError):
             raise ValidationError("file_id must be a UUID") from None
+        token = _new_capability_token()
         pool = await get_pool()
+        # One connection for both reads and the grant. Splitting them made a
+        # plain GET take two round-trips through the pool for no gain.
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
                 conn, vault_id, fid,
@@ -941,26 +1237,27 @@ class FileService:
                 or row.get("upload_state") != "confirmed"
             ):
                 raise NotFoundError("File", file_id)
+            await conn.execute(
+                """
+                INSERT INTO m1_file_transfer_intents (
+                    id, file_id, vault_id, method, token_digest, expires_at,
+                    actor_id
+                ) VALUES (
+                    $1, $2, $3, 'GET', $4,
+                    NOW() + ($5 * INTERVAL '1 second'), $6
+                )
+                """,
+                uuid.uuid4(), fid, vault_id,
+                _capability_digest(token), _PRESIGN_DOWNLOAD_TTL, actor_id,
+            )
 
-        # Override stored Content-Type with DB value so browsers inline
-        # render correctly even when the object was uploaded with a
-        # generic octet-stream (legacy proxy versions < 0.5.1).
-        ct = row["mime_type"] if (
-            row["mime_type"] and row["mime_type"] != "application/octet-stream"
-        ) else None
-        presigned_url = s3_adapter.presign_get(
-            row["s3_key"], ttl=_PRESIGN_DOWNLOAD_TTL,
-            response_content_type=ct,
-        )
-
-        # `get_download_url` is called by the HTTP route that the proxy
-        # invokes after parsing the URI client-side; the returned dict is
-        # consumed by the proxy, not the end user. We still surface the
-        # URI for symmetry with confirm_upload.
         return {
             "kind": "file",
             "name": row["name"],
-            "download_url": presigned_url,
+            # Carried so a caller never has to parse the storage locator out of
+            # `download_url` to learn where the File lives.
+            "collection": row["collection"],
+            "download_url": _capability_url(token),
             "mime_type": row["mime_type"],
             "size_bytes": row["size_bytes"],
             "content_hash": row["content_hash"],
@@ -969,6 +1266,134 @@ class FileService:
             "storage_version": row["storage_version"],
             "version": _file_version(row),
             "expires_in": _PRESIGN_DOWNLOAD_TTL,
+        }
+
+    async def get_file(
+        self, vault_id: uuid.UUID, vault_name: str, file_id: str,
+    ) -> dict:
+        """Return one confirmed File's metadata by id.
+
+        Resolving a File used to be possible only by listing the vault and
+        searching the page that came back, so a File outside that window could
+        not be opened at all. This read is by primary key: it does not depend
+        on how many Files the vault holds, nor on where this one sorts."""
+        if self._measurement is not None:
+            return await self._measurement.get_file(vault_id, vault_name, file_id)
+        # A malformed id is a client error, not a missing File — same boundary
+        # the download route draws.
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await vault_files_repo.find_by_id(conn, vault_id, fid)
+        # An attachment or a still-pending upload is not a readable File here,
+        # and must not be distinguishable from one that does not exist.
+        if (
+            not row
+            or row.get("kind") != "file"
+            or row.get("upload_state") != "confirmed"
+        ):
+            raise NotFoundError("File", file_id)
+        return _file_envelope(row, vault_name)
+
+    async def resolve_download_capability(self, token: str) -> dict:
+        """Resolve a download capability to the File row it grants.
+
+        Looked up by digest and checked for expiry, but NOT single-use: a
+        browser fetches the same URL for the preview, again on a reload, and
+        once more for the download control. A presigned URL behaved the same
+        way inside its lifetime, and callers are written against that.
+
+        Every rejection is the same 404 — an expired token, a token that was
+        never issued, and a File that has since been deleted must not be
+        distinguishable from one another."""
+        if not _is_capability_token_shaped(token):
+            raise NotFoundError("File", "capability")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            grant = await conn.fetchrow(
+                """
+                SELECT file_id, vault_id FROM m1_file_transfer_intents
+                 WHERE token_digest = $1 AND method = 'GET' AND expires_at > NOW()
+                """,
+                _capability_digest(token),
+            )
+            if grant is None:
+                raise NotFoundError("File", "capability")
+            row = await vault_files_repo.find_by_id(
+                conn, grant["vault_id"], grant["file_id"],
+            )
+        if (
+            not row
+            or row.get("kind") != "file"
+            or row.get("upload_state") != "confirmed"
+        ):
+            raise NotFoundError("File", "capability")
+        return row
+
+    async def resolve_write_capability(self, token: str) -> dict:
+        """Resolve an upload capability to the single key it may write.
+
+        Not single-use, for the same reason the download grant is not: a
+        transfer that dropped at 90% has to be startable again, which is
+        exactly what re-PUTting a presigned URL did. Expiry is the bound.
+
+        Whether the bytes ever arrived is deliberately not recorded here. The
+        object store is the authority on that and `confirm_upload` asks it
+        directly; a second record of the same fact could only disagree.
+
+        `already_confirmed` is carried because a deduplicating reservation
+        adopts the File that already holds the key — including one whose
+        bytes are final. Writing to that key is how a caller could replace
+        another File's content, and the damage does not stop at replacement:
+        `confirm_upload` re-derives the digest, finds it disagrees with the
+        content-addressed key, and deletes the row. The route uses this to
+        keep the body away from storage in that case.
+
+        A row without `object_key` belongs to the measurement lane, which
+        carries its bytes in the database and addresses no object store. It is
+        refused rather than having a key inferred for it — and like every
+        other rejection here it is the same 404, so an expired token, a token
+        that was never issued and a token for another lane stay
+        indistinguishable.
+
+        The join is what a presigned URL could not do: if the File was deleted
+        between the reservation and the transfer, the capability stops working
+        instead of writing bytes to a key nothing references any more. One
+        query, because the grant alone was never the whole answer.
+        """
+        if not _is_capability_token_shaped(token):
+            raise NotFoundError("File", "capability")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            grant = await conn.fetchrow(
+                """
+                SELECT i.file_id, i.vault_id, i.object_key, i.mime_type,
+                       f.upload_state
+                  FROM m1_file_transfer_intents AS i
+                  JOIN vault_files AS f
+                    ON f.id = i.file_id AND f.vault_id = i.vault_id
+                 WHERE i.token_digest = $1 AND i.method = 'PUT'
+                   AND i.object_key IS NOT NULL AND i.expires_at > NOW()
+                """,
+                _capability_digest(token),
+            )
+        if grant is None:
+            raise NotFoundError("File", "capability")
+        return {
+            "file_id": grant["file_id"],
+            "vault_id": grant["vault_id"],
+            "object_key": grant["object_key"],
+            # The type the bytes will be stored and later served under is the
+            # one AKB normalized when the capability was issued, not one the
+            # uploading client restates at PUT time.
+            "mime_type": _normalize_content_type(grant["mime_type"]),
+            # Whether this reservation adopted a File that is already
+            # confirmed. It changes what the route may do with the body —
+            # see `upload_by_capability`.
+            "already_confirmed": grant["upload_state"] == "confirmed",
         }
 
     async def list_files(
@@ -1010,25 +1435,7 @@ class FileService:
                         collection_id=cid_row["id"], scoped=True, limit=limit,
                     )
 
-        return [
-            {
-                "kind": "file",
-                "uri": file_uri(vault_name, str(r["id"]), collection=r["collection"]),
-                "collection": r["collection"],
-                "name": r["name"],
-                "mime_type": r["mime_type"],
-                "size_bytes": r["size_bytes"],
-                "content_hash": r["content_hash"],
-                "hash_algorithm": r["hash_algorithm"],
-                "etag": r["etag"],
-                "storage_version": r["storage_version"],
-                "version": _file_version(r),
-                "description": r["description"],
-                "created_by": r["created_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
+        return [_file_envelope(r, vault_name) for r in rows]
 
     async def delete(
         self,
@@ -1111,6 +1518,14 @@ class FileService:
                         "s3_key": row["s3_key"],
                         "size_bytes": row["size_bytes"],
                     },
+                )
+                await enqueue_native_file_projection_delete(
+                    conn,
+                    file_id=fid,
+                    namespace_id=vault_id,
+                    collection=row["collection"],
+                    name=row["name"],
+                    actor=actor_id,
                 )
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])

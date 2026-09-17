@@ -20,6 +20,9 @@ from app.services.keycloak_oidc import KeycloakOIDC
 
 @pytest.mark.asyncio
 async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
+    from app.services import sso_browser_session_service
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(sso_browser_session_service, "next_browser_login_sequence", AsyncMock(return_value=42))
     issued: dict[str, object] = {}
 
     async def capture_issue(key, kind, payload, ttl_secs):
@@ -40,6 +43,11 @@ async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
     assert query["response_type"] == ["code"]
     assert query["scope"] == ["openid profile email"]
     assert query["kc_idp_hint"] == ["workforce"]
+    # Provider selection must win over any native/broker session already in
+    # the browser (for example, the separate product-admin login), without
+    # forcing the upstream provider to discard its own SSO session.
+    assert query["max_age"] == ["0"]
+    assert "prompt" not in query
     assert query["code_challenge_method"] == ["S256"]
     assert len(query["code_challenge"][0]) >= 43
     assert len(query["nonce"][0]) >= 20
@@ -54,7 +62,9 @@ async def test_begin_browser_login_is_nonce_pkce_and_browser_bound(monkeypatch):
         "code_verifier",
         "nonce",
         "browser_binding_hash",
+        "login_sequence",
     }
+    assert payload["login_sequence"] == "42"
     assert payload["redirect_path"] == "/vaults?selected=one"
     assert payload["provider_alias"] == "workforce"
     assert payload["client_id"] == "akb-web"

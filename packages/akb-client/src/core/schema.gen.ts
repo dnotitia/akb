@@ -7,6 +7,26 @@ import type { AkbOperation } from "./fetch.js";
 export type AkbJsonObject = { [key: string]: AkbJsonValue | undefined };
 export type AkbJsonObjectArray = AkbJsonObject[];
 
+export type EventCursor = string;
+
+export type EventKind = string;
+
+export interface ChangeEventEnvelopeV1 {
+  version: 1;
+  cursor: EventCursor;
+  occurred_at: string;
+  vault: string;
+  kind: EventKind;
+  resource_uri?: string | null;
+  actor?: string | null;
+  payload: AkbJsonObject;
+}
+
+export interface TailCheckpointV1 {
+  version: 1;
+  cursor: EventCursor;
+}
+
 export interface AkbTableEnvelope {
   kind: "table";
   uri?: string;
@@ -157,11 +177,15 @@ export interface AkbSearchResult {
   path: string;
   title: string;
   collection?: string | null;
+  collection_summary?: string | null;
+  vault_description?: string | null;
   doc_type?: string | null;
   summary?: string | null;
   tags: string[];
   score: number;
   matched_section?: string | null;
+  section_path?: string | null;
+  chunk_index?: number | null;
   [key: string]: unknown;
 }
 
@@ -195,6 +219,7 @@ export interface AkbDrillDownEnvelope {
 
 export interface AkbGrepMatch {
   text: string;
+  line?: number | null;
   section?: string | null;
   [key: string]: unknown;
 }
@@ -204,6 +229,10 @@ export interface AkbGrepResult {
   vault: string;
   path: string;
   title: string;
+  resource_type?: string | null;
+  revision?: string | null;
+  content_hash?: string | null;
+  payload_placement?: string | null;
   matches?: AkbGrepMatch[];
   [key: string]: unknown;
 }
@@ -213,6 +242,8 @@ export interface AkbGrepEnvelope {
   pattern: string;
   regex: boolean;
   error?: string | null;
+  total_resources?: number | null;
+  returned_resources?: number | null;
   returned_docs?: number | null;
   returned_matches?: number | null;
   total_docs?: number | null;
@@ -220,6 +251,8 @@ export interface AkbGrepEnvelope {
   truncated?: boolean | null;
   hint?: string | null;
   results?: AkbGrepResult[] | null;
+  by_resource?: Record<string, number> | null;
+  resources?: Pick<AkbGrepResult, "uri" | "resource_type" | "revision" | "path">[] | null;
   by_doc?: Record<string, number> | null;
   n_files?: number | null;
   files?: string[] | null;
@@ -640,6 +673,10 @@ export interface operations {
 export interface components {
   schemas: {
     AkbError: AkbErrorPayload;
+    EventCursor: EventCursor;
+    EventKind: EventKind;
+    ChangeEventEnvelopeV1: ChangeEventEnvelopeV1;
+    TailCheckpointV1: TailCheckpointV1;
     AkbTableEnvelope: AkbTableEnvelope;
     AkbTableMigrationEnvelope: AkbTableMigrationEnvelope;
     AkbTableSchemaEnvelope: AkbTableSchemaEnvelope;

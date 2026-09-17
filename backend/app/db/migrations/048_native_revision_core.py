@@ -27,6 +27,42 @@ async def _run(conn):
     async with conn.transaction():
         await conn.execute(
             """
+            CREATE OR REPLACE FUNCTION akb_is_utf8_payload(payload BYTEA)
+            RETURNS BOOLEAN
+            LANGUAGE plpgsql
+            IMMUTABLE
+            STRICT
+            PARALLEL SAFE
+            AS $$
+            DECLARE
+                offset_bytes INTEGER := 1;
+                relative_nul INTEGER;
+                payload_bytes INTEGER := octet_length(payload);
+            BEGIN
+                WHILE offset_bytes <= payload_bytes LOOP
+                    relative_nul := position(
+                        decode('00', 'hex')
+                        IN substring(payload FROM offset_bytes)
+                    );
+                    IF relative_nul = 0 THEN
+                        PERFORM convert_from(substring(payload FROM offset_bytes), 'UTF8');
+                        EXIT;
+                    END IF;
+                    IF relative_nul > 1 THEN
+                        PERFORM convert_from(
+                            substring(payload FROM offset_bytes FOR relative_nul - 1),
+                            'UTF8'
+                        );
+                    END IF;
+                    offset_bytes := offset_bytes + relative_nul;
+                END LOOP;
+                RETURN TRUE;
+            EXCEPTION
+                WHEN SQLSTATE '22021' THEN
+                    RETURN FALSE;
+            END;
+            $$;
+
             CREATE TABLE IF NOT EXISTS m1_reference_payloads (
                 payload_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
                 namespace_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
@@ -49,8 +85,7 @@ async def _run(conn):
                 CONSTRAINT m1_reference_payloads_text_check
                     CHECK (
                         encoding = 'utf-8'
-                        AND convert_from(canonical_bytes, 'UTF8') IS NOT NULL
-                        AND position(decode('00', 'hex') IN canonical_bytes) = 0
+                        AND akb_is_utf8_payload(canonical_bytes)
                     ),
                 CONSTRAINT m1_reference_payloads_placement_check
                     CHECK (selected_placement = 'm1-reference-payload-v1'),

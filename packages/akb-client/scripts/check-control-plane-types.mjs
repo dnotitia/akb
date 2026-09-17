@@ -12,6 +12,26 @@ const facade = await readFile(resolve(root, "src/control-plane.ts"), "utf8");
 if (/\bany\b/u.test(generated) || /\bany\b/u.test(facade)) {
   throw new Error("control-plane generated types and facade must not contain any");
 }
+for (const required of [
+  "export interface DesiredSchemaProjection",
+  "export interface TransitionPlan",
+  "manifest_version: 2",
+  "schema: DesiredSchemaProjection",
+  "transition_plans: TransitionPlan[]",
+]) {
+  if (!generated.includes(required)) {
+    throw new Error(`Manifest v2 generated type is missing: ${required}`);
+  }
+}
+if (generated.includes("export interface ReleaseManifest extends ControlPlaneJsonObject")) {
+  throw new Error("ReleaseManifest must be the strict v2 shape, not the legacy open object");
+}
+if (
+  generated.includes("export interface LegacyAdoptionTargetRequest") &&
+  generated.includes("expected_schema_fingerprint: string;\n  table_allowlist")
+) {
+  throw new Error("Legacy adoption request must derive its fingerprint from the v2 projection");
+}
 
 const operations = [];
 for (const [path, pathItem] of Object.entries(fixture.paths ?? {})) {

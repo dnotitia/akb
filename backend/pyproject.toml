@@ -1,6 +1,6 @@
 [project]
 name = "akb"
-version = "0.14.2"
+version = "0.14.3"
 description = "Agent Knowledge Base - Organizational Memory for Agents"
 requires-python = ">=3.14"
 license = "BUSL-1.1"
@@ -20,13 +20,17 @@ dependencies = [
     "gitpython==3.1.50",
     "python-frontmatter==1.3.0",
     "httpx==0.28.1",
-    "mcp[cli]==1.27.2",
+    "mcp[cli]==2.1.0",
+    "mcp-types==2.1.0",
     "pyyaml==6.0.3",
     "python-multipart==0.0.32",
     "pyjwt==2.13.0",
     "cryptography==48.0.0",
     "bcrypt==5.0.0",
     "boto3==1.43.23",
+    # Atomic refresh snapshots and request-scoped signing use botocore's
+    # credential hooks; pin the already-locked runtime for pip installs too.
+    "botocore==1.43.27",
     "qdrant-client==1.18.0",
     "kiwipiepy==0.23.1",
     "redis==8.0.0",
@@ -48,6 +52,12 @@ dev = [
     "pytest==9.0.3",
     "pytest-asyncio==1.3.0",
     "hypothesis==6.155.7",
+    # Validates the `/stats` responses against the JSON Schema this repo
+    # publishes for them (`app/stats/schema_v1.json`). Declared explicitly even
+    # though it already resolves transitively: the schema check is the only
+    # thing standing between a shape change here and a silently broken
+    # consumer, and it must not depend on another package's dependency list.
+    "jsonschema==4.26.0",
     "ruff==0.15.16",
     "mypy==2.1.0",
     "bandit[toml]==1.9.4",

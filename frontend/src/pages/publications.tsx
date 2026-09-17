@@ -679,6 +679,15 @@ function PublicationSkeleton() {
 }
 
 function resourceHref(vault: string, publication: Publication): string {
+  if (publication.resource_type === "table_query") {
+    // Table publications created by the bounded UI use one safe source table.
+    // Older/raw SQL publications keep the Vault fallback if a single source
+    // cannot be identified without pretending the query itself is a resource.
+    const tableName = publication.query_sql?.match(/\bFROM\s+([a-z][a-z0-9_]*)\b/i)?.[1];
+    return tableName
+      ? `/vault/${vault}/table/${encodeURIComponent(tableName)}`
+      : `/vault/${vault}`;
+  }
   if (!publication.resource_uri) return `/vault/${vault}`;
   if (publication.resource_type === "document") {
     const docPath = parseDocUri(publication.resource_uri)?.id;

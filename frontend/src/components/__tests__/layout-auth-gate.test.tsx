@@ -11,7 +11,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "../layout";
 import * as api from "@/lib/api";
-import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
+import { useAccessVerification } from "@/contexts/current-user-context";
 
 // Mock api so getToken() can be flipped between tests, and the health
 // hook's network call never fires. UserMenu (rendered by Layout) calls
@@ -24,14 +24,11 @@ vi.mock("@/lib/api", () => ({
   searchDocs: vi.fn(),
   logoutOrdinarySession: vi.fn(),
   clearPrivateAssetCache: vi.fn(),
+  authenticatedFetch: vi.fn(async () => new Response(JSON.stringify({ vaults: [] }), { status: 200 })),
 }));
 
 vi.mock("@/hooks/use-health", () => ({
   useHealth: () => ({ data: undefined, isLoading: false, error: null }),
-}));
-
-vi.mock("@/hooks/use-accessible-indexing-health", () => ({
-  useAccessibleIndexingHealth: vi.fn(),
 }));
 
 vi.mock("@/hooks/use-measured-height", () => ({
@@ -39,13 +36,18 @@ vi.mock("@/hooks/use-measured-height", () => ({
   useMeasuredHeight: () => [vi.fn(), 0],
 }));
 
+function AccessProbe() {
+  const { checking, revision } = useAccessVerification();
+  return <output data-testid="access-proof" data-checking={checking} data-revision={revision} />;
+}
+
 function renderAt(path: string, queryClient = new QueryClient()) {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route element={<Layout />}>
-            <Route path="/" element={<div data-testid="home" />} />
+            <Route path="/" element={<div data-testid="home"><AccessProbe /></div>} />
             <Route path="/search" element={<div data-testid="search-page" />} />
             <Route
               path="/vault/:name/settings"
@@ -63,10 +65,6 @@ describe("Layout — auth gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
-    vi.mocked(useAccessibleIndexingHealth).mockReturnValue({
-      data: null,
-      error: null,
-    });
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
       schema_version: 2,
@@ -138,17 +136,6 @@ describe("Layout — auth gate", () => {
   });
 
   it("keeps accessible indexing status immediately before global search", async () => {
-    vi.mocked(useAccessibleIndexingHealth).mockReturnValue({
-      data: {
-        vaultCount: 2,
-        checkedVaultCount: 2,
-        pending: 7,
-        abandoned: 0,
-        indexed: 42,
-        incomplete: false,
-      },
-      error: null,
-    });
     vi.mocked(api.getToken).mockReturnValue("fake-jwt");
 
     renderAt("/");
@@ -156,10 +143,28 @@ describe("Layout — auth gate", () => {
     expect(await screen.findByTestId("home")).toBeTruthy();
     const status = screen.getByTestId("header-indexing-status");
     const search = screen.getByRole("button", { name: "Search knowledge" });
-    expect(status).toHaveTextContent("7 indexing");
+    expect(status).toHaveAttribute("role", "status");
+    expect(within(status).queryByRole("button")).toBeNull();
+    expect(status).toBeEmptyDOMElement();
     expect(
       status.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("preserves lifecycle-deferred sessions and advances access proof only after successful verification", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+    await screen.findByTestId("home");
+    const proof = screen.getByTestId("access-proof");
+    expect(proof).toHaveAttribute("data-revision", "0");
+    vi.mocked(api.getMe).mockRejectedValueOnce(Object.assign(new Error("Unauthorized"), { name: "DeferredSessionError" }));
+    fireEvent(window, new Event("focus"));
+    expect(proof).toHaveAttribute("data-checking", "true");
+    await waitFor(() => expect(proof).toHaveAttribute("data-checking", "false"));
+    expect(screen.queryByTestId("auth-page")).not.toBeInTheDocument();
+    expect(proof).toHaveAttribute("data-revision", "0");
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(proof).toHaveAttribute("data-revision", "1"));
   });
 
   it("moves desktop entry points into an expanded workspace sidebar", async () => {
@@ -201,10 +206,13 @@ describe("Layout — auth gate", () => {
     expect(
       screen.getByRole("button", { name: "Expand sidebar" }),
     ).toHaveAttribute("aria-expanded", "false");
-    const brandLink = screen.getByRole("link", { name: "AKB home" });
-    expect(brandLink.parentElement).toHaveClass("lg:w-52");
-    expect(within(brandLink).getByText("AKB")).toBeVisible();
-    expect(within(brandLink).getByText("AGENT KNOWLEDGEBASE")).toBeVisible();
+    const brandLink = within(sidebar).getByRole("link", { name: "AKB home" });
+    expect(brandLink).toBeInTheDocument();
+    expect(within(brandLink).queryByText("AKB")).not.toBeInTheDocument();
+    expect(sidebar).toHaveClass("fixed", "inset-y-0", "bg-surface");
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(within(sidebar).getByText("AKB")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
   });
 
@@ -214,10 +222,9 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("home")).toBeTruthy();
     expect(screen.getByRole("main").firstElementChild).toHaveClass(
-      "lg:px-8",
-      "xl:px-12",
-      "2xl:px-36",
+      "px-[var(--workspace-gutter)]",
     );
+    expect(screen.getByRole("navigation", { name: "Current page" }).parentElement).toHaveClass("lg:pl-5");
   });
 
   it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {
@@ -231,6 +238,11 @@ describe("Layout — auth gate", () => {
       "true",
     );
     expect(screen.getByTestId("app-sidebar")).toHaveClass("lg:w-14");
+    expect(screen.getByTestId("app-sidebar").querySelector('[data-slot="workspace-sidebar-heading"]')).toHaveClass("h-10", "shrink-0", "border-b");
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(screen.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "true");
   });
 
   it("gives the advanced search route a full-height, unpadded workspace", async () => {
@@ -295,7 +307,7 @@ describe("Layout — auth gate", () => {
 
     window.dispatchEvent(new Event("focus"));
 
-    expect(await screen.findByText("Verifying session…")).toBeTruthy();
+    expect(await screen.findByText("Refreshing access…")).toBeTruthy();
     expect(screen.getByTestId("home")).toBe(mountedWorkspace);
     resolveForeground?.({
       user_id: "user-2",
@@ -308,7 +320,7 @@ describe("Layout — auth gate", () => {
     });
     await waitFor(() => expect(api.getMe).toHaveBeenCalledTimes(2));
     await waitFor(() => {
-      expect(screen.queryByText("Verifying session…")).toBeNull();
+      expect(screen.queryByText("Refreshing access…")).toBeNull();
     });
     expect(screen.getByTestId("home")).toBe(mountedWorkspace);
     expect(queryClient.getQueryData(["private", "alice"])).toBeUndefined();

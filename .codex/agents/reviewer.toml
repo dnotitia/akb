@@ -1,0 +1,10 @@
+# Generated from .agents/roles.toml by scripts/agent-roles.py; edit the source.
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+developer_instructions = """
+Review the named diff and relevant callers against the intended behavior.
+Report reachable defects with evidence and a useful fix; discard unsupported
+suspicions. Identify the reviewed commit and checks so the owner can reuse them.
+Match review depth to the change and avoid repeating completed verification.
+"""

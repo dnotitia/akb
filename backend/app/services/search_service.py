@@ -14,16 +14,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from typing import Literal
 
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
+from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope, status_matches
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
-from app.services.index_service import CHUNK_HEADER_KEYS, generate_embeddings
+from app.services.index_service import (
+    OVERLAP,
+    SOURCE_NATIVE_FILE,
+    generate_embeddings,
+)
 from app.services.grep_replace import (
     DEFAULT_MAX_REPLACEMENTS,
     apply_grep_replacement,
@@ -38,12 +44,38 @@ from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
 
+
+def _log_search_timing(started: float, phases: dict[str, float], returned: int) -> None:
+    """Operational timing only; never log query text, user IDs or result data."""
+    logger.info(
+        "search_timing total_ms=%.2f embedding_ms=%.2f candidates_ms=%.2f "
+        "retrieval_ms=%.2f rerank_ms=%.2f hydration_ms=%.2f returned=%d",
+        (time.perf_counter() - started) * 1000,
+        *(phases.get(name, 0.0) * 1000 for name in (
+            "embedding", "candidates", "retrieval", "rerank", "hydration",
+        )),
+        returned,
+    )
+
 LEGACY_DOCUMENT_SOURCE = "document"
 NATIVE_DOCUMENT_SOURCE = "native_document"
 NATIVE_MEASUREMENT_DATABASE = "akb_revision_m1_measurement"
 NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES = 10_000
 NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
+# Legacy alias for the caller-supplied `source_uris` scope cap. The live limit
+# is `settings.search_max_source_uris` (configurable, documented there); this
+# constant stays so older imports keep resolving, but nothing reads it anymore.
 NATIVE_SEARCH_MAX_SOURCE_URIS = 200
+# Frontmatter slice for candidate filtering (workbench #1069, part 2): the
+# filter decision needs only the leading frontmatter envelope (`type`/`tags`/
+# `status`), never the body. Reading the first 8KiB bounds per-resource memory
+# regardless of body size; a resource whose envelope does not close inside the
+# slice is classified "unparseable" (counted, never silently dropped).
+NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
+# Candidate pagination: filter loop pages through scope rows keyset-ordered by
+# resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
+# 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
+NATIVE_CANDIDATE_PAGE_SIZE = 2_000
 
 
 def active_document_source_type(
@@ -78,17 +110,49 @@ def _configured_document_source_type() -> str:
     )
 
 # Strips the indexing-time enrichment block emitted by
-# `build_doc_metadata_header`. The block is `TITLE: ...\n` followed by
-# at least one more KEY: line and a `\n\n` separator before the body.
-# It rides along with every doc chunk so the BM25 and dense legs see
-# doc-level signals during retrieval — but it is noise when the chunk
-# content is shown to humans or agents. Requiring TWO header lines + a
-# `\n\n` body separator avoids stripping a user paragraph that happens
-# to start with `TITLE: foo`. Table/file chunks are pure-metadata (no
-# body separator) and intentionally do not match. Keys imported from
-# index_service so adding a new builder field can't silently drift.
+# `build_doc_metadata_header` / `build_file_metadata_header`. It rides along
+# with every body chunk so the BM25 and dense legs see resource-level signals
+# during retrieval — but it is noise once the chunk content is shown to a
+# human or an agent.
+#
+# The two patterns below TRANSCRIBE those two builders, key by key and in
+# order, rather than accepting any run of key-shaped lines. The looser form
+# is what lets a user paragraph be eaten: a document whose body opens
+# `TITLE: …` and reaches something key-shaped before its first blank line
+# would have that prose removed. Pinning the structure costs nothing —
+# these are the only two shapes the indexer can write — and both require the
+# `PATH:` line that every such header carries.
+#
+# `SUMMARY:` is the one value interpolated verbatim (`f"SUMMARY: {summary}"`),
+# so it is the only line whose value can carry newlines of its own. Its group
+# is therefore lazy and DOTALL: it runs to the first point where the rest of
+# the header matches, which is the next `TAGS:` or `PATH:` line, and a blank
+# line inside the summary does not end it.
+#
+# Table/file *catalogue* chunks (`build_table_chunk` / `build_file_chunk`) are
+# pure metadata with no `\n\n` body separator and still do not match — there
+# would be nothing left of them.
+#
+# Keep in step with index_service: a new key in either builder needs a new
+# line here, or it starts leaking into drill_down / search / grep output.
+_DOC_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"(?:SUMMARY:.*?\n)?"
+    r"(?:TAGS:[^\n]*\n)?"
+    r"PATH:[^\n]*\n"
+    r"(?:TYPE:[^\n]*\n)?"
+)
+_FILE_METADATA_HEADER = (
+    r"TITLE:[^\n]*\n"
+    r"TYPE:[^\n]*\n"
+    r"VAULT:[^\n]*\n"
+    r"PATH:[^\n]*\n"
+    r"URI:[^\n]*\n"
+    r"(?:SIZE:[^\n]*\n)?"
+)
 _CHUNK_HEADER_RE = re.compile(
-    rf"\ATITLE:[^\n]*\n(?:(?:{'|'.join(CHUNK_HEADER_KEYS)}):[^\n]*\n)+\n"
+    rf"\A(?:{_DOC_METADATA_HEADER}|{_FILE_METADATA_HEADER})\n",
+    re.DOTALL,
 )
 
 
@@ -101,6 +165,191 @@ def strip_chunk_metadata_header(text: str | None) -> str | None:
     if not text:
         return text
     return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def strip_chunk_context_line(text: str | None, section_path: str | None) -> str | None:
+    """Strip the `[# A > ## B]` heading-context line the indexer writes as
+    the first line of a section's first chunk.
+
+    `chunk_markdown` prepends `f"[{section_path}]\n"` to every section so
+    the retrieval legs see the heading path inside the embedded text. On
+    the way out it is pure duplication: `drill_down` already returns the
+    same value in the `section_path` field of the very same row, so the
+    line costs the caller tokens and tells it nothing new.
+
+    Removed only when the first line is *exactly* `[<section_path>]` for
+    this chunk's own `section_path` — a body that legitimately opens with
+    a bracketed line (a markdown link label, a citation key) never
+    matches, and the `section_path` field itself is untouched.
+    """
+    if not text or not section_path:
+        return text
+    prefix = f"[{section_path}]"
+    if not text.startswith(prefix):
+        return text
+    rest = text[len(prefix):]
+    if rest.startswith("\r\n"):
+        return rest[2:]
+    if rest.startswith("\n"):
+        return rest[1:]
+    if rest == "":
+        return rest
+    # `[section]` ran into other text on the same line — not the context
+    # line the indexer wrote.
+    return text
+
+
+def strip_chunk_overlap_prefix(previous: str | None, current: str | None) -> str | None:
+    """Remove the leading run of `current` that is an exact duplicate of the
+    tail of `previous`.
+
+    `_split_large_chunk` carries `OVERLAP` characters of each chunk into the
+    head of the next one so a sentence cut by the size cap is still embedded
+    intact on both sides. Reading a long section back therefore pays for that
+    window once per chunk boundary.
+
+    Only an exact character-for-character match is removed, and never more
+    than `OVERLAP` characters, so `previous + returned` reproduces
+    `previous + current` byte for byte — nothing a caller reading the whole
+    section can no longer see. When no prefix of `current` equals a suffix of
+    `previous`, `current` is returned untouched.
+    """
+    if not previous or not current:
+        return current
+    limit = min(OVERLAP, len(previous), len(current))
+    for size in range(limit, 0, -1):
+        if current[:size] == previous[-size:]:
+            return current[size:]
+    return current
+
+
+def canonical_chunk_id(value) -> str | None:
+    """A chunk id in one canonical spelling, or None if it is not a uuid.
+
+    Drivers return the same id in different shapes — lower-case, upper-case,
+    brace- or urn-wrapped — because each store round-trips it through its own
+    type. Matching a hit against a `chunks` row on the raw string therefore
+    misses for anything but the spelling PostgreSQL happens to emit. Both
+    sides of that lookup go through here instead.
+    """
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _chunk_index_of(hit, chunk_indexes: dict[str, int]) -> int | None:
+    """The ordinal of the chunk a hit matched, or None when it is unknown —
+    an id the driver did not spell as a uuid, or a chunk row that is gone."""
+    canonical = canonical_chunk_id(hit.chunk_id)
+    if canonical is None:
+        return None
+    return chunk_indexes.get(canonical)
+
+
+def _row_value(row, key, default=None):
+    """`row[key]` for asyncpg Records and plain dicts alike, tolerating a
+    projection that did not select `key`."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def clean_section_rows(rows) -> list[dict]:
+    """Build the `drill_down` section payload from stored chunk rows.
+
+    Every transform here removes bytes the caller cannot use: index-side
+    metadata (`strip_chunk_metadata_header`), the heading-context line that
+    duplicates the row's own `section_path` (`strip_chunk_context_line`), and
+    the indexing overlap window a continuation chunk repeats from its
+    predecessor (`strip_chunk_overlap_prefix`). Keys are never removed —
+    `section_path`, `content` and `chunk_index` are returned for every
+    surviving row.
+
+    The overlap strip is deliberately narrow. It fires only between rows the
+    writer could actually have overlapped: same document, consecutive
+    `chunk_index`, same `section_path`, and a `content` that carried neither a
+    metadata header nor a context line (both mark the *first* chunk of a
+    section, which `_split_large_chunk` never prefixes with an overlap). That
+    keeps it from nibbling a character off the start of a new section just
+    because the previous section happened to end with the same one.
+
+    A chunk is also emitted once. `chunks` carries no uniqueness constraint on
+    `(source_id, chunk_index)`, so a re-index that inserted before its delete
+    landed leaves the same body sitting at the same position more than once
+    and every `drill_down` — the `pattern` filter especially, which matches on
+    body text — hands the agent the same paragraph several times over. Rows
+    are collapsed on `(document, chunk_index, section_path, stored content)`:
+    an identical row is a duplicate and goes, while two rows that differ in
+    any part of that identity are both kept. Dropping one of *those* would
+    pick a winner the query has no tiebreaker for, so the response would stop
+    being deterministic in exactly the case where the difference matters.
+
+    A position that does carry two different bodies also suspends the overlap
+    strip across it. Two generations of the same chunk mean the neighbouring
+    row's text may belong to the other generation, and an exact match against
+    the wrong generation is still the wrong cut. Where the index is in that
+    state the bodies are returned whole.
+
+    `rows` must be ordered by `chunk_index`, as both SQL paths in
+    `drill_down` are.
+    """
+    rows = list(rows)
+    # Positions this call sees more than one distinct body for. Computed up
+    # front because the decision for chunk n depends on a row that has not
+    # been reached yet.
+    bodies_at: dict[tuple, set] = {}
+    for r in rows:
+        bodies_at.setdefault(
+            (_row_value(r, "doc_id"), r["chunk_index"]), set()
+        ).add(r["content"])
+    contested = {key for key, bodies in bodies_at.items() if len(bodies) > 1}
+
+    sections: list[dict] = []
+    seen: set[tuple] = set()
+    # doc id -> (chunk_index, cleaned content, section_path) of the row this
+    # document last contributed. Keyed by document because the same call can
+    # (in principle) surface chunks from more than one row of `documents`.
+    previous: dict[object, tuple[int, str, object]] = {}
+    for r in rows:
+        section_path = r["section_path"]
+        chunk_index = r["chunk_index"]
+        doc_key = _row_value(r, "doc_id")
+        stored = r["content"]
+
+        identity = (doc_key, chunk_index, section_path, stored)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        content = strip_chunk_metadata_header(stored)
+        content = strip_chunk_context_line(content, section_path)
+        section_first_chunk = content != stored
+
+        prior = previous.get(doc_key)
+        if (
+            prior is not None
+            and not section_first_chunk
+            and isinstance(chunk_index, int)
+            and prior[0] + 1 == chunk_index
+            and prior[2] == section_path
+            and (doc_key, prior[0]) not in contested
+            and (doc_key, chunk_index) not in contested
+        ):
+            content = strip_chunk_overlap_prefix(prior[1], content)
+
+        if isinstance(chunk_index, int) and content is not None:
+            previous[doc_key] = (chunk_index, content, section_path)
+
+        sections.append({
+            "section_path": section_path,
+            "content": content,
+            "chunk_index": chunk_index,
+        })
+    return sections
 
 
 def fuse_original_and_reranked_hits(
@@ -146,17 +395,37 @@ def vault_path_eligible(
     Phase 2) instead of enumerating source ids. Requires: the flag on, a driver
     whose `vault_filter_supported` is True (it stores vault_id and filters on it),
     and NO doc-level narrowing filter (those still need per-resource source_ids).
-    When False, the existing source_ids path runs unchanged."""
+    When False, the existing source_ids path runs unchanged.
+
+    The vector-store vault filter now ALSO constrains source_type (workbench
+    #1069: the caller passes `source_types` alongside `vault_ids`), so the
+    native arm is eligible too — stale legacy Document points are excluded
+    driver-side before the top-K is cut and can no longer suppress valid
+    native hits. `_hydrate_hits` keeps its arm-mismatch skip as defense in
+    depth."""
     return (
         settings.vault_filter_enabled
         and supports_vault_filter(get_vector_store())
-        # The vector-store vault filter cannot yet constrain source_type.
-        # Under the native arm, stale legacy Document points could consume the
-        # complete top-K before hydration drops them, suppressing valid native
-        # hits. Use the source-id path until the driver accepts that predicate.
-        and _configured_document_source_type() == LEGACY_DOCUMENT_SOURCE
         and not (collection or doc_type or tags or source_uris)
     )
+
+
+def archive_scope_allows_vault_path(scope: ArchiveScope) -> bool:
+    """Whether `scope` can be served by the VAULT path, with the archived
+    predicate applied at hydration instead of by candidate enumeration.
+
+    `unarchived` (the DEFAULT) and `all` can. Requiring `all` here is what
+    disqualified every ordinary search from the fast path (akb#530): archive
+    scope is unlike `collection` / `doc_type` / `tags`, which a caller opts
+    into — it is set on every request nobody customised, so treating it as a
+    narrowing filter meant the fast path had no reachable caller at all.
+
+    `archived` cannot, and stays on the id path. It selects FOR a set that was
+    0.11% of the measured corpus, so a vault-path top-K would be almost
+    entirely non-matching and hydration would filter the page down to nothing.
+    Enumerating ids is the right tool for narrowing to a rare set; it is the
+    wrong one for excluding it."""
+    return scope != "archived"
 
 
 def clamp_search_limit(limit: int) -> int:
@@ -212,6 +481,82 @@ def _verified_native_metadata(row) -> dict:
     return metadata
 
 
+# Matches a complete leading frontmatter envelope: an opening `---` line, then
+# a closing `---` line. `re.DOTALL` so the envelope may span lines; `\Z`-safe
+# via `$` with MULTILINE. Only the envelope presence is tested here — full
+# YAML parsing still goes through `_parse_markdown` on the slice.
+_FRONTMATTER_ENVELOPE_RE = re.compile(r"\A---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+
+
+def _slice_has_complete_frontmatter(slice_text: str) -> bool:
+    """Whether a body slice contains a complete leading frontmatter envelope.
+
+    A body without a leading `---` line has no envelope to complete (plain
+    Markdown: metadata defaults apply). Only a body that OPENS an envelope
+    but never closes it inside the slice is "incomplete" — its filter fields
+    may lie beyond the slice, so the caller must count it as unparseable
+    rather than filter it on defaults.
+    """
+    if not slice_text.startswith("---"):
+        return True
+    return _FRONTMATTER_ENVELOPE_RE.match(slice_text) is not None
+
+
+def _verify_native_body(row) -> None:
+    """Verify one native body without interpreting File bytes as Markdown."""
+    from app.services.native_payload_verification import verify_native_head_body
+
+    verify_native_head_body(row)
+
+
+def _filtered_native_metadata(row) -> dict | None:
+    """Parse filter metadata from a frontmatter slice on a worker thread.
+
+    Returns the metadata dict, or None when the slice holds an INCOMPLETE
+    envelope (opens `---` but never closes inside the slice): the filter
+    fields may lie beyond the slice, so the caller must exclude + count the
+    resource rather than filter it on defaults. A body with no leading `---`
+    parses normally (plain Markdown: defaults apply).
+
+    The slice is byte-cut (`substring(bytes ...)`), so it can end mid-codepoint
+    on multibyte text. The trailing incomplete sequence (at most 3 bytes for
+    UTF-8) is trimmed before decoding — only a cut inside the first 8KiB+1
+    bytes triggers this, and dropping ≤3 tail bytes cannot hide a complete
+    envelope close. A body that is genuinely non-UTF-8 still returns None.
+    """
+    from app.services.document_service import _parse_markdown
+
+    raw = bytes(row["body_slice"])
+    text = _decode_slice_prefix(raw)
+    if text is None:
+        return None
+    if not _slice_has_complete_frontmatter(text):
+        return None
+    metadata, _ = _parse_markdown(text)
+    return metadata
+
+
+def _decode_slice_prefix(raw: bytes) -> str | None:
+    """Decode a byte-cut slice, trimming a trailing partial codepoint.
+
+    Tries strict decode first (the common case: cut landed on a character
+    boundary). On failure, drops up to 3 trailing bytes (the max length of an
+    incomplete UTF-8 sequence) and retries — progressively, so a body ending
+    in genuinely invalid bytes still returns None instead of silently
+    decoding past the corruption.
+    """
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+    for cut in (1, 2, 3):
+        try:
+            return raw[:-cut].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
 class SearchService:
 
     async def _native_document_candidates(
@@ -225,8 +570,10 @@ class SearchService:
         doc_type: str | None,
         tags: list[str] | None,
         include_archived: bool,
+        archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None,
-    ) -> list[str]:
+        doc_types: list[str] | None = None,
+    ) -> tuple[list[str], dict[str, int]]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
         if vaults:
@@ -250,35 +597,56 @@ class SearchService:
                 f"OR v.owner_id = ${index} OR v.public_access IN ('reader', 'writer'))"
             )
         if source_uris:
-            if len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+            max_uris = settings.search_max_source_uris
+            if len(source_uris) > max_uris:
                 raise ValidationError(
-                    f"native search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                    f"native search accepts at most {max_uris} source URIs "
+                    f"(got {len(source_uris)}); split the request or use a "
+                    "vault scope instead"
                 )
-            source_clauses: list[str] = []
+            # Pairwise scope match via unnested (vault, identifier) rows: the SQL
+            # text stays constant-size no matter how many URIs arrive (only the
+            # bind arrays grow). Each pair matches exactly the way the old
+            # per-URI OR expansion did — vault AND (path OR id) PER PAIR — so
+            # no cross-pairing: vault A can never match vault B's identifier.
+            # (A naive `v.name = ANY($1) AND ident = ANY($2)` WOULD cross-match
+            # and pollute the scope across vaults.) Non-doc URIs are skipped,
+            # so every identifier here is a doc path-or-id by construction.
+            uri_pairs: list[tuple[str, str]] = []
             for uri in source_uris:
                 parsed = parse_uri(uri)
                 if parsed is None or parsed.kind != "doc" or not parsed.identifier:
                     continue
-                params.extend([parsed.vault, parsed.identifier])
-                source_clauses.append(
-                    f"(v.name = ${len(params) - 1} AND "
-                    f"(r.current_path = ${len(params)} OR r.resource_id::text = ${len(params)}))"
-                )
-            if not source_clauses:
-                return []
-            conditions.append("(" + " OR ".join(source_clauses) + ")")
+                uri_pairs.append((parsed.vault, parsed.identifier))
+            if not uri_pairs:
+                return [], {}
+            params.extend([
+                [v for v, _ in uri_pairs],
+                [i for _, i in uri_pairs],
+            ])
+            pair_idx = len(params) - 1
+            ident_idx = len(params)
+            conditions.append(
+                f"((v.name, r.current_path) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])) OR "
+                f"(v.name, r.resource_id::text) IN ("
+                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])))"
+            )
 
         joins = """
               FROM native_resources r
               JOIN vaults v ON v.id = r.namespace_id
               JOIN native_revisions nr
                 ON nr.resource_id = r.resource_id
-               AND nr.revision_id = r.head_revision_id
+                AND nr.revision_id = r.head_revision_id
               JOIN native_payload_manifests pm
                 ON pm.payload_manifest_id = nr.payload_manifest_id
               JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
         """
         where_sql = " AND ".join(conditions)
+        # The aggregate guard reads manifest numbers only — no body bytes are
+        # touched, so an oversized scope is rejected before asyncpg
+        # materializes anything (same shape as the grep guard).
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             scope = await conn.fetchrow(
                 f"""
@@ -296,30 +664,64 @@ class SearchService:
                 raise ValidationError(
                     "native search scope exceeds the bounded candidate corpus"
                 )
-            rows = await conn.fetch(
-                f"""
-            SELECT r.resource_id, r.current_path, v.name AS vault_name,
-                   p.payload_id, p.namespace_id, p.content_profile, p.digest,
-                   p.byte_size, p.encoding, p.selected_placement,
-                   p.verification_profile, p.canonical_bytes
-              {joins}
-             WHERE {where_sql}
-             ORDER BY r.resource_id
-                """,
-                *params,
+            # Slice + paginate (workbench #1069, part 2): filter 판정 needs only
+            # the leading frontmatter envelope, so fetch an 8KiB prefix per row
+            # instead of the full body, keyset-paged by resource_id so peak
+            # memory is page-sized rather than scope-sized. `byte_size` still
+            # comes along so the per-row slice can be sanity-checked.
+            candidates: list[str] = []
+            filter_stats: dict[str, int] = {}
+            last_seen: str | None = None
+            while True:
+                page_params = list(params)
+                page_where = where_sql
+                if last_seen is not None:
+                    page_params.append(last_seen)
+                    page_where = f"{where_sql} AND r.resource_id > ${len(page_params)}::uuid"
+                rows = await conn.fetch(
+                    f"""
+                SELECT r.resource_id, r.current_path, v.name AS vault_name,
+                       p.byte_size, p.digest, p.encoding,
+                       p.selected_placement, p.verification_profile,
+                       substring(
+                           p.canonical_bytes FROM 1
+                           FOR {NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1}
+                       ) AS body_slice
+                  {joins}
+                 WHERE {page_where}
+                 ORDER BY r.resource_id
+                 LIMIT {NATIVE_CANDIDATE_PAGE_SIZE}
+                    """,
+                    *page_params,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    last_seen = str(row["resource_id"])
+                    metadata = await asyncio.to_thread(
+                        _filtered_native_metadata, row
+                    )
+                    if metadata is None:
+                        # Envelope opens but never closes inside the slice:
+                        # filter fields may lie beyond it. Exclude + count,
+                        # never filter on defaults.
+                        filter_stats["unparseable_envelope"] = (
+                            filter_stats.get("unparseable_envelope", 0) + 1
+                        )
+                        continue
+                    if doc_type and (metadata.get("type") or "note") != doc_type:
+                        continue
+                    if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
+                        continue
+                    candidates.append(str(row["resource_id"]))
+                if len(rows) < NATIVE_CANDIDATE_PAGE_SIZE:
+                    break
+        if filter_stats:
+            logger.warning(
+                "native candidates: %d unparseable envelope(s) excluded: %s",
+                sum(filter_stats.values()), filter_stats,
             )
-        candidates: list[str] = []
-        for row in rows:
-            metadata = await asyncio.to_thread(_verified_native_metadata, row)
-            if doc_type and (metadata.get("type") or "note") != doc_type:
-                continue
-            row_tags = set(metadata.get("tags") or [])
-            if tags and not row_tags.intersection(tags):
-                continue
-            if not include_archived and metadata.get("status", "draft") == "archived":
-                continue
-            candidates.append(str(row["resource_id"]))
-        return candidates
+        return candidates, filter_stats
 
     async def search(
         self,
@@ -333,7 +735,10 @@ class SearchService:
         limit: int = 10,
         user_id: str | None = None,
         include_archived: bool = False,
+        archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None = None,
+        doc_types: list[str] | None = None,
+        source_type: Literal["document", "file", "table"] | None = None,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow.
 
@@ -342,11 +747,15 @@ class SearchService:
         intersected with the other filters, so retrieval runs only inside that
         set. An empty/omitted list means no restriction (default behaviour).
         """
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
-        if source_uris and len(source_uris) > NATIVE_SEARCH_MAX_SOURCE_URIS:
+        if source_uris and len(source_uris) > settings.search_max_source_uris:
             raise ValidationError(
-                f"search accepts at most {NATIVE_SEARCH_MAX_SOURCE_URIS} source URIs"
+                f"search accepts at most {settings.search_max_source_uris} source URIs "
+                f"(got {len(source_uris)}); split the request or use a "
+                "vault scope instead"
             )
 
         document_source = _configured_document_source_type()
@@ -369,6 +778,8 @@ class SearchService:
         # single entry point for every caller.
         limit = clamp_search_limit(limit)
 
+        started = time.perf_counter()
+        phases: dict[str, float] = {}
         pool = await get_pool()
 
         # Generate query embedding. When the embedding API is down we still
@@ -376,12 +787,15 @@ class SearchService:
         # short-circuit happens later once both legs are known to be empty.
         # Short timeout: a slow/hung embedding API must not stall interactive
         # search for the full 60s indexing budget.
+        phase_started = time.perf_counter()
         try:
             embeddings = await generate_embeddings([query], timeout=5.0)
         except Exception as e:  # noqa: BLE001
             logger.warning("query embedding failed: %s", e)
             embeddings = []
         query_embedding = embeddings[0] if embeddings else None
+        phases["embedding"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         # A None embedding here is intentionally NOT surfaced as `degraded`:
         # sparse-only is a legitimate by-design mode (a deployment may leave
         # `embed_base_url` unset), and we can't cheaply tell "configured but
@@ -402,13 +816,38 @@ class SearchService:
         # AKB is purely per-vault, so this is correctness-equivalent. Otherwise
         # the existing SOURCE_IDS path runs UNCHANGED (flag off / other driver /
         # any doc-level filter present).
-        # `is_ready()` additionally gates on the auto-backfill: until every
-        # pre-upgrade pgvector point carries its vault_id, fall back to the
-        # source-id path so a user can't miss their own un-backfilled docs.
+        # Readiness is cross-process (akb#526): the backfill runner lives in the
+        # worker tier, so the serving tier must derive it from store state it
+        # can see (NULL-vault_id count, briefly cached) rather than from a
+        # process-local latch the worker flips in its own copy.
         from app.services import vault_backfill
-        use_vault_path = vault_path_eligible(
-            collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
-        ) and vault_backfill.is_ready()
+        # Archive scope is the one doc-level narrowing that is NOT opt-in: it
+        # defaults to `unarchived`, so requiring `scope == "all"` here
+        # disqualified EVERY ordinary search from the vault path and sent it to
+        # the id-enumeration fallback — which refuses with the bounded-corpus
+        # error on any scope above the candidate ceiling (akb#530). The
+        # archived predicate moves to hydration, where the AUTHORITATIVE status
+        # is already parsed for free: verified native frontmatter on the native
+        # arm, `documents.status` on the legacy one.
+        #
+        # `archived` deliberately stays on the id path. It asks FOR the ~0.1%
+        # tail, so a vault-path top-K would be almost entirely non-matching and
+        # hydration would filter the page down to nothing. Narrowing to a rare
+        # set is what id enumeration is for; excluding one is not.
+        vault_path_wanted = (
+            not (doc_types or source_type)
+            and archive_scope_allows_vault_path(scope)
+            and vault_path_eligible(
+                collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
+            )
+        )
+        vault_ready = vault_backfill.is_ready() or await vault_backfill.is_ready_async()
+        if vault_path_wanted and not vault_ready:
+            # One line on the serving side naming the disabled path (akb#526):
+            # without it this surfaces only as an unrelated search refusal
+            # downstream (bounded-corpus 422 on large scopes).
+            logger.info("vault path disabled: readiness not established")
+        use_vault_path = vault_path_wanted and vault_ready
 
         if use_vault_path:
             async with pool.acquire() as conn:
@@ -424,8 +863,10 @@ class SearchService:
             #         named scope always resolves to ids (a list), never None.
             # []    → the named vaults are all unreadable → no results.
             if candidate_vault_ids is not None and not candidate_vault_ids:
+                phases["candidates"] = time.perf_counter() - phase_started
+                _log_search_timing(started, phases, 0)
                 return SearchResponse(
-                    query=query, total=0, returned=0, total_matches=0, results=[],
+                    query=query, total=0, returned=0, total_matches=0, results=[], archive_scope=scope,
                 )
         elif has_filters:
             async with pool.acquire() as conn:
@@ -472,14 +913,17 @@ class SearchService:
                     conditions.append(f"v.name = ANY(${idx})")
                     params.append(vaults); idx += 1
                 if collection:
-                    conditions.append(f"d.path LIKE ${idx} || '%'")
-                    params.append(collection); idx += 1
+                    conditions.append(collection_predicate("d.path", collection, params))
+                    idx = len(params) + 1
                 if doc_type:
                     conditions.append(f"d.doc_type = ${idx}")
                     params.append(doc_type); idx += 1
                 if tags:
                     conditions.append(f"d.tags && ${idx}")
                     params.append(tags); idx += 1
+                if doc_types:
+                    conditions.append(f"d.doc_type = ANY(${idx}::text[])")
+                    params.append(doc_types); idx += 1
                 acl_sql, acl_params = _vault_acl(idx)
                 if acl_sql:
                     conditions.append(acl_sql)
@@ -494,10 +938,14 @@ class SearchService:
                 # only the document candidate query carries doc status.)
                 if not include_archived:
                     conditions.append("d.status != 'archived'")
+                elif scope == "archived":
+                    conditions.append("d.status = 'archived'")
 
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
-                if document_source == NATIVE_DOCUMENT_SOURCE:
-                    candidate_source_ids = await self._native_document_candidates(
+                if source_type in {"file", "table"}:
+                    candidate_source_ids = []
+                elif document_source == NATIVE_DOCUMENT_SOURCE:
+                    candidate_source_ids, _filter_stats = await self._native_document_candidates(
                         conn,
                         user_uuid=user_uuid,
                         is_admin=is_admin,
@@ -506,7 +954,9 @@ class SearchService:
                         doc_type=doc_type,
                         tags=tags,
                         include_archived=include_archived,
+                        archive_scope=scope,
                         source_uris=source_uris,
+                        doc_types=doc_types,
                     )
                 else:
                     rows = await conn.fetch(
@@ -519,10 +969,8 @@ class SearchService:
                     )
                     candidate_source_ids = [str(r["id"]) for r in rows]
 
-                # Tables (skip when doc_type explicitly constrains to a
-                # non-table source). Tags/collection apply to documents
-                # only.
-                if not doc_type or doc_type == "table":
+                # Document metadata filters never admit unrelated files/tables.
+                if scope != "archived" and (not doc_type or doc_type == "table") and not (doc_types or tags) and source_type in {None, "table"}:
                     t_params: list = []
                     t_conds: list[str] = []
                     if vaults:
@@ -535,13 +983,15 @@ class SearchService:
                     if source_uris:
                         t_conds.append(f"t.id = ANY(${len(t_params) + 1}::uuid[])")
                         t_params.append(src_table_ids)
-                    q = "SELECT t.id FROM vault_tables t JOIN vaults v ON t.vault_id = v.id"
+                    if collection:
+                        t_conds.append(collection_predicate("col.path", collection, t_params))
+                    q = "SELECT t.id FROM vault_tables t JOIN vaults v ON t.vault_id = v.id LEFT JOIN collections col ON col.id = t.collection_id"
                     if t_conds:
                         q += " WHERE " + " AND ".join(t_conds)
                     trows = await conn.fetch(q, *t_params)
                     candidate_source_ids.extend(str(r["id"]) for r in trows)
 
-                if not doc_type or doc_type == "file":
+                if scope != "archived" and (not doc_type or doc_type == "file") and not (doc_types or tags) and source_type in {None, "file"}:
                     f_params: list = []
                     # Editor attachments are storage implementation details,
                     # never standalone searchable File resources.
@@ -554,8 +1004,7 @@ class SearchService:
                         # migration 020 → collection_id FK. Filter via the
                         # joined collections.path with a prefix match, same
                         # semantics as the documents branch above.
-                        f_conds.append(f"c.path LIKE ${len(f_params) + 1} || '%'")
-                        f_params.append(collection)
+                        f_conds.append(collection_predicate("c.path", collection, f_params))
                     acl_sql, acl_params = _vault_acl(len(f_params) + 1)
                     if acl_sql:
                         f_conds.append(acl_sql)
@@ -574,8 +1023,18 @@ class SearchService:
                     candidate_source_ids.extend(str(r["id"]) for r in frows)
 
                 if not candidate_source_ids:
-                    return SearchResponse(query=query, total=0, returned=0, total_matches=0, results=[])
+                    phases["candidates"] = time.perf_counter() - phase_started
+                    _log_search_timing(started, phases, 0)
+                    return SearchResponse(
+                        query=query,
+                        total=0,
+                        returned=0,
+                        total_matches=0,
+                        results=[],
+                        archive_scope=scope,
+                    )
 
+        phases["candidates"] = time.perf_counter() - phase_started
         target_unique = resolve_first_stage_unique_limit(
             limit=limit,
             rerank_enabled=rerank_enabled,
@@ -585,28 +1044,44 @@ class SearchService:
 
         # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
         # failure — PG is the source of truth, the index is rebuildable.
+        #
+        # source_types (workbench #1069): constrain the driver-side pre-filter
+        # to the active Document arm (+ table/file, which have no second arm)
+        # so stale points from the non-active arm can never consume the top-K.
+        # `_hydrate_hits` keeps its arm-mismatch skip as defense in depth.
+        phase_started = time.perf_counter()
         hits, degraded_reason = await self._run_vector_search(
             query_text=query,
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
             candidate_vault_ids=candidate_vault_ids,
+            source_types=[document_source, "table", "file", SOURCE_NATIVE_FILE],
             limit=target_unique * 3,
         )
+        phases["retrieval"] = time.perf_counter() - phase_started
 
         if not hits:
+            _log_search_timing(started, phases, 0)
             return SearchResponse(
+                archive_scope=scope,
                 query=query, total=0, returned=0, total_matches=0, results=[],
                 degraded=degraded_reason is not None,
                 degradation_reason=degraded_reason,
             )
 
-        # Dedup at the source level — one hit per (source_type, source_id).
+        # Dedup at the public source level — one hit per public resource.
         # Previously dedup was by document_id only; generalizing keeps
-        # tables and files first-class in the dedup pool.
+        # tables and files first-class in the dedup pool. A text File has both
+        # its ordinary S3 metadata chunk (``file``) and its native body chunks
+        # (``native_file``); those are two projections of the same public File,
+        # not two search results.
         seen: set[tuple[str, str]] = set()
         unique_hits = []
         for hit in hits:
-            key = (hit.source_type, hit.source_id)
+            public_source_type = (
+                "file" if hit.source_type == SOURCE_NATIVE_FILE else hit.source_type
+            )
+            key = (public_source_type, hit.source_id)
             if key in seen:
                 continue
             seen.add(key)
@@ -624,15 +1099,44 @@ class SearchService:
         prefetch_capped = total_matches >= target_unique
 
         if rerank_enabled and len(unique_hits) > 1:
+            phase_started = time.perf_counter()
             unique_hits = await self._apply_rerank(query, unique_hits)
-
-        unique_hits = unique_hits[:limit]
+            phases["rerank"] = time.perf_counter() - phase_started
 
         # Post-search metadata join — one fetch per source_type, merged back
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
-        results = await self._hydrate_hits(unique_hits)
+        phase_started = time.perf_counter()
+        # `dropped` counts hits lost between retrieval and hydration by cause
+        # (workbench #1069 G3): any non-empty drop set marks the response
+        # degraded so `total_matches > 0, returned == 0` can never again read
+        # as a silent zero-match.
+        #
+        # The page is the first `limit` deduped hits; `spare` is the rest of
+        # the prefetch pool. Hydration can drop rows — archive scope (akb#530),
+        # a stale head, a deleted source — so refill from `spare` rather than
+        # return a short page whenever the pool left headroom. At the measured
+        # archived density (0.11%) the loop body essentially never runs, so the
+        # common case still pays exactly one hydration round trip. Each pass
+        # consumes at least one spare hit, so it terminates; when the pool is
+        # exhausted the page really is short and `dropped` names the cause.
+        page, spare = unique_hits[:limit], unique_hits[limit:]
+        results, dropped = await self._hydrate_hits(page, archive_scope=scope)
+        while len(results) < limit and spare:
+            take, spare = spare[: limit - len(results)], spare[limit - len(results):]
+            more, more_dropped = await self._hydrate_hits(take, archive_scope=scope)
+            results.extend(more)
+            for cause, count in more_dropped.items():
+                dropped[cause] = dropped.get(cause, 0) + count
+        results = results[:limit]
+        hydrate_reason = (
+            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
+        )
+        if hydrate_reason is not None and degraded_reason is None:
+            degraded_reason = hydrate_reason
+        phases["hydration"] = time.perf_counter() - phase_started
         returned = len(results)
+        _log_search_timing(started, phases, returned)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
             "For an exact corpus-wide count of a literal substring use akb_grep with "
@@ -640,6 +1144,7 @@ class SearchService:
             "exhaustively enumerated."
         ) if prefetch_capped else None
         return SearchResponse(
+            archive_scope=scope,
             query=query,
             total=returned,  # deprecated alias of `returned`
             returned=returned,
@@ -756,17 +1261,31 @@ class SearchService:
 
         return doc_ids, table_ids, file_ids
 
-    async def _hydrate_hits(self, hits: list) -> list[SearchResult]:
+    async def _hydrate_hits(
+        self, hits: list, *, archive_scope: ArchiveScope = "all",
+    ) -> tuple[list[SearchResult], dict[str, int]]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
         document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
+        # Hydration-drop accounting (workbench #1069 G3): every hit that enters
+        # this method but leaves as no result is counted by cause, so a
+        # `total_matches > 0, returned == 0` response can say WHERE the hits
+        # went instead of reading as a silent zero-match. Keys are stable
+        # diagnostic strings (not user-facing copy).
+        dropped: dict[str, int] = {}
         for h in hits:
             if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
                 # A selected backend has exactly one Document authority. Old
-                # vector points from the other arm are never hydrated.
+                # vector points from the other arm are never hydrated. With the
+                # driver-side `source_types` predicate (workbench #1069) these
+                # should no longer arrive; the skip stays as defense in depth
+                # and the counter proves it (stays zero when the predicate
+                # works, goes non-zero if a driver ignores it).
+                dropped["stale_arm"] = dropped.get("stale_arm", 0) + 1
                 continue
             if h.source_type not in by_type:
+                dropped["unknown_source_type"] = dropped.get("unknown_source_type", 0) + 1
                 unknown_types.add(h.source_type)
                 continue
             if h.source_id:
@@ -776,13 +1295,14 @@ class SearchService:
 
         pool = await get_pool()
         meta: dict[tuple[str, str], dict] = {}
+        chunk_indexes: dict[str, int] = {}
         async with pool.acquire() as conn:
             if by_type["document"]:
                 rows = await conn.fetch(
                     """
                     SELECT d.id, v.name AS vault_name, d.path, d.title,
                            c.path AS collection,
-                           d.doc_type, d.summary, d.tags
+                           d.doc_type, d.summary, d.tags, d.status
                       FROM documents d
                       JOIN vaults v ON d.vault_id = v.id
                       LEFT JOIN collections c ON c.id = d.collection_id
@@ -794,6 +1314,7 @@ class SearchService:
                     meta[("document", str(r["id"]))] = {
                         "vault": r["vault_name"], "path": r["path"],
                         "title": r["title"], "doc_type": r["doc_type"],
+                        "status": r.get("status") or "draft",
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
                         "collection": r["collection"],
@@ -869,10 +1390,108 @@ class SearchService:
                         "vault": r["vault_name"],
                         "path": path,
                         "title": metadata.get("title") or path.rsplit("/", 1)[-1],
+                        "status": metadata.get("status") or "draft",
                         "doc_type": metadata.get("type") or "note",
                         "summary": metadata.get("summary"),
                         "tags": list(metadata.get("tags") or []),
                         "collection": collection,
+                        "revision": r["head_revision_id"],
+                    }
+            if by_type[SOURCE_NATIVE_FILE]:
+                native_file_hits = {
+                    uuid.UUID(h.chunk_id): h
+                    for h in hits
+                    if h.source_type == SOURCE_NATIVE_FILE
+                }
+                native_file_body_bytes = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(p.byte_size), 0)::bigint
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.surface = 'file'
+                       AND r.lifecycle = 'live'
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_file'
+                    """,
+                    list(native_file_hits),
+                )
+                if native_file_body_bytes > NATIVE_SEARCH_MAX_BODY_BYTES:
+                    raise ValidationError(
+                        "native search hydration exceeds the bounded body corpus"
+                    )
+                rows = await conn.fetch(
+                    f"""
+                    SELECT c.id AS chunk_id, r.resource_id, r.current_path,
+                           r.head_revision_id, v.name AS vault_name,
+                           f.name, f.description, f.mime_type,
+                           col.path AS collection,
+                           p.payload_id, p.namespace_id, p.content_profile,
+                           p.digest, p.byte_size, p.encoding,
+                           p.selected_placement, p.verification_profile,
+                           p.canonical_bytes
+                      FROM chunks c
+                      JOIN native_derived_chunks dc ON dc.chunk_id = c.id
+                      JOIN native_derived_heads dh
+                        ON dh.resource_id = dc.resource_id
+                       AND dh.revision_id = dc.revision_id
+                      JOIN native_resources r
+                        ON r.resource_id = dc.resource_id
+                       AND r.head_revision_id = dc.revision_id
+                       AND r.surface = 'file'
+                       AND r.lifecycle = 'live'
+                      JOIN vaults v ON v.id = r.namespace_id
+                      JOIN vault_files f
+                        ON f.id = r.resource_id
+                       AND f.vault_id = r.namespace_id
+                      LEFT JOIN collections col ON col.id = f.collection_id
+                      JOIN native_revisions nr
+                        ON nr.resource_id = r.resource_id
+                       AND nr.revision_id = r.head_revision_id
+                      JOIN native_payload_manifests pm
+                        ON pm.payload_manifest_id = nr.payload_manifest_id
+                      JOIN m1_reference_payloads p
+                        ON p.payload_id = pm.private_locator
+                     WHERE c.id = ANY($1::uuid[])
+                       AND c.source_type = 'native_file'
+                       AND {confirmed_file_predicate("f")}
+                    """,
+                    list(native_file_hits),
+                )
+                for r in rows:
+                    # File catalog/S3 remains public authority. The native body
+                    # is a searchable projection and must still verify against
+                    # its immutable Head before a derived hit is exposed.
+                    await asyncio.to_thread(_verify_native_body, r)
+                    catalog_path = (
+                        f"{r['collection']}/{r['name']}"
+                        if r["collection"]
+                        else r["name"]
+                    )
+                    if r["current_path"] != catalog_path:
+                        logger.warning(
+                            "hydrate: stale native File path skipped for %s",
+                            r["resource_id"],
+                        )
+                        dropped["stale_native_file_path"] = dropped.get("stale_native_file_path", 0) + 1
+                        continue
+                    meta[(SOURCE_NATIVE_FILE, str(r["resource_id"]))] = {
+                        "vault": r["vault_name"],
+                        "path": catalog_path,
+                        "title": r["name"],
+                        "doc_type": "file",
+                        "summary": r["description"] or r["mime_type"],
+                        "tags": [],
+                        "collection": r["collection"],
                         "revision": r["head_revision_id"],
                     }
             if by_type["table"]:
@@ -927,6 +1546,74 @@ class SearchService:
                         "collection": r["collection"],
                     }
 
+            # Parent descriptions are response context only. Fetch them from
+            # the source-of-truth catalog after hit selection so they do not
+            # create vector points or influence retrieval/rerank scores.
+            vault_names = sorted({m["vault"] for m in meta.values()})
+            collection_paths = sorted({
+                m["collection"] for m in meta.values() if m.get("collection")
+            })
+            if vault_names:
+                rows = await conn.fetch(
+                    """
+                    SELECT v.name AS vault_name,
+                           v.description AS vault_description,
+                           c.path AS collection_path,
+                           c.summary AS collection_summary
+                      FROM vaults v
+                      LEFT JOIN collections c
+                        ON c.vault_id = v.id
+                       AND c.path = ANY($2::text[])
+                     WHERE v.name = ANY($1::text[])
+                    """,
+                    vault_names,
+                    collection_paths,
+                )
+                vault_descriptions: dict[str, str | None] = {}
+                collection_summaries: dict[tuple[str, str], str | None] = {}
+                for row in rows:
+                    vault_descriptions[row["vault_name"]] = row["vault_description"]
+                    if row["collection_path"] is not None:
+                        collection_summaries[(row["vault_name"], row["collection_path"])] = row[
+                            "collection_summary"
+                        ]
+                for item in meta.values():
+                    item["vault_description"] = vault_descriptions.get(item["vault"])
+                    collection_path = item.get("collection")
+                    item["collection_summary"] = (
+                        collection_summaries.get((item["vault"], collection_path))
+                        if collection_path
+                        else None
+                    )
+
+            # Chunk-level identity for the row that matched. `VectorHit`
+            # carries `section_path` but no ordinal, and the drivers differ in
+            # what they store, so read it from `chunks` — PG is the source of
+            # truth for chunk rows, and this is one keyed lookup for the whole
+            # result page. A hit whose chunk row has since been deleted simply
+            # gets no ordinal; the hit itself is unaffected.
+            chunk_uuids = sorted(
+                {
+                    canonical
+                    for canonical in (canonical_chunk_id(h.chunk_id) for h in hits)
+                    if canonical is not None
+                }
+            )
+            if chunk_uuids:
+                rows = await conn.fetch(
+                    """
+                    SELECT c.id::text AS chunk_id, c.chunk_index
+                      FROM chunks c
+                     WHERE c.id = ANY($1::uuid[])
+                    """,
+                    [uuid.UUID(x) for x in chunk_uuids],
+                )
+                for r in rows:
+                    chunk_id = canonical_chunk_id(_row_value(r, "chunk_id"))
+                    chunk_index = _row_value(r, "chunk_index")
+                    if chunk_id is not None and isinstance(chunk_index, int):
+                        chunk_indexes[chunk_id] = chunk_index
+
         from app.services.uri_service import doc_uri, table_uri, file_uri
 
         results: list[SearchResult] = []
@@ -934,6 +1621,29 @@ class SearchService:
             key = (h.source_type, h.source_id)
             m = meta.get(key)
             if not m:
+                # The hit survived retrieval but its source row is gone or stale
+                # (deleted between retrieval and hydration, or a derived chunk
+                # whose head moved). Count it — this is the workbench #1069
+                # `total_matches=30, returned=0` shape, and it must never again
+                # read as a silent zero-match.
+                dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
+                continue
+            # Archive scope (akb#530). `m["status"]` is the AUTHORITY for this
+            # arm and it is already in hand: the native branch parsed it out of
+            # the verified Head body, the legacy branch selected `d.status`.
+            # Applying it here is what lets the default `unarchived` request
+            # take the vault path instead of enumerating candidate ids.
+            #
+            # Table and File carry no document status; `status_matches(None, …)`
+            # keeps them under `unarchived`/`all` and excludes them under
+            # `archived`, which is exactly what the candidate-side branches do.
+            #
+            # Unconditional, not vault-path-only: on the id path the same
+            # predicate already ran during candidate selection, so this is
+            # idempotent — and it closes the window where a document is
+            # archived between candidate selection and hydration.
+            if not status_matches(m.get("status"), archive_scope):
+                dropped["archive_scope_excluded"] = dropped.get("archive_scope_excluded", 0) + 1
                 continue
             # Build the canonical 0.3.0 URI per resource type. Doc URIs
             # derive the collection from `path` automatically (path
@@ -942,22 +1652,45 @@ class SearchService:
                 uri = doc_uri(m["vault"], m["path"])
             elif h.source_type == "table":
                 uri = table_uri(m["vault"], m["title"], collection=m.get("collection"))
-            elif h.source_type == "file":
+            elif h.source_type in {"file", SOURCE_NATIVE_FILE}:
                 uri = file_uri(m["vault"], h.source_id, collection=m.get("collection"))
             else:
+                dropped["unuriable_source_type"] = dropped.get("unuriable_source_type", 0) + 1
                 continue
             results.append(
                 SearchResult(
-                    source_type=("document" if h.source_type == NATIVE_DOCUMENT_SOURCE else h.source_type),
+                    source_type=(
+                        "document"
+                        if h.source_type == NATIVE_DOCUMENT_SOURCE
+                        else "file"
+                        if h.source_type == SOURCE_NATIVE_FILE
+                        else h.source_type
+                    ),
                     uri=uri,
                     vault=m["vault"], path=m["path"], title=m["title"],
                     collection=m.get("collection"),
+                    collection_summary=m.get("collection_summary"),
+                    vault_description=m.get("vault_description"),
                     doc_type=m["doc_type"], summary=m["summary"],
+                    status=m.get("status"),
                     tags=m["tags"], score=h.score,
-                    matched_section=(strip_chunk_metadata_header(h.content) or "")[:500] or None,
+                    # Cleaned before the clip, not after: the heading-context
+                    # line duplicates `section_path` on this very row, so
+                    # leaving it in would spend the first ~40 characters of
+                    # the excerpt restating the field beside it.
+                    matched_section=(
+                        strip_chunk_context_line(
+                            strip_chunk_metadata_header(h.content),
+                            h.section_path,
+                        ) or ""
+                    )[:500] or None,
+                    section_path=(h.section_path or None),
+                    chunk_index=_chunk_index_of(h, chunk_indexes),
                 )
             )
-        return results
+        if dropped:
+            logger.warning("hydrate: dropped %d hit(s): %s", sum(dropped.values()), dropped)
+        return results, dropped
 
     async def _apply_rerank(self, query: str, hits: list) -> list:
         """Rescore `hits` with the configured reranker. On any rerank
@@ -983,6 +1716,7 @@ class SearchService:
         query_embedding: list[float] | None,
         candidate_source_ids: list[str] | None,
         candidate_vault_ids: list[str] | None = None,
+        source_types: list[str] | None = None,
         limit: int,
     ) -> tuple[list, str | None]:
         """Hybrid search over the vector store.
@@ -1034,6 +1768,7 @@ class SearchService:
                 query_sparse_values=sparse_vals,
                 source_ids=candidate_source_ids,
                 vault_ids=candidate_vault_ids,
+                source_types=source_types,
                 limit=limit,
                 prefetch_per_leg=prefetch_per_leg,
             )
@@ -1077,7 +1812,12 @@ class SearchService:
         max_replacements: int = DEFAULT_MAX_REPLACEMENTS,
         count_only: bool = False,
         files_with_matches: bool = False,
-        measurement_include_text_files: bool = False,
+        measurement_include_text_files: bool | None = None,
+        doc_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        include_archived: bool = True,
+        archive_scope: ArchiveScope | None = None,
+        include_text_files: bool | None = None,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1094,6 +1834,20 @@ class SearchService:
         valid with the default response shape).
         """
         import re as _re
+
+        resource_output = include_text_files is True
+        if (include_text_files is not None and measurement_include_text_files is not None
+                and include_text_files != measurement_include_text_files):
+            raise ValidationError("include_text_files conflicts with measurement_include_text_files")
+        include_text_files = (
+            include_text_files if include_text_files is not None
+            else bool(measurement_include_text_files)
+        )
+        if include_text_files and replace is not None:
+            raise ValidationError("native grep replace does not support File resources")
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
 
         if pattern == "":
             raise ValidationError("grep pattern must not be empty")
@@ -1117,13 +1871,7 @@ class SearchService:
             try:
                 _re.compile(pattern)
             except _re.error as e:
-                return {
-                    "error": f"Invalid regex pattern: {e}",
-                    "pattern": pattern,
-                    "total_docs": 0,
-                    "total_matches": 0,
-                    "results": [],
-                }
+                raise ValidationError(f"Invalid regex pattern: {e}") from e
 
         vaults = _normalize_vault_scope(vault)  # str | list | None → canonical list | None
         # ACL guard: when no vault is given we MUST have a user_id so the
@@ -1136,13 +1884,14 @@ class SearchService:
         limit = clamp_search_limit(limit)
 
         document_source = _configured_document_source_type()
-        if measurement_include_text_files and (
-            settings.document_revision_backend != "native_ledger_m1"
+        if include_text_files and (
+            settings.document_revision_backend
+            not in {"postgres_native", "native_ledger_m1"}
             or document_source != NATIVE_DOCUMENT_SOURCE
         ):
             raise ValidationError(
-                "measurement_include_text_files requires the guarded native measurement "
-                "backend (native_ledger_m1)"
+                "include_text_files requires a native Document backend "
+                "(postgres_native or guarded native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
             from app.services.m1_native_grep_service import M1NativeGrepService
@@ -1162,7 +1911,10 @@ class SearchService:
                 max_replacements=max_replacements,
                 count_only=count_only,
                 files_with_matches=files_with_matches,
-                include_text_files=measurement_include_text_files,
+                include_text_files=include_text_files,
+                resource_output=resource_output,
+                doc_types=doc_types, tags=tags, include_archived=include_archived,
+                archive_scope=scope,
             )
 
         if replace is not None and doc_service is None:
@@ -1184,7 +1936,7 @@ class SearchService:
                     conditions.append(f"c.content LIKE '%' || ${idx} || '%'")
                 else:
                     conditions.append(f"c.content ILIKE '%' || ${idx} || '%'")
-                params.append(pattern)
+                params.append(escape_like(pattern))
             idx += 1
 
             if vaults:
@@ -1206,9 +1958,19 @@ class SearchService:
                 idx += 1
 
             if collection:
-                conditions.append(f"d.path LIKE ${idx} || '%'")
-                params.append(collection)
+                conditions.append(collection_predicate("d.path", collection, params))
+                idx = len(params) + 1
+            if doc_types:
+                conditions.append(f"d.doc_type = ANY(${idx}::text[])")
+                params.append(doc_types)
                 idx += 1
+            if tags:
+                conditions.append(f"d.tags && ${idx}")
+                params.append(tags)
+            if not include_archived:
+                conditions.append("d.status != 'archived'")
+            elif scope == "archived":
+                conditions.append("d.status = 'archived'")
 
             where_sql = " AND ".join(conditions)
             # No prefetch cap. The old `LIMIT (limit * 5)` cap was inherited
@@ -1231,7 +1993,7 @@ class SearchService:
             rows = await conn.fetch(
                 f"""
                 SELECT d.id::text as doc_id, v.name as vault, d.path, d.title,
-                       d.metadata,
+                       d.metadata, d.status,
                        c.section_path, c.content, c.chunk_index
                 FROM chunks c
                 JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
@@ -1257,6 +2019,7 @@ class SearchService:
                     "path": r["path"],
                     "title": r["title"],
                     "metadata": r["metadata"],
+                    **({"status": r["status"]} if r.get("status") is not None else {}),
                     "matches": [],
                 }
 
@@ -1437,6 +2200,50 @@ class SearchService:
 
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            from app.services.native_document_service import NativeDocumentService
+            from app.services.index_service import MAX_CHUNK_SIZE, _HEADING_RE
+
+            # Read verified current authority, not a possibly absent/stale derived
+            # chunk or a legacy catalogue row. The adapter resolves IDs/paths/aliases.
+            document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+
+            def native_sections() -> list[dict]:
+                body = document.content or ""
+                headings = list(_HEADING_RE.finditer(body))
+                spans: list[tuple[str, int, int]] = []
+                if not headings:
+                    spans.append(("", 0, len(body)))
+                elif headings[0].start():
+                    spans.append(("", 0, headings[0].start()))
+                hierarchy: list[tuple[int, str]] = []
+                for index, heading in enumerate(headings):
+                    level = len(heading.group(1))
+                    while hierarchy and hierarchy[-1][0] >= level:
+                        hierarchy.pop()
+                    hierarchy.append((level, f"{'#' * level} {heading.group(2).strip()}"))
+                    path = " > ".join(label for _, label in hierarchy)
+                    start = heading.end()
+                    if body[start:start + 1] == "\n":
+                        start += 1  # Only the heading's line terminator belongs to its syntax.
+                    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+                    spans.append((path, start, end))
+
+                rows: list[dict] = []
+                chunk_index = 0
+                for path, start, end in spans:
+                    # Index chunks insert nested overlap and synthetic context.
+                    # Current-body reads instead slice source spans directly:
+                    # no content guessing, no duplicate bytes, bounded rows.
+                    for offset in range(start, max(start + 1, end), MAX_CHUNK_SIZE):
+                        if not section or section.casefold() in path.casefold():
+                            rows.append({"section_path": path,
+                                         "content": body[offset:min(offset + MAX_CHUNK_SIZE, end)],
+                                         "chunk_index": chunk_index})
+                        chunk_index += 1
+                return rows
+
+            return await asyncio.to_thread(native_sections)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -1444,7 +2251,7 @@ class SearchService:
             if section:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
@@ -1458,7 +2265,7 @@ class SearchService:
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT c.section_path, c.content, c.chunk_index
+                    SELECT c.section_path, c.content, c.chunk_index, d.id AS doc_id
                     FROM chunks c
                     JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                     JOIN vaults v ON d.vault_id = v.id
@@ -1468,35 +2275,52 @@ class SearchService:
                     vault, doc_id,
                 )
 
-            return [
-                {
-                    "section_path": r["section_path"],
-                    "content": strip_chunk_metadata_header(r["content"]),
-                    "chunk_index": r["chunk_index"],
-                }
-                for r in rows
-            ]
+            return clean_section_rows(rows)
 
     async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
-        """Return the document's section paths without their bodies.
+        """Return the document's distinct section paths, without their bodies,
+        in first-occurrence order.
 
         Used by `akb_drill_down`'s empty-match fallback to surface the
         available headings cheaply — pulling full content for a 1000-
         section doc just to extract heading strings is wasteful.
+
+        One heading, one row. A section longer than `MAX_CHUNK_SIZE` is stored
+        as several chunks that all carry the same `section_path`, so the
+        row-per-chunk form repeated a heading once per chunk and the caller's
+        outline cap was spent on duplicates instead of on headings it had not
+        seen yet. `limit` therefore bounds *headings*: the grouping happens in
+        SQL, before the LIMIT, and the Python pass keeps the contract true
+        regardless of how the rows arrive.
         """
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            rows = await self.drill_down(vault, doc_id)
+            native_headings = list(dict.fromkeys(row["section_path"] for row in rows if row["section_path"]))
+            return native_headings[:limit] if isinstance(limit, int) and limit > 0 else native_headings
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
             doc_match = DocumentRepository.match_clause(2)
             sql = f"""
-                SELECT c.section_path
+                SELECT c.section_path, MIN(c.chunk_index) AS first_chunk_index
                 FROM chunks c
                 JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
                 JOIN vaults v ON d.vault_id = v.id
                 WHERE v.name = $1 AND {doc_match}
-                ORDER BY c.chunk_index
+                  AND c.section_path IS NOT NULL
+                  AND c.section_path <> ''
+                GROUP BY c.section_path
+                ORDER BY first_chunk_index, c.section_path
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"
             rows = await conn.fetch(sql, vault, doc_id)
-            return [r["section_path"] for r in rows if r["section_path"]]
+            headings: list[str] = []
+            seen: set[str] = set()
+            for r in rows:
+                section_path = r["section_path"]
+                if not section_path or section_path in seen:
+                    continue
+                seen.add(section_path)
+                headings.append(section_path)
+            return headings

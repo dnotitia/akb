@@ -71,16 +71,9 @@ export function VaultStateBadge({
 }
 
 /**
- * Indexing activity indicator.
- *
- * - `pending`   — actively-indexing chunks (i.e. backend's
- *                 `pending − abandoned`). `null`/`undefined` ⇒ skeleton;
- *                 `0` ⇒ no spinner. `> 0` ⇒ spinner + count.
- * - `abandoned` — retry-exhausted chunks that the worker has given up
- *                 on. Surfaced as a separate warning chip when > 0 so
- *                 they don't masquerade as "still indexing" forever.
- *                 (The backend's delete_worker reaps them after the
- *                 grace window — until then this chip is the signal.)
+ * Presentational chunk badge retained for the component catalog. Product
+ * surfaces use the shared SearchStatusProvider and PendingIndexingBadge.
+ * Pending excludes abandoned chunks; do not subtract abandoned or add retrying.
  */
 export function IndexingBadge({
   pending,
@@ -92,7 +85,7 @@ export function IndexingBadge({
   const abandonedChip = abandoned > 0 ? (
     <Badge
       variant="error"
-      title={`${abandoned.toLocaleString()} chunk(s) failed indexing and are awaiting auto-reap`}
+      title={`${abandoned.toLocaleString()} chunk(s) need indexing attention`}
     >
       <AlertTriangle className="h-3 w-3" aria-hidden />
       {abandoned.toLocaleString()} abandoned
@@ -126,7 +119,7 @@ export function IndexingBadge({
         title={`${pending.toLocaleString()} items pending`}
         aria-busy="true"
       >
-        <CircleDashed className="h-3 w-3 animate-spin" aria-hidden />
+        <CircleDashed className="h-3 w-3 motion-safe:animate-spin" aria-hidden />
         indexing {pending.toLocaleString()}
       </Badge>
       {abandonedChip}

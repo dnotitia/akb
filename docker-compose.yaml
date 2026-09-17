@@ -1,4 +1,4 @@
-# Local AKB stack — 3 containers (Postgres + backend + frontend).
+# Local AKB stack — API + worker + frontend, PostgreSQL and MinIO.
 #
 # Default vector store: pgvector running inside the same Postgres
 # container that holds main app data. Driver writes its derived index
@@ -15,9 +15,10 @@
 # Usage:
 #   1. cp config/app.yaml.example config/app.yaml
 #   2. cp config/secret.yaml.example config/secret.yaml
-#      (set embed_api_key — only required field for a fresh start)
-#   3. docker compose up
-#   4. open http://localhost:3000
+#      (replace system_hmac_secret; embeddings are optional)
+#   3. Generate config/local-session keys as described in README.md.
+#   4. docker compose up
+#   5. Provision the administrator and open http://localhost:3000.
 #
 # The Postgres password is hard-coded to `akb` here for local-dev
 # convenience and must match `db_password` in config/secret.yaml.
@@ -77,6 +78,16 @@ services:
 
   backend:
     build: ./backend
+    environment:
+      AKB_PROCESS_ROLE: api
+      AKB_TOKENIZER_PROCESSES: "1"
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=8)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,16 +95,38 @@ services:
         condition: service_completed_successfully
     volumes:
       # Single source of runtime config. Everything backend reads
-      # comes from the two yaml files mounted here — no env vars.
+      # comes from these YAML files; env only selects process composition.
       - ./config:/etc/akb:ro
       - vault_data:/data/vaults
     ports:
       - "8000:8000"
 
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker_main"]
+    restart: unless-stopped
+    environment:
+      AKB_PROCESS_ROLE: worker
+      # Corpus tokenizer pool size comes from app.yaml's tokenizer_processes.
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./config:/etc/akb:ro
+      - vault_data:/data/vaults
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker_health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
   frontend:
     build: ./frontend
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "3000:3000"
 

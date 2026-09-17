@@ -73,6 +73,64 @@ test("control-plane facade encodes paths, separates tokens, and preserves errors
   assert.equal(denied.error.code, "permission_denied");
 });
 
+test("control-plane operations forward request-scoped AbortSignals", async () => {
+  const signal = new AbortController().signal;
+  const seen = [];
+  const fetch = async (input, init = {}) => {
+    seen.push({ url: String(input), signal: init.signal });
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const admin = createControlPlaneAdminClient({
+    baseUrl: "https://control.invalid",
+    adminToken: "admin-token",
+    fetch,
+  });
+  const app = createControlPlaneAppClient({
+    baseUrl: "https://control.invalid",
+    appToken: "app-token",
+    fetch,
+  });
+
+  await admin.apps.get("app-1", { signal });
+  await admin.inventory.list("app-1", { limit: 3, signal });
+  await app.inventory.list({ limit: 2, signal });
+  await exchangeAppCredential({ baseUrl: "https://control.invalid", credential: "credential", signal, fetch });
+
+  assert.equal(seen.length, 4);
+  assert.ok(seen.every((call) => call.signal === signal));
+  assert.equal(new URL(seen[1].url).searchParams.has("signal"), false);
+  assert.equal(new URL(seen[2].url).searchParams.has("signal"), false);
+});
+
+test("control-plane injected fetch and response failures use the shared result boundary", async () => {
+  const transport = createControlPlaneAdminClient({
+    baseUrl: "https://control.invalid",
+    adminToken: "admin-token",
+    fetch: async () => {
+      throw new Error("control transport details must stay private");
+    },
+  });
+  const failedTransport = await transport.apps.get("app-1");
+  assert.equal(failedTransport.error?.code, "transport_error");
+  assert.equal(failedTransport.error?.status, null);
+  assert.doesNotMatch(failedTransport.error?.message ?? "", /control transport details|private/);
+
+  const malformed = createControlPlaneAdminClient({
+    baseUrl: "https://control.invalid",
+    adminToken: "admin-token",
+    fetch: async () => new Response("{broken", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+  const failedJson = await malformed.apps.get("app-1");
+  assert.equal(failedJson.error?.code, "invalid_json");
+  assert.equal(failedJson.error?.status, 200);
+});
+
 test("control-plane subpath does not expose data-plane constructors", async () => {
   const exports = await import("../src/control-plane.js");
   for (const forbidden of ["createClient", "AkbClient", "akbFetch", "unwrapAkbResponse"]) {

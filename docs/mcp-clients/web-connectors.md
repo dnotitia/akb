@@ -7,6 +7,12 @@ stdio-based clients (Claude Desktop, Codex CLI via `akb-mcp`,
 Claude Code via the stdio proxy), see the project README: the PAT
 flow there is unchanged.
 
+Direct HTTP clients may use either the modern `2026-07-28` stateless surface
+(`server/discover`, per-request `_meta`, and the `Mcp-Protocol-Version` /
+`Mcp-Method` headers) or the legacy initialize/session surface. The backend
+keeps the four legacy revisions `2024-11-05`, `2025-03-26`, `2025-06-18`, and
+`2025-11-25`; a single connection must stay within one generation.
+
 ## What you need
 
 | Piece | Why |

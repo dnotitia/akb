@@ -24,8 +24,109 @@ export interface AppUpdateRequest {
   metadata?: ControlPlaneJsonObject | null;
 }
 
-export interface ReleaseManifest extends ControlPlaneJsonObject {
+export interface ManifestColumn {
+  name: string;
+  type: string;
+  required?: boolean;
+  default?: ControlPlaneJsonValue;
+  check?: ControlPlaneJsonObject | null;
+  enum?: string[] | null;
+  references?: ControlPlaneJsonObject | null;
+  on_delete?: string | null;
+  unique?: boolean;
+  index?: boolean;
+}
+
+export interface ManifestUniqueKey {
+  name?: string | null;
+  columns: string[];
+}
+
+export interface ManifestIndexColumn {
+  name: string;
+  order?: "asc" | "desc";
+}
+
+export interface ManifestIndex {
+  name?: string | null;
+  columns: Array<string | ManifestIndexColumn>;
+}
+
+export interface ManifestTable {
+  name: string;
+  columns: ManifestColumn[];
+  unique_keys: ManifestUniqueKey[];
+  indexes: ManifestIndex[];
+}
+
+export interface DesiredSchemaProjection {
+  tables: ManifestTable[];
+  fingerprint?: string | null;
+}
+
+export interface TransitionSource {
+  release_version: string;
+  schema_fingerprint: string;
+}
+
+export interface TransitionPlan {
+  source: "fresh" | TransitionSource;
   steps: ControlPlaneJsonObject[];
+}
+
+export interface LegacyAdoptionTargetRequest {
+  vault_id: ControlPlaneUuid;
+  table_allowlist: string[];
+}
+
+export interface LegacyAdoptionCreateRequest {
+  baseline_release_id: ControlPlaneUuid;
+  targets: LegacyAdoptionTargetRequest[];
+}
+
+export interface LegacyAdoptionTargetProjection {
+  target_id: ControlPlaneUuid;
+  vault_id: ControlPlaneUuid;
+  table_allowlist: string[];
+  included_tables?: string[];
+  excluded_tables?: string[];
+  missing_tables?: string[];
+  ownership_conflicts?: string[];
+  expected_schema_fingerprint: string;
+  actual_schema_fingerprint?: string | null;
+  state: "planned" | "applied" | "replayed" | "blocked";
+  reason_code?: string | null;
+  installation_id?: ControlPlaneUuid | null;
+  checkpoint?: ControlPlaneJsonObject;
+  planned_metadata?: ControlPlaneJsonObject;
+  replayed?: boolean | null;
+  outcome?: "replayed" | null;
+}
+
+export interface LegacyAdoptionProjection {
+  adoption_id: ControlPlaneUuid;
+  app_id: ControlPlaneUuid;
+  baseline_release_id: ControlPlaneUuid;
+  idempotency_key: ControlPlaneUuid;
+  input_digest: string;
+  status: "planned" | "partial" | "applied" | "blocked";
+  targets: LegacyAdoptionTargetProjection[];
+  checkpoint?: ControlPlaneJsonObject;
+  created_at: ControlPlaneDateTime;
+  updated_at: ControlPlaneDateTime;
+  applied_at?: ControlPlaneDateTime | null;
+  replayed?: boolean | null;
+  outcome?: "applied" | "resumed" | null;
+}
+
+export interface ReleaseManifest {
+  manifest_version: 2;
+  app_key: string;
+  source_revision: string;
+  image_digest: string;
+  schema_version: number;
+  schema: DesiredSchemaProjection;
+  transition_plans: TransitionPlan[];
 }
 
 export interface ReleaseCreateRequest {

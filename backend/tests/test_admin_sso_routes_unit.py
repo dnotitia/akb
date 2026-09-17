@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import uuid
 
 from fastapi import FastAPI
@@ -26,6 +28,7 @@ from app.sso.models import (
 
 
 _SECRET = "write-only-provider-secret-must-not-leak"  # pragma: allowlist secret
+_CATALOG_FIXTURE = Path(__file__).parent / "fixtures" / "admin_sso_provider_catalog_v1.json"
 
 
 def _admin() -> ProductAdminIdentity:
@@ -127,13 +130,7 @@ def test_admin_catalog_is_versioned_bounded_and_secret_free(monkeypatch):
     response = _client(monkeypatch, Control()).get("/api/v1/admin/sso/providers")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "schema_version": 1,
-        "auth_mode": "sso",
-        "control_mode": "direct",
-        "supported_provider_types": ["keycloak-oidc"],
-        "providers": [_provider().admin_view()],
-    }
+    assert response.json() == json.loads(_CATALOG_FIXTURE.read_text())
     assert _SECRET not in response.text
 
 

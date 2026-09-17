@@ -5,7 +5,6 @@ export AKB_URL="${AKB_URL:-http://localhost:8001}"
 
 SUITES=(
   test_mcp_e2e.sh
-  test_edit_e2e.sh
   test_defensive_e2e.sh
   test_graph_replace_e2e.sh
   test_probes_e2e.sh

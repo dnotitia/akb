@@ -240,8 +240,8 @@ if [ -n "$SID" ]; then
 fi
 
 # Self-delete test user to avoid accumulating in DB
-curl -sk --max-time 15 -X DELETE "$BASE/api/v1/my/account" -H "Authorization: Bearer $JWT" >/dev/null 2>&1
-pass "cleanup attempted"
+python3 "$(dirname "${BASH_SOURCE[0]}")/helpers/cleanup_hybrid_account.py" "$BASE" "$USER_NAME" <<<'test1234' \
+  && pass "fixture account cleanup confirmed" || fail "cleanup" "safe account cleanup failed"
 
 echo ""
 echo "═══════════════════════════════════════════"

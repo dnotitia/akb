@@ -88,6 +88,28 @@ class ExternalGitCompatError(AKBError):
         super().__init__(message, status_code=502, code="external_git_compat")
 
 
+async def _active_sidecar_for_document_mutation(conn, vault_id: uuid.UUID) -> bool:
+    """Take an in-transaction active-sidecar snapshot before a mirror write.
+
+    ``lock_vault_for_child_write`` must be held first.  Retirement takes that
+    parent row ``FOR UPDATE`` before it quarantines the sidecar, so a document
+    mutation ordered before quarantine can finish and is revalidated by
+    retirement; one ordered after cannot pass this gate or change a now-manual
+    document back into an external-Git row.
+    """
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT 1
+              FROM vault_external_git
+             WHERE vault_id = $1 AND sync_state = 'active'
+             FOR KEY SHARE
+            """,
+            vault_id,
+        )
+    )
+
+
 class ExternalGitService:
     """Encapsulates clone/fetch/reconcile for read-only mirror vaults."""
 
@@ -104,6 +126,8 @@ class ExternalGitService:
         remote_url: str,
         branch: str,
         auth_token: str | None,
+        *,
+        allow_unmarked_never_synced: bool = False,
     ) -> tuple[str, str]:
         """Make the local bare repo present and trustworthy before reconcile
         reads blobs from it. Returns `(action, materialized_sha)` where action
@@ -141,9 +165,29 @@ class ExternalGitService:
         """
         host = _host_only(remote_url)
         if not self.git.vault_exists(vault_name):
-            logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
-            sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
-            return ("cloned", sha)
+            # Join standard Vault creation's cross-process lock before
+            # materialising an absent bare path. Without this, a standard
+            # create that already observed "absent" can mistake this poller's
+            # mirror for its own failed-create artefact and remove it during
+            # compensation. Re-check after the wait because the standard
+            # winner may have created and then rolled back the same path.
+            creation_fd = self.git.acquire_vault_creation_lock(vault_name)
+            try:
+                if not self.git.vault_exists(vault_name):
+                    logger.info("Bootstrap clone: vault=%s host=%s", vault_name, host)
+                    sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+                    return ("cloned", sha)
+            finally:
+                self.git.release_vault_creation_lock(creation_fd)
+        # A normal marker is written only by a fresh clone or the
+        # DB-authoritative startup backfill. Do NOT recreate it from this stale
+        # poller snapshot: after a completed retirement the retained bare is a
+        # manual vault and an old reconcile must neither clean it up nor make it
+        # eligible for a later fetch publication.
+        if not self.git._is_mirror(vault_name) and last_synced_sha is not None:
+            raise MirrorMarkerError(
+                "external-git mirror marker is missing; refusing to sync"
+            )
         # Findings are value-less enum-style codes → safe to log.
         findings = self.git.inspect_mirror_structure(vault_name, remote_url, branch)
         if last_synced_sha is None or findings or not self.git.is_healthy_repo(vault_name):
@@ -157,8 +201,13 @@ class ExternalGitService:
                 "Untrusted bare repo for mirror %s (%s); re-cloning from %s",
                 vault_name, reason, host,
             )
-            self.git.cleanup_vault_dirs(vault_name)
-            sha = self.git.clone_mirror(vault_name, remote_url, branch, auth_token)
+            sha = self.git.reclone_active_mirror(
+                vault_name,
+                remote_url,
+                branch,
+                auth_token,
+                allow_unmarked_never_synced=allow_unmarked_never_synced,
+            )
             # Loop-breaker: a FRESH, sterilely re-cloned bare must be
             # structurally clean. If it STILL trips the structure inspector, the
             # findings are systemic — a git-version / inspector incompatibility
@@ -175,26 +224,6 @@ class ExternalGitService:
                     "re-clone in a loop (systemic git/inspector incompatibility)"
                 )
             return ("cloned", sha)
-        # Self-heal belt: this bare is a trusted, existing mirror we
-        # are about to keep (unchanged or fetched — not re-cloned). ensure_local_bare
-        # is only ever called for a DB-registered mirror, so if it predates the
-        # marker (created before the marker existed, or missed by the startup
-        # backfill) stamp it now — otherwise _is_mirror stays False and this
-        # mirror's reads keep falling through to GitPython. The unchanged fast
-        # path below would otherwise perpetuate the marker-less state forever.
-        # Idempotent + cheap (a fast lstat when already marked); the
-        # clone/re-clone paths above get their marker from clone_mirror instead.
-        self.git.mark_as_mirror(vault_name)
-        # Fail-CLOSED: confirm the marker now reads back as a
-        # genuine mirror before we KEEP (and serve reads from) this bare. An
-        # abnormal marker entry already made mark_as_mirror raise; this also
-        # refuses the pathological "mark returned but _is_mirror is still False"
-        # case rather than letting the mirror's reads fall open to GitPython.
-        if not self.git._is_mirror(vault_name):
-            raise MirrorMarkerError(
-                f"external-git mirror {vault_name!r} could not establish its "
-                "on-disk marker; refusing to serve"
-            )
         # Treat the mirror as unchanged ONLY when the ls-remote hint, the
         # recorded cursor, AND the LOCAL materialized ref all agree. If the local
         # ref is missing or differs (e.g. a prior partial reconcile advanced the
@@ -209,6 +238,64 @@ class ExternalGitService:
             return ("unchanged", local_sha)
         sha = self.git.fetch_remote(vault_name, remote_url, branch, auth_token)
         return ("fetched", sha)
+
+    async def _ensure_local_bare_for_reconcile(
+        self,
+        pool,
+        *,
+        vault_id: uuid.UUID,
+        vault_name: str,
+        cfg: dict,
+        new_sha: str,
+    ) -> tuple[str, str]:
+        """Run the one exceptional unmarked re-clone under live DB authority.
+
+        An unmarked existing directory is eligible for self-healing only before
+        the mirror's first successful sync. Hold ``FOR SHARE`` on the exact
+        active sidecar while the staged re-clone publishes, so retirement
+        (which needs ``FOR UPDATE`` on that row) either waits for publication or
+        completes first and makes this stale worker refuse. Normal marked paths
+        keep the existing filesystem-only fast path.
+        """
+        values = (
+            vault_name,
+            cfg["last_synced_sha"],
+            new_sha,
+            cfg["remote_url"],
+            cfg["remote_branch"],
+            cfg["auth_token"],
+        )
+        if cfg["last_synced_sha"] is not None or not self.git.vault_exists(vault_name):
+            return await asyncio.to_thread(self.ensure_local_bare, *values)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                active = await conn.fetchval(
+                    """
+                    SELECT 1
+                      FROM vault_external_git
+                     WHERE vault_id = $1
+                       AND sync_state = 'active'
+                       AND last_synced_sha IS NULL
+                       AND remote_url = $2
+                       AND remote_branch = $3
+                       AND auth_token IS NOT DISTINCT FROM $4
+                     FOR SHARE
+                    """,
+                    vault_id,
+                    cfg["remote_url"],
+                    cfg["remote_branch"],
+                    cfg["auth_token"],
+                )
+                if not active:
+                    raise MirrorMarkerError(
+                        "external-git first-sync publication is no longer active"
+                    )
+                return await asyncio.to_thread(
+                    self.ensure_local_bare,
+                    *values,
+                    allow_unmarked_never_synced=True,
+                )
 
     # ── Reconcile (called by poller) ─────────────────────────
 
@@ -248,14 +335,12 @@ class ExternalGitService:
         # authoritative materialized SHA (local ref), which we use from here on
         # so a force-push between ls-remote and fetch can't desync the tree
         # from the cursor. 'unchanged' short-circuits the rest.
-        action, materialized_sha = await asyncio.to_thread(
-            self.ensure_local_bare,
-            vault_name,
-            cfg["last_synced_sha"],
-            new_sha,
-            cfg["remote_url"],
-            cfg["remote_branch"],
-            cfg["auth_token"],
+        action, materialized_sha = await self._ensure_local_bare_for_reconcile(
+            pool,
+            vault_id=vault_id,
+            vault_name=vault_name,
+            cfg=cfg,
+            new_sha=new_sha,
         )
         if action == "unchanged":
             marked = await ext_repo.mark_success(
@@ -314,6 +399,8 @@ class ExternalGitService:
                             vault_id=vault_id, vault_name=vault_name, path=path,
                             expected_blob=existing["external_blob"],
                         )
+                        if outcome == "superseded":
+                            return {"status": "superseded", "sha": materialized_sha}
                         if outcome == "conflict":
                             # A concurrent reconcile moved this path's blob after
                             # our snapshot; the tombstone CAS did not match. Treat
@@ -341,11 +428,13 @@ class ExternalGitService:
                         )
                     skipped += 1
                     continue
-                await self._reindex_file(
+                reindex_outcome = await self._reindex_file(
                     vault_id=vault_id, vault_name=vault_name,
                     path=path, blob_sha=blob_sha, remote_url=cfg["remote_url"],
                     tip_sha=materialized_sha,
                 )
+                if reindex_outcome == "superseded":
+                    return {"status": "superseded", "sha": materialized_sha}
                 if existing:
                     updated += 1
                 else:
@@ -363,6 +452,8 @@ class ExternalGitService:
                     vault_id=vault_id, vault_name=vault_name, path=path,
                     expected_blob=local[path]["external_blob"],
                 )
+                if outcome == "superseded":
+                    return {"status": "superseded", "sha": materialized_sha}
                 if outcome == "conflict":
                     # A concurrent reconcile re-indexed this path to a newer blob
                     # after our snapshot, so it is NOT actually gone from truth.
@@ -432,7 +523,7 @@ class ExternalGitService:
         blob_sha: str,
         remote_url: str,
         tip_sha: str,
-    ) -> None:
+    ) -> str | None:
         raw = await asyncio.to_thread(self.git.cat_blob, vault_name, blob_sha)
         try:
             content = raw.decode("utf-8")
@@ -512,6 +603,8 @@ class ExternalGitService:
                         "Vault was deleted during external Git synchronization",
                         status_code=409,
                     )
+                if not await _active_sidecar_for_document_mutation(conn, vault_id):
+                    return "superseded"
                 previous_asset_state = await doc_repo.find_asset_sync_state_for_update(
                     vault_id, path, conn=conn,
                 )
@@ -587,11 +680,13 @@ class ExternalGitService:
                         "title": title,
                         "doc_type": doc_type,
                         "external_blob": blob_sha,
+                        "resource_id": str(pg_doc_id),
                         "commit": last_commit,
                         "content_hash": compute_text_content_hash(body),
                         "hash_algorithm": HASH_ALGORITHM,
                     },
                 )
+        return None
 
     async def _delete_external_path(
         self,
@@ -615,6 +710,9 @@ class ExternalGitService:
           cursor over content this reconcile never reconciled. Otherwise the next
           poll's ``unchanged`` fast-path (cursor == upstream SHA) would perpetuate
           the stale prior content forever.
+        * ``"superseded"`` — the sidecar is no longer active inside this
+          transaction, so retirement/reconfiguration won before any document,
+          chunk, collection, or event mutation began.
 
         The row is re-read and LOCKED (``FOR UPDATE``) INSIDE the transaction,
         never before it. Two reconciles that overlap (a claim lease that expired
@@ -635,6 +733,8 @@ class ExternalGitService:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     return "already_absent"
+                if not await _active_sidecar_for_document_mutation(conn, vault_id):
+                    return "superseded"
                 row = await conn.fetchrow(
                     """
                     SELECT id, collection_id, created_by, external_blob
@@ -699,7 +799,7 @@ class ExternalGitService:
                     vault_id=vault_id,
                     resource_uri=doc_uri(vault_name, path),
                     actor_id=row["created_by"],
-                    payload={"path": path, "source": "external_git"},
+                    payload={"path": path, "source": "external_git", "resource_id": str(row["id"])},
                 )
         return "deleted"
 

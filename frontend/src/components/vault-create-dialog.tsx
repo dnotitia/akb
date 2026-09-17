@@ -12,11 +12,13 @@ export function VaultCreateDialog({
   open,
   onOpenChange,
   onCreated,
+  onOpenExisting,
   returnFocusRef,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (name: string) => void;
+  onOpenExisting: (name: string) => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [busy, setBusy] = useState(false);
@@ -54,6 +56,7 @@ export function VaultCreateDialog({
         </DialogHeader>
         <VaultCreateForm
           onCreated={onCreated}
+          onOpenExisting={onOpenExisting}
           onCancel={() => handleOpenChange(false)}
           onBusyChange={setBusy}
           className="p-6"

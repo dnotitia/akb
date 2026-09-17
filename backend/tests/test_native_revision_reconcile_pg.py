@@ -109,6 +109,8 @@ async def _fresh_schema(tmp_path: Path):
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
+            "097_native_revision_migration_inventory.py",
+            "105_bridge_body_digest.py",
         ):
             await _load(filename).migrate(conn=conn)
         await conn.close()

@@ -245,14 +245,16 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
 
     captured: dict[str, object] = {}
 
-    async def project(value):
+    async def project(value, *, provider_alias=None):
         assert value is principal
+        assert provider_alias == "workforce"
         # The boundary carries a reason alongside the account now, so the callback
         # can tell "not a member" apart from every other refusal. Success carries
         # none.
         return ProjectionOutcome(user)
 
-    async def create(value, verified, id_claims, tokens):
+    async def create(value, verified, id_claims, tokens, *, login_sequence=None):
+        assert login_sequence is None  # A pre-migration in-flight login has no sequence.
         captured.update(
             value=value,
             verified=verified,

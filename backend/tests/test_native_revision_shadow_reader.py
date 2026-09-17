@@ -41,7 +41,6 @@ from app.services.native_revision_shadow import (
     ShadowComparisonError,
 )
 from app.services.native_revision_shadow_reader import (
-    _apply_unified_patch,
     _canonical_transition,
     LegacyFixedRefShadowReader,
     NativeActivityEvidence,
@@ -103,6 +102,8 @@ async def _fresh_schema(tmp_path: Path):
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",
+            "097_native_revision_migration_inventory.py",
+            "105_bridge_body_digest.py",
         ):
             await _load_migration(filename).migrate(conn=connection)
         await connection.close()
@@ -141,38 +142,6 @@ def _document_body(document: LegacyInventoryDocument) -> bytes:
     if document.resource_id == uuid.UUID("44444444-4444-4444-8444-444444444444"):
         return b"# Second candidate\n\nother secret body\n"
     raise AssertionError(f"unexpected synthetic document: {document.resource_id}")
-
-
-@pytest.mark.parametrize(
-    ("parent_text", "patch", "expected"),
-    [
-        pytest.param(
-            "text\n",
-            "@@ -1 +1 @@\n-text\n+text\n\\ No newline at end of file\n",
-            "text",
-            id="newline-to-no-newline",
-        ),
-        pytest.param(
-            "text",
-            "@@ -1 +1 @@\n-text\n\\ No newline at end of file\n+text\n",
-            "text\n",
-            id="no-newline-to-newline",
-        ),
-    ],
-)
-async def test_apply_unified_patch_preserves_terminal_newline_state(
-    parent_text: str,
-    patch: str,
-    expected: str,
-):
-    assert _apply_unified_patch(parent_text, patch, "modified") == expected
-
-
-async def test_apply_unified_patch_rejects_forged_parent_line():
-    patch = "@@ -1 +1 @@\n-forged\n+text\n"
-
-    with pytest.raises(ShadowReaderScopeError, match="differs from parent body"):
-        _apply_unified_patch("text\n", patch, "modified")
 
 
 def _document() -> LegacyInventoryDocument:
@@ -243,6 +212,22 @@ async def test_inventory_document_schema_does_not_retain_body_text():
     document = _document()
 
     assert not hasattr(document, "body")
+
+
+async def test_persisted_inventory_preserves_empty_legacy_activity_summary():
+    document = replace(_document(), activity=replace(_document().activity, summary=""))
+    namespace_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    fixed_ref = _oid("f")
+    payload = LegacyRevisionBridge.canonical_inventory_payload(
+        namespace_id=namespace_id,
+        fixed_git_oid=fixed_ref,
+        coverage_version="empty-summary-v1",
+        documents=(document,),
+    )
+
+    restored = LegacyRevisionBridge.inventory_from_payload(payload)
+
+    assert restored.documents[0].activity.summary == ""
 
 
 def _run_and_item(
@@ -505,8 +490,7 @@ class _NoWriteGit:
     def __init__(self, *documents: LegacyInventoryDocument):
         self.documents = documents
         self.bodies = {
-            (document.current_path, document.current_commit): _document_body(document)
-            for document in documents
+            (document.current_path, document.current_commit): _document_body(document) for document in documents
         }
         for document in documents:
             for entry in document.lineage[:-1]:
@@ -1040,32 +1024,27 @@ async def test_product_readers_are_scoped_and_read_only():
     await legacy.activity(document, selector=document.current_commit, fixed_ref=fixed_ref)
     assert result["current_commit"] == document.current_commit
     assert result["content"] == "# Migration candidate\n\nsecret body"
-    assert [name for name, _ in git.calls] == [
-        "manual_fixed_ref_history",
-        "file_diff",
-        "read_file",
-        "read_file",
-    ]
+    assert [name for name, _ in git.calls] == ["read_file", "read_file"]
 
     result["projection"]["revision"] = "caller-mutation"
     result["content"] = "caller-mutation"
     reread = await legacy.get(document, selector=document.current_commit, fixed_ref=fixed_ref)
     assert reread["projection"]["revision"] == document.current_commit
     assert reread["content"] == "# Migration candidate\n\nsecret body"
-    assert len(git.calls) == 4
+    assert len(git.calls) == 2
 
     await legacy.get(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.history(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.diff(second, selector=second.current_commit, fixed_ref=fixed_ref)
     await legacy.activity(second, selector=second.current_commit, fixed_ref=fixed_ref)
-    assert len(git.calls) == 8
+    assert len(git.calls) == 4
 
     await legacy.get(document, selector=document.current_commit, fixed_ref=fixed_ref)
-    assert len(git.calls) == 9
+    assert len(git.calls) == 5
 
     with pytest.raises(ShadowReaderScopeError):
         await legacy.get(document, selector=_oid("e"), fixed_ref=fixed_ref)
-    assert len(git.calls) == 9
+    assert len(git.calls) == 5
 
     native_service = _NoWriteNative(
         (document, native_id),
@@ -1163,14 +1142,10 @@ async def test_legacy_reader_treats_modified_singleton_lineage_as_logical_genesi
 
     assert result["text"] == _canonical_transition("", body)
     assert git.parent_reads == []
-    assert [name for name, _ in git.calls] == [
-        "manual_fixed_ref_history",
-        "file_diff",
-        "read_file",
-    ]
+    assert [name for name, _ in git.calls] == ["read_file"]
 
 
-async def test_legacy_reader_rejects_malformed_added_genesis_patch():
+async def test_legacy_reader_does_not_rescan_a_persisted_genesis_patch():
     body = "# Migration candidate\n\ncurrent body\n"
     document = _genesis_document(action="create", body=body)
     path = document.current_path
@@ -1188,12 +1163,14 @@ async def test_legacy_reader_rejects_malformed_added_genesis_patch():
     }
     git = _GenesisDiffGit(document, diff=raw_diff, body=body)
 
-    with pytest.raises(ShadowReaderScopeError, match="invalid parent range"):
-        await LegacyFixedRefShadowReader(git=git, vault_name="p2-manual").diff(
-            document,
-            selector=document.current_commit,
-            fixed_ref=_oid("f"),
-        )
+    result = await LegacyFixedRefShadowReader(git=git, vault_name="p2-manual").diff(
+        document,
+        selector=document.current_commit,
+        fixed_ref=_oid("f"),
+    )
+
+    assert result["text"] == _canonical_transition("", body)
+    assert [name for name, _ in git.calls] == ["read_file"]
 
 
 async def test_legacy_reader_projects_final_delta_with_same_creation_anchor_as_inventory():
@@ -1309,6 +1286,47 @@ async def test_unanchored_projection_keeps_precreation_current_as_only_revision(
     assert [entry.legacy_git_oid for entry in lineage] == [current_oid]
 
 
+async def test_unanchored_projection_uses_newest_create_with_same_second_commits():
+    created_at = datetime(2026, 8, 11, 12, 0, 0, 750_000, tzinfo=UTC)
+    committed_at = created_at.replace(microsecond=0)
+    current_oid = _oid("d")
+    create_oid = _oid("c")
+
+    lineage = project_logical_lineage(
+        (
+            {
+                "legacy_git_oid": current_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "update",
+            },
+            {
+                "legacy_git_oid": create_oid,
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "create",
+            },
+            {
+                "legacy_git_oid": _oid("b"),
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "update",
+            },
+            {
+                "legacy_git_oid": _oid("a"),
+                "path_at_revision": "notes/current.md",
+                "committed_at": committed_at,
+                "action": "create",
+            },
+        ),
+        current_commit=current_oid,
+        current_path="notes/current.md",
+        created_at=created_at,
+    )
+
+    assert [entry.legacy_git_oid for entry in lineage] == [create_oid, current_oid]
+
+
 async def test_anchored_projection_fails_closed_when_anchor_is_absent_or_duplicated():
     created_at = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
     current_oid = _oid("c")
@@ -1387,7 +1405,7 @@ async def test_legacy_reader_treats_precreation_current_as_sole_anchor():
     ]
 
 
-async def test_legacy_reader_rejects_precreation_row_before_current_head():
+async def test_legacy_reader_uses_the_persisted_lineage_instead_of_rescanning_git():
     document = _document()
     fixed_ref = _oid("f")
     git = _NoWriteGit(document)
@@ -1407,60 +1425,42 @@ async def test_legacy_reader_rejects_precreation_row_before_current_head():
     )
     git.snapshot_override = raw
 
-    with pytest.raises(ShadowReaderScopeError, match="history"):
-        await LegacyFixedRefShadowReader(
-            git=git,
-            vault_name="p2-manual",
-        ).history(document, selector=document.current_commit, fixed_ref=fixed_ref)
+    history = await LegacyFixedRefShadowReader(
+        git=git,
+        vault_name="p2-manual",
+    ).history(document, selector=document.current_commit, fixed_ref=fixed_ref)
+
+    assert [entry["selector"] for entry in history["entries"]] == [
+        entry.legacy_git_oid for entry in reversed(document.lineage)
+    ]
+    assert [name for name, _ in git.calls][-1] == "read_file"
 
 
-async def test_legacy_reader_fails_closed_on_missing_or_corrupt_product_facts():
+async def test_legacy_reader_fails_closed_on_corrupt_body_or_persisted_activity():
     document = _document()
     fixed_ref = _oid("f")
 
-    missing_history_git = _NoWriteGit(document)
-    raw = missing_history_git.manual_fixed_ref_history(
-        "p2-manual",
-        fixed_ref,
-        document.current_path,
-        current_commit=document.current_commit,
-    )
-    missing_history_git.snapshot_override = {**raw, "history": raw["history"][:-1]}
-    with pytest.raises(ShadowReaderScopeError, match="history"):
+    corrupt_body_git = _NoWriteGit(document)
+    corrupt_body_git.bodies[(document.current_path, document.current_commit)] = b"forged body"
+    with pytest.raises(ShadowReaderScopeError, match="materialization differs"):
         await LegacyFixedRefShadowReader(
-            git=missing_history_git,
+            git=corrupt_body_git,
             vault_name="p2-manual",
-        ).history(document, selector=document.current_commit, fixed_ref=fixed_ref)
+        ).get(document, selector=document.current_commit, fixed_ref=fixed_ref)
 
-    corrupt_activity_git = _NoWriteGit(document)
-    raw = corrupt_activity_git.manual_fixed_ref_history(
-        "p2-manual",
-        fixed_ref,
-        document.current_path,
-        current_commit=document.current_commit,
+    corrupt_activity_document = replace(
+        document,
+        activity=replace(document.activity, actor=""),
     )
-    corrupt_activity_git.snapshot_override = {
-        **raw,
-        "activity": {**raw["activity"], "actor": "wrong-actor"},
-    }
     with pytest.raises(ShadowReaderScopeError, match="activity"):
         await LegacyFixedRefShadowReader(
-            git=corrupt_activity_git,
+            git=_NoWriteGit(corrupt_activity_document),
             vault_name="p2-manual",
-        ).activity(document, selector=document.current_commit, fixed_ref=fixed_ref)
-
-    corrupt_diff_git = _NoWriteGit(document)
-    corrupt_diff_git.diff_override = {
-        "file": document.current_path,
-        "commit": document.current_commit,
-        "type": "modified",
-        "diff": "@@ -1,3 +1,3 @@\n # Migration candidate\n \n-old body\n+forged body",
-    }
-    with pytest.raises(ShadowReaderScopeError, match="diff"):
-        await LegacyFixedRefShadowReader(
-            git=corrupt_diff_git,
-            vault_name="p2-manual",
-        ).diff(document, selector=document.current_commit, fixed_ref=fixed_ref)
+        ).activity(
+            corrupt_activity_document,
+            selector=document.current_commit,
+            fixed_ref=fixed_ref,
+        )
 
 
 async def test_native_reader_requires_completed_selector_bridge_and_retained_mappings():
@@ -1866,12 +1866,9 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert len(components["retained_mapping_closure"]) == 1
     assert len(components["native_parent_bindings"]) == 1
     assert components["owner_runs"] == sorted(set(components["owner_runs"]))
-    assert receipt["evidence_binding"]["owner_run_count"] == len(
-        components["owner_runs"]
-    )
+    assert receipt["evidence_binding"]["owner_run_count"] == len(components["owner_runs"])
     assert all(
-        len(commitment) == 64 and set(commitment) <= set("0123456789abcdef")
-        for commitment in components["owner_runs"]
+        len(commitment) == 64 and set(commitment) <= set("0123456789abcdef") for commitment in components["owner_runs"]
     )
     recomputed = hashlib.sha256(
         (receipt["evidence_binding"]["domain"] + "\0").encode()
@@ -1912,6 +1909,46 @@ async def test_comparator_receipt_is_redacted_and_classified():
     assert document.current_commit not in encoded
     assert run.fixed_git_oid not in encoded
     assert run.inventory_digest not in encoded
+
+
+async def test_activity_projection_rejects_candidate_values_it_would_mask():
+    document = _document()
+    native_id = _oid("9")
+    legacy = {
+        "events": [
+            {
+                "hash": document.current_commit,
+                "subject": document.activity.subject,
+                "author": {
+                    "id": document.activity.actor,
+                    "display": "Legacy Writer (Git)",
+                },
+                "action": document.activity.action,
+                "summary": document.activity.summary,
+                "projection_revision": document.current_commit,
+            }
+        ]
+    }
+    candidate = {
+        "events": [
+            {
+                "hash": native_id,
+                "subject": "forged subject",
+                "author": {"id": "forged actor", "display": "forged actor"},
+                "action": "delete",
+                "summary": "forged summary",
+                "projection_revision": native_id,
+            }
+        ]
+    }
+
+    with pytest.raises(ShadowComparisonError, match="candidate activity"):
+        NativeRevisionShadowComparator._project_candidate_activity(
+            legacy,
+            candidate,
+            document,
+            native_id,
+        )
 
 
 async def test_owner_run_count_tamper_cannot_survive_correlated_recompute():

@@ -9,7 +9,7 @@
 //   - Forces handlers to match the wire shape — a typo in a field
 //     name surfaces here, not in production.
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 
@@ -71,9 +71,59 @@ describe("search response contract — returned vs total_matches (PR #39)", () =
     expect(resp.returned).toBeUndefined();
     expect(resp.total_matches).toBeUndefined();
   });
+
+  it("forwards the adapter AbortSignal to the authenticated fetch", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ query: "guide", total: 0, results: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      await searchDocs("guide", "team", 20, {}, { signal: controller.signal });
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("/api/v1/search?q=guide&limit=20&vault=team"),
+        expect.objectContaining({ signal: controller.signal, credentials: "same-origin" }),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
 });
 
 describe("grep response contract — total_matches + total_docs", () => {
+  it("serializes scope and metadata filters and keeps regex options exclusive to grep", async () => {
+    const requests: URL[] = [];
+    server.use(http.get("*/api/v1/search", ({ request }) => {
+      requests.push(new URL(request.url));
+      return HttpResponse.json({ results: [] });
+    }), http.get("*/api/v1/grep", ({ request }) => {
+      requests.push(new URL(request.url));
+      return HttpResponse.json({ results: [] });
+    }));
+    const options = { collection: "guide_%", doc_types: ["report", "note"], tags: ["ops", "한글"],
+      source_type: "document" as const, include_archived: false, archive_scope: "archived" as const, include_text_files: true, regex: true, case_sensitive: true };
+    await searchDocs("x", ["a", "b"], 25, options);
+    await grepDocs("A.*B", ["a", "b"], 20, options);
+    for (const url of requests) {
+      expect(url.searchParams.getAll("vault")).toEqual(["a", "b"]);
+      expect(url.searchParams.get("collection")).toBe("guide_%");
+      expect(url.searchParams.getAll("doc_types")).toEqual(["report", "note"]);
+      expect(url.searchParams.getAll("tags")).toEqual(["ops", "한글"]);
+      expect(url.searchParams.get("include_archived")).toBe("false");
+      expect(url.searchParams.get("archive_scope")).toBe("archived");
+    }
+    expect(requests[0].searchParams.has("include_text_files")).toBe(false);
+    expect(requests[1].searchParams.get("include_text_files")).toBe("true");
+    expect(requests[0].searchParams.has("regex")).toBe(false);
+    expect(requests[0].searchParams.get("source_type")).toBe("document");
+    expect(requests[1].searchParams.has("source_type")).toBe(false);
+    expect(requests[1].searchParams.get("regex")).toBe("true");
+    expect(requests[1].searchParams.get("case_sensitive")).toBe("true");
+  });
+
   it("returns the count fields for the default response shape", async () => {
     server.use(
       http.get(`*/api/v1/grep`, () =>

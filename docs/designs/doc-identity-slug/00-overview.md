@@ -74,6 +74,13 @@ title and its clean path is already taken.**
 - **Human label** = `title` — freely mutable, **non-unique**, never re-derives the path.
   Two docs may share a title (esp. across collections); uniqueness lives only on
   `path`, never on `title`. UI must render the live `title`, never reparse the slug.
+- **Interactive uniqueness** = soft, Collection-scoped title guidance. Create,
+  rename, and move requests from the UI set `title_conflict_policy="reject"`.
+  An exact NFC title twin (outer whitespace ignored; case and inner whitespace
+  preserved) returns structured `document_title_conflict` details. The user may
+  open the existing document, change the title/location, or explicitly retry with
+  `allow`. The request field defaults to `allow`, so existing MCP, API, agent,
+  import, and template callers keep the lossless storage contract above.
 
 ## Per-resource scope
 
@@ -105,7 +112,13 @@ mechanism layer (one hardened `slugify`).
   resolving, edges/publications rewritten old→new URI on move, chunk re-index with the
   new path header, alias cleanup on delete. Exposed as the `akb_move` MCP tool
   (collection and/or slug; on-collision suffix reuses Phase 1 rule; the doc UUID is
-  immutable so a move never changes identity). REST endpoint + frontend move UI: TODO.
+  immutable so a move never changes identity). REST endpoint + frontend move and
+  display-title rename UI are shipped; filenames/slugs remain system-managed.
+- **Phase 2.1 (shipped):** compatibility-safe soft uniqueness. The backend keeps
+  title non-unique and adds no migration or DB constraint; opt-in reject checks run
+  inside the existing serialized write transaction, and structured 409 details let
+  interactive clients make duplicate creation an explicit exception rather than the
+  accidental default.
 - **Phase 3 (follow-on):** generalize rename to tables (ALTER + role re-grant) and
   recursive collection move; file rename is a trivial name update.
 

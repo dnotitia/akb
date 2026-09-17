@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from app.config import settings
 
 # The measurement File reads resolve the placement of the body a confirmed
 # native-text row is pinned to. The join is on the row's own Head identity
@@ -142,7 +143,7 @@ def confirmed_attachment_predicate(alias: str = "vf") -> str:
 _ATTACHMENT_SELECT = """
         SELECT vf.id, vf.vault_id, v.name AS vault_name, vf.kind, vf.name,
                vf.s3_key, vf.mime_type, vf.size_bytes, vf.content_hash,
-               vf.hash_verified_at
+               vf.hash_verified_at, vf.created_at, vf.attachment_claimed_at
           FROM vault_files vf
           JOIN vaults v ON v.id = vf.vault_id
 """
@@ -220,7 +221,7 @@ async def insert_pending_attachment(
     size_bytes: int,
     content_hash: str,
     created_by: str,
-) -> None:
+) -> datetime | None:
     """Record a validated editor image before its object-store PUT.
 
     The row remains unreadable while ``hash_verified_at`` is NULL. Persisting
@@ -229,7 +230,7 @@ async def insert_pending_attachment(
     collection: document images are authorized through explicit live/revision
     reference tables.
     """
-    await conn.execute(
+    row = await conn.fetchrow(
         """
         INSERT INTO vault_files (
             id, vault_id, collection_id, kind, upload_state, name, s3_key, mime_type,
@@ -238,10 +239,12 @@ async def insert_pending_attachment(
         )
         VALUES ($1, $2, NULL, 'attachment', 'pending', $3, $4, $5, $6, $7,
                 'sha256', 'Document image', $8)
+        RETURNING created_at
         """,
         file_id, vault_id, name, s3_key, mime_type, size_bytes,
         content_hash, created_by,
     )
+    return row["created_at"] if row else None
 
 
 async def finalize_attachment(
@@ -471,7 +474,9 @@ async def find_authorized_attachment(
            AND vf.vault_id = $2
            AND {confirmed_attachment_predicate("vf")}
            AND (
-                (vf.attachment_claimed_at IS NULL AND vf.created_by = $3)
+                (vf.attachment_claimed_at IS NULL
+                 AND vf.created_by = $3
+                 AND vf.created_at > NOW() - $6::interval)
                 OR EXISTS (
                     SELECT 1
                       FROM document_asset_refs live
@@ -494,6 +499,7 @@ async def find_authorized_attachment(
            )
         """,
         file_id, vault_id, created_by, document_path, commit_prefix,
+        timedelta(hours=settings.document_asset_unclaimed_ttl_hours),
     )
     return dict(row) if row else None
 

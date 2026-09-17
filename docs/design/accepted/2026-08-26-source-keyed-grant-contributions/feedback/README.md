@@ -1,7 +1,8 @@
 # Feedback
 
-Three corrections shaped this record. Two were self-corrections made before
-acceptance, and one was published after it.
+Four corrections shaped this record. Two were self-corrections made before
+acceptance, one was published after it, and the fourth came from the first
+consumer running against a real deployment.
 
 **The cost argument did not decide what it claimed to.** The proposal argued
 for a materialized effective row from the eleven modules that read
@@ -31,3 +32,14 @@ ground — something notices within an hour, which is not what "expired" means f
 a security control — and the correction strengthens the case for a materialized
 row, because the layer below it is watched continuously rather than only on
 request.
+
+**The floor policy covered revocation and said nothing about downgrade.** Found
+by the first rule-driven consumer, against a live deployment, after acceptance.
+An administrator lowering somebody who also holds a stronger rule basis gets a
+200 and no change, and the consumer reported that as in sync — a green tick
+telling an administrator their decision took effect. The semantics are right and
+the reporting was wrong, but the gap was in this record too: "an explicit human
+revoke wins" was written as though it covered every explicit human decision, and
+a downgrade is not a revoke. §8 now says so, along with why a ceiling is the
+wrong repair and what is actually missing. It was invisible to every comparison
+against the effective role, which is why no test found it and a person did.

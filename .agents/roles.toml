@@ -1,0 +1,73 @@
+# Coding-agent roles for this repository: the one source for both agents.
+#
+#   .codex/config.toml, .codex/agents/*.toml   <- Codex reads these by name
+#   .claude/settings.json, .claude/agents/*.md <- Claude Code reads these by name
+#
+# Both views are rendered from this file and committed, so neither agent needs
+# a build step; scripts/check.sh fails when a rendered file is hand-edited or
+# stale. Edit here, then:
+#
+#   python scripts/agent-roles.py          # render both views
+#   python scripts/agent-roles.py --check  # what scripts/check.sh runs
+#
+# Model names are the part that goes stale, and this is the only place they
+# live. `codex` names follow https://developers.openai.com/api/docs/guides/latest-model,
+# `claude` names are Claude Code aliases that resolve to the current release.
+# These settings concern the coding agent, not product inference models.
+
+[owner]
+# The default session model: architecture, consequential review and uncertain
+# cross-repository decisions stay here. Effort starts at medium and is raised
+# per task.
+effort = "medium"
+model.codex = "gpt-6-astra"
+model.claude = "fable"
+verbosity.codex = "low"
+
+[delegation]
+# One level deep, at most three workers at a time. Codex enforces both keys;
+# Claude Code subagents cannot nest, so only the count is a convention there.
+max_workers = 3
+depth = 1
+
+[roles.explorer]
+description = "Optional bounded read-only lookup; the explorer tier is allowed only at max effort."
+effort = "max"
+read_only = true
+model.codex = "gpt-5.6-terra"
+model.claude = "opus"
+instructions = """
+Answer the bounded repository question in the assignment. Return the relevant
+paths and evidence, with uncertainties. Do not edit or initiate release work.
+This role is optional; keep coupled reasoning and final decisions with the
+owner.
+"""
+
+[roles.reviewer]
+description = "Owner-tier review of consequential changes with concrete, reproducible findings."
+effort = "high"
+read_only = true
+model.codex = "gpt-6-astra"
+model.claude = "fable"
+instructions = """
+Review the named diff and relevant callers against the intended behavior.
+Report reachable defects with evidence and a useful fix; discard unsupported
+suspicions. Identify the reviewed commit and checks so the owner can reuse them.
+Match review depth to the change and avoid repeating completed verification.
+"""
+
+[roles.efficiency_worker]
+description = "Opt-in worker tier, only after comparable tasks demonstrate better total efficiency than the owner."
+effort = "medium"
+read_only = false
+model.codex = "gpt-5.6-sol"
+model.claude = "sonnet"
+instructions = """
+Use this role only when the owner has evidence from comparable work that this
+tier meets the quality requirement with better total efficiency than the owner
+at an appropriate effort. A cheaper token price or a small diff alone is
+insufficient. If that premise is absent, return the task for the owner instead
+of guessing. Work only on the assigned paths and outcome, run the relevant
+check, and return the change and any uncertainty. The owner integrates and
+handles releases.
+"""

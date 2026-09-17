@@ -1,6 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode, type RefObject } from "react";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Dialog,
   DialogContent,
@@ -22,6 +24,10 @@ interface ConfirmDialogProps {
   variant?: Variant;
   onConfirm: () => void | Promise<void>;
   busy?: boolean;
+  confirmDisabled?: boolean;
+  confirmationText?: string;
+  confirmationLabel?: string;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function ConfirmDialog({
@@ -34,15 +40,26 @@ export function ConfirmDialog({
   variant = "default",
   onConfirm,
   busy = false,
+  confirmDisabled = false,
+  confirmationText,
+  confirmationLabel = "Type the name to confirm permanent deletion",
+  returnFocusRef,
 }: ConfirmDialogProps) {
   const [internalBusy, setInternalBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [typedConfirmation, setTypedConfirmation] = useState("");
+  const confirmationId = useId();
   const isBusy = busy || internalBusy;
+  const confirmationMatches =
+    confirmationText === undefined || typedConfirmation === confirmationText;
 
   // Clear any stale error each time the dialog (re)opens so a prior failure
   // doesn't bleed into the next confirmation.
   useEffect(() => {
-    if (open) setError(null);
+    if (open) {
+      setError(null);
+      setTypedConfirmation("");
+    }
   }, [open]);
 
   async function handleConfirm() {
@@ -62,7 +79,13 @@ export function ConfirmDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !isBusy && onOpenChange(o)}>
-      <DialogContent>
+      <DialogContent
+        onCloseAutoFocus={(event) => {
+          if (!returnFocusRef?.current) return;
+          event.preventDefault();
+          returnFocusRef.current.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           {description && (
@@ -71,6 +94,23 @@ export function ConfirmDialog({
             </DialogDescription>
           )}
         </DialogHeader>
+        {confirmationText !== undefined && (
+          <div className="space-y-2">
+            <Label htmlFor={confirmationId}>{confirmationLabel}</Label>
+            <Input
+              id={confirmationId}
+              value={typedConfirmation}
+              onChange={(event) => setTypedConfirmation(event.target.value)}
+              autoComplete="off"
+              autoFocus
+              className="font-mono"
+              disabled={isBusy}
+            />
+            <p className="text-xs text-foreground-muted">
+              Enter <code className="font-mono text-foreground">{confirmationText}</code> exactly.
+            </p>
+          </div>
+        )}
         {error && <Alert variant="destructive">{error}</Alert>}
         <DialogFooter>
           <Button
@@ -80,7 +120,7 @@ export function ConfirmDialog({
             disabled={isBusy}
             // Destructive dialogs focus Cancel, not Confirm, so a stray Enter on
             // open can't fire the irreversible action.
-            autoFocus={variant === "destructive"}
+            autoFocus={variant === "destructive" && confirmationText === undefined}
           >
             {cancelLabel}
           </Button>
@@ -88,7 +128,7 @@ export function ConfirmDialog({
             type="button"
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={handleConfirm}
-            disabled={isBusy}
+            disabled={isBusy || confirmDisabled || !confirmationMatches}
             autoFocus={variant !== "destructive"}
           >
             {isBusy ? "Working…" : confirmLabel}

@@ -1,4 +1,4 @@
-"""Pure AKB-126 manifest and public projection contracts."""
+"""Pure app release manifest v2 and public rollout projection contracts."""
 
 from __future__ import annotations
 
@@ -26,31 +26,65 @@ def _manifest(*, operation: str = "add_column", phase: str = "expand") -> dict:
     step["checksum"] = hashlib.sha256(
         json.dumps(step, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
-    body = {"manifest_version": 1, "steps": [step]}
-    body["manifest_checksum"] = hashlib.sha256(
-        json.dumps(
-            {"manifest_version": 1, "steps": [{k: v for k, v in step.items() if k != "checksum"}]},
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
+    create = {
+        "id": "create_orders",
+        "phase": "expand",
+        "operation": "create_table",
+        "payload": {
+            "table": "orders",
+            "columns": [{"name": "flag", "type": "text"}],
+            "unique_keys": [],
+            "indexes": [],
+        },
+    }
+    create["checksum"] = hashlib.sha256(
+        json.dumps(create, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
-    return body
+    return {
+        "manifest_version": 2,
+        "app_key": "rollout-test",
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [{"name": "flag", "type": "text"}],
+                    "unique_keys": [],
+                    "indexes": [],
+                }
+            ]
+        },
+        "transition_plans": [
+            {"source": "fresh", "steps": [create]},
+            {
+                "source": {
+                    "release_version": "1.0.0",
+                    "schema_fingerprint": "a" * 64,
+                },
+                "steps": [step],
+            },
+        ],
+    }
 
 
 def test_manifest_canonical_checksums_and_normalization():
-    body = rollout.validate_manifest(_manifest())
-    assert body["manifest_version"] == 1
-    assert body["steps"][0]["operation"] == "add_column"
-    assert body["steps"][0]["step_order"] == 0
+    body = _manifest()
+    normalized = rollout.validate_manifest(body, rollout.manifest_checksum(body))
+    assert normalized["manifest_version"] == 2
+    assert normalized["transition_plans"][1]["steps"][0]["operation"] == "add_column"
+    assert normalized["transition_plans"][1]["steps"][0]["step_order"] == 0
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda body: body["steps"].append(body["steps"][0].copy()),
-        lambda body: body["steps"][0].update({"phase": "contract"}),
-        lambda body: body["steps"][0].update({"operation": "drop_table"}),
+        lambda body: body["transition_plans"][1]["steps"].append(
+            body["transition_plans"][1]["steps"][0].copy()
+        ),
+        lambda body: body["transition_plans"][1]["steps"][0].update({"phase": "contract"}),
+        lambda body: body["transition_plans"][1]["steps"][0].update({"operation": "drop_table"}),
     ],
 )
 def test_manifest_rejects_unsupported_or_duplicate_steps(mutate):
@@ -62,13 +96,13 @@ def test_manifest_rejects_unsupported_or_duplicate_steps(mutate):
 
 def test_manifest_rejects_unbounded_backfill_and_forbidden_defaults():
     body = _manifest(operation="backfill_column", phase="backfill")
-    payload = body["steps"][0]["payload"]
+    payload = body["transition_plans"][1]["steps"][0]["payload"]
     payload.update({"column": "flag", "where_null": True, "batch_size": 1001, "value": "x"})
     with pytest.raises(ValidationError):
         rollout.validate_manifest(body)
 
     body = _manifest()
-    body["steps"][0]["payload"]["column"]["default"] = "now()"
+    body["transition_plans"][1]["steps"][0]["payload"]["column"]["default"] = "now()"
     with pytest.raises(ValidationError):
         rollout.validate_manifest(body)
 

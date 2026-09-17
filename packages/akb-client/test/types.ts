@@ -40,6 +40,12 @@ import {
   type operations,
 } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
+import {
+  createControlPlaneAdminClient,
+  createControlPlaneAppClient,
+  exchangeAppCredential,
+  type ControlPlaneRequestOptions,
+} from "../src/control-plane.js";
 import type { AkbSchema } from "./fixtures/akb.types.ts";
 
 type TableQueryEnvelope = {
@@ -69,6 +75,24 @@ const requestResult = await client.request<TableQueryEnvelope>("/tables/reef/sql
   body: JSON.stringify({ sql: "SELECT id FROM incidents" }),
 });
 requestResult.throwOnError().data.kind satisfies "table_query";
+
+const controlRequest: ControlPlaneRequestOptions = { signal: new AbortController().signal };
+const controlAdmin = createControlPlaneAdminClient({
+  baseUrl: "https://control.test/api/v1",
+  adminToken: "admin-token",
+});
+const controlApp = createControlPlaneAppClient({
+  baseUrl: "https://control.test/api/v1",
+  appToken: "app-token",
+});
+controlAdmin.apps.get("app", controlRequest);
+controlAdmin.inventory.list("app", { limit: 2, signal: controlRequest.signal });
+controlApp.inventory.list({ signal: controlRequest.signal });
+exchangeAppCredential({
+  baseUrl: "https://control.test/api/v1",
+  credential: "credential",
+  signal: controlRequest.signal,
+});
 const docEnvelope: AkbDocumentEnvelope = { kind: "document", uri: "akb://eng/doc/readme.md" };
 const docWriteEnvelope: AkbDocumentWriteEnvelope = {
   kind: "document_write",

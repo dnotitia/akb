@@ -1,17 +1,16 @@
 FROM node:22-slim AS builder
 
-RUN npm install -g pnpm@latest
-
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-# `--ignore-scripts` skips devDependency postinstall hooks (e.g. msw's
-# service-worker bundle registration). The image only runs the built
-# SPA via nginx — none of those hooks are needed at runtime, and pnpm
-# 10+ otherwise exits non-zero when it sees them.
-RUN pnpm install --frozen-lockfile --ignore-scripts
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/markdown-editor/package.json packages/markdown-editor/tsconfig.json packages/markdown-editor/tsconfig.build.json ./packages/markdown-editor/
+COPY packages/markdown-editor/src ./packages/markdown-editor/src
+RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
+# The workspace install runs the common package's prepare build before the
+# frontend bundle; the workspace allowBuilds list stays limited to esbuild/msw.
+RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN npx vite build
+RUN pnpm run build
 
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html

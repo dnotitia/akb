@@ -35,6 +35,7 @@ from app.services.access_contributions import (
 )
 from app.services.account_markers import is_retired_recovery_admin_password
 from app.services.account_service import presented_issuer_or_none
+from app.services import document_counters
 from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
@@ -533,7 +534,7 @@ async def grant_access(
     async with pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
-                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
             if not vault:
@@ -556,7 +557,7 @@ async def grant_access(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
             target = await conn.fetchrow(
-                "SELECT id, username FROM users WHERE username = $1", target_username,
+                "SELECT id, username, is_admin FROM users WHERE username = $1", target_username,
             )
             if not target:
                 raise NotFoundError("User", target_username)
@@ -577,6 +578,10 @@ async def grant_access(
                     "vault": vault_name,
                     "user": target_username,
                     "role": role,
+                    "target_user_id": str(target["id"]),
+                    "target_is_owner": vault["owner_id"] == target["id"],
+                    "target_is_admin": bool(target.get("is_admin")),
+                    "public_access": vault.get("public_access"),
                     "source_key": source_key,
                     "effective_role": outcome.effective_role,
                     "previous_effective_role": outcome.previous_effective_role,
@@ -637,7 +642,7 @@ async def revoke_access(
     async with pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
-                "SELECT id, owner_id, status FROM vaults WHERE name = $1 FOR UPDATE",
+                "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
             if not vault:
@@ -659,7 +664,7 @@ async def revoke_access(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
             target = await conn.fetchrow(
-                "SELECT id FROM users WHERE username = $1", target_username,
+                "SELECT id, is_admin FROM users WHERE username = $1", target_username,
             )
             if not target:
                 raise NotFoundError("User", target_username)
@@ -667,6 +672,11 @@ async def revoke_access(
                 raise ForbiddenError(
                     "Cannot revoke owner's access. Use transfer_ownership instead."
                 )
+            had_direct = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM vault_access_contributions "
+                "WHERE vault_id = $1 AND user_id = $2 AND source_key = 'direct')",
+                vault["id"], target["id"],
+            )
             if source_key is None:
                 outcome = await remove_all_contributions(
                     conn, vault["id"], target["id"],
@@ -687,6 +697,10 @@ async def revoke_access(
                     "vault": vault_name,
                     "user": target_username,
                     "source_key": source_key,
+                    "target_user_id": str(target["id"]),
+                    "target_is_admin": bool(target.get("is_admin")),
+                    "public_access": vault.get("public_access"),
+                    "direct_removed": bool(had_direct and source_key in (None, DIRECT_SOURCE_KEY) and outcome.applied),
                     "effective_role": outcome.effective_role,
                     "previous_effective_role": outcome.previous_effective_role,
                     "applied": outcome.applied,
@@ -839,59 +853,62 @@ async def explain_vault_access(
     }
 
 
-async def list_accessible_vaults(user_id: str) -> list[dict]:
-    """List all vaults the user has access to, with their role."""
-    pool = await get_pool()
+async def list_accessible_vaults(user_id: str, *, conn=None) -> list[dict]:
+    """List all readable vaults; an optional connection keeps aggregate reads
+    on the same snapshot as this directory's authoritative access policy."""
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as connection:
+            return await list_accessible_vaults(user_id, conn=connection)
     uid = uuid.UUID(user_id)
 
-    async with pool.acquire() as conn:
-        # System admin sees all vaults
-        is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
+    # Read the current account role, rather than trusting a possibly older JWT.
+    is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
 
-        # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
-        # vault_write_policy sidecar in both branches — a vault has at
-        # most one policy row (vault_id is its PK) so this never fans out
-        # rows. NULL (no match) reads as ungoverned, same convention as
-        # `get_vault_info`.
-        if is_admin:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                ORDER BY v.name
-                """,
-                uid,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
-                ORDER BY v.name
-                """,
-                uid,
-            )
+    # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
+    # vault_write_policy sidecar in both branches — a vault has at
+    # most one policy row (vault_id is its PK) so this never fans out
+    # rows. NULL (no match) reads as ungoverned, same convention as
+    # `get_vault_info`.
+    if is_admin:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            ORDER BY v.name
+            """,
+            uid,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
+            ORDER BY v.name
+            """,
+            uid,
+        )
 
-        return [
-            {
-                "id": str(r["id"]),
-                "name": r["name"],
-                "description": r["description"],
-                "status": r["status"],
-                "role": r["role"],
-                "managed_by": r["managed_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
+    return [
+        {
+            "id": str(r["id"]),
+            "name": r["name"],
+            "description": r["description"],
+            "status": r["status"],
+            "role": r["role"],
+            "managed_by": r["managed_by"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
 
 
 # ── Vault info ───────────────────────────────────────────────
@@ -919,6 +936,14 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
 
     vault = await _r("SELECT * FROM vaults WHERE name = $1", vault_name)
     vid = vault["id"]
+    # akb#525: document counters follow the active authority. Legacy `documents`
+    # rows freeze at cutover (native writes never touch that table), so on
+    # `postgres_native` both queries read the native ledger instead. The SQL
+    # lives in `document_counters` with every other counter that had to make
+    # the same choice. Tables/files/collections/edges are
+    # authority-independent and keep their existing queries.
+    doc_count_sql = document_counters.vault_document_count_sql()
+    doc_last_sql = document_counters.vault_last_activity_sql()
     if (
         role_source in ("system_admin", "write_policy_admin_bypass")
         and vault["owner_id"] != uuid.UUID(user_id)
@@ -943,7 +968,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
     ) = await asyncio.gather(
         _r("SELECT username, display_name FROM users WHERE id = $1", vault["owner_id"]),
         _q("SELECT COUNT(*) FROM vault_access WHERE vault_id = $1", vid),
-        _q("SELECT COUNT(*) FROM documents WHERE vault_id = $1", vid),
+        _q(doc_count_sql, vid),
         _q("SELECT COUNT(*) FROM vault_tables WHERE vault_id = $1", vid),
         _q(
             "SELECT COUNT(*) FROM vault_files vf WHERE vault_id = $1 AND "
@@ -960,8 +985,7 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
             vault_uri_prefix(vault_name),
         ),
         _r(
-            "SELECT updated_at, created_by FROM documents WHERE vault_id = $1 "
-            "ORDER BY updated_at DESC LIMIT 1",
+            doc_last_sql,
             vid,
         ),
         _q("SELECT 1 FROM vault_external_git WHERE vault_id = $1", vid),
@@ -1157,6 +1181,7 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                     "vault": vault_name,
                     "from_user_id": str(vault["owner_id"]),
                     "to_username": new_owner_username,
+                    "to_user_id": str(new_owner["id"]),
                 },
             )
 
@@ -1799,6 +1824,14 @@ async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str
 # ── Destructive: vault delete ───────────────────────────────
 
 
+async def _mark_native_revision_vault_purge(conn, vault_id: uuid.UUID) -> None:
+    """Permit the current authorized transaction to purge this exact vault."""
+    await conn.execute(
+        "SELECT set_config('akb.native_revision_vault_purge_id', $1, TRUE)",
+        str(vault_id),
+    )
+
+
 async def delete_vault(user_id: str, vault_name: str) -> dict:
     """Permanently delete a vault and all its data. Owner or admin only.
 
@@ -1837,6 +1870,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
             vault_id = vault["id"]
             is_native_ledger_vault = str(vault["git_path"]).startswith("native-ledger://")
+            await _mark_native_revision_vault_purge(conn, vault_id)
 
             # Capture every object key while the vault lock makes the set
             # complete with respect to concurrent image uploads. Remote S3 I/O
@@ -1849,7 +1883,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 "SELECT id, s3_key, upload_state FROM vault_files WHERE vault_id = $1",
                 vault_id,
             )
-            if file_rows and settings.s3_endpoint_url:
+            if file_rows and settings.object_storage_enabled:
                 from app.services.s3_delete_worker import (
                     enqueue_delete,
                     enqueue_pending_upload_delete,
@@ -1866,7 +1900,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
                 " WHERE vault_id = $1 AND snapshot_s3_key IS NOT NULL",
                 vault_id,
             )
-            if snap_rows and settings.s3_endpoint_url:
+            if snap_rows and settings.object_storage_enabled:
                 from app.services.s3_delete_worker import enqueue_delete
                 for sr in snap_rows:
                     await enqueue_delete(conn, sr["snapshot_s3_key"])
@@ -1882,7 +1916,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             for fr in file_rows:
                 await _drop_source_chunks_with_outbox(conn, "file", str(fr["id"]))
 
-            if file_rows and settings.s3_endpoint_url:
+            if file_rows and settings.object_storage_enabled:
                 await conn.execute("DELETE FROM vault_files WHERE vault_id = $1", vault_id)
 
             await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
@@ -1965,6 +1999,13 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
 
 
 # ── Destructive: user self-delete ──────────────────────────
+
+
+async def delete_other_user_account(user_id: str, *, actor_id: str) -> dict:
+    """The administrator route may never select its own account, in any UUID spelling."""
+    if uuid.UUID(user_id) == uuid.UUID(actor_id):
+        raise ConflictError("Use POST /my/account/deletion to delete your own account", code="self_delete_required")
+    return await delete_user_account(user_id)
 
 
 async def delete_user_account(user_id: str) -> dict:

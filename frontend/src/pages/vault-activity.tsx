@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   AlertCircle,
@@ -12,11 +12,13 @@ import {
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Panel } from "@/components/ui/panel";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
+import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
 import { useDebounce } from "@/hooks/use-debounce";
@@ -30,14 +32,20 @@ export default function VaultActivityPage() {
   const debouncedAuthor = useDebounce(author.trim(), 250);
   const [entries, setEntries] = useState<ActivityEntry[] | null>(null);
   const [quickAuthors, setQuickAuthors] = useState<Array<[string, number]>>([]);
+  const [appliedAuthor, setAppliedAuthor] = useState("");
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const loadedVaultRef = useRef<string | null>(null);
+  const hasEntriesRef = useRef(false);
   const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     if (!name) return;
     let active = true;
-    setEntries(null);
+    const canPreserve = loadedVaultRef.current === name && hasEntriesRef.current;
+    if (!canPreserve) setEntries(null);
+    setRefreshing(canPreserve);
     setError("");
 
     getVaultActivity(name, {
@@ -47,14 +55,20 @@ export default function VaultActivityPage() {
       .then((result) => {
         if (!active) return;
         const activity = result.activity || [];
+        loadedVaultRef.current = name;
+        hasEntriesRef.current = true;
         setEntries(activity);
         setTotal(result.total ?? activity.length);
+        setAppliedAuthor(debouncedAuthor);
         if (!debouncedAuthor) setQuickAuthors(topActivityAuthors(activity));
       })
       .catch((caught: unknown) => {
         if (!active) return;
         setError(errorMessage(caught, "Failed to load activity"));
-        setEntries(null);
+        if (!canPreserve) setEntries(null);
+      })
+      .finally(() => {
+        if (active) setRefreshing(false);
       });
 
     return () => {
@@ -80,7 +94,7 @@ export default function VaultActivityPage() {
         Activity
       </h1>
 
-      <Panel variant="workspace" className="w-full">
+      <Panel variant="workspace" className="w-full" aria-busy={entries === null || refreshing || undefined}>
         <section aria-labelledby="activity-heading">
           <div
             data-testid="activity-ledger-header"
@@ -104,12 +118,15 @@ export default function VaultActivityPage() {
                     ? error
                       ? "Unavailable"
                       : "Loading changes…"
-                    : debouncedAuthor
-                      ? `Changes by ${debouncedAuthor}`
+                    : refreshing
+                      ? "Updating changes…"
+                    : appliedAuthor
+                      ? `Changes by ${appliedAuthor}`
                       : `Latest commits in ${name}`}
                 </span>
               </div>
             </div>
+            {refreshing && <InlineLoadingState label="Refreshing activity" size="sm" className="shrink-0" />}
             {count > 0 && (
               <Button asChild variant="ghost" size="sm" className="shrink-0">
                 <Link to={`/vault/${name}`}>
@@ -132,7 +149,15 @@ export default function VaultActivityPage() {
             />
           )}
 
-          {error ? (
+          {error && entries !== null && (
+            <div className="border-b border-border bg-surface px-4 py-3 sm:px-5">
+              <Alert variant="destructive" title="Activity could not be refreshed">
+                {error}
+              </Alert>
+            </div>
+          )}
+
+          {error && entries === null ? (
             <ActivityError
               error={error}
               onRetry={() => setRetryKey((current) => current + 1)}
@@ -434,7 +459,7 @@ function ActivityError({
 
 function ActivitySkeleton() {
   return (
-    <div role="status" aria-live="polite" aria-label="Loading activity">
+    <LoadingState label="Loading activity">
       {[0, 1, 2, 3].map((index) => (
         <div
           key={index}
@@ -450,8 +475,7 @@ function ActivitySkeleton() {
           <Skeleton className="h-3 w-24 rounded-[var(--radius-sm)]" />
         </div>
       ))}
-      <span className="sr-only">Loading activity…</span>
-    </div>
+    </LoadingState>
   );
 }
 

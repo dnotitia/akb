@@ -1,0 +1,12 @@
+apiVersion: v2
+name: akb
+description: AKB standalone stack with optional owned Keycloak SSO
+type: application
+version: 0.2.0
+appVersion: "0.14.2"
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/dnotitia/akb
+sources:
+  - https://github.com/dnotitia/akb
+maintainers:
+  - name: Dnotitia

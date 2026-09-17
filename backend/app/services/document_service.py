@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from app.services.search_filters import ArchiveScope
 
 if TYPE_CHECKING:
     from app.services.external_git_validation import ValidatedRemote
@@ -112,14 +113,24 @@ def _safe_remote_host(url: str) -> str:
 import frontmatter
 
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError, WriteBusyError
+from app.exceptions import (
+    AKBError,
+    ConflictError,
+    DocumentTitleConflictError,
+    NotFoundError,
+    ValidationError,
+    VaultNameUnavailableError,
+    WriteBusyError,
+)
 from app.models.document import (
     DOC_STATUSES,
+    BrowseContext,
     BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
+    TitleConflictPolicy,
     DocumentUpdateRequest,
 )
 from app.repositories.document_repo import (
@@ -147,7 +158,7 @@ from app.services.kg_service import (
 )
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
 from app.services.write_lane import run_compensation, run_git_write, write_lane
 from app.repositories import table_data_repo
@@ -183,6 +194,9 @@ def build_vault_skill_seed_request(vault: str) -> DocumentPutRequest:
         content=VAULT_SKILL_SEED_TEMPLATE.replace("{vault}", vault),
         type="skill",
         tags=["akb:skill"],
+        # Seeding retains the historical lossless write behavior. Interactive
+        # duplicate guidance is an explicit frontend policy.
+        title_conflict_policy="allow",
     )
 
 
@@ -238,9 +252,52 @@ def _compose_markdown(fm_dict: dict, body: str) -> str:
     return frontmatter.dumps(post)
 
 
-def _parse_markdown(content: str) -> tuple[dict, str]:
-    post = frontmatter.loads(content)
+def _parse_markdown(
+    content: str,
+    *,
+    fallback_metadata: dict | None = None,
+) -> tuple[dict, str]:
+    """Read canonical Markdown and recover bodies from malformed legacy YAML.
+
+    The retired external-Git importer could persist a source file whose leading
+    ``---`` block was not valid YAML.  Such a document still has authoritative
+    metadata in PostgreSQL, but a strict ``frontmatter.loads`` made current
+    reads and every repair write fail before the new body could replace it.
+
+    Match the established historical-read behavior: strip one complete leading
+    frontmatter envelope when parsing fails, otherwise retain the raw text.  A
+    caller that is about to rewrite the document may supply the DB-backed
+    metadata so the repair commit preserves AKB's known title/lifecycle fields.
+    """
+
+    try:
+        post = frontmatter.loads(content)
+    except Exception:  # noqa: BLE001 - compatibility boundary for legacy payloads
+        body = re.sub(
+            r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)",
+            "",
+            content,
+            count=1,
+            flags=re.DOTALL,
+        )
+        return dict(fallback_metadata or {}), body
     return dict(post.metadata), post.content
+
+
+def _document_row_frontmatter(row: dict) -> dict:
+    """Project DB-authoritative metadata for a malformed legacy repair write."""
+
+    metadata = {
+        "title": row["title"],
+        "type": row.get("doc_type") or "note",
+        "status": row.get("status") or "draft",
+        "tags": list(row.get("tags") or []),
+    }
+    for key in ("created_at", "updated_at", "created_by", "domain", "summary"):
+        value = row.get(key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
 
 
 def _body_content_hash(body: str) -> str:
@@ -263,33 +320,9 @@ def _certified_content_hash(md_content: str) -> str:
     return _body_content_hash(canonical_body)
 
 
-# Newest publication slug for one document — the reverse of publication
-# resolution, and the query behind `is_public` / `public_slug`.
-#
-# Keyed on `publications.document_id`, which since migration 058 is the
-# binding for a document publication: a UUID under a composite
-# FK (document_id, vault_id) → documents(id, vault_id). Matching that
-# cannot answer with a publication belonging to some other document, and
-# cannot answer with one belonging to some other vault.
-#
-# The `resource_uri` branch is a FALLBACK, and only for rows the 058
-# backfill could not bind unambiguously (`document_id IS NULL`). It is kept
-# on purpose: without it those publications would report `is_public: false`
-# on a document whose slug still serves its body — telling an author their
-# document is private while it is reachable is a worse answer than the
-# imprecision the fallback carries. It disappears on its own as those rows
-# are re-published or removed; nothing new lands in it, because
-# `create_publication` refuses a document publication without an id.
-#
-# `vault_id = $1` scopes BOTH branches, and is the part that was missing:
-# the previous query matched `resource_uri` with no vault predicate at all,
-# so its answer was not scoped to the vault being asked about.
-# `document_id = $2` alone would have been enough for the primary branch (the
-# composite FK pins the vault), but the predicate sits on the query so the
-# fallback cannot be wrong either.
-#
-# ORDER BY created_at DESC matches `publishDoc()` in the frontend, which
-# reuses the first entry `listPublications` returns.
+# Reverse publication discovery stays vault scoped. Migration 106 binds Native
+# publications to a stable Resource. Only legacy discovery retains an unbound
+# URI fallback; native public reads require an exact Resource binding.
 _PUBLIC_SLUG_SQL = """
     SELECT slug
       FROM publications
@@ -297,8 +330,19 @@ _PUBLIC_SLUG_SQL = """
        AND resource_type = 'document'
        AND (
              document_id = $2::uuid
-          OR (document_id IS NULL AND resource_uri = $3)
+          OR (document_id IS NULL AND native_document_id IS NULL AND resource_uri = $3)
        )
+     ORDER BY created_at DESC
+     LIMIT 1
+"""
+
+
+_NATIVE_PUBLIC_SLUG_SQL = """
+    SELECT slug
+      FROM publications
+     WHERE vault_id = $1
+       AND resource_type = 'document'
+       AND native_document_id = $2::uuid
      ORDER BY created_at DESC
      LIMIT 1
 """
@@ -310,17 +354,11 @@ async def newest_public_slug(
     vault_id: uuid.UUID,
     document_id: uuid.UUID | None,
     resource_uri: str,
+    native_document_id: uuid.UUID | None = None,
 ) -> str | None:
-    """Newest publication slug bound to one document, or None.
-
-    ``document_id`` may be None for a caller that has no ``documents`` row to
-    name (the native-ledger arm keeps no legacy projection). The primary
-    branch then matches nothing — ``document_id = NULL`` is NULL, not true —
-    and the vault-scoped URI fallback answers. See ``_PUBLIC_SLUG_SQL``.
-
-    One function rather than one query per service on purpose: these were two
-    copies, and both carried the same missing ``vault_id`` predicate.
-    """
+    """Discover a bound publication; only legacy discovery permits URI fallback."""
+    if native_document_id is not None:
+        return await conn.fetchval(_NATIVE_PUBLIC_SLUG_SQL, vault_id, native_document_id)
     return await conn.fetchval(_PUBLIC_SLUG_SQL, vault_id, document_id, resource_uri)
 
 
@@ -349,6 +387,20 @@ def validate_vault_name(name: str) -> None:
 
 class DocumentService:
     def __init__(self, git: GitService | None = None):
+        # The Git arm's storage handle, NOT part of the service interface.
+        # `NativeDocumentService` subclasses this and deliberately does not
+        # call `super().__init__()`, so it has no `self.git` — its bodies live
+        # in PostgreSQL and Git is only a fallback for unmigrated bridged
+        # revisions. Reaching for `.git` through a composed document service
+        # therefore raises on a `postgres_native` deployment; that is how
+        # every public document publication became a 500 for a long time.
+        #
+        # Giving the Native subclass a handle to silence that would be worse:
+        # an inherited write path would then commit to a store the deployment
+        # does not read from, quietly. A loud AttributeError is the better
+        # failure, and callers outside this module should use the interface
+        # (`get`, `get_at_commit`, ...) instead.
+        # Pinned by tests/test_publication_document_service_contract_unit.py.
         self.git = git or GitService()
 
     async def _repos(self):
@@ -610,6 +662,21 @@ class DocumentService:
         # valid body content and are intentionally handled separately.
         validate_new_structured_relation_refs(req.vault, req.depends_on)
         validate_new_structured_relation_refs(req.vault, req.related_to)
+
+        if req.title_conflict_policy == "reject":
+            existing = await doc_repo.find_title_conflict(
+                vault_id,
+                normalized_collection,
+                req.title,
+                conn=conn,
+            )
+            if existing:
+                raise DocumentTitleConflictError(
+                    title=req.title,
+                    collection=normalized_collection,
+                    existing_path=existing["path"],
+                    existing_title=existing["title"],
+                )
 
         # Resolve the final path under the (vault, base_path) advisory lock,
         # which serializes writers racing on the same base slug. If the clean
@@ -1001,6 +1068,23 @@ class DocumentService:
                     f"actual {row['current_commit']}"
                 )
 
+            if req.title is not None and req.title_conflict_policy == "reject":
+                collection_path, _ = _split_doc_path(row["path"])
+                existing = await doc_repo.find_title_conflict(
+                    vault_id,
+                    collection_path,
+                    req.title,
+                    exclude_id=row["id"],
+                    conn=conn,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=req.title,
+                        collection=collection_path,
+                        existing_path=existing["path"],
+                        existing_title=existing["title"],
+                    )
+
             response = await self._update_locked(
                 req=req, agent_id=agent_id, vault=vault,
                 vault_id=vault_id, doc_repo=doc_repo, row=row, conn=conn,
@@ -1027,7 +1111,10 @@ class DocumentService:
         if current_content is None:
             raise NotFoundError("Document file", file_path)
 
-        current_fm, current_body = _parse_markdown(current_content)
+        current_fm, current_body = _parse_markdown(
+            current_content,
+            fallback_metadata=_document_row_frontmatter(row),
+        )
         current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body, conn=conn)
         if req.expected_content_hash and req.expected_content_hash != current_hash:
             raise ConflictError(
@@ -1154,6 +1241,9 @@ class DocumentService:
                 "content_hash": content_hash,
                 "hash_algorithm": HASH_ALGORITHM,
                 "content_changed": req.content is not None,
+                "resource_id": str(pg_doc_id),
+                "previous_status": row["status"],
+                "status": req.status if req.status is not None else row["status"],
             },
         )
 
@@ -1173,6 +1263,7 @@ class DocumentService:
         self, vault: str, doc_ref: str, *,
         collection: str | None = None, slug: str | None = None,
         message: str | None = None, agent_id: str | None = None,
+        title_conflict_policy: TitleConflictPolicy = "allow",
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
         """Move/rename a document: change its collection and/or slug while
@@ -1236,6 +1327,22 @@ class DocumentService:
                 raise ValidationError(
                     "move is a no-op: the target path equals the current path"
                 )
+
+            if title_conflict_policy == "reject":
+                existing = await doc_repo.find_title_conflict(
+                    vault_id,
+                    new_coll,
+                    row["title"],
+                    exclude_id=pg_doc_id,
+                    conn=conn,
+                )
+                if existing:
+                    raise DocumentTitleConflictError(
+                        title=row["title"],
+                        collection=new_coll,
+                        existing_path=existing["path"],
+                        existing_title=existing["title"],
+                    )
 
             # On-collision suffix (same robust rule as create): if the clean
             # target is taken by a DIFFERENT doc, disambiguate with this doc's
@@ -1396,6 +1503,7 @@ class DocumentService:
                 payload={
                     "vault": vault, "path": new_path, "old_path": old_path,
                     "old_uri": old_uri, "commit_hash": commit_hash,
+                    "resource_id": str(pg_doc_id),
                 },
             )
 
@@ -1489,7 +1597,10 @@ class DocumentService:
         if current_content is None:
             raise NotFoundError("Document file", file_path)
 
-        current_fm, current_body = _parse_markdown(current_content)
+        current_fm, current_body = _parse_markdown(
+            current_content,
+            fallback_metadata=_document_row_frontmatter(row),
+        )
 
         # Apply edit — validate old_string and find occurrences
         if not old_string:
@@ -1604,6 +1715,7 @@ class DocumentService:
                 "hash_algorithm": HASH_ALGORITHM,
                 "content_changed": True,
                 "source": "edit",
+                "resource_id": str(pg_doc_id),
             },
         )
 
@@ -1684,6 +1796,7 @@ class DocumentService:
             payload={
                 "vault": vault,
                 "path": file_path,
+                "resource_id": str(pg_doc_id),
             },
         )
         # The row delete and the publication cascade are ONE call. That
@@ -1718,6 +1831,7 @@ class DocumentService:
         content_type: str = "all",
         include_hashes: bool = False,
         include_archived: bool = False,
+        archive_scope: ArchiveScope | None = None,
     ) -> BrowseResponse:
         """Unified vault browse.
 
@@ -1741,17 +1855,40 @@ class DocumentService:
         ``collection`` is provided. ``doc`` / ``table`` / ``file`` rows
         are the ones gated by depth.
         """
+        from app.services.search_filters import resolve_archive_scope, status_matches
+
+        scope = resolve_archive_scope(archive_scope, include_archived)
+        include_archived = scope != "unarchived"
         vault_repo, doc_repo, coll_repo = await self._repos()
 
-        vault_id = await vault_repo.get_id_by_name(vault)
         browse_path = collection or ""
+        vault_row = await vault_repo.get_by_name(vault)
 
-        if not vault_id:
-            return BrowseResponse(vault=vault, path=browse_path, items=[])
+        if not vault_row:
+            return BrowseResponse(vault=vault, path=browse_path, items=[], archive_scope=scope)
+        vault_id = vault_row["id"]
+
+        if collection:
+            collection_row = await coll_repo.get_by_path(vault_id, collection)
+            context = BrowseContext(
+                type="collection",
+                uri=coll_uri(vault, collection),
+                name=(collection_row or {}).get("name") or collection.rsplit("/", 1)[-1],
+                path=collection,
+                summary=(collection_row or {}).get("summary"),
+            )
+        else:
+            context = BrowseContext(
+                type="vault",
+                uri=vault_uri(vault),
+                name=vault,
+                path="",
+                description=vault_row.get("description"),
+            )
 
         show_docs = content_type in ("all", "documents")
-        show_tables = content_type in ("all", "tables")
-        show_files = content_type in ("all", "files")
+        show_tables = scope != "archived" and content_type in ("all", "tables")
+        show_files = scope != "archived" and content_type in ("all", "files")
 
         items: list[BrowseItem] = []
         prefix = collection or ""
@@ -1778,8 +1915,16 @@ class DocumentService:
                 include_hashes=include_hashes,
             ))
 
+        items = [item for item in items if item.type != "document" or status_matches(item.status, scope)]
         hint = self._browse_hint(vault, collection, items)
-        return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
+        return BrowseResponse(
+            vault=vault,
+            archive_scope=scope,
+            path=browse_path,
+            context=context,
+            items=items,
+            hint=hint,
+        )
 
     async def _browse_collections(self, coll_repo, vault: str, vault_id, prefix: str) -> list[BrowseItem]:
         """Emit collection rows. With ``prefix`` empty, emits every
@@ -2030,7 +2175,7 @@ class DocumentService:
         public_access = validate_public_access(public_access)
 
         if await vault_repo.get_by_name(name):
-            raise ConflictError(f"Vault already exists: {name}")
+            raise VaultNameUnavailableError()
 
         uid = uuid.UUID(owner_id) if owner_id else None
 
@@ -2128,8 +2273,20 @@ class DocumentService:
         existed_before = await asyncio.to_thread(self.git.vault_exists, name)
         git_path: str | None = None
         created_vault_id: uuid.UUID | None = None
+        collided_before_disk_create = False
         try:
-            git_path = await run_git_write(self.git.init_vault, name)
+            try:
+                git_path = await run_git_write(self.git.init_vault, name)
+            except FileExistsError as exc:
+                # Another process can win after the advisory DB pre-check but
+                # before this request obtains the storage-backed create lock.
+                # Keep that race on the same non-disclosing 409 contract as a
+                # database UNIQUE collision; the outer handler still performs
+                # ownership-aware compensation for failures that happen after
+                # this request creates storage.  This request created nothing,
+                # so its outer handler must not remove the winner's directory.
+                collided_before_disk_create = True
+                raise VaultNameUnavailableError() from exc
             vault_yaml = f"name: {name}\ndescription: {description}\n"
             if template:
                 vault_yaml += f"template: {template}\n"
@@ -2176,6 +2333,8 @@ class DocumentService:
                     skill_internal=True,
                 )
         except BaseException:
+            if collided_before_disk_create:
+                raise
             # run_compensation: the whole rollback runs to COMPLETION even
             # if the cancellation that may be unwinding us keeps firing;
             # the cancel is re-delivered afterwards. Any rollback-internal

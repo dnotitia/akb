@@ -1,0 +1,21 @@
+# Generated from .agents/roles.toml by scripts/agent-roles.py; edit the source.
+# Coding-agent defaults. Product inference models are configured separately.
+model = "gpt-6-astra"
+model_reasoning_effort = "medium"
+model_verbosity = "low"
+
+[agents]
+max_concurrent_threads_per_session = 3
+max_depth = 1
+
+[agents.explorer]
+description = "Optional bounded read-only lookup; the explorer tier is allowed only at max effort."
+config_file = "agents/explorer.toml"
+
+[agents.reviewer]
+description = "Owner-tier review of consequential changes with concrete, reproducible findings."
+config_file = "agents/reviewer.toml"
+
+[agents.efficiency_worker]
+description = "Opt-in worker tier, only after comparable tasks demonstrate better total efficiency than the owner."
+config_file = "agents/efficiency_worker.toml"

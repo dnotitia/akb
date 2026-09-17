@@ -1,0 +1,144 @@
+# Public profile. Prefer one of profiles/*.yaml instead of assembling booleans.
+profile: standalone
+
+global:
+  publicUrl: https://akb.example.com
+  imagePullSecrets: []
+
+images:
+  backend:
+    repository: akb-backend
+    tag: latest
+    pullPolicy: Always
+  frontend:
+    repository: akb-frontend
+    tag: latest
+    pullPolicy: Always
+
+secretContract:
+  # AKB never stores secret values in Helm release metadata. Create the named
+  # Kubernetes Secret before installing the release.
+  name: akb-secret
+
+app:
+  tokenizerProcesses: 2
+  workerShutdownTimeoutSeconds: 35
+  embedding:
+    baseUrl: https://api.openai.com/v1
+    model: text-embedding-3-small
+    dimensions: 1536
+  llm:
+    baseUrl: ""
+    model: ""
+  rerank:
+    enabled: false
+    provider: cohere
+    model: cohere/rerank-v3.5
+    prefetch: 30
+  objectStorage:
+    authMode: static # static | default_chain; default_chain must omit static keys
+    endpointUrl: ""
+    # Retained and ignored: bytes reach a client through the API, never
+    # straight from the store, so the store needs no browser-reachable address.
+    publicUrl: ""
+    bucket: akb-files
+    region: ""
+  vectorStore:
+    driver: pgvector
+    dsn: ""
+    schema: vector_index
+    sparseShape: posting
+    url: ""
+    collection: chunks
+  redis:
+    url: ""
+    eventStream: akb:events
+    streamMaxlen: 100000
+
+backend:
+  replicas: 1
+  resources:
+    api:
+      requests: {cpu: "1", memory: 1Gi}
+      limits: {memory: 4Gi}
+    worker:
+      requests: {cpu: "1", memory: 2Gi}
+      limits: {memory: 4Gi}
+
+frontend:
+  replicas: 1
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+postgres:
+  image: pgvector/pgvector:pg16
+  pullPolicy: IfNotPresent
+  database: akb
+  username: akbuser
+  persistence:
+    size: 20Gi
+    storageClass: ""
+  sharedMemorySize: 4Gi
+  resources:
+    requests: {cpu: "1", memory: 4Gi}
+    limits: {cpu: "4", memory: 8Gi}
+
+vaultData:
+  size: 20Gi
+  storageClass: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  host: akb.example.com
+  tls:
+    enabled: true
+    secretName: akb-tls # pragma: allowlist secret
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 500m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+sso:
+  enabled: false
+  keycloakPublicUrl: https://auth.akb.example.com
+  enrollmentMode: open
+  requireVerifiedEmail: true
+  # Provider-alias-keyed email-domain authority for the browser login path
+  # (dnotitia/akb#529). Empty (default) keeps today's behaviour; e.g.
+  # authoritativeEmailDomains: {workforce: ["example.com"]}.
+  # Exact domain match only; `local` is rejected at config load.
+  authoritativeEmailDomains: {}
+  localRealmLogin:
+    enabled: false
+    displayName: This workspace
+  productAdmin:
+    username: admin
+    email: admin@example.com
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    pullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 500m, memory: 1Gi}
+      limits: {cpu: "2", memory: 2Gi}
+  postgres:
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    pullPolicy: IfNotPresent
+    persistence:
+      size: 10Gi
+      storageClass: ""
+    resources:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits: {cpu: "1", memory: 1Gi}
+  ingress:
+    enabled: true
+    className: nginx
+    host: auth.akb.example.com
+    tls:
+      enabled: true
+      secretName: akb-keycloak-tls # pragma: allowlist secret
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: 10m
+      nginx.ingress.kubernetes.io/proxy-buffer-size: 16k
+      cert-manager.io/cluster-issuer: letsencrypt-prod

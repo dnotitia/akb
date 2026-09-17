@@ -7,10 +7,30 @@ import uuid
 import pytest
 
 from app.config import Settings
+from app.exceptions import AKBError
+from tests.test_workload_identity_config_unit import managed_values
 
 
 _DATABASE_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _IMAGE_DIGEST = "sha256:" + "a" * 64
+
+
+async def test_managed_missing_bucket_prevents_startup(monkeypatch, tmp_path):
+    from app.services import lifecycle
+    from app.services.adapters import s3_adapter
+
+    events = []
+    configured = Settings(**managed_values(git_storage_path=str(tmp_path / "vaults")))
+    _stub_init_storage_dependencies(monkeypatch, lifecycle, configured, events)
+
+    def missing_bucket(bucket):
+        assert bucket == configured.s3_bucket
+        raise AKBError("bucket is not provisioned", status_code=503)
+
+    monkeypatch.setattr(s3_adapter, "ensure_bucket", missing_bucket)
+    with pytest.raises(AKBError, match="not provisioned"):
+        await lifecycle.init_storage()
+    assert events == []
 
 
 def _settings(tmp_path, backend: str | None = None) -> Settings:

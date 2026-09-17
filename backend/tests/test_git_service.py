@@ -7,6 +7,8 @@ tests never touch the real `/data/vaults` directory.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import shutil
 import subprocess
@@ -14,12 +16,13 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 from git import Repo
 
 from app.services.external_git_service import ExternalGitService
-from app.services.git_service import GitService
+from app.services.git_service import FixedRefHistoryError, GitService
 from tests.extgit_http import build_runner
 
 
@@ -34,6 +37,16 @@ def _mirror_git(git_http, tmp_path) -> GitService:
         storage_path=str(tmp_path / "vaults"),
         ext_runner=build_runner(git_http.port),
     )
+
+
+def test_nul_stream_tokens_preserve_utf8_split_across_read_boundary() -> None:
+    prefix = "a" * ((64 * 1024) - 1)
+    payload = f"{prefix}한글\x00tail\x00".encode()
+
+    assert list(GitService._iter_nul_stream_tokens(io.BytesIO(payload))) == [
+        f"{prefix}한글",
+        "tail",
+    ]
 
 
 @pytest.fixture
@@ -62,6 +75,137 @@ def vault(git_service):
 
 def _vault_commit_count(git_service: GitService, vault_name: str) -> int:
     return len(git_service.vault_log(vault_name, max_count=1000))
+
+
+def _commit_file_at(
+    git_service: GitService,
+    vault_name: str,
+    file_path: str,
+    content: str | None,
+    message: str,
+    date: str,
+) -> str:
+    """Create a deterministic fixture commit through the persistent worktree."""
+    worktree = git_service._worktree_path(vault_name)
+    if not worktree.exists():
+        git_service.commit_file(
+            vault_name=vault_name,
+            file_path=".fixture-seed.md",
+            content="",
+            message="fixture seed",
+        )
+        git_service.commit_file(
+            vault_name=vault_name,
+            file_path=".fixture-seed.md",
+            content="",
+            message="fixture seed",
+        )
+    repo = Repo(str(worktree))
+    try:
+        repo.git.reset("--hard", "HEAD")
+        target = worktree / file_path
+        if content is None:
+            repo.git.rm("--", file_path)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            repo.git.add("--", file_path)
+        with repo.git.custom_environment(
+            GIT_AUTHOR_NAME="Fixture",
+            GIT_AUTHOR_EMAIL="fixture@example.dev",
+            GIT_COMMITTER_NAME="Fixture",
+            GIT_COMMITTER_EMAIL="fixture@example.dev",
+            GIT_AUTHOR_DATE=date,
+            GIT_COMMITTER_DATE=date,
+        ):
+            repo.git.commit("-m", message)
+        return repo.git.rev_parse("HEAD").strip()
+    finally:
+        repo.close()
+
+
+def _move_file_at(
+    git_service: GitService,
+    vault_name: str,
+    old_path: str,
+    new_path: str,
+    message: str,
+    date: str,
+) -> str:
+    """Create a deterministic rename fixture through the persistent worktree."""
+    worktree = git_service._worktree_path(vault_name)
+    if not worktree.exists():
+        git_service.commit_file(
+            vault_name=vault_name,
+            file_path=".fixture-seed.md",
+            content="",
+            message="fixture seed",
+        )
+        git_service.commit_file(
+            vault_name=vault_name,
+            file_path=".fixture-seed.md",
+            content="",
+            message="fixture seed",
+        )
+    repo = Repo(str(worktree))
+    try:
+        repo.git.reset("--hard", "HEAD")
+        (worktree / new_path).parent.mkdir(parents=True, exist_ok=True)
+        repo.git.mv("--", old_path, new_path)
+        with repo.git.custom_environment(
+            GIT_AUTHOR_NAME="Fixture",
+            GIT_AUTHOR_EMAIL="fixture@example.dev",
+            GIT_COMMITTER_NAME="Fixture",
+            GIT_COMMITTER_EMAIL="fixture@example.dev",
+            GIT_AUTHOR_DATE=date,
+            GIT_COMMITTER_DATE=date,
+        ):
+            repo.git.commit("-m", message)
+        return repo.git.rev_parse("HEAD").strip()
+    finally:
+        repo.close()
+
+
+def _import_detached_history(
+    git_service: GitService,
+    vault_name: str,
+    source_path: Path,
+    file_path: str,
+    bodies: list[str],
+) -> list[str]:
+    """Import objects from a source lineage without attaching a target ref."""
+    source = Repo.init(source_path)
+    commits: list[str] = []
+    try:
+        writer = source.config_writer()
+        writer.set_value("user", "name", "Fixture Collector")
+        writer.set_value("user", "email", "collector@example.dev")
+        writer.release()
+        target = source_path / file_path
+        for position, body in enumerate(bodies):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            source.git.add("--", file_path)
+            action = "create" if position == 0 else "update"
+            source.git.commit(
+                "-m",
+                (
+                    f"Imported {action}\n\n"
+                    "agent: fixture-collector\n"
+                    f"action: {action}\n"
+                    "summary: detached source history"
+                ),
+            )
+            commits.append(source.head.commit.hexsha)
+
+        target_repo = Repo(str(git_service._bare_path(vault_name)))
+        try:
+            target_repo.git.fetch(str(source_path), source.active_branch.path)
+        finally:
+            target_repo.close()
+    finally:
+        source.close()
+    return commits
 
 
 def _block_chdir(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,6 +255,847 @@ def test_commit_file_creates_initial_commit(git_service: GitService) -> None:
     assert len(sha) == 40
     assert git_service.read_file(name, "first.md") == "first\n"
     assert _vault_commit_count(git_service, name) == 1
+
+
+def test_manual_fixed_ref_history_infers_plain_git_create_activity(
+    git_service: GitService,
+) -> None:
+    """An imported Git commit need not carry AKB's private activity footer."""
+    name = f"plain_import_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nPlain Git history.\n",
+        message="Import documentation",
+        author_name="Fixture Collector",
+        author_email="collector@example.dev",
+    )
+    fixed_ref = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/unrelated.md",
+        content="# Unrelated\n",
+        message="Add unrelated document",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        "notes/imported.md",
+        current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
+    )
+
+    assert snapshot["body"] == b"# Imported\n\nPlain Git history.\n"
+    assert snapshot["history"][0]["action"] == "create"
+    assert snapshot["activity"] == {
+        "legacy_git_oid": current_oid,
+        "committed_at": current.committed_datetime,
+        "actor": "Fixture Collector",
+        "subject": "Import documentation",
+        "summary": "",
+        "action": "create",
+        "path_from": None,
+        "path_to": "notes/imported.md",
+        "changed_paths": [
+            {
+                "change": "create",
+                "path_from": None,
+                "path_to": "notes/imported.md",
+            }
+        ],
+    }
+
+
+def test_manual_fixed_ref_history_infers_plain_git_update_activity(
+    git_service: GitService,
+) -> None:
+    name = f"plain_update_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message="Import documentation",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nRevised.\n",
+        message="Revise documentation",
+        author_name="Fixture Collector",
+        author_email="collector@example.dev",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(current_oid)
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/imported.md",
+        current_commit=current_oid,
+        since_epoch=current.committed_date + 1,
+    )
+
+    assert [entry["action"] for entry in snapshot["history"]] == [
+        "update",
+        "create",
+    ]
+    assert snapshot["activity"]["action"] == "update"
+    assert snapshot["activity"]["actor"] == "Fixture Collector"
+    assert snapshot["activity"]["subject"] == "Revise documentation"
+    assert snapshot["activity"]["changed_paths"] == [
+        {
+            "change": "update",
+            "path_from": None,
+            "path_to": "notes/imported.md",
+        }
+    ]
+
+
+def test_manual_fixed_ref_history_normalizes_legacy_edit_action(
+    git_service: GitService,
+) -> None:
+    """Pre-v2 commits used ``edit`` for the public ``update`` action."""
+    name = f"legacy_edit_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message="Import documentation",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n\nRevised.\n",
+        message=(
+            "Revise documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: edit\n"
+            "summary: historical edit vocabulary"
+        ),
+    )
+
+    snapshot = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/imported.md",
+        current_commit=current_oid,
+    )
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": "notes/imported.md",
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert snapshot["history"][0]["action"] == "update"
+    assert snapshot["activity"]["action"] == "update"
+    assert batched == snapshot
+
+
+def test_manual_fixed_ref_history_batch_preserves_unicode_activity_path(
+    git_service: GitService,
+) -> None:
+    name = f"unicode_activity_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    path = "research/dynamo/전체-아키텍처.md"
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path=path,
+        content="# 전체 아키텍처\n",
+        message=(
+            "Import documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: create\n"
+            "summary: unicode path"
+        ),
+    )
+
+    snapshot = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": path,
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert snapshot["activity"]["action"] == "create"
+    assert snapshot["activity"]["path_to"] == path
+
+
+def test_manual_fixed_ref_history_rejects_declared_activity_that_conflicts_with_git(
+    git_service: GitService,
+) -> None:
+    name = f"invalid_activity_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/imported.md",
+        content="# Imported\n",
+        message=(
+            "Import documentation\n\n"
+            "agent: fixture-collector\n"
+            "action: update\n"
+            "summary: claims an update for a newly added file"
+        ),
+    )
+
+    with pytest.raises(
+        FixedRefHistoryError,
+        match="activity does not match the file action",
+    ):
+        git_service.manual_fixed_ref_history(
+            name,
+            current_oid,
+            "notes/imported.md",
+            current_commit=current_oid,
+        )
+
+
+def test_manual_fixed_ref_history_accepts_create_on_reused_git_path(
+    git_service: GitService,
+) -> None:
+    """A new DB resource may reuse a path that still exists in Legacy Git."""
+    name = f"reused_create_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="notes/reused.md",
+        content="orphaned prior body\n",
+        message="orphaned prior write",
+    )
+    current_oid = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/reused.md",
+        content="new resource body\n",
+        message=(
+            "Create replacement resource\n\n"
+            "agent: fixture-user\n"
+            "action: create\n"
+            "summary: create on reused path"
+        ),
+    )
+
+    single = git_service.manual_fixed_ref_history(
+        name,
+        current_oid,
+        "notes/reused.md",
+        current_commit=current_oid,
+    )
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        current_oid,
+        [
+            {
+                "file_path": "notes/reused.md",
+                "current_commit": current_oid,
+                "since_epoch": None,
+            }
+        ],
+    )[0]
+
+    assert single["activity"]["action"] == "create"
+    assert single["activity"]["changed_paths"] == [
+        {"change": "update", "path_from": None, "path_to": "notes/reused.md"}
+    ]
+    assert batched == single
+
+
+def test_manual_fixed_ref_history_batch_matches_per_path_history_for_lifecycle(
+    git_service: GitService,
+) -> None:
+    name = f"indexed_lifecycle_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    created = _commit_file_at(
+        git_service,
+        name,
+        "notes/draft.md",
+        "one\n",
+        "create",
+        "2026-01-01T00:00:00+0000",
+    )
+    updated = _commit_file_at(
+        git_service,
+        name,
+        "notes/draft.md",
+        "two\n",
+        "update",
+        "2026-01-01T00:00:01+0000",
+    )
+    moved = _move_file_at(
+        git_service,
+        name,
+        "notes/draft.md",
+        "published/draft.md",
+        "move",
+        "2026-01-01T00:00:02+0000",
+    )
+    latest = _commit_file_at(
+        git_service,
+        name,
+        "published/draft.md",
+        "three\n",
+        "update after move",
+        "2026-01-01T00:00:03+0000",
+    )
+    fixed_ref = _commit_file_at(
+        git_service,
+        name,
+        "unrelated.md",
+        "unrelated\n",
+        "unrelated tip",
+        "2026-01-01T00:00:04+0000",
+    )
+    requests = [
+        {
+            "file_path": "notes/draft.md",
+            "current_commit": created,
+            "since_epoch": None,
+        },
+        {
+            "file_path": "notes/draft.md",
+            "current_commit": updated,
+            "since_epoch": None,
+        },
+        {
+            "file_path": "published/draft.md",
+            "current_commit": moved,
+            "since_epoch": None,
+        },
+        {
+            "file_path": "published/draft.md",
+            "current_commit": latest,
+            "since_epoch": None,
+        },
+    ]
+
+    batched = git_service.manual_fixed_ref_history_batch(name, fixed_ref, requests)
+    expected = [
+        git_service.manual_fixed_ref_history(
+            name,
+            fixed_ref,
+            request["file_path"],
+            current_commit=request["current_commit"],
+            since_epoch=request["since_epoch"],
+        )
+        for request in requests
+    ]
+
+    assert batched == expected
+
+    metadata_only = git_service.manual_fixed_ref_history_batch(
+        name,
+        fixed_ref,
+        requests,
+        include_bodies=False,
+    )
+    assert [
+        {key: value for key, value in snapshot.items() if key not in {"body_digest", "byte_size"}}
+        for snapshot in metadata_only
+    ] == [
+        {key: value for key, value in snapshot.items() if key != "body"}
+        for snapshot in expected
+    ]
+    for compact, full in zip(metadata_only, expected, strict=True):
+        assert "body" not in compact
+        assert compact["body_digest"] == hashlib.sha256(full["body"]).hexdigest()
+        assert compact["byte_size"] == len(full["body"])
+
+
+def test_manual_fixed_ref_history_batch_compact_inventory_preserves_nul(
+    git_service: GitService,
+) -> None:
+    name = f"indexed_nul_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="binary.md",
+        content="initial text",
+        message="initial body",
+    )
+    git_service.commit_file(
+        vault_name=name,
+        file_path="binary.md",
+        content="worktree text",
+        message="materialize worktree",
+    )
+    worktree = git_service._worktree_path(name)
+    repo = Repo(str(worktree))
+    (worktree / "binary.md").write_bytes(b"before\x00after")
+    repo.git.add("--", "binary.md")
+    repo.index.commit("binary body")
+    fixed_ref = repo.git.rev_parse("HEAD").strip()
+
+    snapshots = git_service.manual_fixed_ref_history_batch(
+        name,
+        fixed_ref,
+        [
+            {
+                "file_path": "binary.md",
+                "current_commit": fixed_ref,
+                "since_epoch": None,
+            }
+        ],
+        include_bodies=False,
+    )
+
+    assert snapshots[0]["body_digest"] == hashlib.sha256(b"before\x00after").hexdigest()
+    assert snapshots[0]["byte_size"] == len(b"before\x00after")
+
+
+def test_manual_fixed_ref_history_batch_respects_same_path_recreate_boundary(
+    git_service: GitService,
+) -> None:
+    name = f"indexed_recreate_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "old document\n",
+        "old create",
+        "2026-01-01T00:00:00+0000",
+    )
+    _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        None,
+        "old delete",
+        "2026-01-01T00:00:01+0000",
+    )
+    recreated = _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "new document\n",
+        "new create",
+        "2026-01-01T00:00:02+0000",
+    )
+    fixed_ref = _commit_file_at(
+        git_service,
+        name,
+        "unrelated.md",
+        "unrelated\n",
+        "unrelated tip",
+        "2026-01-01T00:00:03+0000",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(recreated)
+    try:
+        since_epoch = current.committed_date
+    finally:
+        current.repo.close()
+    request = {
+        "file_path": "notes/reused.md",
+        "current_commit": recreated,
+        "since_epoch": since_epoch,
+    }
+
+    batched = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request])
+    expected = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        request["file_path"],
+        current_commit=request["current_commit"],
+        since_epoch=request["since_epoch"],
+    )
+
+    assert batched == [expected]
+    assert [entry["legacy_git_oid"] for entry in batched[0]["history"]] == [recreated]
+
+
+def test_manual_fixed_ref_history_stops_at_recorded_current_commit(
+    git_service: GitService,
+) -> None:
+    """Later writes to a reused path do not belong to an older DB document."""
+    name = f"indexed_recorded_head_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    recorded = _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "recorded document\n",
+        "recorded create",
+        "2026-01-01T00:00:00+0000",
+    )
+    _commit_file_at(
+        git_service,
+        name,
+        "notes/reused.md",
+        "later orphan write\n",
+        "later create",
+        "2026-01-01T00:00:01+0000",
+    )
+    fixed_ref = _commit_file_at(
+        git_service,
+        name,
+        "unrelated.md",
+        "unrelated\n",
+        "unrelated tip",
+        "2026-01-01T00:00:02+0000",
+    )
+    request = {
+        "file_path": "notes/reused.md",
+        "current_commit": recorded,
+        "since_epoch": None,
+    }
+
+    single = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        request["file_path"],
+        current_commit=request["current_commit"],
+    )
+    batched = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request])
+
+    assert single["body"] == b"recorded document\n"
+    assert [entry["legacy_git_oid"] for entry in single["history"]] == [recorded]
+    assert batched == [single]
+
+
+def test_manual_fixed_ref_history_batches_independent_imported_lineages(
+    git_service: GitService,
+    tmp_path: Path,
+) -> None:
+    """DB heads remain authoritative when imported objects are not on HEAD."""
+    name = f"indexed_detached_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    git_service.commit_file(
+        vault_name=name,
+        file_path="laws/one.md",
+        content="one current\n",
+        message="materialize one in the vault snapshot",
+    )
+    fixed_ref = git_service.commit_file(
+        vault_name=name,
+        file_path="laws/two.md",
+        content="two current\n",
+        message="materialize two in the vault snapshot",
+    )
+    one_history = _import_detached_history(
+        git_service,
+        name,
+        tmp_path / "source-one",
+        "laws/one.md",
+        ["one original\n", "one current\n"],
+    )
+    two_history = _import_detached_history(
+        git_service,
+        name,
+        tmp_path / "source-two",
+        "laws/two.md",
+        ["two original\n", "two current\n"],
+    )
+    repo_path = git_service._bare_path(name)
+    for current_commit in (one_history[-1], two_history[-1]):
+        ancestry = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(repo_path),
+                "merge-base",
+                "--is-ancestor",
+                current_commit,
+                fixed_ref,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        assert ancestry.returncode == 1
+
+    requests = [
+        {
+            "file_path": "laws/one.md",
+            "current_commit": one_history[-1],
+            "since_epoch": None,
+        },
+        {
+            "file_path": "laws/two.md",
+            "current_commit": two_history[-1],
+            "since_epoch": None,
+        },
+    ]
+    batched = git_service.manual_fixed_ref_history_batch(
+        name,
+        fixed_ref,
+        requests,
+        require_fixed_ref_current=True,
+    )
+    expected = [
+        git_service.manual_fixed_ref_history(
+            name,
+            fixed_ref,
+            file_path,
+            current_commit=current_commit,
+        )
+        for file_path, current_commit in (
+            ("laws/one.md", one_history[-1]),
+            ("laws/two.md", two_history[-1]),
+        )
+    ]
+
+    assert batched == expected
+    assert [snapshot["body"] for snapshot in batched] == [
+        b"one current\n",
+        b"two current\n",
+    ]
+    assert [entry["action"] for entry in batched[0]["history"]] == [
+        "update",
+        "create",
+    ]
+    assert [entry["action"] for entry in batched[1]["history"]] == [
+        "update",
+        "create",
+    ]
+
+
+def test_independent_commit_oids_streams_large_revision_sets(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lineage discovery must not expand the revision set into process argv."""
+    name = f"indexed_streamed_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    parent = git_service.commit_file(
+        vault_name=name,
+        file_path="seed.md",
+        content="seed\n",
+        message="seed",
+    )
+    repo = Repo(str(git_service._bare_path(name)))
+    tree = repo.git.rev_parse(f"{parent}^{{tree}}")
+    current_oids: list[str] = []
+    with repo.git.custom_environment(
+        GIT_AUTHOR_NAME="Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.dev",
+        GIT_COMMITTER_NAME="Fixture",
+        GIT_COMMITTER_EMAIL="fixture@example.dev",
+    ):
+        for index in range(128):
+            parent = repo.git.commit_tree(
+                tree,
+                "-p",
+                parent,
+                "-m",
+                f"streamed lineage {index}",
+            ).strip()
+            current_oids.append(parent)
+
+    git_type = type(repo.git)
+    original_execute = git_type.execute
+
+    def reject_large_argv(self, command, *args, **kwargs):
+        if len(command) > 16:
+            raise OSError("simulated ARG_MAX overflow")
+        return original_execute(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(git_type, "execute", reject_large_argv)
+    try:
+        tips = git_service._independent_commit_oids(repo, current_oids)
+    finally:
+        repo.close()
+
+    assert tips == (current_oids[-1],)
+
+
+def test_manual_fixed_ref_history_batch_keeps_same_second_commits(
+    git_service: GitService,
+) -> None:
+    name = f"indexed_same_second_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    created = _commit_file_at(
+        git_service,
+        name,
+        "notes/same-second.md",
+        "one\n",
+        "create",
+        "2026-01-01T00:00:00+0000",
+    )
+    updated = _commit_file_at(
+        git_service,
+        name,
+        "notes/same-second.md",
+        "two\n",
+        "update",
+        "2026-01-01T00:00:00+0000",
+    )
+    fixed_ref = _commit_file_at(
+        git_service,
+        name,
+        "unrelated.md",
+        "unrelated\n",
+        "unrelated tip",
+        "2026-01-01T00:00:00+0000",
+    )
+    current = Repo(str(git_service._bare_path(name))).commit(updated)
+    try:
+        since_epoch = current.committed_date
+    finally:
+        current.repo.close()
+    request = {
+        "file_path": "notes/same-second.md",
+        "current_commit": updated,
+        "since_epoch": since_epoch,
+    }
+
+    batched = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request])
+    expected = git_service.manual_fixed_ref_history(
+        name,
+        fixed_ref,
+        request["file_path"],
+        current_commit=request["current_commit"],
+        since_epoch=request["since_epoch"],
+    )
+
+    assert batched == [expected]
+    assert [entry["legacy_git_oid"] for entry in batched[0]["history"]] == [updated, created]
+
+
+def test_manual_fixed_ref_history_batch_streams_once_without_materialized_index(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = f"indexed_cache_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    current = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/cached.md",
+        content="cached\n",
+        message="create",
+    )
+    fixed_ref = git_service.commit_file(
+        vault_name=name,
+        file_path="unrelated.md",
+        content="unrelated\n",
+        message="unrelated tip",
+    )
+    repo = Repo(str(git_service._bare_path(name)))
+    git_type = type(repo.git)
+    original_execute = git_type.execute
+    calls = {"log": 0, "diff_tree": 0}
+
+    def counting_execute(self, command, *args, **kwargs):
+        command_names = {str(item) for item in command}
+        if "log" in command_names:
+            calls["log"] += 1
+        if "diff-tree" in command_names:
+            calls["diff_tree"] += 1
+        return original_execute(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(git_type, "execute", counting_execute)
+
+    request = {
+        "file_path": "notes/cached.md",
+        "current_commit": current,
+        "since_epoch": None,
+    }
+    first = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request, request])
+    second = git_service.manual_fixed_ref_history_batch(name, fixed_ref, [request])
+    repo.close()
+
+    assert first[0] == first[1] == second[0]
+    assert calls == {"log": 2, "diff_tree": 2}
+
+
+def test_manual_fixed_ref_history_batch_routes_only_changed_paths(
+    git_service: GitService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = f"indexed_route_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    requests = []
+    for index in range(24):
+        path = f"notes/{index:03d}.md"
+        current_commit = git_service.commit_file(
+            vault_name=name,
+            file_path=path,
+            content=f"body-{index}\n",
+            message=f"create {path}",
+        )
+        requests.append(
+            {
+                "file_path": path,
+                "current_commit": current_commit,
+                "since_epoch": None,
+            }
+        )
+
+    original = git_service._indexed_path_change
+    path_change_calls = 0
+
+    def counted_path_change(changes, active_path):
+        nonlocal path_change_calls
+        path_change_calls += 1
+        return original(changes, active_path)
+
+    monkeypatch.setattr(git_service, "_indexed_path_change", counted_path_change)
+    snapshots = git_service.manual_fixed_ref_history_batch(
+        name,
+        requests[-1]["current_commit"],
+        requests,
+        include_bodies=False,
+    )
+
+    assert len(snapshots) == len(requests)
+    assert all(len(snapshot["history"]) == 1 for snapshot in snapshots)
+    assert path_change_calls <= len(requests) * 2
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    [
+        "fixed_format",
+        "current_format",
+        "fixed_unknown",
+        "current_unknown",
+    ],
+)
+def test_manual_fixed_ref_history_batch_rejects_invalid_fixed_or_current_oid(
+    git_service: GitService,
+    invalid_field: str,
+) -> None:
+    name = f"indexed_invalid_oid_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    valid_commit = git_service.commit_file(
+        vault_name=name,
+        file_path="notes/invalid.md",
+        content="invalid\n",
+        message="create",
+    )
+    fixed_ref = valid_commit
+    current_commit = valid_commit
+    if invalid_field == "fixed_format":
+        fixed_ref = "not-a-commit"
+    elif invalid_field == "current_format":
+        current_commit = "not-a-commit"
+    elif invalid_field == "fixed_unknown":
+        fixed_ref = "0" * 40
+    else:
+        current_commit = "0" * 40
+
+    with pytest.raises(FixedRefHistoryError):
+        git_service.manual_fixed_ref_history_batch(
+            name,
+            fixed_ref,
+            [
+                {
+                    "file_path": "notes/invalid.md",
+                    "current_commit": current_commit,
+                    "since_epoch": None,
+                }
+            ],
+        )
 
 
 def test_read_file_closes_repo_while_caller_still_references_it(
@@ -422,13 +1407,88 @@ def test_ensure_local_bare_reclones_untrusted_stale_dir(git_http, tmp_path):
     (stale / "garbage").write_text("not a git repo")
     assert git.vault_exists(name)  # path present → old code would SKIP clone
 
-    action, sha = svc.ensure_local_bare(name, None, head, url, "main", None)
+    action, sha = svc.ensure_local_bare(
+        name,
+        None,
+        head,
+        url,
+        "main",
+        None,
+        allow_unmarked_never_synced=True,
+    )
 
     assert action == "cloned"
     assert sha == head
     # Stale garbage gone, replaced by a valid clone at the upstream head.
     assert not (git._bare_path(name) / "garbage").exists()
     assert "doc.md" in git.ls_tree(name, sha)
+
+
+def test_never_synced_reclone_holds_exact_active_sidecar_authority(
+    git_service, monkeypatch,
+):
+    """The exceptional unmarked cleanup runs while retirement is DB-blocked."""
+    import asyncio
+
+    state = {"transaction_open": False, "ensure_calls": 0}
+
+    class _Transaction:
+        async def __aenter__(self):
+            state["transaction_open"] = True
+
+        async def __aexit__(self, *_args):
+            state["transaction_open"] = False
+
+    class _Connection:
+        def transaction(self):
+            return _Transaction()
+
+        async def fetchval(self, query, *args):
+            assert "FOR SHARE" in query
+            assert args[0] == vault_id
+            return 1
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    vault_id = uuid.uuid4()
+    vault_name = f"never-synced-{uuid.uuid4().hex[:8]}"
+    git_service._bare_path(vault_name).mkdir()
+    service = ExternalGitService(git=git_service)
+
+    def _ensure(*args, **kwargs):
+        assert state["transaction_open"] is True
+        assert kwargs == {"allow_unmarked_never_synced": True}
+        state["ensure_calls"] += 1
+        return ("cloned", "a" * 40)
+
+    monkeypatch.setattr(service, "ensure_local_bare", _ensure)
+    cfg = {
+        "last_synced_sha": None,
+        "remote_url": "https://example.invalid/repo.git",
+        "remote_branch": "main",
+        "auth_token": None,
+    }
+    result = asyncio.run(
+        service._ensure_local_bare_for_reconcile(
+            _Pool(),
+            vault_id=vault_id,
+            vault_name=vault_name,
+            cfg=cfg,
+            new_sha="a" * 40,
+        )
+    )
+
+    assert result == ("cloned", "a" * 40)
+    assert state == {"transaction_open": False, "ensure_calls": 1}
 
 
 def test_ensure_local_bare_unchanged_when_synced_and_sha_matches(git_http, tmp_path):
@@ -465,6 +1525,144 @@ def test_ensure_local_bare_fetches_when_upstream_advances(git_http, tmp_path):
     assert sha == head2  # materialized SHA follows the fetched local ref
     tree = git.ls_tree(name, sha)
     assert "doc.md" in tree and "extra.md" in tree
+
+
+def test_fetch_remote_refuses_stale_poller_promotion_after_retirement(
+    git_http, tmp_path, monkeypatch,
+):
+    """A fetch staged before retirement must never advance the retained HEAD.
+
+    ``fetch_to_ref`` is the poller's network/staging boundary.  Pause at that
+    seam, finish the offline marker retirement, then resume the stale poller:
+    only its temporary ref may exist; the manual vault's published ``HEAD``
+    must remain the frozen ref.
+    """
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    url, head1 = git_http.add_repo("retired-fetch", {"doc.md": "one\n"})
+    vault_name = f"retired-fetch-{uuid.uuid4().hex[:8]}"
+    git.clone_mirror(vault_name, url, "main", None)
+    head2 = git_http.publish_change("retired-fetch", "doc.md", "two\n")
+    assert head2 != head1
+
+    original_fetch = git._ext_runner.fetch_to_ref
+
+    def fetch_then_finish_retirement(*args, **kwargs):
+        original_fetch(*args, **kwargs)
+        git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+        git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+
+    monkeypatch.setattr(git._ext_runner, "fetch_to_ref", fetch_then_finish_retirement)
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        git.fetch_remote(vault_name, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
+def test_stale_sync_cannot_rearm_a_completed_retired_mirror(git_http, tmp_path):
+    """A later stale reconcile cannot recreate the mirror marker after handoff."""
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head1 = git_http.add_repo("retired-rearm", {"doc.md": "one\n"})
+    vault_name = f"retired-rearm-{uuid.uuid4().hex[:8]}"
+    assert service.ensure_local_bare(vault_name, None, head1, url, "main", None) == (
+        "cloned",
+        head1,
+    )
+    git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+    git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+    head2 = git_http.publish_change("retired-rearm", "doc.md", "two\n")
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror marker is missing"):
+        service.ensure_local_bare(vault_name, head1, head2, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
+def test_stale_reclone_cannot_replace_a_completed_retired_mirror(
+    git_http, tmp_path, monkeypatch,
+):
+    """A health decision made before retirement has no destructive authority.
+
+    Pause at the re-clone publication seam, complete offline retirement, then
+    resume the stale poller. Its staged clone must be discarded: the retained
+    repository, frozen HEAD/history, and marker-free manual-vault shape survive.
+    """
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head1 = git_http.add_repo("retired-reclone", {"doc.md": "one\n"})
+    vault_name = f"retired-reclone-{uuid.uuid4().hex[:8]}"
+    assert service.ensure_local_bare(vault_name, None, head1, url, "main", None) == (
+        "cloned",
+        head1,
+    )
+    head2 = git_http.publish_change("retired-reclone", "doc.md", "two\n")
+    assert head2 != head1
+
+    real_reclone = git.reclone_active_mirror
+
+    def _retire_then_resume(*args, **kwargs):
+        git.quarantine_external_mirror_marker(vault_name, expected_ref=head1)
+        git.finalize_external_mirror_retirement(vault_name, expected_ref=head1)
+        return real_reclone(*args, **kwargs)
+
+    monkeypatch.setattr(git, "reclone_active_mirror", _retire_then_resume)
+    monkeypatch.setattr(
+        git,
+        "inspect_mirror_structure",
+        lambda *args, **kwargs: ["disallowed-config"],
+    )
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        service.ensure_local_bare(vault_name, head1, head2, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head1
+    assert git.read_file(vault_name, "doc.md") == "one\n"
+    assert [item.hexsha for item in Repo(str(bare)).iter_commits()] == [head1]
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
+
+
+def test_stale_first_sync_snapshot_cannot_replace_a_completed_retired_mirror(
+    git_http, tmp_path, monkeypatch,
+):
+    """A stale ``last_synced_sha=None`` snapshot is not publication authority."""
+    from app.exceptions import MirrorMarkerError
+
+    git = _mirror_git(git_http, tmp_path)
+    service = ExternalGitService(git=git)
+    url, head = git_http.add_repo("retired-first-sync", {"doc.md": "one\n"})
+    vault_name = f"retired-first-sync-{uuid.uuid4().hex[:8]}"
+    service.ensure_local_bare(vault_name, None, head, url, "main", None)
+    git.quarantine_external_mirror_marker(vault_name, expected_ref=head)
+    git.finalize_external_mirror_retirement(vault_name, expected_ref=head)
+    monkeypatch.setattr(
+        git,
+        "inspect_mirror_structure",
+        lambda *args, **kwargs: ["disallowed-config"],
+    )
+
+    with pytest.raises(MirrorMarkerError, match="external-git mirror is no longer active"):
+        service.ensure_local_bare(vault_name, None, head, url, "main", None)
+
+    bare = _mirror_bare(tmp_path, vault_name)
+    assert git.current_commit(vault_name) == head
+    assert git.read_file(vault_name, "doc.md") == "one\n"
+    assert not (bare / "akb-external-mirror").exists()
+    assert not (bare / "akb-external-mirror-retiring").exists()
 
 
 def test_is_healthy_repo(git_http, tmp_path):
@@ -694,8 +1892,9 @@ def test_ensure_local_bare_reclones_after_structure_finding(git_http, tmp_path):
 # `clone_mirror` only writes the marker on a fresh clone, so a mirror created
 # before the marker existed has none — `_is_mirror` is False and its reads
 # fall through to GitPython (fail-open). The DB (`vault_external_git`) is the
-# authoritative mirror list; the startup backfill re-stamps the on-disk marker,
-# and `ensure_local_bare` self-heals any miss. Tests use `git init --bare` via
+# authoritative mirror list; the startup backfill re-stamps the on-disk marker.
+# `ensure_local_bare` deliberately refuses a missing marker rather than letting
+# a stale poller re-arm a retired manual vault. Tests use `git init --bare` via
 # the local in-process git fixture (no real network); the fixture host pins
 # GIT_TERMINAL_PROMPT=0 in the runner's sealed env, and we also set it for the
 # fixture's own non-runner git calls as a belt.
@@ -886,7 +2085,12 @@ def test_backfill_mirror_markers_unconditional_and_fail_fast(git_http, tmp_path,
     assert "failv" in str(boot_err.value)
 
 
-def test_ensure_local_bare_self_heals_missing_marker(git_http, tmp_path, monkeypatch):
+def test_ensure_local_bare_requires_authoritative_backfill_for_a_missing_marker(
+    git_http, tmp_path, monkeypatch,
+):
+    from app.exceptions import MirrorMarkerError
+    from app.services.external_git_service import _stamp_mirror_markers
+
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
     git = _mirror_git(git_http, tmp_path)
     svc = ExternalGitService(git=git)
@@ -898,9 +2102,13 @@ def test_ensure_local_bare_self_heals_missing_marker(git_http, tmp_path, monkeyp
     (_mirror_bare(tmp_path, "healv") / "akb-external-mirror").unlink()
     assert git._is_mirror("healv") is False
 
-    # A normal reconcile pass on an UNCHANGED mirror must re-stamp the marker
-    # (self-heal belt) — the unchanged fast path would otherwise perpetuate the
-    # marker-less, fail-open state forever.
+    # A stale reconcile may not recreate a missing marker itself: completed
+    # retirement intentionally leaves the retained manual vault marker-less.
+    with pytest.raises(MirrorMarkerError, match="marker is missing"):
+        svc.ensure_local_bare("healv", head, head, url, "main", None)
+
+    # The DB-authoritative startup sweep is the sole marker-restoration path.
+    assert _stamp_mirror_markers(git, ["healv"]) == (1, [])
     action, sha2 = svc.ensure_local_bare("healv", head, head, url, "main", None)
     assert action == "unchanged" and sha2 == head
     assert git._is_mirror("healv") is True
@@ -1059,13 +2267,13 @@ def test_ensure_local_bare_breaks_reclone_loop_on_systemic_findings(git_http, tm
     # EVERY structure inspection — including on our own fresh sterile re-clone —
     # reports a finding.
     clones: list[str] = []
-    real_clone = git.clone_mirror
+    real_clone = git.reclone_active_mirror
 
     def _counting_clone(name, *a, **k):
         clones.append(name)
         return real_clone(name, *a, **k)
 
-    monkeypatch.setattr(git, "clone_mirror", _counting_clone)
+    monkeypatch.setattr(git, "reclone_active_mirror", _counting_clone)
     monkeypatch.setattr(
         git, "inspect_mirror_structure", lambda *a, **k: ["disallowed config entry"]
     )

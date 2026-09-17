@@ -55,7 +55,7 @@ async def rerank(
 
     base_url = (settings.rerank_base_url or settings.llm_base_url).rstrip("/")
     api_key = settings.rerank_api_key or settings.llm_api_key
-    if not api_key:
+    if not api_key and settings.model_api_governance_mode != "platform_hard":
         raise RerankError("no API key configured (rerank_api_key / llm_api_key)")
 
     payload: dict[str, object] = {
@@ -76,6 +76,8 @@ async def rerank(
         )
         resp.raise_for_status()
         body = resp.json()
+    except model_gateway.WorkloadIdentityError:
+        raise RerankError("Workload identity is unavailable") from None
     except (httpx.ConnectError, httpx.HTTPStatusError,
             httpx.TimeoutException, httpx.UnsupportedProtocol) as e:
         raise RerankError(f"rerank HTTP call failed: {e}") from e

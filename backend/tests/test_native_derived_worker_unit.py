@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
+from app.services import native_derived_worker
+from app.services._backfill import MAX_RETRIES
 from app.services.index_service import MAX_CHUNK_SIZE, SOURCE_TYPES
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
@@ -17,6 +21,7 @@ from app.services.native_derived_worker import (
     NATIVE_DOCUMENT_SOURCE,
     NATIVE_FILE_SOURCE,
     SELECTED_DELIVERY,
+    NativeDerivedWorker,
     build_native_document_chunks,
     build_native_file_chunks,
     source_type_for_surface,
@@ -210,3 +215,186 @@ def test_native_head_body_verification_rejects_a_mismatched_placement_profile(pl
                 "verification_profile": "mismatched-profile-v1",
             }
         )
+
+
+# ── terminal delivery must be countable and named ─────────────────────
+#
+# The failure these cover lost three documents from ranked search and was
+# noticed only because someone happened to be watching `last_error` on an
+# internal queue table during a migration (#527).  Both halves of the fix are
+# asserted here without a database, because the queue state and the log line
+# are what an operator has and neither of them is a query they should have to
+# know to write.
+
+
+class _StatsConn:
+    """One row of `native_invalidation_intents` aggregates."""
+
+    def __init__(self, row):
+        self.row = row
+        self.queries: list[str] = []
+
+    async def fetchrow(self, query, *args):
+        self.queries.append(query)
+        self.args = args
+        return self.row
+
+
+def _stats_pool(row):
+    conn = _StatsConn(row)
+
+    class _Pool:
+        def acquire(self):
+            @asynccontextmanager
+            async def _acquire():
+                yield conn
+
+            return _acquire()
+
+    return _Pool(), conn
+
+
+def _counts(**overrides):
+    row = {
+        "pending": 0,
+        "retrying": 0,
+        "exhausted": 0,
+        "abandoned": 0,
+        "applied": 0,
+        "superseded": 0,
+        "deleted": 0,
+        "direct_grep": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+async def test_an_abandoned_intent_is_reported_even_though_the_queue_drained():
+    """The bug in one assertion: progress at 100%, a document gone.
+
+    `pending` is 0 and `applied` says the rest of the backfill succeeded, which
+    is exactly what an operator watching progress sees when a Resource has been
+    given up on. The count and the status are the only things that say so.
+    """
+    pool, _ = _stats_pool(_counts(applied=41, abandoned=1))
+
+    stats = await native_derived_worker._pending_stats(pool)
+
+    assert stats["pending"] == 0
+    assert stats["abandoned"] == 1
+    assert stats["status"] == "degraded"
+
+
+async def test_a_drained_queue_with_nothing_lost_is_ok():
+    pool, _ = _stats_pool(_counts(applied=42))
+
+    assert (await native_derived_worker._pending_stats(pool))["status"] == "ok"
+
+
+async def test_work_still_in_flight_is_reconciling_not_ok():
+    """`ok` must mean settled, or a poller stops waiting while work remains."""
+    pool, _ = _stats_pool(_counts(pending=3, retrying=1))
+
+    assert (await native_derived_worker._pending_stats(pool))["status"] == "reconciling"
+
+
+async def test_a_claim_killed_on_its_final_attempt_is_exhausted_not_retrying():
+    """The pre-terminal state `queue_rescuer` exists to close.
+
+    The claim query skips `retry_count >= MAX_RETRIES`, so nothing will pick
+    this row up again on its own. Counting it as ordinary retrying work would
+    describe a stalled queue as a busy one.
+    """
+    pool, _ = _stats_pool(_counts(pending=1, exhausted=1))
+
+    stats = await native_derived_worker._pending_stats(pool)
+
+    assert stats["exhausted"] == 1
+    assert stats["status"] == "degraded"
+
+
+async def test_vault_scoped_stats_are_narrowed_by_namespace():
+    namespace_id = uuid.uuid4()
+    pool, conn = _stats_pool(_counts())
+
+    await native_derived_worker._pending_stats(pool, namespace_id)
+
+    assert "AND namespace_id = $2" in conn.queries[0]
+    assert conn.args == (MAX_RETRIES, namespace_id)
+
+
+class _FailureConn:
+    def __init__(self, located):
+        self._located = located
+        self.statements: list[str] = []
+
+    async def execute(self, query, *args):
+        self.statements.append(query)
+
+    async def fetchrow(self, _query, *_args):
+        return self._located
+
+
+def _failure_worker(located):
+    conn = _FailureConn(located)
+
+    class _Pool:
+        def acquire(self):
+            @asynccontextmanager
+            async def _acquire():
+                yield conn
+
+            return _acquire()
+
+    return NativeDerivedWorker(_Pool()), conn
+
+
+def _intent(retry_count):
+    return {
+        "intent_id": uuid.uuid4(),
+        "resource_id": uuid.uuid4(),
+        "revision_id": uuid.uuid4(),
+        "retry_count": retry_count,
+        "surface": "document",
+    }
+
+
+async def test_the_final_failure_names_the_resource_it_just_gave_up_on(caplog):
+    """A count says something was lost; only a path says what to fix."""
+    worker, conn = _failure_worker({"vault_name": "handbook", "current_path": "ops/extracted.md"})
+    caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
+
+    await worker._failure(_intent(MAX_RETRIES), ValueError("body bytes must not be logged"))
+
+    assert "delivery_outcome = 'abandoned'" in conn.statements[0]
+    record = next(r for r in caplog.records if r.levelno == logging.ERROR)
+    message = record.getMessage()
+    assert "ABANDONED" in message
+    assert "vault=handbook" in message
+    assert "path=ops/extracted.md" in message
+    assert "error=ValueError" in message
+    # The class, never the message: an exception can quote the body that
+    # failed to store, exactly as `last_error` refuses to.
+    assert "body bytes must not be logged" not in message
+
+
+async def test_a_retryable_failure_stays_quiet_about_abandonment(caplog):
+    """Attempt 1 of 8 is not a loss, and must not read as one."""
+    worker, _ = _failure_worker({"vault_name": "handbook", "current_path": "ops/extracted.md"})
+    caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
+
+    await worker._failure(_intent(1), ValueError("transient"))
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
+
+
+async def test_an_unnameable_resource_still_reports_the_abandonment(caplog):
+    """Diagnostics are best effort; the row is already terminal when this runs."""
+    worker, _ = _failure_worker(None)
+    caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
+
+    await worker._failure(_intent(MAX_RETRIES), ValueError("boom"))
+
+    message = next(r for r in caplog.records if r.levelno == logging.ERROR).getMessage()
+    assert "ABANDONED" in message
+    assert "vault=<unresolved>" in message

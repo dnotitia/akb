@@ -11,6 +11,7 @@ import pytest
 from app.api.control_plane_models import InventoryProjection
 from app.exceptions import ValidationError
 from app.services import app_inventory_service as inventory
+from app.services import app_resource_service as resources
 
 
 def _row(*, observed: bool = True, mismatch: bool = False) -> dict:
@@ -26,8 +27,13 @@ def _row(*, observed: bool = True, mismatch: bool = False) -> dict:
         "desired_release_id": desired_release_id,
         "desired_version": "1.0.0",
         "desired_manifest": {
-            "steps": [],
-            "expected_schema_fingerprint": "a" * 64,
+            "manifest_version": 2,
+            "app_key": "inventory-test",
+            "source_revision": "a" * 40,
+            "image_digest": "sha256:" + "b" * 64,
+            "schema_version": 3,
+            "schema": {"tables": []},
+            "transition_plans": [{"source": "fresh", "steps": []}],
         },
         "current_release_id": desired_release_id,
         "current_version": "1.0.0",
@@ -39,7 +45,7 @@ def _row(*, observed: bool = True, mismatch: bool = False) -> dict:
         "observed_at": datetime.now(timezone.utc) if observed else None,
         "observed_release_id": observed_release_id if observed else None,
         "observed_release_version": "1.0.0" if observed else None,
-        "schema_fingerprint": "a" * 64 if observed else None,
+        "schema_fingerprint": resources.canonical_table_fingerprint([]) if observed else None,
         "observed_grant_generation": 4 if observed else None,
         "checkpoint": {"phase": "ready", "token": "secret-marker"},
         "recent_error": {"code": "worker_timeout", "message": "secret-marker"},

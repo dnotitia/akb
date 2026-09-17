@@ -2,6 +2,8 @@
 #
 # AKB Publications E2E Test Suite
 # Tests the unified public sharing feature for documents, tables, and files.
+# Detailed authenticated MCP publication behavior runs through the official
+# Python SDK; this shell lane retains REST/public and MCP auth-boundary checks.
 #
 # Covers:
 #   - Document publications (basic, expiration, password, max_views, section, allow_embed)
@@ -42,14 +44,6 @@ TOKEN=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
 
 acurl() { curl -sk -H "Authorization: Bearer $TOKEN" "$@"; }
 
-# Keep human sessions and automation credentials distinct. REST assertions use
-# TOKEN; the MCP compatibility section uses this purpose-created PAT.
-MCP_PAT=$(acurl -X POST "$BASE_URL/api/v1/auth/tokens" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"publications-e2e-mcp"}' \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null)
-[ -n "$MCP_PAT" ] && pass "MCP PAT acquired" || { fail "MCP PAT" "no token"; exit 1; }
-
 # Create vault
 R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=Pub%20test")
 [ "$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null)" = "$VAULT" ] \
@@ -57,7 +51,6 @@ R=$(acurl -X POST "$BASE_URL/api/v1/vaults?name=$VAULT&description=Pub%20test")
 
 # Helper: parse the {uuid} out of an akb://{vault}/file/{uuid} URI.
 uri_file_id() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.rsplit('/',1)[-1] if u else '')"; }
-uri_doc_path() { python3 -c "import sys; u=sys.stdin.read().strip(); print(u.split('/doc/',1)[1] if '/doc/' in u else '')"; }
 
 # Helpers: split one `curl -w '\n%{http_code}'` response into its two halves, so
 # a status and a body can be asserted without paying for a second request. The
@@ -681,11 +674,12 @@ CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$TQ_SLUG
 
 echo ""
 
-# ── 12. MCP integration: legacy akb_publish backward compat ──
-echo "▸ 12. MCP backward compat"
+# ── 12. MCP authentication boundary ──────────────────────────
+echo "▸ 12. MCP authentication boundary"
 
-# Init MCP session
-# A local user-session JWT is deliberately not an MCP credential.
+# A local user-session JWT is deliberately not an MCP credential. Detailed
+# authenticated MCP product behavior is exercised once through the official
+# Python SDK in backend/tests/mcp_e2e.
 JWT_MCP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -693,103 +687,6 @@ JWT_MCP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" 
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-local-session-boundary","version":"0.1"}}}')
 [ "$JWT_MCP_CODE" = "401" ] && pass "Local session JWT rejected by MCP" || fail "MCP local JWT boundary" "HTTP $JWT_MCP_CODE"
 
-SESS=$(curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
-  -i 2>&1 | grep -i "mcp-session-id:" | tr -d '\r' | awk '{print $2}')
-[ -n "$SESS" ] && pass "MCP session initialized" || fail "MCP init" "no session"
-
-curl -sk -X POST "$BASE_URL/mcp/" \
-  -H "Authorization: Bearer $MCP_PAT" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Mcp-Session-Id: $SESS" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
-
-mcp() {
-  local id=$1; shift
-  local name=$1; shift
-  local args=$1
-  curl -sk -X POST "$BASE_URL/mcp/" \
-    -H "Authorization: Bearer $MCP_PAT" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "Mcp-Session-Id: $SESS" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$name\",\"arguments\":$args}}" 2>&1
-}
-mcp_text() {
-  python3 -c "
-import json, sys, re
-text = sys.stdin.read()
-m = re.search(r'(\{.*\})', text, re.DOTALL)
-if m:
-    data = json.loads(m.group(1))
-    if 'result' in data and 'content' in data['result']:
-        print(data['result']['content'][0]['text'])
-"
-}
-
-# akb_publish (basic) — uses canonical URI
-DOC_URI_FOR_MCP="$DOC_URI"
-R=$(mcp 10 akb_publish "{\"uri\":\"$DOC_URI_FOR_MCP\"}" | mcp_text)
-SLUG_FROM_MCP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-[ -n "$SLUG_FROM_MCP" ] && pass "MCP akb_publish returns slug" || fail "MCP publish" "$R"
-
-# akb_publications (list)
-R=$(mcp 11 akb_publications "{\"vault\":\"$VAULT\"}" | mcp_text)
-PUB_TOTAL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("total",0))' 2>/dev/null)
-[ "$PUB_TOTAL" -gt 0 ] && pass "MCP akb_publications list ($PUB_TOTAL)" || fail "MCP list" "$R"
-
-# akb_publication_snapshot — slug alone (vault inferred from row)
-TQ_SLUG_MCP=$(mcp 12 akb_publish "{\"vault\":\"$VAULT\",\"resource_type\":\"table_query\",\"query_sql\":\"SELECT name FROM products\"}" | mcp_text | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-R=$(mcp 13 akb_publication_snapshot "{\"slug\":\"$TQ_SLUG_MCP\"}" | mcp_text)
-SS_MODE_MCP=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode"))' 2>/dev/null)
-[ "$SS_MODE_MCP" = "snapshot" ] && pass "MCP akb_publication_snapshot returns publication dict" || fail "MCP snapshot" "$R"
-
-# akb_unpublish by slug — returns {deleted: N}
-R=$(mcp 14 akb_publications "{\"vault\":\"$VAULT\",\"resource_type\":\"document\"}" | mcp_text)
-ANY_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["publications"][0]["slug"])' 2>/dev/null)
-R=$(mcp 15 akb_unpublish "{\"slug\":\"$ANY_SLUG\"}" | mcp_text)
-DEL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
-[ "$DEL" = "1" ] && pass "MCP akb_unpublish by slug → deleted=1" || fail "MCP unpublish" "$R"
-
-# akb_unpublish rejects unknown args (e.g. legacy `mode`)
-R=$(mcp 16 akb_publish "{\"uri\":\"$DOC_URI\",\"mode\":\"snapshot\"}" | mcp_text)
-echo "$R" | grep -qi "unknown argument" && pass "MCP akb_publish: legacy 'mode' rejected" || fail "MCP legacy mode" "$R"
-
-# akb_publish response has share_url (absolute), no public_url/publication_id
-R=$(mcp 17 akb_publish "{\"uri\":\"$DOC_URI\"}" | mcp_text)
-MCP_SHARE=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("share_url",""))' 2>/dev/null)
-case "$MCP_SHARE" in
-  http://*|https://*) pass "MCP akb_publish: share_url absolute" ;;
-  *) fail "MCP share_url" "$MCP_SHARE" ;;
-esac
-# Same OK:/BAD: absence-assertion shape as the REST check in section 1: an error
-# body and an unparsable body both carry no legacy fields, so require a real
-# publication before reading the absence as meaningful.
-LEAKS=$(echo "$R" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-forbidden = ["publication_id","public_url","public_url_full","public_base"]
-if not d.get("slug"):
-    print("BAD:not-a-publication-response")
-else:
-    found = [k for k in forbidden if k in d]
-    print("OK:leaked=" + ",".join(found) if found else "OK:")' 2>/dev/null)
-[ "$LEAKS" = "OK:" ] && pass "MCP akb_publish: no legacy fields" || fail "MCP legacy leak" "${LEAKS:-unparsable body}: $R"
-
-# akb_unpublish by FILE uri — the bug case that 0.5.x silently rejected.
-FU_RES=$(mcp 18 akb_publish "{\"uri\":\"$FILE_URI\",\"resource_type\":\"file\"}" | mcp_text)
-FU_SLUG=$(echo "$FU_RES" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
-[ -n "$FU_SLUG" ] && pass "MCP akb_publish(file uri) creates slug" || fail "File pub via MCP" "$FU_RES"
-R=$(mcp 19 akb_unpublish "{\"uri\":\"$FILE_URI\"}" | mcp_text)
-DEL=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
-[ "$DEL" -ge 1 ] 2>/dev/null && pass "MCP akb_unpublish(file uri) deletes ≥1" || fail "MCP file uri unpublish" "$R"
-# And the share now 404s
-CODE=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/v1/public/$FU_SLUG")
-[ "$CODE" = "404" ] && pass "Unpublished file share → 404" || fail "File unpub 404" "HTTP $CODE"
 
 echo ""
 
@@ -1016,7 +913,7 @@ else
 fi
 
 # Cascade: empty vault delete
-DELV=$(mcp 90 akb_delete_vault "{\"vault\":\"${VAULT}-empty\"}" | mcp_text)
+DELV=$(acurl -X DELETE "$BASE_URL/api/v1/vaults/${VAULT}-empty")
 DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DELOK" = "True" ] && pass "Empty vault deleted" || fail "Empty vault delete" "$DELV"
 
@@ -1034,12 +931,9 @@ echo "▸ 99. Cleanup"
 # Deleting a vault that still owns publications, tables and files must at least
 # report success — inspect the result instead of assuming it. This checks the
 # acknowledgement only; it is not a check of the downstream cascade.
-DELV=$(mcp 99 akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_text)
+DELV=$(acurl -X DELETE "$BASE_URL/api/v1/vaults/$VAULT")
 DELOK=$(echo "$DELV" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("deleted"))' 2>/dev/null)
 [ "$DELOK" = "True" ] && pass "Cleanup: test vault deleted" || fail "Cleanup vault delete" "$DELV"
-
-# Terminate MCP session
-curl -sk -X DELETE "$BASE_URL/mcp/" -H "Authorization: Bearer $MCP_PAT" -H "Mcp-Session-Id: $SESS" >/dev/null 2>&1
 
 echo ""
 echo "╔══════════════════════════════════════════╗"

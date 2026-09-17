@@ -4,20 +4,19 @@ kind: Kustomization
 namespace: akb
 
 resources:
-  - namespace.yaml
   - postgres.yaml
-  - redis.yaml
   - backend.yaml
   - frontend.yaml
   - ingress.yaml
 
-# Vector store: default driver is pgvector running inside the main
-# Postgres pod (`postgres.yaml` already uses the pgvector/pgvector
-# image, so the extension is available; backend creates its own
-# `vector_index` schema). To run Qdrant as a separate StatefulSet
-# instead, add `qdrant.yaml` to this list and flip
-# `vector_store_driver` to `qdrant` (with vector_url set) in the
-# backend ConfigMap.
+# PostgreSQL includes pgvector and remains the default derived vector index.
+# Redis and Qdrant are optional resources; add redis.yaml or qdrant.yaml from
+# an operator-owned overlay only when the matching runtime configuration is set.
+#
+# file-gateway.yaml is optional in the same way. Without it the API streams
+# file bytes itself, which is correct and simpler; with it the API only
+# authorizes and nginx carries the bytes. It changes no address, so adding or
+# removing it is not a migration. Read the header of that file first — it
+# needs a matching `file_gateway_key` and a Secret.
 
-# Note: akb-init-sql ConfigMap must be created manually before applying:
-#   kubectl create configmap akb-init-sql -n akb --from-file=init.sql=../../backend/app/db/init.sql
+# Secrets are intentionally absent. Provision Secret/akb-secret before apply.

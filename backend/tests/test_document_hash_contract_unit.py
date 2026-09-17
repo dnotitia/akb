@@ -188,6 +188,57 @@ async def test_document_get_hashes_empty_body_as_valid_content(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_document_get_recovers_malformed_legacy_frontmatter(monkeypatch) -> None:
+    raw = "---\ntitle: malformed: yaml\ntype: reference\n---\n# Recovered body\n"
+    returned_body = "# Recovered body\n"
+    vault_id = uuid.uuid4()
+    doc_id = uuid.uuid4()
+    commit = "d" * 40
+    row = {
+        "id": doc_id,
+        "vault_name": "hash-vault",
+        "path": "legacy/malformed.md",
+        "title": "Recovered title",
+        "doc_type": "reference",
+        "status": "active",
+        "summary": None,
+        "domain": None,
+        "created_by": "external-git",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+        "current_commit": commit,
+        "content_hash": None,
+        "hash_algorithm": None,
+        "content_hash_commit": None,
+        "tags": [],
+    }
+    doc_repo = _FakeDocRepo(row)
+    service = DocumentService(git=_FakeGit(raw))
+
+    async def fake_repos():
+        return _FakeVaultRepo(vault_id), doc_repo, object()
+
+    async def fake_public_slug(row: dict) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_repos", fake_repos)
+    monkeypatch.setattr(service, "_get_public_slug", fake_public_slug)
+
+    result = await service.get("hash-vault", "legacy/malformed.md")
+
+    expected_hash = sha256(returned_body.encode("utf-8")).hexdigest()
+    assert result.content == returned_body
+    assert result.title == "Recovered title"
+    assert result.content_hash == expected_hash
+    assert doc_repo.hash_update == {
+        "doc_id": doc_id,
+        "content_hash": expected_hash,
+        "hash_algorithm": "sha256",
+        "content_hash_commit": commit,
+    }
+
+
+@pytest.mark.asyncio
 async def test_document_update_rejects_stale_expected_content_hash() -> None:
     body = "Current body"
     raw = "---\ntitle: Hash Contract\n---\nCurrent body"
@@ -541,6 +592,69 @@ async def test_update_certifies_the_canonical_parsed_body_hash(monkeypatch) -> N
     assert doc_repo.updated is not None
     assert doc_repo.updated["content_hash"] == expected_hash
     assert resp.previous_content_hash == current_hash
+
+
+@pytest.mark.asyncio
+async def test_update_repairs_malformed_legacy_frontmatter(monkeypatch) -> None:
+    import frontmatter
+
+    _patch_index_side_effects(monkeypatch)
+    malformed = "---\ntitle: malformed: yaml\ntype: reference\n---\n# Source body"
+    prior_body = "# Source body"
+    commit = "5" * 40
+    doc_id = uuid.uuid4()
+    created_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    updated_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    row = {
+        "id": doc_id,
+        "path": "legacy/malformed.md",
+        "title": "Recovered title",
+        "doc_type": "reference",
+        "status": "active",
+        "summary": "Recovered summary",
+        "domain": "law",
+        "created_by": "external-git",
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "current_commit": "4" * 40,
+        "content_hash": sha256(prior_body.encode("utf-8")).hexdigest(),
+        "hash_algorithm": "sha256",
+        "content_hash_commit": "4" * 40,
+        "tags": ["source:git"],
+    }
+    git = _CommittingGit(commit, initial_raw=malformed)
+    doc_repo = _FakePutDocRepo(row)
+    service = DocumentService(git=git)
+    req = DocumentUpdateRequest(
+        content=malformed,
+        title=row["title"],
+        type=row["doc_type"],
+        tags=row["tags"],
+        summary=row["summary"],
+        domain=row["domain"],
+        expected_commit=row["current_commit"],
+    )
+
+    resp = await service._update_locked(
+        req=req,
+        agent_id="collector",
+        vault="hash-vault",
+        vault_id=uuid.uuid4(),
+        doc_repo=doc_repo,
+        row=row,
+        conn=None,
+    )
+
+    repaired = frontmatter.loads(git.committed_md)
+    assert repaired.content == malformed
+    assert repaired.metadata["title"] == row["title"]
+    assert repaired.metadata["type"] == row["doc_type"]
+    assert repaired.metadata["status"] == row["status"]
+    assert repaired.metadata["created_at"] == created_at
+    assert repaired.metadata["created_by"] == row["created_by"]
+    assert repaired.metadata["tags"] == row["tags"]
+    assert resp.current_commit == commit
+    assert resp.content_hash == sha256(malformed.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,8 @@ _SECRET = "upstream-client-secret-must-not-leak"  # pragma: allowlist secret
 _NEW_SECRET = "rotated-client-secret-must-not-leak"  # pragma: allowlist secret
 _MANAGEMENT_SECRET = "management-secret-must-not-leak"  # pragma: allowlist secret
 _ISSUER = "https://accounts.example.com/realms/workforce"
+_ENTRA_TENANT = "ade9ac17-851e-48d0-ba36-ed99a8d8c07e"
+_ENTRA_ISSUER = f"https://login.microsoftonline.com/{_ENTRA_TENANT}/v2.0"
 
 
 def _config(*, management_secret: str = _MANAGEMENT_SECRET) -> KeycloakAdminConfig:
@@ -44,6 +46,20 @@ def _spec(**changes: object) -> ProviderConfigureSpec:
         "issuer": _ISSUER,
         "discovery_url": f"{_ISSUER}/.well-known/openid-configuration",
         "client_id": "akb-broker",
+        "client_secret": _SECRET,
+    }
+    values.update(changes)
+    return ProviderConfigureSpec(**values)  # type: ignore[arg-type]
+
+
+def _generic_spec(**changes: object) -> ProviderConfigureSpec:
+    values: dict[str, object] = {
+        "provider_type": "oidc",
+        "alias": "entra-dn",
+        "display_name": "Microsoft Teams",
+        "issuer": _ENTRA_ISSUER,
+        "discovery_url": f"{_ENTRA_ISSUER}/.well-known/openid-configuration",
+        "client_id": "6fd50bdd-9701-4244-a489-0059e8baba49",
         "client_secret": _SECRET,
     }
     values.update(changes)
@@ -82,10 +98,32 @@ class KeycloakFixture:
             return httpx.Response(500, text=f"never expose {_SECRET} {_MANAGEMENT_SECRET}")
         if path == "/auth/admin/realms/akb/identity-provider/import-config":
             body = json.loads(request.content)
-            assert body == {
-                "providerId": "oidc",
-                "fromUrl": f"{_ISSUER}/.well-known/openid-configuration",
-            }
+            assert body["providerId"] == "oidc"
+            if body["fromUrl"] == f"{_ENTRA_ISSUER}/.well-known/openid-configuration":
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": _ENTRA_ISSUER,
+                        "authorizationUrl": (
+                            f"https://login.microsoftonline.com/{_ENTRA_TENANT}"
+                            "/oauth2/v2.0/authorize"
+                        ),
+                        "tokenUrl": (
+                            f"https://login.microsoftonline.com/{_ENTRA_TENANT}"
+                            "/oauth2/v2.0/token"
+                        ),
+                        "jwksUrl": (
+                            f"https://login.microsoftonline.com/{_ENTRA_TENANT}"
+                            "/discovery/v2.0/keys"
+                        ),
+                        "userInfoUrl": "https://graph.microsoft.com/oidc/userinfo",
+                        "logoutUrl": (
+                            f"https://login.microsoftonline.com/{_ENTRA_TENANT}"
+                            "/oauth2/v2.0/logout"
+                        ),
+                    },
+                )
+            assert body["fromUrl"] == f"{_ISSUER}/.well-known/openid-configuration"
             return httpx.Response(
                 200,
                 json={
@@ -191,6 +229,38 @@ async def test_configure_creates_disabled_then_exactly_reads_back():
     assert isinstance(config, dict)
     assert config["clientSecret"] == _SECRET
     assert "untrustedImportedField" not in config
+
+
+async def test_generic_oidc_configure_accepts_entra_discovery_without_provider_code():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+
+    provider = (await control.configure(_generic_spec())).after
+
+    assert provider.provider_type == "oidc"
+    assert provider.state == "configured_disabled"
+    assert provider.redirect_uri.endswith("/broker/entra-dn/endpoint")
+    stored = fixture.providers["entra-dn"]
+    config = stored["config"]
+    assert isinstance(config, dict)
+    assert config["clientAuthMethod"] == "client_secret_post"
+    assert config["userInfoUrl"] == "https://graph.microsoft.com/oidc/userinfo"
+
+
+async def test_generic_oidc_does_not_silently_inherit_keycloak_identity_migration():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_generic_spec())
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.verify_identity_prelink(
+            "entra-dn",
+            broker_subject="22222222-2222-2222-2222-222222222222",
+            upstream_subject="opaque-upstream-subject",
+        )
+
+    assert captured.value.code == "provider_configuration_invalid"
+    assert all("/users/" not in path for _, path in fixture.requests)
 
 
 async def test_configure_rejects_a_valid_but_non_exact_readback():

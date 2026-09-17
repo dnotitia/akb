@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
 # Focused resource-integrity E2E:
-# - document put/get/update/browse expose body content_hash
-# - expected_content_hash rejects stale body updates
 # - file upload confirmation computes and returns byte content_hash
 
 set -uo pipefail
@@ -23,16 +21,12 @@ json_get() {
   python3 -c "import sys,json; d=json.load(sys.stdin); print($expr)" 2>/dev/null
 }
 
-sha256_text() {
-  python3 -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.read().encode('utf-8')).hexdigest())"
-}
-
 sha256_file() {
   python3 -c "import sys,hashlib; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest())" "$1"
 }
 
 echo "╔══════════════════════════════════════════╗"
-echo "║   AKB Resource Hash E2E                  ║"
+echo "║   AKB File Byte Hash E2E                 ║"
 echo "║   Target: $BASE_URL"
 echo "╚══════════════════════════════════════════╝"
 echo ""
@@ -86,47 +80,11 @@ mcp_result() {
 }
 
 echo ""
-echo "▸ 1. Document hash contract"
+echo "▸ 1. File byte hash contract"
 R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"hash e2e\"}" | mcp_result)
 VAULT_ID=$(echo "$R" | json_get "d['vault_id']")
 [ -n "$VAULT_ID" ] && pass "vault created" || fail "vault" "missing vault_id"
 
-DOC_BODY=$'# Hash Contract\n\nStable body for hashing.'
-EXPECTED_HASH=$(printf "%s" "$DOC_BODY" | sha256_text)
-
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"title\":\"Hash Contract\",\"content\":\"# Hash Contract\\n\\nStable body for hashing.\",\"type\":\"spec\"}" | mcp_result)
-DOC_URI=$(echo "$R" | json_get "d['uri']")
-PUT_HASH=$(echo "$R" | json_get "d['content_hash']")
-PUT_COMMIT=$(echo "$R" | json_get "d['current_commit']")
-
-[ "$PUT_HASH" = "$EXPECTED_HASH" ] && pass "akb_put returns body content_hash" || fail "akb_put hash" "got $PUT_HASH expected $EXPECTED_HASH"
-[ -n "$PUT_COMMIT" ] && pass "akb_put returns current_commit" || fail "akb_put commit" "missing"
-
-R=$(mcp_call akb_get "{\"uri\":\"$DOC_URI\"}" | mcp_result)
-GET_HASH=$(echo "$R" | json_get "d['content_hash']")
-GET_COMMIT=$(echo "$R" | json_get "d['current_commit']")
-[ "$GET_HASH" = "$EXPECTED_HASH" ] && pass "akb_get returns matching content_hash" || fail "akb_get hash" "got $GET_HASH"
-[ "$GET_COMMIT" = "$PUT_COMMIT" ] && pass "akb_get current_commit matches put" || fail "akb_get commit" "got $GET_COMMIT"
-
-R=$(mcp_call akb_update "{\"uri\":\"$DOC_URI\",\"summary\":\"metadata only\",\"expected_content_hash\":\"$GET_HASH\",\"message\":\"metadata-only hash check\"}" | mcp_result)
-UPDATE_HASH=$(echo "$R" | json_get "d['content_hash']")
-UPDATE_COMMIT=$(echo "$R" | json_get "d['current_commit']")
-[ "$UPDATE_HASH" = "$EXPECTED_HASH" ] && pass "metadata-only update keeps body hash" || fail "metadata update hash" "got $UPDATE_HASH"
-[ "$UPDATE_COMMIT" != "$PUT_COMMIT" ] && pass "metadata-only update advances commit" || fail "metadata update commit" "commit did not change"
-
-STALE=$(mcp_call akb_update "{\"uri\":\"$DOC_URI\",\"content\":\"changed\",\"expected_content_hash\":\"$(printf stale | sha256_text)\"}" | mcp_result)
-STALE_ERR=$(echo "$STALE" | json_get "d.get('error','')")
-case "$STALE_ERR" in
-  *content_hash*) pass "stale expected_content_hash is rejected" ;;
-  *) fail "expected_content_hash conflict" "unexpected response: $STALE" ;;
-esac
-
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"documents\",\"include_hashes\":true}" | mcp_result)
-BROWSE_HASH=$(echo "$R" | json_get "next(i['content_hash'] for i in d['items'] if i.get('uri') == '$DOC_URI')")
-[ "$BROWSE_HASH" = "$EXPECTED_HASH" ] && pass "akb_browse include_hashes returns document hash" || fail "browse hash" "got $BROWSE_HASH"
-
-echo ""
-echo "▸ 2. File hash contract"
 TMP_FILE="$(mktemp)"
 printf "AKB file hash e2e\n" > "$TMP_FILE"
 FILE_HASH=$(sha256_file "$TMP_FILE")

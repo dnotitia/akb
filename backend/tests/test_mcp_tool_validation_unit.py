@@ -88,7 +88,7 @@ def test_relation_tool_descriptions_match_the_vault_boundary():
     tools = {tool.name: tool for tool in TOOLS}
 
     for tool_name in ("akb_put", "akb_update"):
-        properties = tools[tool_name].inputSchema["properties"]
+        properties = tools[tool_name].input_schema["properties"]
         for field in ("depends_on", "related_to"):
             description = properties[field]["description"].lower()
             assert "same-vault" in description

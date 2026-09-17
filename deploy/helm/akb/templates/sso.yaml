@@ -1,0 +1,197 @@
+{{- if .Values.sso.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-postgres
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: keycloak-database
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak-postgres
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-database
+spec:
+  serviceName: keycloak-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: keycloak-database
+  template:
+    metadata:
+      labels:
+        {{- include "akb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: keycloak-database
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ .Values.sso.postgres.image | quote }}
+          imagePullPolicy: {{ .Values.sso.postgres.pullPolicy }}
+          envFrom:
+            - secretRef: {name: akb-keycloak-db-credentials}
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          volumeMounts:
+            - {name: pgdata, mountPath: /var/lib/postgresql/data}
+          resources:
+            {{- toYaml .Values.sso.postgres.resources | nindent 12 }}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, keycloak, -d, keycloak]}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+  volumeClaimTemplates:
+    - metadata: {name: pgdata}
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.sso.postgres.persistence.storageClass }}
+        storageClassName: {{ .Values.sso.postgres.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ .Values.sso.postgres.persistence.size }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: keycloak
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-headless
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: keycloak
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak
+spec:
+  serviceName: keycloak-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: keycloak
+  template:
+    metadata:
+      labels:
+        {{- include "akb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: keycloak
+    spec:
+      securityContext: {fsGroup: 1000, runAsNonRoot: true, runAsUser: 1000}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: keycloak
+          image: {{ .Values.sso.keycloak.image | quote }}
+          imagePullPolicy: {{ .Values.sso.keycloak.pullPolicy }}
+          args: [start]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: management, containerPort: 9000}
+          env:
+            - {name: KC_DB, value: postgres}
+            - {name: KC_DB_URL_HOST, value: keycloak-postgres}
+            - name: KC_DB_URL_DATABASE
+              valueFrom: {secretKeyRef: {name: akb-keycloak-db-credentials, key: POSTGRES_DB}}
+            - name: KC_DB_USERNAME
+              valueFrom: {secretKeyRef: {name: akb-keycloak-db-credentials, key: POSTGRES_USER}}
+            - name: KC_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: akb-keycloak-db-credentials, key: POSTGRES_PASSWORD}}
+            - {name: KC_HOSTNAME, value: {{ .Values.sso.keycloakPublicUrl | quote }}}
+            - {name: KC_HTTP_ENABLED, value: "true"}
+            - {name: KC_PROXY_HEADERS, value: xforwarded}
+            - {name: KC_HEALTH_ENABLED, value: "true"}
+            - {name: KC_METRICS_ENABLED, value: "true"}
+            - {name: KC_BOOTSTRAP_ADMIN_CLIENT_ID, value: akb-bootstrap-temporary}
+            - name: KC_BOOTSTRAP_ADMIN_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: akb-keycloak-bootstrap, key: client-secret}}
+          resources:
+            {{- toYaml .Values.sso.keycloak.resources | nindent 12 }}
+          startupProbe:
+            httpGet: {path: /health/started, port: management}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health/ready, port: management}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health/live, port: management}
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 6
+{{- if .Values.sso.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak-ingress
+  labels:
+    {{- include "akb.labels" . | nindent 4 }}
+  {{- with .Values.sso.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.sso.ingress.className }}
+  {{- if .Values.sso.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.sso.ingress.host | quote }}]
+      secretName: {{ .Values.sso.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.sso.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port: {number: 8080}
+{{- end }}
+{{- end }}

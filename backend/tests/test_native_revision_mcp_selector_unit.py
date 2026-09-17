@@ -54,6 +54,6 @@ async def test_native_selector_ambiguity_survives_mcp_wire_envelope(
         {"uri": "akb://v/doc/doc.md", selector_key: "abcdef0"},
     )
 
-    envelope = json.loads(response[0].text)
+    envelope = json.loads(response.content[0].text)
     assert envelope["code"] == "native_revision_selector_ambiguous"
     assert envelope["code"] != "conflict"

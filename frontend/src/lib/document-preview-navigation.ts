@@ -4,17 +4,19 @@ export interface DocumentPreviewNavigationState {
   documentPreview: true;
   backgroundLocation: Location;
   returnFocusId?: string;
+  returnFocusFallbackId?: string;
 }
 
 /**
- * Preserve the page that launched a search result so a document can open as a
- * route-backed preview without losing the query, filters, or result scroll.
+ * Preserve the launching page so a document can open as a route-backed preview
+ * without losing search or inbox filters, scroll, or the initiating control.
  */
 export function documentPreviewState(
   backgroundLocation: Location,
   returnFocusId?: string,
+  returnFocusFallbackId?: string,
 ): DocumentPreviewNavigationState {
-  return { documentPreview: true, backgroundLocation, returnFocusId };
+  return { documentPreview: true, backgroundLocation, returnFocusId, returnFocusFallbackId };
 }
 
 /**
@@ -45,4 +47,10 @@ export function documentPreviewReturnFocusId(location: Location) {
   return state?.documentPreview === true && typeof state.returnFocusId === "string"
     ? state.returnFocusId
     : null;
+}
+
+export function documentPreviewReturnFocusFallbackId(location: Location) {
+  const state = location.state as Partial<DocumentPreviewNavigationState> | null;
+  return state?.documentPreview === true && typeof state.returnFocusFallbackId === "string"
+    ? state.returnFocusFallbackId : null;
 }

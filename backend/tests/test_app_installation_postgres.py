@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +16,8 @@ import pytest
 from app.config import settings
 from app.exceptions import ConflictError, ForbiddenError
 from app.services import app_installation_service as installation
+from app.services import app_resource_service as resources
+from app.services import app_rollout_service as rollout
 from app.services import access_service
 from app.services.app_identity_service import AppPrincipal
 from app.services.auth_service import AuthenticatedUser
@@ -30,6 +31,7 @@ _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "051_app_credentials.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
+    _BACKEND / "app" / "db" / "migrations" / "095_app_release_manifest_v2.py",
 ]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -90,13 +92,24 @@ async def _app(pool, label: str) -> uuid.UUID:
         )
 
 
-async def _release(pool, app_id: uuid.UUID, version: str, fingerprint: str = "a" * 64):
+async def _release(pool, app_id: uuid.UUID, version: str):
+    async with pool.acquire() as conn:
+        app_key = await conn.fetchval(
+            "SELECT app_key FROM app_definitions WHERE id=$1", app_id
+        )
     manifest = {
-        "steps": [{"id": "prepare"}],
-        "expected_schema_fingerprint": fingerprint,
+        "manifest_version": 2,
+        "app_key": app_key,
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": []},
+        "transition_plans": [{"source": "fresh", "steps": []}],
     }
-    encoded = json.dumps(manifest, separators=(",", ":"))
-    checksum = hashlib.sha256(encoded.encode()).hexdigest()
+    checksum = rollout.manifest_checksum(manifest, version=version)
+    normalized = rollout.validate_manifest(manifest, checksum, version=version)
+    stored_manifest = rollout.manifest_storage_projection(normalized)
+    encoded = json.dumps(stored_manifest, separators=(",", ":"))
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
@@ -384,7 +397,7 @@ async def test_restore_requires_compatibility_and_uses_next_generation(lifecycle
             app_id,
             vault_id,
             release_id,
-            "a" * 64,
+            resources.canonical_table_fingerprint([]),
         )
         await conn.execute(
             """

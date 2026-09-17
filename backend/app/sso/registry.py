@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import ModuleType
 
-from app.sso.providers import keycloak_oidc
+from app.sso.providers import generic_oidc, keycloak_oidc
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +18,10 @@ _DEFINITIONS = {
     keycloak_oidc.PROVIDER_TYPE: ProviderDefinition(
         provider_type=keycloak_oidc.PROVIDER_TYPE,
         module=keycloak_oidc,
+    ),
+    generic_oidc.PROVIDER_TYPE: ProviderDefinition(
+        provider_type=generic_oidc.PROVIDER_TYPE,
+        module=generic_oidc,
     ),
 }
 

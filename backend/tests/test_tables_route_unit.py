@@ -114,6 +114,7 @@ async def test_execute_sql_route_serialises_envelope_and_forwards_params(monkeyp
     assert captured == {
         "vault_names": ["demo"],
         "user_id": _User.user_id,
+        "actor_id": _User.username,
         "sql": "SELECT $1::int AS value",
         "params": [7],
         "is_admin": False,

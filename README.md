@@ -12,7 +12,7 @@
 
 [![License: BSL 1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](./LICENSE)
 [![npm: akb-mcp](https://img.shields.io/npm/v/akb-mcp.svg?label=npm%3A%20akb-mcp)](https://www.npmjs.com/package/akb-mcp)
-[![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-orange.svg)](https://modelcontextprotocol.io)
+[![MCP](https://img.shields.io/badge/MCP-2026--07--28%20%2B%20legacy-orange.svg)](https://modelcontextprotocol.io)
 
 ## Works with
 
@@ -29,6 +29,21 @@ optional **MCP OAuth Resource Server** path turned on (via Keycloak as
 the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-connectors.md))
 also accept Claude Code's `mcp add --transport http` + `mcp login` flow
 end-to-end, without a PAT.
+
+## MCP protocol compatibility
+
+AKB keeps one tool and authorization core behind two protocol adapters:
+
+| Surface | Modern | Legacy |
+|---|---|---|
+| Direct HTTP `/mcp/` | `2026-07-28` stateless `server/discover` and per-request `_meta` with `Mcp-Protocol-Version` / `Mcp-Method` (and `Mcp-Name` for named calls) | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` initialize + `Mcp-Session-Id` lifecycle |
+| `akb-mcp` stdio proxy | `2026-07-28` discovery and per-request metadata | `2025-06-18` initialize |
+
+The proxy answers either handshake locally and normalizes backend calls to the
+modern stateless contract when available. Legacy backend sessions are used
+only during a rolling upgrade when modern discovery is unavailable. A process
+cannot mix generations, and unsupported revisions or conflicting protocol
+evidence fail closed before a tool or local-file operation runs.
 
 ## Plugins
 
@@ -65,7 +80,7 @@ agent, sign up with any email (a throwaway address is fine) and point the
 > ⚠️ **Throwaway demo.** It is public, wiped and re-seeded weekly, and runs on
 > minimal resources with **no uptime, privacy, or data guarantees**. Don't put
 > anything real or sensitive in it — treat every write as public and ephemeral.
-> For real use, [self-host](#quick-start) in three containers.
+> For real use, [self-host](#quick-start) with Docker Compose or Kubernetes.
 
 ## Why AKB
 
@@ -98,12 +113,12 @@ across systems (AKB: `bge-m3@1024`), so read this as a stack-level comparison.
 
 **Core stays small; flexibility comes from extension, not built-in
 automation.** AKB does not ship its own consolidator, summariser, or
-"knowledge gardener" — instead every write emits a structured event to a
-Redis Stream (`akb:events`). Operators wire any external consumer
-(periodic synthesis bot, doc-rot reaper, weekly-digest agent, audit
+"knowledge gardener" — instead every write records a structured event in the
+PostgreSQL outbox. When `redis_url` is configured, the publisher fans those
+events out to a Redis Stream (`akb:events`). Operators wire any external
+consumer (periodic synthesis bot, doc-rot reaper, weekly-digest agent, audit
 trail, …) on top, with no patches to the core. The base contract is a
-read/write store; opinions about *what to do with* the knowledge live
-outside.
+read/write store; opinions about *what to do with* the knowledge live outside.
 
 ## Architecture
 
@@ -261,8 +276,10 @@ down*; AKB stores, versions, searches, governs, and serves it to agents. See
 
 ## Quick Start
 
-AKB ships as a **3-container stack** (PostgreSQL with pgvector + backend +
-frontend). For semantic (dense) search you bring an OpenAI-compatible
+The default Docker Compose stack runs four long-lived services: PostgreSQL
+with pgvector, MinIO, the backend, and the frontend. A one-shot
+`minio-bootstrap` service creates the local file bucket before the backend
+starts. For semantic (dense) search you bring an OpenAI-compatible
 embedding endpoint (OpenAI, OpenRouter, self-hosted vLLM/TEI, etc.). It is
 not strictly required: with no embed endpoint (or during an outage) the
 pgvector and Qdrant drivers **degrade to BM25-only** lexical search rather
@@ -304,6 +321,10 @@ any deployment. Process composition is the narrow exception:
 `AKB_TOKENIZER_PROCESSES=1..4` can lower the per-process tokenizer pool for a
 deployment container. The Kubernetes base owns those two operational values;
 business, auth, storage, and provider settings remain in the YAML files.
+
+Compose also runs the API and worker separately. See the
+[local deployment guide](deploy/compose/README.md) for existing-volume upgrades,
+configuration changes, and remote-access URLs.
 
 Ordinary registration always creates a non-admin account, including on an
 empty database. Administrator bootstrap is available only through the
@@ -376,8 +397,12 @@ its ordinary-login option without redeploying AKB. The option becomes a usable
 button only when the server-side browser-session capability is ready. Client
 secrets are write-only, and an enabled provider must be disabled before
 reconfiguration.
-See the [SSO provider guide](./docs/sso/README.md) and the first reference
-integration, [Keycloak OIDC behind Keycloak](./docs/sso/providers/keycloak-oidc.md).
+See the [SSO provider guide](./docs/sso/README.md), the standards-based
+[generic OIDC integration](./docs/sso/providers/oidc.md), and the stricter
+[Keycloak OIDC reference](./docs/sso/providers/keycloak-oidc.md). Existing
+Kubernetes installations should also follow the
+[local-to-SSO cutover runbook](./docs/sso/kubernetes-cutover.md) instead of
+treating `auth_mode` as a rolling one-line configuration change.
 
 The dedicated admin callback stores no Keycloak access, refresh, or ID token.
 It creates a short-lived opaque HttpOnly admin cookie plus a CSRF token;
@@ -546,10 +571,20 @@ best-effort and never raises into the serving path. See
 
 ### Production deployment
 
-For Kubernetes, see [`deploy/k8s/README.md`](./deploy/k8s/README.md). The
-`deploy/k8s/` directory contains a generic kustomize base; provide your
-own registry, hostname, and TLS issuer via the documented env vars or an
-operator-private overlay under `deploy/k8s/internal/`.
+For Kubernetes, start with the
+[`deployment guide`](./deploy/k8s/README.md). AKB provides standalone local and
+standalone-SSO resource sets through both Helm and Kustomize.
+
+- Use the dependency-free [`AKB Helm chart`](./deploy/helm/akb/README.md) for a
+  standard `helm upgrade --install` workflow.
+- Use [`deploy/k8s`](./deploy/k8s/README.md) for the standalone Kustomization or
+  `deploy/k8s/standalone-sso` for an installation-owned Keycloak stack.
+- Both paths consume pre-existing, operator-owned Kubernetes Secrets. AKB does
+  not install or operate a credential service or synchronization controller.
+
+Real hostnames, registries, storage classes, TLS issuers, and provider settings
+belong in Helm values or an operator-owned Kustomize overlay; do not commit
+production credentials to this repository.
 
 ## Project Structure
 
@@ -575,8 +610,13 @@ akb/
 │   ├── app.yaml.example      # Non-secret runtime settings
 │   └── secret.yaml.example   # API keys, passwords (gitignored when not .example)
 ├── deploy/
-│   └── k8s/                  # Generic kustomize base for Kubernetes
-└── docker-compose.yaml       # 3-container local stack (postgres + backend + frontend)
+│   ├── all-in-one/           # Single-container demo image
+│   ├── helm/
+│   │   └── akb/              # AKB chart with local and standalone-SSO profiles
+│   └── k8s/
+│       ├── *.yaml            # Standalone AKB + PostgreSQL resources
+│       └── standalone-sso/   # Standalone plus owned Keycloak and its database
+└── docker-compose.yaml       # Local stack (PG + MinIO + API + worker + frontend)
 ```
 
 ## Tech Stack
@@ -591,17 +631,19 @@ akb/
 - **Audit log** (optional): hash-chained append-only JSONL at the MCP
   dispatch point + optional WORM S3 handoff; producer-only (SIEM owns retention)
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
-- **Auth**: JWT + Personal Access Tokens (PATs)
+- **Auth**: local RS256 sessions or Keycloak SSO, plus Personal Access Tokens
+  (PATs) for API and MCP access
 - **MCP**: Streamable HTTP (backend) + stdio proxy (`akb-mcp` on npm)
 
 ## Versioning
 
-AKB follows [SemVer](https://semver.org/). The product version lives in
-`backend/pyproject.toml` (`[project].version`) and is mirrored to
-`frontend/package.json` via `scripts/bump-version.sh <x.y.z>`. Each
-`deploy/k8s/deploy.sh` run tags the Docker images with both the explicit
-version (`:${VERSION}`) and `:latest`, so historical builds remain
-pullable for rollback.
+AKB follows [SemVer](https://semver.org/). The backend product version lives in
+`backend/pyproject.toml` (`[project].version`). A coordinated release uses
+`scripts/bump-version.sh <x.y.z>` to update it together with
+`frontend/package.json`. With image building enabled, each
+`deploy/k8s/deploy.sh` run tags the Docker images with both the
+explicit backend version (`:${VERSION}`) and `:latest`, so historical builds
+remain pullable for rollback.
 
 `packages/akb-mcp-client` (the `akb-mcp` npm proxy) follows its own npm
 semver lifecycle and is **not** tied to the product version.

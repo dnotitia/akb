@@ -1,15 +1,20 @@
 {
   "name": "akb-mcp",
-  "version": "2.2.2",
+  "version": "2.3.2",
   "mcpName": "io.github.dnotitia/akb",
   "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
   "bin": {
     "akb-mcp": "./bin/akb-mcp.mjs"
   },
   "scripts": {
-    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs"
+    "inspect": "node scripts/mcp-inspector-smoke.mjs",
+    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs"
   },
   "type": "module",
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/inspector": "2.4.0"
+  },
   "files": ["bin/", "lib/", "CHANGELOG.md"],
   "keywords": ["mcp", "akb", "knowledge-base", "claude-code", "cursor", "copilot", "ai-agent"],
   "license": "MIT",

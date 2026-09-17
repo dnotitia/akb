@@ -17,6 +17,11 @@ from app.api.routes.admin_auth import (
 )
 from app.config import settings
 from app.exceptions import ForbiddenError
+from app.models.admin_sso import (
+    SsoIdentityMigrationResponse,
+    SsoProviderCatalogResponse,
+    SsoProviderMutationResponse,
+)
 from app.services import audit_log
 from app.sso.keycloak_admin import (
     ProviderControlError,
@@ -298,7 +303,11 @@ def _raise_identity_migration_error(error: IdentityMigrationError) -> None:
     ) from error
 
 
-@router.get("/admin/sso/providers", summary="List managed SSO providers")
+@router.get(
+    "/admin/sso/providers",
+    summary="List managed SSO providers",
+    response_model=SsoProviderCatalogResponse,
+)
 async def list_sso_providers(
     _actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
 ):
@@ -321,6 +330,7 @@ async def list_sso_providers(
 @router.put(
     "/admin/sso/providers/{alias}",
     summary="Configure a disabled SSO provider",
+    response_model=SsoProviderMutationResponse,
 )
 async def configure_sso_provider(
     alias: str,
@@ -408,6 +418,7 @@ async def _toggle_sso_provider(
 
 @router.post(
     "/admin/sso/providers/{alias}/enable",
+    response_model=SsoProviderMutationResponse,
     summary="Enable a configured SSO provider",
 )
 async def enable_sso_provider(
@@ -419,6 +430,7 @@ async def enable_sso_provider(
 
 @router.post(
     "/admin/sso/providers/{alias}/disable",
+    response_model=SsoProviderMutationResponse,
     summary="Disable an SSO provider",
 )
 async def disable_sso_provider(
@@ -487,6 +499,7 @@ async def _verify_and_inspect_identity_migration(
 
 @router.post(
     "/admin/sso/providers/{alias}/identity-migrations/preflight",
+    response_model=SsoIdentityMigrationResponse,
     summary="Verify an exact broker identity migration without writing",
 )
 async def preflight_sso_identity_migration(
@@ -611,6 +624,7 @@ async def _mutate_sso_identity_migration(
 
 @router.post(
     "/admin/sso/providers/{alias}/identity-migrations/apply",
+    response_model=SsoIdentityMigrationResponse,
     summary="Bind an operator-prelinked broker identity to an AKB user",
 )
 async def apply_sso_identity_migration(
@@ -628,6 +642,7 @@ async def apply_sso_identity_migration(
 
 @router.post(
     "/admin/sso/providers/{alias}/identity-migrations/rollback",
+    response_model=SsoIdentityMigrationResponse,
     summary="Remove an AKB broker identity binding before operator cleanup",
 )
 async def rollback_sso_identity_migration(

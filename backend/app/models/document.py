@@ -17,6 +17,7 @@ from app.util.text import NFCModel
 # typo can't silently land in the frontmatter and DB. ("superseded" was a
 # never-operationalized 4th state and was removed in 0.4.4.)
 DOC_STATUSES = ("draft", "active", "archived")
+TitleConflictPolicy = Literal["allow", "reject"]
 
 
 class DocumentFrontmatter(NFCModel):
@@ -61,6 +62,11 @@ class DocumentPutRequest(NFCModel):
     # path stays stable (overview/vault-skill.md) even when the title
     # is friendly text like "{vault} Guide".
     slug: str | None = None
+    # Compatibility-safe soft uniqueness. Existing MCP/API/import callers omit
+    # this field and retain AKB's historical lossless behaviour. Interactive UI
+    # flows opt into `reject`, surface the existing document, then retry with
+    # `allow` only after the user explicitly chooses to keep a duplicate title.
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentUpdateRequest(NFCModel):
@@ -84,6 +90,7 @@ class DocumentUpdateRequest(NFCModel):
     # tracks the document body returned by akb_get; frontmatter-only
     # metadata changes do not change it.
     expected_content_hash: str | None = None
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentMoveRequest(NFCModel):
@@ -92,6 +99,7 @@ class DocumentMoveRequest(NFCModel):
     collection: str | None = None
     slug: str | None = None
     message: str | None = None
+    title_conflict_policy: TitleConflictPolicy = "allow"
 
 
 class DocumentEditRequest(NFCModel):
@@ -210,12 +218,30 @@ class BrowseItem(BaseModel):
     version: str | None = None
 
 
+class BrowseContext(BaseModel):
+    """Metadata for the browse root itself.
+
+    Collection summaries describe why a collection exists; they are context
+    for the resources beneath it, not searchable resources of their own.
+    Vault descriptions serve the same purpose at the vault root.
+    """
+
+    type: Literal["vault", "collection"]
+    uri: str
+    name: str
+    path: str
+    summary: str | None = None
+    description: str | None = None
+
+
 class BrowseResponse(BaseModel):
     """Response for akb_browse."""
 
     kind: Literal["document"] = "document"
     vault: str
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     path: str
+    context: BrowseContext | None = None
     items: list[BrowseItem]
     hint: str | None = None
 
@@ -233,12 +259,23 @@ class SearchResult(BaseModel):
     vault: str
     path: str
     title: str
+    status: str | None = None
     collection: str | None = None                     # containing collection (null at vault root)
+    collection_summary: str | None = None             # parent collection intent; not part of search scoring
+    vault_description: str | None = None              # containing vault intent; not part of search scoring
     doc_type: str | None = None
     summary: str | None = None
     tags: list[str] = Field(default_factory=list)
     score: float
     matched_section: str | None = None                # the chunk that matched
+    # Where the matched chunk sits in the document. Additive, and never a
+    # substitute for `matched_section`: that is the chunk body, these say
+    # which section it came from and which chunk of the document it was, so
+    # a caller can follow up with `akb_drill_down(section=...)` instead of
+    # re-searching. Null when the chunk row is gone (a delete racing the
+    # vector index) or the driver could not name it.
+    section_path: str | None = None                   # heading path of that chunk
+    chunk_index: int | None = None                    # its ordinal in the document
 
 
 class SearchResponse(BaseModel):
@@ -265,6 +302,7 @@ class SearchResponse(BaseModel):
     """
 
     kind: Literal["search"] = "search"
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     query: str
     total: int
     returned: int = 0
@@ -300,19 +338,21 @@ class GrepMatch(BaseModel):
     """Single matched line within a grep result."""
 
     section: str | None = None
+    # One-based searched-body line; Documents exclude parsed frontmatter.
+    line: int | None = Field(default=None, ge=1)
     text: str
 
 
 class GrepResult(BaseModel):
-    """Single document returned by grep."""
+    """Single Document or text File returned by grep."""
 
     uri: str
     vault: str
     path: str
     title: str
-    # Additive native measurement identity. Legacy Document grep leaves these
-    # unset, preserving its frozen response; W3b needs them to distinguish an
-    # admitted searchable text File and bind the result to its current Head.
+    status: str | None = None
+    # Native Document and text File results identify the Head that was read.
+    # Legacy chunk-based grep leaves this additive identity unset.
     resource_type: str | None = None
     revision: str | None = None
     content_hash: str | None = None
@@ -362,18 +402,24 @@ class GrepResponse(BaseModel):
     """
 
     kind: Literal["grep"] = "grep"
+    archive_scope: Literal["unarchived", "archived", "all"] | None = None
     pattern: str
     regex: bool
     error: str | None = None
     returned_docs: int | None = None
     returned_matches: int | None = None
     total_docs: int | None = None
+    total_resources: int | None = None
+    returned_resources: int | None = None
     total_matches: int | None = None
     truncated: bool | None = None
     truncation: GrepTruncation | None = None
     hint: str | None = None
     results: list[GrepResult] | None = None
     by_doc: dict[str, int] | None = None
+    by_resource: dict[str, int] | None = None
+    resources: list[dict[str, str]] | None = None
+    n_resources: int | None = None
     n_files: int | None = None
     files: list[str] | None = None
     replace: str | None = None

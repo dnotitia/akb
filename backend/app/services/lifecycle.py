@@ -18,6 +18,8 @@ from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
 from app.services import (
     asset_gc_worker,
+    account_deletion_worker,
+    sso_account_sync,
     audit_log,
     app_rollout_worker,
     delete_worker,
@@ -27,6 +29,7 @@ from app.services import (
     http_pool,
     m1_file_transfer_reaper,
     metadata_worker,
+    notification_worker,
     queue_rescuer,
     s3_delete_worker,
     sparse_encoder,
@@ -44,9 +47,11 @@ from app.services.revision_backend import (
     selected_document_revision_backend,
 )
 from app.services.sso_callback_urls import is_backchannel_logout_uri
+from app.services.search_capabilities import metadata_enabled
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
+from app.stats import listener as stats_listener, sampler as stats_sampler
 
 logger = logging.getLogger("akb.lifecycle")
 
@@ -183,6 +188,12 @@ def _validate_required_settings() -> None:
 async def init_storage() -> None:
     """Initialize DB schema/migrations and eagerly construct vector-store driver."""
     _validate_required_settings()
+    if settings.model_api_governance_mode == "platform_hard":
+        from app.services.adapters import s3_adapter
+
+        # Provisioning is owned by the managed control plane. Never become
+        # ready with an absent/inaccessible bucket or unusable STS identity.
+        await asyncio.to_thread(s3_adapter.ensure_bucket, settings.s3_bucket)
     await pre_migration_revision_authority_guard()
     await init_db()
     logger.info("Database initialized")
@@ -291,6 +302,20 @@ def _start_api_local(started: list[str]) -> None:
     else:
         logger.info("tool_usage collection disabled (tool_usage.enabled=false)")
 
+    # `/stats` lives on its own socket in this same process, so it is composed
+    # with the serving process and never with the worker one. The sampler is
+    # started only alongside a bound listener — nothing else reads its cache,
+    # and sampling into a snapshot nobody can fetch is pure database load.
+    if stats_listener.start():
+        stats_sampler.start()
+        started.append("stats_listener")
+        started.append("stats_sampler")
+    else:
+        logger.info(
+            "stats listener disabled (neither stats.port nor %s is set)",
+            stats_listener.PORT_ENV_VAR,
+        )
+
 
 def start_api_runtime() -> None:
     """Start only process-local serving support, never durable queue workers."""
@@ -304,6 +329,9 @@ def start_workers(*, include_api_local: bool = True) -> None:
     start_runtime_pools()
     embed_worker.start()
     delete_worker.start()
+    notification_worker.start()
+    account_deletion_worker.start()
+    sso_account_sync.start()
     # ``start_workers`` is normally called from the FastAPI lifespan loop.
     # Keep direct, loop-free lifecycle probes (and import-time diagnostics)
     # side-effect free; the rollout runner owns asyncio tasks and cannot be
@@ -317,7 +345,8 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # External-Git mirrors are a Bare-Git subsystem. The feature kill-switch
     # still gates it within that mode, while PostgreSQL Native composes no
     # mirror poller because its vault storage has no Git write authority.
-    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    selected_backend = selected_document_revision_backend()
+    bare_git_selected = selected_backend == "bare_git"
     if bare_git_selected and settings.external_git_enabled:
         external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
@@ -359,7 +388,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # s3_delete_worker drains s3_delete_outbox into S3 deletes. Only
     # makes sense when S3 is configured; otherwise file uploads are
     # disabled altogether and the outbox stays empty forever.
-    if settings.s3_endpoint_url:
+    if settings.object_storage_enabled:
         asset_gc_worker.start()
         s3_delete_worker.start()
         started.append("asset_gc_worker")
@@ -379,7 +408,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"
         )
-    elif settings.llm_base_url and settings.llm_api_key:
+    elif metadata_enabled(settings, selected_backend):
         metadata_worker.start()
         started.append("metadata_worker")
     else:
@@ -429,6 +458,9 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         ("role_sync", lambda: get_role_sync().stop_reconcile_timer()),
         ("m1_file_transfer_reaper", m1_file_transfer_reaper.stop),
         ("events_publisher", events_publisher.stop),
+        ("notification_worker", notification_worker.stop),
+        ("account_deletion_worker", account_deletion_worker.stop),
+        ("sso_account_sync", sso_account_sync.stop),
         ("metadata_worker", metadata_worker.stop),
         ("external_git_poller", external_git_poller.stop),
         ("asset_gc_worker", asset_gc_worker.stop),
@@ -444,6 +476,8 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         components.extend([
             ("audit_uploader", audit_log.stop_uploader),
             ("tool_usage", lambda: tool_usage.stop()),
+            ("stats_listener", stats_listener.stop),
+            ("stats_sampler", stats_sampler.stop),
         ])
     tasks = [
         asyncio.create_task(_stop_component(name, stop), name=f"stop:{name}")
@@ -489,6 +523,14 @@ async def stop_api_runtime() -> None:
         asyncio.create_task(
             _stop_component("tool_usage", lambda: tool_usage.stop()),
             name="stop:tool_usage",
+        ),
+        asyncio.create_task(
+            _stop_component("stats_listener", stats_listener.stop),
+            name="stop:stats_listener",
+        ),
+        asyncio.create_task(
+            _stop_component("stats_sampler", stats_sampler.stop),
+            name="stop:stats_sampler",
         ),
     ]
     try:

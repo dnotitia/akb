@@ -216,11 +216,19 @@ def test_pg_ident_max_len_is_namedatalen_minus_one():
 
 
 def test_pg_table_name_length_boundary():
-    """E08 regression: a long vault + long table name can push
-    `vt_<vault>__<table>` exactly one byte over the limit, where PG
-    would silently truncate (risking a GRANT collision). Pin the math
-    that `create_table`'s pre-check guards against."""
+    """A long vault + long table name composes one byte over the limit,
+    where PG would silently truncate and risk a GRANT collision.
+
+    This used to assert that `pg_table_name` RETURNED the 64-byte name,
+    because `create_table` refused it a moment later. It no longer does:
+    refusing left the table uncreatable, so the pair is fitted here
+    instead and the collision the truncation risks is carried by a digest
+    over the original pair. What still has to hold is the boundary — the
+    63-byte name is untouched, which is what makes the change need no
+    migration."""
     fits = pg_table_name("a" * 27, "b" * 31)  # 3 + 27 + 2 + 31 = 63
-    over = pg_table_name("a" * 27, "b" * 32)  # 3 + 27 + 2 + 32 = 64
+    over = pg_table_name("a" * 27, "b" * 32)  # composes to 64
+    assert fits == "vt_" + "a" * 27 + "__" + "b" * 31
     assert len(fits) == PG_IDENT_MAX_LEN
-    assert len(over) == PG_IDENT_MAX_LEN + 1
+    assert len(over) <= PG_IDENT_MAX_LEN
+    assert over != fits

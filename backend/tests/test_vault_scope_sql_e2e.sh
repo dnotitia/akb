@@ -3,7 +3,7 @@
 # AKB per-PAT vault-scope (Option B) — PG-native (akb_sql) surface E2E.
 #
 # This is SURFACE 2 of the backstop (M2). Surface 1 (the doc tools /
-# check_vault_access) is proved by test_vault_scope_e2e.sh; here we prove the
+# check_vault_access) is proved by the SDK pytest scope scenario; here we prove the
 # raw-SQL surface: a scoped PAT's `akb_sql` is confined to its vault scope by
 # PostgreSQL ACL itself (SQLSTATE 42501) — NOT by an application string check.
 #

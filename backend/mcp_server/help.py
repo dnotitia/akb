@@ -898,7 +898,7 @@ Optionally pass `replace` to find-and-replace across all matching documents.
 | limit | | Max documents to return (default 20; does not limit writes) |
 | max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
 | count_only | | Return exact per-resource counts without snippets |
-| measurement_include_text_files | | Guarded native measurement mode: include admitted searchable text Files; binary Files stay excluded |
+| measurement_include_text_files | | Native mode: include admitted searchable text Files; binary Files stay excluded |
 
 ## When to use akb_grep vs akb_search
 | Need | Tool |
@@ -1050,7 +1050,7 @@ akb_list_vaults()
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| name | ✓ | Lowercase, hyphens allowed |
+| name | ✓ | Unique across this AKB installation; lowercase letters and digits with single hyphens between words. Becomes part of the canonical `akb://` URI |
 | description | | What this vault is for |
 | template | | Pre-populate with collections |
 
@@ -1060,7 +1060,11 @@ akb_list_vaults()
 ## Example
 ```
 akb_create_vault(name="project-x", description="Project X docs", template="engineering")
-```""",
+```
+
+If the name cannot be assigned, the tool returns the stable
+`vault_name_unavailable` conflict without revealing another Vault's owner,
+visibility, or state.""",
 
     "akb_create_collection": """# akb_create_collection — Create an Empty Collection
 
@@ -1086,14 +1090,15 @@ Requires writer role.""",
 
 The `path` is treated as a **prefix**, not a single row. Deleting `P`
 covers the row at `P` (if any) plus every sub-collection, document,
-and file under `P/`.
+file, and table under `P/`.
 
 - Empty mode (default): succeeds only if the row at `P` exists and
   nothing else lives under the prefix. Any sub-collection, document,
-  or file rejects with `not_empty` and the counts.
+  file, or table rejects with `not_empty` and the counts.
 - `recursive=true`: cascade-delete the row at `P` (if any), every
   sub-collection row beneath it, all documents (one git commit), and
-  all files (s3 outbox).
+  all files (s3 outbox). If any table is included, admin or owner role
+  is required and the physical PostgreSQL tables are dropped.
 - A path with no row and no descendants returns a NotFound error.
 
 ## Parameters
@@ -1101,7 +1106,7 @@ and file under `P/`.
 |-------|----------|-------------|
 | vault | ✓ | Vault name |
 | path | ✓ | Collection path (prefix) |
-| recursive | | Default `false`. Set `true` to cascade sub-collections + docs + files. |
+| recursive | | Default `false`. Set `true` to cascade sub-collections + docs + files + tables. |
 
 ## Examples
 ```
@@ -1109,7 +1114,7 @@ akb_delete_collection(vault="eng", path="old-specs")
 akb_delete_collection(vault="eng", path="legacy", recursive=True)
 ```
 
-Requires writer role.""",
+Requires writer role, or admin/owner when the collection contains tables.""",
 
     "akb_delete": """# akb_delete — Delete a Document
 

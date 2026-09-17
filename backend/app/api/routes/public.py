@@ -39,6 +39,7 @@ from pydantic import ConfigDict
 
 from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import assets
+from app.api.routes.files import _download_capability_slots
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
 from app.db.postgres import get_pool
@@ -47,6 +48,10 @@ from app.util.text import NFCModel
 from app.services import audit_log, file_service, publication_service
 from app.services import publication_rate_limit as pub_rl
 from app.services.access_service import check_vault_access
+from app.services.raw_mime_policy import (
+    RAW_INLINE_IMAGE_PREFIX,
+    is_inert_raw_mime,
+)
 from app.services.auth_service import AuthenticatedUser
 from app.services.publication_service import (
     PublicationError,
@@ -759,31 +764,10 @@ _RAW_PREVIEWABLE_MIMES = {
 # origin, streamed, view-counted) instead of a presigned S3 URL so the vault
 # name embedded in the S3 key never leaks and the view stays revocable. (F4)
 _RAW_INLINE_BINARY_MIMES = {"application/pdf"}
-_RAW_INLINE_IMAGE_PREFIX = "image/"
-# Provably-inert types served WITHOUT a CSP sandbox: raster images, PDF, and
-# plain/CSV/markdown text. Everything else /raw serves (text/html, xml, js, any
-# future active-document mime) is sandboxed by default — fail closed.
-_RAW_INERT_MIMES = {
-    "application/pdf",
-    "text/plain",
-    "text/csv",
-    "text/markdown",
-}
-# image/svg+xml is an image by MIME but an ACTIVE document — it can carry
-# <script> that runs same-origin on direct navigation. It must NOT ride the
-# generic image/ inert exemption; keep it sandboxed like HTML.
-_RAW_ACTIVE_IMAGE_MIMES = {"image/svg+xml", "image/svg"}
-
-
-def _is_inert_raw_mime(mime: str) -> bool:
-    """True when a /raw body can be served without a CSP sandbox — a raster
-    image, PDF, or plain text. SVG is explicitly excluded (scriptable), so it
-    falls through to the sandboxed default even though it starts with image/."""
-    if mime in _RAW_ACTIVE_IMAGE_MIMES:
-        return False
-    if mime.startswith(_RAW_INLINE_IMAGE_PREFIX):
-        return True
-    return mime in _RAW_INERT_MIMES
+# The inert/active split lives in `raw_mime_policy`: more than one route serves
+# stored bytes to a browser, and they must answer that question identically.
+_RAW_INLINE_IMAGE_PREFIX = RAW_INLINE_IMAGE_PREFIX
+_is_inert_raw_mime = is_inert_raw_mime
 
 
 @router.get(
@@ -830,7 +814,7 @@ async def publication_document_asset(slug: str, file_id: str, request: Request):
         row = await assets.load_asset_row(file_id, to_uuid(publication["vault_id"]))
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail="Asset not found") from exc
-    return await assets.image_asset_response(row, public=True)
+    return await assets.image_asset_response(row, public=True, request=request)
 
 
 @router.get(
@@ -1007,8 +991,27 @@ async def publication_download(slug: str, request: Request):
         except Exception as e:  # noqa: BLE001 — any storage failure → 502
             logger.warning("download storage error for %s: %s", slug, e)
             raise HTTPException(status_code=502, detail="File content is temporarily unavailable")
+        # Bounded like the capability download, and with the same budget:
+        # both hold a botocore connection and an anyio thread for the length
+        # of the transfer, and they draw on one pool. This path had no limit
+        # at all, which made the only unauthenticated byte route the one that
+        # could exhaust the others.
+        #
+        # The slot is released from the generator's `finally` so a client
+        # that disconnects mid-stream returns it too. `Semaphore.release` is
+        # not thread-safe and the generator runs in anyio's threadpool, so
+        # the release is marshalled back to the loop.
+        loop = asyncio.get_running_loop()
+        await _download_capability_slots.acquire()
+
+        def _bounded_chunks():
+            try:
+                yield from file_service.iter_object_chunks(file_storage["s3_key"])
+            finally:
+                loop.call_soon_threadsafe(_download_capability_slots.release)
+
         return StreamingResponse(
-            file_service.iter_object_chunks(file_storage["s3_key"]),
+            _bounded_chunks(),
             media_type=file_storage.get("mime_type") or "application/octet-stream",
             headers={
                 "Content-Disposition": file_service.content_disposition_attachment(
@@ -1323,7 +1326,15 @@ async def oembed(url: str, format: str = "json"):
         parsed = parse_uri(publication.get("resource_uri") or "")
         title = publication.get("title")
         if not title:
-            if rt == ResourceType.DOCUMENT:
+            if rt == ResourceType.DOCUMENT and (
+                publication.get("native_document_id") or publication_service._native_documents_enabled()
+            ):
+                try:
+                    doc_row = await publication_service._find_published_document(publication)
+                    title = doc_row["title"]
+                except (NotFoundError, PublicationError):
+                    title = None
+            elif rt == ResourceType.DOCUMENT:
                 doc_path = parsed.identifier if parsed and parsed.kind == "doc" else None
                 uri_vault = parsed.vault if parsed and parsed.kind == "doc" else None
                 raw_doc_id = publication.get("document_id")

@@ -26,11 +26,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
+from app.config import settings
 from app.db.postgres import get_pool
 from app.services import sparse_encoder
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
 from app.services.index_service import generate_embeddings
+from app.services.search_capabilities import file_projection_enabled, native_derived_enabled
 from app.services.vector_store import VectorStoreUnavailable, get_vector_store
 from app.services.vector_store.base import has_dense
 
@@ -154,22 +155,14 @@ async def _process_once() -> int:
     # pipeline from durable native invalidation intents. This hook runs before
     # the normal claim so newly materialized chunks can be indexed in the same
     # pass; unguarded/default deployments never import or execute the consumer.
-    native_document_selected = settings.document_revision_backend in {
-        "postgres_native",
-        "native_ledger_m1",
-    }
-    native_file_measurement = settings.native_revision_m1_file_driver != "s3_current"
-    if (
-        native_document_selected
-        or (
-            native_file_measurement
-            and settings.native_revision_m1_measurement_only
-            and settings.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME
-        )
-    ):
+    if native_derived_enabled(settings):
+        if file_projection_enabled(settings):
+            from app.services.native_file_projection import NativeFileProjectionWorker
+
+            native_processed += await NativeFileProjectionWorker(pool).process_once()
         from app.services.native_derived_worker import NativeDerivedWorker
 
-        native_processed = await NativeDerivedWorker(pool).process_once()
+        native_processed += await NativeDerivedWorker(pool).process_once()
 
     # Stage 1: claim. Tiny transaction; commits before any external
     # work begins.
@@ -354,7 +347,13 @@ async def pending_stats(vault_id=None) -> dict:
                                      AND vector_abandoned_at IS NULL
                                      AND vector_retry_count > 0)                                                AS retrying,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed,
+                    -- Age of the head of the queue. Folded into the aggregate
+                    -- that is already scanning this table so it costs nothing;
+                    -- a separate MIN() would be a second pass. NULL when the
+                    -- queue is empty, which the caller keeps as absence.
+                    MIN(created_at) FILTER (WHERE vector_indexed_at IS NULL
+                                            AND vector_abandoned_at IS NULL)                                    AS oldest_pending
                   FROM chunks
                 """,
             )
@@ -367,7 +366,9 @@ async def pending_stats(vault_id=None) -> dict:
                                      AND vector_abandoned_at IS NULL
                                      AND vector_retry_count > 0)                                                AS retrying,
                     COUNT(*) FILTER (WHERE vector_indexed_at IS NULL AND vector_abandoned_at IS NOT NULL)       AS abandoned,
-                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed
+                    COUNT(*) FILTER (WHERE vector_indexed_at IS NOT NULL)                                       AS indexed,
+                    MIN(created_at) FILTER (WHERE vector_indexed_at IS NULL
+                                            AND vector_abandoned_at IS NULL)                                    AS oldest_pending
                   FROM chunks
                  WHERE vault_id = $1
                 """,
@@ -382,6 +383,11 @@ async def pending_stats(vault_id=None) -> dict:
             "indexed":   int(chunk_row["indexed"]),
         },
     }
+    # Absent, not epoch and not 0: an empty queue has no oldest item, and a
+    # zero timestamp would age forever on whatever dashboard consumed it.
+    oldest_pending = chunk_row["oldest_pending"]
+    if oldest_pending is not None:
+        stats["upsert"]["oldest_pending_enqueued_at"] = oldest_pending.isoformat()
     if vault_id is None:
         # Do this after releasing the chunks stats connection. Holding one pool
         # slot while awaiting another can deadlock /health under concurrent probes.

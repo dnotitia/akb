@@ -1,7 +1,7 @@
 import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Boxes, House, type LucideIcon } from "lucide-react";
+import { Boxes, House, PanelLeftOpen, PanelLeftClose, type LucideIcon } from "lucide-react";
 import {
   clearPrivateAssetCache,
   getAuthConfig,
@@ -14,10 +14,17 @@ import { Logo } from "@/components/logo";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GlobalSearchDialog } from "@/components/global-search-dialog";
 import { HeaderIndexingStatus } from "@/components/header-indexing-status";
+import { NotificationBell } from "@/components/notification-bell";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AppPageLocation } from "@/components/app-page-location";
 import { appRouteBoundaryForPath } from "@/app-route-contract";
+import { Button } from "@/components/ui/button";
+import type { VaultNavigationControl } from "@/components/vault-shell";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
-import { useAccessibleIndexingHealth } from "@/hooks/use-accessible-indexing-health";
+import { ResourceLocationProvider } from "@/contexts/resource-location-context";
+import { SearchStatusProvider } from "@/hooks/use-search-status";
+import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
 
@@ -42,6 +49,13 @@ export function Layout() {
     | { status: "unauthenticated"; user: null }
   >({ status: "checking", user: null });
   const [revalidating, setRevalidating] = useState(false);
+  const [accessRevision, setAccessRevision] = useState(0);
+  const [vaultNavigationWidth, setVaultNavigationWidth] = useState(0);
+  const [vaultNavigationControl, setVaultNavigationControl] = useState<VaultNavigationControl | null>(null);
+  const searchControlsRef = useRef<HTMLDivElement>(null);
+  const accountControlsRef = useRef<HTMLDivElement>(null);
+  const [minimumVaultWorkspaceWidth, setMinimumVaultWorkspaceWidth] = useState(656);
+  const [vaultSidebarCollapsed, setVaultSidebarCollapsed] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem(APP_SIDEBAR_COMPACT_KEY) === "true";
@@ -102,8 +116,9 @@ export function Layout() {
           queryClient.clear();
         }
         setSession({ status: "authenticated", user: verified });
-      } catch {
-        if (disposed) return;
+        setAccessRevision(revision => revision + 1);
+      } catch (error) {
+        if (disposed || (error instanceof Error && error.name === "DeferredSessionError")) return;
         queryClient.clear();
         clearPrivateAssetCache();
         setSession({ status: "unauthenticated", user: null });
@@ -124,11 +139,13 @@ export function Layout() {
     };
 
     window.addEventListener("focus", revalidateForegroundIdentity);
+    window.addEventListener("akb:revalidate-access", revalidateForegroundIdentity);
     window.addEventListener("storage", onStorage);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       disposed = true;
       window.removeEventListener("focus", revalidateForegroundIdentity);
+      window.removeEventListener("akb:revalidate-access", revalidateForegroundIdentity);
       window.removeEventListener("storage", onStorage);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
@@ -136,14 +153,32 @@ export function Layout() {
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
   const isSearchWorkspace = location.pathname === "/search";
-  const viewportLocked = wide || isSearchWorkspace;
-  const sidebarCompact = wide || sidebarCollapsed;
-  const { data: indexingStatus } = useAccessibleIndexingHealth(
-    session.status === "authenticated",
-    activeUser?.user_id,
-  );
+  const isSettingsWorkspace = location.pathname === "/settings";
+  const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
+  const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
+
+  useLayoutEffect(() => {
+    const search = searchControlsRef.current;
+    const account = accountControlsRef.current;
+    if (!wide || !search || !account) return;
+    const measure = () => {
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      // Keep a readable location trail, measured search/indexing/
+      // identity controls, outer insets and the optional drawer trigger.
+      setMinimumVaultWorkspaceWidth(search.getBoundingClientRect().width + account.getBoundingClientRect().width + 21.25 * rem);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(search);
+    observer.observe(account);
+    return () => observer.disconnect();
+  }, [wide, session.status]);
 
   function setSidebarCompact(compact: boolean) {
+    if (wide) {
+      setVaultSidebarCollapsed(compact);
+      return;
+    }
     setSidebarCollapsed(compact);
     try {
       localStorage.setItem(APP_SIDEBAR_COMPACT_KEY, String(compact));
@@ -159,13 +194,7 @@ export function Layout() {
   }, [viewportLocked]);
 
   if (session.status === "checking") {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <div className="coord" role="status" aria-live="polite">
-          Verifying session…
-        </div>
-      </div>
-    );
+    return <AppShellLoading compact={sidebarCompact} />;
   }
 
   if (session.status === "unauthenticated") {
@@ -180,18 +209,21 @@ export function Layout() {
   // scroll. Document-flow routes keep natural page scroll and the footer.
   const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
-    : "min-h-screen flex flex-col bg-background text-foreground";
+    : location.pathname === "/"
+      ? "min-h-screen flex flex-col bg-surface text-foreground"
+      : "min-h-screen flex flex-col bg-background text-foreground";
 
   return (
-    <div className={rootClass} aria-busy={revalidating || undefined}>
+    <SearchStatusProvider identity={activeFingerprint!} enabled={!revalidating}>
+    <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
+    <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
+    <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
-        <div
-          className="fixed inset-0 z-[var(--z-toast)] flex items-center justify-center bg-background/95 backdrop-blur-sm"
-          role="status"
-          aria-live="polite"
-        >
-          <div className="coord">Verifying session…</div>
-        </div>
+        <InlineLoadingState
+          label="Refreshing access…"
+          size="sm"
+          className="fixed left-1/2 top-2 z-[var(--z-toast)] -translate-x-1/2 rounded-full border border-border bg-surface px-3 py-1.5 shadow-md"
+        />
       )}
       {/* Skip link — first focusable element; jumps keyboard/SR users past the
           header chrome to the page content on every route. */}
@@ -202,12 +234,10 @@ export function Layout() {
         Skip to content
       </a>
       {/* ── Glass app header ───────────────────────────────────────── */}
-      <header className="app-header sticky top-0 z-40 shrink-0">
-        <div className="flex h-14 w-full items-center">
-          {/* Keep the brand lockup stable while the navigation rail changes
-              density. Collapsing navigation must not remove product identity
-              or shift the global-search entry point. */}
-          <div className="flex shrink-0 items-center px-3 lg:w-52">
+      <header className={`app-header sticky top-0 z-40 h-14 shrink-0 lg:ml-[var(--vault-navigation-width)] ${wide ? "vault-app-header" : ""}`}>
+        <div className="flex h-full w-full items-center">
+          {/* Desktop identity belongs to the full-height navigation rail. */}
+          <div className="flex shrink-0 items-center px-3 lg:hidden">
             <Link
               to="/"
               aria-label="AKB home"
@@ -216,15 +246,22 @@ export function Layout() {
               <Logo
                 size={28}
                 wordmark
-                subtitle
                 variant="header"
               />
             </Link>
           </div>
 
-          <div className="flex min-w-0 flex-1 items-center pr-3">
-            <div className="ml-auto flex min-w-0 items-center gap-2">
-              <HeaderIndexingStatus status={indexingStatus} />
+          <div className="flex h-full min-w-0 flex-1 items-center pr-3 lg:pl-5">
+            {wide && vaultNavigationControl && <Button id="vault-navigation-trigger" variant="ghost" size="icon"
+              className="mr-2 hidden h-9 w-9 shrink-0 lg:inline-flex"
+              aria-label={vaultNavigationControl.open ? "Close vault navigation" : "Open vault navigation"}
+              aria-expanded={vaultNavigationControl.open} aria-controls="vault-workspace-navigation"
+              onClick={vaultNavigationControl.onToggle}>
+              {vaultNavigationControl.open ? <PanelLeftClose className="h-4 w-4" aria-hidden /> : <PanelLeftOpen className="h-4 w-4" aria-hidden />}
+            </Button>}
+            <AppPageLocation isAdmin={session.user.is_admin} />
+            <div ref={searchControlsRef} className="ml-auto flex min-w-0 flex-1 items-center gap-2 lg:flex-none lg:pl-3">
+              <HeaderIndexingStatus />
               {/* This is a real global-search surface, not a shortcut to /search.
                   Advanced mode and vault/type filters remain on the full page. */}
               <CurrentUserProvider user={session.user}>
@@ -252,7 +289,10 @@ export function Layout() {
               />
             </nav>
 
-            <div className="ml-3 flex shrink-0 items-center justify-end border-l border-border pl-3 lg:w-28">
+            <div ref={accountControlsRef} className="ml-2 flex shrink-0 items-center justify-end gap-2 border-l border-border pl-2 lg:min-w-28">
+              <CurrentUserProvider user={session.user}>
+                <NotificationBell key={session.user.user_id} />
+              </CurrentUserProvider>
               <UserMenu initialUser={session.user} />
             </div>
           </div>
@@ -260,11 +300,14 @@ export function Layout() {
       </header>
 
       <div className={viewportLocked ? "flex min-h-0 flex-1" : "flex flex-1"}>
+        <CurrentUserProvider user={session.user}>
         <AppSidebar
+          key={session.user.user_id}
           compact={sidebarCompact}
-          collapsible={!wide}
+          collapsible
           onCompactChange={setSidebarCompact}
         />
+        </CurrentUserProvider>
 
         <div
           className={
@@ -279,23 +322,23 @@ export function Layout() {
             tabIndex={-1}
             className={
               viewportLocked
-                ? "min-h-0 flex-1 animate-in focus:outline-none"
+                ? "min-h-0 flex-1 focus:outline-none"
                 : "flex-1 animate-in focus:outline-none"
             }
           >
             {viewportLocked ? (
-              <CurrentUserProvider user={session.user}>
+              <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
                 <ErrorBoundary resetKeys={[location.pathname, location.search]}>
-                  <Outlet context={{ indexingStatus }} />
+                  <Outlet context={{ setVaultNavigationWidth, setVaultNavigationControl, minimumVaultWorkspaceWidth }} />
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
-              <div className="w-full px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
-                <CurrentUserProvider user={session.user}>
+              <div className="w-full px-[var(--workspace-gutter)] py-8">
+                <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}
                   >
-                    <Outlet context={{ indexingStatus }} />
+                    <Outlet />
                   </ErrorBoundary>
                 </CurrentUserProvider>
               </div>
@@ -305,7 +348,7 @@ export function Layout() {
           {/* Footer — hidden while a viewport-locked workspace owns scrolling. */}
           {!viewportLocked && (
             <footer className="border-t border-border">
-              <div className="flex w-full items-center justify-between px-4 py-3 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+              <div className="flex w-full items-center justify-between px-[var(--workspace-gutter)] py-3">
                 <div className="coord">© Dnotitia · Seahorse</div>
                 <div className="coord hidden md:block">Agent Knowledgebase</div>
                 <div className="coord">v1.0</div>
@@ -315,6 +358,67 @@ export function Layout() {
         </div>
       </div>
     </div>
+    </ResourceLocationProvider>
+    </CurrentUserProvider>
+    </SearchStatusProvider>
+  );
+}
+
+function AppShellLoading({ compact }: { compact: boolean }) {
+  return (
+    <LoadingState label="Verifying session" className="min-h-screen bg-background text-foreground">
+      <div className={`flex min-h-screen flex-col ${compact ? "lg:pl-14" : "lg:pl-52"}`}>
+        <header className="app-header shrink-0">
+          <div className="flex h-14 w-full items-center">
+            <div className="flex shrink-0 items-center px-3 lg:hidden">
+              <Logo size={28} wordmark variant="header" />
+            </div>
+            <div className="ml-auto flex min-w-0 items-center gap-3 pr-3">
+              <Skeleton className="hidden h-8 w-44 rounded-[var(--radius-md)] sm:block" />
+              <Skeleton className="h-9 w-9 rounded-full" />
+            </div>
+          </div>
+        </header>
+
+        <div className="flex min-h-0 flex-1">
+          <aside className={`fixed inset-y-0 left-0 hidden h-dvh border-r border-border bg-surface lg:block ${compact ? "w-14" : "w-52"}`}>
+            <div className="flex h-14 items-center justify-center border-b border-border">
+              <Logo size={28} wordmark={!compact} variant="header" />
+            </div>
+            <div className="space-y-2 p-3">
+              {[0, 1, 2, 3].map((item) => (
+                <div key={item} className="flex h-10 items-center gap-3 rounded-[var(--radius-md)] px-2">
+                  <Skeleton className="h-8 w-8 shrink-0 rounded-[var(--radius-md)]" />
+                  {!compact && <Skeleton className="h-3.5 w-24 rounded-[var(--radius-sm)]" />}
+                </div>
+              ))}
+            </div>
+          </aside>
+
+          <main className="min-w-0 flex-1 px-4 py-8 sm:px-6 lg:px-8 xl:px-12 2xl:px-36">
+            <div className="border-b border-border pb-6">
+              <Skeleton className="h-3 w-28 rounded-[var(--radius-sm)]" />
+              <Skeleton className="mt-4 h-9 w-64 max-w-full rounded-[var(--radius-md)]" />
+              <Skeleton className="mt-3 h-4 w-full max-w-xl rounded-[var(--radius-sm)]" />
+            </div>
+            <div className="mt-8 grid gap-6 xl:grid-cols-[minmax(0,1fr)_21rem]">
+              <div className="space-y-6">
+                <section className="rounded-[var(--radius-lg)] border border-border bg-surface p-5 shadow-sm">
+                  <Skeleton className="h-5 w-36 rounded-[var(--radius-sm)]" />
+                  <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {[0, 1, 2].map((item) => (
+                      <Skeleton key={item} className="h-28 rounded-[var(--radius-lg)]" />
+                    ))}
+                  </div>
+                </section>
+                <Skeleton className="h-64 rounded-[var(--radius-lg)] border border-border" />
+              </div>
+              <Skeleton className="h-80 rounded-[var(--radius-lg)] border border-border" />
+            </div>
+          </main>
+        </div>
+      </div>
+    </LoadingState>
   );
 }
 

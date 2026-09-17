@@ -123,10 +123,22 @@ export const NewVaultNameConflict: Story = {
     router: { initialEntries: ["/vault/new"] },
     msw: {
       handlers: [
+        http.get(`${API}/my/vaults`, () => HttpResponse.json({ vaults: [] })),
         ...appLayoutHandlers,
         http.get(`${API}/vaults/templates`, () => HttpResponse.json(templates)),
         http.post(`${API}/vaults`, () =>
-          HttpResponse.json({ detail: "Vault already exists." }, { status: 409 }),
+          HttpResponse.json(
+            {
+              message: "Vault name is unavailable. Choose a different name.",
+              error: "Vault name is unavailable. Choose a different name.",
+              code: "vault_name_unavailable",
+              detail: {
+                message: "Vault name is unavailable. Choose a different name.",
+                code: "vault_name_unavailable",
+              },
+            },
+            { status: 409 },
+          ),
         ),
       ],
     },
@@ -136,7 +148,10 @@ export const NewVaultNameConflict: Story = {
     const canvas = within(canvasElement);
     await userEvent.type(await canvas.findByLabelText(/Name/i), "akb");
     await userEvent.click(canvas.getByRole("button", { name: /Create vault/i }));
-    await expect(await canvas.findByText("Vault already exists.")).toBeInTheDocument();
+    await expect(
+      await canvas.findByText("Vault name is unavailable. Choose a different name."),
+    ).toBeInTheDocument();
+    await expect(canvas.queryByRole("button", { name: "Open existing vault" })).not.toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };

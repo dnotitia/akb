@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "computed_at": "2026-08-21T09:00:00Z",
+  "storage": {
+    "db_bytes": 8657174528,
+    "vector_bytes": 3221225472,
+    "file_bytes": 41637294,
+    "file_count": 128,
+    "observed_at": "2026-08-21T08:59:58Z"
+  },
+  "corpus": {
+    "vault_count": 7,
+    "collection_count": 63,
+    "doc_count": 2841,
+    "vector_chunk_count": 19204
+  },
+  "activity": {
+    "window_start": "2026-08-20T00:00:00Z",
+    "window_end": "2026-08-21T00:00:00Z",
+    "calls_read": 4192,
+    "calls_write": 317,
+    "active_actors": 11
+  }
+}

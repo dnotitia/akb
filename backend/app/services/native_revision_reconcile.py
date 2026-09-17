@@ -209,11 +209,22 @@ class NativeRevisionReconcile:
         await self._assert_inventory_covers_completed_resources(inventory)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                await self.bridge.validated_inventory_scope(inventory, conn=conn)
                 run = await self.repository.get_or_create_run(
                     namespace_id=namespace_id,
                     fixed_git_oid=fixed_ref,
                     coverage_version=coverage,
                     inventory_digest=inventory.inventory_digest,
+                    conn=conn,
+                )
+                await self.repository.store_inventory_snapshot(
+                    run,
+                    self.bridge.canonical_inventory_payload(
+                        namespace_id=inventory.namespace_id,
+                        fixed_git_oid=inventory.fixed_git_oid,
+                        coverage_version=inventory.coverage_version,
+                        documents=inventory.documents,
+                    ),
                     conn=conn,
                 )
 

@@ -55,7 +55,7 @@ the frontend in `frontend/`. The stdio MCP proxy that ships on npm lives
 under `packages/akb-mcp-client/`.
 
 The local Compose path and the repository-owned E2E runtime are separate
-development paths. See [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md)
+development paths. See [`scripts/ci/README.md`](scripts/ci/README.md)
 for the suite, runtime, and clean-host bootstrap contracts.
 
 ## Configuration
@@ -74,7 +74,6 @@ variables are read by the backend.** When you need a new setting:
 ```bash
 # Individual endpoint-driven suites against the normal local Compose stack
 AKB_URL=http://localhost:8000 bash backend/tests/test_e2e.sh
-AKB_URL=http://localhost:8000 bash backend/tests/test_edit_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
 # … see backend/tests/ for the full list
 
@@ -87,13 +86,54 @@ export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
 export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
   'import secrets; print(secrets.token_urlsafe(24))')"
 uv run --locked --project backend python \
-  backend/scripts/ci/e2e_runtime.py gate \
+  scripts/ci/e2e_runtime.py gate \
   --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
 unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 
 # Frontend
 cd frontend && pnpm test
 ```
+
+The authenticated MCP pytest behavior suite is run by the repository-owned
+runtime gate and can also consume a ready schema-v2 descriptor directly.
+Local and hosted CI use the same pytest entrypoint: the list-vaults canary and
+the migrated MCP product scenarios consume the same descriptor and fixture
+lifecycle. Transport/session and direct REST checks remain in the shell suite:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e --runtime-descriptor -
+```
+
+For a descriptor file, replace `-` with its path:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/mcp_e2e -v --tb=short \
+  --confcutdir=backend/tests/mcp_e2e \
+  --runtime-descriptor /path/to/descriptor.json
+```
+
+The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
+Ubuntu bootstrap. This pytest command consumes the existing runtime; it does
+not start or tear down a backend, database, or fixture service.
+
+For an isolated browser session, the same runtime can own the existing Vite
+frontend and point its `/api` and `/mcp` proxy at the run's backend:
+
+```bash
+(cd frontend && pnpm install --frozen-lockfile)
+uv run --locked --project backend python \
+  scripts/ci/e2e_runtime.py serve \
+  --with-frontend --frontend-port 3000 \
+  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
+```
+
+Use `services.web.origin` from the ready schema-v2 descriptor as
+`AKB_FRONTEND_URL` for `cd frontend && pnpm run test:e2e:real`. The
+frontend flag is opt-in so the existing backend/MCP `gate` and `serve` paths
+keep their current process and dependency requirements.
 
 The E2E suites create ephemeral users and vaults and clean up after
 themselves. They poll `/health` for indexing completion before running search
@@ -127,13 +167,18 @@ uv tool install --python 3.14 --force 'ruff==0.15.16'
 uv tool install --python 3.14 --force 'detect-secrets==1.5.0'
 ```
 
-**2. Node deps in both pnpm projects.** `frontend/` and `packages/akb-client/`
-are separate projects with separate lockfiles and separate `node_modules`,
-and the gate runs steps in each. Installing only one is the common mistake:
+**2. Node deps in the workspace and independent projects.** `frontend/` and
+`frontend/packages/markdown-editor/` are the two members of the frontend pnpm
+workspace;
+`packages/akb-client/` and `packages/akb-mcp-client/` remain independent
+projects. The workspace uses `frontend/pnpm-lock.yaml`; each independent
+project uses its own lockfile, and the gate runs steps in each. Installing only
+some of them is the common mistake:
 
 ```bash
 (cd frontend && pnpm install --frozen-lockfile)
 (cd packages/akb-client && pnpm install --frozen-lockfile)
+(cd packages/akb-mcp-client && npm ci)
 ```
 
 Then:
@@ -154,7 +199,7 @@ bash scripts/check.sh
 - [ ] `bash scripts/check.sh` passes (see Static Analysis Gate above).
 - [ ] All E2E suites pass against your local stack.
 - [ ] Changes to the E2E runtime/bootstrap also pass the isolated full gate;
-      see [`backend/scripts/ci/README.md`](backend/scripts/ci/README.md).
+      see [`scripts/ci/README.md`](scripts/ci/README.md).
 - [ ] No secrets, internal hostnames/IPs, or personal info in commits or
       diffs (check `git diff` carefully).
 - [ ] New configuration is reflected in `config/*.yaml.example`.

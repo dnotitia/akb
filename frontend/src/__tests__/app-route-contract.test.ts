@@ -26,6 +26,7 @@ describe("application route contract", () => {
       { path: "/vault/:name/skill", component: "SkillRedirect", boundary: "vault-shell" },
       { path: "/search", component: "SearchPage", boundary: "app-layout" },
       { path: "/settings", component: "SettingsPage", boundary: "app-layout" },
+      { path: "/notifications", component: "NotificationsPage", boundary: "app-layout" },
       { path: "*", component: "NotFoundPage", boundary: "app-layout" },
     ]);
   });

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -12,6 +13,8 @@ from app.api.control_plane_models import AppDefinitionProjection, AppReleaseProj
 from app.api.deps import get_current_app, get_current_user
 from app.api.routes import app_registry, app_rollouts
 from app.services.app_identity_service import AppPrincipal
+from app.services import app_resource_service as resources
+from app.services import app_rollout_service as rollout
 from app.services.app_registry_service import (
     _app_projection as project_registry_app,
     _canonical,
@@ -110,12 +113,85 @@ def test_registry_create_uses_explicit_projection_and_no_store(monkeypatch):
     assert response.json()["id"] == str(app_id)
 
 
+def test_registry_release_request_rejects_v1_and_unknown_manifest_fields():
+    client = _registry_client(_user(admin=True))
+    base = {
+        "version": "1.0.0",
+        "manifest": {"steps": []},
+        "manifest_checksum": "a" * 64,
+    }
+
+    old = client.post(
+        f"/api/v1/apps/{uuid.uuid4()}/releases",
+        json=base,
+    )
+    unknown = client.post(
+        f"/api/v1/apps/{uuid.uuid4()}/releases",
+        json={
+            **base,
+            "manifest": {"steps": [], "unexpected": True},
+        },
+    )
+    assert old.status_code == 422
+    assert unknown.status_code == 422
+
+
+def test_registry_release_forwards_the_strict_v2_manifest(monkeypatch):
+    app_id = uuid.uuid4()
+    manifest = {
+        "manifest_version": 2,
+        "app_key": "generic-app",
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": []},
+        "transition_plans": [{"source": "fresh", "steps": []}],
+    }
+    calls: list[dict] = []
+
+    async def fake_create(*_args, **kwargs):
+        calls.append(kwargs)
+        return {
+            "id": str(uuid.uuid4()),
+            "app_id": str(app_id),
+            "version": "1.0.0",
+            "manifest": manifest,
+            "manifest_checksum": "a" * 64,
+            "registered_at": "2026-08-12T00:00:00Z",
+            "replayed": False,
+        }
+
+    monkeypatch.setattr(app_registry, "create_app_release", fake_create)
+    response = _registry_client(_user(admin=True)).post(
+        f"/api/v1/apps/{app_id}/releases",
+        json={
+            "version": "1.0.0",
+            "manifest": manifest,
+            "manifest_checksum": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["manifest"]["manifest_version"] == 2
+    assert calls[0]["manifest"]["schema"]["tables"] == []
+
+
 def test_registry_projections_decode_asyncpg_jsonb_strings():
     app_id = uuid.uuid4()
     release_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
     metadata = {"owner": "validator", "flags": ["safe"]}
-    manifest = {"steps": [], "name": "release"}
+    manifest = {
+        "manifest_version": 2,
+        "app_key": "generic-app",
+        "source_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "schema_version": 3,
+        "schema": {"tables": [], "fingerprint": ""},
+        "transition_plans": [{"source": "fresh", "steps": []}],
+    }
+    manifest["schema"]["fingerprint"] = resources.canonical_table_fingerprint([])
+    release_checksum = rollout.manifest_checksum(manifest, version="1.0.0")
 
     app_projection = project_registry_app(
         {
@@ -133,8 +209,8 @@ def test_registry_projections_decode_asyncpg_jsonb_strings():
             "id": release_id,
             "app_id": app_id,
             "version": "1.0.0",
-            "manifest": '{"steps":[],"name":"release"}',
-            "manifest_checksum": "a" * 64,
+            "manifest": json.dumps(manifest),
+            "manifest_checksum": release_checksum,
             "registered_at": now,
         }
     )

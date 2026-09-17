@@ -29,6 +29,8 @@ from app.api.routes import (
     auth,
     collections,
     documents,
+    events,
+    notifications,
     files,
     help as help_routes,
     knowledge,
@@ -52,6 +54,7 @@ from app.services import (
     external_git_poller,
     external_git_service,
     metadata_worker,
+    notification_worker,
     tool_usage,
 )
 from app.services.access_service import check_vault_access
@@ -142,7 +145,8 @@ async def lifespan(app: FastAPI):
             start_workers()
         else:
             start_api_runtime()
-        yield
+        async with mcp_app.run():
+            yield
     finally:
         if runtime_started:
             if role == "all":
@@ -204,6 +208,9 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     details = exc.errors()
+    if request.url.path == "/api/v1/my/account/deletion":
+        # Validation must never echo the password (including malformed request bodies).
+        details = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in details]
     return JSONResponse(
         status_code=422,
         content=_error_payload(
@@ -340,6 +347,8 @@ app.include_router(app_legacy_adoptions.router, prefix="/api/v1", tags=["app-leg
 app.include_router(app_rollouts.router, prefix="/api/v1", tags=["app-rollouts"])
 app.include_router(access.router, prefix="/api/v1", tags=["access"])
 app.include_router(documents.router, prefix="/api/v1", tags=["documents"])
+app.include_router(events.router, prefix="/api/v1", tags=["events"])
+app.include_router(notifications.router, prefix="/api/v1", tags=["notifications"])
 app.include_router(search.router, prefix="/api/v1", tags=["search"])
 app.include_router(collections.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")
@@ -348,6 +357,11 @@ app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-session
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
+# `/internal` is deliberately not `/api`: every ingress in the deployment maps
+# `/api`, `/mcp`, `/.well-known` and the probes to this service and everything
+# else to the frontend, so this prefix has no route from outside. The byte
+# gateway reaches it over the cluster network with a shared key.
+app.include_router(files.internal_router, prefix="/internal", include_in_schema=False)
 app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
 app.include_router(assets.stable_router, prefix="/api", tags=["assets"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
@@ -465,8 +479,24 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     in one atomic worker), so backfill stats live under
     `vector_store.backfill` and `embed_backfill` is gone — they were
     reporting the same `chunks.vector_indexed_at IS NULL` count.
+
+    Every indexing queue reported here carries its own terminal-failure count
+    beside its progress, and that adjacency is the point: a queue that gave up
+    on an item drains to `pending: 0` exactly like one that finished, so
+    progress alone reads as complete while documents are missing from ranked
+    search. `native_derived` is the document/File-level queue — one intent per
+    Resource revision, and `abandoned` there is a count of Resources that will
+    never be chunked or embedded; `vector_store.backfill.upsert` is the
+    chunk-level one below it; `native_file_projection` is the S3-to-Native
+    admission ahead of both.
     """
-    from app.services import queue_rescuer, sparse_encoder, vault_backfill
+    from app.services import (
+        native_derived_worker,
+        native_file_projection,
+        queue_rescuer,
+        sparse_encoder,
+        vault_backfill,
+    )
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
@@ -502,8 +532,26 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "asset_gc": await _safe(asset_gc_worker.pending_stats),
         "metadata_backfill": await _safe(metadata_worker.pending_stats),
         "events": await _safe(events_publisher.pending_stats),
+        "notifications": await _safe(notification_worker.pending_stats),
+        "native_file_projection": await _safe(native_file_projection.pending_stats),
+        "native_derived": await _safe(native_derived_worker.pending_stats),
         "vector_store": vs_info,
     }
+
+    # Queue-head age, promoted to the top level because it is a named term in
+    # the tenant-monitoring contract and that contract must not depend on the
+    # internal shape of the operational blob below it — `vector_store.backfill`
+    # is free to be reorganised, this key is not. It is also the one indexing
+    # signal an external poller needs, so it stays on the unauthenticated half
+    # of this response alongside the other backlog counters.
+    #
+    # Omitted when the queue is empty: there is no oldest item, and a 0 or an
+    # epoch timestamp would render as an unboundedly stale queue.
+    backfill = vs_info.get("backfill")
+    if isinstance(backfill, dict):
+        upsert = backfill.get("upsert")
+        if isinstance(upsert, dict) and upsert.get("oldest_pending_enqueued_at") is not None:
+            result["oldest_pending_enqueued_at"] = upsert["oldest_pending_enqueued_at"]
 
     # Sensitive operational internals — authenticated callers only:
     #  - PG-RBAC hook-failure counters + last reconcile outcome (silent
@@ -518,6 +566,10 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
             result["rbac"] = get_role_sync().metrics_snapshot()
         except Exception as e:  # noqa: BLE001
             result["rbac"] = {"error": str(e)}
+        from app.services.account_deletion_worker import pending_stats as account_cleanup_stats
+        result["account_deletion_cleanup"] = await _safe(account_cleanup_stats)
+        from app.services.sso_account_sync import pending_stats as sso_account_sync_stats
+        result["sso_account_sync"] = await _safe(sso_account_sync_stats)
         result["audit"] = audit_log.stats()
         result["tool_usage"] = tool_usage.stats()
 

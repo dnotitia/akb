@@ -7,6 +7,409 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Native public links
+
+- Native Document publications bind to vault-scoped Resource identity and read
+  the verified current revision. Moves preserve the selected document; soft
+  deletion revokes its links atomically. Existing verified cutover mappings
+  transfer old links without publishing a new occupant of a reused path.
+- Native section publications return no body or image grants when their section
+  disappears. Public status, unpublish, and oEmbed follow the same identity.
+  Migration 106 adds Native publication bindings and lifecycle enforcement.
+
+### Native Document drill-down
+
+- Native drill-down and section outlines read the verified current Document
+  Head instead of the legacy document/chunk tables. Preserve pre-heading prose,
+  user-authored metadata-shaped text, empty headings, and repeated content in
+  bounded, non-overlapping sections.
+
+### Native grep consistency
+
+- Native grep supports explicit `include_text_files` reads across REST, MCP,
+  SDK and Search UI. The previous measurement option remains an alias; explicit
+  conflicting values fail validation. Resource aggregates accompany Document
+  counts, and File synchronization gaps return a readiness error instead of a
+  misleading empty or stale result.
+- MCP accepts multiple Vaults and the same metadata/lifecycle filters as REST.
+  REST/MCP output limits are aligned at 50. Document replacement rechecks write
+  access per mutation and retains partial receipts on CAS conflicts.
+
+- Native grep now uses the same Unicode case-insensitive matching rules for
+  literal reads and replacements. Full casefold expansions such as `ß`/`ss`
+  no longer match. Regex replacements operate on the same body lines as reads,
+  so anchors and whitespace cannot rewrite unpreviewed cross-line matches.
+- Case-insensitive literal scans and replacements use the existing bounded
+  process worker, including its execution deadline and result-size limits.
+- Native Document and File results retain body-relative line numbers and
+  resource type, searched revision, and content hash through REST/MCP responses.
+  Legacy execution and the prohibition on File grep replacement are unchanged.
+
+### Safe account lifecycle
+
+Add identity-bound account lifecycle preview, paginated deletion blockers,
+local session revocation, and password-confirmed self-deletion endpoints.
+Deletion blocks owned vaults (including archived vaults), protected recovery
+accounts, and the last eligible local administrator. Account deletion is atomic;
+shared publications survive and PostgreSQL role cleanup retries from an
+independent durable outbox. Local JWT revocation uses a monotonic generation.
+Migration 101 also fences legacy cutoff-only revocation with a database trigger,
+so old processes cannot leave new-generation sessions valid after revocation.
+Deletion password confirmation uses the same NFC normalization as login.
+
+**Compatibility:** `DELETE /my/account` now returns 410; clients must use the
+new preview and `POST /my/account/deletion` contract. Administrator deletion
+rejects alternate UUID spellings of the acting account. Self-service mutations
+are disabled by default: enable `account_self_service_enabled` only after all
+JWT issuers and verifiers are upgraded and the cleanup worker heartbeat is
+healthy. Install the migration before serving new JWTs; old issuers must be
+drained because their claimless tokens are rejected after a generation bump.
+
+SSO users can end all ordinary AKB browser sessions while keeping IdP sessions and
+PATs. Migration 103 fences in-flight login callbacks. SSO accounts have a managed-
+account notice instead of self-deletion. Optional `sso_account_sync_enabled` polling
+suspends AKB accounts when the configured Keycloak broker disables/deletes them,
+revoking PATs/browser handles while preserving Vaults and identity bindings. Polling
+is eventual and suspend-only; failures do not mutate accounts. Failed pages advance
+the scan and trigger individual retries, preventing one failed subject from blocking
+other accounts. Health errors clear only after a fully successful sweep. See the
+[implementation and rollout design](../docs/design/accepted/2026-09-15-account-self-service-lifecycle/README.md).
+
+### Every document counter follows the active authority (akb#525)
+
+`GET /vaults/{vault}/info` learned to read the native ledger on
+`postgres_native`, but it was not the only counter answering from a table the
+native write path never touches, and the other two do not read `documents` at
+all — a grep for the query in the issue does not find them.
+
+`akb_browse` reports each collection's `doc_count` and `last_updated` from the
+denormalised `collections` columns, which only `DocumentRepository.increment_count`
+/ `decrement_count` bump — legacy-write-path-only. On a native installation the
+browse payload therefore carried a frozen count directly above the documents
+contradicting it. Measured on one installation: 25 of 10,344 collections already
+disagreed with the live ledger — 16 reporting documents they no longer hold, one
+reporting zero while holding documents.
+
+The operator corpus inventory (`app/stats`) counted `documents` across the whole
+installation, so it reported the pre-cutover total permanently. Same
+installation: 136,183 catalog rows against 136,188 live native documents, the
+gap widening with every write.
+
+Both now read the authority that holds the documents, alongside the vault-info
+counters, through one `document_counters` module rather than three copies of the
+same branch. The legacy arm is unchanged on all three, and pays no query at all
+— the authority is resolved before the pool is touched. Browsing into a subtree
+scopes the recount to that subtree, since only its collections are rendered
+(unscoped on the 50,850-document vault: 118 ms).
+
+Vault last activity also stops sorting `native_revisions.occurred_at`, which made
+the planner scan the entire append-only revision ledger — every vault's history,
+not the one being asked about. It orders the vault's own resources instead and
+reads the actor off the head revision, which `set_head` keeps in step by writing
+`updated_at` and `head_revision_id` in one statement (verified: 136,188 of
+136,188 live document resources had a head whose `occurred_at` equalled
+`updated_at` and was that resource's newest revision). For a 50,850-document
+vault: 93.7 ms to 60.9 ms, and no longer growing with unrelated vaults' history.
+
+Counting is unchanged in meaning on both arms: archived documents still count
+(native `lifecycle` records deletion, not archival), and a collection's count is
+still its direct children.
+
+### Default archive scope no longer disqualifies the vault path (akb#530)
+
+`archive_scope` defaults to `unarchived`, and the vault-path gate demanded
+`scope == "all"` — so the fast path had no reachable caller. Every ordinary
+search fell back to enumerating candidate source ids, which refuses with the
+bounded-corpus error on any scope above the candidate ceiling. Measured on one
+installation: `?q=…` returned 422 while the identical request with
+`&archive_scope=all` returned 200, with archived documents 154 of 136,183
+(0.11%).
+
+The archived predicate moves from candidate enumeration to hydration, where
+the authoritative status is already parsed: verified Head frontmatter on the
+native arm, `documents.status` on the legacy one. `unarchived` and `all` now
+take the vault path; `archived` deliberately keeps the id path, because it
+selects FOR the rare tail and a vault-path top-K would filter down to nothing.
+
+A hit excluded by scope no longer costs a result slot: the page is refilled
+from the rest of the deduped prefetch pool, and the drop is counted as
+`archive_scope_excluded` in the `hydration_dropped` degradation reason, so a
+genuinely short page (an exhausted pool) names its cause. Applying the
+predicate at hydration also closes the window where a document is archived
+between candidate selection and hydration.
+
+Note for the native arm: the retained legacy `documents` rows are a frozen
+cutover projection and are NOT the archived authority. Measured on the same
+installation, 3 of the 154 rows marked archived there carry `status: draft` in
+their native frontmatter, so filtering on that column would wrongly hide live
+documents.
+
+### Vault info document counters follow the active authority (akb#525)
+
+On `postgres_native` the native document path never writes the legacy
+`documents` catalog, so `document_count` froze at its pre-cutover number
+(and read 0/NULL on fresh vaults) while `last_activity`/`last_active_user`
+went stale. `get_vault_info` now branches on the configured document
+authority: native backends count live `native_resources` document surfaces
+and take last activity from the newest touching `native_revisions` row
+(`occurred_at`/`actor`, aliased to the legacy field names); `bare_git`
+keeps the exact legacy queries. Tables/files/collections/edges are
+authority-independent and unchanged.
+
+### Vault-filter readiness visible to the serving tier (akb#526)
+
+`vault_backfill.is_ready()` was a process-local latch flipped only by the
+backfill runner, which lives in the worker tier — on a split api/worker
+deployment the serving process never ran it, so its copy stayed False for
+life and every native-arm query fell back to id enumeration (and the
+bounded-corpus refusal on large scopes), even with zero NULL `vault_id`
+rows. Search now calls `is_ready_async()`: the local latch on hit, else the
+store's own NULL count — state both tiers can see — with a 30s cache on
+negative outcomes so the hot path stays cheap. A True outcome latches
+locally and is never re-checked; a counter failure stays gated (fail
+closed). When the vault path is wanted but readiness is not established,
+search logs one line (`vault path disabled: readiness not established`)
+instead of surfacing only as an unrelated search refusal downstream.
+
+### Write cap + source_uris hardening (bounded-corpus fix, part 3)
+
+The reference placement (`m1-reference-payload-v1`) enforces the same 10MiB
+write cap the pg-bodystore placement already had (`max_text_bytes`). Without
+it, an unbounded body could enter the corpus and every read path had to assume
+the unbounded case; with it, hydration memory is statically bounded by
+`limit × 10MiB` and larger content has a directed home (File storage +
+projection, with the 413 pointing there).
+
+`source_uris` scope resolution collapses from one SQL OR-clause per URI to a
+single `= ANY(...)` predicate per dimension (vaults, paths-or-ids): request
+SQL text stays constant-size no matter how many URIs arrive. The caller-side
+cap moves from the `NATIVE_SEARCH_MAX_SOURCE_URIS` module constant to the
+`search_max_source_uris` setting (default 200, provisional — documented with
+its derivation path: per-driver IN-list measurement). Over-cap rejections now
+name the recovery (split the request or use a vault scope) instead of a bare
+refusal. The old constant stays as an untouched legacy alias.
+
+### Native candidate filtering reads frontmatter slices, paginated (bounded-corpus fix, part 2)
+
+`_native_document_candidates` no longer selects full `canonical_bytes` rows to
+decide `type`/`tags`/`status` filters. It fetches an 8KiB leading-body slice
+per row (`substring(canonical_bytes ...)`, the same shape the native grep path
+already uses) and parses only the frontmatter envelope — per-resource memory
+is slice-sized regardless of body size. Rows are keyset-paginated by
+`resource_id` (2,000/page, ids only accumulate), so peak memory is page-sized
+rather than scope-sized.
+
+A resource whose envelope opens but never closes inside the slice is excluded
+from candidates AND counted (`unparseable_envelope`, logged as a warning) —
+never filtered on defaults. The aggregate `COUNT(*)` / `SUM(byte_size)` guard
+still runs first on manifest numbers (no body bytes touched), and hydration
+still re-verifies the winners, so the per-row verify step is gone from this
+path without losing integrity.
+
+### Native search takes the vault path (bounded-corpus fix, part 1)
+
+`hybrid_search` accepts an orthogonal `source_types` pre-filter on all five
+vector drivers (pgvector, qdrant, seahorse×3): it ANDs with whichever ACL
+filter (`vault_ids` / `source_ids`) is present and excludes stale points from
+the non-active Document arm driver-side, before the top-K cut. The native arm
+is therefore eligible for the vault-granularity path (`vault_path_eligible`),
+so vault-scoped native search no longer enumerates candidate ids through the
+10,000-resource / 128MiB bounded-corpus gate — the gate stays in place for the
+id-enumeration path only. `_hydrate_hits` keeps its arm-mismatch skip as
+defense in depth.
+
+Hydration drops are now counted by cause (`stale_arm`,
+`unknown_source_type`, `stale_native_file_path`, `hydration_miss`,
+`unuriable_source_type`) and surfaced as a `hydration_dropped:...`
+degradation reason, so `total_matches > 0, returned == 0` can never again
+read as a silent zero-match.
+
+### Added a personal notification inbox and document watches
+
+Human browser sessions can view effective Vault-access changes and explicitly
+watch documents for updates, moves, archive/restore transitions, and deletion.
+The web inbox supports server-side category and unread filters, pagination,
+version-aware read acknowledgement, and snapshot-based mark-all-read. Watches
+survive document moves through stable resource identity. Current access is
+checked during delivery and reads; inaccessible targets are redacted or omitted.
+
+Migration 099 adds PostgreSQL-backed subscriptions, inbox entries, and durable
+delivery work for both legacy and Native document mutations. Delivery runs in
+the existing worker, without Redis or an external messaging service. Ordinary
+updates coalesce into fixed five-minute buckets and retention defaults to 90
+days. Operators can disable the feature with `notifications_enabled` or adjust
+`notification_retention_days`. PATs and service credentials cannot read a
+personal inbox. Email, push delivery, and historical-event replay are not included.
+
+See the [personal notifications guide](../docs/guides/personal-notifications.md).
+
+### drill_down and search payload hygiene
+
+`akb_drill_down` returns section bodies, not the scaffolding the indexer wrote
+into them. The `TITLE:/SUMMARY:/TAGS:/PATH:/TYPE:` block is now stripped even
+when the document summary spans several lines — until now those chunks came
+back as nothing but their own metadata. The `[# A > ## B]` context line, which
+repeats the `section_path` field on the same row, is gone from the body, and so
+is the 200-character overlap window a continuation chunk repeats from its
+predecessor (exact matches only, so reading a section end to end still yields
+every character). A chunk that is stored more than once at the same position is
+returned once. `mode='outline'` lists each heading once instead of once per
+chunk, so the 50-row cap now bounds headings rather than repeats.
+
+Search hits gain two additive fields, `section_path` and `chunk_index`, naming
+the chunk that matched so a caller can follow up with
+`akb_drill_down(section=...)` instead of searching again; `matched_section`
+drops the same redundant context line. No response loses a field.
+
+Every `tools/call` now leaves one line on the `akb.mcp.response` logger with
+the tool name, the serialised response size in bytes and the call duration, so
+payload cost is measurable per tool without a schema change.
+
+### Reduced pgvector posting lookup overhead
+
+Fresh pgvector stores use covering indexes for sparse weights and resource
+scope lookups. Existing indexes are left unchanged at startup; an optional
+concurrent-index maintenance script supports posting-store upgrades. Search
+logs now separate embedding, candidate selection, retrieval, reranking and
+hydration, with pgvector leg and pool-wait timings that omit query/result data.
+Explicitly empty pgvector scopes return no results instead of scanning the
+whole index. Source-ID-filtered sparse retrieval materializes its authorized
+chunk set before joining common posting lists, bounding the join without
+changing BM25 terms or scores; wide vault filters retain the direct join. Local
+synthetic benchmarks and real-pgvector tests check ranking and scope parity; see
+`docs/designs/search-performance.md` for limitations.
+
+### Applied search filters before result limits
+
+REST search now supports repeated document types and explicit resource kinds.
+Collection scope is boundary-aware for documents, files and tables, and document
+metadata filters no longer admit unrelated resources. Grep accepts document types,
+tags and explicit archived inclusion, preserves its legacy archive default, and
+reports invalid regex patterns as validation errors. Native and standard search
+paths share metadata semantics. The web Search workspace uses URL-backed server
+filters, regex/case options and distinct incomplete, truncated and empty states.
+
+### Made globally reserved Vault-name conflicts non-disclosing
+
+Vault creation now returns the same `vault_name_unavailable` conflict for an
+existing name and for concurrent database or Git creation races. The response
+does not expose the conflicting Vault's name, owner, visibility, or state, and
+the contract is shared by REST, MCP, standard, native-ledger, and external-git
+creation paths. The create UI documents installation-wide uniqueness and only
+offers to open an existing Vault when that Vault is already present in the
+caller's access-filtered list.
+
+### Added the strict App Release Manifest v2 contract
+
+App release registration now requires a v2-only manifest with immutable app
+identity, full source revision, immutable OCI `sha256:` image digest, product
+schema version, complete desired table projection, and source-specific
+transition plans. Canonical NFC/sorted-key/compact-JSON checksums cover the
+release version, provenance, desired schema, and every plan. v1 payloads,
+unknown fields, raw SQL, expressions, custom code, and destructive operations
+are rejected without a compatibility fallback.
+
+Fresh plans create complete table descriptors, including required columns,
+unique keys, and indexes. Existing-installation rollout and resume select only
+an exact source release/schema fingerprint plan and fail closed before schema
+mutation when one is missing or ambiguous. Legacy adoption derives its
+expected fingerprint from the v2 desired projection; operators no longer send
+a second expected checksum. Migration 095 enforces the v2 registry shape, so
+deployments with historical v1 release rows must resolve that registry state
+before upgrade.
+
+### Added a tenant stats snapshot on its own port
+
+A new `/stats` surface reports coarse inventory — database and file bytes,
+vault/collection/document/chunk counts, and the previous complete UTC day's
+call volume — as plain JSON. It listens on a **separate port**, configured by
+`stats.port` in `app.yaml` or the `AKB_STATS_PORT` environment variable, and is
+not composed at all when neither is set. The separation exists so a control
+plane can read inventory over a NetworkPolicy that cannot reach the API port;
+the surface carries no authentication of its own, so do not bind it where no
+such policy restricts who may connect.
+
+Responses are served from a snapshot recomputed every
+`stats.sampler_interval_secs` (default 300) and never from the request path, so
+polling costs nothing; callers get 503 until the first sample and keep being
+served the last good snapshot while sampling fails. Unmeasurable numbers are
+omitted rather than defaulted to 0, and the previous day's call volume is
+finalized once into `tenant_activity_daily` (migration 087) so a restart cannot
+publish a different number for a window a consumer already recorded. The wire
+contract is `backend/app/stats/schema_v1.json` with golden fixtures beside it.
+This is deliberately not a metrics endpoint — there is no Prometheus
+dependency.
+
+### Reported the age of the indexing queue head on /health
+
+`/health` now carries `oldest_pending_enqueued_at`: the enqueue time of the
+oldest chunk still waiting to be indexed, also available per vault under
+`vector_store.backfill.upsert`. The existing backlog counters said how much
+work was outstanding but not whether it was moving, so a stuck queue and a busy
+one looked alike. The field is omitted entirely when nothing is pending.
+
+### Fixed upstream provider selection with an existing Keycloak session
+
+Ordinary browser login now requires a fresh Keycloak authentication ceremony
+in addition to its signed `kc_idp_hint`. A native Keycloak session left by the
+separate product-admin surface can no longer satisfy an upstream-provider
+request and cause the selected broker alias to be skipped. The request does
+not send `prompt=login`, so the upstream provider can still use its own SSO
+session.
+
+### Added standards-based upstream OIDC provider control
+
+Product administrators can now configure a generic `oidc` upstream from its
+exact HTTPS issuer, client ID, and write-only client secret. AKB still asks its
+Keycloak broker to import discovery, but validates the returned issuer and
+HTTPS endpoints, renders only a bounded secure profile, and fingerprints that
+endpoint set so out-of-band drift fails closed. The profile uses authorization
+code flow with PKCE S256, JWKS signature validation, `client_secret_post`, and
+starts disabled. Microsoft Entra ID and distinct upstream Keycloak realms are
+covered as interoperability contracts; the existing Keycloak-specific provider
+remains available for compatibility and its stricter path/claim policy.
+
+### Made product-admin callback failures recoverable
+
+Expired, malformed, or refused product-admin OIDC callbacks now return the
+browser to `/admin` with a fixed, non-disclosing retry message instead of
+rendering a serialized API error. The one-time browser-binding cookie is
+cleared on failure, while successful callbacks retain the existing short,
+opaque admin session behavior.
+
+### Added dual-era MCP protocol support
+
+The backend now uses the pinned MCP 2.1.0 SDK and serves the 2026-07-28
+stateless request envelope alongside the supported legacy initialize/session
+revisions (`2024-11-05`, `2025-03-26`, `2025-06-18`, and `2025-11-25`) on the
+same authenticated `/mcp/` endpoint. Modern requests carry their own client
+metadata and never create or reuse a session; legacy sessions remain bound to
+the principal that initialized them. Header/body generation mismatches,
+unsupported revisions, and cross-generation requests fail before tool
+dispatch. Tool validation, authorization, RBAC, audit, and side effects stay
+in the shared dispatcher.
+
+### Added collection intent to browse and search responses
+
+`akb_browse` now returns metadata for its current vault or collection root,
+and keeps collection summaries in the default slim response. Search results
+now include their parent collection summary and vault description. These
+fields are hydrated from the catalog after retrieval, so they add context
+without creating collection index records or affecting ranking.
+
+### Aligned resource deletion with Vault permission boundaries
+
+Recursive collection deletion can no longer be used by a Vault writer to
+drop a table that requires administrator access on the dedicated table
+endpoint. REST and MCP collection deletion now derive the table-drop
+capability from the authenticated Vault role and reject the whole operation
+before any mutation when the caller lacks it.
+
+The web app now exposes permission-aware delete actions for documents, files,
+and tables in both resource viewers and the Vault explorer. Table deletion
+requires exact-name confirmation and identifies affected rows, while every
+successful deletion refreshes the explorer and returns the user to the Vault.
+
 ### Fixed repeated production-scale BM25 rebuilds and bounded rebuild memory
 
 The BM25 refresher no longer compares all non-null chunks with the smaller set
@@ -80,6 +483,20 @@ ledger; existing table schema, rows, Vault access, grants, and credentials are
 untouched. Adopted or retained tables reject generic alter/drop and structured
 migrations, while the owning rollout worker retains its exact installation
 context.
+
+## 0.14.3 — 2026-09-08  *(fix — managed workload identity)*
+
+Managed `platform_hard` deployments now read rotating Gateway tokens for model
+calls and use refreshable RGW WebIdentity sessions for file and audit storage.
+Static model/S3/audit keys are rejected. Internal S3 operations and public
+presigns share the workload credentials; URL lifetime is bounded by the exact
+signing session, and API `expires_in` reports the actual lifetime. Managed
+startup requires an accessible pre-provisioned bucket and never creates one.
+
+Standalone static credentials and MinIO bucket creation remain available.
+Explicit `s3_auth_mode: default_chain` supports native cloud credentials,
+including AWS WebIdentity, with cleanup workers enabled even when no custom
+S3 endpoint is configured. See [workload identity configuration](../docs/managed-workload-identity.md).
 
 ## 0.14.2 — 2026-08-13  *(feat — exact PAT authority self-verification)*
 

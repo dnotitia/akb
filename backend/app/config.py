@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -54,6 +55,10 @@ NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
 
 _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# One DNS label of an authoritative email domain: lowercase ASCII
+# alphanumerics with interior hyphens only. Checked after IDNA encoding,
+# so this never sees non-ASCII input.
+_AUTHORITY_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 AuthMode = Literal["local", "sso"]
 LegacyAuthModeStatus = Literal["local_only", "strict_sso", "ambiguous_hybrid", "invalid"]
@@ -202,6 +207,107 @@ def _resolve_auth_mode_config(
     return resolved
 
 
+def _normalize_authority_domain(value: object) -> str:
+    """Normalize one authoritative email domain, or raise.
+
+    Lowercase, one trailing dot stripped, exact-match only: no wildcards, no
+    subdomain inheritance (``example.com`` never covers ``sub.example.com``).
+    A rejecting caller reports the alias; the raw value never reaches an
+    error message (it is operator config, but value-less codes are the
+    house rule for identity-adjacent inputs).
+
+    Length is enforced AFTER IDNA encoding: punycode expansion can push an
+    ASCII-short name past the 253-octet DNS limit, and only the wire form
+    is what the limit constrains.
+    """
+    if not isinstance(value, str):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider domains must be strings"
+        )
+    cleaned = value.strip().lower()
+    if cleaned.endswith("."):
+        cleaned = cleaned[:-1]
+    if not cleaned or ".." in cleaned:
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        )
+    try:
+        ascii_domain = cleaned.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        ) from None
+    labels = ascii_domain.split(".")
+    if (
+        len(ascii_domain) > 253
+        or len(labels) < 2
+        or any(
+            not 1 <= len(label) <= 63 or _AUTHORITY_DOMAIN_LABEL_RE.fullmatch(label) is None
+            for label in labels
+        )
+    ):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider holds an invalid email domain"
+        )
+    return ascii_domain
+
+
+def _normalize_authoritative_email_domains(value: object) -> dict[str, list[str]]:
+    """Validate the alias-keyed authoritative-domain map into canonical form.
+
+    The map is validated here — in the canonical loader — so the same value
+    fails identically whether it arrives from YAML or a directly constructed
+    ``Settings``. Alias validation reuses the provider contract
+    (``validate_alias`` + the reserved ``local`` alias); a bad alias, a
+    non-list domain set, or a bad domain fails the load fail-closed.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AuthModeConfigurationError(
+            "keycloak_authoritative_email_domains_by_provider must be a mapping of provider alias to domain list"
+        )
+    # Local imports keep the module graph acyclic: providers must not import
+    # config, and config needs only the alias contract, not Keycloak I/O.
+    from app.sso import local_realm
+    from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
+
+    normalized: dict[str, list[str]] = {}
+    for raw_alias, raw_domains in value.items():
+        if not isinstance(raw_alias, str):
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider keys must be provider aliases"
+            )
+        # Alias keys are case-sensitive and lowercase-only, exactly like the
+        # provider contract: Keycloak aliases are exact strings and the
+        # browser flow compares them with equality. An uppercase key would
+        # silently never match a login, so reject rather than fold.
+        try:
+            alias = validate_alias(raw_alias)
+        except ProviderDefinitionError:
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider holds an invalid provider alias"
+            ) from None
+        if local_realm.is_local_alias(alias):
+            raise AuthModeConfigurationError(
+                "keycloak_authoritative_email_domains_by_provider must not name the local realm; "
+                "it brokers nowhere and its logins never adopt"
+            )
+        if not isinstance(raw_domains, list) or not raw_domains:
+            raise AuthModeConfigurationError(
+                f"keycloak_authoritative_email_domains_by_provider[{alias}] must be a non-empty domain list"
+            )
+        seen: set[str] = set()
+        domains: list[str] = []
+        for entry in raw_domains:
+            domain = _normalize_authority_domain(entry)
+            if domain not in seen:
+                seen.add(domain)
+                domains.append(domain)
+        normalized[alias] = domains
+    return normalized
+
+
 def is_dns1123_namespace(value: str) -> bool:
     """Return whether ``value`` is a DNS-1123 subdomain."""
     if not value or len(value) > 253:
@@ -311,6 +417,46 @@ class ToolUsageSettings(BaseModel):
     shutdown_deadline_secs: float = Field(default=8.0, ge=0.5, le=60.0)
 
 
+class StatsSettings(BaseModel):
+    """Tenant `/stats` snapshot — a **separate listener**, not part of the API.
+
+    The control plane needs coarse per-tenant inventory (storage, corpus,
+    yesterday's call volume) without being able to reach any tenant data. That
+    separation is enforced at L3/L4 by a NetworkPolicy, which selects on port —
+    so this surface cannot share the API port, and it carries no authentication
+    of its own: reachability *is* the authorization, and the port stays closed
+    unless an operator opens it.
+
+    Off by default. Leave ``port`` unset and no socket is ever bound, no
+    sampler runs, and nothing about the process changes.
+
+    Deliberately NOT a metrics endpoint: no ``prometheus_client``, no
+    exposition format, no registry. Plain JSON, computed on a timer and served
+    from cache, so a scrape storm on this port cannot turn into DB load.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # None = the listener is not composed at all (default). The
+    # AKB_STATS_PORT environment variable overrides this; see
+    # `app/stats/listener.py` for why that exception exists.
+    port: int | None = Field(default=None, ge=1, le=65535)
+    # Bind address for the stats socket. The default binds all interfaces
+    # because the only intended caller is another pod, and the pod's own
+    # NetworkPolicy — not a bind address — is what makes that safe.
+    host: str = "0.0.0.0"
+    # Sampler cadence. Requests are served from the last completed sample and
+    # never trigger a recomputation, so this is the only thing that decides how
+    # much DB work the surface costs. A consumer should poll at half this or
+    # faster; polling at the same period drops a snapshot whenever the two
+    # phases drift apart, and reading the cache costs nothing.
+    sampler_interval_secs: int = Field(default=300, ge=30, le=3600)
+    # How long after a UTC day closes before its activity window is finalized.
+    # Writes that were in flight across midnight still need to land in
+    # `tool_calls`; folding the day the instant it closes would undercount them.
+    activity_grace_minutes: int = Field(default=5, ge=0, le=720)
+
+
 class VaultSkillSettings(BaseModel):
     """Auto-injection of the vault-skill into MCP tool responses."""
 
@@ -398,6 +544,8 @@ class ExternalGitHostRule(BaseModel):
 
 
 class Settings(BaseModel):
+    notifications_enabled: bool = True
+    notification_retention_days: int = Field(default=90, ge=1, le=3650)
     # Forbid unknown keys so a typo in app.yaml / secret.yaml fails loudly
     # instead of being silently dropped (pydantic default is 'ignore').
     # Never include the merged config input in validation errors: it can contain
@@ -469,6 +617,27 @@ class Settings(BaseModel):
     native_revision_m1_file_driver: Literal["s3_current", "fscas", "s3cas"] = "s3_current"
     native_revision_m1_file_fscas_root: str = ""
     native_revision_m1_file_transfer_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=128 * 1024 * 1024)
+
+    # Ceiling on one capability upload. The bytes stream straight through to
+    # the object store, so this bounds the transfer rather than any buffer —
+    # the default clears the largest File AKB is known to hold. The reverse
+    # proxy in front of this service has its own body limit and will reject an
+    # oversized upload earlier and more cheaply; this is the backstop for when
+    # it does not.
+    file_upload_max_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1)
+
+    # Shared secret between this service and the byte gateway that fronts file
+    # downloads. Blank disables the internal authorization route entirely —
+    # it answers 404, exactly as if it did not exist — so a deployment without
+    # a gateway never exposes it. The route is already unreachable from
+    # outside because no ingress maps its prefix; this is the second lock, and
+    # a mismatch fails every download loudly rather than leaking quietly.
+    file_gateway_key: str = ""
+    # How long the gateway has to start fetching. The object store checks the
+    # signature once, when the request begins, so this bounds the hop between
+    # this service and the gateway — not the transfer, which may run for
+    # minutes afterwards.
+    file_gateway_presign_ttl: int = Field(default=60, ge=5, le=3600)
 
     # External-git mirror — network timeouts (seconds) for the poller's
     # three remote-aware git ops. A hanging TCP session otherwise stalls
@@ -552,6 +721,7 @@ class Settings(BaseModel):
     # route must use; startup rejects a direct-provider escape.
     model_api_governance_mode: Literal["external_metering", "platform_hard"] = "external_metering"
     platform_gateway_base_url: str = ""
+    platform_gateway_token_file: str = ""
 
     # LLM — optional. Only consumed by metadata_worker (auto-tagging
     # external_git imports). When unset, metadata_worker stays disabled
@@ -626,27 +796,28 @@ class Settings(BaseModel):
         gateway = self.platform_gateway_base_url.strip().rstrip("/")
         if not gateway:
             raise ValueError("platform_gateway_base_url is required in platform_hard mode")
+        if not Path(self.platform_gateway_token_file).is_absolute():
+            raise ValueError("platform_gateway_token_file must be an absolute token path in platform_hard mode")
+        for name in ("embed_api_key", "llm_api_key", "rerank_api_key"):
+            if getattr(self, name):
+                raise ValueError(f"{name} is forbidden in platform_hard mode")
 
-        routes = [
-            ("embed_base_url", self.embed_base_url, "embed_api_key", self.embed_api_key),
-        ]
+        routes = []
+        if self.embed_base_url:
+            routes.append(("embed_base_url", self.embed_base_url))
         if self.llm_base_url:
-            routes.append(("llm_base_url", self.llm_base_url, "llm_api_key", self.llm_api_key))
+            routes.append(("llm_base_url", self.llm_base_url))
         if self.rerank_enabled:
             routes.append(
                 (
                     "rerank_base_url",
                     self.rerank_base_url or self.llm_base_url,
-                    "rerank_api_key",
-                    self.rerank_api_key or self.llm_api_key,
                 )
             )
 
-        for url_name, url, key_name, key in routes:
+        for url_name, url in routes:
             if not url or url.strip().rstrip("/") != gateway:
                 raise ValueError(f"{url_name} must exactly match platform_gateway_base_url in platform_hard mode")
-            if not key.strip():
-                raise ValueError(f"{key_name} is required in platform_hard mode")
         return self
 
     @model_validator(mode="after")
@@ -699,6 +870,18 @@ class Settings(BaseModel):
     # caller (MCP, REST, internal) is bounded uniformly.
     search_limit_max: int = Field(default=50, ge=1)
 
+    # Cap on the caller-supplied `source_uris` scope list (workbench #1069,
+    # part 3). Each URI expands into SQL OR-clauses (candidate scope) and a
+    # vector-store IN-list entry, so an unbounded list lets one request grow
+    # the query text and the downstream filter payload without bound (the
+    # seahorse drivers have overflowed on giant IN lists before). 200 is a
+    # provisional value — large enough for the "previously found resources"
+    # agent loop, small enough to keep both expansions trivial. Revisit with
+    # a measured per-driver IN-list limit if callers ever need more; until
+    # then the error message tells them to split the request or use a vault
+    # scope instead.
+    search_max_source_uris: int = Field(default=200, ge=1)
+
     # Push the ACL filter down to VAULT granularity in the vector store (issue
     # #189 Phase 2). When True AND the driver is pgvector AND a search has no
     # doc-level filter (collection/doc_type/tags/source_uris), search filters by
@@ -715,11 +898,60 @@ class Settings(BaseModel):
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""  # Internal endpoint (server → S3)
-    s3_public_url: str = ""  # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
+    # Retained and ignored. It named the endpoint a browser would have been
+    # sent to with a signature; nothing signs for a browser any more, because
+    # bytes reach a client through the API or the byte gateway and never
+    # straight from the store. Removing the field would make every existing
+    # deployment's config fail to load — `Settings` forbids unknown keys —
+    # so it stays until a release that can take that break.
+    s3_public_url: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
     s3_region: str = ""
+    # Static retains the existing standalone/MinIO configuration. The native
+    # chain supports cloud roles without requiring a custom S3 endpoint.
+    # platform_hard narrows default_chain to this explicit WebIdentity tuple;
+    # no environment or shared-profile credential can override that identity.
+    s3_auth_mode: Literal["static", "default_chain"] = "static"
+    s3_web_identity_token_file: str = ""
+    s3_role_arn: str = ""
+    s3_sts_endpoint_url: str = ""
+
+    @property
+    def object_storage_enabled(self) -> bool:
+        return bool(self.s3_endpoint_url) or self.s3_auth_mode == "default_chain"
+
+    @model_validator(mode="after")
+    def validate_storage_identity(self) -> "Settings":
+        managed = self.model_api_governance_mode == "platform_hard"
+        if managed and self.s3_auth_mode != "default_chain":
+            raise ValueError("s3_auth_mode must be default_chain in platform_hard mode")
+        if self.s3_auth_mode == "default_chain":
+            for name in ("s3_access_key", "s3_secret_key"):
+                if getattr(self, name):
+                    raise ValueError(f"{name} is forbidden with s3_auth_mode=default_chain")
+        if managed:
+            for name in ("access_key", "secret_key"):
+                if getattr(self.audit, name):
+                    raise ValueError(f"audit.{name} is forbidden in platform_hard mode")
+            if not self.s3_endpoint_url.strip():
+                raise ValueError("s3_endpoint_url is required in platform_hard mode")
+
+        fields = ("s3_web_identity_token_file", "s3_role_arn", "s3_sts_endpoint_url")
+        if managed or any(getattr(self, name) for name in fields):
+            if self.s3_auth_mode != "default_chain":
+                raise ValueError("s3_auth_mode must be default_chain for WebIdentity")
+            for name in fields:
+                if not getattr(self, name).strip():
+                    raise ValueError(f"{name} is required for explicit S3 WebIdentity")
+            if not Path(self.s3_web_identity_token_file).is_absolute():
+                raise ValueError("s3_web_identity_token_file must be an absolute token path")
+            endpoint = urlsplit(self.s3_sts_endpoint_url)
+            if (endpoint.scheme not in ("https", "http") or not endpoint.hostname
+                    or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment):
+                raise ValueError("s3_sts_endpoint_url must be an HTTP(S) endpoint without credentials or query")
+        return self
     # boto3/botocore default to a 60 s connect AND 60 s read timeout with NO
     # retries. A stalled MinIO/S3 (network blip, cold bucket, dead endpoint)
     # then blocks the caller for up to 60 s — and several S3 primitives run on
@@ -881,15 +1113,39 @@ class Settings(BaseModel):
     )
     sso_browser_session_refresh_skew_secs: int = Field(default=30, ge=0, le=300)
     keycloak_verify_ssl: bool = True  # set false only for local self-signed Keycloak
+    # Optional read-only Keycloak account reconciliation. Each tick checks at most
+    # 25 existing identities; suspension preserves accounts, bindings, and Vaults.
+    sso_account_sync_enabled: bool = False
+    sso_account_sync_interval_secs: int = Field(default=30, ge=10, le=3600)
     # Exact identity is issuer/subject and does not require email. Open-mode
     # JIT requires a verified email only when creating a brand-new AKB user;
-    # email is never an account lookup or adoption key. Set false ONLY for a
-    # trusted realm where every account's email is controlled out-of-band.
+    # otherwise email is never an account lookup or adoption key — the one
+    # exception is a browser login through a provider declared in
+    # keycloak_authoritative_email_domains_by_provider for the address's
+    # domain, where the directory owns the mailbox. Set false ONLY for a
+    # trusted realm where every account's email is controlled out-of-band;
+    # on a declared domain that choice additionally admits unverified
+    # adoption, so keep it true wherever authority domains are configured.
     keycloak_require_verified_email: bool = True
     # OIDC account admission policy. `open` permits atomic creation of a fresh
     # user plus exact binding. `invite_only` accepts only an exact prebound
     # (issuer, subject) identity. `disabled` rejects external login entirely.
     keycloak_enrollment_mode: Literal["open", "invite_only", "disabled"] = "open"
+    # Offer the installation's OWN realm as a login option, for a deployment
+    # that has no external identity provider to broker to. Off by default: an
+    # installation that registers no provider keeps today's behaviour rather than
+    # silently gaining a login.
+    #
+    # This does not put two planes into one realm. A realm-local native identity
+    # is already what this realm is for: the product administrator is one, and
+    # this realm is the only human issuer the installation accepts. What the
+    # setting decides is whether ordinary people also hold an account here rather
+    # than at an upstream -- an installation-owner's choice, which is why it is a
+    # setting and not a default. Bounded either way: whoever signs in this way
+    # arrives as a pending admission and still needs approval, exactly like
+    # anyone else, so arrival is not entry.
+    sso_local_realm_login_enabled: bool = False
+    sso_local_realm_display_name: str = "This workspace"
     # `invite_only` records the arrival it refuses so an administrator can
     # approve that exact identity. Both bounds are on the RECORD, never on the
     # refusal: eviction changes what an administrator can still see, and never
@@ -906,6 +1162,24 @@ class Settings(BaseModel):
     # and the projection service repeats that guard for directly constructed
     # Settings. Runtime email adoption has no compatibility bypass.
     keycloak_link_by_email: bool = False
+    # Per-provider email-domain authority for the browser login path
+    # (dnotitia/akb#529). ``alias -> [domains]``; empty (the default) keeps
+    # every installation on today's behaviour. A declared domain lets a
+    # verified brokered login adopt the one active human account carrying
+    # that address, or provision a fresh one — evaluated only when no exact
+    # (issuer, subject) binding exists, only for the alias the flow
+    # selected, and never for the local realm. Flat key so the shallow
+    # app.yaml+secret.yaml merge cannot clobber a nested block.
+    #
+    # This is deliberately NOT keycloak_link_by_email under another name:
+    # that flag (still rejected at canonical load) was install-wide,
+    # unverified, unguarded, and unaudited. This one is per-provider,
+    # domain-scoped, browser-only, verified-email-gated, guard-checked
+    # (active human, no issuer binding, never the recovery admin), and
+    # emits a distinct auth.user_adopted event.
+    # None normalizes to {} (explicit null in YAML is "not configured",
+    # not a type error); anything else non-mapping fails the load.
+    keycloak_authoritative_email_domains_by_provider: dict[str, list[str]] | None = Field(default_factory=dict)
     # Deprecated pre-custody callback input. The active ordinary browser
     # callback is derived from public_base_url and never trusts this value.
     keycloak_redirect_uri: str = ""
@@ -1096,6 +1370,9 @@ class Settings(BaseModel):
     # DDL online; this timer is the belt-and-suspenders that catches
     # any silent hook failure (logged + counted in metrics_snapshot
     # but otherwise not auto-recovered). Set to 0 to disable.
+    # Enable only after every local-session issuer/verifier supports generation claims.
+    account_self_service_enabled: bool = False
+
     role_sync_reconcile_interval_secs: int = 3600
 
     # Event stream — optional Redis Streams fanout. PG outbox (`events`
@@ -1120,6 +1397,18 @@ class Settings(BaseModel):
     # Vault-skill auto-injection into MCP tool responses. See
     # VaultSkillSettings above; the state lives in `services/vault_skill_service`.
     vault_skill: VaultSkillSettings = Field(default_factory=VaultSkillSettings)
+
+    # Tenant `/stats` snapshot listener. Off unless `stats.port` (or
+    # AKB_STATS_PORT) is set. See StatsSettings above.
+    stats: StatsSettings = Field(default_factory=StatsSettings)
+
+    @model_validator(mode="after")
+    def validate_authoritative_email_domains(self) -> "Settings":
+        """Normalize the provider authority map so direct construction fails closed too."""
+        self.keycloak_authoritative_email_domains_by_provider = _normalize_authoritative_email_domains(
+            self.keycloak_authoritative_email_domains_by_provider
+        )
+        return self
 
     @model_validator(mode="after")
     def validate_service_admin_client(self) -> "Settings":
@@ -1219,11 +1508,9 @@ class Settings(BaseModel):
     def keycloak_jwks_uri(self) -> str:
         # Server→Keycloak → backchannel issuer.
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
-
     @property
     def keycloak_human_client_ids(self) -> frozenset[str]:
         """OIDC clients allowed to authorize human API access tokens.
-
         MCP DCR clients are intentionally excluded: MCP has its own route
         profile, audience, and scope contract rather than this static list.
         """
@@ -1235,6 +1522,20 @@ class Settings(BaseModel):
             )
             if client_id.strip()
         )
+
+    def authoritative_email_domains_for(self, provider_alias: str | None) -> tuple[str, ...]:
+        """Declared authority domains for one provider alias, or empty.
+
+        The lookup key is the alias the browser flow selected and verified —
+        never a claim read out of the token at this layer. ``None`` (the
+        non-browser projection paths, which pass no alias) is inert, as is
+        ``""``: unknown and local aliases resolve through the same empty
+        answer, so a second upstream can never inherit the first one's trust.
+        """
+        if not provider_alias:
+            return ()
+        mapping = self.keycloak_authoritative_email_domains_by_provider or {}
+        return tuple(mapping.get(provider_alias, ()))
 
     @property
     def keycloak_service_admin_client_id_effective(self) -> str:

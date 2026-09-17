@@ -38,7 +38,7 @@ export default function VaultNewPage() {
           </nav>
           <PageHeader
             title="Create a vault"
-            subtitle="A vault is a Git-backed knowledge root. Documents, tables, and files live inside it. Pick a short, lowercase name — it becomes the URL path and the repo identifier."
+            subtitle="A vault is a Git-backed knowledge root. Documents, tables, and files live inside it. Pick a short, lowercase name that is unique across this AKB installation — it becomes part of the canonical akb:// URI and the repo identifier."
             className="mb-6"
           />
         </>
@@ -47,6 +47,7 @@ export default function VaultNewPage() {
     >
       <VaultCreateForm
         onCreated={(name) => navigate(`/vault/${name}`)}
+        onOpenExisting={(name) => navigate(`/vault/${name}`)}
         onCancel={handleCancel}
         onBusyChange={setCreating}
         className="rounded-[var(--radius-lg)] border border-border bg-surface p-8 shadow-sm"

@@ -72,7 +72,6 @@ def test_create_replay_changes_201_to_200_and_never_caches(monkeypatch) -> None:
             {
                 "vault_id": str(uuid.uuid4()),
                 "table_allowlist": ["orders"],
-                "expected_schema_fingerprint": "a" * 64,
             }
         ],
     }
@@ -119,7 +118,7 @@ def test_status_and_apply_forward_ids_and_set_no_store(monkeypatch) -> None:
     assert calls == [("get", app_id, adoption_id), ("apply", app_id, adoption_id)]
 
 
-def test_request_validation_rejects_non_uuid_idempotency_and_bad_fingerprint() -> None:
+def test_request_validation_rejects_non_uuid_idempotency_and_caller_fingerprint() -> None:
     app_id = uuid.uuid4()
     client = _client(user=_user())
     response = client.post(

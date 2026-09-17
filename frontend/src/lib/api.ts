@@ -6,6 +6,7 @@ export type PublicAuthMode = AuthMode | "hybrid";
 let _token: string | null = null;
 let _authMode: AuthMode | null = null;
 let _authSessionGeneration = 0;
+let _ssoCsrfToken: string | null = null;
 const SAFE_AUTH_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOCAL_TOKEN_STORAGE_KEY = "akb_token";
 const LEGACY_SSO_SESSION_KEY = "akb_legacy_sso";
@@ -187,6 +188,47 @@ export function getToken(): string | null {
   return _token;
 }
 
+export type AuthSessionSnapshot = Readonly<{ generation: number; token: string | null; mode: AuthMode | null; csrfToken: string | null }>;
+
+export function authSessionSnapshot(): AuthSessionSnapshot {
+  const token = getToken();
+  // The readable CSRF cookie changes with every SSO browser session. It binds
+  // a reviewed action to that session without exposing its HttpOnly credential.
+  const csrfToken = _authMode === "sso" ? cookieValue(ssoCsrfCookieName()) : null;
+  if (csrfToken !== _ssoCsrfToken) {
+    _ssoCsrfToken = csrfToken;
+    _authSessionGeneration += 1;
+    clearPrivateAssetCache();
+  }
+  return { generation: _authSessionGeneration, token, mode: _authMode, csrfToken };
+}
+
+export function isCurrentAuthSession(snapshot: AuthSessionSnapshot): boolean {
+  const current = authSessionSnapshot();
+  return current.generation === snapshot.generation && current.token === snapshot.token && current.mode === snapshot.mode && current.csrfToken === snapshot.csrfToken;
+}
+
+let lifecycleAttempt: { snapshot: AuthSessionSnapshot } | null = null;
+export function beginAccountLifecycle(snapshot: AuthSessionSnapshot): () => void {
+  if (!isCurrentAuthSession(snapshot) || lifecycleAttempt) {
+    throw new ApiError("Your session changed. Review this action again.", 409, { code: "account_identity_changed" });
+  }
+  const attempt = { snapshot };
+  lifecycleAttempt = attempt;
+  return () => { if (lifecycleAttempt === attempt) lifecycleAttempt = null; };
+}
+
+export function clearCompletedAccountSession(snapshot: AuthSessionSnapshot): boolean {
+  if (!isCurrentAuthSession(snapshot)) return false;
+  clearPrivateAssetCache();
+  clearLegacySsoSession();
+  setToken(null);
+  // SSO credentials are already revoked server-side. Leave the inert cookies
+  // alone so a late response cannot erase a newer login, and invalidate old work.
+  if (snapshot.mode === "sso") _authSessionGeneration += 1;
+  return true;
+}
+
 function ssoCsrfCookieName(): string {
   return window.location.protocol === "https:"
     ? "__Host-akb_sso_csrf"
@@ -218,7 +260,7 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
       const token = getToken();
       if (token) merged.set("Authorization", `Bearer ${token}`);
     }
-    if (_authMode === "sso" && unsafeMethod && !merged.has("Authorization")) {
+    if (_authMode === "sso" && unsafeMethod && !merged.has("Authorization") && !merged.has("X-AKB-CSRF")) {
       const csrf = cookieValue(ssoCsrfCookieName());
       if (csrf) merged.set("X-AKB-CSRF", csrf);
     }
@@ -231,7 +273,7 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
     const token = getToken();
     if (token) merged.Authorization = `Bearer ${token}`;
   }
-  if (_authMode === "sso" && unsafeMethod && !hasHeader("Authorization")) {
+  if (_authMode === "sso" && unsafeMethod && !hasHeader("Authorization") && !hasHeader("X-AKB-CSRF")) {
     const csrf = cookieValue(ssoCsrfCookieName());
     if (csrf) merged["X-AKB-CSRF"] = csrf;
   }
@@ -271,16 +313,21 @@ export async function authenticatedFetch(
   }
   const requestMethod = init?.method || (input instanceof Request ? input.method : "GET");
   const requestHeaders = init?.headers || (input instanceof Request ? input.headers : undefined);
+  const requestSession = authSessionSnapshot();
   const res = await fetch(input, {
     ...init,
     credentials: "same-origin",
     headers: withAuthCarrier(requestHeaders, requestMethod),
   });
   if (res.status === 401) {
-    if (unauthorized !== "preserve-session") {
+    const deferred = !isCurrentAuthSession(requestSession) ||
+      (lifecycleAttempt !== null && lifecycleAttempt.snapshot.generation === requestSession.generation);
+    if (unauthorized !== "preserve-session" && !deferred) {
       expireUnauthorizedSession(unauthorized === "expire-and-redirect");
     }
-    throw new Error("Unauthorized");
+    const error = new ApiError("Unauthorized", 401, null);
+    if (deferred) error.name = "DeferredSessionError";
+    throw error;
   }
   return res;
 }
@@ -295,7 +342,7 @@ async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? null);
 }
 
 async function api<T>(
@@ -794,6 +841,7 @@ export interface AdminSsoProvider {
   client_id: string | null;
   client_secret_configured: boolean;
   redirect_uri: string;
+  post_logout_redirect_uri: string;
   capabilities: {
     supports_logout: boolean;
     supports_identity_migration: boolean;
@@ -816,7 +864,7 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     !hasExactKeys(provider, [
       "provider_type", "alias", "display_name", "state", "enabled", "issuer",
       "discovery_url", "client_id", "client_secret_configured",
-      "redirect_uri", "capabilities",
+      "redirect_uri", "post_logout_redirect_uri", "capabilities",
     ]) ||
     !hasExactKeys(capabilities, ["supports_logout", "supports_identity_migration"]) ||
     typeof provider.provider_type !== "string" ||
@@ -851,6 +899,10 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     !provider.redirect_uri ||
     provider.redirect_uri.length > 2048 ||
     hasControlCharacters(provider.redirect_uri) ||
+    typeof provider.post_logout_redirect_uri !== "string" ||
+    !provider.post_logout_redirect_uri ||
+    provider.post_logout_redirect_uri.length > 2048 ||
+    hasControlCharacters(provider.post_logout_redirect_uri) ||
     ((state === "enabled" || state === "configured_disabled") && (
       provider.issuer === null ||
       provider.discovery_url === null ||
@@ -873,6 +925,7 @@ function parseAdminSsoProvider(value: unknown): AdminSsoProvider {
     client_id: provider.client_id as string | null,
     client_secret_configured: provider.client_secret_configured,
     redirect_uri: provider.redirect_uri,
+    post_logout_redirect_uri: provider.post_logout_redirect_uri,
     capabilities: {
       supports_logout: capabilities.supports_logout,
       supports_identity_migration: capabilities.supports_identity_migration,
@@ -1185,18 +1238,220 @@ export const getDocument = (vault: string, id: string, version?: string) => {
     version ? `${path}?version=${encodeURIComponent(version)}` : path,
   );
 };
-export const updateDocument = (vault: string, id: string, data: any) =>
-  api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(data) });
+
+export interface DocumentHistoryEntry {
+  hash: string;
+  message: string;
+  author: string;
+  author_name?: string | null;
+  date: string;
+}
+
+export interface DocumentHistoryResult {
+  kind: "document_history";
+  uri?: string;
+  history: DocumentHistoryEntry[];
+  /**
+   * `activity` is an explicit compatibility mode for a frontend deployed in
+   * front of a server that predates the document-lineage endpoint. It keeps
+   * version browsing available, but the UI labels the reduced guarantee.
+   */
+  source: "document" | "activity";
+}
+
+export interface DocumentDiff {
+  kind: "document_diff";
+  file: string;
+  commit: string;
+  type: "added" | "deleted" | "modified" | "unknown" | "unchanged";
+  diff: string;
+  error?: string | null;
+  /** Additive fields understood by newer servers; the current UI does not require them. */
+  base_commit?: string | null;
+  additions?: number;
+  deletions?: number;
+  hunks?: number;
+  truncated?: boolean;
+}
+
+/**
+ * Status-preserving failure for the version-history surfaces.
+ *
+ * The generic API helper historically discarded status when FastAPI returned
+ * a string `detail`. History/Diff need the status to distinguish an old
+ * server's 404/405 from lost access or a retryable server failure.
+ */
+export class DocumentRevisionApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "DocumentRevisionApiError";
+    this.status = status;
+  }
+}
+
+async function documentRevisionJson<T>(path: string): Promise<T> {
+  const response = await authenticatedFetch(`${API_BASE}${path}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const detail = body?.detail;
+    const message =
+      typeof detail === "string"
+        ? detail
+        : typeof detail?.message === "string"
+          ? detail.message
+          : typeof body?.error === "string"
+            ? body.error
+            : `${response.status} ${response.statusText || "Request failed"}`;
+    throw new DocumentRevisionApiError(message, response.status);
+  }
+  return response.json() as Promise<T>;
+}
+
+export async function getDocumentHistory(
+  vault: string,
+  id: string,
+  limit = 20,
+): Promise<DocumentHistoryResult> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  const result = await documentRevisionJson<{
+    kind: "document_history";
+    uri: string;
+    history: DocumentHistoryEntry[];
+  }>(
+    `/history/${encodeURIComponent(vault)}/${encodeURIComponent(id)}?${query}`,
+  );
+  return { ...result, source: "document" };
+}
+
+function activityEntryToDocumentHistory(entry: ActivityEntry): DocumentHistoryEntry | null {
+  if (!entry.hash) return null;
+  return {
+    hash: entry.hash,
+    message: entry.subject || entry.summary || "Document update",
+    author: entry.author || entry.agent || "Unknown author",
+    author_name: entry.author_name ?? null,
+    date: entry.date || entry.timestamp || "",
+  };
+}
+
+export async function getDocumentHistoryWithFallback(
+  vault: string,
+  id: string,
+  limit = 20,
+): Promise<DocumentHistoryResult> {
+  try {
+    return await getDocumentHistory(vault, id, limit);
+  } catch (error) {
+    if (
+      !(error instanceof DocumentRevisionApiError) ||
+      (error.status !== 404 && error.status !== 405)
+    ) {
+      throw error;
+    }
+  }
+
+  const legacy = await getVaultActivity(vault, { collection: id, limit });
+  return {
+    kind: "document_history",
+    history: legacy.activity
+      .map(activityEntryToDocumentHistory)
+      .filter((entry): entry is DocumentHistoryEntry => entry !== null),
+    source: "activity",
+  };
+}
+
+export function getDocumentDiff(
+  vault: string,
+  id: string,
+  commit: string,
+): Promise<DocumentDiff> {
+  const query = new URLSearchParams({ commit });
+  return documentRevisionJson<DocumentDiff>(
+    `/diff/${encodeURIComponent(vault)}/${encodeURIComponent(id)}?${query}`,
+  );
+}
+
+export interface DocumentUpdateInput {
+  content?: string;
+  title?: string;
+  type?: string;
+  status?: "draft" | "active" | "archived";
+  tags?: string[];
+  domain?: string | null;
+  summary?: string | null;
+  depends_on?: string[];
+  related_to?: string[];
+  message?: string;
+  expected_commit?: string;
+  expected_content_hash?: string;
+  title_conflict_policy?: "allow" | "reject";
+}
+
+export interface DocumentUpdateResult {
+  path?: string;
+  current_commit?: string | null;
+  commit_hash?: string | null;
+  [key: string]: unknown;
+}
+
+export const updateDocument = (vault: string, id: string, data: DocumentUpdateInput) =>
+  api<DocumentUpdateResult>(
+    `/documents/${vault}/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(data) },
+  );
+
+export interface DocumentMoveInput {
+  collection?: string;
+  slug?: string;
+  message?: string;
+  title_conflict_policy?: "allow" | "reject";
+}
+
+export interface DocumentMoveResult {
+  kind: "document_write";
+  uri: string;
+  vault: string;
+  path: string;
+  commit_hash: string;
+  current_commit?: string | null;
+  previous_commit?: string | null;
+  action?: string | null;
+}
+
+/** Move a document without changing its stable resource identity.
+ *
+ * The backend owns Git history, old-URI aliases, relationships, publications,
+ * and destination collision checks. Callers must navigate to `result.path`
+ * rather than predicting the server-normalized destination.
+ */
+export const moveDocument = (
+  vault: string,
+  id: string,
+  data: DocumentMoveInput,
+) =>
+  api<DocumentMoveResult>(
+    `/documents/${encodeURIComponent(vault)}/${encodeURIComponent(id)}/move`,
+    { method: "POST", body: JSON.stringify(data) },
+  );
+
 export const deleteDocument = (vault: string, id: string) =>
   api<any>(`/documents/${vault}/${encodeURIComponent(id)}`, { method: "DELETE" });
 
 // ── Editor image assets ──
 export interface AssetUploadResponse {
+  kind?: "attachment";
   id: string;
-  url: string;
+  /** Stable target persisted in document Markdown. */
+  target: string;
+  /** Same stable target for the existing editor wire shape; never a runtime URL. */
+  url?: string;
   name: string;
   mime_type: string;
   size_bytes: number;
+  unclaimed_expires_at?: string | null;
+  source_file_uri?: string;
 }
 
 /**
@@ -1221,6 +1476,51 @@ export async function uploadAsset(
   }
   return res.json();
 }
+
+export interface AttachmentRetentionPolicy {
+  kind: "attachment_policy";
+  vault: string;
+  server_time: string;
+  unclaimed_ttl_hours: number;
+  revision_retention_days: number;
+}
+
+/** Read the active server policy used to bound recoverable attachment drafts. */
+export const getAttachmentRetentionPolicy = (vault: string) =>
+  api<AttachmentRetentionPolicy>(
+    `/assets/${encodeURIComponent(vault)}/policy`,
+  );
+
+export interface AttachmentMetadata {
+  kind: "attachment";
+  target: string;
+  status: "unclaimed" | "claimed" | "expired";
+  unclaimed_expires_at?: string | null;
+}
+
+/** Resolve an attachment through the same document/user reachability boundary as its bytes. */
+export async function getAttachmentMetadata(
+  vault: string,
+  fileId: string,
+  source?: { document?: string; commit?: string },
+): Promise<AttachmentMetadata> {
+  const params = new URLSearchParams();
+  if (source?.document) params.set("document", source.document);
+  if (source?.commit) params.set("commit", source.commit);
+  const query = params.toString();
+  const response = await authenticatedFetch(
+    `${API_BASE}/assets/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/metadata${query ? `?${query}` : ""}`,
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<AttachmentMetadata>;
+}
+
+/** Copy a confirmed standalone image File into an independent Attachment. */
+export const copyFileToAttachment = (vault: string, fileId: string) =>
+  api<AssetUploadResponse>(
+    `/assets/${encodeURIComponent(vault)}/from-file/${encodeURIComponent(fileId)}`,
+    { method: "POST" },
+  );
 
 /** Fetch a private asset with the app's Bearer credential for blob rendering. */
 export async function getAssetBlob(
@@ -1319,6 +1619,15 @@ export interface VaultFileUploadResult {
   version?: string | null;
 }
 
+export interface VaultFileDeleteResult {
+  kind: "file";
+  uri?: string | null;
+  vault: string;
+  collection?: string | null;
+  name: string;
+  deleted: true;
+}
+
 /**
  * Complete the backend's presigned file flow from the browser: reserve the
  * file record, PUT the bytes directly to object storage, then certify the
@@ -1393,12 +1702,44 @@ export async function uploadVaultFile(
   }
 }
 
+export interface VaultFileDownloadResult {
+  kind: "file";
+  name?: string;
+  download_url: string;
+  mime_type?: string;
+  size_bytes?: number;
+  content_hash?: string;
+  version?: string | null;
+  expires_in?: number;
+}
+
+/** Resolve a standalone File to a short-lived download URL for viewing. */
+export async function getVaultFileDownloadUrl(
+  vault: string,
+  fileId: string,
+): Promise<VaultFileDownloadResult> {
+  const response = await authenticatedFetch(
+    `${API_BASE}/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<VaultFileDownloadResult>;
+}
+
+export const deleteVaultFile = (vault: string, fileId: string) =>
+  api<VaultFileDeleteResult>(
+    `/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+
 // ── Vault tables ──
 export interface VaultTableColumnInput {
   name: string;
   type: string;
   required?: boolean;
   unique?: boolean;
+  default?: unknown;
+  enum?: unknown[];
+  primary_key?: boolean;
 }
 
 export interface VaultTableCreateInput {
@@ -1417,6 +1758,58 @@ export interface VaultTableCreateResult {
   created?: boolean;
 }
 
+export interface VaultTableDeleteResult {
+  kind: "table";
+  uri: string;
+  vault: string;
+  collection?: string | null;
+  name: string;
+  deleted: true;
+}
+
+export interface VaultTableInfo {
+  kind?: "table";
+  uri?: string;
+  vault?: string;
+  collection?: string | null;
+  name: string;
+  description?: string;
+  columns: VaultTableColumnInput[];
+  row_count: number;
+  created_at?: string;
+}
+
+export interface VaultTableQueryResult {
+  kind: "table_query";
+  vault?: string;
+  table?: string;
+  columns: string[];
+  items: Record<string, unknown>[];
+  total: number;
+}
+
+export interface VaultTableRowsQueryOptions {
+  limit?: number;
+  offset?: number;
+  order?: string;
+  filters?: Array<{ column: string; expression: string }>;
+  signal?: AbortSignal;
+}
+
+export class TableRowConflictError extends Error {
+  rowId: string;
+
+  constructor(rowId: string, action: "update" | "delete") {
+    super(
+      action === "update"
+        ? "This row changed after you opened it. Review the current values or overwrite them explicitly."
+        : "This row changed after you opened it. Its latest version must be reviewed before deletion.",
+    );
+    this.name = "TableRowConflictError";
+    this.rowId = rowId;
+  }
+}
+
 export const createVaultTable = (
   vault: string,
   input: VaultTableCreateInput,
@@ -1430,11 +1823,138 @@ export const createVaultTable = (
     }),
   });
 
+export const listVaultTables = (vault: string) =>
+  api<{ items: VaultTableInfo[] }>(`/tables/${encodeURIComponent(vault)}`);
+
+export const listVaultTableRows = (
+  vault: string,
+  table: string,
+  {
+    limit = 50,
+    offset = 0,
+    order = "created_at.desc,id.desc",
+    filters = [],
+    signal,
+  }: VaultTableRowsQueryOptions = {},
+) => {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    order,
+  });
+  for (const filter of filters) query.append(filter.column, filter.expression);
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    { headers: { Prefer: "count=exact" }, signal },
+  );
+};
+
+export async function getVaultTableRow(
+  vault: string,
+  table: string,
+  rowId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  const result = await listVaultTableRows(vault, table, {
+    limit: 1,
+    order: "id.asc",
+    filters: [{ column: "id", expression: `eq.${rowId}` }],
+    signal,
+  });
+  return result.items[0] || null;
+}
+
+export const insertVaultTableRow = (
+  vault: string,
+  table: string,
+  row: Record<string, unknown>,
+) =>
+  api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?select=*`,
+    {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(row),
+    },
+  );
+
+export const updateVaultTableRow = (
+  vault: string,
+  table: string,
+  rowId: string,
+  changes: Record<string, unknown>,
+  options: { expectedUpdatedAt?: string; force?: boolean } = {},
+) => {
+  const query = new URLSearchParams({ id: `eq.${rowId}`, select: "*" });
+  if (options.expectedUpdatedAt && !options.force) {
+    query.set("updated_at", `eq.${options.expectedUpdatedAt}`);
+  }
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(changes),
+    },
+  ).then((result) => {
+    if (options.expectedUpdatedAt && !options.force && result.items.length === 0) {
+      throw new TableRowConflictError(rowId, "update");
+    }
+    return result;
+  });
+};
+
+export const deleteVaultTableRow = (
+  vault: string,
+  table: string,
+  rowId: string,
+  options: { expectedUpdatedAt?: string; force?: boolean } = {},
+) => {
+  const query = new URLSearchParams({ id: `eq.${rowId}`, select: "id" });
+  if (options.expectedUpdatedAt && !options.force) {
+    query.set("updated_at", `eq.${options.expectedUpdatedAt}`);
+  }
+  return api<VaultTableQueryResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
+    {
+      method: "DELETE",
+      headers: { Prefer: "return=representation" },
+    },
+  ).then((result) => {
+    if (options.expectedUpdatedAt && !options.force && result.items.length === 0) {
+      throw new TableRowConflictError(rowId, "delete");
+    }
+    return result;
+  });
+};
+
+export const deleteVaultTable = (vault: string, tableName: string) =>
+  api<VaultTableDeleteResult>(
+    `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(tableName)}`,
+    { method: "DELETE" },
+  );
+
 // ── Browse ──
-export const browseVault = (vault: string, collection?: string, depth = 1) => {
+export type ArchiveScope = "unarchived" | "archived" | "all";
+
+export const browseVault = (vault: string, collection?: string, depth = 1, options: { archive_scope?: ArchiveScope } = {}) => {
   const p = new URLSearchParams({ depth: String(depth) });
   if (collection) p.set("collection", collection);
-  return api<{ vault: string; path: string; items: any[] }>(`/browse/${vault}?${p}`);
+  if (options.archive_scope) p.set("archive_scope", options.archive_scope);
+  return api<{
+    archive_scope?: ArchiveScope;
+    vault: string;
+    path: string;
+    context?: {
+      type: "vault" | "collection";
+      uri: string;
+      name: string;
+      path: string;
+      summary?: string | null;
+      description?: string | null;
+    } | null;
+    items: any[];
+  }>(`/browse/${vault}?${p}`);
 };
 
 export interface KnowledgeImportResult {
@@ -1474,6 +1994,7 @@ export async function importKnowledgeBundle(
 //   - truncated / hint: set when the prefetch pool filled, meaning the
 //     corpus may contain more hits than the response surfaces (#77 / 0.2.5).
 export interface SearchResponse {
+  archive_scope?: ArchiveScope;
   query: string;
   total: number;
   returned: number;
@@ -1492,17 +2013,54 @@ export interface SearchResponse {
 const vaultScopeParams = (vaults?: string[] | string): string[] =>
   (Array.isArray(vaults) ? vaults : vaults ? [vaults] : []).filter(Boolean);
 
-export const searchDocs = (query: string, vaults?: string[] | string, limit = 10) => {
+export interface SearchOptions {
+  archive_scope?: ArchiveScope;
+  collection?: string;
+  source_type?: "document" | "file" | "table";
+  doc_types?: string[];
+  tags?: string[];
+  include_archived?: boolean;
+  regex?: boolean;
+  case_sensitive?: boolean;
+  include_text_files?: boolean;
+}
+
+function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal: boolean) {
+  if (options.archive_scope) p.set("archive_scope", options.archive_scope);
+  if (options.collection) p.set("collection", options.collection);
+  for (const type of options.doc_types || []) p.append("doc_types", type);
+  for (const tag of options.tags || []) p.append("tags", tag);
+  if (options.include_archived !== undefined) p.set("include_archived", String(options.include_archived));
+  if (literal) {
+    if (options.include_text_files) p.set("include_text_files", "true");
+    if (options.regex !== undefined) p.set("regex", String(options.regex));
+    if (options.case_sensitive !== undefined) p.set("case_sensitive", String(options.case_sensitive));
+  } else if (options.source_type) p.set("source_type", options.source_type);
+}
+
+export const searchDocs = (
+  query: string,
+  vaults?: string[] | string,
+  limit = 10,
+  options: SearchOptions = {},
+  requestOptions: Pick<RequestInit, "signal"> = {},
+) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   for (const v of vaultScopeParams(vaults)) p.append("vault", v);
-  return api<SearchResponse>(`/search?${p}`);
+  appendSearchOptions(p, options, false);
+  return api<SearchResponse>(`/search?${p}`, requestOptions);
 };
 
 export interface GrepMatch {
+  line?: number | null;
   section: string | null;
   text: string;
 }
 export interface GrepDoc {
+  resource_type?: string | null;
+  revision?: string | null;
+  content_hash?: string | null;
+  status?: string | null;
   uri: string;
   vault: string;
   path: string;
@@ -1515,6 +2073,9 @@ export interface GrepDoc {
 // matches than the response surfaces — switch to count_only or
 // files_with_matches at the agent / caller level (backend #76 / 0.2.4).
 export interface GrepResponse {
+  total_resources?: number;
+  returned_resources?: number;
+  archive_scope?: ArchiveScope;
   pattern: string;
   regex: boolean;
   returned_docs?: number;
@@ -1525,9 +2086,10 @@ export interface GrepResponse {
   hint?: string | null;
   results: GrepDoc[];
 }
-export const grepDocs = (query: string, vaults?: string[] | string, limit = 20) => {
+export const grepDocs = (query: string, vaults?: string[] | string, limit = 20, options: SearchOptions = {}) => {
   const p = new URLSearchParams({ q: query, limit: String(limit) });
   for (const v of vaultScopeParams(vaults)) p.append("vault", v);
+  appendSearchOptions(p, options, true);
   return api<GrepResponse>(`/grep?${p}`);
 };
 
@@ -1677,10 +2239,19 @@ export const deleteRelation = (source: string, target: string, relation?: string
 };
 
 // ── Recent ──
-export const getRecent = (vault?: string, limit = 20) => {
+export const getRecent = async (vault?: string, limit = 20, options?: { scope?: "all" | "watching"; cursor?: string }) => {
   const p = new URLSearchParams({ limit: String(limit) });
   if (vault) p.set("vault", vault);
-  return api<{ changes: any[] }>(`/recent?${p}`);
+  if (options?.scope) p.set("scope", options.scope);
+  if (options?.cursor) p.set("cursor", options.cursor);
+  const response = await authenticatedFetch(`${API_BASE}/recent?${p}`);
+  // Legacy routers often return string-detail errors. Keep the status so Home
+  // can distinguish missing support from a transient connection failure.
+  if ([404, 405, 501].includes(response.status)) {
+    throw new ApiError("Recent updates are unavailable on this server.", response.status, null);
+  }
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json() as Promise<{ changes: any[]; scope?: "all" | "watching"; next_cursor?: string | null }>;
 };
 
 export interface ActivityEntry {
@@ -2063,6 +2634,25 @@ export const deletePublication = (vault: string, slug: string) =>
 
 export const createPublicationSnapshot = (vault: string, slug: string) =>
   api<Publication>(`/publications/${vault}/${slug}/snapshot`, { method: "POST" });
+
+export interface TablePublicationPreview {
+  kind?: "table_query";
+  columns: string[];
+  items: Record<string, unknown>[];
+  total: number;
+}
+
+/** Execute the generated, read-only table publication query as the current user.
+ *
+ * The table publish dialog never accepts raw SQL. It builds a bounded SELECT
+ * from server-provided identifiers, then uses this endpoint as the required
+ * pre-publication preview and permission check.
+ */
+export const previewTablePublicationQuery = (vault: string, sql: string) =>
+  api<TablePublicationPreview>(`/tables/${encodeURIComponent(vault)}/sql`, {
+    method: "POST",
+    body: JSON.stringify({ sql }),
+  });
 
 export const searchUsers = (query?: string) =>
   api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);

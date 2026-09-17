@@ -1,155 +1,156 @@
-# Kubernetes deploy
+# AKB Kubernetes deployment
 
-Generic kustomize base for deploying AKB to a Kubernetes cluster. Pair
-with an operator-specific overlay for real hostnames, registries, and
-TLS issuers.
+The Kubernetes tree has two application shapes and no credential-service
+lifecycle:
 
-## Layout
-
-```
+```text
 deploy/k8s/
-├── deploy.sh              # build → push → kubectl apply (kustomize base)
-├── kustomization.yaml     # base resources (pgvector default; qdrant.yaml not listed)
-├── namespace.yaml
-├── postgres.yaml          # pgvector/pgvector:pg16 StatefulSet — hosts both
-│                          # the main DB and the vector_index schema
-├── qdrant.yaml            # optional Qdrant StatefulSet — add to
-│                          # kustomization.yaml only if you flip the
-│                          # backend's vector_store_driver to qdrant
-├── redis.yaml             # event-stream Redis (optional, gated by app.yaml)
-├── backend.yaml           # Deployment + ConfigMap (vector_store_driver: pgvector)
-├── frontend.yaml          # Deployment + Service
-├── ingress.yaml           # placeholder host (akb.example.com)
-├── standalone-sso/        # AKB + owned Keycloak 26.7 + dedicated Keycloak DB;
-│                          # temporary bootstrap service-account retirement
-└── internal/              # gitignored — operator-private overlays
-    ├── deploy-internal.sh
-    ├── cluster-issuer.yaml
-    ├── ingress-patch.yaml
-    └── backend-config-patch.yaml
+├── kustomization.yaml       # standalone AKB + PostgreSQL
+├── backend.yaml
+├── frontend.yaml
+├── postgres.yaml
+├── ingress.yaml
+├── deploy.sh                # optional build/apply convenience
+├── standalone-sso/          # standalone plus owned Keycloak and its database
+├── qdrant.yaml              # optional operator-owned addition
+└── redis.yaml               # optional operator-owned addition
 ```
 
-**Vector store**: the base ships with `vector_store_driver: pgvector`
-inside the Postgres pod. Other options:
+Neither shape creates Kubernetes Secrets, installs a credentials server, or
+installs a cluster-scoped synchronization controller. The operator provisions
+the required Secrets before applying AKB.
 
-- **Qdrant** as a separate StatefulSet — add `qdrant.yaml` to
-  `kustomization.yaml` and patch `akb-app-config` to set
-  `vector_store_driver: qdrant` + `vector_url: http://qdrant:6333`.
-- **Seahorse Cloud** (managed) — no extra StatefulSet; patch
-  `akb-app-config` with `vector_store_driver: seahorse` +
-  `seahorse_tenant_uuid` + `seahorse_table_name`/`seahorse_table_uuid`,
-  and put `seahorse_token: shsk_<...>` in the secret. AKB calls the
-  Seahorse BFF (`https://console.seahorse.dnotitia.ai/bff`) for table
-  lifecycle and the per-table host for data CRUD/search.
+## Required Secrets
 
-The `internal/` overlay shows the Qdrant pattern for the production
-cluster.
+Both shapes consume `Secret/akb-secret`. For local authentication it contains:
 
-## Backend process topology
+| Key | Purpose |
+|---|---|
+| `db_password` | PostgreSQL container password |
+| `system_hmac_secret` | Stable platform compatibility projection |
+| `secret.yaml` | Sensitive backend settings, including the same database and HMAC values |
+| `local-session-private.pem` | Local RS256 session signer |
+| `local-session-jwks.json` | Local RS256 public keyset |
+| `auth_runtime_contract` | `local-session-rs256-v2` |
+| `auth_runtime_generation` | Positive generation, initially `1` |
+| `auth_runtime_mode` | `local` |
 
-The base Deployment keeps one `Recreate` Pod and one RWO Git PVC, but runs two
-containers from the same backend image:
+Generate the local key pair with the backend CLI. Create the Secret through
+the operator's normal credential process; this repository does not generate or
+rotate it during deployment.
 
-- `backend` uses `AKB_PROCESS_ROLE=api` and serves FastAPI/MCP. It owns only
-  serving-process sinks and one query-tokenizer child.
-- `worker` runs `python -m app.worker_main` with
-  `AKB_PROCESS_ROLE=worker`. It owns durable queue consumers, external-Git
-  reconciliation, and periodic maintenance. Its exec probe checks an
-  event-loop heartbeat.
+The `standalone-sso` shape uses `auth_runtime_mode=sso` and requires the SSO
+runtime values inside `secret.yaml`. It also uses the stable top-level
+projections documented in
+[`standalone-sso/README.md`](standalone-sso/README.md) and these additional
+Secrets:
 
-This separation prevents a worker stall from blocking the serving loop. It is
-not the final horizontally scalable topology: both containers still mount the
-RWO PVC because synchronous Bare-Git reads/writes remain in the API path.
-Keep `replicas: 1`, `strategy: Recreate`, and the API PVC mount until the
-single-writer gitd, MCP session, audit/throttle, and drift-recovery gates in
-[`docs/design/accepted/2026-08-18-worker-runtime-safety-foundation`](../../docs/design/accepted/2026-08-18-worker-runtime-safety-foundation/README.md)
-are complete.
+- `akb-keycloak-db-credentials`
+- `akb-keycloak-bootstrap`
+- `akb-product-admin-bootstrap`
+- optional `akb-keycloak-upgrade` for the documented legacy SSO upgrade only
 
-For a standalone installation whose canonical human-auth mode is `sso`, use
-[`standalone-sso/README.md`](standalone-sso/README.md). That overlay owns its
-Keycloak lifecycle and dedicated database. Do not apply it to a managed tenant
-that reuses a platform-owned/shared Keycloak realm.
+Kubernetes Secret data is base64-encoded, not encrypted by that encoding.
+Production operators should use appropriate RBAC, etcd encryption at rest,
+restricted backups, and their existing credential source.
 
-## Quickstart (generic)
+## Render directly
+
+Standalone:
 
 ```bash
-# 1. Provide a registry to push images to.
-export REGISTRY=ghcr.io/myorg          # or my-registry.local:5000
-export PUBLIC_URL=https://akb.example.com    # printed at the end; optional
+kubectl kustomize --load-restrictor=LoadRestrictionsNone deploy/k8s \
+  > rendered-akb.yaml
+```
 
-# 2. Edit ingress.yaml to set your real hostname.
-$EDITOR deploy/k8s/ingress.yaml
+Standalone SSO:
 
-# 3. Provide a ClusterIssuer named `letsencrypt-prod` (or change the
-#    annotation in ingress.yaml). cert-manager + your DNS provider.
+```bash
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/k8s/standalone-sso > rendered-akb-sso.yaml
+```
 
-# 4. Apply.
+The checked-in hostnames are examples. Patch image references, ingress hosts,
+TLS settings, storage classes, and provider configuration in an
+operator-owned overlay before applying either render.
+
+## Convenience deployer
+
+`deploy.sh` preserves the pre-profile build/apply workflow. It never creates
+or modifies credentials.
+
+Standalone with existing images:
+
+```bash
+NAMESPACE=akb \
+AKB_PROFILE=standalone \
+SKIP_BUILD=true \
+BACKEND_IMAGE=ghcr.io/example/akb-backend:0.14.2 \
+FRONTEND_IMAGE=ghcr.io/example/akb-frontend:0.14.1 \
 bash deploy/k8s/deploy.sh
 ```
 
-After the script finishes:
+Standalone SSO:
 
 ```bash
-kubectl edit configmap akb-app-config -n akb   # set embed_*, llm_*, s3_*, public_base_url
-kubectl edit secret    akb-secret-config -n akb # set system_hmac_secret, embed_api_key, …
+NAMESPACE=akb \
+AKB_PROFILE=standalone-sso \
+SKIP_BUILD=true \
+BACKEND_IMAGE=ghcr.io/example/akb-backend:0.14.2 \
+FRONTEND_IMAGE=ghcr.io/example/akb-frontend:0.14.1 \
+SSO_AKB_PUBLIC_URL=https://akb.example.com \
+SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
+SSO_PRODUCT_ADMIN_USERNAME=admin \
+SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
+bash deploy/k8s/deploy.sh
 ```
 
-The placeholder ConfigMap in `backend.yaml` matches `config/app.yaml.example`
-defaults (OpenAI embeddings, no LLM, no Redis, no S3) so the stack can
-boot for smoke-testing before you wire in real providers.
+Without `SKIP_BUILD=true`, set `REGISTRY`; the script builds and pushes both
+images. `KUBE_CONTEXT`, `IMAGE_PLATFORM`, `STORAGE_CLASS`, and
+`KUSTOMIZE_DIR` remain optional operator inputs.
 
-## Operator-specific overlay (`internal/`)
+## Removing a legacy bundled credential service
 
-The `internal/` directory is gitignored and intended for environment-
-specific overrides — real hostnames, internal registries, ClusterIssuers
-with DNS-01 credentials, ConfigMap with private endpoints. The simplest
-pattern is a small wrapper script:
+This section applies only to an installation created by AKB chart `0.1.x` or
+the former credential-service deployment profiles. Do not perform an in-place
+upgrade until the AKB Kubernetes Secrets are independent from their old
+`VaultStaticSecret` owners.
 
-```bash
-# deploy/k8s/internal/deploy-internal.sh
-export REGISTRY=my-registry.internal:5000
-export PUBLIC_URL=https://akb.mycorp.example
-kubectl apply -f "$(dirname "$0")/cluster-issuer.yaml"
-bash "$(dirname "$0")/../deploy.sh"
-kubectl apply -f "$(dirname "$0")/ingress.yaml"        # overrides base
-kubectl apply -f "$(dirname "$0")/backend-config.yaml" # overrides base ConfigMap
-kubectl rollout restart deployment/backend -n akb
-```
+1. Back up the credential source, its data volume or snapshot, and the current
+   Kubernetes Secrets through the approved operator process.
+2. Confirm the application Secrets currently exist:
 
-Anything you put under `internal/` is automatically excluded by the
-top-level `.gitignore`. Treat it as your private operations folder —
-secrets management of choice (sealed-secrets, vault, cluster-bound
-Secrets) goes here too.
+   ```bash
+   kubectl get secret -n <namespace> \
+     akb-secret akb-keycloak-db-credentials \
+     akb-keycloak-bootstrap akb-product-admin-bootstrap
+   ```
 
-## Secrets
+   Omit the three SSO-only names for a local installation.
+3. Orphan the legacy projection objects so Kubernetes preserves their Secret
+   children instead of garbage-collecting them:
 
-Three Secrets are NOT created by `deploy.sh` — manage them out-of-band so
-re-runs don't clobber real credentials with placeholders:
+   ```bash
+   kubectl delete vaultstaticsecret -n <namespace> \
+     akb-runtime akb-redis akb-keycloak-database \
+     akb-keycloak-bootstrap akb-product-admin-bootstrap \
+     --cascade=orphan --ignore-not-found
+   ```
 
-- `akb-secret-config` — `secret.yaml` mounted at `/etc/akb/secret.yaml`
-  in the backend pod. Required keys: `db_password`, `system_hmac_secret`,
-  `embed_api_key` (and optionally `llm_api_key`, `rerank_api_key`,
-  `s3_*_key`, `vector_api_key`, `redis_password`).
-- `akb-local-session-keys` — the persistent RSA-3072 private key and public
-  JWKS for `local-session-rs256-v2`. Generate them explicitly once and back
-  them up with the installation. Replacing both files without retaining the
-  old public JWK intentionally forces every local user to sign in again.
-- `redis-credentials` — single key `password`, referenced by the Redis
-  CR. Skip if you disable the event stream (`redis_url: ""`).
+4. Verify every required Secret still exists and has no
+   `VaultStaticSecret` owner reference. The current Helm chart and `deploy.sh`
+   refuse to proceed while that ownership remains.
+5. Deploy AKB with `standalone` or `standalone-sso`, then verify database,
+   login, and application health.
+6. Only after AKB is healthy, decommission the old server release and retained
+   storage according to the operator's backup policy. A shared cluster
+   controller must be removed only by its cluster owner after confirming that
+   no other namespace consumes it.
 
-```bash
-kubectl create secret generic akb-secret-config -n akb \
-  --from-file=secret.yaml=./secret.yaml
+`--cascade=orphan` is intentional: ordinary deletion would also delete the
+generated Secret children and make the subsequent AKB rollout fail.
 
-cd backend
-uv run python -m app.cli generate-local-session-keyset \
-  --output-dir ../local-session-keys
-cd ..
-kubectl create secret generic akb-local-session-keys -n akb \
-  --from-file=private.pem=./local-session-keys/private.pem \
-  --from-file=jwks.json=./local-session-keys/jwks.json
+## Helm
 
-PW=$(openssl rand -base64 32)
-kubectl create secret generic redis-credentials -n akb \
-  --from-literal=password="$PW"
-```
+For a chart-based installation, see [`../helm/akb`](../helm/akb/README.md).
+The Helm chart renders the same standalone and standalone-SSO shapes.

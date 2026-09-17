@@ -24,6 +24,7 @@
   /* ── Semantic tokens (light default) ────────────────────────────── */
   --color-background: #f6f7f9;
   --color-surface: #ffffff;
+  --color-navigation: #f0f5f7;
   --color-surface-2: #ebeef2;
   --color-surface-muted: #ebeef2;     /* AKB alias == family surface-2 */
   --color-foreground: #1d1d1f;
@@ -178,6 +179,7 @@
   color-scheme: dark;
   --color-background: #0b0f14;
   --color-surface: #121821;
+  --color-navigation: #0d151e;
   --color-surface-2: #1b2430;
   --color-surface-muted: #1b2430;
   --color-foreground: #e7eaef;
@@ -257,6 +259,15 @@
   --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.55);
   --shadow-xl: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
+
+/* Vault controls adapt to the remaining work area, not the full viewport. */
+.vault-app-header { container-type: inline-size; container-name: vault-toolbar; }
+@container vault-toolbar (max-width: 700px) {
+  #global-search-trigger { width: 2.25rem; padding-inline: 0; justify-content: center; }
+  #global-search-trigger > span { display: none; }
+  [data-testid="header-indexing-status"] { width: 8rem; }
+}
+.vault-app-header > div { overflow-x: auto; }
 
 /* ── Global ──────────────────────────────────────────────────────── */
 * {
@@ -384,7 +395,7 @@ h1, h2, h3, h4, h5, h6 {
   backdrop-filter: saturate(130%) blur(8px);
   -webkit-backdrop-filter: saturate(130%) blur(8px);
   border-bottom: 1px solid var(--color-border);
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
+  box-shadow: none;
 }
 
 /* Gradient brand wordmark */
@@ -631,6 +642,11 @@ body::before {
     box-shadow var(--duration-fast) var(--ease-in-out);
 }
 
+/* Opt into an immediate keyboard focus ring for recovery actions. The ring
+   itself uses the Button primitive's box-shadow, so it must not wait on the
+   shared color/shadow transition. */
+.focus-ring-instant:focus-visible { transition: none; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 1ms !important;
@@ -722,8 +738,8 @@ body::before {
 
 /* ── MarkdownRender (.akb-md) — KaTeX math ───────────────────────
    The shared <MarkdownRender> component styles block elements via its
-   components map; KaTeX, however, injects its own DOM (.katex-display)
-   that we can't reach through react-markdown's component overrides. So
+   editor surface; KaTeX, however, injects its own DOM (.katex-display)
+   that the shared viewer injects. So
    the display-math card + inline color land here, scoped to .akb-md. */
 .akb-md .katex { color: var(--color-foreground); }
 .akb-md .katex-display {
@@ -738,12 +754,98 @@ body::before {
 .akb-md .katex-display > .katex { white-space: nowrap; }
 
 /* The document file frame may grow into space reclaimed from either rail.
-   Keep prose scannable without constraining tables, code blocks, or media that
-   benefit from the wider Git-style workspace. */
-.document-reading-flow > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote) {
+   Keep prose and ordinary tables aligned on one scannable measure. Tables may
+   still overflow horizontally inside their own wrapper when their columns need
+   more room; code blocks and media continue to use the wider workspace. */
+/* Reader commands use the available workspace width, not the viewport. Keep
+   modes/actions on one metric even when the navigation rails are expanded. */
+.document-command-inner { --reader-control-size: 2.75rem; }
+.document-command-inner [data-reader-control] {
+  height: var(--reader-control-size);
+  min-height: var(--reader-control-size);
+  border-radius: var(--radius-sm);
+  font-size: .875rem;
+  line-height: 1.25rem;
+  font-weight: 500;
+  gap: .375rem;
+}
+.document-command-inner [data-reader-icon],
+.document-command-inner [data-reader-navigation] {
+  width: var(--reader-control-size);
+  min-width: var(--reader-control-size);
+  padding-inline: 0;
+}
+.document-command-group {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: .25rem;
+}
+.document-command-divider {
+  position: relative;
+  padding-left: .5rem;
+}
+.document-command-divider::before {
+  content: "";
+  position: absolute;
+  inset-block: .5rem;
+  left: 0;
+  width: 1px;
+  background: var(--color-border);
+}
+@container resource-commands (min-width: 32rem) {
+  .document-command-inner [data-reader-navigation] { width: auto; padding-inline: .625rem; }
+}
+@container resource-commands (min-width: 48rem) {
+  .document-command-inner { --reader-control-size: 2rem; }
+}
+@container resource-commands (max-width: 32rem) {
+  .document-command-inner:has(.document-read-modes) > [data-slot="resource-command-meta"] { display: none; }
+  .document-command-inner [data-slot="resource-command-actions"] { gap: .25rem; }
+  .document-read-modes [role="tab"] { padding-inline: .5rem; }
+}
+
+.document-reading-flow {
+  --document-reading-measure: 64rem;
+  font-size: 1rem;
+  line-height: 1.65;
+}
+.document-reading-flow.document-reading-wide { --document-reading-measure: none; }
+.document-reading-flow .ProseMirror { min-width: 0; }
+.document-reading-flow .ProseMirror > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote, .akb-md-table, .tableWrapper) {
   width: 100%;
-  max-width: 64rem;
+  max-width: var(--document-reading-measure);
   margin-inline: auto;
+}
+.document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
+.document-reading-flow .ProseMirror > p:has(img) { max-width: none; }
+.document-reading-flow .ProseMirror img { max-width: 100%; height: auto; }
+.document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
+.document-reading-flow .ProseMirror > .akb-md-table { max-width: var(--document-reading-measure); }
+.document-reading-flow .ProseMirror table {
+  display: table;
+  width: 100%;
+  /* Tiptap writes a column-derived inline min-width for the editing surface. */
+  min-width: 100% !important;
+  margin-block: 0;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.document-reading-flow .ProseMirror :where(th, td) {
+  padding: 0.625rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--color-border);
+}
+.document-reading-flow .ProseMirror th { background: var(--color-surface-2); }
+.document-reading-flow .ProseMirror :where(th, td) > p { margin: 0; }
+.document-reading-flow .ProseMirror tr:last-child td { border-bottom: 0; }
+.document-reading-flow .ProseMirror pre { white-space: pre; overflow-x: auto; }
+.document-reading-flow .ProseMirror pre code { white-space: inherit; }
+.document-reading-flow .ProseMirror :where(pre, .akb-md-table):focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
 }
 
 /* ── Hairline + misc utilities (preserved) ──────────────────────── */

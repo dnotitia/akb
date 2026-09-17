@@ -146,7 +146,7 @@ describe("SearchPage · semantic (dense) mode", () => {
     });
     renderAt("/search?q=postgres");
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25, expect.any(Object)),
     );
     expect(await screen.findByText("PostgreSQL tuning")).toBeTruthy();
     expect(screen.getByText("Top match")).toBeTruthy();
@@ -217,7 +217,7 @@ describe("SearchPage · semantic (dense) mode", () => {
     const u = userEvent.setup();
     await u.click(screen.getByRole("button", { name: "deployment guide" }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("deployment guide", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("deployment guide", [], 25, expect.any(Object)),
     );
 
     await u.click(screen.getByRole("button", { name: "Clear search query" }));
@@ -260,7 +260,7 @@ describe("SearchPage · semantic (dense) mode", () => {
 
     await user.click(screen.getByRole("button", { name: /worker isolation/i }));
     await waitFor(() =>
-      expect(mockedSearch).toHaveBeenCalledWith("worker isolation", [], 25),
+      expect(mockedSearch).toHaveBeenCalledWith("worker isolation", [], 25, expect.any(Object)),
     );
   });
 });
@@ -356,6 +356,32 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
       .find((b) => b.hasAttribute("aria-pressed"));
     if (!toggle) throw new Error("Literal toggle button not found");
     await u.click(toggle);
-    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", []));
+    await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", [], 20, expect.objectContaining({ regex: false, case_sensitive: false })));
+  });
+});
+
+
+describe("text File literal search", () => {
+  it("uses resource totals and File navigation with body-relative provenance", async () => {
+    mockedGrep.mockResolvedValue({ pattern: "needle", regex: false,
+      total_docs: 0, total_resources: 1, returned_resources: 1, total_matches: 1,
+      results: [{ uri: "akb://eng/file/f-123", vault: "eng", path: "note.txt", title: "Text note",
+        resource_type: "file", revision: "r1", matches: [{ section: null, text: "needle", line: 3 }] }],
+    });
+    renderAt("/search?q=needle&mode=literal&include_text_files=true");
+    const link = await screen.findByRole("link", { name: /Text note/ });
+    expect(link).toHaveAttribute("href", "/vault/eng/file/f-123");
+    expect(screen.getByText("1 resource · 1 match")).toBeVisible();
+    expect(screen.getByText("Body line 3")).toBeVisible();
+    expect(screen.getByText("Revision r1")).toBeVisible();
+    expect(mockedGrep).toHaveBeenCalledWith("needle", [], 20, expect.objectContaining({ include_text_files: true }));
+  });
+
+  it.each([409, 503])("shows unavailable instead of zero matches on %s", async (status) => {
+    mockedGrep.mockRejectedValue(new Error(`Text File search is not ready (${status}); retry.`));
+    renderAt("/search?q=needle&mode=literal&include_text_files=true");
+    expect(await screen.findByText(/Text File search is not ready/)).toBeVisible();
+    expect(screen.queryByText(/No results for/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 resources/)).not.toBeInTheDocument();
   });
 });

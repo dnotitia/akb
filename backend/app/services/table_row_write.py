@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import asyncpg
@@ -112,6 +113,7 @@ async def insert_rows(
         vault_name=vault_name,
         table_name=table_name,
         user_id=user_id,
+        actor_id=actor_id,
         is_admin=is_admin,
     )
 
@@ -123,6 +125,7 @@ async def update_rows(
     table_name: str,
     user_id: uuid.UUID | str,
     body: Any,
+    actor_id: str,
     is_admin: bool = False,
     query_params: Sequence[tuple[str, str]] = (),
     prefer_header: str | None = None,
@@ -145,6 +148,7 @@ async def update_rows(
         vault_name=vault_name,
         table_name=table_name,
         user_id=user_id,
+        actor_id=actor_id,
         is_admin=is_admin,
     )
 
@@ -156,6 +160,7 @@ async def delete_rows(
     table_name: str,
     user_id: uuid.UUID | str,
     is_admin: bool = False,
+    actor_id: str,
     query_params: Sequence[tuple[str, str]] = (),
     prefer_header: str | None = None,
 ) -> RowMutationResponse | dict[str, Any]:
@@ -176,6 +181,7 @@ async def delete_rows(
         vault_name=vault_name,
         table_name=table_name,
         user_id=user_id,
+        actor_id=actor_id,
         is_admin=is_admin,
     )
 
@@ -210,6 +216,7 @@ async def query_rows(
         vault_name=vault_name,
         table_name=table_name,
         user_id=user_id,
+        actor_id=actor_id,
         is_admin=is_admin,
     )
 
@@ -531,10 +538,12 @@ async def _execute_mutation(
     table_name: str,
     user_id: uuid.UUID | str,
     is_admin: bool,
+    actor_id: str,
 ) -> RowMutationResponse | dict[str, Any]:
     try:
         result = await get_user_sql_executor().execute(
             user_id=user_id,
+            actor_id=actor_id,
             sql=compiled.sql,
             params=compiled.params,
             fetch=compiled.fetch,
@@ -811,4 +820,16 @@ def _last_value(query_params: Sequence[tuple[str, str]], key: str) -> str | None
 def _normalize_value(value: Any, type_name: str) -> Any:
     if _is_json_type(type_name) and not isinstance(value, str):
         return json.dumps(value)
+    # JSON decoders represent decimal literals as binary floats. Passing that
+    # float directly to PostgreSQL NUMERIC preserves the binary approximation
+    # (for example 0.87 becomes a long 0.86999… value). Convert through the
+    # shortest decimal string so structured row writes keep the value the user
+    # actually entered. Booleans are intentionally excluded: PG should reject
+    # them as a type mismatch rather than silently treating True as 1.
+    if (
+        type_name in {"numeric", "number"}
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    ):
+        return Decimal(str(value))
     return value

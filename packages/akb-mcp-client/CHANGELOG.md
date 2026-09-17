@@ -1,5 +1,59 @@
 # Changelog
 
+## 2.3.2 — opt-in per-call usage record
+
+Setting `AKB_MCP_USAGE_LOG=<path>` makes the proxy append one JSON line per
+`tools/call` — `{ts, tool, result_bytes, text_chars, latency_ms, error}`.
+Unset, which is the default, nothing is opened, formatted or written — not even
+a clock read — and the proxy behaves exactly as it did in 2.3.1.
+
+It exists because response size is what a tool call actually costs the agent
+reading it, and until now that number could only be recovered by instrumenting
+the client. The record is taken where every `tools/call` result passes, so the
+proxy-local file tools — which never reach the backend — are measured on the
+same footing as forwarded calls.
+
+Failures are measured too and carry `error: true`: a call that fails still
+consumed a round trip, and a session whose failures are invisible reads as
+cheaper than it was. A call that threw before producing a response records
+`result_bytes: 0`.
+
+**Arguments are never written.** The record covers size and timing only —
+a call's arguments carry vault content and, on the file tools, local paths.
+
+Characters, not tokens: a tokenizer in the proxy would pin a model the proxy
+does not otherwise depend on. A path that cannot be written warns once and then
+stays quiet rather than failing calls.
+
+## 2.3.1 — negotiate the legacy protocol version instead of hard-rejecting
+
+The legacy `initialize` path no longer returns `-32602 "Unsupported protocol
+version"` when the client names a revision other than `2025-06-18`. Per the MCP
+spec's version negotiation, the proxy now always answers with the revision it
+supports (`2025-06-18`) and lets the client decide whether to proceed. It still
+never echoes a revision it does not implement.
+
+The strict boundary added in 2.2.2 / 2.3.0 broke every client that negotiates a
+newer legacy revision — including Claude Code, which sends `2025-11-25` on the
+`initialize` method — because there was no downgrade path. This restores
+interoperability with those clients while keeping the modern `server/discover`
+(`2026-07-28`) surface unchanged.
+
+## 2.3.0 — dual-generation MCP bridge
+
+The stdio proxy now exposes both supported client surfaces in one process:
+legacy clients use the existing `2025-06-18` initialize contract, while modern
+clients use `2026-07-28` `server/discover` plus per-request metadata. The first
+client request fixes the generation for that process; initialize/discover
+mixing and malformed or unsupported modern envelopes are rejected without
+forwarding or local-file side effects.
+
+Backend calls are normalized to the 2026-07-28 stateless request contract and
+carry the method/name headers required by that wire. A narrowly scoped legacy
+backend session is retained only when discovery proves the peer is an older
+rolling-upgrade backend. Modern discovery and legacy initialize are answered
+locally, so either client remains registered while the backend is unavailable.
+
 ## 2.2.2 — strict MCP protocol boundary
 
 The stdio proxy now rejects an `initialize` request that names an unsupported

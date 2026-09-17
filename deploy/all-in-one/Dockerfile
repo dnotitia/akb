@@ -31,16 +31,20 @@
 FROM node:22-slim AS frontend-builder
 
 WORKDIR /src
-RUN npm install -g pnpm@latest
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./frontend/
+COPY frontend/packages/markdown-editor/package.json frontend/packages/markdown-editor/tsconfig.json frontend/packages/markdown-editor/tsconfig.build.json ./frontend/packages/markdown-editor/
+COPY frontend/packages/markdown-editor/src ./frontend/packages/markdown-editor/src
+RUN corepack enable && corepack prepare "$(node -p 'require("./frontend/package.json").packageManager')" --activate
+# The workspace install runs the common package's prepare build before Vite;
+# the workspace allowBuilds list stays limited to esbuild/msw.
+RUN cd frontend && pnpm install --frozen-lockfile
 
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --ignore-scripts
-
-COPY frontend/ ./
-RUN npx vite build
+COPY frontend/ ./frontend/
+RUN cd frontend && pnpm run build
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
@@ -56,11 +60,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# MinIO server + mc client (bucket bootstrap)
-RUN curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
-        -o /usr/local/bin/minio && chmod +x /usr/local/bin/minio && \
-    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-        -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
+# MinIO server + mc client (bucket bootstrap), pinned to dated archive releases.
+# minio sha256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+# mc sha256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+ARG MINIO_RELEASE=RELEASE.2025-09-07T16-13-09Z
+ARG MC_RELEASE=RELEASE.2025-08-13T08-35-41Z
+RUN curl -fsSL https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${MINIO_RELEASE} \
+        -o /usr/local/bin/minio && \
+    echo "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  /usr/local/bin/minio" | sha256sum -c - && \
+    chmod +x /usr/local/bin/minio && \
+    curl -fsSL https://dl.min.io/client/mc/release/linux-${TARGETARCH}/archive/mc.${MC_RELEASE} \
+        -o /usr/local/bin/mc && \
+    echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  /usr/local/bin/mc" | sha256sum -c - && \
+    chmod +x /usr/local/bin/mc
 
 # Backend requires Python >=3.14 (backend/pyproject.toml). The pgvector
 # base image (debian bookworm) only ships system python 3.11 — kept
@@ -89,11 +101,11 @@ COPY backend /app/backend
 RUN rm -rf /app/backend/config
 
 # Frontend static bundle.
-COPY --from=frontend-builder /src/dist /var/www/akb
+COPY --from=frontend-builder /src/frontend/dist /var/www/akb
 
 # All-in-one bundle config + supervisord + nginx + entrypoint.
-COPY deploy/all-in-one/app.yaml /etc/akb/app.yaml
-COPY deploy/all-in-one/secret.yaml.template /etc/akb/secret.yaml.template
+COPY deploy/all-in-one/app.yaml /opt/akb/app.yaml
+COPY deploy/all-in-one/configure.py /usr/local/bin/akb-demo-configure.py
 COPY deploy/all-in-one/supervisord.conf /etc/supervisor/conf.d/akb.conf
 COPY deploy/all-in-one/nginx.conf /etc/nginx/sites-available/akb
 COPY deploy/all-in-one/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -108,5 +120,7 @@ RUN mkdir -p /data/vaults /data/minio /data/pgsql /var/log/akb /var/lib/akb && \
     chown -R www-data:www-data /var/www/akb
 
 EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/readyz >/dev/null && /opt/venv/bin/python -m app.worker_health
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]

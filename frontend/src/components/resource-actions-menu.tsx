@@ -1,0 +1,155 @@
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import type { ReactNode, Ref } from "react";
+import { Archive, ArchiveRestore, FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+
+interface ResourceActionsMenuProps {
+  resourceName: string;
+  deleteLabel?: string;
+  onDelete?: () => void;
+  moveLabel?: string;
+  onMove?: () => void;
+  publishLabel?: string;
+  onPublish?: () => void;
+  moveDisabledReason?: string;
+  archiveAction?: "archive" | "restore";
+  onArchiveAction?: () => void;
+  archiveDisabledReason?: string;
+  className?: string;
+  side?: "top" | "right" | "bottom" | "left";
+  align?: "start" | "center" | "end";
+  /** Reading/personal actions, before location and lifecycle mutations. */
+  children?: ReactNode;
+  onCloseAutoFocus?: (event: Event) => void;
+  /** Compact reading toolbar appearance; other resource menus stay unchanged. */
+  readerControl?: boolean;
+  triggerRef?: Ref<HTMLButtonElement>;
+}
+
+/** Shared overflow action for document, file, and table resources.
+ *
+ * The menu keeps destructive actions out of the primary button row while
+ * making them consistently discoverable in both workspace headers and the
+ * Vault explorer. Confirmation remains the responsibility of the caller.
+ */
+export function ResourceActionsMenu({
+  resourceName,
+  deleteLabel,
+  onDelete,
+  moveLabel,
+  onMove,
+  publishLabel,
+  onPublish,
+  moveDisabledReason,
+  archiveAction,
+  onArchiveAction,
+  archiveDisabledReason,
+  className,
+  side = "bottom",
+  align = "end",
+  children,
+  onCloseAutoFocus,
+  readerControl = false,
+  triggerRef,
+}: ResourceActionsMenuProps) {
+  const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
+  const showPublishAction = Boolean(publishLabel && onPublish);
+  const showDeleteAction = Boolean(deleteLabel && onDelete);
+  if (!children && !showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
+
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <Button
+          ref={triggerRef}
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label={`Actions for ${resourceName}`}
+          title={`Actions for ${resourceName}`}
+          data-reader-control={readerControl || undefined}
+          data-reader-icon={readerControl || undefined}
+          className={cn("shrink-0", readerControl && "text-foreground-muted hover:text-foreground data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground", className)}
+        >
+          <MoreHorizontal className="h-4 w-4" aria-hidden />
+        </Button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          onCloseAutoFocus={onCloseAutoFocus}
+          side={side}
+          align={align}
+          sideOffset={4}
+          className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+        >
+          {children}
+          {children && (showMoveAction || showPublishAction || showDeleteAction || archiveAction) && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+          {showMoveAction && (
+            <DropdownMenu.Item
+              aria-disabled={moveDisabledReason ? true : undefined}
+              onSelect={(event) => {
+                if (moveDisabledReason || !onMove) {
+                  event.preventDefault();
+                  return;
+                }
+                onMove();
+              }}
+              className={cn(
+                "flex cursor-pointer select-none items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover",
+                moveDisabledReason && "cursor-not-allowed opacity-50",
+              )}
+            >
+              <FolderInput className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden />
+              <span className="min-w-0">
+                <span className="block font-medium">{moveLabel}</span>
+                {moveDisabledReason && (
+                  <span className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">
+                    {moveDisabledReason}
+                  </span>
+                )}
+              </span>
+            </DropdownMenu.Item>
+          )}
+          {archiveAction && (
+            <DropdownMenu.Item
+              aria-disabled={archiveDisabledReason ? true : undefined}
+              onSelect={(event) => {
+                if (archiveDisabledReason || !onArchiveAction) event.preventDefault();
+                else onArchiveAction();
+              }}
+              className={cn("flex cursor-pointer select-none items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover", archiveDisabledReason && "cursor-not-allowed opacity-50")}
+            >
+              {archiveAction === "restore" ? <ArchiveRestore className="mt-0.5 h-4 w-4 shrink-0 text-link" aria-hidden /> : <Archive className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />}
+              <span>
+                <span className="block font-medium">{archiveAction === "restore" ? "Restore document" : "Archive document"}</span>
+                {archiveDisabledReason && <span className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">{archiveDisabledReason}</span>}
+              </span>
+            </DropdownMenu.Item>
+          )}
+          {showPublishAction && (
+            <DropdownMenu.Item
+              onSelect={onPublish}
+              className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
+            >
+              <Share2 className="h-4 w-4 text-link" aria-hidden />
+              {publishLabel}
+            </DropdownMenu.Item>
+          )}
+          {(showMoveAction || showPublishAction || archiveAction) && showDeleteAction && (
+            <DropdownMenu.Separator className="my-1 h-px bg-border" />
+          )}
+          {showDeleteAction && (
+            <DropdownMenu.Item
+              onSelect={onDelete}
+              className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-destructive outline-none data-[highlighted]:bg-destructive-soft data-[highlighted]:text-destructive-soft-foreground"
+            >
+              <Trash2 className="h-4 w-4" aria-hidden />
+              {deleteLabel}
+            </DropdownMenu.Item>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}

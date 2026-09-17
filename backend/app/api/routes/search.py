@@ -9,6 +9,7 @@ from app.models.document import DrillDownResponse, GrepResponse, SearchResponse
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.search_service import SearchService
+from app.services.search_filters import ArchiveScope, resolve_archive_scope
 from app.services.uri_service import parse_uri
 
 router = APIRouter()
@@ -35,21 +36,28 @@ async def search_documents(
     collection: str | None = Query(None),
     type: str | None = Query(None),
     tags: list[str] | None = Query(None),
+    doc_types: list[str] | None = Query(None, description="Document types (OR); intersects legacy type."),
+    source_type: Literal["document", "file", "table"] | None = Query(None),
     limit: int = Query(10, ge=1, le=100),
     include_archived: bool = Query(False, description="Include archived documents (hidden from search by default)."),
+    archive_scope: ArchiveScope | None = Query(None, description="Document archive scope; overrides include_archived. Archived scope excludes files and tables."),
     source_uris: list[str] | None = Query(
         None,
         description="Restrict search to this set of resource akb:// URIs (intersected with the other filters + ACL).",
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    return await search_service.search(
+    response = await search_service.search(
         query=q, vault=vault, collection=collection,
         mode=mode, rerank=rerank,
         doc_type=type, tags=tags, limit=limit,
         user_id=user.user_id, include_archived=include_archived,
         source_uris=source_uris,
+        doc_types=doc_types, source_type=source_type,
+        archive_scope=archive_scope,
     )
+    response.archive_scope = resolve_archive_scope(archive_scope, include_archived)
+    return response
 
 
 @router.get(
@@ -88,12 +96,19 @@ async def grep_documents(
     collection: str | None = Query(None),
     regex: bool = Query(False),
     case_sensitive: bool = Query(False),
-    limit: int = Query(20, ge=1, le=100),
+    doc_types: list[str] | None = Query(None),
+    tags: list[str] | None = Query(None),
+    include_archived: bool = Query(True, description="Legacy default includes archived documents; the search UI explicitly excludes them."),
+    archive_scope: ArchiveScope | None = Query(None, description="Document archive scope; overrides include_archived."),
+    limit: int = Query(20, ge=1, le=50),
     count_only: bool = Query(False, description="grep -c — per-doc counts + total"),
     files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
-    measurement_include_text_files: bool = Query(
-        False,
-        description="Guarded native M1 W3b mode: include admitted searchable text Files.",
+    include_text_files: bool | None = Query(
+        None, description="Native mode: include admitted searchable text Files; omitted means Documents only.",
+    ),
+    measurement_include_text_files: bool | None = Query(
+        None, description="Deprecated alias for include_text_files; conflicting values are rejected.",
+        deprecated=True,
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
@@ -101,8 +116,12 @@ async def grep_documents(
         pattern=q, vault=vault, collection=collection,
         regex=regex, case_sensitive=case_sensitive, limit=limit,
         count_only=count_only, files_with_matches=files_with_matches,
+        include_text_files=include_text_files,
         measurement_include_text_files=measurement_include_text_files,
         user_id=user.user_id,
+        doc_types=doc_types, tags=tags, include_archived=include_archived,
+        archive_scope=archive_scope,
     )
     response.setdefault("regex", regex)
+    response["archive_scope"] = resolve_archive_scope(archive_scope, include_archived)
     return {"kind": "grep", **response}

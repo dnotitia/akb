@@ -402,8 +402,8 @@ echo "▸ Cleanup"
 mcp_call akb_delete_vault "{\"vault\":\"$VAULT_A\",\"confirm\":true}" >/dev/null
 mcp_call akb_delete_vault "{\"vault\":\"$VAULT_B\",\"confirm\":true}" >/dev/null
 # Self-delete test user
-curl -sk --max-time 15 -X DELETE "$BASE_URL/api/v1/my/account" -H "Authorization: Bearer $JWT" >/dev/null 2>&1
-pass "vaults deleted"
+python3 "$(dirname "${BASH_SOURCE[0]}")/helpers/cleanup_hybrid_account.py" "$BASE_URL" "$E2E_USER" <<<'test1234' \
+  && pass "fixture account cleanup confirmed" || fail "cleanup" "safe account cleanup failed"
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""
