@@ -512,6 +512,7 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             backchannel_logout_uri=(settings.keycloak_backchannel_logout_uri_effective),
             upgrade_client_id=parsed.upgrade_client_id,
             upgrade_client_secret=upgrade_secret,
+            local_realm_self_registration=settings.sso_local_realm_self_registration,
         )
         await _initialize_operator_database()
         control = KeycloakStandaloneSSOControl(verify_ssl=settings.keycloak_verify_ssl)

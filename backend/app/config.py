@@ -1146,6 +1146,18 @@ class Settings(BaseModel):
     # anyone else, so arrival is not entry.
     sso_local_realm_login_enabled: bool = False
     sso_local_realm_display_name: str = "This workspace"
+    # Let the installation's OWN realm offer Keycloak's self-registration
+    # form, for a deployment whose people authenticate at this realm directly
+    # (no upstream broker). Off by default: the bootstrap keeps converging the
+    # realm to `registrationAllowed: False`, so an installation that never
+    # opts in keeps today's behaviour and its restarts never flap.
+    #
+    # This only opens the Keycloak registration form. Whether a newly
+    # registered identity can enter AKB is still decided by
+    # `keycloak_enrollment_mode` (open/invite_only/disabled) exactly like any
+    # other identity, and sign-in through this realm still arrives as a
+    # pending admission, so arrival is not entry.
+    sso_local_realm_self_registration: bool = False
     # `invite_only` records the arrival it refuses so an administrator can
     # approve that exact identity. Both bounds are on the RECORD, never on the
     # refusal: eviction changes what an administrator can still see, and never

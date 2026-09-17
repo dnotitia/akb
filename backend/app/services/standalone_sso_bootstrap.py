@@ -66,6 +66,10 @@ class StandaloneSSOBootstrapSpec:
     backchannel_logout_uri: str = ""
     upgrade_client_id: str = "akb-bootstrap-upgrade-v2"
     upgrade_client_secret: str = field(default="", repr=False)
+    # Opt-in Keycloak self-registration on the installation's own realm.
+    # Converged like every other realm field (see _realm_profile), so restarts
+    # keep whatever the installation chose instead of flapping.
+    local_realm_self_registration: bool = False
 
     @property
     def issuer(self) -> str:
