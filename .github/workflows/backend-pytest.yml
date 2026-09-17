@@ -223,6 +223,7 @@ jobs:
             tests/test_migration_037_upgrade_unit.py
             tests/test_migration_050_drop_todos_unit.py
             tests/test_migration_058_publication_identity_unit.py
+            tests/test_migration_107_native_asset_refs_pg.py
             tests/test_index_order_unit.py
             tests/concurrency/test_alter_unique_race_unit.py
             tests/test_native_revision_reconcile_pg.py

@@ -1315,9 +1315,17 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
     assert storage_touched is False
 
 
+@pytest.mark.parametrize("arm", ["document_id", "native_document_id"])
 @pytest.mark.asyncio
-async def test_sync_references_retains_previous_and_publishes_current() -> None:
+async def test_sync_references_retains_previous_and_publishes_current(arm) -> None:
+    """The same sequence runs for either arm, against that arm's column.
+
+    Parametrized rather than duplicated: the Native arm regressed precisely
+    because its half of this behaviour did not exist, and a test that only ever
+    exercised `document_id` could not notice.
+    """
     from app.repositories import vault_files_repo
+    from app.repositories.vault_files_repo import DocumentAssetOwner
 
     document_id = uuid.uuid4()
     vault_id = uuid.uuid4()
@@ -1329,10 +1337,10 @@ async def test_sync_references_retains_previous_and_publishes_current() -> None:
         async def execute(self, sql, *args):
             calls.append((" ".join(sql.split()), args))
 
+    owner = DocumentAssetOwner(vault_id=vault_id, **{arm: document_id})
     await vault_files_repo.sync_document_asset_references(
         _Connection(),
-        document_id=document_id,
-        vault_id=vault_id,
+        owner=owner,
         document_path="new/doc.md",
         commit_hash="b" * 40,
         asset_ids={asset_id},
@@ -1348,6 +1356,33 @@ async def test_sync_references_retains_previous_and_publishes_current() -> None:
     assert "INSERT INTO document_asset_refs" in calls[2][0]
     assert "INSERT INTO document_asset_revision_refs" in calls[3][0]
     assert calls[3][1][1:4] == ("new/doc.md", "b" * 40, [asset_id])
+
+    # Every statement that selects the document's own rows must do so through
+    # the arm it was given, and never through the other one.
+    other = "native_document_id" if arm == "document_id" else "document_id"
+    for sql, args in calls[:3]:
+        assert f"live.{arm}" in sql or f" {arm} =" in sql or f"({arm}," in sql, sql
+        assert f"live.{other}" not in sql and f" {other} =" not in sql, sql
+        assert args[0] == document_id
+
+
+@pytest.mark.asyncio
+async def test_a_document_asset_owner_names_exactly_one_arm() -> None:
+    """Neither column and both columns are equally meaningless."""
+    from app.repositories.vault_files_repo import DocumentAssetOwner
+
+    vault_id = uuid.uuid4()
+    with pytest.raises(ValueError):
+        DocumentAssetOwner(vault_id=vault_id)
+    with pytest.raises(ValueError):
+        DocumentAssetOwner(
+            vault_id=vault_id,
+            document_id=uuid.uuid4(),
+            native_document_id=uuid.uuid4(),
+        )
+    native = DocumentAssetOwner(vault_id=vault_id, native_document_id=uuid.uuid4())
+    assert native.column == "native_document_id"
+    assert native.document_key == native.native_document_id
 
 
 @pytest.mark.asyncio
