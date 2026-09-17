@@ -438,8 +438,11 @@ describe("MarkdownEditor image insertion", () => {
     const { container } = render(
       <MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />,
     );
+    const picker = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    fireEvent.click(screen.getByRole("button", { name: "Insert image" }));
+    expect(picker).toHaveProperty("multiple", true);
 
-    fireEvent.change(container.querySelector('input[type="file"]')!, {
+    fireEvent.change(picker, {
       target: { files },
     });
     expect(await screen.findByText(/1 image remain/)).toBeVisible();
@@ -456,6 +459,7 @@ describe("MarkdownEditor image insertion", () => {
       files[2],
       files[1],
     ]);
+    expect(screen.getAllByRole("img")).toHaveLength(3);
   });
 
   it("does not offer a futile retry for a server size rejection", async () => {

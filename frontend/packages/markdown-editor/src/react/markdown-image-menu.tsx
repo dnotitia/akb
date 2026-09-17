@@ -316,9 +316,26 @@ export function MarkdownImageMenuControls({
       if (!unchanged) setEntries(next)
     }
 
+    const resizeObserver = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(sync)
+    resizeObserver?.observe(surfaceRoot)
+    resizeObserver?.observe(editorRoot)
+    const observeImages = () => {
+      editorRoot.querySelectorAll<HTMLImageElement>('img[data-markdown-target]').forEach(image => {
+        resizeObserver?.observe(image)
+      })
+    }
+
     sync()
+    observeImages()
     editor.on('transaction', sync)
-    const observer = typeof MutationObserver === 'undefined' ? null : new MutationObserver(sync)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(() => {
+          sync()
+          observeImages()
+        })
     observer?.observe(editorRoot, {
       attributes: true,
       attributeFilter: ['alt', 'data-markdown-target'],
@@ -326,10 +343,13 @@ export function MarkdownImageMenuControls({
       subtree: true,
       characterData: true,
     })
+    window.addEventListener('resize', sync)
 
     return () => {
       editor.off('transaction', sync)
       observer?.disconnect()
+      resizeObserver?.disconnect()
+      window.removeEventListener('resize', sync)
       entriesRef.current = []
     }
   }, [editor, enabled, effectiveReadOnly, hasReplace, isEditableTarget, rootRef])

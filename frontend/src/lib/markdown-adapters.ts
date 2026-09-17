@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import type { MarkdownSearchContext } from "@akb/markdown-editor";
+import type {
+  MarkdownSearchContext,
+  MarkdownUploadContext,
+} from "@akb/markdown-editor";
 import {
   copyFileToAttachment,
   getAttachmentMetadata,
@@ -10,7 +13,11 @@ import {
   searchDocs,
   uploadAsset,
 } from "@/lib/api";
-import { assetIdFromUrl } from "@/lib/image-assets";
+import {
+  assetIdFromUrl,
+  classifyEditorImageUploadFailure,
+  prepareEditorImage,
+} from "@/lib/image-assets";
 import { docUri, fileUri, parseUri } from "@/lib/uri";
 
 export type AkbMarkdownTargetKind = "document" | "file" | "attachment";
@@ -271,18 +278,50 @@ export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {
   const targetResolver = createAkbMarkdownTargetResolver(defaults);
   return {
     upload: {
-      async upload(file: Blob, context?: AkbMarkdownUploadContext) {
+      async upload(file: Blob, context?: MarkdownUploadContext) {
         const vault = context?.vault ?? defaults.vault;
         const isFile = typeof File !== "undefined" && file instanceof File;
         const name = isFile ? (file as File).name : "attachment";
         const uploadFile = isFile
           ? (file as File)
           : new File([file], name, { type: file.type || "application/octet-stream" });
-        const uploaded = await uploadAsset(vault, uploadFile, context?.signal);
+        let prepared: File;
+        try {
+          prepared = (await prepareEditorImage(uploadFile)).file;
+        } catch (error) {
+          const failure = classifyEditorImageUploadFailure(error, uploadFile);
+          throw Object.assign(new Error(failure.message), {
+            code: "invalid",
+            retryable: failure.retryable,
+          });
+        }
+
+        let uploaded: Awaited<ReturnType<typeof uploadAsset>>;
+        try {
+          uploaded = await uploadAsset(vault, prepared, context?.signal);
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") throw error;
+          const failure = classifyEditorImageUploadFailure(error, uploadFile);
+          throw Object.assign(new Error(failure.message), {
+            code: failure.retryable ? "unavailable" : "invalid",
+            retryable: failure.retryable,
+          });
+        }
+
+        const target = canonicalAkbMarkdownTarget(
+          uploaded.target ?? uploaded.url,
+          "attachment",
+        );
+        if (!target) {
+          throw Object.assign(new Error("The image upload returned an invalid asset URL."), {
+            code: "invalid",
+            retryable: false,
+          });
+        }
         return {
           kind: "attachment" as const,
           id: uploaded.id,
-          target: canonicalAkbMarkdownTarget(uploaded.target ?? uploaded.url, "attachment") ?? uploaded.url,
+          target,
           alt: name.replace(/\.[^.]+$/, "") || "Image",
           expiresAt: uploaded.unclaimed_expires_at ?? undefined,
         };

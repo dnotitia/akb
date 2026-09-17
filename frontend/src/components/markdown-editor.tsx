@@ -3,9 +3,6 @@ import {
   EditorContent,
   MarkdownEditingSurface,
   MarkdownToolbar,
-  MarkdownToolbarButton,
-  MarkdownToolbarGroup,
-  useMarkdownCommands,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
   type MarkdownImageMenuOptions,
@@ -15,14 +12,7 @@ import {
   extractMarkdownTargets,
   serializeEditorMarkdown,
 } from "@akb/markdown-editor";
-import {
-  ImagePlus,
-  Loader2,
-  RotateCcw,
-  X,
-} from "lucide-react";
-import { Alert } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
+import type { MarkdownAsset } from "@akb/markdown-editor";
 import { discardAsset, getAssetBlob } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
@@ -33,16 +23,11 @@ import {
 } from "@/lib/markdown-adapters";
 import {
   assetIdFromUrl,
-  classifyEditorImageUploadFailure,
   EDITOR_IMAGE_MIME_TYPES,
-  prepareEditorImage,
-  validateEditorImage,
 } from "@/lib/image-assets";
 import { cn } from "@/lib/utils";
 
 type MarkdownEditorInstance = NonNullable<ReturnType<typeof useMarkdownEditor>>;
-
-type EditorCommand = (...args: unknown[]) => boolean;
 
 const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace"> = {
   labels: {
@@ -67,17 +52,6 @@ const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace
   },
   isEditableTarget: (target) => canonicalAkbMarkdownTarget(target) !== null,
 };
-
-function invokeCommand(
-  editor: MarkdownEditorInstance,
-  name: string,
-  ...args: unknown[]
-): boolean {
-  const command = (editor.commands as unknown as Record<string, EditorCommand>)[
-    name
-  ];
-  return command ? Reflect.apply(command, editor.commands, args) : false;
-}
 
 function imageAssetIds(editor: MarkdownEditorInstance): string[] {
   const ids = new Set<string>();
@@ -352,11 +326,7 @@ interface EditorToolbarProps {
   editor: MarkdownEditorInstance | null;
   searchAdapter?: ReturnType<typeof createAkbMarkdownAdapters>["search"];
   vault: string;
-  uploadingImage: boolean;
-  onChooseImages: (files: File[]) => void;
-  onOpenImagePicker: () => void;
   appearance: "framed" | "canvas" | "workspace";
-  imageInputRef: React.RefObject<HTMLInputElement | null>;
 }
 
 const AKB_MARKDOWN_TABLE_OPTIONS = {
@@ -379,11 +349,7 @@ function EditorToolbar({
   editor,
   searchAdapter,
   vault,
-  uploadingImage,
-  onChooseImages,
-  onOpenImagePicker,
   appearance,
-  imageInputRef,
 }: EditorToolbarProps) {
   return (
     <MarkdownToolbar
@@ -402,34 +368,7 @@ function EditorToolbar({
             ? "bg-surface px-3 py-2"
             : "rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5",
       )}
-    >
-      <MarkdownToolbarGroup label="Attachments">
-        <MarkdownToolbarButton
-          label={uploadingImage ? "Uploading image" : "Insert image"}
-          disabled={!editor || uploadingImage}
-          onClick={onOpenImagePicker}
-        >
-          {uploadingImage ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <ImagePlus className="h-4 w-4" />
-          )}
-        </MarkdownToolbarButton>
-        <input
-          ref={imageInputRef}
-          type="file"
-          accept={EDITOR_IMAGE_MIME_TYPES.join(",")}
-          className="sr-only"
-          tabIndex={-1}
-          aria-hidden="true"
-          onChange={(event) => {
-            const files = Array.from(event.currentTarget.files ?? []);
-            event.currentTarget.value = "";
-            if (files.length) onChooseImages(files);
-          }}
-        />
-      </MarkdownToolbarGroup>
-    </MarkdownToolbar>
+    />
   );
 }
 
@@ -445,36 +384,6 @@ const AKB_MARKDOWN_SEARCH_LABELS: Partial<MarkdownLinkSearchLabels> = {
   file: "File",
   resource: "Resource",
 };
-
-function transferredImages(transfer: DataTransfer): File[] {
-  return Array.from(transfer.files ?? []).filter((file) =>
-    file.type.startsWith("image/"),
-  );
-}
-
-function isStandaloneImageClipboard(transfer: DataTransfer): boolean {
-  const files = transferredImages(transfer);
-  if (!files.length) return false;
-  const html = transfer.getData("text/html");
-  if (!html.trim()) {
-    const plain = transfer.getData("text/plain").trim();
-    if (!plain) return true;
-    const imageNames = new Set(files.map((file) => file.name));
-    const lines = plain
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    return lines.length > 0 && lines.every((line) => imageNames.has(line));
-  }
-
-  if (!/<img\b/i.test(html)) return false;
-  const template = document.createElement("template");
-  template.innerHTML = html;
-  for (const node of template.content.querySelectorAll("img, meta, link, style")) {
-    node.remove();
-  }
-  return !(template.content.textContent ?? "").trim();
-}
 
 export interface MarkdownEditorProps {
   value: string;
@@ -524,31 +433,15 @@ export function MarkdownEditor({
   onUnclaimedAssetIdsChange,
 }: MarkdownEditorProps) {
   const rootRef = React.useRef<HTMLDivElement>(null);
-  const imageInputRef = React.useRef<HTMLInputElement>(null);
-  const replacementPositionRef = React.useRef<number | null>(null);
-  const uploadControllerRef = React.useRef<AbortController | null>(null);
-  const uploadInFlightRef = React.useRef(false);
-  const deferredImageFilesRef = React.useRef<File[]>([]);
   const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
   const unclaimedAssetExpirationsRef = React.useRef(
     new Map(Object.entries(initialUnclaimedAssetExpirations)),
   );
   const discardingAssetIdsRef = React.useRef(new Set<string>());
-  const mountedRef = React.useRef(true);
   const preserveUploadsOnUnmountRef = React.useRef(preserveUploadsOnUnmount);
   const onUploadingChangeRef = React.useRef(onUploadingChange);
   const onAssetExpirationsChangeRef = React.useRef(onAssetExpirationsChange);
   const onUnclaimedAssetIdsChangeRef = React.useRef(onUnclaimedAssetIdsChange);
-  const [uploadingImage, setUploadingImage] = React.useState(false);
-  const [uploadingName, setUploadingName] = React.useState("");
-  const [uploadFailure, setUploadFailure] = React.useState<{
-    files: File[];
-    message: string;
-    retryable: boolean;
-    kind: "error" | "queued";
-    replacementPosition?: number;
-  } | null>(null);
-
   const adapters = React.useMemo(
     () => createAkbMarkdownAdapters({ vault, document, commit }),
     [commit, document, vault],
@@ -579,7 +472,6 @@ export function MarkdownEditor({
     editable: !readOnly,
     onChange: handleChange,
   });
-  const commands = useMarkdownCommands(editor);
 
   React.useEffect(() => {
     onUploadingChangeRef.current = onUploadingChange;
@@ -629,15 +521,40 @@ export function MarkdownEditor({
     [discardUnclaimedAsset],
   );
 
+  const handleAssetUploaded = React.useCallback((asset: MarkdownAsset) => {
+    const assetId = asset.id ?? assetIdFromUrl(asset.target);
+    if (!assetId) return;
+    unclaimedAssetIdsRef.current.add(assetId);
+    if (asset.expiresAt) {
+      unclaimedAssetExpirationsRef.current.set(assetId, asset.expiresAt);
+    }
+    reportAssetExpirations();
+    reportUnclaimedAssetIds();
+  }, [reportAssetExpirations, reportUnclaimedAssetIds]);
+
+  const imageUpload = React.useMemo(
+    () => ({
+      adapter: adapters.upload,
+      context: { vault, document, commit },
+      accept: EDITOR_IMAGE_MIME_TYPES.join(","),
+      classNames: { status: "border-x border-t-0" },
+      onUploadingChange: (uploading: boolean) => {
+        onUploadingChangeRef.current?.(uploading);
+      },
+      onAssetUploaded: handleAssetUploaded,
+      onAssetReplaced: (previousTarget: string) => {
+        discardIfUnclaimed(previousTarget);
+      },
+    }),
+    [adapters.upload, commit, discardIfUnclaimed, document, handleAssetUploaded, vault],
+  );
+
   React.useEffect(() => {
     reportUnclaimedAssetIds();
   }, [reportUnclaimedAssetIds]);
   React.useEffect(() => {
-    mountedRef.current = true;
     const unclaimedAssetIds = unclaimedAssetIdsRef.current;
     return () => {
-      mountedRef.current = false;
-      uploadControllerRef.current?.abort();
       if (!preserveUploadsOnUnmountRef.current) {
         for (const assetId of unclaimedAssetIds) discardUnclaimedAsset(assetId);
       }
@@ -674,176 +591,6 @@ export function MarkdownEditor({
     Boolean(adapters.targetResolver),
   );
   usePrivateImageSources(rootRef, editor, vault, document, commit);
-  const uploadImages = React.useCallback(
-    async (files: File[], replacementPosition?: number) => {
-      if (
-        !editor ||
-        readOnly ||
-        uploadInFlightRef.current ||
-        files.length === 0
-      )
-        return;
-      const controller = new AbortController();
-      uploadControllerRef.current = controller;
-      uploadInFlightRef.current = true;
-      setUploadFailure(null);
-      setUploadingImage(true);
-      onUploadingChangeRef.current?.(true);
-      const failures: Array<{
-        file: File;
-        message: string;
-        retryable: boolean;
-      }> = [];
-      const cancelled: File[] = [];
-      let inserted = 0;
-      let failed = false;
-      try {
-        for (const [index, file] of files.entries()) {
-          if (controller.signal.aborted) {
-            cancelled.push(file, ...files.slice(index + 1));
-            break;
-          }
-          try {
-            setUploadingName(`Checking ${file.name}`);
-            const validationMessage = validateEditorImage(file);
-            if (validationMessage)
-              throw Object.assign(new Error(validationMessage), {
-                status: 415,
-              });
-            const prepared = await prepareEditorImage(file);
-            setUploadingName(
-              prepared.optimized
-                ? `Uploading optimized ${file.name}`
-                : file.name,
-            );
-            const asset = await adapters.upload.upload(prepared.file, {
-              vault,
-              document,
-              commit,
-              signal: controller.signal,
-            });
-            const target = typeof asset.target === "string" ? asset.target : "";
-            const assetId = assetIdFromUrl(target);
-            if (!assetId)
-              throw new Error(
-                "The image upload returned an invalid asset URL.",
-              );
-            unclaimedAssetIdsRef.current.add(assetId);
-            if (asset.expiresAt)
-              unclaimedAssetExpirationsRef.current.set(
-                assetId,
-                asset.expiresAt,
-              );
-            reportAssetExpirations();
-            reportUnclaimedAssetIds();
-            if (!mountedRef.current)
-              throw new DOMException("Upload cancelled", "AbortError");
-            const alt = file.name.replace(/\.[^.]+$/, "") || "Image";
-            if (replacementPosition !== undefined && inserted === 0) {
-              const oldNode = editor.state.doc.nodeAt(replacementPosition);
-              const oldTarget =
-                oldNode?.type.name === "image"
-                  ? String(oldNode.attrs.target ?? "")
-                  : undefined;
-              invokeCommand(editor, "focus");
-              invokeCommand(editor, "setNodeSelection", replacementPosition);
-              invokeCommand(editor, "updateAttributes", "image", {
-                target,
-                alt,
-              });
-              discardIfUnclaimed(oldTarget);
-            } else commands.insertImage(target, alt);
-            inserted += 1;
-          } catch (error) {
-            failed = true;
-            if (
-              controller.signal.aborted ||
-              (error instanceof DOMException && error.name === "AbortError")
-            ) {
-              cancelled.push(file, ...files.slice(index + 1));
-              break;
-            }
-            const failure = classifyEditorImageUploadFailure(error, file);
-            failures.push({
-              file,
-              message: failure.message,
-              retryable: failure.retryable,
-            });
-          }
-        }
-        if (mountedRef.current && (failures.length || cancelled.length)) {
-          const retryable = failures
-            .filter((failure) => failure.retryable)
-            .map((failure) => failure.file);
-          const queued = deferredImageFilesRef.current.splice(0);
-          setUploadFailure({
-            files: [...retryable, ...queued],
-            message: [
-              ...failures.map((failure) => failure.message),
-              cancelled.length
-                ? `${cancelled.length} image${cancelled.length === 1 ? "" : "s"} cancelled.`
-                : "",
-              "Successful images remain in the draft.",
-            ]
-              .filter(Boolean)
-              .join(" "),
-            retryable: retryable.length > 0 || queued.length > 0,
-            kind: "error",
-            replacementPosition,
-          });
-        }
-      } finally {
-        uploadControllerRef.current = null;
-        uploadInFlightRef.current = false;
-        if (mountedRef.current) {
-          setUploadingImage(false);
-          setUploadingName("");
-          onUploadingChangeRef.current?.(false);
-          if (!failed && deferredImageFilesRef.current.length > 0)
-            setUploadFailure({
-              files: deferredImageFilesRef.current.splice(0),
-              message:
-                "The previous image batch finished. Upload the next batch when ready.",
-              retryable: true,
-              kind: "queued",
-              replacementPosition,
-            });
-        }
-      }
-    },
-    [
-      adapters.upload,
-      commands,
-      commit,
-      discardIfUnclaimed,
-      document,
-      editor,
-      readOnly,
-      reportAssetExpirations,
-      reportUnclaimedAssetIds,
-      vault,
-    ],
-  );
-
-  const handleImageDrop = (event: React.DragEvent<HTMLDivElement>) => {
-    const files = transferredImages(event.dataTransfer);
-    if (!files.length) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (readOnly) return;
-    if (uploadInFlightRef.current) deferredImageFilesRef.current.push(...files);
-    else void uploadImages(files);
-  };
-  const handleImageDragOver = (event: React.DragEvent<HTMLDivElement>) => {
-    const hasImage =
-      transferredImages(event.dataTransfer).length > 0 ||
-      Array.from(event.dataTransfer.items ?? []).some(
-        (item) => item.kind === "file" && item.type.startsWith("image/"),
-      );
-    if (!hasImage) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = readOnly ? "none" : "copy";
-  };
 
   const editorClassName = cn(
     "akb-markdown-content prose dark:prose-invert !max-w-none !min-h-96 w-full cursor-text outline-none font-sans text-[15px] leading-7 text-foreground",
@@ -896,35 +643,15 @@ export function MarkdownEditor({
         onSourceChange={handleSourceChange}
         readOnly={readOnly}
         table={AKB_MARKDOWN_TABLE_OPTIONS}
-        imageMenu={{
-          ...AKB_MARKDOWN_IMAGE_MENU_OPTIONS,
-          onReplace: (position) => {
-            replacementPositionRef.current = position;
-            imageInputRef.current?.click();
-          },
-        }}
-        modeSwitchDisabled={uploadingImage}
-        onWysiwygDragOverCapture={handleImageDragOver}
-        onWysiwygDropCapture={handleImageDrop}
+        imageMenu={AKB_MARKDOWN_IMAGE_MENU_OPTIONS}
+        imageUpload={imageUpload}
         toolbar={
           !readOnly && editor ? (
             <EditorToolbar
               editor={editor}
               searchAdapter={adapters.search}
               vault={vault}
-              uploadingImage={uploadingImage}
-              onChooseImages={(files) => {
-                const replacementPosition =
-                  replacementPositionRef.current ?? undefined;
-                replacementPositionRef.current = null;
-                void uploadImages(files, replacementPosition);
-              }}
-              onOpenImagePicker={() => {
-                replacementPositionRef.current = null;
-                imageInputRef.current?.click();
-              }}
               appearance={appearance}
-              imageInputRef={imageInputRef}
             />
           ) : null
         }
@@ -933,99 +660,7 @@ export function MarkdownEditor({
         sourceRequired={required}
         sourceClassName={sourceClassName}
       >
-        {uploadingImage && (
-          <Alert
-            variant="info"
-            title="Uploading image"
-            className="border-x border-t-0"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="truncate">{uploadingName}</span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => uploadControllerRef.current?.abort()}
-              >
-                <X className="h-3.5 w-3.5" aria-hidden />
-                Cancel upload
-              </Button>
-            </div>
-          </Alert>
-        )}
-        {!uploadingImage && uploadFailure && (
-          <Alert
-            variant={uploadFailure.kind === "queued" ? "warning" : "destructive"}
-            title={
-              uploadFailure.kind === "queued"
-                ? "Images waiting to upload"
-                : "Image upload failed"
-            }
-            className="border-x border-t-0"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <span className="min-w-0 flex-1">
-                {uploadFailure.message}
-                {uploadFailure.files.length > 0
-                  ? ` ${uploadFailure.files.length} image${uploadFailure.files.length === 1 ? "" : "s"} remain in this batch.`
-                  : ""}
-              </span>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {uploadFailure.retryable && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      void uploadImages(
-                        uploadFailure.files,
-                        uploadFailure.replacementPosition,
-                      )
-                    }
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                    {uploadFailure.kind === "queued" ? "Upload" : "Retry"}
-                  </Button>
-                )}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    replacementPositionRef.current =
-                      uploadFailure.replacementPosition ?? null;
-                    imageInputRef.current?.click();
-                  }}
-                >
-                  <ImagePlus className="h-3.5 w-3.5" aria-hidden />
-                  Choose another
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setUploadFailure(null)}
-                >
-                  Dismiss
-                </Button>
-              </div>
-            </div>
-          </Alert>
-        )}
-        <div
-          className="relative min-w-0"
-          onPasteCapture={(event) => {
-            if (readOnly) return;
-            const files = transferredImages(event.clipboardData);
-            if (!files.length) return;
-            if (!isStandaloneImageClipboard(event.clipboardData)) return;
-            event.preventDefault();
-            event.stopPropagation();
-            if (uploadInFlightRef.current)
-              deferredImageFilesRef.current.push(...files);
-            else void uploadImages(files);
-          }}
-        >
+        <div className="relative min-w-0">
           {editor ? (
             <EditorContent editor={editor} />
           ) : (
