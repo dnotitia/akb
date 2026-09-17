@@ -7,6 +7,25 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### MCP transport
+
+- The legacy MCP transport is stateless. Its session lived in a per-process
+  dict in the SDK, so a client that initialized against one replica got
+  `Session not found` from the next — roughly half its calls on a two-replica
+  deployment. Nothing could make that dict shared: it holds live streams, not
+  data. The state is gone instead, which costs nothing here (this server
+  advertises `tools` with `listChanged: false`, answers with `json_response`,
+  never opens the standalone GET stream and never sends a server-to-client
+  request — the entire set stateless mode gives up). The modern era already
+  worked this way.
+- `initialize` no longer returns `Mcp-Session-Id`, and a legacy request no
+  longer needs one. Clients should send `MCP-Protocol-Version` on each request,
+  as the spec already asks: with no session to remember the handshake, that
+  header is what tells the server — and its audit trail — which revision an
+  exchange belongs to. The bundled proxy now sends it. `DELETE` keeps its
+  `{"terminated": true}` contract and reports success with no session to
+  release, rather than a 404 for one the client was never given.
+
 ### Native public links
 
 - Native Document publications bind to vault-scoped Resource identity and read
