@@ -82,6 +82,11 @@ class _CompiledMutation:
     fetch: bool
     status_code: int
     projections: list[Any]
+    # Row-CAS guard: True when the compiler pinned an expected_row_commit
+    # conjunct. The executor maps zero-matched-rows to 409 ONLY on this
+    # flag — never by sniffing the SQL text (a refactor of the conjunct
+    # spelling must not silently turn a 409 into a success no-op).
+    cas_guarded: bool = False
 
 
 @dataclass
@@ -401,7 +406,13 @@ def compile_update_rows(
     # Row CAS: pin the mutation to the caller's observed token. Absent
     # token = caller error (fail closed, never a broad silent write);
     # wrong token = zero matched rows → 409 at execution (see
-    # _execute_mutation's affected_rows check).
+    # _execute_mutation's affected_rows check). NOTE (forgeability):
+    # per-user roles hold table-level UPDATE (no column REVOKEs), so a
+    # caller CAN set row_commit via raw akb_sql today. That writes a
+    # token nobody else holds (trigger overwrites it on next UPDATE
+    # anyway) — it can only deny oneself, never forge another writer's
+    # match. Compiled paths (REST/AST) reject row_commit outright
+    # (reserved + immutable sets above).
     cas_or_error = _extract_expected_row_commit(query_params)
     if isinstance(cas_or_error, dict):
         return cas_or_error
@@ -433,6 +444,7 @@ def compile_update_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -484,6 +496,7 @@ def _compile_update_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -530,6 +543,7 @@ def compile_delete_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -571,6 +585,7 @@ def _compile_delete_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -622,7 +637,7 @@ async def _execute_mutation(
             offset=0,
         )
         total = len(body["items"])
-        if total == 0 and "row_commit =" in compiled.sql:
+        if total == 0 and compiled.cas_guarded:
             # CAS-guarded mutation matched nothing: the row moved under
             # the caller (stale token) or never existed under this
             # filter. Either way the caller must re-read — never report
@@ -642,7 +657,7 @@ async def _execute_mutation(
         )
 
     affected_rows = int(result.get("affected_rows") or 0)
-    if affected_rows == 0 and "row_commit =" in compiled.sql:
+    if affected_rows == 0 and compiled.cas_guarded:
         return err(
             "row_commit moved: re-read the row and retry with its "
             "current row_commit.",
