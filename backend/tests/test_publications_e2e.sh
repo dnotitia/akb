@@ -193,13 +193,23 @@ echo "$CONTENT" | grep -q "## Beta" && fail "Section bleed" "Beta should be excl
 SF=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_filter",""))' 2>/dev/null)
 [ "$SF" = "Alpha" ] && pass "section_filter exposed" || fail "section_filter field" "$SF"
 
-# Non-existent section → fallback to full content
+# A section filter that matches nothing must NOT fall back to the document.
+# This used to assert the opposite -- that the whole document came back with a
+# flag beside it. That fallback is exactly what let a link cut for one section
+# read the rest of the document, so the contract changed: no match resolves to
+# an empty body. `## Beta` is the section this link was never granted, so its
+# presence in the response is the leak itself.
 R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
   -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"Nonexistent\"}")
 FAKE_SEC_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])' 2>/dev/null)
 R=$(curl -sk "$BASE_URL/api/v1/public/$FAKE_SEC_SLUG")
 CONTENT=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' 2>/dev/null)
-echo "$CONTENT" | grep -q "## Beta" && pass "Non-existent section falls back to full doc" || fail "Section fallback" "missing Beta"
+FAKE_SNF=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_not_found"))' 2>/dev/null)
+echo "$CONTENT" | grep -q "## Beta" \
+  && fail "Non-existent section served the document" "Beta reached a link scoped to another section" \
+  || pass "Non-existent section does not fall back to the document"
+[ -z "$CONTENT" ] && pass "Non-existent section serves an empty body" || fail "Non-existent section body" "${#CONTENT} chars"
+[ "$FAKE_SNF" = "True" ] && pass "Non-existent section reports section_not_found" || fail "section_not_found" "$FAKE_SNF"
 
 echo ""
 
