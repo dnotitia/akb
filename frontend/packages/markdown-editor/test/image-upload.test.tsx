@@ -95,8 +95,10 @@ describe('shared image upload surface', () => {
     await waitFor(() => expect(activeEditor?.view).toBeTruthy())
     const replace = await screen.findByRole('button', { name: 'Replace image: first' })
     fireEvent.click(replace)
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]')!
+    expect(input).toHaveProperty('multiple', false)
     const file = new File(['replacement'], 'replacement.png', { type: 'image/png' })
-    fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [file] } })
+    fireEvent.change(input, { target: { files: [file] } })
     await waitFor(() => expect(adapter.upload).toHaveBeenCalled())
 
     act(() => {
@@ -122,7 +124,10 @@ describe('shared image upload surface', () => {
         .mockResolvedValueOnce({ kind: 'attachment', target: '/api/assets/two', alt: 'two' }),
     }
     render(<UploadSurface adapter={adapter} />)
-    fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [first, second] } })
+    const input = document.querySelector('input[type="file"]')!
+    fireEvent.click(screen.getByRole('button', { name: 'Insert image' }))
+    expect(input).toHaveProperty('multiple', true)
+    fireEvent.change(input, { target: { files: [first, second] } })
 
     expect(await screen.findByText('Image upload failed')).toBeVisible()
     expect(screen.getByRole('img', { name: 'one' })).toBeVisible()
@@ -130,6 +135,7 @@ describe('shared image upload surface', () => {
     await waitFor(() => expect(adapter.upload).toHaveBeenCalledTimes(3))
     expect(adapter.upload).toHaveBeenLastCalledWith(second, expect.anything())
     expect(await screen.findByRole('img', { name: 'two' })).toBeVisible()
+    expect(screen.getAllByRole('img')).toHaveLength(2)
   })
 
   it('does not expose the upload surface in read-only mode', async () => {

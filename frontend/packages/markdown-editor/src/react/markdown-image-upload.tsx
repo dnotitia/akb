@@ -454,11 +454,13 @@ export function useMarkdownImageUpload(
       : pendingAnchorRef.current ?? makeInsertAnchor()
     pendingAnchorRef.current = null
     if (!anchor) return
+    const selectedFiles = anchor.kind === 'replace' ? files.slice(0, 1) : files
+    if (!selectedFiles.length) return
     if (activeRef.current) {
-      queuedRef.current.push({ files: [...files], anchor })
+      queuedRef.current.push({ files: [...selectedFiles], anchor })
       return
     }
-    startBatch(files, anchor)
+    startBatch(selectedFiles, anchor)
   }, [enabled, makeInsertAnchor, registerAnchor, startBatch])
 
   const selectFiles = useCallback((files: readonly File[]) => {
@@ -468,6 +470,7 @@ export function useMarkdownImageUpload(
   const openPicker = useCallback(() => {
     if (!enabled || activeRef.current) return
     pendingAnchorRef.current = makeInsertAnchor()
+    if (inputRef.current) inputRef.current.multiple = true
     inputRef.current?.click()
   }, [enabled, makeInsertAnchor])
 
@@ -476,6 +479,7 @@ export function useMarkdownImageUpload(
     const anchor = makeReplacementAnchor(position)
     if (!anchor) return
     pendingAnchorRef.current = anchor
+    if (inputRef.current) inputRef.current.multiple = false
     inputRef.current?.click()
   }, [enabled, makeReplacementAnchor])
 
