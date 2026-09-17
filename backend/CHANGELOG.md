@@ -25,6 +25,12 @@ specifically; the proxy has its own log in
   so the same link disclosed a different amount depending on which backend
   served it; they now share one rule. The viewer notice says the section is gone
   rather than announcing a fallback that no longer happens.
+- A section-scoped publication derives its `summary` from the published section
+  instead of carrying the document's stored one. A stored summary describes the
+  whole document — written by the author, derived from its opening at create
+  time, or filled in by the LLM metadata worker on an imported document — and a
+  link cut for one section was never granted the rest of it. Publications
+  without a section filter are unchanged.
 
 ### Native Document drill-down
 

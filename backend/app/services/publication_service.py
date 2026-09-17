@@ -35,7 +35,7 @@ from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services import asset_service, file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
-from app.services.document_service import DocumentService
+from app.services.document_service import DocumentService, derive_summary
 from app.services.revision_backend import canonical_document_revision_backend, get_document_service
 from app.services.uri_service import doc_uri, parse_uri
 
@@ -1432,6 +1432,35 @@ async def _find_published_document(publication: dict):
     return doc_row
 
 
+def _scoped_summary(
+    doc_row,
+    section_filter: str | None,
+    resolved_body: _ResolvedDocumentBody,
+) -> str | None:
+    """The summary a section-scoped link is allowed to carry.
+
+    The stored summary describes the WHOLE document, whichever of the three
+    producers wrote it -- the author, the create-time derivation, or the LLM
+    metadata worker on an imported document. None of them knows about a
+    section filter, so handing it to a scoped link discloses prose from
+    sections that link never received; `content` and the image manifest are
+    already narrowed and this was the field left behind.
+
+    When a filter is present the stored value is not consulted at all. It
+    cannot be: a stored summary carries no record of which producer wrote it,
+    so "use the author's, derive the automatic one" is not a question that can
+    be answered after the fact. Deriving unconditionally makes it one rule.
+
+    A filter that matched nothing, or a body that could not be read, yields
+    None -- there is nothing the link is entitled to summarise.
+    """
+    if not section_filter:
+        return doc_row["summary"]
+    if resolved_body.content_unavailable or resolved_body.section_not_found:
+        return None
+    return derive_summary(resolved_body.content)
+
+
 async def resolve_document_publication(publication: dict) -> dict:
     """Read document content for a document-type publication.
 
@@ -1446,12 +1475,13 @@ async def resolve_document_publication(publication: dict) -> dict:
     section_filter = publication.get("section_filter")
     doc_row = await _find_published_document(publication)
     resolved_body = await _resolve_document_body(doc_row, section_filter)
+    summary = _scoped_summary(doc_row, section_filter, resolved_body)
 
     return {
         "resource_type": ResourceType.DOCUMENT,
         "title": publication.get("title") or doc_row["title"],
         "type": doc_row["doc_type"],
-        "summary": doc_row["summary"],
+        "summary": summary,
         "domain": doc_row["domain"],
         # Author attribution via the RESOLVED name only (created_by_name =
         # display_name, or username when no display name) — never the raw
