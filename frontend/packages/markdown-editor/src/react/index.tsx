@@ -10,10 +10,12 @@ import {
   Heading1,
   Heading2,
   Heading3,
+  ImagePlus,
   Italic,
   Link2,
   List,
   ListOrdered,
+  Loader2,
   Minus,
   Pilcrow,
   Quote,
@@ -37,6 +39,29 @@ export type { MarkdownImageMenuClassNames, MarkdownImageMenuLabels, MarkdownImag
 import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown-table.js'
 import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
 export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+import {
+  MarkdownImageUploadProvider,
+  MarkdownImageUploadStatus,
+  MarkdownImageUploadInput,
+  useMarkdownImageUpload,
+  useMarkdownImageUploadContext,
+} from './markdown-image-upload.js'
+export type {
+  MarkdownImageUploadClassNames,
+  MarkdownImageUploadController,
+  MarkdownImageUploadFailure,
+  MarkdownImageUploadLabels,
+  MarkdownImageUploadOptions,
+  MarkdownImageUploadState,
+} from './markdown-image-upload.js'
+export {
+  DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS,
+  MarkdownImageUploadProvider,
+  MarkdownImageUploadStatus,
+  MarkdownImageUploadInput,
+  useMarkdownImageUpload,
+  useMarkdownImageUploadContext,
+} from './markdown-image-upload.js'
 import { markdownTableState } from '../table.js'
 import type {
   MarkdownAdapters,
@@ -53,6 +78,7 @@ import type {
   MarkdownTargetResolution,
   MarkdownTargetResolverContext,
 } from '../types.js'
+import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 
@@ -95,6 +121,7 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             setMarkdown: () => false,
             insertMarkdown: () => false,
             insertImage: () => false,
+            replaceImageAt: () => false,
             setImageAltAt: () => false,
             deleteImageAt: () => false,
             setLink: () => false,
@@ -349,6 +376,7 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   toolbar?: ReactNode
   table?: MarkdownTableOptions
   imageMenu?: MarkdownImageMenuOptions
+  imageUpload?: MarkdownImageUploadOptions
   sourcePlaceholder?: string
   sourceLabel?: string
   sourceAriaLabel?: string
@@ -377,6 +405,7 @@ export function MarkdownEditingSurface({
   toolbar,
   table,
   imageMenu,
+  imageUpload,
   sourcePlaceholder = 'Write Markdown source…',
   sourceLabel,
   sourceAriaLabel,
@@ -390,6 +419,7 @@ export function MarkdownEditingSurface({
   className,
   ...props
 }: MarkdownEditingSurfaceProps) {
+  const imageUploadController = useMarkdownImageUpload(editor, imageUpload, readOnly)
   const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
   const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
   const [source, setSource] = useState(markdown)
@@ -402,6 +432,44 @@ export function MarkdownEditingSurface({
   const sourceInputLabelId = `${sourceInputId}-label`
   const surfaceRef = useRef<HTMLDivElement>(null)
   const resolvedSourceLabel = sourceLabel ?? labels.sourceField
+  const effectiveImageMenu = imageUploadController && imageMenu
+    ? {
+        ...imageMenu,
+        onReplace: (position: number) => imageUploadController.beginReplacement(position),
+      }
+    : imageMenu
+  const effectiveModeSwitchDisabled = modeSwitchDisabled || Boolean(imageUploadController?.state.uploading)
+
+  const handleWysiwygDragOverCapture: DragEventHandler<HTMLDivElement> = event => {
+    imageUploadController?.handleDragOver(event)
+    onWysiwygDragOverCapture?.(event)
+  }
+  const handleWysiwygDropCapture: DragEventHandler<HTMLDivElement> = event => {
+    imageUploadController?.handleDrop(event)
+    onWysiwygDropCapture?.(event)
+  }
+
+  const wysiwygPanel = (
+    <div
+      hidden={mode !== 'wysiwyg'}
+      data-markdown-mode-panel="wysiwyg"
+      onDragOverCapture={handleWysiwygDragOverCapture}
+      onDropCapture={handleWysiwygDropCapture}
+      onPasteCapture={event => imageUploadController?.handlePaste(event)}
+    >
+      {mode === 'wysiwyg' ? toolbar : null}
+      {imageUploadController ? (
+        <MarkdownImageUploadStatus options={imageUpload} />
+      ) : null}
+      {children}
+      {imageUploadController ? (
+        <MarkdownImageUploadInput
+          accept={imageUpload?.accept}
+          className={imageUpload?.classNames?.input}
+        />
+      ) : null}
+    </div>
+  )
 
   useLayoutEffect(() => {
     if (sourceDirtyRef.current) return
@@ -468,7 +536,7 @@ export function MarkdownEditingSurface({
     <button
       type="button"
       aria-pressed={mode === target}
-      disabled={!editor || modeSwitchDisabled}
+      disabled={!editor || effectiveModeSwitchDisabled}
       onClick={() => selectMode(target)}
       className={joinClasses(
         'inline-flex h-8 items-center justify-center rounded-[var(--radius-sm)] px-3 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50',
@@ -500,15 +568,11 @@ export function MarkdownEditingSurface({
         </div>
       </div>
 
-      <div
-        hidden={mode !== 'wysiwyg'}
-        data-markdown-mode-panel="wysiwyg"
-        onDragOverCapture={onWysiwygDragOverCapture}
-        onDropCapture={onWysiwygDropCapture}
-      >
-        {mode === 'wysiwyg' ? toolbar : null}
-        {children}
-      </div>
+      {imageUploadController ? (
+        <MarkdownImageUploadProvider controller={imageUploadController}>
+          {wysiwygPanel}
+        </MarkdownImageUploadProvider>
+      ) : wysiwygPanel}
 
       <div hidden={mode !== 'source'} data-markdown-mode-panel="source">
         <label id={sourceInputLabelId} htmlFor={sourceInputId} className="sr-only">
@@ -546,7 +610,7 @@ export function MarkdownEditingSurface({
         editor={editor}
         rootRef={surfaceRef}
         readOnly={readOnly}
-        options={imageMenu}
+        options={effectiveImageMenu}
       />
     </div>
   )
@@ -561,6 +625,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   adapters?: MarkdownAdapters
   resolverContext?: MarkdownTargetResolverContext
   imageMenu?: MarkdownImageMenuOptions
+  imageUpload?: MarkdownImageUploadOptions
 }
 
 export function MarkdownEditor({
@@ -572,6 +637,7 @@ export function MarkdownEditor({
   adapters,
   resolverContext,
   imageMenu,
+  imageUpload,
   ...props
 }: MarkdownEditorProps) {
   const editor = useMarkdownEditor({
@@ -595,6 +661,7 @@ export function MarkdownEditor({
       profile={profile}
       readOnly={readOnly}
       imageMenu={imageMenu}
+      imageUpload={imageUpload}
       onSourceChange={(next, sourceEditor) => onChange?.(next, sourceEditor)}
     >
       <MarkdownSurface
@@ -1048,6 +1115,7 @@ export function MarkdownToolbar({
   const commands = useMarkdownCommands(editor)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const [linkOpen, setLinkOpen] = useState(false)
+  const imageUpload = useMarkdownImageUploadContext()
   const editable = Boolean(editor && state?.isEditable)
   const active = state?.active
   const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
@@ -1257,6 +1325,21 @@ export function MarkdownToolbar({
           <Link2 className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
+      {imageUpload && (
+        <MarkdownToolbarGroup label={imageUpload.labels.group}>
+          <MarkdownToolbarButton
+            label={imageUpload.state.uploading ? imageUpload.labels.uploading : imageUpload.labels.insert}
+            disabled={!editable || imageUpload.state.uploading}
+            onClick={imageUpload.openPicker}
+          >
+            {imageUpload.state.uploading ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <ImagePlus className="h-4 w-4" />
+            )}
+          </MarkdownToolbarButton>
+        </MarkdownToolbarGroup>
+      )}
       <MarkdownToolbarGroup label="History">
         <MarkdownToolbarButton
           label="Undo"

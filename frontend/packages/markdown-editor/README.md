@@ -182,6 +182,37 @@ canonical `target` that is safe to store in Markdown; `runtimeUrl` exists only o
 result and is never serialized. `uploadMarkdownBatch` keeps success, failure, and cancellation
 per file so a partial batch can be recovered without losing successful attachments.
 
+`MarkdownEditingSurface` can own the complete image flow when a product supplies
+`imageUpload`. The shared surface handles file selection, standalone image paste, drop,
+serial progress, cancellation, partial failure, retry, and image replacement. It stores an
+editor selection bookmark before the asynchronous work begins and maps that bookmark through
+later edits, so a successful upload returns to its original logical location. The product keeps
+validation, storage, authorization, canonical Attachment targets, and claim/preserve/discard
+policy in the adapter callbacks.
+
+```tsx
+<MarkdownEditingSurface
+  editor={editor}
+  markdown={markdown}
+  imageUpload={{
+    adapter: uploadAdapter,
+    context: { vault: 'team', document: 'notes/guide.md', draftId },
+    onAssetUploaded: (asset, file) => trackUnclaimed(asset, file),
+    onAssetReplaced: previousTarget => discardUnclaimed(previousTarget),
+  }}
+  imageMenu={{ isEditableTarget: targetPolicy }}
+  toolbar={<MarkdownToolbar editor={editor} />}
+>
+  <EditorContent editor={editor} />
+</MarkdownEditingSurface>
+```
+
+`MarkdownImageUploadOptions.onAssetUploaded` runs for every completed remote asset,
+including a result that finishes after cancellation, so the product can retain or discard it
+according to its draft policy. `onAssetReplaced` runs only after the first replacement target
+was updated successfully. Failed or cancelled items are never inserted into Markdown, and the
+shared UI retries only retryable items.
+
 ```ts
 import {
   MarkdownViewer,
@@ -224,6 +255,10 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.8.0` public contract adds the shared image upload surface, mapped
+insertion/replacement targets, per-file retry/cancellation state, and the
+product-owned asset lifecycle callbacks described above.
 
 The `0.7.0` public contract adds shared image description editing and body
 removal by document position, with per-occurrence menus, product target and

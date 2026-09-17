@@ -50,7 +50,8 @@ export interface MarkdownParseOptions {
 
 export interface MarkdownUploadContext {
   vault?: string
-  documentId?: string
+  document?: string
+  commit?: string
   draftId?: string
   target?: string
   signal?: AbortSignal
@@ -89,6 +90,11 @@ export interface MarkdownUploadBatchResult {
   failed: number
   cancelled: number
   partial: boolean
+}
+
+export interface MarkdownUploadBatchOptions {
+  onFileStart?: (file: Blob, index: number, total: number) => void
+  onFileSettled?: (item: MarkdownUploadItem, index: number, total: number) => void
 }
 
 export interface MarkdownSearchResult {
@@ -172,6 +178,8 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  /** Replace one image occurrence at this ProseMirror document position. */
+  replaceImageAt(position: number, target: string, alt?: string, title?: string): boolean
   /** Update only the image node at this ProseMirror document position. */
   setImageAltAt(position: number, alt: string): boolean
   /** Remove only the image node at this ProseMirror document position. */

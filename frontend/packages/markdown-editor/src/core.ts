@@ -145,6 +145,29 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
         type: 'image',
         attrs: { target, alt, title: title ?? null },
       }),
+    replaceImageAt: (position, target, alt = '', title) => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        typeof target !== 'string' ||
+        !target ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .updateAttributes('image', { target, alt, title: title ?? null })
+        .focus()
+        .run()
+    },
     setImageAltAt: (position, alt) => {
       if (
         !editor.isEditable ||

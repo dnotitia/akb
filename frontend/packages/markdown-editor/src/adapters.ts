@@ -5,6 +5,7 @@ import type {
   MarkdownTargetResolver,
   MarkdownTargetResolverContext,
   MarkdownUploadAdapter,
+  MarkdownUploadBatchOptions,
   MarkdownUploadBatchResult,
   MarkdownUploadContext,
   MarkdownUploadItem,
@@ -75,12 +76,16 @@ export async function uploadMarkdownBatch(
   adapter: MarkdownUploadAdapter,
   files: readonly Blob[],
   context: MarkdownUploadContext = {},
+  options: MarkdownUploadBatchOptions = {},
 ): Promise<MarkdownUploadBatchResult> {
   const items: MarkdownUploadItem[] = []
 
-  for (const file of files) {
+  for (const [index, file] of files.entries()) {
+    options.onFileStart?.(file, index, files.length)
     if (context.signal?.aborted) {
-      items.push(cancelledItem(file))
+      const item = cancelledItem(file)
+      items.push(item)
+      options.onFileSettled?.(item, index, files.length)
       continue
     }
 
@@ -90,14 +95,20 @@ export async function uploadMarkdownBatch(
       // signal. The returned asset is still real and must remain visible to
       // the caller so it can be claimed or explicitly discarded. The signal
       // gates the next file; it does not erase a completed result.
-      items.push({ status: 'success', file, asset })
+      const item = { status: 'success', file, asset } satisfies MarkdownUploadItem
+      items.push(item)
+      options.onFileSettled?.(item, index, files.length)
     } catch (error) {
       const normalized = adapterError(error)
       if (normalized.code === 'cancelled' || context.signal?.aborted) {
-        items.push({ status: 'cancelled', file, error: normalized })
+        const item = { status: 'cancelled', file, error: normalized } satisfies MarkdownUploadItem
+        items.push(item)
+        options.onFileSettled?.(item, index, files.length)
         continue
       }
-      items.push({ status: 'failed', file, error: normalized })
+      const item = { status: 'failed', file, error: normalized } satisfies MarkdownUploadItem
+      items.push(item)
+      options.onFileSettled?.(item, index, files.length)
     }
   }
 
