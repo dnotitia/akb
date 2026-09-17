@@ -261,6 +261,59 @@ async def test_deleting_the_native_resource_row_cascades():
         assert await _refs(conn, f["vault_id"]) == 0
 
 
+async def test_publishing_the_same_reference_twice_is_a_no_op_for_either_arm():
+    """The repository's own upsert, run against PostgreSQL rather than a fake.
+
+    Each arm's uniqueness is a PARTIAL unique index, and `ON CONFLICT` refuses
+    to match a partial index unless the statement repeats its predicate. The
+    unit tests for this function drive a connection object that records SQL
+    and never executes it, so the string looked correct while every insert
+    failed against a real database — including the Git arm's, which this
+    change was not supposed to touch.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.repositories import vault_files_repo
+    from app.repositories.vault_files_repo import DocumentAssetOwner
+
+    async with _migrated_database() as conn:
+        f = await _fixture(conn)
+        retain = datetime.now(timezone.utc) + timedelta(days=1)
+        owners = (
+            DocumentAssetOwner(vault_id=f["vault_id"], document_id=f["git_doc"]),
+            DocumentAssetOwner(vault_id=f["vault_id"], native_document_id=f["native_doc"]),
+        )
+        for owner in owners:
+            for _ in range(2):  # the second call is what needs the arbiter
+                await vault_files_repo.sync_document_asset_references(
+                    conn,
+                    owner=owner,
+                    document_path="p/doc.md",
+                    commit_hash="c" * 40,
+                    asset_ids={f["asset_id"]},
+                    retain_until=retain,
+                )
+        assert await _refs(conn, f["vault_id"]) == 2
+
+        # Dropping the image removes that arm's reference and leaves the other.
+        await vault_files_repo.sync_document_asset_references(
+            conn,
+            owner=owners[1],
+            document_path="p/doc.md",
+            commit_hash="d" * 40,
+            asset_ids=set(),
+            retain_until=retain,
+        )
+        rows = await conn.fetch(
+            "SELECT document_id, native_document_id FROM document_asset_refs"
+            " WHERE vault_id = $1",
+            f["vault_id"],
+        )
+        assert [(r["document_id"], r["native_document_id"]) for r in rows] == [
+            (f["git_doc"], None),
+        ]
+
+
 async def test_without_the_migration_a_native_reference_is_impossible():
     """The negative control: this is the state that broke every inline image."""
     async with _migrated_database(apply_107=False) as conn:

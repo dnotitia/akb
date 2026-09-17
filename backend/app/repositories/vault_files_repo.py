@@ -637,7 +637,10 @@ async def sync_document_asset_references(
             INSERT INTO document_asset_refs ({column}, vault_id, asset_id)
             SELECT $1, $2, asset_id
               FROM unnest($3::uuid[]) AS asset_id
-            ON CONFLICT ({column}, asset_id) DO NOTHING
+            -- Each arm's uniqueness is a PARTIAL index, and an arbiter has to
+            -- name the same predicate or PostgreSQL refuses to match it.
+            ON CONFLICT ({column}, asset_id) WHERE {column} IS NOT NULL
+            DO NOTHING
             """.format(column=owner.column),
             owner.document_key, owner.vault_id, list(asset_ids),
         )
