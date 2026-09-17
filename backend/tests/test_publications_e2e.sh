@@ -193,6 +193,22 @@ echo "$CONTENT" | grep -q "## Beta" && fail "Section bleed" "Beta should be excl
 SF=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("section_filter",""))' 2>/dev/null)
 [ "$SF" = "Alpha" ] && pass "section_filter exposed" || fail "section_filter field" "$SF"
 
+# The summary a scoped link carries must describe ITS section, not the document.
+# The stored summary here is "Alpha content" (the create-time derivation takes
+# the document's first non-heading line), so a link scoped to Gamma is the case
+# that tells the two apart: it must summarise Gamma and must not carry Alpha's
+# prose, which that link was never granted.
+R=$(acurl -X POST "$BASE_URL/api/v1/publications/$VAULT/create" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"document\",\"uri\":\"$DOC_URI\",\"section_filter\":\"Gamma\"}")
+GAM_SLUG=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("slug",""))' 2>/dev/null)
+GAM=$(curl -sk "$BASE_URL/api/v1/public/$GAM_SLUG")
+GAM_SUM=$(echo "$GAM" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("summary") or "")' 2>/dev/null)
+[ "$GAM_SUM" = "Gamma content" ] && pass "Scoped summary describes its own section" || fail "Scoped summary" "$GAM_SUM"
+case "$GAM_SUM" in
+  *"Alpha content"*) fail "Scoped summary carried another section" "$GAM_SUM" ;;
+  *) pass "Scoped summary excludes Alpha" ;;
+esac
+
 # A section filter that matches nothing must NOT fall back to the document.
 # This used to assert the opposite -- that the whole document came back with a
 # flag beside it. That fallback is exactly what let a link cut for one section

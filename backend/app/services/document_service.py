@@ -216,6 +216,31 @@ from app.util.text import split_doc_path as _split_doc_path
 from app.util.text import strip_own_suffix as _strip_own_suffix
 
 
+def derive_summary(markdown: str) -> str | None:
+    """The document's first non-heading paragraph, capped at 200 characters.
+
+    Extracted so the publication resolver can ask the same question of a
+    *section-scoped* body. A stored summary describes the whole document --
+    author-written, derived here at create time, or filled in by the LLM
+    metadata worker on an imported document -- and a link cut for one section
+    was never granted the rest of it, so that resolver derives instead of
+    reading the stored value. Keep this the single definition: two copies of
+    "what counts as the summary line" is how the section rules drifted before.
+    """
+    for line in markdown.split("\n"):
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or stripped.startswith("---")
+            or stripped.startswith("|")
+            or stripped.startswith("```")
+        ):
+            continue
+        return stripped[:200]
+    return None
+
+
 def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
     # Frontmatter no longer carries a `id:` line — the canonical handle
     # is the akb:// URI (vault + path). Path is captured in the .md
@@ -234,13 +259,9 @@ def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
     if req.summary:
         fm["summary"] = req.summary
     else:
-        # Auto-generate summary from content (first non-heading paragraph, max 200 chars)
-        for line in req.content.split("\n"):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith("---") or stripped.startswith("|") or stripped.startswith("```"):
-                continue
-            fm["summary"] = stripped[:200]
-            break
+        derived = derive_summary(req.content)
+        if derived is not None:
+            fm["summary"] = derived
     if req.depends_on:
         fm["depends_on"] = req.depends_on
     if req.related_to:
