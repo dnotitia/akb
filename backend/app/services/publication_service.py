@@ -37,7 +37,7 @@ from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services import asset_service, file_service, table_service
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services.document_service import DocumentService
-from app.services.revision_backend import get_document_service
+from app.services.revision_backend import canonical_document_revision_backend, get_document_service
 from app.services.uri_service import doc_uri, parse_uri
 
 logger = logging.getLogger("akb.publications")
@@ -85,6 +85,10 @@ def _get_doc_service() -> DocumentService:
     if _doc_service is None:
         _doc_service = get_document_service()
     return _doc_service
+
+
+def _native_documents_enabled() -> bool:
+    return canonical_document_revision_backend(settings.document_revision_backend) == "postgres_native"
 
 
 # ============================================================
@@ -272,6 +276,7 @@ async def create_publication(
     resource_type: str,
     resource_uri: str | None = None,
     document_id: uuid.UUID | None = None,
+    native_document_id: uuid.UUID | None = None,
     query_sql: str | None = None,
     query_vault_names: list[str] | None = None,
     query_params: dict | None = None,
@@ -296,12 +301,11 @@ async def create_publication(
     option, which keeps the create surface free of a field that means
     nothing for document/file publications.
 
-    **Which column binds a document publication to its document.**
-    ``document_id`` does, and only it: a UUID under a composite
-    ``FOREIGN KEY (document_id, vault_id) REFERENCES documents (id, vault_id)
-    ON DELETE CASCADE``, so a bound row cannot name a document outside its
-    own vault and cannot outlive that document. It is REQUIRED for
-    ``resource_type='document'``.
+    Legacy documents bind through ``document_id``; Native documents bind through
+    ``native_document_id``. Exactly one is required. Each binding has a
+    vault-scoped foreign key; Native additionally pins the Document surface.
+    Native lifecycle triggers revoke links on soft deletion and keep their
+    derived location current on move.
 
     ``resource_uri`` is retained and still written, but for documents it is
     DERIVED — the path-shaped rendering of the same binding, kept current by
@@ -329,8 +333,8 @@ async def create_publication(
         # only because rows predating it exist; nothing created from here on
         # may add another unbound one, and a caller that cannot name the
         # document it resolved has no business publishing it.
-        if document_id is None:
-            raise ValueError("document_id is required for resource_type='document'")
+        if (document_id is None) == (native_document_id is None):
+            raise ValueError("Exactly one document identity is required for resource_type='document'")
     if resource_type == ResourceType.FILE and not resource_uri:
         raise ValueError("resource_uri is required for resource_type='file'")
     if resource_type == ResourceType.TABLE_QUERY:
@@ -406,16 +410,27 @@ async def create_publication(
                 # `FOR SHARE OF d` locks only `documents` — taking a lock on
                 # `vaults` too would serialize this against unrelated writes
                 # across the whole vault.
-                bound = await conn.fetchrow(
-                    """
-                    SELECT d.path, v.name AS vault_name
-                      FROM documents d
-                      JOIN vaults v ON v.id = d.vault_id
-                     WHERE d.id = $1 AND d.vault_id = $2
-                     FOR SHARE OF d
-                    """,
-                    document_id, vault_id,
-                )
+                if native_document_id is not None:
+                    bound = await conn.fetchrow(
+                        """
+                        SELECT r.current_path AS path, v.name AS vault_name
+                          FROM native_resources r JOIN vaults v ON v.id = r.namespace_id
+                         WHERE r.resource_id = $1 AND r.namespace_id = $2
+                           AND r.surface = 'document' AND r.lifecycle = 'live'
+                         FOR SHARE OF r
+                        """, native_document_id, vault_id,
+                    )
+                else:
+                    bound = await conn.fetchrow(
+                        """
+                        SELECT d.path, v.name AS vault_name
+                          FROM documents d
+                          JOIN vaults v ON v.id = d.vault_id
+                         WHERE d.id = $1 AND d.vault_id = $2
+                         FOR SHARE OF d
+                        """,
+                        document_id, vault_id,
+                    )
                 if bound is None:
                     raise ValueError(
                         f"Document not found (resource was deleted concurrently): {resource_uri}"
@@ -487,10 +502,10 @@ async def create_publication(
                         slug, vault_id, resource_type, resource_uri, document_id,
                         query_sql, query_vault_names, query_params,
                         password_hash, max_views, expires_at,
-                        mode, section_filter, allow_embed, title, created_by
+                        mode, section_filter, allow_embed, title, created_by, native_document_id
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                            'live', $12, $13, $14, $15)
+                            'live', $12, $13, $14, $15, $16)
                     RETURNING *
                 )
                 SELECT p.*, v.name AS vault
@@ -499,7 +514,7 @@ async def create_publication(
                 slug, vault_id, resource_type, resource_uri, document_id,
                 query_sql, query_vault_names, json.dumps(query_params or {}),
                 pwd_hash, max_views, expires_at,
-                section_filter, allow_embed, title, created_by,
+                section_filter, allow_embed, title, created_by, native_document_id,
             )
 
     logger.info("Publication created: %s (type=%s)", slug, resource_type)
@@ -546,6 +561,7 @@ async def create_publication_for_vault(
 
     resource_uri: str | None = None
     resolved_document_id: uuid.UUID | None = None
+    resolved_native_id: uuid.UUID | None = None
     resolved_query_vaults = query_vault_names
 
     if resource_type == ResourceType.DOCUMENT:
@@ -558,14 +574,24 @@ async def create_publication_for_vault(
         # row lock, the path is only how the URI renders. Keeping the path
         # alone is what let the publication land on a different document
         # than the one resolved here.
-        from app.repositories.document_repo import DocumentRepository
-        doc_repo = DocumentRepository(pool)
-        async with pool.acquire() as conn:
-            doc_row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_id)
-        if not doc_row:
-            raise ValueError(f"Document not found: {doc_id}")
-        resolved_document_id = doc_row["id"]
-        resource_uri = doc_uri(vault_name, doc_row["path"])
+        if _native_documents_enabled():
+            from app.repositories.native_revision_repo import NativeRevisionRepository
+            row = await NativeRevisionRepository(pool).resolve_live_reference(
+                namespace_id=vault_id, surface="document", reference=doc_id,
+            )
+            if row is None:
+                raise ValueError(f"Document not found: {doc_id}")
+            resolved_native_id = row["resource_id"]
+            resource_uri = doc_uri(vault_name, row["current_path"])
+        else:
+            from app.repositories.document_repo import DocumentRepository
+            doc_repo = DocumentRepository(pool)
+            async with pool.acquire() as conn:
+                doc_row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_id)
+            if not doc_row:
+                raise ValueError(f"Document not found: {doc_id}")
+            resolved_document_id = doc_row["id"]
+            resource_uri = doc_uri(vault_name, doc_row["path"])
     elif resource_type == ResourceType.FILE:
         if not file_id:
             raise ValueError("file_id required for resource_type='file'")
@@ -611,6 +637,7 @@ async def create_publication_for_vault(
         resource_type=resource_type,
         resource_uri=resource_uri,
         document_id=resolved_document_id,
+        native_document_id=resolved_native_id,
         query_sql=query_sql,
         query_vault_names=resolved_query_vaults,
         query_params=query_params,
@@ -728,13 +755,30 @@ async def delete_publications_for_document(
     # `delete_publications_by_doc_uri` instead and skip it — see that function
     # for why parsing there would be actively harmful.
     parsed = parse_uri(resource_uri) if isinstance(resource_uri, str) else None
-    if parsed is None or parsed.kind != "doc":
+    if parsed is None or parsed.kind != "doc" or parsed.identifier is None:
         raise ValueError(
             "delete_publications_for_document requires a canonical document "
             f"URI (akb://<vault>/…/doc/<name>), got {resource_uri!r}. "
             "Resolve an id to its URI BEFORE deleting the row — resolving it "
             "after leaves the publication behind."
         )
+    if _native_documents_enabled():
+        from app.repositories.native_revision_repo import NativeRevisionRepository
+        pool = await get_pool()
+        async with _connection(conn) as connection:
+            vault_id = await connection.fetchval("SELECT id FROM vaults WHERE name = $1", parsed.vault)
+            if vault_id is None or (expected_vault_id is not None and vault_id != expected_vault_id):
+                return 0
+            bound = await NativeRevisionRepository(pool).resolve_live_reference(
+                namespace_id=vault_id, surface="document", reference=parsed.identifier,
+                conn=connection,
+            )
+            if bound is not None:
+                rows = await connection.fetch(
+                    "DELETE FROM publications WHERE vault_id = $1 AND native_document_id = $2 RETURNING id",
+                    vault_id, bound["resource_id"],
+                )
+                return len(rows)
     return await delete_publications_by_doc_uri(
         resource_uri, expected_vault_id=expected_vault_id, conn=conn,
     )
@@ -1273,6 +1317,17 @@ async def _resolve_document_body(
     doc_row,
     section_filter: str | None,
 ) -> _ResolvedDocumentBody:
+    if "_native_body" in doc_row:
+        body = doc_row["_native_body"]
+        missing = False
+        if section_filter:
+            body, found = _filter_section(body, section_filter)
+            if not found:
+                body, missing = "", True
+        return _ResolvedDocumentBody(
+            content=body, content_unavailable=False, section_not_found=missing,
+            asset_ids=frozenset(asset_service.extract_asset_ids(body)),
+        )
     commit_hash = await _resolve_document_commit(doc_row)
     resolved = await asyncio.to_thread(
         _read_document_body_uncached,
@@ -1293,6 +1348,8 @@ async def _resolve_document_asset_ids(
     doc_row,
     section_filter: str | None,
 ) -> frozenset[uuid.UUID]:
+    if "_native_body" in doc_row:
+        return (await _resolve_document_body(doc_row, section_filter)).asset_ids
     commit_hash = await _resolve_document_commit(doc_row)
     if commit_hash is None:
         resolved = await asyncio.to_thread(
@@ -1324,6 +1381,28 @@ async def _find_published_document(publication: dict):
     vault cannot satisfy the lookup.
     """
     from app.services.uri_service import parse_uri
+
+    native_id = publication.get("native_document_id")
+    if native_id is not None:
+        from app.services.native_document_service import NativeDocumentService
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", to_uuid(publication["vault_id"]))
+        if vault_name is None:
+            raise PublicationNotFound(publication.get("slug", ""))
+        try:
+            document = await NativeDocumentService(pool=pool).get_by_resource_id(vault_name, to_uuid(native_id))
+        except NotFoundError:
+            # A link resolved just before deletion must not reveal the private
+            # Resource UUID through the anonymous error response.
+            raise PublicationNotFound(publication.get("slug", "")) from None
+        row = document.model_dump()
+        row.update(doc_type=document.type, vault_name=vault_name, _native_body=document.content or "")
+        return row
+    if _native_documents_enabled():
+        # Verified cutover bindings are transferred transactionally. An old
+        # unbound link is not authority to publish any occupant of its path.
+        raise PublicationNotFound(publication.get("slug", ""))
 
     uri = publication.get("resource_uri")
     raw_doc_id = publication.get("document_id")

@@ -357,6 +357,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "103_sso_account_lifecycle.py",  # SSO browser logout and managed account sync
         "104_file_write_capability_key.py",  # the one object key a file write capability grants
         "105_bridge_body_digest.py",  # a bridged revision body readable without the git volume
+        "106_native_document_publications.py",  # bind Native public links to vault-scoped Document identity
     ):
         if filename in applied:
             continue
