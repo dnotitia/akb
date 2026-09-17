@@ -410,7 +410,9 @@ export function useMarkdownImageUpload(
             .map(item => item.error.message),
           ...placementFailures.map(failure => failure.error.message),
           result.cancelled ? batchLabels.cancelled(result.cancelled) : '',
-          result.succeeded || placementFailures.length ? batchLabels.successful : '',
+          (result.succeeded || placementFailures.length) && (hasErrors || queuedFiles.length)
+            ? batchLabels.successful
+            : '',
           queuedFiles.length ? batchLabels.previousBatchFinished : '',
         ].filter(Boolean)
 
