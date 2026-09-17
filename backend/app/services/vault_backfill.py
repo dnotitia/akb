@@ -221,10 +221,20 @@ async def pending_stats() -> dict:
     signal). null_remaining includes orphans; readiness ignores them.
     `applicable` = this worker auto-fills here (pgvector same-instance);
     `vault_filter_supported` = the driver is capable at all (so an operator on
-    qdrant/seahorse, where applicable=False, still sees the gate is live)."""
+    qdrant/seahorse, where applicable=False, still sees the gate is live).
+
+    `ready` comes from `is_ready_async`, for the reason akb#526 gave for the
+    search path: the process-local latch is set by the backfill runner, and on
+    a split api/worker deployment `/health` is served by processes that never
+    run it. Reading the latch here made the field report whether THIS process
+    had happened to establish readiness -- so two replicas behind one Service
+    answered differently at the same instant, and a freshly rolled deployment
+    said `false` until traffic arrived. The state the backfill actually
+    finished in is in the store, where every tier can see it.
+    """
     store = get_vector_store()
     out: dict = {
-        "ready": is_ready(),
+        "ready": await is_ready_async(),
         "applicable": _applicable(),
         "vault_filter_supported": supports_vault_filter(store),
     }
