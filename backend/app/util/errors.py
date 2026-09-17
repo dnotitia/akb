@@ -106,6 +106,7 @@ INVALID_OPERATOR = "invalid_operator"  # unknown or unsupported row-read operato
 INVALID_CAST = "invalid_cast"  # unsupported / malformed JSON-path cast
 FILTER_TOO_DEEP = "filter_too_deep"  # boolean filter nesting past MAX_BOOL_DEPTH
 NOT_IMPLEMENTED = "not_implemented"  # recognized-but-unsupported request shape
+ROW_COMMIT_REQUIRED = "row_commit_required"  # UPDATE/DELETE without expected_row_commit (row CAS)
 
 # Knowledge-graph linking
 SELF_LINK = "self_link"

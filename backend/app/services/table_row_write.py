@@ -29,9 +29,11 @@ from app.services.user_sql_executor import (
 )
 from app.util.errors import (
     BULK_TOO_LARGE,
+    CONFLICT,
     INVALID_ARGUMENT,
     NO_UNIQUE_CONSTRAINT,
     PERMISSION_DENIED,
+    ROW_COMMIT_REQUIRED,
     SQL_ERROR,
     UNFILTERED_MUTATION,
     UNIQUE_VIOLATION,
@@ -45,7 +47,13 @@ def _is_json_type(type_name: str) -> bool:
 
 MAX_BULK_ROWS = 1000
 INSERT_SERVER_CONTROLLED = {"created_by", "updated_at"}
-UPDATE_IMMUTABLE = {"id", "created_by", "created_at", "updated_at"}
+UPDATE_IMMUTABLE = {"id", "created_by", "created_at", "updated_at", "row_commit"}
+# Row-CAS token (migration 108 + create-time DDL): server-minted, never
+# user-writable. Callers pin it via the `expected_row_commit` control
+# param (query-string or AST `cas` key), matched as an extra WHERE
+# conjunct; zero matched rows → 409, never a silent no-op.
+ROW_COMMIT_COLUMN = "row_commit"
+EXPECTED_ROW_COMMIT_PARAM = "expected_row_commit"
 WRITE_CONTROL_PARAMS = {
     "select",
     "all",
@@ -55,6 +63,7 @@ WRITE_CONTROL_PARAMS = {
     "order",
     "limit",
     "offset",
+    EXPECTED_ROW_COMMIT_PARAM,
 }
 WRITE_AST_KEYS = {"insert", "update", "delete"}
 
@@ -73,6 +82,11 @@ class _CompiledMutation:
     fetch: bool
     status_code: int
     projections: list[Any]
+    # Row-CAS guard: True when the compiler pinned an expected_row_commit
+    # conjunct. The executor maps zero-matched-rows to 409 ONLY on this
+    # flag — never by sniffing the SQL text (a refactor of the conjunct
+    # spelling must not silently turn a 409 into a success no-op).
+    cas_guarded: bool = False
 
 
 @dataclass
@@ -389,6 +403,28 @@ def compile_update_rows(
         return where_or_error
     where_sql = where_or_error
 
+    # Row CAS: pin the mutation to the caller's observed token. Absent
+    # token = caller error (fail closed, never a broad silent write);
+    # wrong token = zero matched rows → 409 at execution (see
+    # _execute_mutation's affected_rows check). NOTE (forgeability):
+    # per-user roles hold table-level UPDATE (no column REVOKEs), so a
+    # caller CAN set row_commit via raw akb_sql today. That writes a
+    # token nobody else holds (trigger overwrites it on next UPDATE
+    # anyway) — it can only deny oneself, never forge another writer's
+    # match. Compiled paths (REST/AST) reject row_commit outright
+    # (reserved + immutable sets above).
+    cas_or_error = _extract_expected_row_commit(query_params)
+    if isinstance(cas_or_error, dict):
+        return cas_or_error
+    if cas_or_error is None:
+        return err(
+            "UPDATE requires expected_row_commit (row CAS): re-read the row "
+            "and retry with its current row_commit.",
+            code=ROW_COMMIT_REQUIRED,
+            hint="Add ?expected_row_commit=<token> (or eq.<token>) alongside the row filter.",
+        )
+    where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
+
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -408,6 +444,7 @@ def compile_update_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -432,6 +469,15 @@ def _compile_update_ast(
     where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
     if isinstance(where_or_error, dict):
         return where_or_error
+    cas_token = ast.get("cas", ast.get("expected_row_commit"))
+    if not isinstance(cas_token, str) or not cas_token:
+        return err(
+            "AST update requires cas (row CAS): re-read the row and retry "
+            "with its current row_commit.",
+            code=ROW_COMMIT_REQUIRED,
+            hint="Add {\"cas\": \"<token>\"} alongside the AST filter.",
+        )
+    where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -450,6 +496,7 @@ def _compile_update_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -468,6 +515,18 @@ def compile_delete_rows(
         return where_or_error
     where_sql = where_or_error
 
+    cas_or_error = _extract_expected_row_commit(query_params)
+    if isinstance(cas_or_error, dict):
+        return cas_or_error
+    if cas_or_error is None:
+        return err(
+            "DELETE requires expected_row_commit (row CAS): re-read the row "
+            "and retry with its current row_commit.",
+            code=ROW_COMMIT_REQUIRED,
+            hint="Add ?expected_row_commit=<token> (or eq.<token>) alongside the row filter.",
+        )
+    where_sql = f"({where_sql}) AND row_commit = {_add_param(params, cas_or_error)}"
+
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -484,6 +543,7 @@ def compile_delete_rows(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -501,6 +561,15 @@ def _compile_delete_ast(
     where_or_error = _compile_ast_mutation_where(ast, column_meta, params)
     if isinstance(where_or_error, dict):
         return where_or_error
+    cas_token = ast.get("cas", ast.get("expected_row_commit"))
+    if not isinstance(cas_token, str) or not cas_token:
+        return err(
+            "AST delete requires cas (row CAS): re-read the row and retry "
+            "with its current row_commit.",
+            code=ROW_COMMIT_REQUIRED,
+            hint="Add {\"cas\": \"<token>\"} alongside the AST filter.",
+        )
+    where_or_error = f"({where_or_error}) AND row_commit = {_add_param(params, cas_token)}"
     fetch = _prefer_return_representation(prefer_header)
     projections: list[Any] = []
     returning_sql = ""
@@ -516,6 +585,7 @@ def _compile_delete_ast(
         fetch=fetch,
         status_code=200 if fetch else 204,
         projections=projections,
+        cas_guarded=True,
     )
 
 
@@ -567,6 +637,17 @@ async def _execute_mutation(
             offset=0,
         )
         total = len(body["items"])
+        if total == 0 and compiled.cas_guarded:
+            # CAS-guarded mutation matched nothing: the row moved under
+            # the caller (stale token) or never existed under this
+            # filter. Either way the caller must re-read — never report
+            # a silent no-op as success.
+            return err(
+                "row_commit moved: re-read the row and retry with its "
+                "current row_commit.",
+                code=CONFLICT,
+                hint="GET the row, take its fresh row_commit, retry the mutation.",
+            )
         content_range = f"0-{total - 1}/{total}" if total else "*/0"
         body["total"] = total
         return RowMutationResponse(
@@ -576,6 +657,13 @@ async def _execute_mutation(
         )
 
     affected_rows = int(result.get("affected_rows") or 0)
+    if affected_rows == 0 and compiled.cas_guarded:
+        return err(
+            "row_commit moved: re-read the row and retry with its "
+            "current row_commit.",
+            code=CONFLICT,
+            hint="GET the row, take its fresh row_commit, retry the mutation.",
+        )
     return RowMutationResponse(
         status_code=compiled.status_code,
         body=None,
@@ -636,6 +724,39 @@ def _compile_update_set_parts(
     if not set_parts:
         return err("PATCH body must include at least one mutable column.", code=INVALID_ARGUMENT)
     return set_parts
+
+
+def _extract_expected_row_commit(
+    query_params: Sequence[tuple[str, str]],
+) -> str | None | dict[str, Any]:
+    """Pull the CAS token out of the control params (not a column filter).
+
+    Returns the token string, None when absent, or an err dict when the
+    shape is wrong (empty value / repeated param). The token is matched
+    with plain `eq.` semantics — equality only, never ordering — mirroring
+    Document `expected_commit`. A column literally named like the param is
+    impossible (`row_commit` is reserved), so no column-identity conflict.
+    """
+    seen: list[str] = []
+    for key, value in query_params:
+        if key == EXPECTED_ROW_COMMIT_PARAM:
+            seen.append(value)
+    if not seen:
+        return None
+    if len(seen) > 1:
+        return err(
+            "expected_row_commit must appear at most once.",
+            code=INVALID_ARGUMENT,
+        )
+    token = seen[0]
+    if token.startswith("eq."):
+        token = token[3:]
+    if not token:
+        return err(
+            "expected_row_commit must be a non-empty token.",
+            code=INVALID_ARGUMENT,
+        )
+    return token
 
 
 def _compile_mutation_where(
