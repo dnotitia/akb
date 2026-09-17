@@ -195,6 +195,77 @@ async def test_without_a_shared_secret_the_challenge_is_still_issued(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_replica_behind_on_the_guide_still_accepts_the_newer_token(monkeypatch):
+    """The 60-second window a guide edit opens between replicas.
+
+    The token is a function of the guide version, so a replica still serving
+    the previous one derives a different token and the retry can never match
+    until its cache expires. `_CACHE_TTL` is 60 seconds, and a guide is edited
+    roughly every other day across the corpus — small, but the failure it
+    produces is the same ping-pong that made MCP writes impossible before the
+    token was derived at all.
+
+    Here the "other replica" is simulated by deriving the token while the
+    service sees the new guide, then putting the service back on the old one.
+    """
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-new"))
+    issued = await vss.preflight_payload("s", "v1", "id")
+    token = issued["ack_token"]
+
+    # This replica is behind: its cache holds the previous version.
+    vss.reset()
+    monkeypatch.setattr(
+        vss.settings, "system_hmac_secret", "test-system-hmac-secret"  # pragma: allowlist secret
+    )
+    fetched = {"n": 0}
+
+    async def drifting(vault, vault_id=None):
+        fetched["n"] += 1
+        # First read is the stale guide; the forced re-read sees the new one.
+        version = "v-old" if fetched["n"] == 1 else "v-new"
+        return {"content": "# skill body", "version": version}
+
+    monkeypatch.setattr(vss, "_fetch_skill", drifting)
+
+    assert await vss.preflight_payload(
+        "s", "v1", "id", acknowledgement=token
+    ) is None, "a replica behind on the guide rejected a valid acknowledgement"
+    assert fetched["n"] == 2, "the mismatch did not force a re-read"
+
+
+@pytest.mark.asyncio
+async def test_wrong_acknowledgements_cannot_force_a_read_per_call(monkeypatch):
+    """The re-read is a repair path, not an amplifier a caller can drive."""
+    fetched = {"n": 0}
+
+    async def counting(vault, vault_id=None):
+        fetched["n"] += 1
+        return {"content": "# skill body", "version": "v-stable"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", counting)
+    for _ in range(8):
+        assert await vss.preflight_payload(
+            "s", "v1", "id", acknowledgement="x" * 32
+        ) is not None
+    # One initial resolve plus at most one forced re-read inside the interval.
+    assert fetched["n"] <= 2, f"{fetched['n']} guide reads for 8 wrong tokens"
+
+
+@pytest.mark.asyncio
+async def test_a_first_touch_does_not_force_a_read(monkeypatch):
+    """No acknowledgement presented means nothing to be behind on."""
+    fetched = {"n": 0}
+
+    async def counting(vault, vault_id=None):
+        fetched["n"] += 1
+        return {"content": "# skill body", "version": "v1"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", counting)
+    assert await vss.preflight_payload("s", "v1", "id") is not None
+    assert fetched["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_version_change_reinjects(monkeypatch):
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-old"))
     assert (await vss.injection_payload("s", "v1"))["reason"] == "first_touch"
