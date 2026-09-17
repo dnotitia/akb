@@ -355,9 +355,9 @@ vector_url: ""
 vector_collection: chunks
 
 # Seahorse Cloud driver settings (ignored unless driver is "seahorse-cloud").
-# Two-plane API: management (BFF) for table lifecycle + per-table
-# data-plane host (auto-discovered from BFF response).
-seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/bff"
+# Two-plane API: management for table lifecycle + per-table
+# data-plane host (auto-discovered from the management response).
+seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/api"
 seahorse_cloud_tenant_uuid: ""
 seahorse_cloud_table_name: ""    # one of (table_name, table_uuid) required
 seahorse_cloud_table_uuid: ""
