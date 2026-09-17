@@ -891,6 +891,21 @@ async def test_realm_sets_a_lean_product_admin_password_policy_from_creation():
     )
 
 
+async def test_realm_self_registration_is_opt_in_and_converged():
+    closed = KeycloakStandaloneSSOControl._realm_profile(_spec())  # noqa: SLF001
+    assert closed["registrationAllowed"] is False
+
+    opened = KeycloakStandaloneSSOControl._realm_profile(  # noqa: SLF001
+        replace(_spec(), local_realm_self_registration=True)
+    )
+    assert opened["registrationAllowed"] is True
+    # Every other converged field is unchanged: opting in moves exactly one
+    # realm flag, so existing installations keep byte-identical behaviour.
+    assert {k: v for k, v in opened.items() if k != "registrationAllowed"} == {
+        k: v for k, v in closed.items() if k != "registrationAllowed"
+    }
+
+
 async def test_client_profiles_separate_user_admin_and_management_authorities():
     spec = replace(
         _spec(),
