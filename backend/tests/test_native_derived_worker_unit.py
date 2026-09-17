@@ -228,20 +228,26 @@ def test_native_head_body_verification_rejects_a_mismatched_placement_profile(pl
 
 
 class _StatsConn:
-    """One row of `native_invalidation_intents` aggregates."""
+    """The two aggregate rows `_pending_stats` reads, in the order it reads them.
 
-    def __init__(self, row):
-        self.row = row
+    The cumulative counters and the Head-scoped ones come from separate
+    queries over different populations, so a fake that answered both from one
+    row could not tell a repaired loss from a live one — which is the only
+    thing these cases are about.
+    """
+
+    def __init__(self, rows):
+        self.rows = list(rows)
         self.queries: list[str] = []
 
     async def fetchrow(self, query, *args):
         self.queries.append(query)
         self.args = args
-        return self.row
+        return self.rows.pop(0) if len(self.rows) > 1 else self.rows[0]
 
 
-def _stats_pool(row):
-    conn = _StatsConn(row)
+def _stats_pool(row, heads=None):
+    conn = _StatsConn([row, heads if heads is not None else _heads()])
 
     class _Pool:
         def acquire(self):
@@ -255,6 +261,7 @@ def _stats_pool(row):
 
 
 def _counts(**overrides):
+    """The cumulative ledger row: everything this queue has ever recorded."""
     row = {
         "pending": 0,
         "retrying": 0,
@@ -269,6 +276,13 @@ def _counts(**overrides):
     return row
 
 
+def _heads(**overrides):
+    """The subset still at a Resource Head: what is true of the corpus now."""
+    row = {"pending": 0, "retrying": 0, "exhausted": 0, "abandoned": 0}
+    row.update(overrides)
+    return row
+
+
 async def test_an_abandoned_intent_is_reported_even_though_the_queue_drained():
     """The bug in one assertion: progress at 100%, a document gone.
 
@@ -276,7 +290,7 @@ async def test_an_abandoned_intent_is_reported_even_though_the_queue_drained():
     is exactly what an operator watching progress sees when a Resource has been
     given up on. The count and the status are the only things that say so.
     """
-    pool, _ = _stats_pool(_counts(applied=41, abandoned=1))
+    pool, _ = _stats_pool(_counts(applied=41, abandoned=1), _heads(abandoned=1))
 
     stats = await native_derived_worker._pending_stats(pool)
 
@@ -305,12 +319,46 @@ async def test_a_claim_killed_on_its_final_attempt_is_exhausted_not_retrying():
     this row up again on its own. Counting it as ordinary retrying work would
     describe a stalled queue as a busy one.
     """
-    pool, _ = _stats_pool(_counts(pending=1, exhausted=1))
+    pool, _ = _stats_pool(_counts(pending=1, exhausted=1), _heads(pending=1, exhausted=1))
 
     stats = await native_derived_worker._pending_stats(pool)
 
     assert stats["exhausted"] == 1
     assert stats["status"] == "degraded"
+
+
+async def test_a_loss_that_a_later_revision_repaired_stops_being_a_fault():
+    """The ledger keeps it; the verdict must not.
+
+    A revision is abandoned, the author saves again, and the new Head indexes
+    cleanly. Nothing is missing from ranked search, yet the cumulative counter
+    can never go back down — so a verdict read from it reports the same repair
+    as an outage for the life of the deployment.
+    """
+    pool, _ = _stats_pool(_counts(applied=42, abandoned=1), _heads())
+
+    stats = await native_derived_worker._pending_stats(pool)
+
+    assert stats["abandoned"] == 1, "the ledger still records what was given up on"
+    assert stats["abandoned_at_head"] == 0
+    assert stats["status"] == "ok"
+
+
+async def test_a_stuck_final_attempt_on_a_superseded_revision_is_not_degraded():
+    """Its Head has an intent of its own; this row is waiting on the rescuer."""
+    pool, _ = _stats_pool(_counts(pending=1, exhausted=1), _heads())
+
+    stats = await native_derived_worker._pending_stats(pool)
+
+    assert stats["exhausted"] == 1
+    assert stats["status"] == "reconciling"
+
+
+async def test_a_live_loss_is_still_degraded_when_the_ledger_holds_repaired_ones():
+    """One current Head lost, several historical — the verdict follows the one."""
+    pool, _ = _stats_pool(_counts(applied=99, abandoned=7), _heads(abandoned=1))
+
+    assert (await native_derived_worker._pending_stats(pool))["status"] == "degraded"
 
 
 async def test_vault_scoped_stats_are_narrowed_by_namespace():
@@ -320,6 +368,8 @@ async def test_vault_scoped_stats_are_narrowed_by_namespace():
     await native_derived_worker._pending_stats(pool, namespace_id)
 
     assert "AND namespace_id = $2" in conn.queries[0]
+    # Both populations are narrowed, or the verdict would be the deployment's.
+    assert "AND i.namespace_id = $2" in conn.queries[1]
     assert conn.args == (MAX_RETRIES, namespace_id)
 
 

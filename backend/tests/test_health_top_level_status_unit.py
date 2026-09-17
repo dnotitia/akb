@@ -3,46 +3,20 @@
 The top-level `status` was the literal `"ok"` — nothing computed it — while
 the queue sections below honestly report `degraded` when they hold terminal
 work. An installation with permanently abandoned intents therefore reported
-`"ok"` at the top. These pin the aggregate without a live server: the
-aggregation helpers live on the `health` handler's closure surface, so the
-tests exercise the same rule table through a thin local copy of the contract
-— terminal work degrades, pending work reconciles, anything else is ok, and
-a failed or misshapen section contributes nothing rather than failing the
-whole response.
+`"ok"` at the top. These pin the aggregate without a live server: terminal
+work degrades, pending work reconciles, anything else is ok, and a failed or
+misshapen section contributes nothing rather than failing the whole response.
+
+The rule table used to be restated here as a local copy, because both helpers
+were closures on the `health` handler. A copy passes whatever the original
+does, so it proved nothing about the endpoint — and the defect below lived in
+exactly the half the copy was standing in for. They are module-level now and
+imported, so these assertions are about the shipped code.
 """
 
 from __future__ import annotations
 
-
-def _terminal(section: object) -> tuple[int, int]:
-    if not isinstance(section, dict):
-        return (0, 0)
-    try:
-        exhausted = int(section.get("exhausted") or 0)
-    except (TypeError, ValueError):
-        exhausted = 0
-    try:
-        abandoned = int(section.get("abandoned") or 0)
-    except (TypeError, ValueError):
-        abandoned = 0
-    return (exhausted, abandoned)
-
-
-def _aggregate_status(sections: list[object]) -> str:
-    pending_work = False
-    for section in sections:
-        if isinstance(section, dict) and section.get("error"):
-            continue
-        exhausted, abandoned = _terminal(section)
-        if exhausted or abandoned:
-            return "degraded"
-        try:
-            pending_work = pending_work or bool(
-                int(section.get("pending") or 0) or int(section.get("retrying") or 0)
-            )
-        except (TypeError, ValueError, AttributeError):
-            continue
-    return "reconciling" if pending_work else "ok"
+from app.main import _aggregate_status, _terminal
 
 
 def test_abandoned_anywhere_degrades_the_top_level():
@@ -98,3 +72,48 @@ def test_nested_upsert_and_delete_slices_count():
     # the rule reads the slice, not the `vector_store` envelope.
     assert _aggregate_status([{"pending": 0, "abandoned": 2}]) == "degraded"
     assert _aggregate_status([{"pending": 3, "abandoned": 0}]) == "reconciling"
+
+
+# ── a ledger is not a diagnosis ──────────────────────────────────────────
+
+
+def test_a_section_that_keeps_a_ledger_is_read_at_its_head():
+    """The counter that can never go down must not set a verdict that can't.
+
+    `native_derived` counts every intent it ever gave up on. Save the document
+    again and the new revision indexes cleanly, so nothing is missing from
+    ranked search — but the entry stays, and a verdict taken from it calls the
+    installation degraded for as long as it lives.
+    """
+    repaired = {"pending": 0, "abandoned": 2, "abandoned_at_head": 0}
+    assert _terminal(repaired) == (0, 0)
+    assert _aggregate_status([repaired]) == "ok"
+
+
+def test_a_live_loss_still_degrades_through_the_same_key():
+    live = {"pending": 0, "abandoned": 7, "abandoned_at_head": 1}
+    assert _terminal(live) == (0, 1)
+    assert _aggregate_status([live]) == "degraded"
+
+
+def test_a_stuck_final_attempt_is_read_at_its_head_too():
+    superseded = {"pending": 1, "exhausted": 1, "exhausted_at_head": 0, "abandoned": 0}
+    assert _terminal(superseded) == (0, 0)
+    assert _aggregate_status([superseded]) == "reconciling"
+
+
+def test_a_section_without_the_suffix_keeps_reading_its_own_counters():
+    """Only `native_derived` distinguishes the two populations today."""
+    assert _terminal({"pending": 0, "exhausted": 2, "abandoned": 1}) == (2, 1)
+    assert _aggregate_status([{"pending": 0, "abandoned": 1}]) == "degraded"
+
+
+def test_the_head_key_wins_even_when_it_is_the_larger_number():
+    """Preference, not a minimum — the rule is which population, not which value."""
+    assert _terminal({"abandoned": 1, "abandoned_at_head": 4}) == (0, 4)
+
+
+def test_a_misshapen_head_key_falls_back_to_contributing_nothing():
+    # Reading the head key is still tolerant: it must not fail the response.
+    assert _terminal({"abandoned": 3, "abandoned_at_head": "none"}) == (0, 0)
+    assert _terminal({"abandoned": 3, "abandoned_at_head": None}) == (0, 0)
