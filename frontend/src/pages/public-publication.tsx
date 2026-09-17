@@ -269,8 +269,10 @@ function DocumentBody({ slug, data }: { slug: string; data: PublicationResponse 
 
         {data.section_not_found && (
           <Alert variant="warning" title="Section not found" className="mb-8">
-            Section <code className="font-mono">{data.section_filter}</code> wasn't
-            matched. Showing the full document.
+            This link shares the section{" "}
+            <code className="font-mono">{data.section_filter}</code>, which is no
+            longer in the document. Nothing is shown here: the link grants that
+            section, not the document around it.
           </Alert>
         )}
 

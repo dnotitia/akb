@@ -589,6 +589,9 @@ export const publicSectionWarning: PublicationResponse = {
   title: "Section filtered guide",
   section_filter: "Missing section",
   section_not_found: true,
+  // A section that no longer matches resolves to an EMPTY body. Leaving the
+  // document content here drew a state the server cannot produce.
+  content: "",
 };
 
 export const publicContentUnavailable: PublicationResponse = {
