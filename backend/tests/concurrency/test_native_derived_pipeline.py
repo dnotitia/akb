@@ -534,7 +534,7 @@ async def test_failed_intent_retries_then_reclaims_and_applies(monkeypatch):
             assert recovered["last_error"] is None
 
 
-async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(monkeypatch):
+async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(monkeypatch, caplog):
     async with _fresh_database() as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
@@ -548,6 +548,7 @@ async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(
             raise RuntimeError("never persist this sensitive message")
 
         monkeypatch.setattr(worker, "_head", fail_head)
+        caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
         for attempt in range(MAX_RETRIES):
             assert await worker.process_once() == 0
             if attempt + 1 < MAX_RETRIES:
@@ -558,8 +559,31 @@ async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(
                     )
 
         stats = await worker.pending_stats(vault_id)
+        # `pending` drains to zero exactly as it would on success, so progress
+        # alone reads like a finished backfill. These are what stop that from
+        # being the whole story: the queue counts what it dropped and refuses to
+        # call itself `ok` with an empty queue.
         assert stats["pending"] == 0
         assert stats["abandoned"] == 1
+        assert stats["exhausted"] == 0
+        assert stats["status"] == "degraded"
+
+        # The same numbers through the module-level entry point `/health` calls,
+        # so the endpoint is wired to this table and not merely to a shape.
+        async def _fixture_pool():
+            return pool
+
+        monkeypatch.setattr(native_derived_worker, "get_pool", _fixture_pool)
+        assert await native_derived_worker.pending_stats(vault_id) == stats
+
+        # A count tells an operator something is wrong; only the path tells them
+        # what to fix. The class, never the message -- the message can quote the
+        # body that failed to store.
+        abandonment = next(r for r in caplog.records if r.levelno == logging.ERROR).getMessage()
+        assert "ABANDONED" in abandonment
+        assert "path=" in abandonment
+        assert "error=RuntimeError" in abandonment
+
         settled = await worker.settle(
             namespace_id=vault_id,
             timeout_seconds=0.2,
@@ -581,21 +605,19 @@ async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(
             assert terminal["last_error"] == "RuntimeError"
 
 
-async def test_a_body_the_derived_index_cannot_store_is_lost_but_counted(monkeypatch, caplog):
-    """akb#527, reproduced through the real substrate rather than a fake.
+async def test_a_body_carrying_nul_is_indexed_rather_than_lost():
+    """akb#527, closed — through the real substrate rather than a fake.
 
-    A `0x00` sits where a space belongs — what the PDF extractor emitted. The
-    payload store accepts it (its UTF-8 check is NUL-tolerant by construction,
-    migration 048), and `chunks.content` is `text`, which cannot hold one. So
-    nothing about the Resource changes between attempts and every attempt fails
-    identically until the budget is gone.
+    A `0x00` sits where a space belongs, which is what a conversion upstream
+    emitted. The payload store accepts it (its UTF-8 check is NUL-tolerant by
+    construction, migration 048) and `chunks.content` is `text`, which cannot
+    hold one — so every attempt used to fail identically until the retry budget
+    was gone, leaving the Resource permanently absent from the derived index
+    while it stayed readable and greppable.
 
-    The Resource is then permanently absent from the derived index while
-    staying readable and greppable, and — this is the defect — `pending` has
-    drained to zero exactly as it would have on success. An operator watching
-    progress sees a finished backfill. What must stop that from being the whole
-    story is asserted here: the queue counts what it dropped, refuses to call
-    itself `ok` with an empty queue, and names the Resource once in a log.
+    The byte is now dropped where chunks are built, so a body already stored
+    with one is indexed on the first attempt. What the derived index holds is
+    the text without the byte; what it used to hold was nothing at all.
     """
     async with _fresh_database() as pool:
         async with pool.acquire() as conn:
@@ -610,55 +632,33 @@ async def test_a_body_the_derived_index_cannot_store_is_lost_but_counted(monkeyp
             payload="---\ntitle: Extracted\n---\n# Extracted\nword\x00word\x00word\n",
         )
         worker = NativeDerivedWorker(pool)
-        caplog.set_level(logging.ERROR, logger="akb.native_derived_worker")
 
-        for attempt in range(MAX_RETRIES):
-            assert await worker.process_once() == 0
-            if attempt + 1 < MAX_RETRIES:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE native_invalidation_intents SET next_attempt_at = NOW() WHERE revision_id = $1",
-                        created.revision_id,
-                    )
+        assert await worker.process_once() == 1
 
         async with pool.acquire() as conn:
-            terminal = await conn.fetchrow(
+            settled = await conn.fetchrow(
                 """
                 SELECT retry_count, delivery_outcome, completed_at, last_error
                   FROM native_invalidation_intents WHERE revision_id = $1
                 """,
                 created.revision_id,
             )
-            assert terminal["retry_count"] == MAX_RETRIES
-            assert terminal["completed_at"] is not None
-            assert terminal["delivery_outcome"] == "abandoned"
-            # The class, never the message — the message quotes the body.
-            assert terminal["last_error"] == "CharacterNotInRepertoireError"
-            # Absent from the derived index: no chunk, so nothing to embed and
-            # nothing for ranked search to return.
-            assert await conn.fetchval(
-                "SELECT COUNT(*) FROM chunks WHERE source_id = $1", created.resource_id,
-            ) == 0
+            assert settled["retry_count"] == 0
+            assert settled["delivery_outcome"] == "applied"
+            assert settled["last_error"] is None
+
+            rows = await conn.fetch(
+                "SELECT content FROM chunks WHERE source_id = $1", created.resource_id,
+            )
+            assert rows, "the body reached the derived index"
+            joined = "".join(r["content"] for r in rows)
+            assert "\x00" not in joined
+            assert "wordwordword" in joined
 
         stats = await worker.pending_stats(vault_id)
-        assert stats["pending"] == 0        # progress says the backfill finished …
-        assert stats["abandoned"] == 1      # … and a document is missing from the index
-        assert stats["exhausted"] == 0
-        assert stats["status"] == "degraded"
-
-        # The same numbers through the module-level entry point `/health` and
-        # `/health/vault/{name}` call, so the endpoint test above is wired to
-        # this table and not merely to a shape.
-        async def _fixture_pool():
-            return pool
-
-        monkeypatch.setattr(native_derived_worker, "get_pool", _fixture_pool)
-        assert await native_derived_worker.pending_stats(vault_id) == stats
-
-        abandonment = next(r for r in caplog.records if r.levelno == logging.ERROR).getMessage()
-        assert "ABANDONED" in abandonment
-        assert "path=ops/extracted.md" in abandonment
-        assert "error=CharacterNotInRepertoireError" in abandonment
+        assert stats["pending"] == 0
+        assert stats["abandoned"] == 0
+        assert stats["status"] == "ok"
 
 
 async def test_multiworker_skip_locked_claims_intent_once():
