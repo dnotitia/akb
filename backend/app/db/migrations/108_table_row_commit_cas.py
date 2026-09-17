@@ -1,4 +1,4 @@
-"""Migration 107: row CAS token (`row_commit`) on dynamic vault tables.
+"""Migration 108: row CAS token (`row_commit`) on dynamic vault tables.
 
 T2-1 of the Table row-CAS wave (feeds ADR-0019 trigger (a)).
 
@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from app.db.postgres import close_pool, get_pool, init_db
 
-logger = logging.getLogger("akb.migration.107")
+logger = logging.getLogger("akb.migration.108")
 
 _VT_NAME_RE = re.compile(r"^vt_[a-z0-9_]+$")
 
@@ -135,7 +135,7 @@ async def _run(conn):
             retriggered += 1
 
     logger.info(
-        "Migration 107 applied: row_commit column + bump trigger on "
+        "Migration 108 applied: row_commit column + bump trigger on "
         "%d new vt_* table(s), trigger ensured on %d existing%s",
         added,
         retriggered,

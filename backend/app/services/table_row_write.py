@@ -48,7 +48,7 @@ def _is_json_type(type_name: str) -> bool:
 MAX_BULK_ROWS = 1000
 INSERT_SERVER_CONTROLLED = {"created_by", "updated_at"}
 UPDATE_IMMUTABLE = {"id", "created_by", "created_at", "updated_at", "row_commit"}
-# Row-CAS token (migration 107 + create-time DDL): server-minted, never
+# Row-CAS token (migration 108 + create-time DDL): server-minted, never
 # user-writable. Callers pin it via the `expected_row_commit` control
 # param (query-string or AST `cas` key), matched as an extra WHERE
 # conjunct; zero matched rows → 409, never a silent no-op.

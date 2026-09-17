@@ -358,7 +358,8 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "104_file_write_capability_key.py",  # the one object key a file write capability grants
         "105_bridge_body_digest.py",  # a bridged revision body readable without the git volume
         "106_native_document_publications.py",  # bind Native public links to vault-scoped Document identity
-        "107_table_row_commit_cas.py",  # row_commit CAS token + bump trigger on vt_* tables
+        "107_native_document_asset_refs.py",  # let an inline image be owned by a Native document
+        "108_table_row_commit_cas.py",  # row_commit CAS token + bump trigger on vt_* tables
     ):
         if filename in applied:
             continue

@@ -551,7 +551,7 @@ async def create_dynamic_table(
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     col_defs.append("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
-    # Row-CAS token (migration 107 backfills existing tables): minted by
+    # Row-CAS token (migration 108 backfills existing tables): minted by
     # DEFAULT on INSERT, bumped by trigger on UPDATE, matched via
     # `expected_row_commit` on UPDATE/DELETE. Server-owned, never user-set
     # (see table_service._RESERVED + row-write IMMUTABLE sets).

@@ -49,6 +49,7 @@ from app.services import asset_service
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.uri_service import doc_uri
 from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
+from app.repositories.vault_files_repo import DocumentAssetOwner
 
 logger = logging.getLogger("akb.external_git")
 
@@ -659,8 +660,9 @@ class ExternalGitService:
                     )
                     await asset_service.sync_document_assets(
                         conn,
-                        document_id=pg_doc_id,
-                        vault_id=vault_id,
+                        owner=DocumentAssetOwner(
+                            vault_id=vault_id, document_id=pg_doc_id,
+                        ),
                         document_path=path,
                         commit_hash=last_commit,
                         asset_ids=asset_ids,

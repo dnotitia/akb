@@ -160,7 +160,7 @@ async def test_stale_token_delete_matches_zero_rows():
             assert left == 1, "row deleted by stale token"
 
 
-async def test_migration_107_backfills_legacy_table():
+async def test_migration_108_backfills_legacy_table():
     async with _fresh_database() as pool:
         # Simulate a pre-107 table: create, then strip the new column.
         pg = await _make_table(pool, "vt_eng__legacy")
@@ -173,7 +173,7 @@ async def test_migration_107_backfills_legacy_table():
         import importlib
 
         mod = importlib.import_module(
-            "app.db.migrations.107_table_row_commit_cas"
+            "app.db.migrations.108_table_row_commit_cas"
         )
         async with pool.acquire() as conn:
             await mod.migrate(conn)

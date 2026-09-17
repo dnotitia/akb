@@ -77,7 +77,7 @@ from app.repositories.table_data_repo import (  # noqa: F401
 logger = logging.getLogger("akb.tables")
 
 # Reserved column names that conflict with auto-added bookkeeping columns.
-# `row_commit` is the row-CAS token (migration 107 + create-time DDL):
+# `row_commit` is the row-CAS token (migration 108 + create-time DDL):
 # server-minted on INSERT default, bumped by trigger on UPDATE, matched
 # on UPDATE/DELETE via `expected_row_commit`. Never user-writable.
 _RESERVED = {"id", "created_at", "updated_at", "created_by", "row_commit"}
