@@ -185,10 +185,10 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     first = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", checkpoint_path=checkpoint)
     first_artifact = await first.run()
     assert first_artifact["status"] == "complete"
-    assert first_artifact["completed_trials"] == 120
-    assert first_artifact["checkpoint"]["new_trials"] == 120
+    assert first_artifact["completed_trials"] == 200
+    assert first_artifact["checkpoint"]["new_trials"] == 200
     assert first_artifact["checkpoint"]["reused_trials"] == 0
-    assert first_artifact["locale_counts"] == {"en-US": 8, "ko-KR": 8}
+    assert first_artifact["locale_counts"] == {"en-US": 13, "ko-KR": 13}
     assert set(first_artifact["locale_metrics"]) == {"en-US", "ko-KR"}
     assert first_artifact["artifact_hash_input"]["task_locales"][0]["locale"] == tasks[0].locale
     assert first_artifact["runs"]["primary:http"]["locale_metrics"]
@@ -201,9 +201,9 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     second_artifact = await second.run()
 
     assert second_artifact["status"] == "complete"
-    assert second_artifact["completed_trials"] == 120
+    assert second_artifact["completed_trials"] == 200
     assert second_artifact["checkpoint"]["new_trials"] == 0
-    assert second_artifact["checkpoint"]["reused_trials"] == 120
+    assert second_artifact["checkpoint"]["reused_trials"] == 200
     assert second_artifact["checkpoint"]["rerun_trials"] == 0
     assert smoke_calls == []
     assert evaluation_calls == []

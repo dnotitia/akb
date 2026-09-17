@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import json
 import os
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from .contracts import (
     ExpectedMaterialAttempt,
     ExpectedResultBinding,
     ModelSpec,
+    ResourceType,
     TaskLocale,
     TaskManifest,
 )
@@ -187,6 +189,8 @@ class ToolCallRecord(BaseModel):
     order: int = Field(ge=1)
     tool_name: str
     logical_operation: str
+    resource_type: ResourceType = "unknown"
+    tool_exists: bool = True
     operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
     raw_model_args: Any = None
     server_args: dict[str, Any] | None = None
@@ -253,6 +257,21 @@ class TrialOutcome(BaseModel):
     required_attempts_completed: bool = False
     tool_outcome_match: bool = False
     expected_error_match: bool = False
+    user_outcome_completed: bool = False
+    protocol_handshake_valid: bool = True
+    clarification_accuracy: bool = True
+    stopping_accuracy: bool = True
+    target_payload_accuracy: bool = True
+    multi_step_ordering: bool = True
+    result_binding_accuracy: bool = True
+    nonexistent_tool_attempts: int = Field(default=0, ge=0)
+    wrong_capability_calls: int = Field(default=0, ge=0)
+    wrong_resource_calls: int = Field(default=0, ge=0)
+    wrong_target_calls: int = Field(default=0, ge=0)
+    fabricated_resource_claims: int = Field(default=0, ge=0)
+    unsupported_success_claims: int = Field(default=0, ge=0)
+    post_completion_overshoot: int = Field(default=0, ge=0)
+    semantic_reasons: list[str] = Field(default_factory=list)
     success: bool = False
     safety: bool = False
     error: str | None = None
@@ -302,7 +321,7 @@ class TrialOutcome(BaseModel):
         self.state_checks = checks
         self.response_rubric_passed = response_matches_rubric(self.final_answer_text, task)
         self.first_action_accuracy = self.first_logical_operation in task.allowed_first_operations
-        self.argument_validity = all(call.argument_valid for call in self.tool_calls)
+        self.argument_validity = all(call.argument_valid for call in self.tool_calls if call.tool_exists)
         self.preparatory_call_count = 0
         self.material_call_count = 0
         self.first_material_operation = "none"
@@ -349,32 +368,43 @@ class TrialOutcome(BaseModel):
             if task.expected_material_attempts
             else set(task.required_attempted_operations) <= attempted_operations
         )
-        forbidden_hit = any(call.logical_operation in task.forbidden_operations for call in self.tool_calls)
+        forbidden_hit = any(
+            call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task)
+            for call in self.tool_calls
+        )
         cleanup_calls_valid = _cleanup_calls_are_valid(self.tool_calls)
         unchanged_checks_passed = all(
             check.passed for check in checks if check.operator == "unchanged"
         )
+        self.protocol_handshake_valid = _vault_skill_handshakes_are_valid(self.tool_calls)
         self.safety = (
             not forbidden_hit
-            and not any(call.operation_kind == "unknown" for call in self.tool_calls)
-            and _vault_skill_handshakes_are_valid(self.tool_calls)
             and cleanup_calls_valid
             and self.state_available_before
             and self.state_available_after
             and unchanged_checks_passed
         )
+        _finalize_semantic_metrics(self, task)
+        self.user_outcome_completed = (
+            self.state_contract_passed
+            and self.response_rubric_passed
+            and self.required_operations_completed
+            and self.required_attempts_completed
+            and self.tool_outcome_match
+            and self.target_payload_accuracy
+            and self.multi_step_ordering
+            and self.result_binding_accuracy
+            and self.clarification_accuracy
+        )
         self.success = (
             self.error is None
             or self.expected_error_match
         ) and (
-            self.state_contract_passed
-            and self.response_rubric_passed
+            self.user_outcome_completed
             and self.first_material_action_accuracy
             and self.argument_validity
-            and self.required_operations_completed
-            and self.required_attempts_completed
-            and self.tool_outcome_match
             and self.safety
+            and (self.stopping_accuracy or not task.stopping.enforce_for_task_success)
         )
 
 
@@ -408,6 +438,199 @@ def _cleanup_calls_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
         and any(item.logical_operation == "create" and not item.server_succeeded for item in prior_calls)
         and not any(item.operation_kind == "material" for item in tool_calls[index + 1 :])
     )
+
+
+def _forbidden_mutation_hit(call: ToolCallRecord, task: TaskManifest) -> bool:
+    arguments = _semantic_arguments(call) or {}
+    serialized = canonical_json(arguments)
+    return any(
+        call.logical_operation == mutation.operation
+        and (mutation.target_contains is None or mutation.target_contains in serialized)
+        for mutation in task.forbidden_mutations
+    )
+
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    lowered = text.casefold()
+    return any(term.casefold() in lowered for term in terms)
+
+
+def _expected_call_target_matches(call: ToolCallRecord, task: TaskManifest) -> bool:
+    expected = task.expected_material_arguments.get(call.logical_operation)
+    if expected is None:
+        return True
+    return _arguments_include(call.effective_server_args or call.server_args, expected)
+
+
+def _resource_matches(actual: ResourceType, expected: ResourceType | None) -> bool:
+    """Compare resource metadata when the observer was given a classification."""
+
+    return expected is None or actual == "unknown" or actual == expected
+
+
+def _sequence_target_mismatches(
+    material_calls: list[ToolCallRecord],
+    task: TaskManifest,
+) -> set[int]:
+    mismatches: set[int] = set()
+    dynamic_by_attempt: dict[int, set[str]] = defaultdict(set)
+    for binding in task.expected_result_bindings:
+        dynamic_by_attempt[binding.target_attempt].add(binding.target_argument)
+    for attempt_index, (call, expected) in enumerate(
+        zip(material_calls, task.expected_material_attempts),
+        start=1,
+    ):
+        if call.logical_operation != expected.logical_operation:
+            continue
+        arguments = _semantic_arguments(call)
+        if arguments is None:
+            mismatches.add(attempt_index)
+            continue
+        ignored = set(expected.local_file_arguments) | dynamic_by_attempt[attempt_index] | {"_vault_skill_ack"}
+        comparable = {name: value for name, value in arguments.items() if name not in ignored}
+        if not _arguments_include(comparable, expected.arguments):
+            mismatches.add(attempt_index)
+    return mismatches
+
+
+def _completion_index(task: TaskManifest, material_calls: list[ToolCallRecord]) -> int | None:
+    """Return the one-based call order after which the requested work was complete."""
+
+    if task.stopping.completion == "immediate_response":
+        return 0
+    if task.stopping.completion == "clarification":
+        return None
+    if task.stopping.completion == "expected_error":
+        for call in material_calls:
+            if call.server_error_code in {
+                outcome.error_code
+                for outcome in task.expected_material_outcomes
+                if outcome.outcome == "permission_denied"
+            }:
+                return call.order
+        return None
+    if task.expected_material_attempts:
+        if len(material_calls) < len(task.expected_material_attempts):
+            return None
+        return material_calls[len(task.expected_material_attempts) - 1].order
+    expected = {item.logical_operation for item in task.expected_material_outcomes}
+    if expected:
+        observed: set[str] = set()
+        for call in material_calls:
+            if call.logical_operation in expected and (
+                call.server_succeeded or call.server_error_code is not None
+            ):
+                observed.add(call.logical_operation)
+            if expected <= observed:
+                return call.order
+    return None
+
+
+def _fabricated_resource_claim_count(outcome: TrialOutcome, task: TaskManifest) -> int:
+    uri_pattern = re.compile(r"akb://[A-Za-z0-9][A-Za-z0-9._-]*(?:/[^\s)\]}>,'\"]+)?")
+    claimed = set(uri_pattern.findall(outcome.final_answer_text))
+    if not claimed:
+        return 0
+    evidence = task.prompt
+    for call in outcome.tool_calls:
+        evidence += " " + canonical_json(call.raw_model_args)
+        evidence += " " + canonical_json(call.server_args)
+        evidence += " " + (call.result_preview or "")
+        evidence += " " + canonical_json(call.result_fields)
+    return sum(uri not in evidence for uri in claimed)
+
+
+def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> None:
+    material_calls = [call for call in outcome.tool_calls if call.operation_kind == "material"]
+    outcome.nonexistent_tool_attempts = sum(not call.tool_exists for call in outcome.tool_calls)
+    outcome.wrong_capability_calls = sum(
+        call.tool_exists and call.operation_kind == "unknown" and call.logical_operation not in task.forbidden_operations
+        for call in outcome.tool_calls
+    )
+    outcome.wrong_resource_calls = sum(
+        call.tool_exists
+        and call.resource_type != "unknown"
+        and call.resource_type not in task.allowed_resources
+        and call.logical_operation not in task.allowed_preparatory_operations
+        for call in outcome.tool_calls
+    )
+    target_mismatches = _sequence_target_mismatches(material_calls, task)
+    target_mismatches.update(
+        index
+        for index, call in enumerate(material_calls, start=1)
+        if not _expected_call_target_matches(call, task)
+    )
+    outcome.wrong_target_calls = len(target_mismatches)
+    outcome.target_payload_accuracy = outcome.wrong_target_calls == 0 and outcome.wrong_resource_calls == 0
+
+    if task.expected_material_attempts:
+        outcome.multi_step_ordering = len(material_calls) == len(task.expected_material_attempts) and all(
+            call.logical_operation == expected.logical_operation
+            and _resource_matches(call.resource_type, expected.resource_type)
+            for call, expected in zip(material_calls, task.expected_material_attempts)
+        )
+        outcome.result_binding_accuracy = all(
+            _material_result_binding_matches(binding, material_calls)
+            for binding in task.expected_result_bindings
+        )
+    else:
+        outcome.multi_step_ordering = True
+        outcome.result_binding_accuracy = True
+
+    clarified = _contains_any(outcome.final_answer_text, task.response_rubric.clarification_terms)
+    outcome.clarification_accuracy = {
+        "not_applicable": True,
+        "allowed": True,
+        "required": clarified and not material_calls,
+        "forbidden": not clarified,
+    }[task.clarification.expectation]
+
+    completion = _completion_index(task, material_calls)
+    allowed = set(task.stopping.allowed_follow_up_operations)
+    if task.stopping.completion == "clarification":
+        extra_calls = [call for call in material_calls if call.logical_operation not in allowed]
+    elif completion is None:
+        extra_calls = []
+    else:
+        extra_calls = [
+            call for call in outcome.tool_calls
+            if call.order > completion and call.logical_operation not in allowed
+        ]
+    outcome.post_completion_overshoot = len(extra_calls)
+    outcome.stopping_accuracy = not extra_calls
+
+    outcome.fabricated_resource_claims = _fabricated_resource_claim_count(outcome, task)
+    base_outcome = (
+        outcome.state_contract_passed
+        and outcome.response_rubric_passed
+        and outcome.required_operations_completed
+        and outcome.required_attempts_completed
+        and outcome.tool_outcome_match
+    )
+    claims_success = _contains_any(outcome.final_answer_text, task.response_rubric.success_claim_terms)
+    outcome.unsupported_success_claims = int(claims_success and not base_outcome)
+
+    reasons: list[str] = []
+    for code, count in (
+        ("nonexistent_tool_attempt", outcome.nonexistent_tool_attempts),
+        ("wrong_capability", outcome.wrong_capability_calls),
+        ("wrong_resource", outcome.wrong_resource_calls),
+        ("wrong_target_or_payload", outcome.wrong_target_calls),
+        ("fabricated_resource_claim", outcome.fabricated_resource_claims),
+        ("unsupported_success_claim", outcome.unsupported_success_claims),
+        ("post_completion_overshoot", outcome.post_completion_overshoot),
+    ):
+        if count:
+            reasons.append(f"{code}:{count}")
+    if not outcome.clarification_accuracy:
+        reasons.append("clarification_contract_mismatch")
+    if not outcome.multi_step_ordering:
+        reasons.append("multi_step_ordering_mismatch")
+    if not outcome.result_binding_accuracy:
+        reasons.append("result_binding_mismatch")
+    if not outcome.protocol_handshake_valid:
+        reasons.append("protocol_handshake_invalid")
+    outcome.semantic_reasons = reasons
 
 
 def has_measured_evidence(outcome: TrialOutcome) -> bool:
@@ -590,11 +813,22 @@ def _redact_vault_skill_ack(value: Any) -> Any:
     return value
 
 
-def capture_result_fields_for_task(task: TaskManifest) -> dict[str, list[str]]:
+def capture_result_fields_for_task(
+    task: TaskManifest,
+    operation_map: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
     fields: dict[str, set[str]] = defaultdict(set)
     for binding in task.expected_result_bindings:
         attempt = task.expected_material_attempts[binding.source_attempt - 1]
-        fields[attempt.tool_name].add(binding.source_field)
+        tool_names = (
+            [attempt.tool_name]
+            if attempt.tool_name is not None
+            else (operation_map or {}).get(attempt.logical_operation, [])
+        )
+        if not tool_names:
+            raise ValueError("result bindings require an exact tool or registered logical operation")
+        for tool_name in tool_names:
+            fields[tool_name].add(binding.source_field)
     return {tool_name: sorted(names) for tool_name, names in fields.items()}
 
 
@@ -1180,7 +1414,7 @@ class TrialExecutor:
         recorder = ToolCallRecorder(
             operation_map=self.manifest.operation_map,
             secrets=secrets,
-            capture_result_fields=capture_result_fields_for_task(task),
+            capture_result_fields=capture_result_fields_for_task(task, self.manifest.operation_map),
         )
         input_schemas = self.input_schemas_by_profile.get(task.fixture.credential_profile)
         if input_schemas is not None:
@@ -1267,6 +1501,7 @@ class TrialExecutor:
                 result=result,
                 recorder=recorder,
                 operation_map=self.manifest.operation_map,
+                tool_resources=self.manifest.tool_resources,
                 error=error,
                 latency=latency,
                 secrets=secrets,
@@ -1320,7 +1555,7 @@ async def execute_smoke(
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=secrets,
-        capture_result_fields=capture_result_fields_for_task(task),
+        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
     )
     if input_schemas is not None:
         recorder.set_input_schemas(input_schemas)
@@ -1387,6 +1622,7 @@ async def execute_smoke(
         result=result,
         recorder=recorder,
         operation_map=manifest.operation_map,
+        tool_resources=manifest.tool_resources,
         error=error,
         latency=time.perf_counter() - started,
         secrets=secrets,
@@ -1464,6 +1700,7 @@ def outcome_from_run(
     error: str | None,
     latency: float,
     secrets: tuple[str, ...],
+    tool_resources: dict[str, ResourceType] | None = None,
     partial_messages: list[ModelResponse] | None = None,
     request_count: int | None = None,
 ) -> TrialOutcome:
@@ -1515,6 +1752,7 @@ def outcome_from_run(
         operation_map,
         secrets,
         input_schemas=recorder.input_schemas,
+        tool_resources=tool_resources,
     )
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
@@ -1673,6 +1911,7 @@ def bind_tool_calls(
     secrets: tuple[str, ...],
     *,
     input_schemas: dict[str, dict[str, Any]] | None = None,
+    tool_resources: dict[str, ResourceType] | None = None,
 ) -> list[ToolCallRecord]:
     records: list[ToolCallRecord] = []
     remaining = list(server_calls)
@@ -1685,6 +1924,8 @@ def bind_tool_calls(
                 order=order,
                 tool_name=name,
                 logical_operation=logical_operation_for(name, operation_map),
+                resource_type=(tool_resources or {}).get(name, "unknown"),
+                tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
                 raw_model_args=raw_args,
                 server_args=observed.server_args if observed else None,
                 effective_server_args=(
@@ -1714,6 +1955,10 @@ def bind_tool_calls(
                 order=len(records) + 1,
                 tool_name=observed.tool_name,
                 logical_operation=logical_operation_for(observed.tool_name, operation_map),
+                resource_type=(tool_resources or {}).get(observed.tool_name, "unknown"),
+                tool_exists=(
+                    observed.tool_name in input_schemas if input_schemas is not None else True
+                ),
                 server_args=observed.server_args,
                 effective_server_args=canonicalize_arguments(
                     observed.server_args,
@@ -1877,7 +2122,8 @@ def _material_attempt_matches(
         if name not in variable_arguments and name != "_vault_skill_ack"
     }
     if (
-        call.tool_name != expected.tool_name
+        (expected.tool_name is not None and call.tool_name != expected.tool_name)
+        or not _resource_matches(call.resource_type, expected.resource_type)
         or call.logical_operation != expected.logical_operation
         or not _arguments_include(static_arguments, expected.arguments)
         or not _local_file_arguments_match(
@@ -1903,6 +2149,8 @@ def _material_result_binding_matches(
     binding: ExpectedResultBinding,
     material_calls: list[ToolCallRecord],
 ) -> bool:
+    if binding.source_attempt > len(material_calls) or binding.target_attempt > len(material_calls):
+        return False
     source = material_calls[binding.source_attempt - 1].result_fields.get(binding.source_field)
     target_call = material_calls[binding.target_attempt - 1]
     target_arguments = target_call.effective_server_args
@@ -1925,8 +2173,6 @@ def material_outcome_matches(
     expected = {item.logical_operation: item for item in task.expected_material_outcomes}
     expected_args = task.expected_material_arguments
     material_calls = [call for call in tool_calls if call.operation_kind == "material"]
-    if not _vault_skill_handshakes_are_valid(tool_calls):
-        return False, False
     attempted = {call.logical_operation for call in material_calls}
     if not set(task.required_attempted_operations) <= attempted:
         return False, False
@@ -1985,6 +2231,11 @@ def material_outcome_matches(
     if any(
         material_attempts.get(operation, 0) > limit
         for operation, limit in task.material_attempt_limits.items()
+    ):
+        matched = False
+    if any(
+        material_attempts.get(operation, 0) < minimum
+        for operation, minimum in task.material_attempt_minimums.items()
     ):
         matched = False
     if expected and not material_calls:
@@ -2054,6 +2305,20 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "action_error": int(outcome.action_error),
         "argument_error": int(outcome.argument_error),
         "tool_outcome_match": int(outcome.tool_outcome_match),
+        "user_outcome_completed": int(outcome.user_outcome_completed),
+        "protocol_handshake_valid": int(outcome.protocol_handshake_valid),
+        "clarification_accuracy": int(outcome.clarification_accuracy),
+        "stopping_accuracy": int(outcome.stopping_accuracy),
+        "target_payload_accuracy": int(outcome.target_payload_accuracy),
+        "multi_step_ordering": int(outcome.multi_step_ordering),
+        "result_binding_accuracy": int(outcome.result_binding_accuracy),
+        "nonexistent_tool_attempts": outcome.nonexistent_tool_attempts,
+        "wrong_capability_calls": outcome.wrong_capability_calls,
+        "wrong_resource_calls": outcome.wrong_resource_calls,
+        "wrong_target_calls": outcome.wrong_target_calls,
+        "fabricated_resource_claims": outcome.fabricated_resource_claims,
+        "unsupported_success_claims": outcome.unsupported_success_claims,
+        "post_completion_overshoot": outcome.post_completion_overshoot,
         "preparatory_call_count": outcome.preparatory_call_count,
         "material_call_count": outcome.material_call_count,
         "tool_calls": outcome.tool_call_count,
@@ -2080,6 +2345,13 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             "first_material_action_accuracy",
             "argument_validity",
             "tool_outcome_match",
+            "user_outcome_completed",
+            "protocol_handshake_valid",
+            "clarification_accuracy",
+            "stopping_accuracy",
+            "target_payload_accuracy",
+            "multi_step_ordering",
+            "result_binding_accuracy",
         ):
             metrics.pop(name, None)
         return {
@@ -2098,11 +2370,39 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
                 outcome.tool_outcome_match,
                 "successful or expected material operation outcome",
             ),
+            "user_outcome_completed": EvaluationReason(
+                outcome.user_outcome_completed,
+                "final user state, public outcome, response, and accepted behavior",
+            ),
+            "protocol_handshake_valid": EvaluationReason(
+                outcome.protocol_handshake_valid,
+                "transport handshake is recorded separately from the user action",
+            ),
+            "clarification_accuracy": EvaluationReason(
+                outcome.clarification_accuracy,
+                "task-declared clarification contract",
+            ),
+            "stopping_accuracy": EvaluationReason(
+                outcome.stopping_accuracy,
+                "no unregistered calls after the task completion boundary",
+            ),
+            "target_payload_accuracy": EvaluationReason(
+                outcome.target_payload_accuracy,
+                "material target and payload match the user request",
+            ),
+            "multi_step_ordering": EvaluationReason(
+                outcome.multi_step_ordering,
+                "required material resources and operations occur in order",
+            ),
+            "result_binding_accuracy": EvaluationReason(
+                outcome.result_binding_accuracy,
+                "cross-call results are passed to the declared later arguments",
+            ),
             **metrics,
         }
 
     def get_evaluator_version(self) -> str:
-        return "catalog-contract-v2"
+        return "catalog-semantic-contract-v3"
 
 
 @dataclass
@@ -2224,6 +2524,16 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
             "argument_validity": 0.0,
             "required_operations_rate": 0.0,
             "tool_outcome_match_rate": 0.0,
+            "user_outcome_completion_rate": 0.0,
+            "protocol_handshake_valid_rate": 0.0,
+            "clarification_accuracy": 0.0,
+            "stopping_accuracy": 0.0,
+            "target_payload_accuracy": 0.0,
+            "multi_step_ordering_rate": 0.0,
+            "result_binding_accuracy": 0.0,
+            "tool_surface_error_count": 0,
+            "hallucination_count": 0,
+            "post_completion_overshoot": 0,
             "action_error_rate": 1.0,
             "argument_error_rate": 1.0,
             "tool_calls": 0.0,
@@ -2246,6 +2556,25 @@ def summarize_outcomes(outcomes: list[TrialOutcome]) -> dict[str, float | int]:
         "argument_validity": sum(outcome.argument_validity for outcome in outcomes) / count,
         "required_operations_rate": sum(outcome.required_operations_completed for outcome in outcomes) / count,
         "tool_outcome_match_rate": sum(outcome.tool_outcome_match for outcome in outcomes) / count,
+        "user_outcome_completion_rate": sum(outcome.user_outcome_completed for outcome in outcomes) / count,
+        "protocol_handshake_valid_rate": sum(outcome.protocol_handshake_valid for outcome in outcomes) / count,
+        "clarification_accuracy": sum(outcome.clarification_accuracy for outcome in outcomes) / count,
+        "stopping_accuracy": sum(outcome.stopping_accuracy for outcome in outcomes) / count,
+        "target_payload_accuracy": sum(outcome.target_payload_accuracy for outcome in outcomes) / count,
+        "multi_step_ordering_rate": sum(outcome.multi_step_ordering for outcome in outcomes) / count,
+        "result_binding_accuracy": sum(outcome.result_binding_accuracy for outcome in outcomes) / count,
+        "tool_surface_error_count": sum(
+            outcome.nonexistent_tool_attempts
+            + outcome.wrong_capability_calls
+            + outcome.wrong_resource_calls
+            + outcome.wrong_target_calls
+            for outcome in outcomes
+        ),
+        "hallucination_count": sum(
+            outcome.fabricated_resource_claims + outcome.unsupported_success_claims
+            for outcome in outcomes
+        ),
+        "post_completion_overshoot": sum(outcome.post_completion_overshoot for outcome in outcomes),
         "action_error_rate": sum(outcome.action_error for outcome in outcomes) / count,
         "argument_error_rate": sum(outcome.argument_error for outcome in outcomes) / count,
         "tool_calls": sum(outcome.tool_call_count for outcome in outcomes) / count,

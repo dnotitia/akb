@@ -7,7 +7,7 @@ import pytest
 
 from mcp_catalog.contracts import hash_json, load_run_manifest
 from mcp_catalog.execution import TrialOutcome
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
+from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
 
 ROOT = Path(__file__).parents[1]
 
@@ -16,7 +16,7 @@ def _trials(*, candidate: bool) -> list[dict]:
     result: list[dict] = []
     task_ids = ("task-a", "task-b")
     for task_id in task_ids:
-        for repeat_index in range(1, 4):
+        for repeat_index in range(1, 3):
             outcome = TrialOutcome(
                 task_id=task_id,
                 category="single_operation",
@@ -30,6 +30,10 @@ def _trials(*, candidate: bool) -> list[dict]:
                 argument_validity=True,
                 success=True,
                 safety=True,
+                user_outcome_completed=True,
+                target_payload_accuracy=True,
+                input_tokens=80 if candidate else 90,
+                output_tokens=10,
                 total_tokens=90 if candidate else 100,
                 latency_seconds=0.9 if candidate else 1.0,
             )
@@ -78,12 +82,17 @@ def _artifact(manifest: dict, *, candidate: bool) -> dict:
     return artifact
 
 
+def _seal(artifact: dict) -> None:
+    artifact["artifact_hash_input"] = deepcopy(_build_artifact_hash_input(artifact, trial_order=[]))
+    artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
+
+
 def test_paired_comparison_averages_repeats_per_task_and_applies_all_gates() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
     result = compare_artifacts(_artifact(manifest, candidate=False), _artifact(manifest, candidate=True))
 
     assert result["independent_task_count"] == 2
-    assert result["repeat_count"] == 3
+    assert result["repeat_count"] == 2
     assert result["paired"]["primary:http"]["metrics"]["success"]["independent_tasks"] == 2
     assert result["gate"]["status"] == "pass"
     assert result["gate"]["catalog_reduction"]["http:default"] == 0.5
@@ -107,3 +116,29 @@ def test_incomplete_arm_artifact_cannot_be_paired() -> None:
 
     with pytest.raises(ValueError, match="incomplete baseline"):
         compare_artifacts(baseline, candidate)
+
+
+def test_preregistered_arm_order_is_counterbalanced_across_repeats() -> None:
+    first = planned_arm_order("read-vaults-en", 1, "registered-seed")
+    second = planned_arm_order("read-vaults-en", 2, "registered-seed")
+
+    assert first == tuple(reversed(second))
+    assert planned_arm_order("read-vaults-en", 1, "registered-seed") == first
+
+
+def test_provider_distribution_imbalance_downgrades_comparison_to_inconclusive() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    baseline = _artifact(manifest, candidate=False)
+    candidate = _artifact(manifest, candidate=True)
+    for trial in baseline["runs"]["primary:http"]["trials"]:
+        trial["provider_evidence"] = [{"routing": {"provider": "parasail"}}]
+    for trial in candidate["runs"]["primary:http"]["trials"]:
+        trial["provider_evidence"] = [{"routing": {"provider": "fallback-provider"}}]
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["gate"]["status"] == "inconclusive"
+    assert result["gate"]["checks"]["provider_distribution_balanced"] is False
+    assert result["gate"]["provider_sensitivity"]["maximum_share_difference"] == 1.0

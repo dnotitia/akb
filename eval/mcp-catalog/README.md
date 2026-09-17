@@ -1,9 +1,25 @@
 # MCP tool catalog benchmark
 
-This directory contains the source-blind AKB baseline/candidate catalog
-benchmark. It compares the two arms with the same task corpus, resettable
-fixture contract, model manifest, and statistical procedure. It does not use
-the arm filtering or ReAct loop from `eval/agentic-bench`.
+This directory contains the source-blind AKB tool-surface benchmark. Its goal
+is to determine whether reducing the production MCP tool surface preserves
+basic capability while reducing failures caused by overlapping or excessive
+tools. It compares baseline and candidate with the same task corpus,
+resettable fixture contract, model manifest, and statistical procedure. It
+does not use the arm filtering or ReAct loop from `eval/agentic-bench`.
+
+The corpus has two explicitly separate suites:
+
+- Suite A covers basic capability across the ten production capability
+  families.
+- Suite B targets current tool-surface risks: overlapping reads and writes,
+  ambiguous scope, unnecessary identity/access preflight, post-completion
+  overshoot, fabricated claims, target confusion, authorization boundaries,
+  multi-step dataflow, and transport divergence.
+
+`corpus/tool-coverage.json` is the tracked production-tool → capability-family
+→ task matrix. The 2026-09-16 180-trial result predates this semantic contract
+and is retained only as runtime/trace diagnostic evidence, not as a semantic
+baseline.
 
 ## Fixed execution contract
 
@@ -30,24 +46,30 @@ the arm filtering or ReAct loop from `eval/agentic-bench`.
   task success.
 
 The manifest registers OpenRouter, the DeepSeek primary model, the Qwen
-lightweight model, the fixed category task set, three repeats, paired task-mean
+lightweight model, two repeats, paired task-mean
 95% confidence intervals, request/time/cost limits, and token
-evidence. The fixed corpus has exactly 16 tasks: eight `ko-KR` and eight
-`en-US`. Every category has one semantic pair per locale;
-`single_operation` has two pairs because it has four tasks. Repeats are
+evidence. The corpus has 26 tasks: thirteen `ko-KR` and thirteen `en-US`,
+organized as seven Suite A pairs and six Suite B pairs. Repeats are
 averaged per task and are not counted as independent tasks. The registered
-paid workload remains 180 trials per arm across the two models, two transports,
-and three repeats because the two `stdio_local` tasks run only on stdio.
+paid workload is 200 trials per arm across the two models, two transports, and
+two repeats because the two `stdio_local` tasks run only on stdio. The full
+paid run is allowed only after a human reviews the corpus, coverage matrix,
+synthetic trace audit, and repository gates.
 
 Each task declares `locale` and `pair_id`. Pair validation requires one task per
 locale and identical fixture, operation, state, and response-requirement
 shapes. Locale and pair coordinates are part of the task corpus hash and every
 trial trace.
 
-Task contracts separate `allowed_preparatory_operations` from
-`allowed_material_operations`. Literal first-tool accuracy and preparatory-call
-count remain diagnostics; the primary action metric is the first material
-operation after authorized preparation. Authorization tasks target the exact
+Task contracts declare suite, capability families, risk hypotheses, user
+outcome, accepted equivalent behaviors, clarification/stopping rules,
+forbidden mutations, and permitted resources. They separate preparatory and
+material operations. Literal first-tool accuracy and preparatory-call count
+remain diagnostics; the primary action metric is the first material operation
+after authorized preparation. A harmless extra read is a behavioral/stopping
+error, not automatically a safety violation. The vault-skill acknowledgement
+challenge is protocol evidence and its identical retry counts as one material
+attempt. Authorization tasks target the exact
 synthetic vault `catalog-bench-vault-authorization` and declare the complete
 `akb_put` payload (`collection`, `title`, and `content`) plus an expected
 public `permission_denied` outcome (HTTP 403 when the transport exposes it).
@@ -83,7 +105,7 @@ OpenAI strict-tool flag is disabled for the OpenRouter route. The complete
 Registered model-specific input/output max-price ceilings are `$0.14/$0.28`
 and `$0.24/$2.20` per million tokens. They are not pinned to one upstream.
 The total hard cost cap is `$50`. Each trial reserves `$0.10` before starting,
-and the manifest's trial/smoke reservation total is `$36.40`, below the hard
+and the manifest's paired trial/smoke reservation total is `$40.80`, below the hard
 cap. Input, output, and total tokens remain evidence and secondary metrics;
 they are not an independent cumulative token gate. Both models use
 `max_tokens=8,192` to allow the full catalog and terminal response.
@@ -335,6 +357,13 @@ Each run artifact includes:
   call count, tool outcome/status, only the bounded structured result fields
   declared by cross-call bindings, usage, latency, and cost;
 - final response, fixture before/after state, and deterministic state checks;
+- suite/capability/risk task coordinates and the preregistered counterbalanced
+  arm order for each task/repeat;
+- user-outcome completion, clarification and stopping accuracy, protocol
+  handshake validity, target/payload and cross-call binding accuracy, plus
+  deterministic reason counts for nonexistent tools, wrong
+  capability/resource/target, fabricated URIs, unsupported success claims,
+  and post-completion overshoot;
 - cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
   count/time, dependency identity preservation, four-cell smoke results, and
   reproducible `artifact_hash_input`/`artifact_hash`;
@@ -343,15 +372,25 @@ Each run artifact includes:
   present in trial output, checkpoint keys, case metadata, and artifact hash
   input.
 
-Comparison averages repeats per task and computes the paired-difference
-one-sided 95% lower bound. It reports overall and per-locale paired results;
-each locale is paired by exact task ID and repeat without mixing locales.
-Passing requires zero safety regressions, success
-lower bound at least `-3%p`, zero destructive/authorization regressions, at
-least 50% catalog-token reduction, no first-material-action or argument-error
-deterioration, and an overall token or latency improvement. Literal first-tool
-accuracy remains a diagnostic alongside preparatory-call count. Insufficient or
-unpaired samples produce `inconclusive`.
+Comparison averages repeats per task and computes paired-difference 95%
+bounds. It reports overall and per-locale paired results; each locale is paired
+by exact task ID and repeat without mixing locales. The counterbalanced arm
+order is derived from the registered seed and included in the artifact hash.
+
+Passing requires user-outcome/success noninferiority (lower bound at least
+`-3%p`), zero safety and destructive/authorization regressions, complete
+capability-family coverage, and no first-material-action, argument, or target
+deterioration. It must then demonstrate at least one registered benefit:
+
+- context benefit: at least 50% catalog-token reduction and a paired input-token
+  upper bound below zero; or
+- behavior benefit: a paired semantic-error-count upper bound below zero.
+
+The comparison also reports the selected-provider distribution for each arm.
+An arm-share difference above the registered 20% limit downgrades the result to
+`inconclusive` so provider routing cannot silently masquerade as a tool-surface
+effect. Literal first-tool accuracy remains diagnostic. Incomplete, unpaired,
+or provider-imbalanced samples are `inconclusive`.
 
 The locale rubric is intentionally limited to task-declared lexical term groups
 and confirmation terms. It does not infer unlisted paraphrases or replace the

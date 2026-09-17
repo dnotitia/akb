@@ -5,56 +5,30 @@ from pathlib import Path
 import pytest
 from mcp_types import Tool
 
-from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, source_blind_violations_for, token_estimate
+from mcp_catalog.catalog import input_schemas_from_catalog
+from mcp_catalog.contracts import (
+    CatalogSnapshot,
+    hash_json,
+    load_run_manifest,
+    load_task_corpus,
+    source_blind_violations_for,
+    token_estimate,
+)
 from mcp_catalog.execution import (
     ToolCallRecord,
     TrialOutcome,
     canonicalize_arguments,
     capture_tool_input_schemas,
 )
-from mcp_catalog.catalog import input_schemas_from_catalog
 from mcp_catalog.runtime import StateObservation
 
 
 ROOT = Path(__file__).parents[1]
-VAULT = "catalog-bench-multi"
-COLLECTION = "team-notes"
+VAULT = "catalog-bench-knowledge"
+COLLECTION = "notes"
 TITLE = "quick-update"
 CONTENT = "A short note for the team."
-EXPECTED_ATTEMPTS = [
-    ("akb_create_vault", {"name": VAULT, "public_access": "none"}),
-    ("akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
-    (
-        "akb_put",
-        {
-            "vault": VAULT,
-            "collection": COLLECTION,
-            "title": TITLE,
-            "content": CONTENT,
-            "type": "note",
-            "status": "draft",
-        },
-    ),
-]
-REQUIRED_ATTEMPTS = [
-    ("akb_create_vault", {"name": VAULT}),
-    ("akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
-    ("akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT}),
-]
-RAW_ATTEMPTS = [
-    ("akb_create_vault", {"name": VAULT}),
-    ("akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
-    ("akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT}),
-]
-PUBLIC_INPUT_SCHEMAS = {
-    "akb_create_vault": {"properties": {"public_access": {"default": "none"}}},
-    "akb_put": {
-        "properties": {
-            "type": {"default": "note"},
-            "status": {"default": "draft"},
-        }
-    },
-}
+URI = f"akb://{VAULT}/coll/{COLLECTION}/doc/quick-update"
 
 
 class _ListedToolset:
@@ -81,31 +55,21 @@ def _multistep_tasks():
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     manifest.validate_tasks(tasks)
-    return manifest, [task for task in tasks if task.pair_id == "multi-step"]
+    return manifest, [task for task in tasks if task.pair_id == "knowledge-workflow"]
 
 
 @pytest.mark.asyncio
 async def test_raw_server_tool_schemas_drive_server_argument_defaults() -> None:
     schemas = await capture_tool_input_schemas(_ListedToolset())
 
-    assert canonicalize_arguments(
-        {"name": VAULT}, schemas["akb_create_vault"]
-    ) == {"name": VAULT, "public_access": "none"}
-    assert canonicalize_arguments(
-        {"parent": "akb://catalog-bench-multi", "file_path": "sample-note.txt"},
-        schemas["akb_put_file"],
-    ) == {"parent": "akb://catalog-bench-multi", "file_path": "sample-note.txt", "collection": ""}
-    assert canonicalize_arguments(
-        {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
-        schemas["akb_put"],
-    ) == {
-        "vault": VAULT,
-        "collection": COLLECTION,
-        "title": TITLE,
-        "content": CONTENT,
-        "type": "note",
-        "status": "draft",
+    assert canonicalize_arguments({"name": VAULT}, schemas["akb_create_vault"]) == {
+        "name": VAULT,
+        "public_access": "none",
     }
+    assert canonicalize_arguments(
+        {"parent": f"akb://{VAULT}", "file_path": "sample-note.txt"},
+        schemas["akb_put_file"],
+    ) == {"parent": f"akb://{VAULT}", "file_path": "sample-note.txt", "collection": ""}
 
 
 def test_captured_catalog_schema_is_the_scorer_authority() -> None:
@@ -114,10 +78,7 @@ def test_captured_catalog_schema_is_the_scorer_authority() -> None:
             "name": "akb_put",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "type": {"default": "note"},
-                    "status": {"default": "draft"},
-                },
+                "properties": {"type": {"default": "note"}, "status": {"default": "draft"}},
             },
         }
     ]
@@ -131,37 +92,51 @@ def test_captured_catalog_schema_is_the_scorer_authority() -> None:
         tools=tools,
     )
 
-    assert input_schemas_from_catalog(snapshot) == {
-        "akb_put": tools[0]["inputSchema"],
-    }
+    assert input_schemas_from_catalog(snapshot) == {"akb_put": tools[0]["inputSchema"]}
 
 
 def _call(
     order: int,
     tool_name: str,
+    logical_operation: str,
+    resource_type: str,
     arguments: dict[str, object],
     *,
+    result_fields: dict[str, str] | None = None,
     succeeded: bool = True,
 ) -> ToolCallRecord:
     return ToolCallRecord(
         order=order,
         tool_name=tool_name,
-        logical_operation="create",
+        logical_operation=logical_operation,
+        resource_type=resource_type,
         raw_model_args=arguments,
         server_args=arguments,
-        effective_server_args=canonicalize_arguments(arguments, PUBLIC_INPUT_SCHEMAS.get(tool_name, {})),
+        effective_server_args=arguments,
         raw_args_valid=True,
         server_args_equal_raw=True,
         transport_succeeded=True,
         server_succeeded=succeeded,
         server_status_code=None if succeeded else 500,
         server_error_code=None if succeeded else "internal_error",
+        result_fields=result_fields or {},
     )
 
 
 def _exact_calls() -> list[ToolCallRecord]:
     return [
-        _call(order, tool_name, arguments) for order, (tool_name, arguments) in enumerate(RAW_ATTEMPTS, start=1)
+        _call(1, "akb_create_vault", "create", "vault", {"name": VAULT}),
+        _call(2, "akb_create_collection", "create", "collection", {"vault": VAULT, "path": COLLECTION}),
+        _call(
+            3,
+            "akb_put",
+            "create",
+            "document",
+            {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
+            result_fields={"uri": URI},
+        ),
+        _call(4, "akb_get", "read", "document", {"uri": URI}),
+        _call(5, "akb_provenance", "read", "document", {"uri": URI}),
     ]
 
 
@@ -174,148 +149,91 @@ def _score(task, calls: list[ToolCallRecord]) -> TrialOutcome:
         model_class="primary",
         model_id="model",
         transport="http",
-        final_answer_text="The vault, collection, and document are ready.",
-        first_logical_operation="create",
+        final_answer_text="quick-update was created and confirmed.",
+        first_logical_operation=calls[0].logical_operation if calls else "none",
         tool_calls=calls,
     )
-    before = StateObservation(True, 200, {"vaults": []})
-    after = StateObservation(True, 200, {"vaults": [{"name": VAULT}]})
+    before = StateObservation(True, 200, {"items": []})
+    after = StateObservation(True, 200, {"items": [{"name": "quick-update.md"}]})
     outcome.finalize(task, before, after)
     return outcome
 
 
-def test_multistep_pair_declares_the_same_exact_ordered_public_attempts() -> None:
+def test_multistep_pair_declares_semantic_sequence_without_legacy_tool_lock_in() -> None:
     manifest, tasks = _multistep_tasks()
     all_tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
 
     assert len(tasks) == 2
     assert {task.locale for task in tasks} == {"ko-KR", "en-US"}
-    assert len(all_tasks) == 16
-    assert len(manifest.pair_categories) == 8
-    assert sum(len(task.fixture.transports) for task in all_tasks) * len(manifest.models) * manifest.repeats == 180
+    assert len(all_tasks) == 26
+    assert len(manifest.pair_categories) == 13
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
-
-    expected = [(tool_name, "create", arguments, "success") for tool_name, arguments in REQUIRED_ATTEMPTS]
     for task in tasks:
-        assert task.material_attempt_limits == {"create": 3}
-        assert [
-            (attempt.tool_name, attempt.logical_operation, attempt.arguments, attempt.outcome)
-            for attempt in task.expected_material_attempts
-        ] == expected
-        assert task.expected_final_state.probe.path == "/api/v1/vaults"
-        assert task.expected_final_state.must[0].value == {"name": VAULT}
-        for target in (VAULT, COLLECTION, TITLE, CONTENT):
-            assert target in task.prompt
+        assert [attempt.logical_operation for attempt in task.expected_material_attempts] == [
+            "create",
+            "create",
+            "create",
+            "read",
+            "read",
+        ]
+        assert [attempt.resource_type for attempt in task.expected_material_attempts] == [
+            "vault",
+            "collection",
+            "document",
+            "document",
+            "document",
+        ]
+        assert all(attempt.tool_name is None for attempt in task.expected_material_attempts)
+        assert len(task.expected_result_bindings) == 2
 
-    assert [attempt.model_dump(mode="json") for attempt in tasks[0].expected_material_attempts] == [
-        attempt.model_dump(mode="json") for attempt in tasks[1].expected_material_attempts
-    ]
 
-
-def test_only_the_exact_three_call_trace_completes_the_multistep_task() -> None:
+def test_exact_outcome_and_cross_call_dataflow_complete_the_multistep_task() -> None:
     _manifest, tasks = _multistep_tasks()
     outcome = _score(tasks[0], _exact_calls())
 
     assert outcome.required_attempts_completed is True
-    assert outcome.tool_outcome_match is True
-    assert outcome.success is True
-    assert [call.effective_server_args for call in outcome.tool_calls] == [
-        arguments for _tool_name, arguments in EXPECTED_ATTEMPTS
-    ]
-
-
-def test_explicit_public_defaults_match_the_same_canonical_attempt_contract() -> None:
-    _manifest, tasks = _multistep_tasks()
-    calls = [_call(order, tool_name, args) for order, (tool_name, args) in enumerate(EXPECTED_ATTEMPTS, 1)]
-
-    outcome = _score(tasks[0], calls)
-
-    assert outcome.tool_outcome_match is True
+    assert outcome.multi_step_ordering is True
+    assert outcome.result_binding_accuracy is True
+    assert outcome.user_outcome_completed is True
     assert outcome.success is True
 
 
 @pytest.mark.parametrize(
     "mutation",
-    (
-        "vault_only",
-        "missing_collection",
-        "missing_document",
-        "wrong_order",
-        "wrong_tool",
-        "wrong_vault",
-        "wrong_collection_path",
-        "wrong_document_collection",
-        "wrong_title",
-        "wrong_content",
-        "failed_step",
-        "extra_create",
-    ),
+    ("missing_step", "wrong_order", "wrong_target", "wrong_resource", "missing_binding", "failed_step", "extra_step"),
 )
-def test_incomplete_or_noncanonical_multistep_trace_fails(mutation: str) -> None:
+def test_incomplete_or_semantically_wrong_multistep_trace_fails(mutation: str) -> None:
     _manifest, tasks = _multistep_tasks()
     calls = _exact_calls()
 
-    if mutation == "vault_only":
-        calls = calls[:1]
-    elif mutation == "missing_collection":
-        calls = [calls[0], calls[2]]
-    elif mutation == "missing_document":
-        calls = calls[:2]
+    if mutation == "missing_step":
+        calls = calls[:-1]
     elif mutation == "wrong_order":
-        calls = [
-            _call(1, "akb_create_collection", {"vault": VAULT, "path": COLLECTION}),
-            _call(2, "akb_create_vault", {"name": VAULT}),
-            _call(3, "akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT}),
-        ]
-    elif mutation == "wrong_tool":
-        calls[1] = _call(
-            2,
-            "akb_put",
-            {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
+        calls[0], calls[1] = calls[1], calls[0]
+    elif mutation == "wrong_target":
+        calls[1] = calls[1].model_copy(
+            update={"server_args": {"vault": "other", "path": COLLECTION}, "effective_server_args": {"vault": "other", "path": COLLECTION}}
         )
-    elif mutation == "wrong_vault":
-        calls[0] = _call(1, "akb_create_vault", {"name": "other-vault"})
-    elif mutation == "wrong_collection_path":
-        calls[1] = _call(2, "akb_create_collection", {"vault": VAULT, "path": "other-notes"})
-    elif mutation == "wrong_document_collection":
-        calls[2] = _call(
-            3, "akb_put", {"vault": VAULT, "collection": "other-notes", "title": TITLE, "content": CONTENT}
-        )
-    elif mutation == "wrong_title":
-        calls[2] = _call(
-            3, "akb_put", {"vault": VAULT, "collection": COLLECTION, "title": "other-title", "content": CONTENT}
-        )
-    elif mutation == "wrong_content":
-        calls[2] = _call(
-            3, "akb_put", {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": "Different content."}
-        )
+    elif mutation == "wrong_resource":
+        calls[1] = calls[1].model_copy(update={"resource_type": "document"})
+    elif mutation == "missing_binding":
+        calls[2] = calls[2].model_copy(update={"result_fields": {}})
     elif mutation == "failed_step":
-        calls[1] = _call(2, "akb_create_collection", {"vault": VAULT, "path": COLLECTION}, succeeded=False)
-    elif mutation == "extra_create":
-        calls.append(_call(4, "akb_create_collection", {"vault": VAULT, "path": "extra"}))
+        calls[1] = calls[1].model_copy(update={"server_succeeded": False, "server_error_code": "internal_error"})
+    elif mutation == "extra_step":
+        calls.append(_call(6, "akb_get", "read", "document", {"uri": URI}))
 
+    calls = [call.model_copy(update={"order": order}) for order, call in enumerate(calls, 1)]
     outcome = _score(tasks[0], calls)
 
-    assert outcome.required_attempts_completed is False
-    assert outcome.tool_outcome_match is False
+    assert outcome.user_outcome_completed is False
     assert outcome.success is False
 
 
-def test_public_schema_valid_optional_metadata_does_not_block_multistep_completion() -> None:
+def test_equivalent_read_tools_are_accepted_when_semantics_and_binding_match() -> None:
     _manifest, tasks = _multistep_tasks()
     calls = _exact_calls()
-    calls[0].effective_server_args["public_access"] = "reader"
-    calls[2] = _call(
-        3,
-        "akb_put",
-        {
-            "parent": f"akb://{VAULT}/coll/{COLLECTION}",
-            "title": TITLE,
-            "content": CONTENT,
-            "status": "active",
-            "slug": "quick-update",
-        },
-    )
+    calls[3] = calls[3].model_copy(update={"tool_name": "akb_drill_down"})
 
     outcome = _score(tasks[0], calls)
 
@@ -323,31 +241,13 @@ def test_public_schema_valid_optional_metadata_does_not_block_multistep_completi
     assert outcome.success is True
 
 
-def test_malformed_parent_uri_is_a_scoring_mismatch() -> None:
-    _manifest, tasks = _multistep_tasks()
-    calls = _exact_calls()
-    calls[2] = _call(
-        3,
-        "akb_put",
-        {"parent": "akb://[", "title": TITLE, "content": CONTENT},
-    )
-
-    outcome = _score(tasks[0], calls)
-
-    assert outcome.tool_outcome_match is False
-    assert outcome.success is False
-
-
-def test_manifest_rejects_attempt_tool_not_registered_for_its_logical_operation() -> None:
+def test_manifest_rejects_unknown_semantic_operation() -> None:
     manifest, tasks = _multistep_tasks()
-    changed_by_id = {}
-    for task in tasks:
-        attempts = [
-            attempt.model_copy(update={"tool_name": "akb_search"}) if index == 1 else attempt
-            for index, attempt in enumerate(task.expected_material_attempts)
-        ]
-        changed_by_id[task.id] = task.model_copy(update={"expected_material_attempts": attempts})
+    changed_by_id = {
+        task.id: task.model_copy(update={"allowed_material_operations": [*task.allowed_material_operations, "invent"]})
+        for task in tasks
+    }
 
-    with pytest.raises(ValueError, match="expected material attempt tools"):
+    with pytest.raises(ValueError, match="operation_map"):
         all_tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
         manifest.validate_tasks([changed_by_id.get(task.id, task) for task in all_tasks])

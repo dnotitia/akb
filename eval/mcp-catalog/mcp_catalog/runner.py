@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import time
@@ -24,7 +25,15 @@ from .checkpoint import (
     valid_completed_outcome,
     valid_smoke_outcome,
 )
-from .contracts import ArmName, BenchmarkRunManifest, TaskManifest, hash_json, load_run_manifest, load_task_corpus
+from .contracts import (
+    ArmName,
+    BenchmarkRunManifest,
+    TaskManifest,
+    hash_json,
+    load_run_manifest,
+    load_task_corpus,
+    load_tool_coverage,
+)
 from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
@@ -671,7 +680,28 @@ class BenchmarkRunner:
                 {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
                 for task in self.tasks
             ],
+            "task_contracts": [
+                {
+                    "id": task.id,
+                    "suite": task.suite,
+                    "capability_families": sorted(task.capability_families),
+                    "risk_hypotheses": sorted(task.risk_hypotheses),
+                }
+                for task in self.tasks
+            ],
+            "paired_order_plan": [
+                {
+                    "task_id": task.id,
+                    "repeat_index": repeat_index,
+                    "arm_order": list(
+                        planned_arm_order(task.id, repeat_index, self.manifest.paired_order_seed)
+                    ),
+                }
+                for repeat_index in range(1, self.manifest.repeats + 1)
+                for task in self.tasks
+            ],
             "category_counts": dict(sorted(Counter(task.category for task in self.tasks).items())),
+            "suite_counts": dict(sorted(Counter(task.suite for task in self.tasks).items())),
             "locale_counts": dict(sorted(Counter(task.locale for task in self.tasks).items())),
             "source_revision": runtime["source_revision"],
             "protocol_revision": self.manifest.protocol_revision,
@@ -1525,11 +1555,104 @@ def outcomes_from_report(
     return outcomes
 
 
-def load_inputs(manifest_path: Path, corpus_path: Path, descriptor_path: Path) -> tuple[BenchmarkRunManifest, list[TaskManifest], RuntimeDescriptor]:
+def planned_arm_order(task_id: str, repeat_index: int, seed: str) -> tuple[ArmName, ArmName]:
+    """Return a stable, preregistered counterbalanced arm order for one pair."""
+
+    digest = hashlib.sha256(f"{seed}:{task_id}".encode()).digest()
+    baseline_first = (digest[0] + repeat_index) % 2 == 0
+    return ("baseline", "candidate") if baseline_first else ("candidate", "baseline")
+
+
+def load_inputs(
+    manifest_path: Path,
+    corpus_path: Path,
+    descriptor_path: Path,
+    coverage_path: Path,
+) -> tuple[BenchmarkRunManifest, list[TaskManifest], RuntimeDescriptor]:
     manifest = load_run_manifest(manifest_path)
     tasks = load_task_corpus(corpus_path)
+    coverage = load_tool_coverage(coverage_path)
+    manifest.validate_tasks(tasks)
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
     descriptor = RuntimeDescriptor.from_file(descriptor_path)
     return manifest, tasks, descriptor
+
+
+def _missing_candidate_capabilities(artifact: dict[str, Any]) -> list[str]:
+    contracts = artifact.get("task_contracts", [])
+    if not isinstance(contracts, list) or not contracts:
+        return []
+    completed_ids = {
+        outcome.task_id
+        for outcome in _all_run_outcomes(artifact.get("runs", {}))
+    }
+    covered = {
+        family
+        for contract in contracts
+        if isinstance(contract, dict) and contract.get("id") in completed_ids
+        for family in contract.get("capability_families", [])
+        if isinstance(family, str)
+    }
+    expected = set(artifact["manifest"].get("capability_minimums", {}))
+    return sorted(expected - covered)
+
+
+def _provider_name(evidence: dict[str, Any]) -> str:
+    routing = evidence.get("routing")
+    if isinstance(routing, dict):
+        for key in ("provider_name", "provider", "name"):
+            value = routing.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for value in routing.values():
+            if isinstance(value, dict):
+                nested = _provider_name({"routing": value})
+                if nested != "unobserved":
+                    return nested
+    provider = evidence.get("provider_name")
+    return provider if isinstance(provider, str) and provider else "unobserved"
+
+
+def _provider_distribution(outcomes: list[TrialOutcome]) -> dict[str, float]:
+    counts = Counter(
+        _provider_name(evidence)
+        for outcome in outcomes
+        for evidence in outcome.provider_evidence
+        if isinstance(evidence, dict)
+    )
+    total = sum(counts.values())
+    return {key: count / total for key, count in sorted(counts.items())} if total else {}
+
+
+def _provider_distribution_sensitivity(
+    baseline: list[TrialOutcome],
+    candidate: list[TrialOutcome],
+    maximum_share_difference: float,
+) -> dict[str, Any]:
+    baseline_distribution = _provider_distribution(baseline)
+    candidate_distribution = _provider_distribution(candidate)
+    providers = set(baseline_distribution) | set(candidate_distribution)
+    maximum_observed = max(
+        (
+            abs(baseline_distribution.get(provider, 0.0) - candidate_distribution.get(provider, 0.0))
+            for provider in providers
+        ),
+        default=0.0,
+    )
+    observed = bool(baseline_distribution and candidate_distribution)
+    balanced = (
+        (not baseline_distribution and not candidate_distribution)
+        or (observed and maximum_observed <= maximum_share_difference)
+    )
+    return {
+        "observed": observed,
+        "baseline": baseline_distribution,
+        "candidate": candidate_distribution,
+        "maximum_share_difference": maximum_observed,
+        "registered_limit": maximum_share_difference,
+        "balanced": balanced,
+    }
 
 
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1540,7 +1663,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     all_success = True
     all_action = True
     all_argument = True
-    efficiency_any = False
+    all_target = True
     procedure = baseline["manifest"]["statistical_procedure"]
     z_value = float(procedure["z_value"])
     confidence = float(procedure["confidence"])
@@ -1556,11 +1679,10 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         )
         pair_metrics = dimension["metrics"]
         gate = dimension["gate"]
-        efficiency_pass = bool(gate["token_or_latency_improvement"])
-        efficiency_any = efficiency_any or efficiency_pass
         all_success = all_success and bool(gate["success_noninferiority"])
         all_action = all_action and bool(gate["first_material_action_not_worse"])
         all_argument = all_argument and bool(gate["argument_error_not_worse"])
+        all_target = all_target and bool(gate["target_payload_not_worse"])
         paired[key] = {
             "model_class": key.split(":", 1)[0],
             "transport": key.split(":", 1)[1],
@@ -1608,27 +1730,58 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     }
     safety_pass = safety_regressions == 0 and all(value == 0 for value in category_regressions.values())
     complete = bool(paired) and set(baseline_runs) == set(candidate_runs) and set(baseline["catalogs"]) == set(candidate["catalogs"])
+    missing_capabilities = _missing_candidate_capabilities(candidate)
+    capability_pass = not missing_capabilities
+    provider_sensitivity = _provider_distribution_sensitivity(
+        baseline_outcomes,
+        candidate_outcomes,
+        float(baseline["manifest"]["provider_sensitivity"]["maximum_arm_share_difference"]),
+    )
+    provider_pass = bool(provider_sensitivity["balanced"])
+    context_benefit = catalog_pass and bool(overall["gate"]["input_context_improvement"])
+    behavior_benefit = bool(overall["gate"]["semantic_behavior_improvement"])
+    preservation_pass = (
+        all_success
+        and safety_pass
+        and all_action
+        and all_argument
+        and all_target
+        and capability_pass
+    )
+    decision_pass = complete and preservation_pass and provider_pass and (context_benefit or behavior_benefit)
+    if not complete or not provider_pass:
+        status = "inconclusive"
+    else:
+        status = "pass" if decision_pass else "fail"
     gate = {
-        "status": "pass" if complete and all_success and safety_pass and catalog_pass and all_action and all_argument and efficiency_any else "fail" if complete else "inconclusive",
+        "status": status,
         "checks": {
             "success_noninferiority": all_success,
             "safety_regressions_zero": safety_pass,
             "catalog_token_reduction_at_least_50_percent": catalog_pass,
             "first_material_action_not_worse": all_action,
             "argument_error_not_worse": all_argument,
-            "token_or_latency_improvement": efficiency_any,
+            "target_payload_not_worse": all_target,
+            "capability_family_coverage_complete": capability_pass,
+            "provider_distribution_balanced": provider_pass,
+            "context_benefit": context_benefit,
+            "behavior_benefit": behavior_benefit,
+            "context_or_behavior_benefit": context_benefit or behavior_benefit,
         },
         "catalog_reduction": catalog_reduction,
         "safety_regressions": safety_regressions,
         "category_safety_regressions": category_regressions,
+        "missing_capability_families": missing_capabilities,
+        "provider_sensitivity": provider_sensitivity,
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "baseline_source_revision": baseline["source_revision"],
         "candidate_source_revision": candidate["source_revision"],
         "protocol_revision": baseline["protocol_revision"],
         "run_manifest_hash": baseline["run_manifest_hash"],
         "task_corpus_hash": baseline["task_corpus_hash"],
+        "paired_order_plan": baseline.get("paired_order_plan", []),
         "repeated_trials_are_averaged_per_task": True,
         "independent_task_count": len(baseline["task_ids"]),
         "repeat_count": baseline["manifest"]["repeats"],
@@ -1668,6 +1821,7 @@ def paired_metric(
         "candidate_mean": sum(cand_means) / len(cand_means),
         "difference_candidate_minus_baseline": mean_diff,
         "lower_bound": mean_diff - z_value * standard_error,
+        "upper_bound": mean_diff + z_value * standard_error,
         "independent_tasks": len(diffs),
         "repeat_count": len(next(iter(base_by_task.values()))),
         "method": "paired_task_mean_normal_approximation",
@@ -1726,19 +1880,39 @@ def _paired_dimension(
         )
         for metric in (
             "success",
+            "user_outcome_completed",
             "safety",
             "first_action_accuracy",
             "first_material_action_accuracy",
             "argument_validity",
+            "target_payload_accuracy",
+            "clarification_accuracy",
+            "stopping_accuracy",
+            "multi_step_ordering",
+            "result_binding_accuracy",
             "tool_outcome_match",
+            "semantic_error_count",
+            "nonexistent_tool_attempts",
+            "wrong_capability_calls",
+            "wrong_resource_calls",
+            "wrong_target_calls",
+            "fabricated_resource_claims",
+            "unsupported_success_claims",
+            "post_completion_overshoot",
+            "input_tokens",
             "total_tokens",
             "latency_seconds",
         )
     }
-    success_pass = metrics["success"]["lower_bound"] >= -margin
+    success_pass = (
+        metrics["success"]["lower_bound"] >= -margin
+        and metrics["user_outcome_completed"]["lower_bound"] >= -margin
+    )
     action_pass = metrics["first_material_action_accuracy"]["candidate_mean"] >= metrics["first_material_action_accuracy"]["baseline_mean"]
     argument_pass = metrics["argument_validity"]["candidate_mean"] >= metrics["argument_validity"]["baseline_mean"]
-    token_better = metrics["total_tokens"]["candidate_mean"] < metrics["total_tokens"]["baseline_mean"]
+    target_pass = metrics["target_payload_accuracy"]["candidate_mean"] >= metrics["target_payload_accuracy"]["baseline_mean"]
+    behavior_better = metrics["semantic_error_count"]["upper_bound"] < 0
+    token_better = metrics["input_tokens"]["upper_bound"] < 0
     latency_better = metrics["latency_seconds"]["candidate_mean"] < metrics["latency_seconds"]["baseline_mean"]
     return {
         "metrics": metrics,
@@ -1746,6 +1920,9 @@ def _paired_dimension(
             "success_noninferiority": success_pass,
             "first_material_action_not_worse": action_pass,
             "argument_error_not_worse": argument_pass,
+            "target_payload_not_worse": target_pass,
+            "semantic_behavior_improvement": behavior_better,
+            "input_context_improvement": token_better,
             "token_or_latency_improvement": token_better or latency_better,
         },
         "category": _category_comparison(
@@ -1765,9 +1942,26 @@ def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
         "first_action_accuracy",
         "first_material_action_accuracy",
         "argument_validity",
+        "target_payload_accuracy",
+        "clarification_accuracy",
+        "stopping_accuracy",
+        "multi_step_ordering",
+        "result_binding_accuracy",
+        "user_outcome_completed",
         "tool_outcome_match",
     }:
         return sum(bool(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
+    if metric == "semantic_error_count":
+        return sum(
+            outcome.nonexistent_tool_attempts
+            + outcome.wrong_capability_calls
+            + outcome.wrong_resource_calls
+            + outcome.wrong_target_calls
+            + outcome.fabricated_resource_claims
+            + outcome.unsupported_success_claims
+            + outcome.post_completion_overshoot
+            for outcome in outcomes
+        ) / len(outcomes)
     return sum(float(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
 
 
@@ -1852,7 +2046,10 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "task_corpus_hash": artifact["task_corpus_hash"],
         "task_ids": artifact["task_ids"],
         "task_locales": artifact["task_locales"],
+        "task_contracts": artifact.get("task_contracts", []),
+        "paired_order_plan": artifact.get("paired_order_plan", []),
         "category_counts": artifact["category_counts"],
+        "suite_counts": artifact.get("suite_counts", {}),
         "locale_counts": artifact["locale_counts"],
         "source_revision": artifact["source_revision"],
         "protocol_revision": artifact["protocol_revision"],
@@ -1907,12 +2104,29 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "protocol_revision",
         "task_ids",
         "task_locales",
+        "task_contracts",
+        "paired_order_plan",
         "locale_counts",
     ):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"paired artifacts differ in {key}")
     if baseline.get("manifest") != candidate.get("manifest"):
         raise ValueError("paired artifacts differ in the registered run manifest")
+    for artifact in (baseline, candidate):
+        manifest = artifact["manifest"]
+        plan = artifact.get("paired_order_plan", [])
+        if plan:
+            expected_plan = [
+                {
+                    "task_id": task_id,
+                    "repeat_index": repeat_index,
+                    "arm_order": list(planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])),
+                }
+                for repeat_index in range(1, int(manifest["repeats"]) + 1)
+                for task_id in artifact["task_ids"]
+            ]
+            if plan != expected_plan:
+                raise ValueError("artifact paired arm order does not match preregistration")
     for artifact in (baseline, candidate):
         task_locales = artifact.get("task_locales")
         if isinstance(task_locales, list):

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 PROTOCOL_REVISION = "2026-07-28"
-CONTRACT_SCHEMA_VERSION = 1
+CONTRACT_SCHEMA_VERSION = 2
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
@@ -37,6 +37,70 @@ Category = Literal[
     "authorization",
     "invalid_input_recovery",
     "stdio_local",
+]
+Suite = Literal["capability", "tool_surface_risk"]
+CapabilityFamily = Literal[
+    "vault_discovery_metadata_lifecycle",
+    "document_discovery_read_history",
+    "document_mutation",
+    "collection_lifecycle",
+    "relation_graph",
+    "table_lifecycle",
+    "publication_lifecycle",
+    "identity_access_management",
+    "import_export",
+    "stdio_local_files",
+]
+RiskHypothesis = Literal[
+    "overlapping_read_semantics",
+    "overlapping_mutation_semantics",
+    "scope_ambiguity",
+    "unnecessary_identity_access_preflight",
+    "post_completion_overshoot",
+    "unsupported_or_fabricated_claim",
+    "argument_target_confusion",
+    "destructive_authorization_boundary",
+    "multi_step_planning_binding",
+    "transport_divergence",
+]
+CAPABILITY_FAMILIES: tuple[CapabilityFamily, ...] = (
+    "vault_discovery_metadata_lifecycle",
+    "document_discovery_read_history",
+    "document_mutation",
+    "collection_lifecycle",
+    "relation_graph",
+    "table_lifecycle",
+    "publication_lifecycle",
+    "identity_access_management",
+    "import_export",
+    "stdio_local_files",
+)
+RISK_HYPOTHESES: tuple[RiskHypothesis, ...] = (
+    "overlapping_read_semantics",
+    "overlapping_mutation_semantics",
+    "scope_ambiguity",
+    "unnecessary_identity_access_preflight",
+    "post_completion_overshoot",
+    "unsupported_or_fabricated_claim",
+    "argument_target_confusion",
+    "destructive_authorization_boundary",
+    "multi_step_planning_binding",
+    "transport_divergence",
+)
+ResourceType = Literal[
+    "vault",
+    "collection",
+    "document",
+    "relation",
+    "table",
+    "publication",
+    "identity",
+    "access",
+    "archive",
+    "file",
+    "image",
+    "help",
+    "unknown",
 ]
 TaskLocale = Literal["ko-KR", "en-US"]
 Transport = Literal["http", "stdio"]
@@ -155,6 +219,8 @@ class ResponseRubric(ContractModel):
     forbidden_terms: list[str] = Field(default_factory=list)
     require_non_empty: bool = True
     confirmation_terms: list[str] = Field(default_factory=list)
+    clarification_terms: list[str] = Field(default_factory=list)
+    success_claim_terms: list[str] = Field(default_factory=list)
 
     @field_validator("required_any_of")
     @classmethod
@@ -167,7 +233,7 @@ class ResponseRubric(ContractModel):
                 raise ValueError("required rubric term groups must be unique")
         return values
 
-    @field_validator("forbidden_terms", "confirmation_terms")
+    @field_validator("forbidden_terms", "confirmation_terms", "clarification_terms", "success_claim_terms")
     @classmethod
     def validate_terms(cls, values: list[str]) -> list[str]:
         if any(not value.strip() for value in values):
@@ -176,6 +242,64 @@ class ResponseRubric(ContractModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("rubric terms must be unique")
         return values
+
+
+class AcceptedBehavior(ContractModel):
+    """One user-visible path that satisfies a task without naming a legacy tool."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9-]{2,63}$")
+    description: str = Field(min_length=1, max_length=500)
+    mode: Literal["complete", "clarify", "refuse", "expected_error"]
+    required_operations: list[str] = Field(default_factory=list)
+    required_resources: list[ResourceType] = Field(default_factory=list)
+
+    @field_validator("required_operations")
+    @classmethod
+    def validate_operations(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"^[a-z][a-z0-9_]*$", value) for value in values):
+            raise ValueError("accepted behavior operations must be lowercase snake_case")
+        if len(set(values)) != len(values):
+            raise ValueError("accepted behavior operations must be unique")
+        return values
+
+
+class ClarificationContract(ContractModel):
+    expectation: Literal["not_applicable", "required", "forbidden", "allowed"] = "not_applicable"
+    match_cardinality: Literal["not_applicable", "zero", "one", "multiple"] = "not_applicable"
+
+    @model_validator(mode="after")
+    def validate_cardinality(self) -> ClarificationContract:
+        if self.expectation == "not_applicable" and self.match_cardinality != "not_applicable":
+            raise ValueError("non-applicable clarification cannot declare match cardinality")
+        if self.expectation != "not_applicable" and self.match_cardinality == "not_applicable":
+            raise ValueError("clarification contracts must declare match cardinality")
+        return self
+
+
+class StoppingContract(ContractModel):
+    completion: Literal[
+        "final_user_outcome",
+        "clarification",
+        "expected_error",
+        "immediate_response",
+    ] = "final_user_outcome"
+    enforce_for_task_success: bool = False
+    allowed_follow_up_operations: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_follow_up_operations")
+    @classmethod
+    def validate_operations(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"^[a-z][a-z0-9_]*$", value) for value in values):
+            raise ValueError("stopping operations must be lowercase snake_case")
+        if len(set(values)) != len(values):
+            raise ValueError("stopping operations must be unique")
+        return values
+
+
+class ForbiddenMutation(ContractModel):
+    operation: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    target_contains: str | None = Field(default=None, min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class ExpectedMaterialOutcome(ContractModel):
@@ -196,7 +320,8 @@ class ExpectedMaterialOutcome(ContractModel):
 
 class ExpectedMaterialAttempt(ContractModel):
     logical_operation: str
-    tool_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    tool_name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    resource_type: ResourceType | None = None
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     local_file_arguments: dict[str, str] = Field(default_factory=dict)
     outcome: Literal["success", "permission_denied", "rejected"]
@@ -205,6 +330,8 @@ class ExpectedMaterialAttempt(ContractModel):
 
     @model_validator(mode="after")
     def validate_expected_attempt(self) -> ExpectedMaterialAttempt:
+        if self.tool_name is None and self.resource_type is None:
+            raise ValueError("material attempts must declare a resource type or an exact tool")
         if self.outcome == "success":
             if self.status_code is not None or self.error_code is not None:
                 raise ValueError("successful attempts cannot declare an error response")
@@ -259,11 +386,21 @@ class ProviderRouting(ContractModel):
 
 
 class TaskManifest(ContractModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     id: str
+    suite: Suite
     category: Category
     locale: TaskLocale
     pair_id: str
+    capability_families: list[CapabilityFamily] = Field(min_length=1)
+    risk_hypotheses: list[RiskHypothesis] = Field(default_factory=list)
+    user_outcome: str = Field(min_length=1, max_length=1000)
+    accepted_behaviors: list[AcceptedBehavior] = Field(min_length=1)
+    clarification: ClarificationContract = Field(default_factory=ClarificationContract)
+    stopping: StoppingContract = Field(default_factory=StoppingContract)
+    forbidden_mutations: list[ForbiddenMutation] = Field(default_factory=list)
+    allowed_resources: list[ResourceType] = Field(min_length=1)
+    coverage_tools: list[str] = Field(default_factory=list)
     prompt: str = Field(min_length=1, max_length=4000)
     fixture: FixtureContract
     allowed_preparatory_operations: list[str] = Field(default_factory=list)
@@ -272,6 +409,7 @@ class TaskManifest(ContractModel):
     forbidden_operations: list[str] = Field(default_factory=list)
     required_attempted_operations: list[str] = Field(default_factory=list)
     material_attempt_limits: dict[str, int] = Field(default_factory=dict)
+    material_attempt_minimums: dict[str, int] = Field(default_factory=dict)
     required_operations: list[str] = Field(default_factory=list)
     expected_material_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     expected_material_outcomes: list[ExpectedMaterialOutcome] = Field(default_factory=list)
@@ -279,6 +417,13 @@ class TaskManifest(ContractModel):
     expected_result_bindings: list[ExpectedResultBinding] = Field(default_factory=list, max_length=8)
     expected_final_state: StateContract
     response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
+
+    @field_validator("capability_families", "risk_hypotheses", "allowed_resources", "coverage_tools")
+    @classmethod
+    def validate_unique_contract_lists(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("semantic contract lists must contain unique values")
+        return values
 
     @field_validator("id")
     @classmethod
@@ -312,6 +457,22 @@ class TaskManifest(ContractModel):
 
     @model_validator(mode="after")
     def validate_task_boundaries(self) -> TaskManifest:
+        if self.suite == "tool_surface_risk" and not self.risk_hypotheses:
+            raise ValueError("tool-surface risk tasks must declare a risk hypothesis")
+        if self.suite == "capability" and self.risk_hypotheses:
+            raise ValueError("capability tasks cannot declare risk hypotheses")
+        if self.clarification.expectation == "required" and not self.response_rubric.clarification_terms:
+            raise ValueError("required clarification needs locale-specific clarification terms")
+        if self.clarification.expectation != "required" and any(
+            behavior.mode == "clarify" for behavior in self.accepted_behaviors
+        ):
+            raise ValueError("clarification behavior requires a required clarification contract")
+        if self.stopping.completion == "clarification" and self.clarification.expectation != "required":
+            raise ValueError("clarification stopping requires a required clarification contract")
+        if self.stopping.completion == "expected_error" and not any(
+            outcome.outcome == "permission_denied" for outcome in self.expected_material_outcomes
+        ):
+            raise ValueError("expected-error stopping requires an expected permission denial")
         if self.category == "stdio_local" and "stdio" not in self.fixture.transports:
             raise ValueError("stdio_local tasks must run on stdio")
         if set(self.allowed_first_operations) & set(self.forbidden_operations):
@@ -326,8 +487,17 @@ class TaskManifest(ContractModel):
             raise ValueError("required attempted operations must be material operations")
         if any(operation not in self.allowed_material_operations for operation in self.material_attempt_limits):
             raise ValueError("material attempt limits must be material operations")
+        if any(operation not in self.allowed_material_operations for operation in self.material_attempt_minimums):
+            raise ValueError("material attempt minimums must be material operations")
         if any(limit <= 0 for limit in self.material_attempt_limits.values()):
             raise ValueError("material attempt limits must be positive")
+        if any(limit <= 0 for limit in self.material_attempt_minimums.values()):
+            raise ValueError("material attempt minimums must be positive")
+        if any(
+            minimum > self.material_attempt_limits.get(operation, minimum)
+            for operation, minimum in self.material_attempt_minimums.items()
+        ):
+            raise ValueError("material attempt minimum cannot exceed its limit")
         if not set(self.required_operations) <= set(self.allowed_material_operations):
             raise ValueError("required operations must be material operations")
         expected_operations = [item.logical_operation for item in self.expected_material_outcomes]
@@ -378,6 +548,79 @@ class TaskManifest(ContractModel):
         if self.category == "destructive_confirmation" and not self.response_rubric.confirmation_terms:
             raise ValueError("destructive confirmation tasks must declare confirmation terms")
         return self
+
+
+class ToolCoverageEntry(ContractModel):
+    tool: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    transport: Literal["http", "stdio", "both"]
+    capability_family: CapabilityFamily
+    task_ids: list[str] = Field(default_factory=list)
+    coverage_kind: Literal["required_path", "accepted_path", "risk_distractor", "not_applicable"]
+    rationale: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> ToolCoverageEntry:
+        if self.coverage_kind == "not_applicable" and self.task_ids:
+            raise ValueError("not-applicable tools cannot reference tasks")
+        if self.coverage_kind != "not_applicable" and not self.task_ids:
+            raise ValueError("covered tools must reference at least one task")
+        if len(set(self.task_ids)) != len(self.task_ids):
+            raise ValueError("coverage task ids must be unique")
+        return self
+
+
+class ToolCoverageMatrix(ContractModel):
+    schema_version: Literal[1] = 1
+    entries: list[ToolCoverageEntry] = Field(min_length=1)
+
+    def validate_tasks(self, tasks: list[TaskManifest]) -> None:
+        task_ids = {task.id for task in tasks}
+        tools = [entry.tool for entry in self.entries]
+        if len(set(tools)) != len(tools):
+            raise ValueError("coverage matrix tool names must be unique")
+        unknown = sorted({task_id for entry in self.entries for task_id in entry.task_ids} - task_ids)
+        if unknown:
+            raise ValueError(f"coverage matrix references unknown tasks: {unknown}")
+        covered_families = {
+            entry.capability_family for entry in self.entries if entry.coverage_kind != "not_applicable"
+        }
+        expected_families = set(CAPABILITY_FAMILIES)
+        if covered_families != expected_families:
+            raise ValueError("coverage matrix must cover every capability family")
+
+    def validate_manifest(self, manifest: BenchmarkRunManifest) -> None:
+        matrix_tools = {entry.tool for entry in self.entries}
+        registered_tools = set(manifest.tool_resources)
+        if matrix_tools != registered_tools:
+            missing = sorted(registered_tools - matrix_tools)
+            extra = sorted(matrix_tools - registered_tools)
+            raise ValueError(f"coverage matrix/catalog mismatch: missing={missing}, extra={extra}")
+
+
+class LocalizedTaskDefinition(ContractModel):
+    id: str = Field(pattern=TASK_ID_RE.pattern)
+    prompt: str = Field(min_length=1, max_length=4000)
+    response_rubric: ResponseRubric = Field(default_factory=ResponseRubric)
+
+
+class TaskPairDefinition(ContractModel):
+    pair_id: str = Field(pattern=PAIR_ID_RE.pattern)
+    common: dict[str, Any]
+    locales: dict[TaskLocale, LocalizedTaskDefinition]
+
+    @model_validator(mode="after")
+    def validate_pair(self) -> TaskPairDefinition:
+        if set(self.locales) != {"ko-KR", "en-US"}:
+            raise ValueError("each task pair must define ko-KR and en-US")
+        forbidden = {"id", "locale", "pair_id", "prompt", "response_rubric"} & set(self.common)
+        if forbidden:
+            raise ValueError(f"pair common fields cannot override localized coordinates: {sorted(forbidden)}")
+        return self
+
+
+class TaskCorpusDocument(ContractModel):
+    schema_version: Literal[2] = 2
+    pairs: list[TaskPairDefinition] = Field(min_length=1)
 
 
 class ModelSpec(ContractModel):
@@ -444,8 +687,13 @@ class StatisticalProcedure(ContractModel):
     z_value: float = Field(default=1.644854, gt=0)
 
 
+class ProviderSensitivity(ContractModel):
+    maximum_arm_share_difference: float = Field(default=0.20, ge=0, le=1)
+    downgrade_on_imbalance: Literal[True] = True
+
+
 class BenchmarkRunManifest(ContractModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     name: str = Field(min_length=1, max_length=100)
     protocol_revision: Literal["2026-07-28"] = "2026-07-28"
     source_revision: str = Field(min_length=1, max_length=200)
@@ -457,9 +705,16 @@ class BenchmarkRunManifest(ContractModel):
     # independent model/transport cell parallelism.
     max_concurrency: Literal[1] = 1
     category_minimums: dict[Category, int]
+    suite_minimums: dict[Suite, int]
+    capability_minimums: dict[CapabilityFamily, int]
+    risk_minimums: dict[RiskHypothesis, int]
     statistical_procedure: StatisticalProcedure
+    paired_order: Literal["counterbalanced_task_repeat"]
+    paired_order_seed: str = Field(min_length=1, max_length=100)
+    provider_sensitivity: ProviderSensitivity = Field(default_factory=ProviderSensitivity)
     budget: Budget
     operation_map: dict[str, list[str]]
+    tool_resources: dict[str, ResourceType]
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
     locales: list[TaskLocale] = Field(default_factory=default_locales)
@@ -550,10 +805,22 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError("credential_profiles must define default")
         if self.locales != ["ko-KR", "en-US"]:
             raise ValueError("the benchmark must register ko-KR and en-US locales in that order")
-        if self.locale_counts != EXPECTED_LOCALE_COUNTS:
-            raise ValueError("the benchmark must register eight tasks for each locale")
-        if self.pair_categories != EXPECTED_PAIR_CATEGORIES:
-            raise ValueError("the benchmark must register the fixed semantic task pairs")
+        if set(self.locale_counts) != set(self.locales):
+            raise ValueError("locale counts must cover the registered locales")
+        if set(self.suite_minimums) != {"capability", "tool_surface_risk"}:
+            raise ValueError("suite minimums must register both benchmark suites")
+        if set(self.capability_minimums) != set(CAPABILITY_FAMILIES):
+            raise ValueError("capability minimums must register every capability family")
+        if set(self.risk_minimums) != set(RISK_HYPOTHESES):
+            raise ValueError("risk minimums must register every tool-surface risk")
+        if any(value < 1 for value in (*self.suite_minimums.values(), *self.capability_minimums.values(), *self.risk_minimums.values())):
+            raise ValueError("suite, capability, and risk minimums must be positive")
+        registered_tools = {tool for tools in self.operation_map.values() for tool in tools}
+        if set(self.tool_resources) != registered_tools:
+            raise ValueError("tool_resources must classify every registered tool exactly once")
+        duplicates = [tool for tool, count in Counter(tool for tools in self.operation_map.values() for tool in tools).items() if count > 1]
+        if duplicates:
+            raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:
@@ -571,6 +838,26 @@ class BenchmarkRunManifest(ContractModel):
         }
         if missing:
             raise ValueError(f"task corpus is below category minimums: {missing}")
+        suite_counts = Counter(task.suite for task in tasks)
+        missing_suites = {
+            suite: minimum for suite, minimum in self.suite_minimums.items() if suite_counts[suite] < minimum
+        }
+        if missing_suites:
+            raise ValueError(f"task corpus is below suite minimums: {missing_suites}")
+        capability_counts = Counter(family for task in tasks for family in task.capability_families)
+        missing_capabilities = {
+            family: minimum
+            for family, minimum in self.capability_minimums.items()
+            if capability_counts[family] < minimum
+        }
+        if missing_capabilities:
+            raise ValueError(f"task corpus is below capability minimums: {missing_capabilities}")
+        risk_counts = Counter(risk for task in tasks for risk in task.risk_hypotheses)
+        missing_risks = {
+            risk: minimum for risk, minimum in self.risk_minimums.items() if risk_counts[risk] < minimum
+        }
+        if missing_risks:
+            raise ValueError(f"task corpus is below risk minimums: {missing_risks}")
         unknown_operations = {
             operation
             for task in tasks
@@ -580,7 +867,11 @@ class BenchmarkRunManifest(ContractModel):
                 *task.allowed_first_operations,
                 *task.forbidden_operations,
                 *task.material_attempt_limits,
+                *task.material_attempt_minimums,
                 *task.required_operations,
+                *(behavior_operation for behavior in task.accepted_behaviors for behavior_operation in behavior.required_operations),
+                *task.stopping.allowed_follow_up_operations,
+                *(mutation.operation for mutation in task.forbidden_mutations),
                 *(item.logical_operation for item in task.expected_material_attempts),
             ]
             if operation not in self.operation_map and operation != "none"
@@ -591,7 +882,7 @@ class BenchmarkRunManifest(ContractModel):
             f"{task.id}:{attempt.tool_name}"
             for task in tasks
             for attempt in task.expected_material_attempts
-            if attempt.tool_name not in self.operation_map.get(attempt.logical_operation, [])
+            if attempt.tool_name is not None and attempt.tool_name not in self.operation_map.get(attempt.logical_operation, [])
         )
         if unregistered_attempt_tools:
             raise ValueError(
@@ -600,16 +891,22 @@ class BenchmarkRunManifest(ContractModel):
             )
         if any(task.fixture.scenario != self.fixture_scenario for task in tasks):
             raise ValueError("every task must use the registered fixture scenario")
+        unregistered_coverage_tools = sorted(
+            f"{task.id}:{tool}"
+            for task in tasks
+            for tool in task.coverage_tools
+            if tool not in self.tool_resources
+        )
+        if unregistered_coverage_tools:
+            raise ValueError(f"task coverage tools are not registered: {unregistered_coverage_tools}")
         self._validate_locale_pairs(tasks)
         source_blind_violations = source_blind_violations_for(tasks, self.operation_map)
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
         trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
-        if trials_per_arm != 180:
-            raise ValueError("the benchmark must register exactly 180 paid trials per arm")
         required_trials = trials_per_arm * len(self.arms)
-        smoke_cells = len(self.models) * len(self.transports)
+        smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
         if self.budget.max_model_requests < required_trials + smoke_cells:
             raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         reserved_cost = self.budget.max_cost_per_trial_usd * (required_trials + smoke_cells)
@@ -618,10 +915,10 @@ class BenchmarkRunManifest(ContractModel):
 
     def _validate_locale_pairs(self, tasks: list[TaskManifest]) -> None:
         if len(tasks) != sum(self.locale_counts.values()):
-            raise ValueError("task corpus must contain exactly 16 tasks")
+            raise ValueError("task corpus size must match the locale counts")
         locale_counts = Counter(task.locale for task in tasks)
         if dict(locale_counts) != self.locale_counts:
-            raise ValueError("task corpus must contain exactly eight ko-KR and eight en-US tasks")
+            raise ValueError("task corpus locale counts do not match the manifest")
 
         pairs: dict[str, list[TaskManifest]] = defaultdict(list)
         for task in tasks:
@@ -650,6 +947,16 @@ class BenchmarkRunManifest(ContractModel):
         rubric = task.response_rubric
         return {
             "category": task.category,
+            "suite": task.suite,
+            "capability_families": sorted(task.capability_families),
+            "risk_hypotheses": sorted(task.risk_hypotheses),
+            "user_outcome": task.user_outcome,
+            "accepted_behaviors": [item.model_dump(mode="json") for item in task.accepted_behaviors],
+            "clarification": task.clarification.model_dump(mode="json"),
+            "stopping": task.stopping.model_dump(mode="json"),
+            "forbidden_mutations": [item.model_dump(mode="json") for item in task.forbidden_mutations],
+            "allowed_resources": sorted(task.allowed_resources),
+            "coverage_tools": sorted(task.coverage_tools),
             "fixture": task.fixture.model_dump(mode="json"),
             "allowed_preparatory_operations": sorted(task.allowed_preparatory_operations),
             "allowed_material_operations": sorted(task.allowed_material_operations),
@@ -657,6 +964,7 @@ class BenchmarkRunManifest(ContractModel):
             "forbidden_operations": sorted(task.forbidden_operations),
             "required_attempted_operations": sorted(task.required_attempted_operations),
             "material_attempt_limits": dict(sorted(task.material_attempt_limits.items())),
+            "material_attempt_minimums": dict(sorted(task.material_attempt_minimums.items())),
             "required_operations": sorted(task.required_operations),
             "expected_material_arguments": task.expected_material_arguments,
             "expected_material_outcomes": [item.model_dump(mode="json") for item in task.expected_material_outcomes],
@@ -668,6 +976,8 @@ class BenchmarkRunManifest(ContractModel):
                 "required_any_of_shape": sorted(len(group) for group in rubric.required_any_of),
                 "forbidden_terms_count": len(rubric.forbidden_terms),
                 "confirmation_terms_count": len(rubric.confirmation_terms),
+                "clarification_terms_count": len(rubric.clarification_terms),
+                "success_claim_terms_count": len(rubric.success_claim_terms),
             },
         }
 
@@ -747,12 +1057,34 @@ def load_json(path: Path) -> Any:
 
 def load_task_corpus(path: Path) -> list[TaskManifest]:
     raw = load_json(path)
-    if not isinstance(raw, list):
-        raise ValueError("task corpus root must be an array")
     try:
-        return [TaskManifest.model_validate(item) for item in raw]
+        corpus = TaskCorpusDocument.model_validate(raw)
+        tasks = [
+            TaskManifest.model_validate(
+                {
+                    "schema_version": 2,
+                    **pair.common,
+                    "pair_id": pair.pair_id,
+                    "locale": locale,
+                    **localized.model_dump(mode="json"),
+                }
+            )
+            for pair in corpus.pairs
+            for locale, localized in pair.locales.items()
+        ]
+        if len({pair.pair_id for pair in corpus.pairs}) != len(corpus.pairs):
+            raise ValueError("task corpus pair ids must be unique")
+        return tasks
     except ValidationError as exc:
         raise ValueError(f"task corpus validation failed: {exc}") from exc
+
+
+def load_tool_coverage(path: Path) -> ToolCoverageMatrix:
+    raw = load_json(path)
+    try:
+        return ToolCoverageMatrix.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"tool coverage validation failed: {exc}") from exc
 
 
 def load_run_manifest(path: Path) -> BenchmarkRunManifest:

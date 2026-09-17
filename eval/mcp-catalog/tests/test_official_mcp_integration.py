@@ -58,11 +58,24 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
 def test_raw_and_server_arguments_are_separately_recorded() -> None:
     task = TaskManifest.model_validate(
         {
-            "schema_version": 1,
+                "schema_version": 2,
                 "id": "raw-server-args",
+                "suite": "capability",
                 "category": "single_operation",
                 "locale": "en-US",
                 "pair_id": "raw-server",
+                "capability_families": ["document_discovery_read_history"],
+                "user_outcome": "Read the requested value without mutating state.",
+                "accepted_behaviors": [
+                    {
+                        "id": "read-value",
+                        "description": "Return the requested value.",
+                        "mode": "complete",
+                        "required_operations": ["read"],
+                        "required_resources": ["document"],
+                    }
+                ],
+                "allowed_resources": ["document"],
                 "prompt": "값을 읽어 줘.",
                 "fixture": {"scenario": "empty", "transports": ["http"]},
                 "allowed_material_operations": ["read"],

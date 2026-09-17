@@ -167,7 +167,7 @@ class FakeExecutor:
 @pytest.mark.asyncio
 async def test_pydantic_evals_repeat_uses_case_lifecycle_for_reset_and_report() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     fixture = FakeFixture()
     executor = FakeExecutor(manifest)
 
@@ -186,7 +186,7 @@ async def test_pydantic_evals_repeat_uses_case_lifecycle_for_reset_and_report() 
 @pytest.mark.asyncio
 async def test_single_repeat_can_carry_exact_index_and_checkpoint_after_teardown() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     events: list[tuple[int, str]] = []
 
     async def checkpoint_sink(outcome: TrialOutcome, status: str) -> None:
@@ -209,7 +209,7 @@ async def test_single_repeat_can_carry_exact_index_and_checkpoint_after_teardown
 @pytest.mark.asyncio
 async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsuccessful() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-ko")
     model_id = manifest.models[0].model_id
     events: list[str] = []
 
@@ -273,7 +273,7 @@ async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsu
 @pytest.mark.asyncio
 async def test_provider_is_not_called_until_reset_readiness_recovers() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     from mcp_catalog.runtime import RuntimeDescriptor
 
     runtime_descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
@@ -300,7 +300,7 @@ async def test_provider_is_not_called_until_reset_readiness_recovers() -> None:
 @pytest.mark.asyncio
 async def test_failed_reset_preserves_readiness_stage_and_blocks_provider() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     fixture = _NeverReadyFixture()
     executor = _ReadinessGuardExecutor(manifest, _NotReadyMarker())
     failures: list[Exception] = []
@@ -325,7 +325,7 @@ async def test_failed_reset_preserves_readiness_stage_and_blocks_provider() -> N
 @pytest.mark.asyncio
 async def test_setup_reset_blocks_the_next_trial() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     fixture = _FailsBeforeNextTrialFixture()
     marker = _NotReadyMarker()
     marker.ready = True
@@ -355,7 +355,7 @@ async def test_setup_reset_blocks_the_next_trial() -> None:
 @pytest.mark.asyncio
 async def test_reset_timeout_blocks_provider_execution() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "destructive-confirm-ko")
     from mcp_catalog.runtime import RuntimeDescriptor
 
     runtime_descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
@@ -391,7 +391,7 @@ async def test_reset_timeout_blocks_provider_execution() -> None:
 @pytest.mark.asyncio
 async def test_lifecycle_passes_a_fresh_http_token_after_each_reset() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-a")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "read-vaults-ko")
     fixture = FakeFixture()
     executor = _TokenRecordingExecutor(manifest)
     refreshed = 0

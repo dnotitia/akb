@@ -12,6 +12,7 @@ from mcp_catalog.contracts import (
     hash_json,
     load_run_manifest,
     load_task_corpus,
+    load_tool_coverage,
     source_blind_violations_for,
     token_estimate,
 )
@@ -22,11 +23,16 @@ ROOT = Path(__file__).parents[1]
 def test_registered_manifest_and_corpus_cover_every_category() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    coverage = load_tool_coverage(ROOT / "corpus" / "tool-coverage.json")
 
     manifest.validate_tasks(tasks)
-    assert len(tasks) == 16
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
+    assert len(tasks) == 26
+    assert len(coverage.entries) == 50
     assert {model.class_name for model in manifest.models} == {"primary", "lightweight"}
     assert {task.category for task in tasks} == set(manifest.category_minimums)
+    assert {task.suite for task in tasks} == {"capability", "tool_surface_risk"}
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
     assert manifest.budget.max_total_cost_usd == 50.0
     assert manifest.models[0].model_id == "deepseek/deepseek-v4-flash-0731"

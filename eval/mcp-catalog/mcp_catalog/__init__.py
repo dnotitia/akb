@@ -7,10 +7,13 @@ from .contracts import (
     ExpectedMaterialAttempt,
     ExpectedMaterialOutcome,
     ExpectedResultBinding,
+    ToolCoverageEntry,
+    ToolCoverageMatrix,
     TaskLocale,
     TaskManifest,
     load_run_manifest,
     load_task_corpus,
+    load_tool_coverage,
 )
 
 __all__ = [
@@ -20,8 +23,11 @@ __all__ = [
     "ExpectedMaterialAttempt",
     "ExpectedMaterialOutcome",
     "ExpectedResultBinding",
+    "ToolCoverageEntry",
+    "ToolCoverageMatrix",
     "TaskLocale",
     "TaskManifest",
     "load_run_manifest",
     "load_task_corpus",
+    "load_tool_coverage",
 ]

@@ -50,11 +50,12 @@ def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
         assert IMAGE_NAME in task.prompt
         assert DOCUMENT_TITLE in task.prompt
         assert IMAGE_ALT in task.prompt
-        assert "complete content" in task.prompt.casefold() or "본문" in task.prompt
-        assert [attempt.tool_name for attempt in task.expected_material_attempts] == [
-            "akb_put_file",
-            "akb_put_image",
-            "akb_put",
+        assert "returned markdown" in task.prompt.casefold() or "반환된 Markdown" in task.prompt
+        assert [attempt.tool_name for attempt in task.expected_material_attempts] == [None, None, None]
+        assert [attempt.resource_type for attempt in task.expected_material_attempts] == [
+            "file",
+            "image",
+            "document",
         ]
         assert [attempt.arguments for attempt in task.expected_material_attempts] == [
             {"parent": PARENT, "collection": ""},
@@ -92,7 +93,7 @@ def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
 def test_stdio_prompt_exposes_only_the_declared_absolute_fixture_paths() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    task = next(task for task in tasks if task.id == "stdio-local-b")
+    task = next(task for task in tasks if task.id == "stdio-local-en")
     consumer_root = Path("/private/runtime/node-consumer")
     prompt = render_task_prompt(
         task,
@@ -110,7 +111,7 @@ def test_stdio_prompt_exposes_only_the_declared_absolute_fixture_paths() -> None
 @pytest.mark.asyncio
 async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     result = {
         "content": [
             {
@@ -123,7 +124,7 @@ async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() ->
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=(),
-        capture_result_fields=capture_result_fields_for_task(task),
+        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
     )
 
     async def image_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
@@ -157,7 +158,7 @@ async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() ->
 @pytest.mark.asyncio
 async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data_for_the_model() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     result = {
         "structuredContent": {
             "url": "/api/assets/fixture-image",
@@ -169,7 +170,7 @@ async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=(),
-        capture_result_fields=capture_result_fields_for_task(task),
+        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
     )
 
     async def image_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
@@ -307,7 +308,7 @@ def test_stdio_image_markdown_must_flow_into_the_created_document(
     success: bool,
 ) -> None:
     _manifest, tasks = load_run_manifest(ROOT / "config" / "run.json"), load_task_corpus(ROOT / "corpus" / "tasks.json")
-    task = next(task for task in tasks if task.id == "stdio-local-b")
+    task = next(task for task in tasks if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):
@@ -345,7 +346,7 @@ def test_stdio_image_markdown_must_flow_into_the_created_document(
     ),
 )
 def test_stdio_attempts_reject_wrong_sources_targets_and_outcomes(tmp_path: Path, mutation: str) -> None:
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):
@@ -410,7 +411,7 @@ def test_stdio_attempts_reject_wrong_sources_targets_and_outcomes(tmp_path: Path
 
 
 def test_stdio_final_browse_requires_the_uploaded_file_and_created_document(tmp_path: Path) -> None:
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):
@@ -441,7 +442,7 @@ def test_stdio_final_browse_requires_the_uploaded_file_and_created_document(tmp_
 @pytest.mark.asyncio
 async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(tmp_path: Path) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):
@@ -508,7 +509,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
 
 
 def test_vault_skill_handshake_requires_the_returned_ack_and_same_semantic_retry(tmp_path: Path) -> None:
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):
@@ -538,8 +539,9 @@ def test_vault_skill_handshake_requires_the_returned_ack_and_same_semantic_retry
 
     outcome = _score_stdio(task, consumer_root, [challenge, wrong_ack, calls[1], calls[2]])
 
-    assert outcome.tool_outcome_match is False
-    assert outcome.safety is False
+    assert outcome.tool_outcome_match is True
+    assert outcome.protocol_handshake_valid is False
+    assert outcome.safety is True
     assert outcome.success is False
 
     changed_args = {**base_file_args, "description": "different semantic request", "_vault_skill_ack": "fixture-ack"}
@@ -552,11 +554,12 @@ def test_vault_skill_handshake_requires_the_returned_ack_and_same_semantic_retry
         }
     )
     changed = _score_stdio(task, consumer_root, [challenge, changed_retry, calls[1], calls[2]])
-    assert changed.tool_outcome_match is False
+    assert changed.tool_outcome_match is True
+    assert changed.protocol_handshake_valid is False
 
 
 def test_uncommitted_image_cleanup_is_allowed_only_after_a_failed_material_attempt(tmp_path: Path) -> None:
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-b")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-en")
     consumer_root = tmp_path / "node-consumer"
     consumer_root.mkdir()
     for filename in (FILE_NAME, IMAGE_NAME):

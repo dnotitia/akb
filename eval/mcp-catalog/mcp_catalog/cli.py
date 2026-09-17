@@ -20,6 +20,7 @@ from .runtime import RuntimeContractError, RuntimeDescriptor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "config" / "run.json"
 DEFAULT_CORPUS = PROJECT_ROOT / "corpus" / "tasks.json"
+DEFAULT_COVERAGE = PROJECT_ROOT / "corpus" / "tool-coverage.json"
 SIGNAL_GRACE_SECONDS = 30.0
 
 
@@ -56,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 def add_inputs(parser: argparse.ArgumentParser, *, descriptor_required: bool) -> None:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
+    parser.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
     parser.add_argument("--descriptor", type=Path, required=descriptor_required)
 
 
@@ -81,11 +83,14 @@ def main() -> None:
 
 
 def validate(args: argparse.Namespace) -> int:
-    from .contracts import load_run_manifest, load_task_corpus
+    from .contracts import load_run_manifest, load_task_corpus, load_tool_coverage
 
     manifest = load_run_manifest(args.manifest)
     tasks = load_task_corpus(args.corpus)
+    coverage = load_tool_coverage(getattr(args, "coverage", DEFAULT_COVERAGE))
     manifest.validate_tasks(tasks)
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
     descriptor_info: dict[str, Any] | None = None
     if args.descriptor is not None:
         descriptor = RuntimeDescriptor.from_file(args.descriptor)
@@ -107,6 +112,16 @@ def validate(args: argparse.Namespace) -> int:
         "valid": True,
         "task_count": len(tasks),
         "category_counts": {key: sum(task.category == key for task in tasks) for key in sorted(manifest.category_minimums)},
+        "suite_counts": {key: sum(task.suite == key for task in tasks) for key in sorted(manifest.suite_minimums)},
+        "capability_counts": {
+            key: sum(key in task.capability_families for task in tasks)
+            for key in sorted(manifest.capability_minimums)
+        },
+        "risk_counts": {
+            key: sum(key in task.risk_hypotheses for task in tasks)
+            for key in sorted(manifest.risk_minimums)
+        },
+        "coverage_tool_count": len(coverage.entries),
         "locale_counts": dict(sorted(Counter(task.locale for task in tasks).items())),
         "pair_ids": sorted({task.pair_id for task in tasks}),
         "repeats": manifest.repeats,
@@ -118,7 +133,12 @@ def validate(args: argparse.Namespace) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
-    manifest, tasks, descriptor = load_inputs(args.manifest, args.corpus, args.descriptor)
+    manifest, tasks, descriptor = load_inputs(
+        args.manifest,
+        args.corpus,
+        args.descriptor,
+        getattr(args, "coverage", DEFAULT_COVERAGE),
+    )
     runner = BenchmarkRunner(
         manifest,
         tasks,
