@@ -18,6 +18,7 @@ import type {
   CredentialMetadata,
   CredentialRotateRequest,
   EligibilityProjection,
+  InitialGrantApprovalRequest,
   InstallationCommandRequest,
   InstallationProjection,
   InventoryProjection,
@@ -69,6 +70,7 @@ export type {
   DesiredSchemaProjection,
   EligibilityProjection,
   GrantProjection,
+  InitialGrantApprovalRequest,
   InstallationCommandRequest,
   InstallationProjection,
   InventoryItem,
@@ -170,6 +172,7 @@ export interface ControlPlaneAdminCredentials {
 
 export interface ControlPlaneAdminInstallations {
   apply(appId: string, vaultId: string, input: InstallationCommandRequest, options?: ControlPlaneRequestOptions): ControlPlaneResult<InstallationProjection>;
+  approveInitialGrant(appId: string, vaultId: string, input: InitialGrantApprovalRequest, options?: ControlPlaneRequestOptions): ControlPlaneResult<InstallationProjection>;
   get(appId: string, vaultId: string, options?: ControlPlaneRequestOptions): ControlPlaneResult<InstallationProjection>;
   uninstall(appId: string, vaultId: string, options?: ControlPlaneRequestOptions): ControlPlaneResult<InstallationProjection>;
 }
@@ -269,6 +272,7 @@ export function createControlPlaneAdminClient(
     },
     installations: {
       apply: (appId, vaultId, input, options) => requester.call("PUT", `/apps/${segment(appId)}/installations/${segment(vaultId)}`, input, undefined, options),
+      approveInitialGrant: (appId, vaultId, input, options) => requester.call("POST", `/apps/${segment(appId)}/installations/${segment(vaultId)}/grant`, input, undefined, options),
       get: (appId, vaultId, options) => requester.call("GET", `/apps/${segment(appId)}/installations/${segment(vaultId)}`, undefined, undefined, options),
       uninstall: (appId, vaultId, options) => requester.call("DELETE", `/apps/${segment(appId)}/installations/${segment(vaultId)}`, undefined, undefined, options),
     },

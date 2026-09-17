@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -14,7 +15,10 @@ import uuid
 import asyncpg
 import pytest
 
-from app.exceptions import ConflictError
+from app.exceptions import ConflictError, ForbiddenError
+from app.services import access_service
+from app.services import app_identity_service
+from app.services import app_installation_service as installation
 from app.services import app_legacy_adoption_service as adoption
 from app.services import app_inventory_service as inventory
 from app.services import app_rollout_service as rollout
@@ -30,6 +34,7 @@ _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATIONS = [
     _BACKEND / "app" / "db" / "migrations" / "042_vault_migrations.py",
+    _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py",
     _BACKEND / "app" / "db" / "migrations" / "047_app_registry.py",
     _BACKEND / "app" / "db" / "migrations" / "052_app_inventory.py",
     _BACKEND / "app" / "db" / "migrations" / "077_legacy_adoptions.py",
@@ -393,6 +398,270 @@ async def test_migration_reapply_plan_read_only_apply_and_owned_table_protection
                         "type": "text",
                     }
                 ],
+            )
+
+
+async def test_initial_grant_approval_preserves_adoption_and_rejects_drift_or_replay(
+    monkeypatch,
+):
+    async with _fresh_database() as pool:
+        monkeypatch.setattr(adoption, "get_pool", lambda: pool)
+        monkeypatch.setattr(table_service, "get_pool", lambda: pool)
+        monkeypatch.setattr(table_migration_service, "get_pool", lambda: pool)
+        monkeypatch.setattr(installation, "get_pool", lambda: pool)
+        monkeypatch.setattr(access_service, "get_pool", lambda: pool)
+
+        fixture = await _fixture(pool, label="initial-grant")
+        admin_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users(id, username, email, password_hash, is_admin)
+                VALUES($1, $2, $3, 'unused', TRUE)
+                """,
+                admin_id,
+                f"initial-grant-admin-{admin_id.hex}",
+                f"initial-grant-{admin_id.hex}@example.invalid",
+            )
+        user = AuthenticatedUser(
+            user_id=str(admin_id),
+            username=f"initial-grant-admin-{admin_id.hex}",
+            email=f"initial-grant-{admin_id.hex}@example.invalid",
+            display_name=None,
+            is_admin=True,
+            auth_method="jwt",
+        )
+
+        principal = app_identity_service.AppPrincipal(
+            app_id=fixture["app_id"],
+            credential_id=uuid.uuid4(),
+            credential_generation=1,
+            deployment="fixture",
+            token_id="fixture-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        target = {
+            "vault_id": str(fixture["vault_id"]),
+            "table_allowlist": [fixture["table_name"]],
+        }
+        plan = await adoption.create_legacy_adoption(
+            fixture["app_id"],
+            baseline_release_id=fixture["release_id"],
+            idempotency_key=str(uuid.uuid4()),
+            targets=[target],
+            user=user,
+            correlation_id="initial-grant-plan",
+        )
+        applied = await adoption.apply_legacy_adoption(
+            fixture["app_id"],
+            uuid.UUID(plan["adoption_id"]),
+            user=user,
+            correlation_id="initial-grant-apply",
+        )
+        assert applied["targets"][0]["state"] == "applied"
+
+        with pytest.raises(ForbiddenError, match="App request denied"):
+            await installation.get_app_installation_status(
+                principal,
+                fixture["vault_id"],
+                correlation_id="initial-grant-before-status",
+            )
+
+        async with pool.acquire() as conn:
+            before = await conn.fetchrow(
+                """
+                SELECT id, lifecycle, desired_release_id, current_release_id,
+                       grant_generation
+                  FROM vault_app_installations
+                 WHERE app_id=$1 AND vault_id=$2
+                """,
+                fixture["app_id"],
+                fixture["vault_id"],
+            )
+            observed_before = await conn.fetchrow(
+                """
+                SELECT observed_generation, observed_release_id,
+                       observed_release_version, schema_fingerprint,
+                       observed_grant_generation, checkpoint, recent_error
+                  FROM app_installation_observed_states
+                 WHERE installation_id=$1
+                """,
+                before["id"],
+            )
+            row_count_before = await conn.fetchval(
+                f"SELECT count(*) FROM {fixture['physical']}"
+            )
+            assert before["lifecycle"] == "active"
+            assert before["desired_release_id"] == fixture["release_id"]
+            assert before["current_release_id"] == fixture["release_id"]
+            assert before["grant_generation"] == 0
+            assert observed_before["observed_generation"] == 0
+            assert observed_before["observed_grant_generation"] == 0
+
+            await conn.execute(
+                """
+                UPDATE vault_tables
+                   SET columns='[{"name":"amount","type":"numeric"},
+                                {"name":"drift","type":"text"}]'::jsonb
+                 WHERE vault_id=$1 AND name=$2
+                """,
+                fixture["vault_id"],
+                fixture["table_name"],
+            )
+
+        with pytest.raises(ConflictError, match="Initial grant approval"):
+            await installation.approve_initial_installation_grant(
+                fixture["app_id"],
+                fixture["vault_id"],
+                baseline_release_id=fixture["release_id"],
+                capabilities=["installation:read"],
+                user=user,
+                correlation_id="initial-grant-drift-before-approval",
+            )
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM installation_grants WHERE installation_id=$1",
+                before["id"],
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT grant_generation FROM vault_app_installations WHERE id=$1",
+                before["id"],
+            ) == 0
+            await conn.execute(
+                """
+                UPDATE vault_tables
+                   SET columns='[{"name":"amount","type":"numeric"}]'::jsonb
+                 WHERE vault_id=$1 AND name=$2
+                """,
+                fixture["vault_id"],
+                fixture["table_name"],
+            )
+
+        async def approve(correlation_id: str, capabilities: list[str] | None = None):
+            return await installation.approve_initial_installation_grant(
+                fixture["app_id"],
+                fixture["vault_id"],
+                baseline_release_id=fixture["release_id"],
+                capabilities=capabilities or ["installation:read"],
+                user=user,
+                correlation_id=correlation_id,
+            )
+
+        results = await asyncio.gather(
+            *(approve(f"initial-grant-concurrent-{index}") for index in range(8))
+        )
+        assert sum(result["command_status"] == "accepted" for result in results) == 1
+        assert sum(result["command_status"] == "already_applied" for result in results) == 7
+        assert {result["installation_id"] for result in results} == {str(before["id"])}
+        assert {result["desired_grant_generation"] for result in results} == {1}
+
+        status = await installation.get_app_installation_status(
+            principal,
+            fixture["vault_id"],
+            correlation_id="initial-grant-after-status",
+        )
+        assert status["lifecycle"] == "active"
+        assert status["desired_release"]["id"] == str(fixture["release_id"])
+        assert status["current_release"]["id"] == str(fixture["release_id"])
+        assert status["observed"]["generation"] == observed_before["observed_generation"]
+        assert status["observed"]["grant_generation"] == 1
+        assert status["active_grant"] == {
+            "generation": 1,
+            "status": "active",
+            "capabilities": ["installation:read"],
+        }
+
+        with pytest.raises(ConflictError, match="conflicts with current grant"):
+            await approve(
+                "initial-grant-different-capability",
+                ["installation:read", "inventory:read"],
+            )
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE vault_tables
+                   SET columns='[{"name":"amount","type":"numeric"},
+                                {"name":"drift","type":"text"}]'::jsonb
+                 WHERE vault_id=$1 AND name=$2
+                """,
+                fixture["vault_id"],
+                fixture["table_name"],
+            )
+        with pytest.raises(ConflictError, match="Initial grant approval"):
+            await approve("initial-grant-drift-after-approval")
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM installation_grants WHERE installation_id=$1",
+                before["id"],
+            ) == 1
+            assert await conn.fetchval(
+                f"SELECT count(*) FROM {fixture['physical']}"
+            ) == row_count_before
+            observed_after = await conn.fetchrow(
+                "SELECT * FROM app_installation_observed_states WHERE installation_id=$1",
+                before["id"],
+            )
+            assert observed_after["observed_generation"] == observed_before["observed_generation"]
+            assert observed_after["observed_release_id"] == observed_before["observed_release_id"]
+            assert observed_after["observed_release_version"] == observed_before["observed_release_version"]
+            assert observed_after["schema_fingerprint"] == observed_before["schema_fingerprint"]
+            assert observed_after["checkpoint"] == observed_before["checkpoint"]
+            assert observed_after["recent_error"] == observed_before["recent_error"]
+            await conn.execute(
+                """
+                UPDATE vault_tables
+                   SET columns='[{"name":"amount","type":"numeric"}]'::jsonb
+                 WHERE vault_id=$1 AND name=$2
+                """,
+                fixture["vault_id"],
+                fixture["table_name"],
+            )
+
+        uninstalled = await installation.uninstall_installation(
+            fixture["app_id"],
+            fixture["vault_id"],
+            user=user,
+            correlation_id="initial-grant-uninstall",
+        )
+        assert uninstalled["lifecycle"] == "uninstalled"
+        assert uninstalled["desired_grant_generation"] == 1
+        with pytest.raises(ConflictError, match="Initial grant approval"):
+            await approve("initial-grant-replay-after-uninstall")
+
+        async with pool.acquire() as conn:
+            final = await conn.fetchrow(
+                """
+                SELECT i.lifecycle, i.grant_generation,
+                       g.generation, g.status
+                  FROM vault_app_installations AS i
+                  JOIN installation_grants AS g ON g.installation_id=i.id
+                 WHERE i.id=$1
+                """,
+                before["id"],
+            )
+            assert dict(final) == {
+                "lifecycle": "uninstalled",
+                "grant_generation": 1,
+                "generation": 1,
+                "status": "revoked",
+            }
+            assert await conn.fetchval(
+                "SELECT count(*) FROM app_owned_resources WHERE installation_id=$1 AND status='owned'",
+                before["id"],
+            ) == 0
+            assert await conn.fetchval(
+                "SELECT count(*) FROM app_owned_resources WHERE installation_id=$1 AND status='retained'",
+                before["id"],
+            ) == 1
+
+        with pytest.raises(ForbiddenError, match="App request denied"):
+            await installation.get_app_installation_status(
+                principal,
+                fixture["vault_id"],
+                correlation_id="initial-grant-after-uninstall-status",
             )
 
 

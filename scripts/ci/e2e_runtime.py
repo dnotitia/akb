@@ -2012,6 +2012,9 @@ class E2ERuntime:
         app_id: uuid.UUID,
         version: str,
         schema_tables: Sequence[dict[str, object]] = (),
+        transition_plans: Sequence[
+            tuple[object, Sequence[dict[str, object]]]
+        ] | None = None,
     ) -> uuid.UUID:
         app_key = await connection.fetchval(
             "SELECT app_key FROM app_definitions WHERE id=$1", app_id
@@ -2022,6 +2025,7 @@ class E2ERuntime:
             app_key=app_key,
             version=version,
             tables=schema_tables,
+            transition_plans=transition_plans,
         )
         encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
         release_id = uuid.uuid4()
@@ -2725,6 +2729,7 @@ class E2ERuntime:
         self,
         connection: Any,
         *,
+        password_hash: str,
         system_admin_id: uuid.UUID,
     ) -> None:
         """Seed one explicit table baseline for the adoption scenario.
@@ -2743,9 +2748,9 @@ class E2ERuntime:
         owner = actors.get("target_owner")
         if not isinstance(target, dict) or not isinstance(owner, dict):
             raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
-        target_app_id = target.get("id")
+        _rollout_app_id = target.get("id")
         owner_id = owner.get("id")
-        if not isinstance(target_app_id, str) or not isinstance(owner_id, str):
+        if not isinstance(_rollout_app_id, str) or not isinstance(owner_id, str):
             raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
 
         table_name = "legacy_orders"
@@ -2759,30 +2764,128 @@ class E2ERuntime:
             "unique_keys": [],
             "indexes": [],
         }
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                [descriptor],
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        ).hexdigest()
-        app_uuid = uuid.UUID(target_app_id)
+        fingerprint = _fixture_schema_fingerprint([descriptor])
         owner_uuid = uuid.UUID(owner_id)
+        owner_username = await connection.fetchval(
+            "SELECT username FROM users WHERE id=$1",
+            owner_uuid,
+        )
+        if not isinstance(owner_username, str):
+            raise ProvisioningFailure("legacy adoption fixture owner is unavailable")
+        actors["target_owner"].update(
+            {
+                "username": owner_username,
+                "vault_role": "owner",
+                "vault_scope": "legacy_adoption",
+            }
+        )
+        actor_specs = (
+            ("target_admin", "target-admin", "admin"),
+            ("reader", "reader", "reader"),
+            ("writer", "writer", "writer"),
+            ("foreign_admin", "foreign-admin", "owner"),
+        )
+        actor_ids: dict[str, uuid.UUID] = {}
+        for role, label, vault_role in actor_specs:
+            username = f"{namespace}-{label}"
+            actor_id = await self._insert_fixture_user(
+                connection,
+                username=username,
+                password_hash=password_hash,
+                label=f"{namespace}-{label}",
+            )
+            actor_ids[role] = actor_id
+            actors[role] = {
+                "id": str(actor_id),
+                "username": username,
+                "role": role,
+                "vault_role": vault_role,
+                "vault_scope": (
+                    "legacy_adoption"
+                    if role != "foreign_admin"
+                    else "legacy_foreign"
+                ),
+            }
+
+        legacy_app_id = uuid.uuid4()
+        legacy_app_key = f"{namespace}-legacy-target"
+        await connection.execute(
+            "INSERT INTO app_definitions(id, app_key, display_name) VALUES($1, $2, $3)",
+            legacy_app_id,
+            legacy_app_key,
+            "Runtime Legacy Adoption Target",
+        )
         release_id = await self._insert_fixture_release(
             connection,
-            app_id=app_uuid,
+            app_id=legacy_app_id,
             version="5.0.0",
             schema_tables=[descriptor],
         )
+        baseline_checksum = await connection.fetchval(
+            "SELECT manifest_checksum FROM app_releases WHERE id=$1",
+            release_id,
+        )
+        if not isinstance(baseline_checksum, str):
+            raise ProvisioningFailure("legacy adoption baseline checksum is unavailable")
         vault_id, vault_name = await self._insert_fixture_vault(
             connection,
             namespace=namespace,
             label="legacy-adoption",
             owner_id=owner_uuid,
-            grants=[(owner_uuid, "owner")],
+            grants=[
+                (owner_uuid, "owner"),
+                (actor_ids["target_admin"], "admin"),
+                (actor_ids["reader"], "reader"),
+                (actor_ids["writer"], "writer"),
+            ],
             granted_by=system_admin_id,
         )
+        foreign_vault_id, foreign_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="legacy-foreign",
+            owner_id=actor_ids["foreign_admin"],
+            grants=[(actor_ids["foreign_admin"], "owner")],
+            granted_by=system_admin_id,
+        )
+        next_release = await self._insert_fixture_release(
+            connection,
+            app_id=legacy_app_id,
+            version="6.0.0",
+            schema_tables=[descriptor],
+            transition_plans=[
+                (
+                    "fresh",
+                    [
+                        {
+                            "id": f"create_{table_name}",
+                            "phase": "expand",
+                            "operation": "create_table",
+                            "payload": {
+                                "table": table_name,
+                                "columns": baseline_columns,
+                                "unique_keys": [],
+                                "indexes": [],
+                            },
+                        }
+                    ],
+                ),
+                (
+                    {
+                        "release_version": "5.0.0",
+                        "schema_fingerprint": fingerprint,
+                    },
+                    [],
+                )
+            ],
+        )
+        next_checksum = await connection.fetchval(
+            "SELECT manifest_checksum FROM app_releases WHERE id=$1",
+            next_release,
+        )
+        if not isinstance(next_checksum, str):
+            raise ProvisioningFailure("legacy adoption no-op checksum is unavailable")
+        apps["legacy"] = {"id": str(legacy_app_id)}
         physical = f"vt_{re.sub(r'[^a-z0-9]', '_', vault_name.lower())}__{table_name}"
         if not re.fullmatch(r"[a-z0-9_]+", physical):
             raise ProvisioningFailure("legacy adoption fixture identifier is invalid")
@@ -2817,10 +2920,15 @@ class E2ERuntime:
         fixture_id = "legacy-adoption"
         fixture = {
             "fixture_id": fixture_id,
-            "app_id": target_app_id,
+            "app_id": str(legacy_app_id),
             "vault_id": str(vault_id),
             "vault_name": vault_name,
             "release_id": str(release_id),
+            "baseline_version": "5.0.0",
+            "baseline_manifest_checksum": baseline_checksum,
+            "next_release_id": str(next_release),
+            "next_version": "6.0.0",
+            "next_manifest_checksum": next_checksum,
             "table_name": table_name,
             "table_allowlist": [table_name],
             "expected_schema_fingerprint": fingerprint,
@@ -2834,10 +2942,28 @@ class E2ERuntime:
                 "schema_fingerprint": fingerprint,
                 "row_count": 3,
             },
-            "after": {
+            "after_adoption": {
                 "lifecycle": "active",
                 "desired_current_release_id": str(release_id),
                 "grant_generation": 0,
+                "observed_grant_generation": 0,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+            "after_initial_grant": {
+                "lifecycle": "active",
+                "desired_current_release_id": str(release_id),
+                "grant_generation": 1,
+                "observed_grant_generation": 1,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+            "after": {
+                "lifecycle": "active",
+                "desired_current_release_id": str(next_release),
+                "grant_generation": 1,
+                "observed_grant_generation": 1,
+                "observed_release_version": "6.0.0",
                 "schema_fingerprint": fingerprint,
                 "row_count": 3,
             },
@@ -2851,26 +2977,39 @@ class E2ERuntime:
                 "id": str(vault_id),
                 "name": vault_name,
             }
+            vaults["legacy_foreign"] = {
+                "id": str(foreign_vault_id),
+                "name": foreign_vault_name,
+            }
         releases = self._fixture_catalog.setdefault("releases", {})
         if isinstance(releases, dict):
             releases["target_legacy_adoption"] = {
                 "id": str(release_id),
                 "version": "5.0.0",
+                "manifest_checksum": baseline_checksum,
                 "expected_schema_fingerprint": fingerprint,
+            }
+            releases["target_legacy_adoption_next"] = {
+                "id": str(next_release),
+                "version": "6.0.0",
+                "manifest_checksum": next_checksum,
+                "source_release_version": "5.0.0",
+                "source_schema_fingerprint": fingerprint,
             }
         coordinates = self._fixture_catalog.setdefault("coordinates", {})
         if isinstance(coordinates, dict):
             admin = coordinates.setdefault("admin", {})
             if isinstance(admin, dict):
                 admin["legacy_adoption"] = {
-                    "app_id": target_app_id,
+                    "app_id": str(legacy_app_id),
                     "vault_id": str(vault_id),
                     "baseline_release_id": str(release_id),
+                    "allowed_actors": ["system_admin", "target_owner", "target_admin"],
                     "table_allowlist": [table_name],
                     "create": {
                         "service": "app",
                         "method": "POST",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions",
                         "headers": {"Idempotency-Key": "uuid-v4"},
                         "body": {
                             "baseline_release_id": str(release_id),
@@ -2885,14 +3024,103 @@ class E2ERuntime:
                     "status": {
                         "service": "app",
                         "method": "GET",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions/{{adoption_id}}",
                     },
                     "apply": {
                         "service": "app",
                         "method": "POST",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}/apply",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions/{{adoption_id}}/apply",
                     },
                 }
+                capabilities = [
+                    "installation:read",
+                    "inventory:read",
+                    "rollout:read",
+                    "rollout:request",
+                ]
+                admin["legacy_initial_grant"] = {
+                    "app_id": str(legacy_app_id),
+                    "vault_id": str(vault_id),
+                    "baseline_release_id": str(release_id),
+                    "allowed_actors": ["system_admin", "target_owner", "target_admin"],
+                    "capabilities": capabilities,
+                    "request": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{legacy_app_id}/installations/{vault_id}/grant",
+                        "body": {
+                            "baseline_release_id": str(release_id),
+                            "capabilities": capabilities,
+                        },
+                    },
+                    "status": {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{legacy_app_id}/installations/{vault_id}",
+                    },
+                }
+                admin["legacy_noop_rollout"] = {
+                    "app_id": str(legacy_app_id),
+                    "vault_id": str(vault_id),
+                    "release_id": str(next_release),
+                    "manifest_checksum": next_checksum,
+                    "request": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{legacy_app_id}/rollouts",
+                        "headers": {"Idempotency-Key": "uuid-v4"},
+                        "body": {
+                            "release_id": str(next_release),
+                            "manifest_checksum": next_checksum,
+                            "idempotency_key": "uuid-v4",
+                        },
+                    },
+                    "status": {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{legacy_app_id}/rollouts/{{rollout_id}}",
+                    },
+                }
+            app = coordinates.setdefault("legacy_app", {})
+            if isinstance(app, dict):
+                app.update(
+                    {
+                        "app_id": str(legacy_app_id),
+                        "credential": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": f"/api/v1/apps/{legacy_app_id}/credentials",
+                            "body": {"deployment": "legacy-adoption-fixture"},
+                        },
+                        "exchange": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/auth/app-token",
+                            "body": {"credential": "<issued-value>"},
+                        },
+                        "status": {
+                            "service": "app",
+                            "method": "GET",
+                            "path": f"/api/v1/app/installations/{vault_id}",
+                        },
+                        "inventory": {
+                            "service": "app",
+                            "method": "GET",
+                            "path": "/api/v1/app/inventory",
+                        },
+                        "rollout": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/app/rollouts",
+                            "headers": {"Idempotency-Key": "uuid-v4"},
+                            "body": {
+                                "release_id": str(next_release),
+                                "manifest_checksum": next_checksum,
+                                "idempotency_key": "uuid-v4",
+                            },
+                        },
+                    }
+                )
 
     async def _seed_app_installation_lifecycle(
         self,
@@ -3353,6 +3581,7 @@ class E2ERuntime:
                     )
                     await self._seed_control_plane_legacy_adoption(
                         connection,
+                        password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
                 else:

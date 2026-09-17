@@ -261,6 +261,7 @@ jobs:
             tests/test_app_identity_postgres.py
             tests/test_app_inventory_postgres.py
             tests/test_app_installation_postgres.py
+            tests/test_app_legacy_adoption_postgres.py
             tests/test_app_rollout_postgres.py
             tests/test_recovery_admin_provisioning_postgres.py
             tests/test_local_session_generation_postgres.py
