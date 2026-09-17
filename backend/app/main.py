@@ -523,8 +523,53 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         except Exception as e:  # noqa: BLE001
             return {"error": str(e)}
 
+    def _terminal(section: dict | None) -> tuple[int, int]:
+        """(exhausted, abandoned) of one queue section, tolerantly.
+
+        Sections are not uniform — some expose `status`, some only counters,
+        and a failed reporter is `{"error": ...}` — so read the counters, not
+        the verdict. Unknown shapes contribute nothing rather than failing
+        the whole response: a health endpoint must not 500 because one queue
+        changed its stats dict.
+        """
+        if not isinstance(section, dict):
+            return (0, 0)
+        try:
+            exhausted = int(section.get("exhausted") or 0)
+        except (TypeError, ValueError):
+            exhausted = 0
+        try:
+            abandoned = int(section.get("abandoned") or 0)
+        except (TypeError, ValueError):
+            abandoned = 0
+        return (exhausted, abandoned)
+
+    def _aggregate_status(sections: list[dict | None]) -> str:
+        """Top-level verdict over the queue sections (#538).
+
+        `degraded` when any section holds terminal work (exhausted or
+        abandoned) — a queue that gave up on an item drains to `pending: 0`
+        exactly like one that finished, so progress alone reads as complete
+        while documents are missing. Otherwise `reconciling` while anything
+        is still pending/retrying, else `ok`. Sections that only expose
+        counters without terminal fields simply contribute zeros.
+        """
+        pending_work = False
+        for section in sections:
+            if not isinstance(section, dict) or section.get("error"):
+                continue
+            exhausted, abandoned = _terminal(section)
+            if exhausted or abandoned:
+                return "degraded"
+            try:
+                pending_work = pending_work or bool(
+                    int(section.get("pending") or 0) or int(section.get("retrying") or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        return "reconciling" if pending_work else "ok"
+
     result: dict = {
-        "status": "ok",
         "service": "akb",
         "workers": worker_lifecycle_snapshot(),
         "queue_claims": queue_rescuer.snapshot(),
@@ -537,6 +582,26 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "native_derived": await _safe(native_derived_worker.pending_stats),
         "vector_store": vs_info,
     }
+
+    # Top-level aggregate (#538): `degraded` when any queue section holds
+    # terminal work, else `reconciling` while work is pending, else `ok`.
+    # Computed AFTER the sections so the verdict always describes this
+    # response, never a previous one. `vector_store.backfill.upsert` and
+    # `.delete` are nested one level deeper than the flat sections, so they
+    # join as their own entries; anything that failed to report (an
+    # `{"error": ...}` dict, a missing key) contributes nothing.
+    _backfill = vs_info.get("backfill") if isinstance(vs_info, dict) else None
+    _upsert = _backfill.get("upsert") if isinstance(_backfill, dict) else None
+    _delete = _backfill.get("delete") if isinstance(_backfill, dict) else None
+    result["status"] = _aggregate_status([
+        result["external_git"],
+        result["metadata_backfill"],
+        result["events"],
+        result["native_file_projection"],
+        result["native_derived"],
+        _upsert,
+        _delete,
+    ])
 
     # Queue-head age, promoted to the top level because it is a named term in
     # the tenant-monitoring contract and that contract must not depend on the
