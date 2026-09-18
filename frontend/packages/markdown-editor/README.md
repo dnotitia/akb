@@ -2,9 +2,9 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, the default formatting/link/table controls, shared document/file search UI, and the
-conformance contract. Products still own storage, permissions, search adapters and context, copy,
-and product-specific URL policy.
+state hooks, the default formatting/link/table/slash controls, shared document/file search UI, and
+the conformance contract. Products still own storage, permissions, search adapters and context,
+copy, and product-specific URL policy.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 
@@ -16,7 +16,9 @@ import {
   MarkdownEditingSurface,
   MarkdownViewer,
   MarkdownToolbar,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   type MarkdownTableOptions,
+  type MarkdownSlashCommandMessages,
   canonicalizeMarkdown,
   parseMarkdown,
   serializeEditorMarkdown,
@@ -40,10 +42,28 @@ function Document({ markdown, onChange }) {
 `MarkdownEditor` includes a `WYSIWYG` / `Source` switch for the same Markdown
 draft. Source opens from the current editor body, and Source edits emit raw
 Markdown through `onChange`; the shared editor stays mounted, and formatting,
-link search, and slash handlers remain attached to the WYSIWYG surface.
+link search, and the slash command menu remain attached to the WYSIWYG surface.
 `serializeEditorMarkdown(editor, { profile: 'preserve' })` reads the current
 editor body and omits the terminal empty paragraph that Tiptap keeps as an
 editing caret after an atomic block.
+
+The WYSIWYG editor enables one common slash menu by default. It owns these ten
+commands: Heading 1–3, Quote, Bullet list, Numbered list, Task list, Table,
+Code block, and Divider. The menu filters its localized labels, descriptions,
+and keywords without an extra search input. It opens only at an empty paragraph
+line start, never inside inline text, code, or IME composition; selecting a
+command replaces the slash/query range and leaves the cursor ready for editing.
+Escape closes only the menu and preserves the draft. The menu exposes a
+listbox/option ARIA relationship, keeps the active option synchronized across
+keyboard and pointer input, scrolls the active option into view, and flips or
+clamps to the viewport and clipping ancestors.
+
+Products provide copy with `slash.messages` and may observe its lifecycle with
+`slash.onOpenChange`. Styling is product-owned through these stable classes:
+`markdown-slash-command-popup`, `markdown-slash-command-menu`,
+`markdown-slash-command-options`, `markdown-slash-command-option`, and
+`markdown-slash-command-option-selected`. Pass `slash={false}` for a read-only
+or non-WYSIWYG surface such as `MarkdownViewer`.
 
 Products with a custom editor instance and toolbar can compose the same public
 surface from the `/react` entry point:
@@ -53,6 +73,7 @@ import {
   EditorContent,
   MarkdownEditingSurface,
   MarkdownToolbar,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   type MarkdownTableOptions,
   useMarkdownEditor,
 } from '@akb/markdown-editor/react'
@@ -66,6 +87,7 @@ function ProductEditor({ markdown, onChange, readOnly }) {
     initialMarkdown: markdown,
     editable: !readOnly,
     onChange,
+    slash: { messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES },
   })
 
   return (
@@ -120,8 +142,8 @@ Read-only surfaces do not render image controls. Closing or cancelling the
 description dialog returns focus to the editor.
 
 `MarkdownToolbar` owns the default Paragraph, Heading 1–3, bold, italic,
-strikethrough, inline code, list, blockquote, code block, horizontal rule,
-table insertion, link, and undo/redo controls. It reads the same editor state
+strikethrough, inline code, bullet/numbered/task lists, blockquote, code block,
+horizontal rule, table insertion, link, and undo/redo controls. It reads the same editor state
 and commands as the editor, preserves the current selection while the link
 popup receives focus, restores the selection on cancel, validates before
 mutating, and exposes roving keyboard focus. Product-specific controls can be
@@ -255,6 +277,12 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.9.0` public contract adds the shared ten-command slash menu, localized
+filtering, keyboard/pointer selection, ARIA state, viewport/clipping-boundary
+placement, IME/read-only guards, and the shared task-list command used by the
+toolbar and slash menu. It removes the former `onSlash` callback in favor of
+the menu contract described above.
 
 The `0.8.0` public contract adds the shared image upload surface, mapped
 insertion/replacement targets, per-file retry/cancellation state, and the

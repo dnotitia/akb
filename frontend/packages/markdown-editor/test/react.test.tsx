@@ -47,20 +47,17 @@ describe('React surfaces', () => {
     expect(surfaces[1]).toHaveAttribute('contenteditable', 'false')
   })
 
-  it('routes slash keyboard input to the shared callback while preserving the slash', async () => {
+  it('opens the shared slash menu while preserving the trigger query', async () => {
     const user = userEvent.setup()
-    const slashCalls: number[] = []
-    const { container } = render(
-      <MarkdownEditor markdown="본문" onSlash={({ position }) => slashCalls.push(position)} />,
-    )
+    const { container } = render(<MarkdownEditor markdown="" />)
 
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toBeInTheDocument())
     const editor = container.querySelector('.ProseMirror') as HTMLElement
     editor.focus()
     await user.keyboard('/')
 
-    expect(slashCalls).toHaveLength(1)
-    expect(editor).toHaveTextContent('/본문')
+    expect(await screen.findByTestId('slash-command-menu')).toBeInTheDocument()
+    expect(editor).toHaveTextContent('/')
   })
 
   it('updates state hooks and commands through the same editor instance', async () => {
@@ -183,7 +180,6 @@ describe('React surfaces', () => {
 
   it('edits the same Markdown draft in Source and reflects external values and readOnly', async () => {
     const user = userEvent.setup()
-    const onSlash = vi.fn()
     const sourceChanges = vi.fn()
     let activeEditor: ReturnType<typeof useMarkdownEditor> = null
 
@@ -194,7 +190,6 @@ describe('React surfaces', () => {
         initialMarkdown: '# Original',
         editable: !readOnly,
         onChange: setMarkdown,
-        onSlash,
       })
       useEffect(() => {
         activeEditor = editor
@@ -236,7 +231,7 @@ describe('React surfaces', () => {
     expect(source).toHaveValue('# Original')
     expect(view.queryByRole('button', { name: 'Formatting tool' })).not.toBeInTheDocument()
     await user.type(source, '/')
-    expect(onSlash).not.toHaveBeenCalled()
+    expect(view.queryByTestId('slash-command-menu')).not.toBeInTheDocument()
     const editedMarkdown = '## Edited\n\n![diagram](/api/assets/00000000-0000-4000-8000-000000000001)\n\n<!-- keep -->'
     fireEvent.compositionStart(source)
     fireEvent.change(source, { target: { value: editedMarkdown } })
@@ -247,7 +242,6 @@ describe('React surfaces', () => {
       editedMarkdown,
       editor,
     )
-    expect(onSlash).not.toHaveBeenCalled()
     expect(view.getByTestId('markdown-value')).toHaveTextContent('<!-- keep -->')
 
     await user.click(view.getByRole('button', { name: 'WYSIWYG' }))

@@ -5,6 +5,7 @@ import {
   MarkdownToolbar,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
+  type MarkdownSlashCommandOptions,
   type MarkdownImageMenuOptions,
   type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
@@ -28,6 +29,38 @@ import {
 import { cn } from "@/lib/utils";
 
 type MarkdownEditorInstance = NonNullable<ReturnType<typeof useMarkdownEditor>>;
+
+const AKB_MARKDOWN_SLASH_OPTIONS: MarkdownSlashCommandOptions = {
+  messages: {
+    header: "Insert block",
+    escapeHint: "Esc",
+    sections: { text: "TEXT", lists: "LISTS", structure: "STRUCTURE" },
+    footer: {
+      navigation: "↑↓ Navigate",
+      insert: "↵ Insert",
+      close: "Esc Close",
+    },
+    empty: "No matching blocks.",
+    commands: {
+      heading1: { label: "Heading 1", description: "Large section heading" },
+      heading2: { label: "Heading 2", description: "Medium section heading" },
+      heading3: { label: "Heading 3", description: "Small section heading" },
+      quote: { label: "Quote", description: "Call out a quotation" },
+      bulletList: {
+        label: "Bullet list",
+        description: "Create an unordered list",
+      },
+      numberedList: {
+        label: "Numbered list",
+        description: "Create an ordered list",
+      },
+      taskList: { label: "Task list", description: "Track work with checkboxes" },
+      table: { label: "Table", description: "Insert a basic 3 × 2 table" },
+      codeBlock: { label: "Code block", description: "Add a fenced code block" },
+      divider: { label: "Divider", description: "Separate sections with a rule" },
+    },
+  },
+};
 
 const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace"> = {
   labels: {
@@ -471,6 +504,7 @@ export function MarkdownEditor({
     profile: "preserve",
     editable: !readOnly,
     onChange: handleChange,
+    slash: AKB_MARKDOWN_SLASH_OPTIONS,
   });
 
   React.useEffect(() => {

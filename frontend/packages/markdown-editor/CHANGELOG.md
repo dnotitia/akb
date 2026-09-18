@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Add the shared ten-command slash menu with localized filtering, keyboard and
+  pointer selection, ARIA state, viewport/clipping-boundary placement, active
+  option scrolling, Escape handling, and IME/read-only guards.
+- Add the shared task-list command to `MarkdownCommands`, state, toolbar, and
+  slash menu while keeping formatting ownership in the package.
+- Replace the obsolete `onSlash` callback with the public slash menu options.
+
 ## 0.8.0
 
 - Add the shared image upload surface for file selection, standalone image

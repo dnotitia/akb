@@ -1,6 +1,6 @@
 {
   "name": "@akb/markdown-editor",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Product-neutral Tiptap Markdown editor, viewer, and conformance contract for AKB and Reef.",
   "type": "module",
   "sideEffects": false,
@@ -51,6 +51,7 @@
     "@tiptap/pm": "3.31.3",
     "@tiptap/react": "3.31.3",
     "@tiptap/starter-kit": "3.31.3",
+    "@tiptap/suggestion": "3.31.3",
     "katex": "0.17.0",
     "lucide-react": "1.7.0"
   },
