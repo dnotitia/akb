@@ -115,6 +115,10 @@ async def _corpus(monkeypatch, *, shape: str = "posting"):
         await admin.close()
 
 
+async def _no_sleep(_seconds):
+    """Retries are asserted by count, not by wall clock."""
+
+
 async def _write_old(store, pool, chunk_id: uuid.UUID, content: str, idx: int) -> None:
     """One chunk through the pre-flip write path (`posting` shape)."""
     terms, weights = await sparse_encoder.encode_document(content)
@@ -320,6 +324,69 @@ async def test_splitting_the_write_changes_nothing_but_the_wall_clock(
                 )
             }
         assert got == serial, f"writers={writers} 가 다른 벡터를 썼다"
+
+
+async def test_a_deadlock_is_retried_rather_than_ending_the_sweep(monkeypatch):
+    """Concurrency made this reachable, so the sweep has to survive it.
+
+    Every writer's encoding upserts into `bm25_vocab`, and so does the stats
+    recompute and the indexer. Live, at four writers with sixteen encodes each,
+    a four-process cycle formed and the sweep died after 4% of the corpus —
+    having looked alive the whole time, because the liveness check matched its
+    own command line.
+
+    Postgres picks a victim and aborts it; the work is idempotent and the next
+    attempt meets a committed transaction instead of a live one. What is
+    asserted here is that the retry happens and that the batch still lands.
+    """
+    from scripts import backfill_bm25_vector as bf
+
+    async with _corpus(monkeypatch) as (store, pool):
+        ids = [uuid.UUID(int=i) for i in range(1, 7)]
+        for n, cid in enumerate(ids):
+            await _write_old(store, pool, cid, f"term{n} shared", n)
+        await _prepare(pool, _SCHEMA)
+
+        real_once = bf._apply_once
+        calls: list[int] = []
+
+        async def flaky(pool_, schema, rows):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+            return await real_once(pool_, schema, rows)
+
+        monkeypatch.setattr(bf, "_apply_once", flaky)
+        monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+
+        assert await bf._pass(pool, _SCHEMA, None, 1) == len(ids)
+        assert len(calls) == 3, f"재시도가 {len(calls)-1}번 — 2번이어야 한다"
+
+        nulls, _ = await _counts(pool, _SCHEMA, None)
+        assert nulls == 0
+
+
+async def test_a_deadlock_that_never_clears_is_reported_not_swallowed(monkeypatch):
+    """Retrying forever would turn a real problem into a silent stall — which
+    is the shape this whole episode already took once."""
+    from scripts import backfill_bm25_vector as bf
+
+    async with _corpus(monkeypatch) as (store, pool):
+        await _write_old(store, pool, uuid.uuid4(), "anything", 0)
+        await _prepare(pool, _SCHEMA)
+
+        tries: list[int] = []
+
+        async def always(pool_, schema, rows):
+            tries.append(1)
+            raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+
+        monkeypatch.setattr(bf, "_apply_once", always)
+        monkeypatch.setattr(bf.asyncio, "sleep", _no_sleep)
+
+        with pytest.raises(asyncpg.exceptions.DeadlockDetectedError):
+            await bf._pass(pool, _SCHEMA, None, 1)
+        assert len(tries) == bf._DEADLOCK_RETRIES
 
 
 async def test_the_sweep_walks_past_a_batch_boundary(monkeypatch):

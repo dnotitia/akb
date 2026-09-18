@@ -68,6 +68,14 @@ specifically; the proxy has its own log in
   `--prepare` now adds only the column and `--index` builds it at the end.
   `--writers` overlaps the disk waits: one writer measured 4-16 rows/s, two
   32.3 and 32.5 across two orderings, four 45-62.
+- A deadlock is retried instead of ending the sweep, and each writer encodes
+  four chunks at a time rather than sixteen. The concurrency the previous point
+  added made this reachable: every encode upserts into `bm25_vocab`, which the
+  stats recompute and the indexer also write, and at four writers with sixteen
+  encodes each a four-process cycle formed and the sweep died 4% in. Retrying
+  is the answer rather than avoiding the collision — Postgres aborts one side
+  and the next attempt meets a committed transaction — but the retry is bounded,
+  because retrying forever would turn a real problem into a silent stall.
 
 
 ### A sparse shape the code does not handle now fails loudly
