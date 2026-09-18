@@ -93,6 +93,22 @@ describe('markdown @ reference menu', () => {
     expect(editor.getMarkdown()).toContain('continue')
   })
 
+  it('keeps long labels inspectable when the visual label is constrained', async () => {
+    const title = 'akb_reference_adapter_release_checklist_2026_09_final_review_notes.md'
+    const editor = mountEditor({
+      search: vi.fn(async () => [
+        { id: 'long-file', kind: 'file' as const, title, target: 'akb://team/file/long-file.md' },
+      ]),
+    })
+
+    await act(async () => editor.commands.insertContent('@'))
+    const option = await screen.findByRole('option')
+    const label = option.querySelector('.markdown-reference-label')
+
+    expect(option).toHaveAttribute('aria-label', title)
+    expect(label).toHaveAttribute('title', title)
+  })
+
   it('uses the same candidate for pointer and keyboard selection and preserves undo/redo', async () => {
     const adapter: MarkdownReferenceAdapter = {
       search: vi.fn(async () => candidates),

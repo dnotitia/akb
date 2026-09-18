@@ -324,7 +324,9 @@ function MarkdownReferenceMenu({
                     >
                       <Icon className="markdown-reference-icon" aria-hidden="true" />
                       <span className="markdown-reference-copy">
-                        <span className="markdown-reference-label">{candidate.title}</span>
+                        <span className="markdown-reference-label" title={candidate.title}>
+                          {candidate.title}
+                        </span>
                         {detail && <span className="markdown-reference-description">{detail}</span>}
                       </span>
                     </button>

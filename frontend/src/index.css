@@ -1055,12 +1055,17 @@ body::before {
 }
 .markdown-reference-copy {
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
   gap: 0.125rem;
 }
 .markdown-reference-label {
+  min-width: 0;
+  overflow: hidden;
   font-size: 0.8125rem;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .markdown-reference-description {
   overflow: hidden;
