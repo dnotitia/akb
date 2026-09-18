@@ -60,6 +60,12 @@ async def connection():
     migration = _load_migration("084_bm25_corpus_revision.py")
     assert migration is not None
     await migration.migrate(conn)
+    # `recompute_stats` keeps its cursor and partial term counts in real
+    # tables now (akb#616), so this fixture needs 111 for the same reason it
+    # needs 005 — the schema it exercises is no longer implied by init.sql.
+    resume_tables = _load_migration("111_bm25_recompute_resume.py")
+    assert resume_tables is not None
+    await resume_tables.migrate(conn)
 
     vault_name = f"bm25-revision-{uuid.uuid4().hex[:10]}"
     vault_id = await conn.fetchval(
