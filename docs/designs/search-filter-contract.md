@@ -96,6 +96,12 @@ so a pending request is not briefly displayed as a genuine empty response.
   when none were. It is page-relative, not a pool or corpus figure, and holds
   only causes that are not faults — a component that failed belongs to
   `degraded` instead, and no cause is reported in both places.
+- `recovered` is its fault counterpart: internal cause name → how many
+  candidates a fault removed from this page before the refill loop replaced
+  them, `{}` when the page needed no repair. It is populated only when the page
+  is complete, so it never names a fault `degradation_reason` is already
+  naming. It reports corpus health, not a problem with the response, and is not
+  a reason to retry, warn, or withhold results.
 - Grep distinguishes returned resources/lines from exact total matching
   resources/lines. Explicit File opt-in adds resource aggregates while keeping
   Document aggregates Document-only. Native results preserve type, revision,
@@ -104,10 +110,14 @@ so a pending request is not briefly displayed as a genuine empty response.
 - A degraded response is incomplete, whether it contains results or not. It must
   never be labelled a genuine zero-match. Retry is available without changing the
   query, and raw server diagnostic details are not displayed as user guidance.
-  Degradation reports a component that failed or a hit lost to a stale source
-  row; a filter is not one. Excluding the documents the request asked to exclude
-  — the default `unarchived` archive scope, for one — leaves the response
-  unflagged and is reported in `excluded` rather than in a banner.
+  Degradation reports a component that failed, or a hit lost to a stale source
+  row that left the page short of the requested limit. Two things are not
+  degradation. A filter is not: excluding the documents the request asked to
+  exclude — the default `unarchived` archive scope, for one — leaves the
+  response unflagged and is reported in `excluded` rather than in a banner. Nor
+  is a fault the search already made good: when the refill loop replaced the
+  dropped candidate the page is complete, so the response is unflagged and the
+  fault is reported in `recovered`.
 - During a same-mode refresh the previous ledger is labelled busy; request
   generations prevent late responses from replacing newer results.
 

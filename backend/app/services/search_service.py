@@ -114,6 +114,29 @@ def _public_exclusions(dropped: Mapping[str, int]) -> dict[str, int]:
     }
 
 
+def _fault_drops(dropped: Mapping[str, int]) -> dict[str, int]:
+    """The drops that ARE faults — the exact complement of `_public_exclusions`.
+
+    Two response fields are built from this one dict, and which one gets it is
+    decided by whether the page came back short (akb#611): `degradation_reason`
+    when the fault cost the caller a result, `recovered` when the refill loop
+    replaced it. Deriving both from the same call is what keeps them naming the
+    same set — a cause classified here cannot appear in `excluded`, and a cause
+    named there cannot appear here, because `NON_DEGRADING_DROP_CAUSES` is the
+    single table both consult.
+
+    Keyed by the internal cause name, deliberately: these five causes already
+    reach the caller under exactly these names inside `degradation_reason`, and
+    giving them a second public word would make one fault answer to two names
+    depending on whether the page happened to fill.
+    """
+    return {
+        cause: count
+        for cause, count in sorted(dropped.items())
+        if cause not in NON_DEGRADING_DROP_CAUSES
+    }
+
+
 def active_document_source_type(
     *,
     backend: str,
@@ -1166,27 +1189,60 @@ class SearchService:
             for cause, count in more_dropped.items():
                 dropped[cause] = dropped.get(cause, 0) + count
         results = results[:limit]
-        # Only the fault causes reach the flag. `archive_scope_excluded` stays
-        # in `dropped` and is still named by the hydration WARNING, which is
-        # what makes a genuinely short page readable — but it no longer claims
-        # the retrieval service failed (akb#604). Two of the three consumers of
-        # `degraded` discard the whole result set on it, so a page the refill
-        # loop completed was being thrown away because one archived document
-        # happened to pass through the pool.
-        faults = {k: v for k, v in dropped.items() if k not in NON_DEGRADING_DROP_CAUSES}
+        returned = len(results)
+        # Only the fault causes can reach the flag. `archive_scope_excluded`
+        # stays in `dropped` and is still named by the hydration WARNING, which
+        # is what makes a genuinely short page readable — but it no longer
+        # claims the retrieval service failed (akb#604). Two of the three
+        # consumers of `degraded` discard the whole result set on it, so a page
+        # the refill loop completed was being thrown away because one archived
+        # document happened to pass through the pool.
+        faults = _fault_drops(dropped)
+        # …and a fault only degrades the response if it actually cost the caller
+        # a result (akb#611). The refill loop above drains the ENTIRE spare pool
+        # before it will return a short page, so `returned == limit` is exactly
+        # the state in which every fault drop was replaced, and `returned <
+        # limit` is exactly the state in which the pool ran out with the page
+        # still unfilled. That equivalence is what makes this predicate the
+        # right one rather than an approximation:
+        #
+        #   returned <  limit  →  the pool was exhausted, so the page holds
+        #                         `total_matches` minus every drop. Without the
+        #                         faults it would have held
+        #                         `min(limit, total_matches - filtered)`, which
+        #                         is strictly larger whenever a fault occurred.
+        #                         The fault cost at least one result. Degraded.
+        #   returned == limit  →  the caller received every result they asked
+        #                         for. The cost is zero by construction, whether
+        #                         one candidate was dropped or twenty.
+        #
+        # `returned < limit` on its own would be wrong in the other direction: a
+        # corpus with fewer matches than `limit` returns a short page with
+        # nothing wrong with it, and a page shortened by the archive filter is
+        # akb#604 all over again. The conjunction is what names the fault case
+        # and only the fault case.
+        page_short_of_limit = returned < limit
         hydrate_reason = (
-            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(faults.items()))}" if faults else None
+            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in faults.items())}"
+            if faults and page_short_of_limit else None
         )
         if hydrate_reason is not None and degraded_reason is None:
             degraded_reason = hydrate_reason
-        # The other half of the same split (akb#608): the fault causes went to
-        # the flag above, the non-fault ones go to the caller as a count that
-        # names them. `dropped` was accumulated across the initial hydration
-        # and every refill pass, so this counts candidates considered for THIS
-        # page — which is the number that explains a page shorter than `limit`.
+        # The compensated half of the same split. A fault the refill loop paid
+        # for is not a failure of this response, but "a chunk pointed at a row
+        # that is gone" is still a corpus-integrity signal, and dropping it
+        # would trade one blind spot for another. It is reported as a count
+        # instead of a flag, and only when the page is complete, so each fault
+        # is stated exactly once: `degradation_reason` when it cost something,
+        # `recovered` when it did not.
+        recovered = {} if page_short_of_limit else faults
+        # The non-fault half (akb#608): the causes that belong to the REQUEST go
+        # to the caller as a count that names them. `dropped` was accumulated
+        # across the initial hydration and every refill pass, so this counts
+        # candidates considered for THIS page — which is the number that
+        # explains a page shorter than `limit`.
         excluded = _public_exclusions(dropped)
         phases["hydration"] = time.perf_counter() - phase_started
-        returned = len(results)
         _log_search_timing(started, phases, returned)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
@@ -1205,6 +1261,7 @@ class SearchService:
             degraded=degraded_reason is not None,
             degradation_reason=degraded_reason,
             excluded=excluded,
+            recovered=recovered,
             results=results,
         )
 

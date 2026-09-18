@@ -494,10 +494,16 @@ const searchEnvelope: SearchResponse = {
   // reads `excluded` and tests it for emptiness instead of narrowing an
   // optional first — which is the absent/zero distinction the field removes.
   excluded: { archived: 1 },
+  // Required for the same reason (akb#611), and the counterpart to the above:
+  // `excluded` names what the request removed, `recovered` what a fault removed
+  // before the search replaced it. A page carrying `recovered` is complete, so
+  // it is not degraded — the count is corpus health, not an incident.
+  recovered: { hydration_miss: 2 },
   results: [{ source_type: "document", uri: "akb://eng/doc/readme.md", vault: "eng", path: "readme.md", title: "Readme", tags: [], score: 1 }],
 };
 searchEnvelope.kind satisfies "search";
 searchEnvelope.excluded satisfies Record<string, number>;
+searchEnvelope.recovered satisfies Record<string, number>;
 
 type RawGraphResponse = AkbOperationResponse<operations["graphNeighbors"]>;
 const rawGraphResponse: RawGraphResponse = {
