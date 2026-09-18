@@ -149,4 +149,25 @@ describe("AKB Markdown target adapter", () => {
       "Search results are temporarily unavailable.",
     );
   });
+
+  it("does present the results a degraded retrieval still carries", async () => {
+    apiMocks.searchDocs.mockResolvedValue({
+      degraded: true,
+      results: [
+        { uri: DOCUMENT, title: "Guide", matched_section: "body" },
+        { uri: "akb://other/coll/private/doc/guide.md", title: "Other vault" },
+      ],
+    });
+    const adapters = createAkbMarkdownAdapters({ vault: "team" });
+
+    await expect(adapters.search.search("guide", { vault: "team" })).resolves.toEqual([
+      {
+        id: DOCUMENT,
+        title: "Guide",
+        snippet: "body",
+        target: DOCUMENT,
+        kind: "document",
+      },
+    ]);
+  });
 });
