@@ -7,6 +7,34 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### A third sparse shape, `vchord`, stores BM25 terms in an index
+
+- `vector_store_sparse_shape` gains `vchord`, which keeps each chunk's terms in
+  a single `bm25vector` column on `chunks` and lets a block-max BM25 index own
+  the scoring, instead of the `posting` side table's row per (term, document).
+  Nothing selects it: the default stays `posting`, and the branch is
+  unreachable until an operator chooses it on a database that has the
+  extension (`deploy/postgres/Dockerfile` builds one).
+- The weight convention is no longer a property of the driver alone. `pgvector`
+  bakes k1/b into document weights for `posting` and `arrays`; for `vchord` the
+  index applies them, so the encoder must emit raw term frequencies. Sending
+  pre-baked weights there would saturate twice — the 0.7.7 bug, which fails as
+  worse ranking and never as an error. `encode_document` now takes the shape
+  from the store rather than from global settings, because the two can differ:
+  the bench harness builds one store per shape while the setting never moves.
+- Filtered searches choose their query shape by selectivity. Letting the index
+  lead is 69x faster when the filter keeps 18% of the corpus; materialising the
+  candidates first is 21x faster at 0.19%, and they converge below 0.05%.
+  `plan_cache_mode` is pinned to a custom plan for the duration: asyncpg always
+  prepares, and a generic plan built without the filter's values took the same
+  statement from 0.8ms to 1501ms on the eleventh execution.
+- The result is filtered on the sign of the score. `<&>` orders the whole table
+  rather than filtering it — a document holding no query term scores exactly
+  `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
+  chunks whenever fewer than k match. `posting` never had this because it joins
+  on the term.
+
+
 ### A sparse shape the code does not handle now fails loudly
 
 - `vector_store_sparse_shape` was branched on as a two-way `if` in four places,

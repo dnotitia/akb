@@ -43,6 +43,22 @@ and the scoring, nothing else. Its vector type is built from an integer array
 of term ids, which is what AKB's `bm25_vocab` already mints, so the Korean
 tokenizer stays exactly where it is.
 
+## Before moving the extension pin
+
+The sparse query path filters on the sign of the score: a document holding any
+query term scores strictly negative, one holding none scores exactly `-0`, and
+the filter keeps the negatives. That holds because this extension's IDF is a
+log1p variant which stays positive at every document frequency — measured at
+`df = N`, all fifty matching documents still scored below zero.
+
+Classic BM25 IDF, `log((N-df+0.5)/(df+0.5))`, turns negative once a term is in
+more than half the corpus. An extension version that switched to it would make
+the filter discard real matches for common terms, silently and only for the
+terms most queries contain.
+
+So when moving this pin, check that a document containing a query term still
+scores below zero at high document frequency before accepting the bump.
+
 ## Licensing
 
 `vchord_bm25` is published under the GNU Affero General Public License v3 or

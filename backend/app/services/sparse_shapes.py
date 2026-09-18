@@ -19,8 +19,14 @@ from __future__ import annotations
 
 from typing import Literal, get_args
 
-SparseShape = Literal["posting", "arrays"]
+SparseShape = Literal["posting", "arrays", "vchord"]
 
+#: `posting` is the production shape: a side table of (term, document, weight)
+#: rows. `arrays` keeps the same numbers in columns on `chunks` and exists for
+#: the bench harness. `vchord` hands the terms to a block-max BM25 index inside
+#: PostgreSQL and lets it own the scoring, which also changes the weight
+#: convention the encoder must produce — see `sparse_encoder._use_raw_weights`.
+#:
 #: Every member, derived from the type rather than restated beside it. Anything
 #: that needs to enumerate shapes (tests, validation, an operator-facing list)
 #: reads this, so a new member cannot be added to one and missed by the other.

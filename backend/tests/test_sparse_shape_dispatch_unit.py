@@ -56,7 +56,7 @@ def test_the_setting_does_not_restate_the_members():
 
 def test_the_settings_model_refuses_an_unknown_shape():
     with pytest.raises(Exception):
-        Settings(vector_store_sparse_shape="vchord")  # type: ignore[arg-type]
+        Settings(vector_store_sparse_shape="no-such-shape")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("site", ["_do_ensure", "upsert_one", "_search_sparse"])
@@ -80,7 +80,10 @@ def test_the_stats_sampler_names_every_shape():
 
     src = inspect.getsource(sampler.pgvector_relations)
     for shape in SPARSE_SHAPES:
-        assert f'== "{shape}"' in src, f"sampler 가 '{shape}' 를 안 다룬다"
+        # The member has to be named; whether by `==` or by membership in a
+        # tuple is the author's business. What is not allowed is a shape that
+        # reaches the end without ever being mentioned.
+        assert f'"{shape}"' in src, f"sampler 가 '{shape}' 를 안 다룬다"
     assert "assert_never(shape)" in src
 
 

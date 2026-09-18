@@ -468,14 +468,37 @@ _RAW_WEIGHT_DRIVERS: frozenset[str] = frozenset({
 })
 
 
-def _use_raw_weights() -> bool:
-    """True when the active vector_store_driver computes BM25 internally
-    and expects raw TF on the doc side + weight=1.0 on the query side.
-    See module docstring for the convention table."""
-    return settings.vector_store_driver in _RAW_WEIGHT_DRIVERS
+# Pgvector sparse shapes whose store computes BM25 itself. The convention is
+# not a property of the driver alone once one driver can store the terms in
+# more than one way: `pgvector` bakes the weights for `posting` and `arrays`
+# and must NOT for `vchord`, whose index owns k1/b and recomputes the score.
+_RAW_WEIGHT_SHAPES: frozenset[str] = frozenset({"vchord"})
 
 
-async def encode_document(text: str) -> tuple[list[int], list[float]]:
+def _use_raw_weights(sparse_shape: str | None = None) -> bool:
+    """True when the active store computes BM25 internally and expects raw TF
+    on the doc side + weight=1.0 on the query side.
+
+    Keyed on the driver AND, for pgvector, on the sparse shape. Reading the
+    driver alone was correct while every pgvector shape baked its weights;
+    it stops being correct the moment one of them does not, and getting it
+    wrong is the 0.7.7 double-saturation bug again — silently, with no error,
+    just worse ranking. `test_sparse_weight_convention.py` holds the matrix.
+
+    The shape is only consulted for `pgvector`: it is that driver's setting,
+    and a value left over from a previous driver must not change what another
+    driver's encoder produces."""
+    if settings.vector_store_driver in _RAW_WEIGHT_DRIVERS:
+        return True
+    if settings.vector_store_driver == "pgvector":
+        shape = sparse_shape if sparse_shape is not None else settings.vector_store_sparse_shape
+        return shape in _RAW_WEIGHT_SHAPES
+    return False
+
+
+async def encode_document(
+    text: str, *, sparse_shape: str | None = None
+) -> tuple[list[int], list[float]]:
     """Encode a document chunk to a sparse (indices, values) tuple.
 
     Weight convention depends on the active driver (see module
@@ -488,7 +511,7 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
     term_counts = Counter(tokens)
     vocab = await get_or_create_term_ids(term_counts.keys())
 
-    if _use_raw_weights():
+    if _use_raw_weights(sparse_shape):
         # Raw TF. The downstream driver (seahorse-db) feeds these
         # into Coral's inverted index as raw term frequencies; the
         # BM25 saturation/normalization is applied by the index at
@@ -534,7 +557,9 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
     return indices, values
 
 
-async def encode_query(text: str) -> tuple[list[int], list[float]]:
+async def encode_query(
+    text: str, *, sparse_shape: str | None = None
+) -> tuple[list[int], list[float]]:
     """Encode a query to a sparse (indices, values) tuple. OOV terms
     are dropped; no new terms are registered.
 
@@ -549,7 +574,7 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
     if not vocab:
         return [], []
 
-    if _use_raw_weights():
+    if _use_raw_weights(sparse_shape):
         # Driver-side BM25: query weight = 1.0; the inverted index
         # multiplies by IDF derived from the per-term-df metadata
         # `hybrid_search` ships. OOV-but-in-vocab terms still pass

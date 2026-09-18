@@ -77,7 +77,13 @@ def pgvector_relations() -> tuple[str, ...]:
     shape = settings.vector_store_sparse_shape
     if shape == "posting":
         return ("chunks", "posting")
-    if shape == "arrays":
+    # Spelled as two comparisons rather than `in ("arrays", "vchord")`: mypy
+    # does not narrow a Literal out of a tuple membership test, so the `in`
+    # form leaves `assert_never` holding `Literal['arrays', 'vchord']` and the
+    # type gate goes red. Both keep the sparse terms inside `chunks` — `arrays`
+    # as two columns, `vchord` as one `bm25vector` whose index is an index ON
+    # `chunks` and so already inside `pg_total_relation_size('chunks')`.
+    if shape == "arrays" or shape == "vchord":
         return ("chunks",)
     assert_never(shape)
 

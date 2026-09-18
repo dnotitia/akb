@@ -228,7 +228,9 @@ async def _process_once() -> int:
     for position, (row, dense) in enumerate(zip(batch, embeddings_padded)):
         content = row["content"] or ""
         try:
-            sparse_idx, sparse_vals = await sparse_encoder.encode_document(content)
+            sparse_idx, sparse_vals = await sparse_encoder.encode_document(
+                content, sparse_shape=getattr(store, "sparse_shape", None),
+            )
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"],
