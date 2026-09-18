@@ -7,6 +7,30 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### An interrupted BM25 recompute resumes instead of starting over
+
+- The corpus scan behind `recompute_stats()` kept its partial document
+  frequencies in a session-scoped temporary table and its cursor and running
+  totals in Python locals, so any interruption — a rolling deploy, an OOM, a
+  dropped connection — discarded every document already tokenized. On a large
+  corpus the scan is the expensive part by orders of magnitude and worker
+  shutdown is an absolute deadline, which made routine deployments destroy it.
+- Migration 111 adds `bm25_recompute_run` (one row: cursor, running totals,
+  tokenizer identity, the run's `source_revision`, a resume count) and
+  `bm25_recompute_terms` (the partial per-term frequencies). Each batch commits
+  its term contributions and its advanced cursor in one transaction, so an
+  interruption now costs one batch.
+- The final publish is unchanged and still atomic: a partial scan publishes
+  nothing. Clearing the run happens inside that same transaction, so
+  "published" and "no longer resumable" are one event.
+- A run is resumed only while the tokenizer identity still matches; a tokenizer
+  change discards the partial counts and starts over. The `source_revision`
+  captured when the run first started is carried across resumes, keeping the
+  window in which mid-scan writes are revisited.
+- `/health` gains `bm25.recompute_in_flight`: documents counted, chunks
+  scanned, how many times the run has been resumed, when it started and when it
+  last advanced — `null` when no scan is open.
+
 ### Search degradation is counted
 
 - `/health` gains a `search` section: how many search responses were observed
