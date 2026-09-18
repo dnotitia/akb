@@ -76,6 +76,16 @@ NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
 # resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
 # 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
 NATIVE_CANDIDATE_PAGE_SIZE = 2_000
+# Hydration drop causes that are NOT faults (akb#604). `_hydrate_hits` counts
+# six causes; five of them mean something is wrong or stale and belong on the
+# degradation flag. `archive_scope_excluded` is the odd one out: it belongs to
+# the REQUEST, not to a fault — the caller asked for the default `unarchived`
+# scope and hydration gave them exactly that. A filter doing its job is part of
+# the query, which is why neither Elasticsearch (`_shards.failed`, `timed_out`)
+# nor Solr (`partialResults`) raises a partial/failure signal for one. The
+# counter itself is unchanged and still logged; only the conclusion drawn from
+# it changed.
+NON_DEGRADING_DROP_CAUSES = frozenset({"archive_scope_excluded"})
 
 
 def active_document_source_type(
@@ -1108,9 +1118,10 @@ class SearchService:
         # backward-compatible (doc_id == source_id) while adding table/file.
         phase_started = time.perf_counter()
         # `dropped` counts hits lost between retrieval and hydration by cause
-        # (workbench #1069 G3): any non-empty drop set marks the response
-        # degraded so `total_matches > 0, returned == 0` can never again read
-        # as a silent zero-match.
+        # (workbench #1069 G3), so `total_matches > 0, returned == 0` can never
+        # again read as a silent zero-match. A FAULT cause marks the response
+        # degraded; a cause in `NON_DEGRADING_DROP_CAUSES` does not, because a
+        # filter honouring the request is not a failure (akb#604).
         #
         # The page is the first `limit` deduped hits; `spare` is the rest of
         # the prefetch pool. Hydration can drop rows — archive scope (akb#530),
@@ -1129,8 +1140,16 @@ class SearchService:
             for cause, count in more_dropped.items():
                 dropped[cause] = dropped.get(cause, 0) + count
         results = results[:limit]
+        # Only the fault causes reach the flag. `archive_scope_excluded` stays
+        # in `dropped` and is still named by the hydration WARNING, which is
+        # what makes a genuinely short page readable — but it no longer claims
+        # the retrieval service failed (akb#604). Two of the three consumers of
+        # `degraded` discard the whole result set on it, so a page the refill
+        # loop completed was being thrown away because one archived document
+        # happened to pass through the pool.
+        faults = {k: v for k, v in dropped.items() if k not in NON_DEGRADING_DROP_CAUSES}
         hydrate_reason = (
-            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
+            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(faults.items()))}" if faults else None
         )
         if hydrate_reason is not None and degraded_reason is None:
             degraded_reason = hydrate_reason
@@ -1727,7 +1746,12 @@ class SearchService:
         empty/partial result is degraded — not a true zero-match. The store is
         a derived view, so a failure never raises to the caller; PG truth is
         untouched. Previously every failure was swallowed into a silent ``[]``
-        with no signal (issue #189)."""
+        with no signal (issue #189).
+
+        This leg is not the only producer of the response-level flag: hydration
+        raises it too, for a hit whose source row is gone or stale. What both
+        producers have in common is that something WENT WRONG — a filter
+        honouring the request never sets it (akb#604)."""
         sparse_failed = False
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
