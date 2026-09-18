@@ -33,6 +33,31 @@ specifically; the proxy has its own log in
   `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
   chunks whenever fewer than k match. `posting` never had this because it joins
   on the term.
+- A document with no content-bearing terms is stored as an empty vector rather
+  than left NULL. The two are not the same statement: `NULL` means nothing has
+  encoded the row yet, which is what lets a backfill over an existing corpus
+  say exactly how much work is left. It costs nothing at search time — `'{}'`
+  scores `-0` and the sign filter above drops it, measured with five matches
+  against ten thousand empty rows under `LIMIT 10`.
+
+### `scripts/backfill_bm25_vector.py` fills the column on an existing corpus
+
+- A corpus indexed under `posting` has `sparse_bm25` empty, and those rows are
+  excluded from sparse search — so flipping the shape on a populated database
+  would hide every existing chunk until something filled it in. The script
+  fills it ahead of the flip, while `posting` is still serving, so there is no
+  window in which search is worse.
+- It needs no progress table and no dual write. `IS NULL` is the queue, so an
+  interrupted run resumes by asking again; and because the `posting` write path
+  stamps `indexed_at` on every write without touching `sparse_bm25`, a `--since`
+  pass finds both what was inserted and what was rewritten while the previous
+  pass ran. Convergence is the run that writes zero.
+- The index is built `CONCURRENTLY`, outside `_do_ensure`. That method runs its
+  DDL in one transaction, and a build over a corpus this size holds a
+  `ShareLock` against every INSERT for its duration.
+- Writes are conditioned on the row still holding the content that was encoded,
+  so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
+  than being stamped with tokens from text it no longer has.
 
 
 ### A sparse shape the code does not handle now fails loudly
