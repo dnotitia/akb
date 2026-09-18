@@ -118,7 +118,6 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
     element,
     editable = true,
     onChange,
-    onSlash,
   } = options
 
   const resolvedElement =
@@ -126,7 +125,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
 
   return new Editor({
     element: resolvedElement,
-    extensions: createMarkdownExtensions({ profile, onSlash }),
+    extensions: createMarkdownExtensions({ profile }),
     content: initialMarkdown,
     contentType: 'markdown',
     editable,
@@ -233,6 +232,7 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
     toggleCode: () => editor.commands.toggleCode(),
     toggleBulletList: () => editor.commands.toggleBulletList(),
     toggleOrderedList: () => editor.commands.toggleOrderedList(),
+    toggleTaskList: () => editor.commands.toggleTaskList(),
     toggleBlockquote: () => editor.commands.toggleBlockquote(),
     toggleCodeBlock: () => editor.commands.toggleCodeBlock(),
     setHorizontalRule: () => editor.commands.setHorizontalRule(),
