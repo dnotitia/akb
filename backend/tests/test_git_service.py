@@ -715,6 +715,64 @@ def test_manual_fixed_ref_history_batch_respects_same_path_recreate_boundary(
     assert [entry["legacy_git_oid"] for entry in batched[0]["history"]] == [recreated]
 
 
+def test_file_log_real_fixture_keeps_external_history_and_manual_boundary(
+    git_service: GitService,
+) -> None:
+    """A real path lineage supports both source-specific history policies."""
+    name = f"history_boundary_{uuid.uuid4().hex[:8]}"
+    git_service.init_vault(name)
+    upstream = _commit_file_at(
+        git_service,
+        name,
+        "notes/imported.md",
+        "upstream body\n",
+        "upstream create",
+        "2024-01-01T00:00:00+0000",
+    )
+    deleted = _commit_file_at(
+        git_service,
+        name,
+        "notes/imported.md",
+        None,
+        "upstream delete",
+        "2024-01-02T00:00:00+0000",
+    )
+    recreated = _commit_file_at(
+        git_service,
+        name,
+        "notes/imported.md",
+        "recreated body\n",
+        "local recreate",
+        "2024-01-03T00:00:00+0000",
+    )
+    repo = Repo(str(git_service._bare_path(name)))
+    try:
+        created_at_epoch = repo.commit(recreated).committed_date
+    finally:
+        repo.close()
+
+    # An external import's local created_at is later than its upstream commits;
+    # omitting the boundary keeps the complete upstream path history visible.
+    external_history = git_service.file_log(
+        name, "notes/imported.md", max_count=10, since_epoch=None
+    )
+    assert [entry["hash"] for entry in external_history] == [
+        recreated[:12],
+        deleted[:12],
+        upstream[:12],
+    ]
+
+    # Native/manual documents still use created_at as the delete/recreate
+    # lineage boundary, so the prior document cannot leak into history.
+    manual_history = git_service.file_log(
+        name,
+        "notes/imported.md",
+        max_count=10,
+        since_epoch=created_at_epoch,
+    )
+    assert [entry["hash"] for entry in manual_history] == [recreated[:12]]
+
+
 def test_manual_fixed_ref_history_stops_at_recorded_current_commit(
     git_service: GitService,
 ) -> None:

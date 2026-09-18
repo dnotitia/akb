@@ -163,7 +163,7 @@ export const HistoryStates: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByRole("button", { name: /View document at commit story-a/i }));
+    await userEvent.click(canvas.getByRole("button", { name: /View version story-a/i }));
     await expect(canvas.getByText("codex")).toBeVisible();
   },
 };

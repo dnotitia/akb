@@ -54,7 +54,7 @@ async function expectVaultShell(canvasElement: HTMLElement) {
 async function expectGraphVaultShell(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-  await expect(canvas.queryByRole("tree", { name: "akb explorer" })).not.toBeInTheDocument();
+  await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
 }
 
 export const NewDocumentBlank: Story = {
@@ -67,9 +67,9 @@ export const NewDocumentBlank: Story = {
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "New document." })).toBeInTheDocument();
-    await expect(canvas.getByRole("button", { name: /Create document/i })).toBeDisabled();
+    const dialog = within(document.body);
+    await expect(await dialog.findByRole("dialog")).toBeInTheDocument();
+    await expect(dialog.getByRole("button", { name: /Create document/i })).toBeDisabled();
     await expectVaultShell(canvasElement);
   },
 };
@@ -86,9 +86,9 @@ export const NewDocumentPrefilledCollection: Story = {
   },
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByDisplayValue("runbooks")).toBeInTheDocument();
-    await expect(await canvas.findByText("Existing collection")).toBeInTheDocument();
+    const dialog = within(document.body);
+    await expect(await dialog.findByDisplayValue("runbooks")).toBeInTheDocument();
+    await expect(await dialog.findByText("Existing collection")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -121,7 +121,7 @@ export const TablePreview: Story = {
       handlers: [
         ...resourceShellHandlers,
         http.get(`${API}/tables/akb`, () => HttpResponse.json({ items: tableCatalog })),
-        http.post(`${API}/tables/akb/sql`, () =>
+        http.get(`${API}/tables/akb/releases/rows`, () =>
           HttpResponse.json({
             columns: ["version", "date", "status", "owner"],
             items: tableRows,
@@ -162,7 +162,7 @@ export const TableEmpty: Story = {
         http.get(`${API}/tables/akb`, () =>
           HttpResponse.json({ items: [{ ...tableCatalog[0], row_count: 0 }] }),
         ),
-        http.post(`${API}/tables/akb/sql`, () =>
+        http.get(`${API}/tables/akb/releases/rows`, () =>
           HttpResponse.json({ columns: ["version", "date"], items: [], total: 0 }),
         ),
       ],
@@ -184,7 +184,7 @@ export const TableLoading: Story = {
       handlers: [
         ...resourceShellHandlers,
         http.get(`${API}/tables/akb`, () => HttpResponse.json({ items: tableCatalog })),
-        http.post(`${API}/tables/akb/sql`, async () => {
+        http.get(`${API}/tables/akb/releases/rows`, async () => {
           await delay("infinite");
           return HttpResponse.json({ columns: [], items: [], total: 0 });
         }),
@@ -207,7 +207,7 @@ export const TableQueryError: Story = {
       handlers: [
         ...resourceShellHandlers,
         http.get(`${API}/tables/akb`, () => HttpResponse.json({ items: tableCatalog })),
-        http.post(`${API}/tables/akb/sql`, () =>
+        http.get(`${API}/tables/akb/releases/rows`, () =>
           HttpResponse.json({ detail: "permission denied for table releases" }, { status: 403 }),
         ),
       ],
@@ -327,8 +327,9 @@ export const GraphOverview: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("complementary", { name: "Graph controls" })).toBeInTheDocument();
-    await expect(await canvas.findByText(/Showing the 3 most-connected of 6 nodes/i)).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Knowledge graph" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("main", { name: "Graph exploration workspace" })).toBeInTheDocument();
+    await expect(await canvas.findByText(/Showing 3 of 6 resources/i)).toBeInTheDocument();
     await expectGraphVaultShell(canvasElement);
   },
 };
@@ -347,7 +348,7 @@ export const GraphEmpty: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Empty graph")).toBeInTheDocument();
+    await expect(await canvas.findByText("There is nothing to map yet")).toBeInTheDocument();
     await expectGraphVaultShell(canvasElement);
   },
 };
@@ -368,8 +369,8 @@ export const GraphError: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Failed to load graph")).toBeInTheDocument();
-    await expect(await canvas.findByText(/Graph backend unavailable/i)).toBeInTheDocument();
+    await expect(await canvas.findByText("The graph could not be loaded")).toBeInTheDocument();
+    await expect(await canvas.findByRole("button", { name: "Retry" })).toBeInTheDocument();
     await expectGraphVaultShell(canvasElement);
   },
 };

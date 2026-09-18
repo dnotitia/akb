@@ -62,8 +62,8 @@ export const IndexWithExistingVaults: Story = {
     ).toBeInTheDocument();
     await expect(await canvas.findByLabelText("2 vaults available")).toBeInTheDocument();
     await expect((await canvas.findAllByText("Vaults")).length).toBeGreaterThan(1);
-    await expect(canvas.queryByText("Collections")).not.toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(canvas.queryByRole("tree", { name: "akb explorer" })).not.toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
     const createButtons = await canvas.findAllByRole("button", { name: "New vault" });
     await userEvent.click(createButtons[createButtons.length - 1]);
@@ -107,7 +107,7 @@ export const NewVaultWithTemplates: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
     await userEvent.click(await canvas.findByLabelText("Vault template"));
     await expect(await within(document.body).findByText("Engineering workspace")).toBeVisible();

@@ -4,6 +4,7 @@ function resetWorkspaceChrome() {
   if (typeof window === "undefined") return;
   window.localStorage.setItem("akb.treeVisible", "1");
   window.localStorage.setItem("akb.vaultRailCollapsed", "0");
+  window.localStorage.setItem("akb_app_sidebar_compact", "false");
 }
 
 /** Storybook adapter for the canonical application route tree. */

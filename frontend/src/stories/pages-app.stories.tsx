@@ -58,16 +58,14 @@ export const HomeWorkspace: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(
-      await canvas.findByRole("heading", { name: "Find what the team already knows." }),
+      await canvas.findByRole("heading", { name: "Home" }),
     ).toBeInTheDocument();
-    await expect(await canvas.findByText("Recent activity")).toBeInTheDocument();
+    await expect(await canvas.findByText("Recent updates")).toBeInTheDocument();
     await expect(await canvas.findByText("Your vaults")).toBeInTheDocument();
     await expect(await canvas.findByRole("link", { name: "View all vaults" })).toBeInTheDocument();
     await expect(canvas.queryByRole("button", { name: "Show more vaults" })).not.toBeInTheDocument();
-    await expect(await canvas.findByRole("heading", { name: "Connect" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("button", { name: "Mint token" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("tab", { name: "Claude Code" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await within(document.body).findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };
@@ -89,8 +87,16 @@ export const HomeRecentExpandable: Story = {
         defaultVaultListHandler,
         defaultAnyVaultInfoHandler,
         http.get(`${API}/recent`, ({ request }) => {
-          const limit = Number(new URL(request.url).searchParams.get("limit") || "8");
-          return HttpResponse.json({ changes: expandableRecent.slice(0, limit) });
+          const params = new URL(request.url).searchParams;
+          if (params.get("scope") === "watching") {
+            return HttpResponse.json({ scope: "watching", changes: [] });
+          }
+          const page = params.get("cursor") === "page-2" ? expandableRecent.slice(6, 12) : expandableRecent.slice(0, 6);
+          return HttpResponse.json({
+            scope: "all",
+            changes: page,
+            next_cursor: params.get("cursor") === "page-2" ? null : "page-2",
+          });
         }),
       ],
     },
@@ -98,11 +104,10 @@ export const HomeRecentExpandable: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Expandable change 8")).toBeInTheDocument();
-    await expect(canvas.queryByText("Expandable change 9")).not.toBeInTheDocument();
-    await expect(
-      await canvas.findByRole("button", { name: "Show more recent activity" }),
-    ).toBeInTheDocument();
+    await expect(await canvas.findByText("Expandable change 6")).toBeInTheDocument();
+    await expect(canvas.queryByText("Expandable change 7")).not.toBeInTheDocument();
+    const showMore = await canvas.findByRole("button", { name: "Show more" });
+    await expect(showMore).toBeEnabled();
   },
 };
 
@@ -121,9 +126,9 @@ export const HomeEmptyWorkspace: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Nothing touched yet")).toBeInTheDocument();
-    await expect(await canvas.findByText("No vaults yet")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByText("Nothing updated yet")).toBeInTheDocument();
+    await expect(await canvas.findByText("Create your first vault")).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };
@@ -148,10 +153,10 @@ export const HomeRecentLoading: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(
-      await canvas.findByRole("heading", { name: "Find what the team already knows." }),
+      await canvas.findByRole("heading", { name: "Home" }),
     ).toBeInTheDocument();
-    await expect(await canvas.findByText("Recent activity")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByText("Recent updates")).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -173,8 +178,9 @@ export const HomeRecentError: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Couldn't load recent activity")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    const recent = await canvas.findByRole("region", { name: "Recent document updates" });
+    await expect(await within(recent).findByText("Could not load recent updates.")).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -193,8 +199,8 @@ export const SettingsProfile: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Account settings" })).toBeInTheDocument();
-    await expect(await canvas.findByText("Personal workspace")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByText("Public profile")).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };
@@ -219,7 +225,7 @@ export const SettingsTokensError: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Couldn't load tokens")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };
@@ -241,7 +247,7 @@ export const SettingsAdminRoster: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Users")).toBeInTheDocument();
     await expect(await canvas.findByText("writer")).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
 
@@ -259,8 +265,8 @@ export const SettingsAdminPermissionFallback: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Personal workspace")).toBeInTheDocument();
+    await expect(await canvas.findByText("Public profile")).toBeInTheDocument();
     await expect(canvas.queryByRole("tab", { name: "Admin" })).not.toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
   },
 };
