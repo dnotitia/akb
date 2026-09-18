@@ -47,20 +47,9 @@ import {
 export {
   createMarkdownSlashCommandExtension,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
-  createMarkdownSlashCommandRegistry,
-  ensureMarkdownSlashOptionVisible,
-  filterMarkdownSlashCommands,
-  getMarkdownSlashMenuBoundary,
-  MARKDOWN_SLASH_COMMAND_CATEGORY_ORDER,
-  MARKDOWN_SLASH_COMMAND_DEFINITIONS,
-  resolveMarkdownSlashMenuPosition,
 } from './markdown-slash-command.js'
 export type {
-  LocalizedMarkdownSlashCommand,
-  MarkdownSlashCommandDefinition,
   MarkdownSlashCommandOptions,
-  MarkdownSlashMenuBoundary,
-  ResolvedMarkdownSlashMenuPosition,
 } from './markdown-slash-command.js'
 import {
   MarkdownImageUploadProvider,
