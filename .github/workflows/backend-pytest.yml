@@ -77,6 +77,32 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      # The BM25 index extension, for `tests/test_vchord_sparse_shape_postgres.py`.
+      # Without this service those tests skip — and a skip here reads exactly
+      # like a pass, which is the failure this job's file list already guards
+      # against for a different reason.
+      #
+      # This is the SAME digest `deploy/postgres/Dockerfile` copies the
+      # extension out of, so CI exercises the version an operator building
+      # that image would get. It is the upstream image rather than ours
+      # because a `services:` entry must be pullable, and this one happens to
+      # ship pgvector too (0.8.1) — enough for the `vector` column the shared
+      # DDL creates. It is NOT the production base: that is
+      # `pgvector/pgvector:pg16`, above, at a newer pgvector. Nothing in these
+      # tests reads a vector, so the difference stays inside the DDL.
+      vchord:
+        image: tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d
+        env:
+          POSTGRES_USER: akb
+          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
+          POSTGRES_DB: akb
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd "pg_isready -U akb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +155,10 @@ jobs:
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
+          # The vchord service above. The sparse-shape tests create and drop
+          # their own database on it, so it is a separate server, not a
+          # separate database on the one above.
+          AKB_VCHORD_TEST_DSN: postgresql://akb:akb@localhost:15433/akb  # pragma: allowlist secret
         # #215 declarative-DDL integration tests need a live PG too (index
         # ASC/DESC physical order, migration 037 upgrade path, add-unique-key
         # concurrency race). They skip in the DB-free unit job above, so gate
@@ -288,6 +318,10 @@ jobs:
             tests/test_table_if_not_exists_e2e.py
             tests/test_kg_document_ref_postgres.py
             tests/test_search_covering_indexes_e2e.py
+            # Needs the vchord service, not the postgres one. It skips rather
+            # than failing where the extension is absent, so it has to be on a
+            # list that runs somewhere it is present.
+            tests/test_vchord_sparse_shape_postgres.py
           )
           # A truncated list is the failure this step has already had
           # once, and it reads as a pass. Both halves of that are worth
