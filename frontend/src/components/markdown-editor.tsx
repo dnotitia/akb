@@ -403,6 +403,7 @@ export interface MarkdownEditorProps {
   ariaLabelledby?: string;
   required?: boolean;
   vault: string;
+  onSlashOpenChange?: (open: boolean, dismiss?: () => void) => void;
   document?: string;
   commit?: string;
   onUploadingChange?: (uploading: boolean) => void;
@@ -428,6 +429,7 @@ export function MarkdownEditor({
   ariaLabelledby,
   required,
   vault,
+  onSlashOpenChange,
   document,
   commit,
   onUploadingChange,
@@ -477,7 +479,13 @@ export function MarkdownEditor({
     profile: "preserve",
     editable: !readOnly,
     onChange: handleChange,
-    slash: AKB_MARKDOWN_SLASH_OPTIONS,
+    slash: React.useMemo(
+      () => ({
+        ...AKB_MARKDOWN_SLASH_OPTIONS,
+        onOpenChange: onSlashOpenChange,
+      }),
+      [onSlashOpenChange],
+    ),
   });
 
   React.useEffect(() => {

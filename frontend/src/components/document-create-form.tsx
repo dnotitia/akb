@@ -59,6 +59,7 @@ export interface DocumentCreateFormProps {
   onDirtyChange?: (dirty: boolean) => void;
   onCreatingChange?: (creating: boolean) => void;
   onUploadingChange?: (uploading: boolean) => void;
+  onSlashOpenChange?: (open: boolean, dismiss?: () => void) => void;
   onAssetIdsChange?: (assetIds: readonly string[]) => void;
   onAssetExpirationsChange?: (expirations: Readonly<Record<string, string>>) => void;
   onUnclaimedAssetIdsChange?: (assetIds: readonly string[]) => void;
@@ -100,6 +101,7 @@ export function DocumentCreateForm({
   onDirtyChange,
   onCreatingChange,
   onUploadingChange,
+  onSlashOpenChange,
   onAssetIdsChange,
   onAssetExpirationsChange,
   onUnclaimedAssetIdsChange,
@@ -599,6 +601,7 @@ export function DocumentCreateForm({
                       setUploadingImage(uploading);
                       if (uploading) setClaimedAssetIds(null);
                     }}
+                    onSlashOpenChange={onSlashOpenChange}
                     initialUnclaimedAssetIds={restoredDraft?.assetIds}
                     initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
                     preserveUploadsOnUnmount
