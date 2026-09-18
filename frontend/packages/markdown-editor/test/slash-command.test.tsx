@@ -44,6 +44,11 @@ afterEach(() => {
 
 describe('markdown slash command menu', () => {
   it('defines all common blocks and filters translated labels and keywords', () => {
+    expect(DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES.sections).toEqual({
+      text: 'Text',
+      lists: 'Lists',
+      structure: 'Structure',
+    })
     const commands = createMarkdownSlashCommandRegistry(DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES)
 
     expect(commands).toHaveLength(10)

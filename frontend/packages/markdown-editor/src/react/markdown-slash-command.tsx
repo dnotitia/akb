@@ -45,9 +45,9 @@ export const DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES: MarkdownSlashCommandMessag
   header: 'Insert block',
   escapeHint: 'Esc',
   sections: {
-    text: 'TEXT',
-    lists: 'LISTS',
-    structure: 'STRUCTURE',
+    text: 'Text',
+    lists: 'Lists',
+    structure: 'Structure',
   },
   footer: {
     navigation: '↑↓ Navigate',
@@ -543,10 +543,12 @@ function positionMarkdownSlashMenu(
     availableHeight || MARKDOWN_SLASH_MENU_MAX_HEIGHT,
     sideHeight || availableHeight || MARKDOWN_SLASH_MENU_MAX_HEIGHT,
   )
-  const nominalWidth =
-    measuredRect.width ||
-    Number.parseFloat(getComputedStyle(menu).width) ||
-    MARKDOWN_SLASH_MENU_NOMINAL_WIDTH
+  const computedWidth = Number.parseFloat(getComputedStyle(menu).width) || 0
+  const nominalWidth = Math.max(
+    measuredRect.width,
+    computedWidth,
+    MARKDOWN_SLASH_MENU_NOMINAL_WIDTH,
+  )
   const width = Math.min(nominalWidth, availableWidth || nominalWidth)
   if (availableWidth > 0) menu.style.width = `${width}px`
 
