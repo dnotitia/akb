@@ -58,6 +58,16 @@ specifically; the proxy has its own log in
 - Writes are conditioned on the row still holding the content that was encoded,
   so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
   than being stamped with tokens from text it no longer has.
+- The index is built last, and the writes are split. Running it against a real
+  corpus showed the cost is not where it looked: a 500-row batch spent 4.1
+  seconds tokenizing and 21.8 writing, because adding a column value to a table
+  at the default fillfactor is a non-HOT update (2.5% were HOT) and every one
+  of those inserts into all of the table's indexes — including a 15 GB HNSW
+  that does not fit in shared_buffers, at 938 buffer accesses per row. With the
+  BM25 index also present a batch took 103 seconds rather than 2.5, so
+  `--prepare` now adds only the column and `--index` builds it at the end.
+  `--writers` overlaps the disk waits: one writer measured 4-16 rows/s, two
+  32.3 and 32.5 across two orderings, four 45-62.
 
 
 ### A sparse shape the code does not handle now fails loudly

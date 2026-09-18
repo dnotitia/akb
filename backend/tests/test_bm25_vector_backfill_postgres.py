@@ -22,7 +22,7 @@ import pytest
 from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
 
-from scripts.backfill_bm25_vector import _counts, _pass, _prepare
+from scripts.backfill_bm25_vector import _build_index, _counts, _pass, _prepare
 
 pytestmark = pytest.mark.asyncio
 
@@ -127,40 +127,68 @@ async def _write_old(store, pool, chunk_id: uuid.UUID, content: str, idx: int) -
         )
 
 
-async def test_prepare_adds_the_column_and_a_valid_index(monkeypatch):
-    """And says so twice — an operator re-running it must not get a new index."""
+async def _bm25_indexes(pool):
+    async with pool.acquire() as c:
+        rows = await c.fetch(
+            "SELECT c.relname FROM pg_index i "
+            "  JOIN pg_class c ON c.oid = i.indexrelid "
+            "  JOIN pg_class t ON t.oid = i.indrelid "
+            "  JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "  JOIN pg_am am ON am.oid = c.relam "
+            " WHERE t.relname='chunks' AND n.nspname=$1 AND am.amname='bm25'",
+            _SCHEMA,
+        )
+    return {r["relname"] for r in rows}
+
+
+async def _column_count(pool):
+    async with pool.acquire() as c:
+        return int(await c.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema=$1 AND table_name='chunks' "
+            "AND column_name='sparse_bm25'", _SCHEMA,
+        ))
+
+
+async def test_prepare_adds_the_column_and_deliberately_not_the_index(monkeypatch):
+    """The order is the whole performance story, so it is pinned here.
+
+    Measured on a 2.1M-chunk corpus: one 500-row batch took 103 seconds with the
+    index present and 2.5 without. Every row written into an existing BM25 index
+    pays its per-term maintenance, and paying that two million times instead of
+    once is the difference between hours and days. A `--prepare` that helpfully
+    created the index would put the sweep back on the slow path with nothing
+    failing to say so — which is exactly what happened before this assertion
+    existed."""
     async with _corpus(monkeypatch) as (_store, pool):
-        async with pool.acquire() as c:
-            assert await c.fetchval(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_schema=$1 AND table_name='chunks' "
-                "AND column_name='sparse_bm25'", _SCHEMA,
-            ) == 0
+        assert await _column_count(pool) == 0
 
         await _prepare(pool, _SCHEMA)
         await _prepare(pool, _SCHEMA)  # idempotent
 
-        async with pool.acquire() as c:
-            assert await c.fetchval(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_schema=$1 AND table_name='chunks' "
-                "AND column_name='sparse_bm25'", _SCHEMA,
-            ) == 1
-            rows = await c.fetch(
-                "SELECT c.relname, i.indisvalid, am.amname "
-                "  FROM pg_index i "
-                "  JOIN pg_class c ON c.oid = i.indexrelid "
-                "  JOIN pg_class t ON t.oid = i.indrelid "
-                "  JOIN pg_namespace n ON n.oid = t.relnamespace "
-                "  JOIN pg_am am ON am.oid = c.relam "
-                " WHERE t.relname='chunks' AND n.nspname=$1 AND am.amname='bm25'",
-                _SCHEMA,
-            )
-        assert len(rows) == 1, f"bm25 인덱스가 {len(rows)}개 — 재실행이 하나 더 지었다"
-        assert rows[0]["indisvalid"]
+        assert await _column_count(pool) == 1
+        assert await _bm25_indexes(pool) == set(), (
+            "--prepare 가 인덱스를 만들었다 — sweep 이 행마다 인덱스 유지비를 낸다"
+        )
 
 
-async def test_prepare_builds_the_index_the_store_will_look_for(monkeypatch):
+async def test_the_index_build_refuses_a_half_filled_column(monkeypatch):
+    """Building early is not wrong, it is slow — and slow in a way that looks
+    like nothing. Refusing names the remaining work instead."""
+    async with _corpus(monkeypatch) as (store, pool):
+        await _write_old(store, pool, uuid.uuid4(), "one chunk", 0)
+        await _prepare(pool, _SCHEMA)
+
+        with pytest.raises(SystemExit, match="still have no vector"):
+            await _build_index(pool, _SCHEMA)
+        assert await _bm25_indexes(pool) == set()
+
+        await _pass(pool, _SCHEMA, None)
+        await _build_index(pool, _SCHEMA)
+        assert len(await _bm25_indexes(pool)) == 1
+
+
+async def test_the_index_build_uses_the_name_the_store_will_look_for(monkeypatch):
     """The name is written down in two places and they have to agree.
 
     `_do_ensure` creates `idx_vi_chunks_bm25 IF NOT EXISTS` on boot and
@@ -177,21 +205,10 @@ async def test_prepare_builds_the_index_the_store_will_look_for(monkeypatch):
     async with _corpus(monkeypatch) as (store, pool):
         await _write_old(store, pool, uuid.uuid4(), "anything at all", 0)
         await _prepare(pool, _SCHEMA)
+        await _pass(pool, _SCHEMA, None)
+        await _build_index(pool, _SCHEMA)
 
-        async def _bm25_indexes():
-            async with pool.acquire() as c:
-                rows = await c.fetch(
-                    "SELECT c.relname FROM pg_index i "
-                    "  JOIN pg_class c ON c.oid = i.indexrelid "
-                    "  JOIN pg_class t ON t.oid = i.indrelid "
-                    "  JOIN pg_namespace n ON n.oid = t.relnamespace "
-                    "  JOIN pg_am am ON am.oid = c.relam "
-                    " WHERE t.relname='chunks' AND n.nspname=$1 AND am.amname='bm25'",
-                    _SCHEMA,
-                )
-            return {r["relname"] for r in rows}
-
-        prepared = await _bm25_indexes()
+        prepared = await _bm25_indexes(pool)
         assert len(prepared) == 1
 
         after_store = PgvectorStore(
@@ -200,7 +217,7 @@ async def test_prepare_builds_the_index_the_store_will_look_for(monkeypatch):
         async with pool.acquire() as conn:
             await after_store._do_ensure(conn)
 
-        assert await _bm25_indexes() == prepared, (
+        assert await _bm25_indexes(pool) == prepared, (
             "스토어가 다른 이름으로 인덱스를 하나 더 지었다 — 전환 후 첫 부팅이 "
             "트랜잭션 안에서 전체 빌드를 한다"
         )
@@ -238,6 +255,71 @@ async def test_the_sweep_empties_the_queue_and_an_empty_document_does_not_stall_
 
         # A second sweep has nothing to do — idempotent, not merely repeatable.
         assert await _pass(pool, _SCHEMA, None) == 0
+
+
+@pytest.mark.parametrize("writers", [1, 3, 7], ids=["one", "three", "seven"])
+async def test_splitting_the_write_changes_nothing_but_the_wall_clock(
+    monkeypatch, writers
+):
+    """The batch is cut into `writers` parts that run at once, because the write
+    is disk-latency bound on a table carrying a large HNSW index — one writer
+    measured 4-16 rows/s against 45-62 for four. Concurrency added for speed has
+    to be provably invisible in the result, so the same corpus is swept at three
+    widths, including ones that do not divide the batch evenly, and the vectors
+    are compared against what a single writer produces.
+    """
+    from scripts import backfill_bm25_vector as bf
+
+    monkeypatch.setattr(bf, "_BATCH", 5)
+    async with _corpus(monkeypatch) as (store, pool):
+        ids = [uuid.UUID(int=i) for i in range(1, 18)]
+        for n, cid in enumerate(ids):
+            await _write_old(store, pool, cid, f"alpha beta{n} gamma{n % 3}", n)
+        await _prepare(pool, _SCHEMA)
+
+        # The flag has to reach the database as that many statements. Equivalence
+        # alone cannot see this — a `writers` that was silently ignored would
+        # pass every assertion below while the speed it exists for never
+        # arrived, and nothing would say so.
+        real_apply = bf._apply
+        pending = {"n": 0}
+
+        async def counting_apply(*a, **k):
+            pending["n"] += 1
+            return await real_apply(*a, **k)
+
+        monkeypatch.setattr(bf, "_apply", counting_apply)
+
+        assert await bf._pass(pool, _SCHEMA, None, writers) == len(ids)
+        # 17 rows at a batch of 5 is 4 batches: 5,5,5,2. Each is cut into at
+        # most `writers` parts, and a batch smaller than `writers` yields one
+        # part per row rather than empty ones.
+        expected = sum(min(writers, n) for n in (5, 5, 5, 2))
+        assert pending["n"] == expected, (
+            f"writers={writers}: _apply 가 {pending['n']}번 — {expected}번이어야 한다"
+        )
+        monkeypatch.setattr(bf, "_apply", real_apply)
+
+        nulls, _ = await _counts(pool, _SCHEMA, None)
+        assert nulls == 0
+
+        async with pool.acquire() as c:
+            got = {
+                r["chunk_id"]: r["v"] for r in await c.fetch(
+                    f'SELECT chunk_id, sparse_bm25::text AS v FROM "{_SCHEMA}".chunks'
+                )
+            }
+        # Re-encode every chunk single-threaded and require the same vectors.
+        async with pool.acquire() as c:
+            await c.execute(f'UPDATE "{_SCHEMA}".chunks SET sparse_bm25 = NULL')
+        assert await bf._pass(pool, _SCHEMA, None, 1) == len(ids)
+        async with pool.acquire() as c:
+            serial = {
+                r["chunk_id"]: r["v"] for r in await c.fetch(
+                    f'SELECT chunk_id, sparse_bm25::text AS v FROM "{_SCHEMA}".chunks'
+                )
+            }
+        assert got == serial, f"writers={writers} 가 다른 벡터를 썼다"
 
 
 async def test_the_sweep_walks_past_a_batch_boundary(monkeypatch):
@@ -454,6 +536,7 @@ async def test_the_backfilled_corpus_answers_a_search(monkeypatch):
             await _write_old(store, pool, cid, f"haystack{i} straw", 10 + i)
         await _prepare(pool, _SCHEMA)
         await _pass(pool, _SCHEMA, None)
+        await _build_index(pool, _SCHEMA)
 
         term_ids = await sparse_encoder.get_or_create_term_ids(["needle"])
         needle = term_ids["needle"]
