@@ -575,6 +575,16 @@ def test_search_openapi_contract_is_codegen_typed():
     assert {"kind", "query", "total", "returned", "total_matches", "results"}.issubset(
         schemas["AkbSearchEnvelope"]["required"]
     )
+    # `excluded` is required, not optional (akb#608): the server always emits
+    # it, so a generated client gets a value to test for emptiness instead of
+    # an optional it has to narrow first — which is the absent/zero
+    # distinction the field exists to remove. Integer-valued map, one entry per
+    # public cause name.
+    assert "excluded" in schemas["AkbSearchEnvelope"]["required"]
+    assert schemas["AkbSearchEnvelope"]["properties"]["excluded"] == {
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+    }
     assert {"kind", "uri", "sections"}.issubset(schemas["AkbDrillDownEnvelope"]["required"])
     assert {"kind", "pattern", "regex"}.issubset(schemas["AkbGrepEnvelope"]["required"])
 

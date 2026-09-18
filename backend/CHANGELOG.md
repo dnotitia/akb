@@ -27,7 +27,38 @@ specifically; the proxy has its own log in
   in neither does a filter produce a degradation signal.
 
   A short page remains visible as the gap between `total_matches` and
-  `returned`.
+  `returned`, and the next entry gives it a cause.
+
+### A short page now says why it is short
+
+- Search responses carry `excluded`: how many candidates a filter removed on
+  the way to this page, keyed by cause — `{"archived": 1}`. It is `{}` when
+  nothing was excluded, and always present, so a caller checks it for
+  emptiness rather than for presence.
+
+  Until now a caller who asked for `limit` results and received fewer had
+  nothing in the response that explained the difference. `total_matches` could
+  not: it is the size of the prefetch pool measured before hydration, and its
+  own documentation says so in as many words. `truncated` answers a different
+  question again — whether that pool hit its ceiling. The information existed,
+  counted and logged at the point of the drop, and simply never reached the
+  response; wiring it into the failure flag instead is what produced the
+  defect fixed above.
+
+  The two reasons a page comes back short are now one field each. `degraded`
+  means a component failed or a hit was lost to a stale row; `excluded` means
+  the request itself took documents out, which is not a fault and is not worth
+  retrying. No cause appears in both. This follows the shape general-purpose
+  engines use — Elasticsearch reports skipped and failed shards as structured
+  counts under `_shards` rather than as a boolean, and reports how many
+  documents matched separately — and the count, not another flag, is what a
+  caller can act on.
+
+  Its keys are public vocabulary translated from the internal counter names,
+  so renaming a diagnostic string is not a breaking API change. It counts
+  candidates considered for the page that was returned, including the refills
+  that replaced a filtered hit, and deliberately carries no name from the
+  `total_*` family, which describes the pool.
 
 ### BM25 statistics
 

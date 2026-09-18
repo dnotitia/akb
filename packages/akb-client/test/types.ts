@@ -490,9 +490,14 @@ const searchEnvelope: SearchResponse = {
   total: 1,
   returned: 1,
   total_matches: 1,
+  // Required, not optional (akb#608): the server always emits it, so a caller
+  // reads `excluded` and tests it for emptiness instead of narrowing an
+  // optional first — which is the absent/zero distinction the field removes.
+  excluded: { archived: 1 },
   results: [{ source_type: "document", uri: "akb://eng/doc/readme.md", vault: "eng", path: "readme.md", title: "Readme", tags: [], score: 1 }],
 };
 searchEnvelope.kind satisfies "search";
+searchEnvelope.excluded satisfies Record<string, number>;
 
 type RawGraphResponse = AkbOperationResponse<operations["graphNeighbors"]>;
 const rawGraphResponse: RawGraphResponse = {

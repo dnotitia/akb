@@ -397,10 +397,17 @@ TOOLS = [
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
             "more hits than reported — switch to akb_grep with count_only=true for an exact "
             "literal-substring count, or refine the query. "
+            "A page shorter than `limit` has exactly two explanations, and they are separate "
+            "fields. `excluded` counts what a FILTER removed from this page, keyed by cause "
+            "(e.g. `{\"archived\": 1}` — the default scope hides archived documents; pass "
+            "include_archived=true to see them). Nothing went wrong when it is non-empty, so "
+            "do not retry: the same request returns the same page. It is `{}` when nothing "
+            "was excluded. "
             "When `degraded=true` the retrieval index hit a transient failure (vector-store "
             "outage or a degraded leg), so results may be incomplete or empty — this is NOT a "
             "genuine zero-match; `degradation_reason` names the cause. Retry shortly, or fall "
-            "back to akb_grep for a literal search."
+            "back to akb_grep for a literal search. A filter never sets this flag and never "
+            "appears in that reason."
         ),
         input_schema={
             "type": "object",

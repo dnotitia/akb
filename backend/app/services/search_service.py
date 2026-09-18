@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Literal
 
 from app.config import settings
@@ -76,7 +77,8 @@ NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
 # resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
 # 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
 NATIVE_CANDIDATE_PAGE_SIZE = 2_000
-# Hydration drop causes that are NOT faults (akb#604). `_hydrate_hits` counts
+# Hydration drop causes that are NOT faults (akb#604), and the public name each
+# one answers to in `SearchResponse.excluded` (akb#608). `_hydrate_hits` counts
 # six causes; five of them mean something is wrong or stale and belong on the
 # degradation flag. `archive_scope_excluded` is the odd one out: it belongs to
 # the REQUEST, not to a fault — the caller asked for the default `unarchived`
@@ -85,7 +87,31 @@ NATIVE_CANDIDATE_PAGE_SIZE = 2_000
 # nor Solr (`partialResults`) raises a partial/failure signal for one. The
 # counter itself is unchanged and still logged; only the conclusion drawn from
 # it changed.
-NON_DEGRADING_DROP_CAUSES = frozenset({"archive_scope_excluded"})
+#
+# The keys on the left are internal diagnostic strings, free to be renamed; the
+# values are API vocabulary and are not. Mapping them explicitly — rather than
+# slicing a suffix off the counter name — is what keeps a rename of the former
+# from breaking the latter. One dict, because excusing a cause from the failure
+# flag and giving it a word the caller sees are the same decision: a cause with
+# no public name would be dropped from the response with nothing to explain the
+# short page, which is the gap akb#608 exists to close.
+PUBLIC_DROP_CAUSE_NAMES = {"archive_scope_excluded": "archived"}
+NON_DEGRADING_DROP_CAUSES = frozenset(PUBLIC_DROP_CAUSE_NAMES)
+
+
+def _public_exclusions(dropped: Mapping[str, int]) -> dict[str, int]:
+    """The non-fault drops, re-keyed to the names `SearchResponse` publishes.
+
+    Fault causes are filtered out here, not merely left unnamed: they are
+    reported by `degradation_reason`, and each fact belongs in exactly one
+    place (akb#608). `dropped` only ever holds positive counts, so an empty
+    result means nothing was excluded.
+    """
+    return {
+        PUBLIC_DROP_CAUSE_NAMES[cause]: count
+        for cause, count in sorted(dropped.items())
+        if cause in PUBLIC_DROP_CAUSE_NAMES
+    }
 
 
 def active_document_source_type(
@@ -1153,6 +1179,12 @@ class SearchService:
         )
         if hydrate_reason is not None and degraded_reason is None:
             degraded_reason = hydrate_reason
+        # The other half of the same split (akb#608): the fault causes went to
+        # the flag above, the non-fault ones go to the caller as a count that
+        # names them. `dropped` was accumulated across the initial hydration
+        # and every refill pass, so this counts candidates considered for THIS
+        # page — which is the number that explains a page shorter than `limit`.
+        excluded = _public_exclusions(dropped)
         phases["hydration"] = time.perf_counter() - phase_started
         returned = len(results)
         _log_search_timing(started, phases, returned)
@@ -1172,6 +1204,7 @@ class SearchService:
             hint=hint,
             degraded=degraded_reason is not None,
             degradation_reason=degraded_reason,
+            excluded=excluded,
             results=results,
         )
 

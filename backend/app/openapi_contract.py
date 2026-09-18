@@ -1019,13 +1019,21 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "hint": _nullable_string(),
                 "degraded": {"type": "boolean"},
                 "degradation_reason": _nullable_string(),
+                # Non-fault exclusions for this page, keyed by public cause
+                # name (akb#608): `{"archived": 1}`. Required because it is
+                # always emitted — a consumer checks it for emptiness, never
+                # for presence — and empty when nothing was excluded.
+                "excluded": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
                 "results": {
                     "type": "array",
                     "items": {"$ref": "#/components/schemas/SearchResult"},
                 },
             },
             "Hybrid search success envelope.",
-            required=("kind", "query", "total", "returned", "total_matches", "results"),
+            required=("kind", "query", "total", "returned", "total_matches", "excluded", "results"),
         ),
         "AkbDrillDownEnvelope": _kind_schema(
             "drill_down",
