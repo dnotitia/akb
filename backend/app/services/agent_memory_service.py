@@ -43,6 +43,7 @@ from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest
 from app.services.document_service import DocumentService
+from app.services.native_document_service import NativeDocumentService
 from app.services.revision_backend import get_document_service
 
 logger = logging.getLogger("akb.agent_memory")
@@ -832,16 +833,29 @@ class AgentMemoryService:
         return {**dict(row), "agent_id": agent_id}
 
     async def _count_snapshots(self, vault_name: str, coll_path: str) -> int:
+        from app.services.document_counters import native_documents_are_authoritative
+
         pool = await get_pool()
         async with pool.acquire() as conn:
-            n = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM documents d JOIN vaults v ON d.vault_id = v.id
-                 WHERE v.name = $1
-                   AND d.path LIKE $2
-                """,
-                vault_name, f"{coll_path}/snapshot-%.md",
-            )
+            if native_documents_are_authoritative():
+                n = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM native_resources
+                     WHERE namespace_id = (SELECT id FROM vaults WHERE name = $1)
+                       AND surface = 'document' AND lifecycle = 'live'
+                       AND current_path LIKE $2 ESCAPE '\\'
+                    """,
+                    vault_name, f"{coll_path}/snapshot-%.md",
+                )
+            else:
+                n = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM documents d JOIN vaults v ON d.vault_id = v.id
+                     WHERE v.name = $1
+                       AND d.path LIKE $2
+                    """,
+                    vault_name, f"{coll_path}/snapshot-%.md",
+                )
         return int(n or 0)
 
     async def _build_injected_context(
@@ -882,7 +896,18 @@ class AgentMemoryService:
         list — semantic search wiring inside scope-restricted vaults
         is a follow-up (uses ``search_service.search`` with
         ``vault=vault_name`` + collection filter).
+
+        Backend dispatch (#542): on `postgres_native` the native path
+        never writes `documents`, so the legacy catalog below would
+        return only pre-cutover rows — a silently partial answer. The
+        native ledger (same shape as the browse view) is the authority
+        there, resolved through #525's counter module rather than a
+        local branch.
         """
+        from app.services.document_counters import native_documents_are_authoritative
+
+        if native_documents_are_authoritative():
+            return await self._fetch_scope_native(vault_name, scope, limit)
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -909,7 +934,64 @@ class AgentMemoryService:
             })
         return out
 
+    async def _fetch_scope_native(
+        self,
+        vault_name: str,
+        scope: str,
+        limit: int,
+    ) -> list[dict]:
+        """Native-ledger variant of `_fetch_scope` (see its docstring).
+
+        Reads live document Heads under `{scope}/` from `native_resources`
+        and hydrates display fields through the native document service —
+        the same service the recall URIs resolve through — so the list can
+        never disagree with what opening one returns.
+        """
+        from app.util.text import like_escape
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            vault_row = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1", vault_name,
+            )
+            if not vault_row:
+                return []
+            rows = await conn.fetch(
+                "SELECT resource_id, current_path AS path "
+                "FROM native_resources "
+                "WHERE namespace_id = $1 AND surface = 'document' "
+                "AND lifecycle = 'live' "
+                "AND current_path LIKE $2 ESCAPE '\\' "
+                "ORDER BY updated_at DESC LIMIT $3",
+                vault_row["id"],
+                like_escape(scope.rstrip("/")) + "/%",
+                limit,
+            )
+        svc = NativeDocumentService()
+        out = []
+        for r in rows:
+            try:
+                doc = await svc.get_by_resource_id(vault_name, r["resource_id"])
+            except Exception:  # noqa: BLE001 — one unreadable Head must not fail recall
+                logger.warning(
+                    "agent memory native recall skipped %s", r["path"], exc_info=True,
+                )
+                continue
+            out.append({
+                "uri": f"akb://{vault_name}/coll/{_parent_path(doc.path)}/doc/{_basename(doc.path)}",
+                "title": doc.title,
+                "summary": doc.summary,
+                "type": doc.type,
+                "tags": list(doc.tags or []),
+                "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+            })
+        return out
+
     async def _fetch_recap_summary(self, vault_name: str, coll_path: str) -> dict | None:
+        from app.services.document_counters import native_documents_are_authoritative
+
+        if native_documents_are_authoritative():
+            return await self._fetch_recap_summary_native(vault_name, coll_path)
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -929,6 +1011,48 @@ class AgentMemoryService:
             "summary": row["summary"],
             "tags": list(row["tags"] or []),
             "ended_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        }
+
+    async def _fetch_recap_summary_native(
+        self, vault_name: str, coll_path: str,
+    ) -> dict | None:
+        """Native-ledger variant of `_fetch_recap_summary`.
+
+        Resolves `recap.md` under the session collection through the native
+        document service — the same read `get_by_resource_id` serves — so a
+        recap written after the cutover is visible where the legacy catalog
+        would report no session end.
+        """
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            vault_row = await conn.fetchrow(
+                "SELECT id FROM vaults WHERE name = $1", vault_name,
+            )
+            if not vault_row:
+                return None
+            row = await conn.fetchrow(
+                "SELECT resource_id FROM native_resources "
+                "WHERE namespace_id = $1 AND surface = 'document' "
+                "AND lifecycle = 'live' AND current_path = $2",
+                vault_row["id"], f"{coll_path}/recap.md",
+            )
+            if not row:
+                return None
+        try:
+            doc = await NativeDocumentService().get_by_resource_id(
+                vault_name, row["resource_id"],
+            )
+        except Exception:  # noqa: BLE001 — same skip-one policy as scope recall
+            logger.warning(
+                "agent memory native recap skipped %s/recap.md", coll_path, exc_info=True,
+            )
+            return None
+        return {
+            "uri": f"akb://{vault_name}/coll/{coll_path}/doc/recap.md",
+            "title": doc.title,
+            "summary": doc.summary,
+            "tags": list(doc.tags or []),
+            "ended_at": doc.updated_at.isoformat() if doc.updated_at else None,
         }
 
     # ── Rendering ──────────────────────────────────────────

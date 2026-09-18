@@ -78,10 +78,16 @@ for (const viewport of [
                 archive_scope: url.searchParams.get("archive_scope") || "unarchived",
                 regex: url.searchParams.get("regex") === "true",
                 total_docs: 0,
-                total_matches: 0,
+                total_matches: url.searchParams.has("include_text_files") ? 1 : 0,
                 returned_docs: 0,
-                returned_matches: 0,
-                results: [],
+                total_resources: url.searchParams.has("include_text_files") ? 1 : 0,
+                returned_resources: url.searchParams.has("include_text_files") ? 1 : 0,
+                returned_matches: url.searchParams.has("include_text_files") ? 1 : 0,
+                results: url.searchParams.has("include_text_files") ? [{
+                  uri: "akb://fixture/file/f-text", vault: "fixture", path: "deploy.txt",
+                  title: "Deployment text File", resource_type: "file", revision: "revision-1",
+                  matches: [{ text: "deployment", line: 2, section: null }],
+                }] : [],
               },
             });
           return route.fulfill({ json: { vaults: [], items: [], total: 0 } });
@@ -115,8 +121,11 @@ for (const viewport of [
       await page
         .getByRole("button", { name: "Filter by document type" })
         .click();
+      // Document metadata filters exclude Files; clear the semantic report filter.
+      await page.getByRole("button", { name: "Toggle report" }).click();
       // URL navigation is a React transition; wait for its controlled state.
       for (const label of [
+        "Include text Files",
         "Regular expression",
         "Case sensitive",
       ]) {
@@ -129,11 +138,18 @@ for (const viewport of [
       await expect
         .poll(() => requests.at(-1)?.searchParams.get("archive_scope"))
         .toBe("all");
+      expect(requests.at(-1)?.searchParams.get("include_text_files")).toBe("true");
       expect(requests.at(-1)?.searchParams.get("regex")).toBe("true");
       expect(requests.at(-1)?.searchParams.get("case_sensitive")).toBe("true");
-      expect(requests.at(-1)?.searchParams.getAll("doc_types")).toEqual([
-        "report",
-      ]);
+      expect(requests.at(-1)?.searchParams.getAll("doc_types")).toEqual([]);
+      await expect(page.getByRole("link", { name: /Deployment text File/ })).toHaveAttribute("href", "/vault/fixture/file/f-text");
+      await expect(page.getByText("1 resource · 1 match")).toBeVisible();
+      await expect(page.getByText("Body line 2")).toBeVisible();
+      await page.reload();
+      await page.evaluate((isDark) => document.documentElement.classList.toggle("dark", isDark), dark);
+      await expect(page.getByText("Deployment text File")).toBeVisible();
+      await page.getByRole("button", { name: "Filter by document type" }).click();
+      await expect(page.getByLabel("Include text Files")).toBeChecked();
       await page.goBack();
       await expect(
         page.getByRole("button", { name: "Document state", exact: true }),

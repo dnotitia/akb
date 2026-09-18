@@ -144,7 +144,7 @@ vault_filter_enabled: false
 # cloud storage even without an endpoint; never set static key fields with it.
 s3_auth_mode: static # static | default_chain
 s3_endpoint_url: "http://minio:9000" # local Compose; blank disables object storage
-s3_public_url: "http://localhost:9000" # browser endpoint; change for remote access
+s3_public_url: "" # retained and ignored; nothing signs a URL for a browser any more
 s3_bucket: akb-files
 s3_region: ""
 # Explicit WebIdentity (required in platform_hard): configured token → STS only,
@@ -355,9 +355,9 @@ vector_url: ""
 vector_collection: chunks
 
 # Seahorse Cloud driver settings (ignored unless driver is "seahorse-cloud").
-# Two-plane API: management (BFF) for table lifecycle + per-table
-# data-plane host (auto-discovered from BFF response).
-seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/bff"
+# Two-plane API: management for table lifecycle + per-table
+# data-plane host (auto-discovered from the management response).
+seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/api"
 seahorse_cloud_tenant_uuid: ""
 seahorse_cloud_table_name: ""    # one of (table_name, table_uuid) required
 seahorse_cloud_table_uuid: ""

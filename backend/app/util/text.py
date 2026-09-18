@@ -27,8 +27,24 @@ from pydantic import BaseModel, model_validator
 
 
 def to_nfc(s: str) -> str:
-    """Return NFC-normalized form. Safe to call on already-NFC text."""
-    return unicodedata.normalize("NFC", s)
+    """Return NFC-normalized form, with NUL bytes removed.
+
+    NUL is dropped here rather than anywhere downstream because this is the
+    boundary every request model already passes user text through, and because
+    PostgreSQL `text` cannot hold the byte at all: a body carrying one is
+    accepted (bodies live in the payload store), and then every attempt to
+    index it raises `CharacterNotInRepertoireError` until the retry ceiling
+    gives up and the document is silently absent from ranked search while
+    staying readable and greppable (akb#527).
+
+    Removing rather than rejecting: a NUL in Markdown is not content a writer
+    meant to send, it arrives from an encoding accident upstream, and refusing
+    the write would fail an operation whose meaning is entirely intact without
+    the byte. Every other character is left exactly as it was.
+
+    Safe to call on already-NFC text.
+    """
+    return unicodedata.normalize("NFC", s).replace("\x00", "")
 
 
 def to_nfc_any(value: Any) -> Any:

@@ -50,12 +50,15 @@ INIT_RESP=$(curl -sk -i -X POST "$BASE_URL/mcp/" \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"security-rest-e2e","version":"1.0"}}}' 2>&1)
 SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}')
-[ -n "$SID" ] && pass "MCP setup session acquired" || { fail "MCP setup" "missing session id"; exit 1; }
+# The legacy transport is stateless, so `initialize` mints no session and
+# the revision travels on `mcp-protocol-version` instead. Asserting the
+# absence keeps this suite honest about which contract it runs against.
+[ -z "$SID" ] && pass "MCP mints no session" || { fail "MCP setup" "unexpected session id: $SID"; exit 1; }
 curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT1" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H "mcp-session-id: $SID" \
+  -H "mcp-protocol-version: 2025-03-26" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
 
 mcp_call() {
@@ -64,7 +67,7 @@ mcp_call() {
     -H "Authorization: Bearer $PAT1" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
-    -H "mcp-session-id: $SID" \
+    -H "mcp-protocol-version: 2025-03-26" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" \
     | python3 -c 'import sys,json; print(json.loads(sys.stdin.read())["result"]["content"][0]["text"])' 2>/dev/null
 }

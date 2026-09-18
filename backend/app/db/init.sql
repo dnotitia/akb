@@ -819,6 +819,7 @@ CREATE TABLE IF NOT EXISTS publications (
     -- rule each write has to remember. Match type is the default (MATCH
     -- SIMPLE) so a NULL document_id is exempt even though vault_id is NOT
     -- NULL — MATCH FULL would forbid the NULL and is wrong here.
+    native_document_id UUID,
     document_id UUID,
     CONSTRAINT publications_document_fk
         FOREIGN KEY (document_id, vault_id) REFERENCES documents(id, vault_id)
@@ -925,6 +926,20 @@ CREATE OR REPLACE FUNCTION akb_set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Row-CAS token mint (migration 107 + create-time DDL). Every UPDATE on a
+-- vault data table gets a fresh `row_commit`, so a concurrent writer
+-- holding a stale token fails its `expected_row_commit` match (409)
+-- instead of silently winning a lost update. SECURITY INVOKER, same
+-- reasoning as akb_set_updated_at above (gen_random_uuid needs no
+-- privilege beyond pgcrypto, already installed).
+CREATE OR REPLACE FUNCTION akb_bump_row_commit()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.row_commit = gen_random_uuid()::TEXT;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

@@ -118,6 +118,56 @@ async def test_current_heads_exclude_history_include_deleted_and_keep_vault_scop
     assert (await native_derived_worker._pending_stats(ledger, vault))["abandoned"] == 8
 
 
+async def test_the_two_head_scoped_queries_answer_the_same_question(ledger):
+    """Two joins, one definition — the drift guard for keeping both.
+
+    `_current_head_stats` drives from `native_resources` because one vault's
+    Heads are few and the revision key is unique, which is the plan the
+    per-vault endpoint needs. `_pending_stats` cannot: `/health` is global and
+    already reads the whole ledger, so it carries the Head test as a LEFT JOIN
+    alongside the cumulative counters it was always producing. Different
+    shapes, same population — and nothing but this says so.
+    """
+    vault = uuid.uuid4()
+    resources = [uuid.uuid4() for _ in range(6)]
+    for index, resource in enumerate(resources):
+        await ledger.conn.execute(
+            "INSERT INTO native_resources VALUES ($1, $2, $3, $4)",
+            resource, vault, f"head-{index}", "deleted" if index == 5 else "live",
+        )
+        await ledger.conn.execute(
+            """INSERT INTO native_invalidation_intents
+                   (intent_id, namespace_id, resource_id, revision_id, completed_at, delivery_outcome)
+               VALUES ($1, $2, $3, $4, NOW(), 'abandoned')""",
+            uuid.uuid4(), vault, resource, f"superseded-{index}",
+        )
+        outcome = ["applied", "abandoned", None, None, "abandoned", "abandoned"][index]
+        retries = [0, 0, MAX_RETRIES, 2, 0, 0][index]
+        await ledger.conn.execute(
+            """INSERT INTO native_invalidation_intents
+                   (intent_id, namespace_id, resource_id, revision_id, completed_at, retry_count, delivery_outcome)
+               VALUES ($1, $2, $3, $4, CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END, $5, $6)""",
+            uuid.uuid4(), vault, resource, f"head-{index}", retries, outcome,
+        )
+    # An intent whose Resource row is gone: it cannot be missing from search.
+    orphan = uuid.uuid4()
+    await ledger.conn.execute(
+        """INSERT INTO native_invalidation_intents
+               (intent_id, namespace_id, resource_id, revision_id, completed_at, delivery_outcome)
+           VALUES ($1, $2, $3, $4, NOW(), 'abandoned')""",
+        uuid.uuid4(), vault, orphan, "orphan-head",
+    )
+
+    heads = await native_derived_worker._current_head_stats(ledger, vault)
+    stats = await native_derived_worker._pending_stats(ledger, vault)
+
+    assert heads == {"pending": 2, "retrying": 1, "exhausted": 1, "abandoned": 3}
+    assert {key: stats[f"{key}_at_head"] for key in heads} == heads
+    # The ledger is larger, and stays larger: six superseded plus the orphan.
+    assert stats["abandoned"] == 10
+    assert stats["status"] == "degraded"
+
+
 async def test_current_head_query_on_million_intent_ledger(ledger):
     """Measure the actual query with existing key indexes, not a new index."""
     await ledger.conn.execute("""
@@ -150,3 +200,34 @@ async def test_current_head_query_on_million_intent_ledger(ledger):
         "observed_vault_heads": 100, "execution_ms": plan["Execution Time"],
         "planning_ms": plan["Planning Time"], "plan": plan["Plan"],
     }))
+
+    # `/health` calls the unscoped form, so measure that too: it is
+    # unauthenticated and pollable. Carrying the Head test on the cumulative
+    # counters instead doubled their scan (272ms -> 545ms here), which is why
+    # it is a second query narrowed to the rows that are unsettled or given up
+    # on. Read the number below against `reads_rows`: this fixture makes a
+    # quarter of every revision abandoned, so the narrowing barely bites here
+    # and the cost is a ceiling, not an estimate — on a deployment ledger the
+    # same query reads under one row in a hundred.
+    heads = await native_derived_worker._current_head_stats(ledger)
+    assert heads == {
+        "pending": 5_000, "retrying": 0, "exhausted": 2_500, "abandoned": 2_500,
+    }
+    global_plan = json.loads(await ledger.conn.fetchval(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + ledger.last_query, *ledger.last_args,
+    ))[0]
+    print(json.dumps({
+        "query": "current_head_stats(global)", "intent_rows": 1_000_000,
+        "resources": 10_000, "reads_rows": await ledger.conn.fetchval(
+            "SELECT count(*) FROM native_invalidation_intents"
+            " WHERE completed_at IS NULL OR delivery_outcome = 'abandoned'"),
+        "execution_ms": global_plan["Execution Time"],
+        "planning_ms": global_plan["Planning Time"], "plan": global_plan["Plan"],
+    }))
+
+    stats = await native_derived_worker._pending_stats(ledger)
+    assert {key: stats[f"{key}_at_head"] for key in heads} == heads
+    # Every revision 99 plus every revision of one n in four, against the
+    # 2,500 Heads among them: the gap between the ledger and the diagnosis.
+    assert stats["abandoned"] == 257_500
+    assert stats["status"] == "degraded"

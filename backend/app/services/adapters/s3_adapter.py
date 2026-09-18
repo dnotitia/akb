@@ -62,7 +62,6 @@ def wrap_error(e: ClientError, context: str) -> AKBError:
 
 
 _internal_client = None
-_presign_client = None
 _session = None
 _client_lock = threading.RLock()
 _bucket_verified: set[str] = set()
@@ -79,7 +78,6 @@ _signing_snapshot: ContextVar[tuple[Any, datetime | None, int] | None] = Context
     "s3_signing_snapshot", default=None,
 )
 
-_DEFAULT_PRESIGN_TTL = 3600
 _STREAM_CHUNK_SIZE = 64 * 1024
 _PRESIGN_CLOCK_MARGIN = 60
 
@@ -159,15 +157,16 @@ _internal_presign_client = None
 def internal_presign_client():
     """A signer bound to the INTERNAL endpoint.
 
-    `presign_client` signs against `s3_public_url`, which is correct for a URL
-    handed to a browser and wrong for one handed to the byte gateway: the
-    gateway sits inside the cluster, and a URL naming the public host would
-    send it back out through the ingress it exists to replace.
+    There used to be a second signer here, bound to `s3_public_url`, for URLs
+    handed to a browser. It was retired along with the browser-facing presign,
+    and the internal endpoint is the only one left for a reason: the byte
+    gateway sits inside the cluster, so a URL naming the public host would
+    send it back out through the ingress the gateway exists to replace.
 
-    It carries the same `before-sign` snapshot so a temporary session's
-    remaining lifetime still bounds the signature. This deployment uses static
-    keys and never exercises that, which is exactly why it has to be wired
-    here rather than noticed later.
+    It registers the `before-sign` hook that pins a frozen credential to one
+    signature. Registering it is only half the wiring — the hook reads a
+    ContextVar that `presign_internal_get` sets, and returns immediately when
+    that is unset. Both halves or neither.
     """
     global _internal_presign_client
     if _internal_presign_client is None:
@@ -182,20 +181,6 @@ def internal_presign_client():
     return _internal_presign_client
 
 
-def presign_client():
-    """boto3 S3 client targeting the public endpoint. Used to sign URLs
-    that clients reach from outside the cluster. Falls back to the
-    internal endpoint when no public URL is configured."""
-    global _presign_client
-    with _client_lock:
-        if _presign_client is None:
-            _presign_client = session_client(
-                settings.s3_public_url or settings.s3_endpoint_url, settings.s3_region,
-            )
-            _presign_client.meta.events.register("before-sign.s3", _bind_signing_snapshot)
-    return _presign_client
-
-
 def _bind_signing_snapshot(request, **_kwargs):
     snapshot = _signing_snapshot.get()
     if snapshot is None or not request.context.get("is_presign_request"):
@@ -206,24 +191,6 @@ def _bind_signing_snapshot(request, **_kwargs):
     # Botocore's request-specific credential hook avoids replacing the shared
     # client's credentials. The pinned-runtime tests exercise actual SigV4.
     request.context.setdefault("signing", {})["request_credentials"] = credentials
-
-
-def _presign(operation: str, params: dict[str, Any], ttl: int) -> PresignedURL:
-    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1:
-        raise StorageError("Presign lifetime must be a positive integer")
-    signer = presign_client()
-    credentials, expiry = frozen_snapshot(_credential_session())
-    if expiry is not None:
-        remaining = int((expiry - datetime.now(timezone.utc)).total_seconds()) - _PRESIGN_CLOCK_MARGIN
-        ttl = min(ttl, remaining)
-    if ttl < 1:
-        raise StorageError("S3 session has insufficient lifetime for a presigned URL")
-    context_token = _signing_snapshot.set((credentials, expiry, ttl))
-    try:
-        url = signer.generate_presigned_url(operation, Params=params, ExpiresIn=ttl)
-        return PresignedURL(url, ttl)
-    finally:
-        _signing_snapshot.reset(context_token)
 
 
 def ensure_bucket(bucket: str) -> None:
@@ -408,7 +375,7 @@ def presign_internal_get(
     content_type: str,
     content_disposition: str,
     cache_control: str,
-) -> str:
+) -> PresignedURL:
     """Sign one object read for the byte gateway, policy included.
 
     The response headers travel in the signature rather than being re-applied
@@ -419,6 +386,22 @@ def presign_internal_get(
     inherited from the server block, which is where the unconditional security
     headers live.
     """
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1:
+        raise StorageError("Presign lifetime must be a positive integer")
+
+    # A temporary session's remaining life bounds the signature: a URL that
+    # outlives the credential which signed it is refused at the moment it is
+    # used, which here means mid-transfer. Freeze the credential and clamp the
+    # lifetime to it, less a margin for clock skew.
+    credentials, expiry = frozen_snapshot(_credential_session())
+    if expiry is not None:
+        remaining = int(
+            (expiry - datetime.now(timezone.utc)).total_seconds()
+        ) - _PRESIGN_CLOCK_MARGIN
+        ttl = min(ttl, remaining)
+    if ttl < 1:
+        raise StorageError("S3 session has insufficient lifetime for a presigned URL")
+
     params = {
         "Bucket": settings.s3_bucket,
         "Key": key,
@@ -426,45 +409,22 @@ def presign_internal_get(
         "ResponseContentDisposition": content_disposition,
         "ResponseCacheControl": cache_control,
     }
+    # The frozen credential reaches the signer through this variable and the
+    # `before-sign` hook the client registers. Setting it is what makes that
+    # hook do anything: it returns immediately when the variable is unset, so
+    # a signer that registers the hook and skips this step silently loses the
+    # clamp — which is exactly what the first version of this function did.
+    context_token = _signing_snapshot.set((credentials, expiry, ttl))
     try:
-        return internal_presign_client().generate_presigned_url(
+        url = internal_presign_client().generate_presigned_url(
             "get_object", Params=params, ExpiresIn=ttl,
         )
+        # The lifetime actually signed, not the one asked for. A clamp nobody
+        # can observe is a clamp that can quietly stop working.
+        return PresignedURL(url, ttl)
     except ClientError as e:
         raise StorageError(wrap_error(e, f"sign read {key}").message) from e
+    finally:
+        _signing_snapshot.reset(context_token)
 
 
-def presign_get(
-    key: str,
-    *,
-    ttl: int = _DEFAULT_PRESIGN_TTL,
-    response_content_type: str | None = None,
-    response_content_disposition: str | None = None,
-) -> PresignedURL:
-    """Presigned GET URL for direct download from S3."""
-    try:
-        params: dict[str, Any] = {"Bucket": settings.s3_bucket, "Key": key}
-        if response_content_type:
-            params["ResponseContentType"] = response_content_type
-        if response_content_disposition:
-            params["ResponseContentDisposition"] = response_content_disposition
-        return _presign("get_object", params, ttl)
-    except ClientError as e:
-        raise StorageError(wrap_error(e, f"presign download {key}").message) from e
-
-
-def presign_put(
-    key: str,
-    *,
-    content_type: str = "application/octet-stream",
-    ttl: int = _DEFAULT_PRESIGN_TTL,
-) -> PresignedURL:
-    """Presigned PUT URL for direct upload to S3 by an external client."""
-    try:
-        return _presign(
-            "put_object",
-            {"Bucket": settings.s3_bucket, "Key": key, "ContentType": content_type},
-            ttl,
-        )
-    except ClientError as e:
-        raise wrap_error(e, f"presign upload {key}") from e

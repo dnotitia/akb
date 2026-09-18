@@ -35,6 +35,23 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "keycloakPublicUrl": {"type": "string", "pattern": "^https?://[^/]+/?$"},
+        "enrollmentMode": {"type": "string", "enum": ["open", "invite_only", "disabled"]},
+        "requireVerifiedEmail": {"type": "boolean"},
+        "authoritativeEmailDomains": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 3}
+          }
+        },
+        "localRealmLogin": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "displayName": {"type": "string", "minLength": 1}
+          }
+        },
         "productAdmin": {
           "type": "object",
           "required": ["username", "email"],

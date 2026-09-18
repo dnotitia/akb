@@ -743,19 +743,45 @@ async def test_adoption_preserves_mixed_case_legacy_email_account(pool):
 
 
 async def test_ambiguous_email_case_variants_require_explicit_approval(pool):
+    # Pre-109 legacy state: two case variants of one address coexist because
+    # no UNIQUE(lower(email)) existed yet. The helper inserts directly (not
+    # through register()), so it can still stage that state; migration 109
+    # renames such rows on real installations. The adopt lookup must find
+    # both and refuse rather than pick one implicitly.
+    #
+    # The full 109 index cannot coexist with the staged pair, so it is
+    # dropped for the body and rebuilt in `finally` (which re-validates the
+    # whole table — the staged pair is cleaned first, so the rebuild holds).
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
     email = f"auth-case-conflict-{uuid.uuid4().hex[:8]}@{_DOMAIN}"
-    user_ids = [await _insert_unbound_user(pool, email), await _insert_unbound_user(pool, email.upper())]
-    subject = f"case-conflict-{uuid.uuid4().hex}"
-    with pytest.raises(ExternalIdentityConflictError):
-        await _resolve_or_provision_keycloak_user(_claims(subject, email), provider_alias=_ALIAS)
-
-    assert await _binding(pool, subject) is None
+    first_id = await _insert_unbound_user(pool, email)
     async with pool.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT count(*) FROM users WHERE id=ANY($1::uuid[]) AND auth_provider='local'", user_ids
-        ) == 2
-        assert await conn.fetchval(
-            "SELECT count(*) FROM pending_admissions WHERE issuer=$1 AND subject=$2", _ISSUER, subject
-        ) == 1
+        # Bypass the 109 backstop the way pre-migration rows bypassed it:
+        # the legacy rows predate the index.
+        await conn.execute("DROP INDEX IF EXISTS users_email_lower_uniq")
+        second_id = await _insert_unbound_user(pool, email.upper())
+    try:
+        subject = f"case-conflict-{uuid.uuid4().hex}"
+        with pytest.raises(ExternalIdentityConflictError):
+            await _resolve_or_provision_keycloak_user(_claims(subject, email), provider_alias=_ALIAS)
+
+        assert await _binding(pool, subject) is None
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM users WHERE (id=$1 OR id=$2) AND auth_provider='local'", first_id, second_id
+            ) == 2
+            assert await conn.fetchval(
+                "SELECT count(*) FROM pending_admissions WHERE issuer=$1 AND subject=$2", _ISSUER, subject
+            ) == 1
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM pending_admissions WHERE issuer=$1 AND subject=$2", _ISSUER, subject
+            )
+            await conn.execute(
+                "DELETE FROM users WHERE id=$1 OR id=$2", first_id, second_id
+            )
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uniq ON users (lower(email))"
+            )

@@ -97,8 +97,11 @@ def test_native_grep_matcher_has_literal_regex_and_case_contract():
         M1NativeGrepService._matcher("(", regex=True, case_sensitive=False)
 
 
+@pytest.mark.parametrize("regex", [True, False])
 @pytest.mark.asyncio
-async def test_adversarial_regex_is_off_loop_and_fails_within_bound(monkeypatch):
+async def test_adversarial_regex_is_off_loop_and_fails_within_bound(monkeypatch, regex):
+    payload = (b"a" * 26) + b"!" if regex else b"a" * 1_000_000
+    pattern = r"(a+)+$" if regex else "a" * 1023 + "b"
     body = HeadBody(
         namespace_id=uuid.uuid4(),
         vault="measure",
@@ -107,8 +110,8 @@ async def test_adversarial_regex_is_off_loop_and_fails_within_bound(monkeypatch)
         path="slow.txt",
         revision_id="a" * 40,
         digest="b" * 64,
-        byte_size=27,
-        canonical_bytes=(b"a" * 26) + b"!",
+        byte_size=len(payload),
+        canonical_bytes=payload,
     )
     service = M1NativeGrepService(object())  # type: ignore[arg-type]
 
@@ -131,7 +134,7 @@ async def test_adversarial_regex_is_off_loop_and_fails_within_bound(monkeypatch)
     try:
         with pytest.raises(AKBError, match="timed out") as error:
             await service.grep(
-                r"(a+)+$", user_id=uuid.uuid4(), regex=True,
+                pattern, user_id=uuid.uuid4(), regex=regex,
                 include_text_files=True,
             )
     finally:
@@ -563,12 +566,18 @@ class _Conn:
     def transaction(self, **_kwargs):
         return _Acquire(self)
 
+    async def fetchval(self, sql, *params):
+        assert "to_regclass" in sql
+        return False
+
     async def fetchrow(self, sql, *params):
         self.aggregate_sql = sql
         self.params = params
         return self.aggregate
 
     async def fetch(self, sql, *params):
+        if "WITH file_sources" in sql:
+            return []  # Catalogue behavior is exercised against real PostgreSQL.
         self.sql = sql
         self.params = params
         self.body_fetches += 1
@@ -830,6 +839,8 @@ async def test_count_only_counts_without_materializing_snippets(monkeypatch):
         "total_resources": 1,
         "total_matches": 5,
         "by_resource": {body.uri: 5},
+        "total_documents": 0,
+        "by_document": {},
     }
 
 
@@ -994,3 +1005,44 @@ def test_regex_worker_rejects_when_process_slots_are_exhausted(monkeypatch):
     with pytest.raises(AKBError, match="capacity exhausted") as error:
         native_grep._run_regex_bounded(lambda: None, (), {}, 0.1)
     assert error.value.status_code == 429
+
+
+@pytest.mark.parametrize(
+    ("text", "pattern", "regex", "expected_count", "expected"),
+    [
+        ("Straße\nSTRASSE", "strasse", False, 1, "Straße\nX"),
+        ("İstanbul\nistanbul", "istanbul", False, 2, "X\nX"),
+        ("TODO\r\nTODO\rTODO\nlast", "^TODO$", True, 3, "X\nX\rX\nlast"),
+        ("TODO\nother TODO", "^TODO", True, 1, "X\nother TODO"),
+        ("a\nb", r"a\s+b|b", True, 1, "a\nX"),
+    ],
+)
+def test_native_preview_and_replacement_share_line_and_unicode_semantics(
+    text, pattern, regex, expected_count, expected,
+):
+    payload = text.encode("utf-8")
+    body = HeadBody(
+        namespace_id=uuid.uuid4(), vault="test", resource_id=uuid.uuid4(),
+        surface="document", path="example.md", revision_id="a" * 40,
+        digest=hashlib.sha256(payload).hexdigest(), byte_size=len(payload),
+        canonical_bytes=payload,
+    )
+    scan = native_grep._scan_bodies_sync(
+        [body], pattern, regex=regex, case_sensitive=False,
+    )
+    assert scan["total_matches"] == expected_count
+    assert native_grep._replace_bodies_sync(
+        [body], pattern, "X", regex=regex, case_sensitive=False,
+    ) == [expected]
+
+
+@pytest.mark.asyncio
+async def test_missing_payload_cannot_turn_nonempty_scope_into_success():
+    row = _row()
+    conn = _Conn(row, aggregate={"resource_count": 2, "total_bytes": row["byte_size"] * 2})
+    with pytest.raises(AKBError) as error:
+        await M1NativeGrepService(_Pool(conn))._head_bodies(
+            user_id=uuid.uuid4(), vaults=None, collection=None,
+            resource_id=None, surfaces=("document",),
+        )
+    assert error.value.code == "grep_payload_not_ready"

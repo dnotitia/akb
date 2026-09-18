@@ -239,10 +239,6 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_put",
-        lambda *_args, **_kwargs: pytest.fail("a replacement must not be signed against the store"),
-    )
     monkeypatch.setattr(fs, "_issue_write_capability", _issue)
     monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
 
@@ -293,10 +289,6 @@ async def test_upload_url_carries_no_locator_and_never_signs(monkeypatch):
     monkeypatch.setattr(fs.vault_files_repo, "s3_key_available_for_registration", allowed)
     monkeypatch.setattr(fs.vault_files_repo, "insert_or_adopt", inserted)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_put",
-        lambda *_a, **_k: pytest.fail("an upload must not be signed against the store"),
-    )
 
     result = await service.initiate_upload(
         "team", _row()["vault_id"], "", "test.bin", actor_id="tester",
@@ -337,10 +329,10 @@ async def test_download_reports_the_capability_lifetime_and_never_signs(monkeypa
         return {**_row(), "upload_state": "confirmed", "hash_algorithm": "sha256"}
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", find)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_get",
-        lambda *_a, **_k: pytest.fail("a download must not be signed against the store"),
-    )
+    # The guard that used to stand here monkeypatched `presign_get` to fail.
+    # That function no longer exists, which is a stronger statement than any
+    # stub could make: there is no way to sign a download for a client.
+    assert not hasattr(fs.s3_adapter, "presign_get")
 
     result = await service.get_download_url(_row()["vault_id"], str(_row()["id"]))
 

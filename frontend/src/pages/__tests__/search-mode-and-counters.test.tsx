@@ -359,3 +359,29 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
     await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", [], 20, expect.objectContaining({ regex: false, case_sensitive: false })));
   });
 });
+
+
+describe("text File literal search", () => {
+  it("uses resource totals and File navigation with body-relative provenance", async () => {
+    mockedGrep.mockResolvedValue({ pattern: "needle", regex: false,
+      total_docs: 0, total_resources: 1, returned_resources: 1, total_matches: 1,
+      results: [{ uri: "akb://eng/file/f-123", vault: "eng", path: "note.txt", title: "Text note",
+        resource_type: "file", revision: "r1", matches: [{ section: null, text: "needle", line: 3 }] }],
+    });
+    renderAt("/search?q=needle&mode=literal&include_text_files=true");
+    const link = await screen.findByRole("link", { name: /Text note/ });
+    expect(link).toHaveAttribute("href", "/vault/eng/file/f-123");
+    expect(screen.getByText("1 resource · 1 match")).toBeVisible();
+    expect(screen.getByText("Body line 3")).toBeVisible();
+    expect(screen.getByText("Revision r1")).toBeVisible();
+    expect(mockedGrep).toHaveBeenCalledWith("needle", [], 20, expect.objectContaining({ include_text_files: true }));
+  });
+
+  it.each([409, 503])("shows unavailable instead of zero matches on %s", async (status) => {
+    mockedGrep.mockRejectedValue(new Error(`Text File search is not ready (${status}); retry.`));
+    renderAt("/search?q=needle&mode=literal&include_text_files=true");
+    expect(await screen.findByText(/Text File search is not ready/)).toBeVisible();
+    expect(screen.queryByText(/No results for/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 resources/)).not.toBeInTheDocument();
+  });
+});

@@ -9,6 +9,7 @@ export const SEARCH_FILTER_KEYS = [
   "archive_scope",
   "regex",
   "case_sensitive",
+  "include_text_files",
 ] as const;
 
 export function readSearchOptions(params: URLSearchParams): SearchOptions {
@@ -28,6 +29,7 @@ export function readSearchOptions(params: URLSearchParams): SearchOptions {
     archiveScope === "all"
       ? { archive_scope: archiveScope }
       : {}),
+    include_text_files: params.get("include_text_files") === "true",
     regex: params.get("regex") === "true",
     case_sensitive: params.get("case_sensitive") === "true",
   };

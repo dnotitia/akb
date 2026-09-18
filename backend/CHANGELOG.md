@@ -7,6 +7,101 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### BM25 statistics
+
+- A recompute that cannot take the advisory lock retries briefly instead of
+  waiting a full refresh interval. A rolling restart leaves the replaced pod
+  holding the lock until it drains, so the replacement's first tick could find
+  it held by a process already leaving and then sleep six hours — three
+  restarts in a day left one deployment's statistics fifteen hours stale while
+  the corpus moved on. The retry is bounded and short: a lock still held after
+  it belongs to a recompute that is really running elsewhere, and skipping that
+  one is correct, because it publishes the statistics the tick wanted.
+
+### Indexing
+
+- A NUL byte in a body no longer costs the document its place in ranked search.
+  Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
+  does not, so indexing raised `CharacterNotInRepertoireError` on every attempt
+  until the retry ceiling abandoned the intent, leaving the document readable
+  and greppable but absent from ranked search. The byte is now removed where
+  every request model already normalizes user text, and again where chunks are
+  built — the second boundary is what lets bodies stored before this be indexed
+  without anyone finding and rewriting them. Nothing else about the text
+  changes, and a write is never refused for carrying one.
+
+### MCP transport
+
+- The legacy MCP transport is stateless. Its session lived in a per-process
+  dict in the SDK, so a client that initialized against one replica got
+  `Session not found` from the next — roughly half its calls on a two-replica
+  deployment. Nothing could make that dict shared: it holds live streams, not
+  data. The state is gone instead, which costs nothing here (this server
+  advertises `tools` with `listChanged: false`, answers with `json_response`,
+  never opens the standalone GET stream and never sends a server-to-client
+  request — the entire set stateless mode gives up). The modern era already
+  worked this way.
+- `initialize` no longer returns `Mcp-Session-Id`, and a legacy request no
+  longer needs one. Clients should send `MCP-Protocol-Version` on each request,
+  as the spec already asks: with no session to remember the handshake, that
+  header is what tells the server — and its audit trail — which revision an
+  exchange belongs to. The bundled proxy now sends it. `DELETE` keeps its
+  `{"terminated": true}` contract and reports success with no session to
+  release, rather than a 404 for one the client was never given.
+
+### Native public links
+
+- Native Document publications bind to vault-scoped Resource identity and read
+  the verified current revision. Moves preserve the selected document; soft
+  deletion revokes its links atomically. Existing verified cutover mappings
+  transfer old links without publishing a new occupant of a reused path.
+- Native section publications return no body or image grants when their section
+  disappears. Public status, unpublish, and oEmbed follow the same identity.
+  Migration 106 adds Native publication bindings and lifecycle enforcement.
+
+### Section-scoped publications
+
+- A section filter that no longer matches resolves to an empty body and an empty
+  image manifest on **every** revision backend, not only the
+  PostgreSQL-authoritative one. The two resolution paths previously disagreed,
+  so the same link disclosed a different amount depending on which backend
+  served it; they now share one rule. The viewer notice says the section is gone
+  rather than announcing a fallback that no longer happens.
+- A section-scoped publication derives its `summary` from the published section
+  instead of carrying the document's stored one. A stored summary describes the
+  whole document — written by the author, derived from its opening at create
+  time, or filled in by the LLM metadata worker on an imported document — and a
+  link cut for one section was never granted the rest of it. Publications
+  without a section filter are unchanged.
+
+### Native Document drill-down
+
+- Native drill-down and section outlines read the verified current Document
+  Head instead of the legacy document/chunk tables. Preserve pre-heading prose,
+  user-authored metadata-shaped text, empty headings, and repeated content in
+  bounded, non-overlapping sections.
+
+### Native grep consistency
+
+- Native grep supports explicit `include_text_files` reads across REST, MCP,
+  SDK and Search UI. The previous measurement option remains an alias; explicit
+  conflicting values fail validation. Resource aggregates accompany Document
+  counts, and File synchronization gaps return a readiness error instead of a
+  misleading empty or stale result.
+- MCP accepts multiple Vaults and the same metadata/lifecycle filters as REST.
+  REST/MCP output limits are aligned at 50. Document replacement rechecks write
+  access per mutation and retains partial receipts on CAS conflicts.
+
+- Native grep now uses the same Unicode case-insensitive matching rules for
+  literal reads and replacements. Full casefold expansions such as `ß`/`ss`
+  no longer match. Regex replacements operate on the same body lines as reads,
+  so anchors and whitespace cannot rewrite unpreviewed cross-line matches.
+- Case-insensitive literal scans and replacements use the existing bounded
+  process worker, including its execution deadline and result-size limits.
+- Native Document and File results retain body-relative line numbers and
+  resource type, searched revision, and content hash through REST/MCP responses.
+  Legacy execution and the prohibition on File grep replacement are unchanged.
+
 ### Safe account lifecycle
 
 Add identity-bound account lifecycle preview, paginated deletion blockers,

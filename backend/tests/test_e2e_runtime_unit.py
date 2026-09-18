@@ -31,6 +31,8 @@ from e2e_runtime import (  # noqa: E402
     MinioResetFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
+    _fixture_schema_fingerprint,
+    _fixture_v2_manifest,
     _parse_args,
     prepare_private_runtime_root,
     select_capability_profile,
@@ -810,7 +812,19 @@ def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_co
                 "fixture_id": "legacy-adoption",
                 "vault_id": "vault-legacy",
                 "before": {"row_count": 3},
-                "after": {"grant_generation": 0},
+                "after_adoption": {
+                    "grant_generation": 0,
+                    "observed_grant_generation": 0,
+                },
+                "after_initial_grant": {
+                    "grant_generation": 1,
+                    "observed_grant_generation": 1,
+                },
+                "after": {
+                    "grant_generation": 1,
+                    "observed_grant_generation": 1,
+                    "desired_current_release_id": "release-next",
+                },
             }
         },
     }
@@ -824,7 +838,62 @@ def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_co
         "target_type": "legacy_adoption",
     } in control["targets"]
     assert discovery["fixtures"]["legacy_adoption"]["before"]["row_count"] == 3
-    assert discovery["fixtures"]["legacy_adoption"]["after"]["grant_generation"] == 0
+    assert discovery["fixtures"]["legacy_adoption"]["after_adoption"]["grant_generation"] == 0
+    assert discovery["fixtures"]["legacy_adoption"]["after_initial_grant"]["grant_generation"] == 1
+    assert discovery["fixtures"]["legacy_adoption"]["after"]["desired_current_release_id"] == "release-next"
+
+
+def test_legacy_noop_release_fixture_has_fresh_and_exact_source_plans():
+    table = {
+        "name": "legacy_orders",
+        "columns": [
+            {"name": "amount", "type": "numeric"},
+            {"name": "state", "type": "text"},
+        ],
+        "unique_keys": [],
+        "indexes": [],
+    }
+    fingerprint = _fixture_schema_fingerprint([table])
+    manifest, checksum = _fixture_v2_manifest(
+        app_key="fixture-legacy-target",
+        version="6.0.0",
+        tables=[table],
+        transition_plans=[
+            (
+                "fresh",
+                [
+                    {
+                        "id": "create_legacy_orders",
+                        "phase": "expand",
+                        "operation": "create_table",
+                        "payload": {
+                            "table": "legacy_orders",
+                            "columns": table["columns"],
+                            "unique_keys": [],
+                            "indexes": [],
+                        },
+                    }
+                ],
+            ),
+            (
+                {
+                    "release_version": "5.0.0",
+                    "schema_fingerprint": fingerprint,
+                },
+                [],
+            ),
+        ],
+    )
+
+    assert len(checksum) == 64
+    assert manifest["schema"]["fingerprint"] == fingerprint
+    assert manifest["transition_plans"][1] == {
+        "source": {
+            "release_version": "5.0.0",
+            "schema_fingerprint": fingerprint,
+        },
+        "steps": [],
+    }
 
 
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):

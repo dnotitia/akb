@@ -215,3 +215,14 @@ def test_stripping_is_idempotent():
 def test_empty_and_none_pass_through():
     assert strip_chunk_metadata_header(None) is None
     assert strip_chunk_metadata_header("") == ""
+
+
+def test_issue_339_title_uri_user_prose_survives_strip_and_drill_down():
+    from app.services.search_service import clean_section_rows
+
+    body = "TITLE: Release notes\nURI: https://example.com/x\n\nactual body\n"
+    assert strip_chunk_metadata_header(body) == body
+    sections = clean_section_rows([{
+        "doc_id": "issue-339", "chunk_index": 0, "section_path": None, "content": body,
+    }])
+    assert sections[0]["content"] == body

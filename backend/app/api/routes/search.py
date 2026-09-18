@@ -100,12 +100,15 @@ async def grep_documents(
     tags: list[str] | None = Query(None),
     include_archived: bool = Query(True, description="Legacy default includes archived documents; the search UI explicitly excludes them."),
     archive_scope: ArchiveScope | None = Query(None, description="Document archive scope; overrides include_archived."),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=50),
     count_only: bool = Query(False, description="grep -c — per-doc counts + total"),
     files_with_matches: bool = Query(False, description="grep -l — URIs with matches"),
-    measurement_include_text_files: bool = Query(
-        False,
-        description="Native mode: include admitted searchable text Files.",
+    include_text_files: bool | None = Query(
+        None, description="Native mode: include admitted searchable text Files; omitted means Documents only.",
+    ),
+    measurement_include_text_files: bool | None = Query(
+        None, description="Deprecated alias for include_text_files; conflicting values are rejected.",
+        deprecated=True,
     ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
@@ -113,6 +116,7 @@ async def grep_documents(
         pattern=q, vault=vault, collection=collection,
         regex=regex, case_sensitive=case_sensitive, limit=limit,
         count_only=count_only, files_with_matches=files_with_matches,
+        include_text_files=include_text_files,
         measurement_include_text_files=measurement_include_text_files,
         user_id=user.user_id,
         doc_types=doc_types, tags=tags, include_archived=include_archived,

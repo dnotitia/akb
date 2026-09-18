@@ -1217,13 +1217,19 @@ class FileService:
         its access log no longer sees any of this."""
         if self._measurement is not None:
             return await self._measurement.get_download_url(vault_id, file_id)
+        # A malformed id is a client error, not a missing File — same boundary
+        # the single-file read draws.
+        try:
+            fid = uuid.UUID(file_id)
+        except (ValueError, AttributeError):
+            raise ValidationError("file_id must be a UUID") from None
         token = _new_capability_token()
         pool = await get_pool()
         # One connection for both reads and the grant. Splitting them made a
         # plain GET take two round-trips through the pool for no gain.
         async with pool.acquire() as conn:
             row = await vault_files_repo.find_by_id(
-                conn, vault_id, uuid.UUID(file_id),
+                conn, vault_id, fid,
             )
             if (
                 not row
@@ -1241,7 +1247,7 @@ class FileService:
                     NOW() + ($5 * INTERVAL '1 second'), $6
                 )
                 """,
-                uuid.uuid4(), uuid.UUID(file_id), vault_id,
+                uuid.uuid4(), fid, vault_id,
                 _capability_digest(token), _PRESIGN_DOWNLOAD_TTL, actor_id,
             )
 

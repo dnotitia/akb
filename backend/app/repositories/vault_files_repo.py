@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from app.config import settings
@@ -450,6 +451,40 @@ async def find_attachment_by_id(
     return dict(row) if row else None
 
 
+@dataclass(frozen=True)
+class DocumentAssetOwner:
+    """The document a live asset reference belongs to — one arm, never both.
+
+    A document lives either in `documents` (the Git arm) or in
+    `native_resources` (the Native arm), and `document_asset_refs` carries one
+    nullable column for each. Passing the pair around as a value rather than as
+    two loose keyword arguments is what makes "exactly one" unrepresentable at
+    the call site instead of only in the database CHECK.
+    """
+
+    vault_id: uuid.UUID
+    document_id: uuid.UUID | None = None
+    native_document_id: uuid.UUID | None = None
+
+    def __post_init__(self) -> None:
+        if (self.document_id is None) == (self.native_document_id is None):
+            raise ValueError(
+                "a document asset reference names exactly one of "
+                "document_id / native_document_id"
+            )
+
+    @property
+    def column(self) -> str:
+        """The owning column's name — a closed set, never caller input."""
+        return "document_id" if self.document_id is not None else "native_document_id"
+
+    @property
+    def document_key(self) -> uuid.UUID:
+        value = self.document_id if self.document_id is not None else self.native_document_id
+        assert value is not None  # __post_init__ guarantees this
+        return value
+
+
 async def find_authorized_attachment(
     conn,
     *,
@@ -552,8 +587,7 @@ async def claim_attachment_references(
 async def sync_document_asset_references(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
     document_path: str,
     commit_hash: str,
     asset_ids: set[uuid.UUID],
@@ -577,35 +611,38 @@ async def sync_document_asset_references(
             )
             SELECT live.vault_id, $3, $4, live.asset_id, $5
               FROM document_asset_refs live
-             WHERE live.document_id = $1 AND live.vault_id = $2
+             WHERE live.{column} = $1 AND live.vault_id = $2
             ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
             DO UPDATE SET retain_until = GREATEST(
                 document_asset_revision_refs.retain_until,
                 EXCLUDED.retain_until
             )
-            """,
-            document_id, vault_id, previous_path or document_path,
+            """.format(column=owner.column),
+            owner.document_key, owner.vault_id, previous_path or document_path,
             previous_commit, retain_until,
         )
 
     await conn.execute(
         """
         DELETE FROM document_asset_refs
-         WHERE document_id = $1
+         WHERE {column} = $1
            AND vault_id = $2
            AND NOT (asset_id = ANY($3::uuid[]))
-        """,
-        document_id, vault_id, list(asset_ids),
+        """.format(column=owner.column),
+        owner.document_key, owner.vault_id, list(asset_ids),
     )
     if asset_ids:
         await conn.execute(
             """
-            INSERT INTO document_asset_refs (document_id, vault_id, asset_id)
+            INSERT INTO document_asset_refs ({column}, vault_id, asset_id)
             SELECT $1, $2, asset_id
               FROM unnest($3::uuid[]) AS asset_id
-            ON CONFLICT (document_id, asset_id) DO NOTHING
-            """,
-            document_id, vault_id, list(asset_ids),
+            -- Each arm's uniqueness is a PARTIAL index, and an arbiter has to
+            -- name the same predicate or PostgreSQL refuses to match it.
+            ON CONFLICT ({column}, asset_id) WHERE {column} IS NOT NULL
+            DO NOTHING
+            """.format(column=owner.column),
+            owner.document_key, owner.vault_id, list(asset_ids),
         )
         await conn.execute(
             """
@@ -620,23 +657,22 @@ async def sync_document_asset_references(
                 EXCLUDED.retain_until
             )
             """,
-            vault_id, document_path, commit_hash, list(asset_ids), retain_until,
+            owner.vault_id, document_path, commit_hash, list(asset_ids), retain_until,
         )
 
 
 async def list_live_document_asset_ids(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
 ) -> set[uuid.UUID]:
     rows = await conn.fetch(
         """
         SELECT asset_id
           FROM document_asset_refs
-         WHERE document_id = $1 AND vault_id = $2
-        """,
-        document_id, vault_id,
+         WHERE {column} = $1 AND vault_id = $2
+        """.format(column=owner.column),
+        owner.document_key, owner.vault_id,
     )
     return {row["asset_id"] for row in rows}
 
@@ -644,8 +680,7 @@ async def list_live_document_asset_ids(
 async def retain_current_document_assets(
     conn,
     *,
-    document_id: uuid.UUID,
-    vault_id: uuid.UUID,
+    owner: DocumentAssetOwner,
     document_path: str,
     commit_hash: str | None,
     retain_until: datetime,
@@ -660,14 +695,14 @@ async def retain_current_document_assets(
         )
         SELECT live.vault_id, $3, $4, live.asset_id, $5
           FROM document_asset_refs live
-         WHERE live.document_id = $1 AND live.vault_id = $2
+         WHERE live.{column} = $1 AND live.vault_id = $2
         ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
         DO UPDATE SET retain_until = GREATEST(
             document_asset_revision_refs.retain_until,
             EXCLUDED.retain_until
         )
-        """,
-        document_id, vault_id, document_path, commit_hash, retain_until,
+        """.format(column=owner.column),
+        owner.document_key, owner.vault_id, document_path, commit_hash, retain_until,
     )
 
 

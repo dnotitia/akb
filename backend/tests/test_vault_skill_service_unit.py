@@ -6,7 +6,12 @@ from app.services import vault_skill_service as vss
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch):
+    # Startup refuses to boot without this secret, so the signed challenge is
+    # the only path a deployment ever takes; the tests take it too.
+    monkeypatch.setattr(
+        vss.settings, "system_hmac_secret", "test-system-hmac-secret"  # pragma: allowlist secret
+    )
     vss.reset()
     yield
     vss.reset()
@@ -112,6 +117,152 @@ async def test_strict_ack_is_bound_to_session_vault_identity_and_version(monkeyp
     assert updated is not None
     assert updated["version"] == "v-new"
     assert updated["ack_token"] != token
+
+
+@pytest.mark.asyncio
+async def test_an_acknowledgement_verifies_on_a_replica_that_never_issued_it(monkeypatch):
+    """The challenge has to outlive the process that answered the first call.
+
+    `reset()` empties every per-process map, which is exactly what a second
+    pod holds: it never saw the token. When the challenge lived in
+    `_challenge_map` this retry minted a fresh one instead of verifying, the
+    client retried with that, landed back on the first pod, and the loop never
+    closed — which is what two replicas did to every MCP document write.
+    """
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+
+    challenge = await vss.preflight_payload("sess", "v1", "vault-id")
+    token = challenge["ack_token"]
+    # A signed challenge is derived, so there is nothing to have remembered.
+    assert not vss._challenge_map
+
+    vss.reset()  # a different replica
+
+    assert await vss.preflight_payload(
+        "sess", "v1", "vault-id", acknowledgement=token
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_replicas_issue_one_challenge_for_one_key_and_version(monkeypatch):
+    """Two pods must hand the same client the same token, not two tokens."""
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+
+    first = await vss.preflight_payload("sess", "v1", "vault-id")
+    vss.reset()
+    second = await vss.preflight_payload("sess", "v1", "vault-id")
+
+    assert first["ack_token"] == second["ack_token"]
+    # Still opaque: a different secret is a different challenge.
+    monkeypatch.setattr(
+        vss.settings, "system_hmac_secret", "other-deployment"  # pragma: allowlist secret
+    )
+    vss.reset()
+    assert (await vss.preflight_payload("sess", "v1", "vault-id"))["ack_token"] != first[
+        "ack_token"
+    ]
+
+
+def test_signed_fields_are_length_prefixed_so_two_bindings_cannot_collide():
+    """Two different bindings must never sign the same message.
+
+    `session_id` is client input and `vault_id`/`version` are opaque strings.
+    Joining them with a separator lets one binding's fields spell another's:
+    these two keys differ only in which side of the boundary a separator falls
+    on, so a joined message is byte-identical for both and one token would
+    verify for the other. Real session ids and git oids make that unreachable
+    today; length-prefixing makes it unrepresentable, which is the property
+    worth pinning rather than the reachability.
+    """
+    assert vss._challenge_token(("a", "b", "c\x1fd"), "e") != vss._challenge_token(
+        ("a", "b", "c"), "d\x1fe"
+    )
+
+
+@pytest.mark.asyncio
+async def test_without_a_shared_secret_the_challenge_is_still_issued(monkeypatch):
+    """The fallback is test-only, but it must not be broken code."""
+    monkeypatch.setattr(vss.settings, "system_hmac_secret", "")
+    monkeypatch.setattr(vss.settings, "jwt_secret", "")
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+
+    challenge = await vss.preflight_payload("sess", "v1", "vault-id")
+    assert challenge is not None
+    assert vss._challenge_map  # this one IS remembered — per process
+    assert await vss.preflight_payload(
+        "sess", "v1", "vault-id", acknowledgement=challenge["ack_token"]
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_a_replica_behind_on_the_guide_still_accepts_the_newer_token(monkeypatch):
+    """The 60-second window a guide edit opens between replicas.
+
+    The token is a function of the guide version, so a replica still serving
+    the previous one derives a different token and the retry can never match
+    until its cache expires. `_CACHE_TTL` is 60 seconds, and a guide is edited
+    roughly every other day across the corpus — small, but the failure it
+    produces is the same ping-pong that made MCP writes impossible before the
+    token was derived at all.
+
+    Here the "other replica" is simulated by deriving the token while the
+    service sees the new guide, then putting the service back on the old one.
+    """
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-new"))
+    issued = await vss.preflight_payload("s", "v1", "id")
+    token = issued["ack_token"]
+
+    # This replica is behind: its cache holds the previous version.
+    vss.reset()
+    monkeypatch.setattr(
+        vss.settings, "system_hmac_secret", "test-system-hmac-secret"  # pragma: allowlist secret
+    )
+    fetched = {"n": 0}
+
+    async def drifting(vault, vault_id=None):
+        fetched["n"] += 1
+        # First read is the stale guide; the forced re-read sees the new one.
+        version = "v-old" if fetched["n"] == 1 else "v-new"
+        return {"content": "# skill body", "version": version}
+
+    monkeypatch.setattr(vss, "_fetch_skill", drifting)
+
+    assert await vss.preflight_payload(
+        "s", "v1", "id", acknowledgement=token
+    ) is None, "a replica behind on the guide rejected a valid acknowledgement"
+    assert fetched["n"] == 2, "the mismatch did not force a re-read"
+
+
+@pytest.mark.asyncio
+async def test_wrong_acknowledgements_cannot_force_a_read_per_call(monkeypatch):
+    """The re-read is a repair path, not an amplifier a caller can drive."""
+    fetched = {"n": 0}
+
+    async def counting(vault, vault_id=None):
+        fetched["n"] += 1
+        return {"content": "# skill body", "version": "v-stable"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", counting)
+    for _ in range(8):
+        assert await vss.preflight_payload(
+            "s", "v1", "id", acknowledgement="x" * 32
+        ) is not None
+    # One initial resolve plus at most one forced re-read inside the interval.
+    assert fetched["n"] <= 2, f"{fetched['n']} guide reads for 8 wrong tokens"
+
+
+@pytest.mark.asyncio
+async def test_a_first_touch_does_not_force_a_read(monkeypatch):
+    """No acknowledgement presented means nothing to be behind on."""
+    fetched = {"n": 0}
+
+    async def counting(vault, vault_id=None):
+        fetched["n"] += 1
+        return {"content": "# skill body", "version": "v1"}
+
+    monkeypatch.setattr(vss, "_fetch_skill", counting)
+    assert await vss.preflight_payload("s", "v1", "id") is not None
+    assert fetched["n"] == 1
 
 
 @pytest.mark.asyncio

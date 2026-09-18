@@ -875,16 +875,19 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_grep")
 async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
-    # Read access check when vault is specified
-    if args.get("vault"):
-        await check_vault_access(uid, args["vault"], required_role="reader")
+    from app.services.search_service import _normalize_vault_scope
+
+    vaults = _normalize_vault_scope(args.get("vault"))
     replace = args.get("replace")
-    if replace is not None:
-        # Replace requires writer access on the target vault
-        if args.get("vault"):
-            await check_vault_access(uid, args["vault"], required_role="writer")
-        else:
-            return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    if replace is not None and not vaults:
+        return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    limit = args.get("limit", 20)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return err("limit must be between 1 and 50", code=INVALID_ARGUMENT)
+    for vault in dict.fromkeys(vaults or []):
+        await check_vault_access(
+            uid, vault, required_role="writer" if replace is not None else "reader",
+        )
     result = await search_service.grep(
         pattern=args["pattern"],
         vault=args.get("vault"),
@@ -895,11 +898,18 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         doc_service=doc_service if replace is not None else None,
         agent_id=user.username if replace is not None else None,
         user_id=uid,
-        limit=args.get("limit", 20),
+        limit=limit,
         max_replacements=args.get("max_replacements", DEFAULT_MAX_REPLACEMENTS),
         count_only=args.get("count_only", False),
         files_with_matches=args.get("files_with_matches", False),
-        measurement_include_text_files=args.get("measurement_include_text_files", False),
+        include_text_files=args.get("include_text_files"),
+        measurement_include_text_files=args.get(
+            "measurement_include_text_files", None if "include_text_files" in args else False,
+        ),
+        doc_types=args.get("doc_types"),
+        tags=args.get("tags"),
+        include_archived=args.get("include_archived", True),
+        archive_scope=args.get("archive_scope"),
     )
     return result
 

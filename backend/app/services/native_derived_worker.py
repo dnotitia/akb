@@ -74,6 +74,22 @@ def source_type_for_surface(surface: str) -> str:
         raise ValueError(f"unsupported native derived surface: {surface}") from None
 
 
+def _indexable(canonical_text: str) -> str:
+    """Drop what PostgreSQL `text` cannot hold from a body already at rest.
+
+    The write boundary removes NUL now (`to_nfc`), so nothing new arrives
+    carrying one. Bodies stored before that do, and they live in the payload
+    store, which accepts the byte -- so the document reads back intact while
+    every indexing attempt raises `CharacterNotInRepertoireError`, retries to
+    the ceiling and is abandoned (akb#527). Sanitising here is what lets those
+    documents be indexed without anyone having to find and rewrite them.
+
+    Only the byte goes. An index missing eight NULs and a document missing its
+    whole entry in ranked search are not comparable losses.
+    """
+    return canonical_text.replace("\x00", "")
+
+
 def build_native_document_chunks(
     *,
     vault_name: str,
@@ -81,7 +97,7 @@ def build_native_document_chunks(
     canonical_text: str,
 ) -> list[Chunk]:
     """Build the real AKB chunk representation from one verified native body."""
-    metadata, body = _parse_markdown(canonical_text)
+    metadata, body = _parse_markdown(_indexable(canonical_text))
     if not body.strip():
         return []
     title = str(metadata.get("title") or path.rsplit("/", 1)[-1])
@@ -110,6 +126,7 @@ def build_native_file_chunks(
     so the whole verified body is chunked on size alone. The header carries
     File addressing (``akb://…/file/<uuid>``), not a Document path.
     """
+    canonical_text = _indexable(canonical_text)
     if not canonical_text.strip():
         return []
     collection = path.rsplit("/", 1)[0] if "/" in path else None
@@ -136,6 +153,21 @@ async def _pending_stats(
     ``status`` refuses to say ``ok`` while it is non-zero, even with an empty
     queue: a backfill that reached 100% having dropped documents is not a
     finished backfill.
+
+    It is a ledger, though, and a ledger never forgets.  A revision that was
+    abandoned and then superseded by one that indexed cleanly leaves its entry
+    behind forever, so a verdict taken from it reports a loss that has already
+    been repaired and keeps reporting it.  ``*_at_head`` is the same count
+    narrowed to intents whose revision is still the Resource's Head — the ones
+    that describe a document missing from ranked search *now*.  The verdict
+    reads those; the cumulative counts stay exactly as they were, because the
+    question "what has this queue ever given up on" is also worth answering.
+    They come from ``_current_head_stats``, a second query rather than a join
+    on this one.  The counters here read every row, and carrying the Head test
+    on that scan doubled it; the Head query only needs the rows that are not
+    settled or were given up on, which is a small fraction of any healthy
+    ledger.  Two narrow scans, one definition of "at the Head", and the vault
+    surface keeps the exact query whose plan it was measured on.
 
     ``exhausted`` is deliberately separate from terminal ``abandoned``: it is
     the final claimed attempt while its lease is still in force.  The claim
@@ -174,19 +206,22 @@ async def _pending_stats(
             """,
             *params,
         )
-    pending = int(row["pending"])
-    exhausted = int(row["exhausted"])
-    abandoned = int(row["abandoned"])
+    at_head = await _current_head_stats(pool, namespace_id)  # defined below
     return {
-        "pending": pending,
+        "pending": int(row["pending"]),
         "retrying": int(row["retrying"]),
-        "exhausted": exhausted,
-        "abandoned": abandoned,
+        "exhausted": int(row["exhausted"]),
+        "abandoned": int(row["abandoned"]),
+        **{f"{key}_at_head": value for key, value in at_head.items()},
         "applied": int(row["applied"]),
         "superseded": int(row["superseded"]),
         "deleted": int(row["deleted"]),
         "direct_grep": int(row["direct_grep"]),
-        "status": "degraded" if exhausted or abandoned else "reconciling" if pending else "ok",
+        "status": (
+            "degraded" if at_head["exhausted"] or at_head["abandoned"]
+            else "reconciling" if int(row["pending"])
+            else "ok"
+        ),
     }
 
 
@@ -195,16 +230,31 @@ async def pending_stats(namespace_id: uuid.UUID | None = None) -> dict[str, int 
     return await _pending_stats(await get_pool(), namespace_id)
 
 
-async def _current_head_stats(pool: asyncpg.Pool, namespace_id: uuid.UUID) -> dict[str, int]:
+async def _current_head_stats(
+    pool: asyncpg.Pool,
+    namespace_id: uuid.UUID | None = None,
+) -> dict[str, int]:
     """Count only intents for the current Head, including deletion Heads.
 
     The historical ledger remains available through ``pending_stats``. Its
     abandoned revisions must not become permanent current-resource warnings.
-    Require both namespace keys as well as the Resource and Head revision keys.
+    Require the Resource and Head revision keys, and the namespace key too
+    when the caller named one.
+
+    Every counter here is a subset of "not settled, or given up on", so the
+    join reads only those rows.  The restriction changes no count and is what
+    makes the unscoped form affordable on ``/health``: measured against a
+    deployment ledger it costs less than the cumulative counters beside it,
+    where the same join over the whole table costs several times more.
     """
+    params: list[object] = [MAX_RETRIES]
+    scope = ""
+    if namespace_id is not None:
+        params.append(namespace_id)
+        scope = "AND i.namespace_id = $2"
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT COUNT(*) FILTER (WHERE i.completed_at IS NULL) AS pending,
                    COUNT(*) FILTER (
                        WHERE i.completed_at IS NULL
@@ -219,9 +269,10 @@ async def _current_head_stats(pool: asyncpg.Pool, namespace_id: uuid.UUID) -> di
                 ON r.namespace_id = i.namespace_id
                AND r.resource_id = i.resource_id
                AND r.head_revision_id = i.revision_id
-             WHERE i.namespace_id = $2
+             WHERE (i.completed_at IS NULL OR i.delivery_outcome = 'abandoned')
+               {scope}
             """,
-            MAX_RETRIES, namespace_id,
+            *params,
         )
     return {key: int(row[key]) for key in ("pending", "retrying", "exhausted", "abandoned")}
 

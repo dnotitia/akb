@@ -4,7 +4,7 @@
 # Differences vs cluster yaml:
 #   - db_user: akb            (cluster: akbuser — local compose hard-codes 'akb')
 #   - s3_endpoint_url: http://minio:9000  (cluster: in-cluster IP)
-#   - s3_public_url: ""       (benchmark doesn't return presigned URLs to a browser)
+#   - s3_public_url: ""       (retained and ignored everywhere, not benchmark-specific)
 #   - public_base_url: ""     (no publication snapshots in benchmark)
 #   - llm_*: ""               (metadata_worker disabled — irrelevant to retrieval)
 #   - redis_url: ""           (no redis container in this stack — events outbox stays in PG)

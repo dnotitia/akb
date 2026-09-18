@@ -38,6 +38,8 @@ app:
   objectStorage:
     authMode: static # static | default_chain; default_chain must omit static keys
     endpointUrl: ""
+    # Retained and ignored: bytes reach a client through the API, never
+    # straight from the store, so the store needs no browser-reachable address.
     publicUrl: ""
     bucket: akb-files
     region: ""

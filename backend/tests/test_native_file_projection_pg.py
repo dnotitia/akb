@@ -61,6 +61,8 @@ async def _fresh_schema():
         for filename in (
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
+            "055_native_revision_m1_file_storage.py",
+            "057_native_revision_m1_payload_placement.py",
             "089_native_file_projection_outbox.py",
         ):
             await _load(filename).migrate(conn=conn)
@@ -456,3 +458,132 @@ async def test_abandoned_projection_is_visible_requeued_and_recovers(
             "abandoned": 0,
             "status": "ok",
         }
+
+
+async def test_grep_file_coverage_tracks_current_catalogue_and_not_just_live_heads(monkeypatch, tmp_path):
+    from app.exceptions import AKBError
+    from app.services.m1_native_grep_service import M1NativeGrepService
+
+    async with _fresh_schema() as pool:
+        monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+        payloads = {"v1": b"old needle\n", "v2": b"new needle\n", "invalid": b"\x00bad"}
+        monkeypatch.setattr(projection.s3_adapter, "iter_chunks", lambda key: iter([payloads[key]]))
+        async with pool.acquire() as conn:
+            owner = await conn.fetchval(
+                "INSERT INTO users (username, email, password_hash) VALUES ($1,$2,'unused') RETURNING id",
+                str(uuid.uuid4()), str(uuid.uuid4()) + "@example.test",
+            )
+            vault = await conn.fetchval(
+                "INSERT INTO vaults (name,git_path,owner_id) VALUES ($1,'/tmp/unused', $2) RETURNING id",
+                str(uuid.uuid4()), owner,
+            )
+        # Exercise the public REST serializer and MCP dispatch against this
+        # actual database. Only transport authentication is fixture-injected.
+        from types import SimpleNamespace
+        import httpx
+        from fastapi import FastAPI
+        monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+        from app.api.routes import search as routes
+        from app.api.deps import get_current_user
+        from app.main import akb_error_handler
+        from app.services import search_service as search_module
+        import mcp_server.server as mcp
+
+        async def get_pool():
+            return pool
+
+        monkeypatch.setattr(search_module, "get_pool", get_pool)
+        app = FastAPI()
+        app.include_router(routes.router)
+        app.add_exception_handler(AKBError, akb_error_handler)
+        app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(user_id=str(owner))
+
+        async def rest():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                return await client.get("/grep", params={"q": "needle", "include_text_files": "true"})
+
+        file_id = uuid.uuid4()
+        grep = M1NativeGrepService(pool)
+        worker = projection.NativeFileProjectionWorker(pool)
+
+        async def query(pattern="needle", **kwargs):
+            return await grep.grep_public(
+                pattern, user_id=owner, include_text_files=True, resource_output=True, **kwargs,
+            )
+
+        async def not_ready():
+            with pytest.raises(AKBError) as error:
+                await query(count_only=True)
+            assert error.value.status_code == 409
+            assert error.value.code == "grep_file_projection_not_ready"
+
+        await _publish_source(pool, file_id=file_id, vault_id=vault,
+                              payload=payloads["v1"], mime_type="text/plain", s3_key="v1")
+        await not_ready()  # Missing projection must not masquerade as zero matches.
+        pending = await rest()
+        assert pending.status_code == 409
+        assert pending.json()["code"] == "grep_file_projection_not_ready"
+        # A caller without access cannot infer that another vault is pending.
+        hidden = await grep.grep_public("needle", user_id=uuid.uuid4(), include_text_files=True)
+        assert hidden["total_matches"] == 0
+        # Document-only metadata filters exclude Files before readiness checks.
+        filtered = await query(doc_types=["note"])
+        assert filtered["total_resources"] == 0
+        assert await worker.process_once() == 1
+        hit = await query()
+        assert hit["total_resources"] == 1 and hit["total_docs"] == 0
+        assert hit["results"][0]["resource_type"] == "file"
+        assert hit["results"][0]["matches"][0]["line"] == 1
+        http = await rest()
+        assert http.status_code == 200
+        wire = http.json()
+        mcp_result = await mcp._handle_grep(
+            {"pattern": "needle", "include_text_files": True}, str(owner),
+            mcp._MCPUser(user_id=str(owner), username="fixture-owner"),
+        )
+        for key in ("total_docs", "total_resources", "returned_resources", "total_matches"):
+            assert wire[key] == mcp_result[key] == hit[key]
+        assert wire["results"][0]["revision"] == mcp_result["results"][0]["revision"]
+        assert wire["results"][0]["matches"] == [{"line": 1, "text": "old needle"}]
+        counts = await query(count_only=True)
+        assert counts["by_doc"] == {} and len(counts["by_resource"]) == 1
+        listing = await query(files_with_matches=True)
+        assert listing["files"] == [] and listing["n_resources"] == 1
+
+        # Even an identical-byte new generation must complete its own intent.
+        await _publish_source(pool, file_id=file_id, vault_id=vault,
+                              payload=payloads["v1"], mime_type="text/plain", s3_key="v1")
+        await not_ready()
+        assert await worker.process_once() == 1
+        assert (await query())["total_resources"] == 1
+
+        await _publish_source(pool, file_id=file_id, vault_id=vault,
+                              payload=payloads["v2"], mime_type="text/plain", s3_key="v2")
+        await not_ready()
+        # Exhausted/abandoned work must not expose stale text either.
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE native_file_projection_outbox SET completed_at=NOW(), outcome='abandoned' WHERE file_id=$1", file_id)
+        await not_ready()
+        assert await projection._requeue_abandoned(pool, namespace_id=vault, file_id=file_id) == 1
+        assert await worker.process_once() == 1
+        assert (await query("old"))["total_resources"] == 0
+        assert (await query("new"))["total_resources"] == 1
+
+        await _publish_source(pool, file_id=file_id, vault_id=vault,
+                              payload=payloads["invalid"], mime_type="text/plain", s3_key="invalid")
+        await not_ready()
+        assert await worker.process_once() == 1
+        assert (await query())["total_resources"] == 0  # Verified non-text exclusion.
+        await _publish_source(pool, file_id=file_id, vault_id=vault,
+                              payload=payloads["v1"], mime_type="text/plain", s3_key="v1")
+        assert await worker.process_once() == 1
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM vault_files WHERE id=$1", file_id)
+                await projection.enqueue_native_file_projection_delete(
+                    conn, file_id=file_id, namespace_id=vault, collection=None,
+                    name="fixture.txt", actor="fixture-owner",
+                )
+        await not_ready()  # The old live Head is not an existing File.
+        assert await worker.process_once() == 1
+        assert (await query())["total_resources"] == 0

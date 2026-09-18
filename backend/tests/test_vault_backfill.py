@@ -137,6 +137,8 @@ async def test_pending_stats_shape(monkeypatch):
     monkeypatch.setattr(vault_backfill, "_applicable", lambda: True)
 
     class _Store:
+        vault_filter_supported = True
+
         async def vault_backfill_pending(self):
             return 42
 
@@ -145,6 +147,52 @@ async def test_pending_stats_shape(monkeypatch):
     assert stats["ready"] is False
     assert stats["applicable"] is True
     assert stats["null_remaining"] == 42
+
+
+@pytest.mark.asyncio
+async def test_pending_stats_reports_readiness_the_serving_tier_can_see(monkeypatch):
+    """The field is about the corpus, not about who is answering.
+
+    `/health` is served by the api tier, which never runs the backfill runner,
+    so the process-local latch is never set there and the field read `false`
+    for the life of the process -- on a finished corpus, on two replicas that
+    disagreed with each other, and on a deployment that had just rolled.
+    """
+    monkeypatch.setattr(vault_backfill, "_applicable", lambda: True)
+
+    class _Finished:
+        vault_filter_supported = True
+
+        async def vault_backfill_pending(self):
+            return 0
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Finished())
+    assert vault_backfill.is_ready() is False, "this process never ran the runner"
+
+    stats = await vault_backfill.pending_stats()
+
+    assert stats["ready"] is True
+    assert stats["null_remaining"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_stats_agrees_with_the_search_gate(monkeypatch):
+    """One question, one answer: search and /health must not diverge."""
+    monkeypatch.setattr(vault_backfill, "_applicable", lambda: True)
+    remaining = [7]
+
+    class _Draining:
+        vault_filter_supported = True
+
+        async def vault_backfill_pending(self):
+            return remaining[0]
+
+    monkeypatch.setattr(vault_backfill, "get_vector_store", lambda: _Draining())
+    assert (await vault_backfill.pending_stats())["ready"] is await vault_backfill.is_ready_async()
+
+    remaining[0] = 0
+    monkeypatch.setattr(vault_backfill, "_last_check", None, raising=False)
+    assert (await vault_backfill.pending_stats())["ready"] is True
 
 
 @pytest.mark.asyncio

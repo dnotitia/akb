@@ -139,6 +139,7 @@ from app.repositories.document_repo import (
     acquire_path_lock,
 )
 from app.repositories.events_repo import emit_event
+from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
@@ -215,6 +216,31 @@ from app.util.text import split_doc_path as _split_doc_path
 from app.util.text import strip_own_suffix as _strip_own_suffix
 
 
+def derive_summary(markdown: str) -> str | None:
+    """The document's first non-heading paragraph, capped at 200 characters.
+
+    Extracted so the publication resolver can ask the same question of a
+    *section-scoped* body. A stored summary describes the whole document --
+    author-written, derived here at create time, or filled in by the LLM
+    metadata worker on an imported document -- and a link cut for one section
+    was never granted the rest of it, so that resolver derives instead of
+    reading the stored value. Keep this the single definition: two copies of
+    "what counts as the summary line" is how the section rules drifted before.
+    """
+    for line in markdown.split("\n"):
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or stripped.startswith("---")
+            or stripped.startswith("|")
+            or stripped.startswith("```")
+        ):
+            continue
+        return stripped[:200]
+    return None
+
+
 def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
     # Frontmatter no longer carries a `id:` line — the canonical handle
     # is the akb:// URI (vault + path). Path is captured in the .md
@@ -233,13 +259,9 @@ def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
     if req.summary:
         fm["summary"] = req.summary
     else:
-        # Auto-generate summary from content (first non-heading paragraph, max 200 chars)
-        for line in req.content.split("\n"):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith("---") or stripped.startswith("|") or stripped.startswith("```"):
-                continue
-            fm["summary"] = stripped[:200]
-            break
+        derived = derive_summary(req.content)
+        if derived is not None:
+            fm["summary"] = derived
     if req.depends_on:
         fm["depends_on"] = req.depends_on
     if req.related_to:
@@ -320,33 +342,9 @@ def _certified_content_hash(md_content: str) -> str:
     return _body_content_hash(canonical_body)
 
 
-# Newest publication slug for one document — the reverse of publication
-# resolution, and the query behind `is_public` / `public_slug`.
-#
-# Keyed on `publications.document_id`, which since migration 058 is the
-# binding for a document publication: a UUID under a composite
-# FK (document_id, vault_id) → documents(id, vault_id). Matching that
-# cannot answer with a publication belonging to some other document, and
-# cannot answer with one belonging to some other vault.
-#
-# The `resource_uri` branch is a FALLBACK, and only for rows the 058
-# backfill could not bind unambiguously (`document_id IS NULL`). It is kept
-# on purpose: without it those publications would report `is_public: false`
-# on a document whose slug still serves its body — telling an author their
-# document is private while it is reachable is a worse answer than the
-# imprecision the fallback carries. It disappears on its own as those rows
-# are re-published or removed; nothing new lands in it, because
-# `create_publication` refuses a document publication without an id.
-#
-# `vault_id = $1` scopes BOTH branches, and is the part that was missing:
-# the previous query matched `resource_uri` with no vault predicate at all,
-# so its answer was not scoped to the vault being asked about.
-# `document_id = $2` alone would have been enough for the primary branch (the
-# composite FK pins the vault), but the predicate sits on the query so the
-# fallback cannot be wrong either.
-#
-# ORDER BY created_at DESC matches `publishDoc()` in the frontend, which
-# reuses the first entry `listPublications` returns.
+# Reverse publication discovery stays vault scoped. Migration 106 binds Native
+# publications to a stable Resource. Only legacy discovery retains an unbound
+# URI fallback; native public reads require an exact Resource binding.
 _PUBLIC_SLUG_SQL = """
     SELECT slug
       FROM publications
@@ -354,8 +352,19 @@ _PUBLIC_SLUG_SQL = """
        AND resource_type = 'document'
        AND (
              document_id = $2::uuid
-          OR (document_id IS NULL AND resource_uri = $3)
+          OR (document_id IS NULL AND native_document_id IS NULL AND resource_uri = $3)
        )
+     ORDER BY created_at DESC
+     LIMIT 1
+"""
+
+
+_NATIVE_PUBLIC_SLUG_SQL = """
+    SELECT slug
+      FROM publications
+     WHERE vault_id = $1
+       AND resource_type = 'document'
+       AND native_document_id = $2::uuid
      ORDER BY created_at DESC
      LIMIT 1
 """
@@ -367,17 +376,11 @@ async def newest_public_slug(
     vault_id: uuid.UUID,
     document_id: uuid.UUID | None,
     resource_uri: str,
+    native_document_id: uuid.UUID | None = None,
 ) -> str | None:
-    """Newest publication slug bound to one document, or None.
-
-    ``document_id`` may be None for a caller that has no ``documents`` row to
-    name (the native-ledger arm keeps no legacy projection). The primary
-    branch then matches nothing — ``document_id = NULL`` is NULL, not true —
-    and the vault-scoped URI fallback answers. See ``_PUBLIC_SLUG_SQL``.
-
-    One function rather than one query per service on purpose: these were two
-    copies, and both carried the same missing ``vault_id`` predicate.
-    """
+    """Discover a bound publication; only legacy discovery permits URI fallback."""
+    if native_document_id is not None:
+        return await conn.fetchval(_NATIVE_PUBLIC_SLUG_SQL, vault_id, native_document_id)
     return await conn.fetchval(_PUBLIC_SLUG_SQL, vault_id, document_id, resource_uri)
 
 
@@ -406,6 +409,20 @@ def validate_vault_name(name: str) -> None:
 
 class DocumentService:
     def __init__(self, git: GitService | None = None):
+        # The Git arm's storage handle, NOT part of the service interface.
+        # `NativeDocumentService` subclasses this and deliberately does not
+        # call `super().__init__()`, so it has no `self.git` — its bodies live
+        # in PostgreSQL and Git is only a fallback for unmigrated bridged
+        # revisions. Reaching for `.git` through a composed document service
+        # therefore raises on a `postgres_native` deployment; that is how
+        # every public document publication became a 500 for a long time.
+        #
+        # Giving the Native subclass a handle to silence that would be worse:
+        # an inherited write path would then commit to a store the deployment
+        # does not read from, quietly. A loud AttributeError is the better
+        # failure, and callers outside this module should use the interface
+        # (`get`, `get_at_commit`, ...) instead.
+        # Pinned by tests/test_publication_document_service_contract_unit.py.
         self.git = git or GitService()
 
     async def _repos(self):
@@ -782,8 +799,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,
@@ -1194,8 +1210,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,
@@ -1389,7 +1404,7 @@ class DocumentService:
             )
             now = datetime.now(timezone.utc)
             live_asset_ids = await asset_service.list_live_document_asset_ids(
-                conn, document_id=pg_doc_id, vault_id=vault_id,
+                conn, owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             )
             summary = message or f"{old_path} -> {new_path}"
             commit_msg = (
@@ -1423,8 +1438,7 @@ class DocumentService:
             )
             await asset_service.sync_document_assets(
                 conn,
-                document_id=pg_doc_id,
-                vault_id=vault_id,
+                owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
                 document_path=new_path,
                 commit_hash=commit_hash,
                 asset_ids=live_asset_ids,
@@ -1673,8 +1687,7 @@ class DocumentService:
         )
         await asset_service.sync_document_assets(
             conn,
-            document_id=pg_doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
             document_path=file_path,
             commit_hash=commit_hash,
             asset_ids=asset_ids,

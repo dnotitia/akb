@@ -34,11 +34,17 @@ from app.services.app_inventory_service import (
     sanitize_checkpoint,
     sanitize_recent_error,
 )
-from app.services.app_resource_service import lock_app_vault_pair
+from app.services.app_resource_service import (
+    canonical_table_fingerprint,
+    fetch_allowlisted_tables,
+    lock_app_vault_pair,
+    lock_table_mutation,
+)
 from app.services.auth_service import AuthenticatedUser
 
 LIFECYCLE_MODES = frozenset({"install", "restore", "fresh"})
 READABLE_LIFECYCLES = frozenset({"installing", "active", "upgrading", "blocked"})
+INITIAL_GRANT_MODE = "initial_grant_approval"
 _SAFE_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _SAFE_RELEASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$")
 _SAFE_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{64}$")
@@ -92,6 +98,18 @@ def _safe_fingerprint(value: Any) -> str | None:
         return None
     value = value.strip()
     return value.lower() if _SAFE_FINGERPRINT.fullmatch(value) else None
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+    return []
 
 
 def _release_payload(release_id: Any, version: Any) -> dict[str, Any] | None:
@@ -703,6 +721,290 @@ async def _insert_grant(
         capabilities,
         json.dumps({"source": "control_plane", "mode": mode}),
     )
+
+
+async def _load_latest_grant(conn: Any, installation_id: uuid.UUID) -> Any:
+    return await conn.fetchrow(
+        """
+        SELECT generation, status, capabilities, provenance
+          FROM installation_grants
+         WHERE installation_id = $1
+         ORDER BY generation DESC
+         LIMIT 1
+        """,
+        installation_id,
+    )
+
+
+async def _validate_initial_grant_target(
+    conn: Any,
+    *,
+    app_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    baseline_release: Any,
+    installation: Any,
+) -> tuple[Any, Any, int]:
+    """Validate the adopted baseline before creating or replaying its grant.
+
+    Adoption is the only writer that may create a generation-zero active
+    installation.  Rechecking its durable target, registry schema projection,
+    owned resources, and observation here keeps approval from turning a drifted
+    or hand-created row into an authorized installation.
+    """
+
+    adoption = await conn.fetchrow(
+        """
+        SELECT target.state,
+               target.expected_schema_fingerprint,
+               target.actual_schema_fingerprint,
+               target.table_allowlist,
+               target.included_tables,
+               target.installation_id,
+               plan.status AS plan_status,
+               plan.baseline_release_id
+          FROM app_legacy_adoption_targets AS target
+          JOIN app_legacy_adoption_plans AS plan
+            ON plan.id = target.adoption_id
+         WHERE target.app_id = $1
+           AND target.vault_id = $2
+           AND target.installation_id = $3
+         ORDER BY target.updated_at DESC
+         LIMIT 1
+        """,
+        app_id,
+        vault_id,
+        installation["id"],
+    )
+    expected = expected_schema_fingerprint(baseline_release["manifest"])
+    if (
+        adoption is None
+        or adoption["state"] not in {"applied", "replayed"}
+        or adoption["plan_status"] not in {"applied", "partial"}
+        or adoption["baseline_release_id"] != baseline_release["id"]
+        or adoption["expected_schema_fingerprint"] != expected
+        or adoption["actual_schema_fingerprint"] != expected
+        or expected is None
+        or installation["lifecycle"] != "active"
+        or installation["desired_release_id"] != baseline_release["id"]
+        or installation["current_release_id"] != baseline_release["id"]
+        or installation["grant_generation"] not in {0, 1}
+    ):
+        raise ConflictError("Initial grant approval is not eligible")
+
+    table_allowlist = [
+        value for value in _json_list(adoption["table_allowlist"]) if isinstance(value, str)
+    ]
+    included_tables = [
+        value for value in _json_list(adoption["included_tables"]) if isinstance(value, str)
+    ]
+    if not table_allowlist or sorted(table_allowlist) != sorted(included_tables):
+        raise ConflictError("Initial grant approval is not eligible")
+    for table_name in sorted(set(table_allowlist)):
+        await lock_table_mutation(conn, vault_id, table_name)
+    tables = await fetch_allowlisted_tables(
+        conn,
+        vault_id,
+        sorted(set(table_allowlist)),
+        lock=True,
+    )
+    if (
+        sorted(row["name"] for row in tables) != sorted(set(included_tables))
+        or canonical_table_fingerprint(tables) != expected
+    ):
+        raise ConflictError("Initial grant approval is not eligible")
+
+    resources = await conn.fetch(
+        """
+        SELECT resource_kind, resource_key, status
+          FROM app_owned_resources
+         WHERE installation_id = $1
+         ORDER BY resource_kind, resource_key
+        """,
+        installation["id"],
+    )
+    if {
+        (row["resource_kind"], row["resource_key"], row["status"])
+        for row in resources
+    } != {
+        ("table", table_name, "owned") for table_name in sorted(set(included_tables))
+    }:
+        raise ConflictError("Initial grant approval is not eligible")
+
+    observed = await conn.fetchrow(
+        """
+        SELECT observed_release_id,
+               observed_release_version,
+               schema_fingerprint,
+               observed_grant_generation
+          FROM app_installation_observed_states
+         WHERE installation_id = $1
+         FOR UPDATE
+        """,
+        installation["id"],
+    )
+    if (
+        observed is None
+        or observed["observed_release_id"] != baseline_release["id"]
+        or observed["observed_release_version"] != baseline_release["version"]
+        or _safe_fingerprint(observed["schema_fingerprint"]) != expected
+        or observed["observed_grant_generation"] not in {0, 1}
+    ):
+        raise ConflictError("Initial grant approval is not eligible")
+
+    latest_grant = await _load_latest_grant(conn, installation["id"])
+    if installation["grant_generation"] == 0:
+        if latest_grant is not None or observed["observed_grant_generation"] != 0:
+            raise ConflictError("Initial grant approval is not eligible")
+        return observed, None, 1
+
+    if (
+        latest_grant is None
+        or latest_grant["generation"] != 1
+        or latest_grant["status"] != "active"
+        or observed["observed_grant_generation"] != 1
+    ):
+        # Capability matching is checked by the caller.  This branch only
+        # rejects a revoked, foreign, or otherwise non-replayable generation.
+        raise ConflictError("Initial grant approval is not eligible")
+    provenance = latest_grant["provenance"]
+    if isinstance(provenance, str):
+        try:
+            provenance = json.loads(provenance)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            provenance = {}
+    if not isinstance(provenance, dict) or provenance.get("mode") != INITIAL_GRANT_MODE:
+        raise ConflictError("Initial grant approval is not eligible")
+    return observed, latest_grant, 1
+
+
+async def approve_initial_installation_grant(
+    app_id: uuid.UUID | str,
+    vault_id: uuid.UUID | str,
+    *,
+    baseline_release_id: uuid.UUID | str,
+    capabilities: list[str],
+    user: AuthenticatedUser,
+    correlation_id: str,
+) -> dict[str, Any]:
+    """Approve or replay the first grant for a successful legacy adoption."""
+
+    app_id = _as_uuid(app_id, field="app_id")
+    vault_id = _as_uuid(vault_id, field="vault_id")
+    baseline_release_id = _as_uuid(
+        baseline_release_id,
+        field="baseline_release_id",
+    )
+    normalized_capabilities = normalize_capabilities(capabilities)
+    action = "app.installation.initial_grant"
+    actor_kind = await _authorize_command(
+        user,
+        app_id,
+        vault_id,
+        action=action,
+        correlation_id=correlation_id,
+    )
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _lock_pair(conn, app_id, vault_id)
+                _app, _vault, release = await _load_context(
+                    conn,
+                    app_id,
+                    vault_id,
+                    baseline_release_id,
+                )
+                assert release is not None
+                installation = await _load_installation(conn, app_id, vault_id)
+                if installation is None:
+                    raise ConflictError("Initial grant approval is not eligible")
+                _observed, latest_grant, generation = await _validate_initial_grant_target(
+                    conn,
+                    app_id=app_id,
+                    vault_id=vault_id,
+                    baseline_release=release,
+                    installation=installation,
+                )
+                if latest_grant is not None:
+                    if not _grant_matches(
+                        latest_grant,
+                        normalized_capabilities,
+                        mode=INITIAL_GRANT_MODE,
+                    ):
+                        raise ConflictError("Initial grant approval conflicts with current grant")
+                    projection = await _fetch_projection(conn, app_id, vault_id)
+                    assert projection is not None
+                    result = _command_payload(
+                        projection,
+                        command_status="already_applied",
+                        replayed=True,
+                    )
+                else:
+                    await _insert_grant(
+                        conn,
+                        installation["id"],
+                        generation,
+                        normalized_capabilities,
+                        INITIAL_GRANT_MODE,
+                    )
+                    updated = await conn.execute(
+                        """
+                        UPDATE app_installation_observed_states
+                           SET observed_grant_generation = $2,
+                               observed_at = NOW(),
+                               received_at = NOW()
+                         WHERE installation_id = $1
+                           AND observed_grant_generation = 0
+                        """,
+                        installation["id"],
+                        generation,
+                    )
+                    if updated != "UPDATE 1":
+                        raise ConflictError("Initial grant observation could not be recorded")
+                    projection = await _fetch_projection(conn, app_id, vault_id)
+                    assert projection is not None
+                    result = _command_payload(
+                        projection,
+                        command_status="accepted",
+                        replayed=False,
+                    )
+    except asyncpg.UniqueViolationError:
+        _record_command_error(
+            action,
+            actor_kind,
+            user,
+            app_id,
+            vault_id,
+            correlation_id,
+            "conflict",
+        )
+        raise ConflictError("Initial grant approval conflicted with another request") from None
+    except (ValidationError, ConflictError, NotFoundError) as exc:
+        _record_command_error(
+            action,
+            actor_kind,
+            user,
+            app_id,
+            vault_id,
+            correlation_id,
+            _audit_reason(exc),
+        )
+        raise
+
+    record_app_audit(
+        action,
+        correlation_id=correlation_id,
+        outcome="ok",
+        reason=result["command_status"],
+        actor=actor_kind,
+        actor_id=user.user_id,
+        app_id=app_id,
+        installation_id=result["installation_id"],
+        vault_id=vault_id,
+        generation=result["desired_grant_generation"],
+    )
+    return result
 
 
 def _record_command_error(

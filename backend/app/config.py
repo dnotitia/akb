@@ -898,7 +898,13 @@ class Settings(BaseModel):
 
     # S3-compatible object storage (for vault files)
     s3_endpoint_url: str = ""  # Internal endpoint (server → S3)
-    s3_public_url: str = ""  # External endpoint for presigned URLs (client → S3). Falls back to s3_endpoint_url.
+    # Retained and ignored. It named the endpoint a browser would have been
+    # sent to with a signature; nothing signs for a browser any more, because
+    # bytes reach a client through the API or the byte gateway and never
+    # straight from the store. Removing the field would make every existing
+    # deployment's config fail to load — `Settings` forbids unknown keys —
+    # so it stays until a release that can take that break.
+    s3_public_url: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "akb-files"
@@ -1140,6 +1146,18 @@ class Settings(BaseModel):
     # anyone else, so arrival is not entry.
     sso_local_realm_login_enabled: bool = False
     sso_local_realm_display_name: str = "This workspace"
+    # Let the installation's OWN realm offer Keycloak's self-registration
+    # form, for a deployment whose people authenticate at this realm directly
+    # (no upstream broker). Off by default: the bootstrap keeps converging the
+    # realm to `registrationAllowed: False`, so an installation that never
+    # opts in keeps today's behaviour and its restarts never flap.
+    #
+    # This only opens the Keycloak registration form. Whether a newly
+    # registered identity can enter AKB is still decided by
+    # `keycloak_enrollment_mode` (open/invite_only/disabled) exactly like any
+    # other identity, and sign-in through this realm still arrives as a
+    # pending admission, so arrival is not entry.
+    sso_local_realm_self_registration: bool = False
     # `invite_only` records the arrival it refuses so an administrator can
     # approve that exact identity. Both bounds are on the RECORD, never on the
     # refusal: eviction changes what an administrator can still see, and never
@@ -1245,7 +1263,7 @@ class Settings(BaseModel):
     # Vector store (hybrid dense + BM25). Driver-pluggable.
     #
     # The two `seahorse-*` drivers are intentionally separate:
-    #   - `seahorse-cloud` talks to the managed Seahorse Cloud BFF +
+    #   - `seahorse-cloud` talks to the managed Seahorse Cloud management API +
     #     per-table data-plane host (zero infrastructure to run).
     #   - `seahorse-db`    talks to a self-hosted SeahorseDB Coral
     #     coordinator (single HTTP URL; you run Coral + Writer +
@@ -1277,11 +1295,15 @@ class Settings(BaseModel):
     vector_api_key: str = ""
     vector_collection: str = "chunks"
 
-    # Seahorse Cloud driver settings. Two-plane API: management (BFF)
+    # Seahorse Cloud driver settings. Two-plane API: management
     # for table lifecycle + per-table data-plane host. The driver
     # discovers the data-plane host from the management lookup; only
     # set the management URL + token + tenant + table identifier.
-    seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/bff"
+    # The management prefix is `/api`: the legacy `/bff` prefix no
+    # longer routes (every path under it answers an unconditional 401,
+    # #524), so a default pointing there fails in `ensure_collection`
+    # with a message about a missing authorization header.
+    seahorse_cloud_management_url: str = "https://console.seahorse.dnotitia.ai/api"
     seahorse_cloud_token: str = ""  # secret.yaml — Bearer (shsk_...)
     seahorse_cloud_tenant_uuid: str = ""
     seahorse_cloud_table_name: str = ""  # one of (table_name, table_uuid) required

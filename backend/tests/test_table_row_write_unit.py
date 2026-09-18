@@ -208,6 +208,7 @@ def test_compile_write_ast_update_reuses_ast_filter() -> None:
         ast={
             "update": {"severity": "critical"},
             "where": {"col": "severity", "op": "eq", "val": "high"},
+            "cas": "tok-1",
             "returning": "*",
         },
         actor_id="alice",
@@ -217,9 +218,31 @@ def test_compile_write_ast_update_reuses_ast_filter() -> None:
     assert compiled.fetch is True
     assert compiled.sql == (
         "UPDATE vt_eng__incidents SET severity = $1, updated_at = NOW() "
-        "WHERE severity = $2 RETURNING *"
+        "WHERE (severity = $2) AND row_commit = $3 RETURNING *"
     )
-    assert compiled.params == ["critical", "high"]
+    assert compiled.params == ["critical", "high", "tok-1"]
+
+
+def test_compile_write_ast_update_without_cas_is_unguarded_not_rejected() -> None:
+    """Row CAS is opt-in: no token means the mutation this endpoint always did.
+
+    The caller's own filter still scopes it — the token is an extra predicate,
+    never the thing that narrows the statement.
+    """
+    compiled = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={
+            "update": {"severity": "critical"},
+            "where": {"col": "severity", "op": "eq", "val": "high"},
+        },
+        actor_id="alice",
+    )
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 def test_compile_write_ast_delete_requires_filter_or_all_true() -> None:
@@ -237,11 +260,24 @@ def test_compile_write_ast_delete_requires_filter_or_all_true() -> None:
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
-        ast={"delete": True, "all": True},
+        ast={"delete": True, "all": True, "cas": "tok-1"},
         actor_id="alice",
     )
     assert not isinstance(all_rows, dict)
-    assert all_rows.sql == "DELETE FROM vt_eng__incidents WHERE TRUE"
+    assert all_rows.sql == "DELETE FROM vt_eng__incidents WHERE (TRUE) AND row_commit = $1"
+
+
+def test_compile_write_ast_delete_without_cas_is_unguarded_not_rejected() -> None:
+    compiled = compile_ast_mutation(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        ast={"delete": True, "all": True},
+        actor_id="alice",
+    )
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
 
 
 def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
@@ -255,7 +291,7 @@ def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
             "id": "00000000-0000-0000-0000-000000000001",
             "created_by": "mallory",
         },
-        query_params=[("severity", "eq.high")],
+        query_params=[("severity", "eq.high"), ("expected_row_commit", "eq.tok-1")],
         prefer_header="return=representation",
     )
 
@@ -264,9 +300,9 @@ def test_compile_update_reuses_filters_and_ignores_server_columns() -> None:
     assert compiled.status_code == 200
     assert compiled.sql == (
         "UPDATE vt_eng__incidents SET severity = $1, metadata = $2, "
-        "updated_at = NOW() WHERE (severity = $3) RETURNING *"
+        "updated_at = NOW() WHERE ((severity = $3)) AND row_commit = $4 RETURNING *"
     )
-    assert compiled.params == ["critical", json.dumps({"tier": "gold"}), "high"]
+    assert compiled.params == ["critical", json.dumps({"tier": "gold"}), "high", "tok-1"]
 
 
 def test_compile_write_serializes_canonical_jsonb_values() -> None:
@@ -285,10 +321,24 @@ def test_compile_write_serializes_canonical_jsonb_values() -> None:
         table_name="incidents",
         columns=JSONB_COLUMNS,
         body={"metadata": {"tier": "silver"}},
-        query_params=[("severity", "eq.high")],
+        query_params=[("severity", "eq.high"), ("expected_row_commit", "tok-1")],
     )
     assert not isinstance(updated, dict)
-    assert updated.params == [json.dumps({"tier": "silver"}), "high"]
+    assert updated.params == [json.dumps({"tier": "silver"}), "high", "tok-1"]
+
+
+def test_compile_update_without_cas_token_is_unguarded_not_rejected() -> None:
+    compiled = compile_update_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        body={"severity": "critical"},
+        query_params=[("severity", "eq.high")],
+    )
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 def test_compile_update_requires_filter_or_all_true() -> None:
@@ -306,11 +356,12 @@ def test_compile_update_requires_filter_or_all_true() -> None:
         table_name="incidents",
         columns=COLUMNS,
         body={"severity": "critical"},
-        query_params=[("all", "true")],
+        query_params=[("all", "true"), ("expected_row_commit", "tok-1")],
     )
     assert not isinstance(all_rows, dict)
     assert all_rows.sql == (
-        "UPDATE vt_eng__incidents SET severity = $1, updated_at = NOW() WHERE TRUE"
+        "UPDATE vt_eng__incidents SET severity = $1, updated_at = NOW() "
+        "WHERE (TRUE) AND row_commit = $2"
     )
     assert all_rows.fetch is False
     assert all_rows.status_code == 204
@@ -348,16 +399,30 @@ def test_compile_delete_requires_filter_and_can_return_representation() -> None:
         vault_name="eng",
         table_name="incidents",
         columns=COLUMNS,
-        query_params=[("severity", "eq.low"), ("select", "id,title")],
+        query_params=[("severity", "eq.low"), ("select", "id,title"),
+                      ("expected_row_commit", "tok-1")],
         prefer_header="return=representation",
     )
     assert not isinstance(compiled, dict)
     assert compiled.fetch is True
     assert compiled.status_code == 200
     assert compiled.sql == (
-        "DELETE FROM vt_eng__incidents WHERE (severity = $1) RETURNING id, title"
+        "DELETE FROM vt_eng__incidents WHERE ((severity = $1)) AND row_commit = $2 RETURNING id, title"
     )
-    assert compiled.params == ["low"]
+    assert compiled.params == ["low", "tok-1"]
+
+
+def test_compile_delete_without_cas_token_is_unguarded_not_rejected() -> None:
+    compiled = compile_delete_rows(
+        vault_name="eng",
+        table_name="incidents",
+        columns=COLUMNS,
+        query_params=[("severity", "eq.low")],
+    )
+    assert not isinstance(compiled, dict), compiled
+    assert compiled.cas_guarded is False
+    assert "row_commit" not in compiled.sql
+    assert "severity = $" in compiled.sql
 
 
 # A real column can share a name with a reserved write-control param
@@ -377,13 +442,14 @@ def test_compile_delete_does_not_drop_filter_on_reserved_word_column() -> None:
         vault_name="eng",
         table_name="events",
         columns=COLUMNS_WITH_RESERVED_NAMES,
-        query_params=[("count", "eq.0"), ("source", "eq.test")],
+        query_params=[("count", "eq.0"), ("source", "eq.test"),
+                      ("expected_row_commit", "tok-1")],
     )
     assert not isinstance(compiled, dict)
     assert compiled.sql == (
-        "DELETE FROM vt_eng__events WHERE (count = $1) AND (source = $2)"
+        "DELETE FROM vt_eng__events WHERE ((count = $1) AND (source = $2)) AND row_commit = $3"
     )
-    assert compiled.params == [0, "test"]
+    assert compiled.params == [0, "test", "tok-1"]
 
 
 def test_compile_update_does_not_drop_filter_on_reserved_word_column() -> None:
@@ -392,14 +458,14 @@ def test_compile_update_does_not_drop_filter_on_reserved_word_column() -> None:
         table_name="events",
         columns=COLUMNS_WITH_RESERVED_NAMES,
         body={"source": "resolved"},
-        query_params=[("order", "eq.first")],
+        query_params=[("order", "eq.first"), ("expected_row_commit", "tok-1")],
     )
     assert not isinstance(compiled, dict)
     assert compiled.sql == (
         "UPDATE vt_eng__events SET source = $1, updated_at = NOW() "
-        "WHERE (order = $2)"
+        "WHERE ((order = $2)) AND row_commit = $3"
     )
-    assert compiled.params == ["resolved", "first"]
+    assert compiled.params == ["resolved", "first", "tok-1"]
 
 
 def test_compile_delete_still_treats_reserved_word_as_control_when_no_such_column() -> None:
