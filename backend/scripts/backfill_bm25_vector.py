@@ -13,6 +13,7 @@ in, ahead of the flip, while `posting` is still serving.
     python -m scripts.backfill_bm25_vector --prepare
     python -m scripts.backfill_bm25_vector
     python -m scripts.backfill_bm25_vector --since '2026-09-18T12:00:00+00:00'
+    python -m scripts.backfill_bm25_vector --index
 
 WHY IT NEEDS NO CURSOR AND NO DUAL WRITE
 ----------------------------------------
@@ -36,10 +37,11 @@ that could each be answered while the other drifted. Each run prints the instant
 to hand the next one, and the run that writes 0 is the one that found nothing
 left:
 
-    --prepare
+    --prepare                      the column, milliseconds
     (no flag)                      the bulk of it, hours
     --since <that run's instant>   minutes
     --since <that run's instant>   until it writes 0
+    --index                        once, over a full column
     flip vector_store_sparse_shape to vchord
     --since <the flip's instant>   once
 
@@ -58,10 +60,28 @@ longer has.
 
 COST
 ----
-Tokenizing is the whole cost: 2.1M chunks at roughly 150/s is about four hours,
-and it is CPU in the Kiwi process pool, not database work. `--prepare` builds the
-index CONCURRENTLY because a plain CREATE INDEX holds a ShareLock for the whole
-build (minutes, at this size) and that blocks INSERT.
+Tokenizing looks like the whole cost and is not. Measured on a 2.1M-chunk
+corpus, a 500-row batch spent 4.1 seconds encoding (123 chunks/s, the same rate
+the stats recompute gets) and 21.8 seconds writing.
+
+The write is expensive for a reason that has nothing to do with BM25. Adding a
+column value to `chunks` is a non-HOT update — the table sits at the default
+fillfactor 100, its rows average 1.1 KB, and only 2% of its tuples are dead, so
+there is nowhere on the page for the new version (measured: 2.5% of updates were
+HOT). A non-HOT update inserts into every index on the table, and one of them is
+a 15 GB HNSW that does not fit in `shared_buffers`. That is 938 buffer accesses
+per row, a third of them real reads, and it is disk latency rather than CPU.
+
+Two things follow, and both are in this script rather than in advice:
+
+- **The BM25 index is built last.** With it present a 500-row batch took 103
+  seconds instead of 2.5 — every row would pay its per-term maintenance, and
+  that index's cost is dominated by vocabulary breadth. `--prepare` adds only
+  the column; `--index` builds it CONCURRENTLY at the end, over a column that
+  is already full, so the build does not hold a ShareLock against every INSERT.
+- **The writes are split.** Overlapping the disk waits is the only lever that
+  works here: one writer measured 4-16 rows/s, two 32.3 and 32.5 (two
+  orderings, 0.6% apart), four 45-62. `--writers` defaults to four.
 """
 from __future__ import annotations
 
@@ -74,6 +94,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import asyncpg
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
@@ -90,17 +112,50 @@ _BATCH = 500
 # bounds both the tokenizer queue and the number of vocab round trips in flight.
 _CONCURRENCY = 16
 
+# How many UPDATE statements run at once, and how long one is given.
+#
+# The write, not the tokenizing, is what this job costs. On a table carrying a
+# 15 GB HNSW index over 2.1M rows, adding a column value is a non-HOT update
+# (measured: 2.5% of updates were HOT — the table is at the default fillfactor
+# 100 and only 2% of its tuples are dead), so every row also inserts into every
+# index, the HNSW included. That insert walks a graph that does not fit in
+# `shared_buffers`: 938 buffer accesses per row, a third of them real reads.
+#
+# It is therefore disk-latency bound, not CPU bound, and overlapping the waits
+# is what helps. Measured at 400 rows a run, twice in each ordering to keep
+# cache warming from writing the answer: one writer 4–16 rows/s, two writers
+# 32.3 and 32.5 (two orderings, 0.6% apart), four writers 45–62. Four is where
+# the evidence stops being noisy without pushing a shared instance harder.
+_WRITERS = 4
+
+# A single 400-row write took 24s warm and 97s cold, so the 30s the application
+# pool uses would abandon the job on an ordinary slow batch. The work is
+# resumable, but a restart re-walks the primary key from the start, and 30s is
+# not a limit worth paying that for.
+_WRITE_TIMEOUT = 600.0
+
 _INDEX = "idx_vi_chunks_bm25"
 
 
-async def _vector_pool():
+async def _vector_pool(writers: int = 1):
+    """A pool of this job's own, not the application's.
+
+    The store's pool is sized for a web service and carries a 30-second
+    command timeout; both are wrong here. A batch write takes tens of seconds
+    by design, and `writers` of them run at once plus the reader — borrowing
+    that many connections from the pool the request path shares would be
+    taking them from the thing this migration is supposed to leave alone.
+    """
     store = get_vector_store()
     if not isinstance(store, PgvectorStore):
         raise SystemExit(
             f"driver '{settings.vector_store_driver}' has no sparse_bm25 column; "
             "this backfill is pgvector-only."
         )
-    return await store._pool()
+    dsn = store._dsn or settings.database_url
+    return await asyncpg.create_pool(
+        dsn, min_size=1, max_size=writers + 1, command_timeout=_WRITE_TIMEOUT,
+    )
 
 
 async def _column_exists(pool, schema: str) -> bool:
@@ -147,14 +202,7 @@ async def _counts(pool, schema: str, since: datetime | None) -> tuple[int, int]:
 
 
 async def _prepare(pool, schema: str) -> None:
-    """Add the column and build the index, both idempotent.
-
-    `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so this
-    deliberately does not open one. It is also the reason this is a separate
-    step rather than something `_do_ensure` does: that method runs its whole
-    DDL inside one transaction under an advisory lock, and a build of this size
-    would hold a ShareLock against every INSERT for the duration.
-    """
+    """Add the column. Deliberately NOT the index — see `_build_index`."""
     async with pool.acquire() as c:
         await c.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
         t0 = time.monotonic()
@@ -163,7 +211,41 @@ async def _prepare(pool, schema: str) -> None:
             "ADD COLUMN IF NOT EXISTS sparse_bm25 bm25_catalog.bm25vector"
         )
         print(f"  column: ok ({(time.monotonic() - t0) * 1000:.1f}ms)")
+        print("  index:  not yet — run --index after the sweep converges")
 
+
+async def _build_index(pool, schema: str) -> None:
+    """Build the index once, over a column that is already full.
+
+    The order matters far more than it looks. Measured on a 2.1M-chunk corpus:
+    one 500-row batch took **103 seconds** with the index present and **2.5
+    seconds** without it — 42x, and at the first rate the sweep would take
+    roughly five days. Every row written into an existing BM25 index pays that
+    index's per-term maintenance, and the per-term cost is the dominant term in
+    this index's size: at fixed posting count, a 68x larger vocabulary made the
+    index 17.5x bigger, while doubling the rows at fixed vocabulary added 7%.
+    Paying it two million times instead of once is the whole difference.
+
+    So: `--prepare` adds the column, the sweep fills it, and this builds the
+    index at the end. It is also why this cannot be `_do_ensure`'s job — that
+    method runs its DDL inside one transaction under an advisory lock, and a
+    build of this size would hold a ShareLock against every INSERT for its
+    duration. `CREATE INDEX CONCURRENTLY` cannot run inside a transaction
+    block, which is why this opens none.
+    """
+    async with pool.acquire() as c:
+        nulls = int(await c.fetchval(
+            f'SELECT count(*) FROM "{schema}".chunks WHERE sparse_bm25 IS NULL'
+        ))
+        if nulls:
+            # Building over a half-filled column is not wrong, but it turns the
+            # rest of the sweep into the slow kind. Refusing is the useful
+            # answer: the operator has more sweeping to do.
+            raise SystemExit(
+                f"{nulls} row(s) still have no vector. Build the index after the "
+                "sweep converges — with it in place each batch pays index "
+                "maintenance per row, which measured 42x slower."
+            )
         t0 = time.monotonic()
         await c.execute(
             f'CREATE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} '
@@ -173,7 +255,11 @@ async def _prepare(pool, schema: str) -> None:
             "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
             f'"{schema}".{_INDEX}',
         )
-        print(f"  index:  {'valid' if valid else 'INVALID'} "
+        size = await c.fetchval(
+            "SELECT pg_size_pretty(pg_relation_size(to_regclass($1)))",
+            f'"{schema}".{_INDEX}',
+        )
+        print(f"  index:  {'valid' if valid else 'INVALID'}  {size} "
               f"({time.monotonic() - t0:.1f}s)")
         if not valid:
             # A CONCURRENTLY build that loses its race leaves the index behind
@@ -181,7 +267,7 @@ async def _prepare(pool, schema: str) -> None:
             # point: a silent invalid index is a search that quietly stops
             # matching after the flip.
             raise SystemExit(
-                f"{_INDEX} is INVALID — drop it and re-run --prepare "
+                f"{_INDEX} is INVALID — drop it and re-run --index "
                 "(a CONCURRENTLY build that fails leaves it behind unusable)."
             )
 
@@ -243,11 +329,13 @@ async def _apply(pool, schema: str, rows) -> int:
                 [r["chunk_id"] for r in rows],
                 list(encoded),
                 [r["indexed_at"] for r in rows],
+                timeout=_WRITE_TIMEOUT,
             )
     return int(res.split()[-1]) if res.startswith("UPDATE") else 0
 
 
-async def _pass(pool, schema: str, since: datetime | None) -> int:
+async def _pass(pool, schema: str, since: datetime | None,
+                writers: int = _WRITERS) -> int:
     """One forward sweep over the primary key.
 
     Keyset pagination rather than a bare `WHERE ... LIMIT`: with the latter,
@@ -282,7 +370,14 @@ async def _pass(pool, schema: str, since: datetime | None) -> int:
             break
         cursor = rows[-1]["chunk_id"]
         seen += len(rows)
-        written += await _apply(pool, schema, rows)
+        # Split the batch and write the parts at once. Encoding still happens
+        # inside each part, so the tokenizer stays busy while the writes wait
+        # on disk — which is the whole reason this is split.
+        size = -(-len(rows) // writers)
+        parts = [rows[i:i + size] for i in range(0, len(rows), size)]
+        written += sum(await asyncio.gather(
+            *(_apply(pool, schema, part) for part in parts)
+        ))
         elapsed = time.monotonic() - started
         print(f"\r  {seen} read · {written} written · "
               f"{seen / elapsed:.0f}/s", end="", flush=True)
@@ -298,12 +393,19 @@ async def main() -> None:
     ap.add_argument("--check", action="store_true",
                     help="report what is left, then exit")
     ap.add_argument("--prepare", action="store_true",
-                    help="add the column and build the index CONCURRENTLY, then exit")
+                    help="add the column (not the index), then exit")
+    ap.add_argument("--index", action="store_true",
+                    help="build the index CONCURRENTLY once the sweep has "
+                         "converged, then exit")
     ap.add_argument("--since", metavar="TIMESTAMP",
                     help="re-encode rows rewritten after this instant "
                          "(ISO 8601); use the start of the previous pass")
     ap.add_argument("--tokenizer-processes", type=int, default=None,
                     help="Kiwi process pool size (default: the app setting)")
+    ap.add_argument("--writers", type=int, default=_WRITERS,
+                    help=f"UPDATE statements in flight at once (default {_WRITERS}); "
+                         "the write is disk-latency bound, so this is the knob "
+                         "that matters")
     args = ap.parse_args()
 
     since = datetime.fromisoformat(args.since) if args.since else None
@@ -312,11 +414,21 @@ async def main() -> None:
 
     await init_db()
     schema = settings.vector_store_schema
+    pool = None
     try:
-        pool = await _vector_pool()
+        pool = await _vector_pool(max(1, args.writers))
 
         if args.prepare:
             await _prepare(pool, schema)
+            return
+
+        if args.index:
+            if not await _column_exists(pool, schema):
+                raise SystemExit(
+                    f'"{schema}".chunks has no sparse_bm25 column — '
+                    "run --prepare first."
+                )
+            await _build_index(pool, schema)
             return
 
         if not await _column_exists(pool, schema):
@@ -339,7 +451,7 @@ async def main() -> None:
 
         sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
         try:
-            written = await _pass(pool, schema, since)
+            written = await _pass(pool, schema, since, args.writers)
         finally:
             sparse_encoder.stop_tokenizer_pool()
 
@@ -359,6 +471,8 @@ async def main() -> None:
         print(f"  python -m scripts.backfill_bm25_vector "
               f"--since '{started_at.isoformat()}'")
     finally:
+        if pool is not None:
+            await pool.close()
         await close_pool()
 
 
