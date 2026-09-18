@@ -69,7 +69,10 @@ def test_the_vector_literal_is_strictly_increasing_and_folded():
     not increasing at position 9". Sorted is not enough; a repeated id has to
     become one entry."""
     assert _bm25vector_literal([5, 1, 5], [1.0, 2.0, 1.0]) == "{1:2, 5:2}"
-    assert _bm25vector_literal([], []) is None
+    # No terms is a vector, not an absence. `NULL` is reserved for "nothing has
+    # encoded this row yet", which is the only thing that makes a backfill's
+    # `IS NULL` an exact count of work left.
+    assert _bm25vector_literal([], []) == "{}"
     # A fractional weight here means a pre-baked value reached the wrong
     # branch; it must never round down to a term that is not there.
     # Reached through the store this is now unreachable — `upsert_one` refuses
@@ -79,8 +82,8 @@ def test_the_vector_literal_is_strictly_increasing_and_folded():
     # by accident.
     assert _bm25vector_literal([7], [0.4]) == "{7:1}"
     # `zip` would truncate silently and index the document under half its
-    # terms; `'{}'` would be a valid, NOT NULL vector scoring -0 and would
-    # become padding. Both are refused rather than produced.
+    # terms — a document indexed under a subset of what it says, with nothing
+    # downstream able to notice. Refused rather than produced.
     with pytest.raises(ValueError, match="disagree"):
         _bm25vector_literal([10, 20], [1.0])
     with pytest.raises(ValueError, match="disagree"):
@@ -298,6 +301,63 @@ async def test_documents_without_the_query_term_never_fill_the_page():
                 filter_col="vault_id", limit=10,
             )
         assert set(unfiltered) == matching
+
+
+async def test_an_empty_vector_is_stored_and_never_displaces_a_match():
+    """`'{}'` is written for a document with no terms, and costs nothing.
+
+    The column has to distinguish "nothing encoded this row yet" (`NULL`) from
+    "something did and there were no terms" (`'{}'`), because only then is
+    `sparse_bm25 IS NULL` an exact count of what a backfill still owes. The
+    objection to storing it was that `'{}'` passes the `IS NOT NULL` guard and
+    scores `-0`, so it would top the page up the way the test above describes.
+
+    It does not, and the reason is the order: `-0` sorts after every negative
+    score, so an empty row can only take a slot no match wanted, and
+    `-0 < 0` is false so the outer filter drops it there. This asserts it at a
+    scale where a wrong answer could not hide — three matches against two
+    hundred empty rows, asked for ten."""
+    async with _store() as (store, pool):
+        vid = uuid.uuid4()
+        async with pool.acquire() as conn:
+            for i in range(1, 4):
+                await store.upsert_one(
+                    chunk_id=str(uuid.UUID(int=i)), source_type="document",
+                    source_id=str(uuid.uuid4()), vault_id=str(vid),
+                    section_path="", content=f"hit{i}", chunk_index=i,
+                    dense=None, sparse_indices=[10], sparse_values=[float(i)],
+                    conn=conn,
+                )
+            for i in range(100, 300):
+                await store.upsert_one(
+                    chunk_id=str(uuid.UUID(int=i)), source_type="document",
+                    source_id=str(uuid.uuid4()), vault_id=str(vid),
+                    section_path="", content="", chunk_index=i,
+                    dense=None, sparse_indices=[], sparse_values=[], conn=conn,
+                )
+            await conn.execute("ANALYZE vector_index.chunks")
+
+            stored = await conn.fetch(
+                "SELECT sparse_bm25::text AS v FROM vector_index.chunks "
+                "WHERE chunk_index >= 100"
+            )
+            assert len(stored) == 200
+            assert {r["v"] for r in stored} == {"{}"}, "빈 문서가 NULL 로 갔다"
+
+            matching = {str(uuid.UUID(int=i)) for i in (1, 2, 3)}
+            for selective in (True, False):
+                with pytest.MonkeyPatch.context() as mp:
+                    mp.setattr(
+                        type(store), "_filter_is_selective",
+                        lambda *a, s=selective, **k: _const(s),
+                    )
+                    hits = await store._search_sparse(
+                        conn, terms=[10], weights=[1.0], filter_uuids=[vid],
+                        filter_col="vault_id", limit=10,
+                    )
+                assert set(hits) == matching, (
+                    f"selective={selective}: 빈 벡터가 자리를 먹었다 — {hits}"
+                )
 
 
 async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting():
