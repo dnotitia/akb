@@ -91,6 +91,11 @@ so a pending request is not briefly displayed as a genuine empty response.
 
 - Hybrid `returned` is the number of returned resources. `total_matches` is a
   candidate-pool count, **not** a corpus-wide total. The UI labels top results.
+- `excluded` explains a page shorter than the requested limit: public cause name
+  → how many candidates that filter removed while assembling this page, `{}`
+  when none were. It is page-relative, not a pool or corpus figure, and holds
+  only causes that are not faults — a component that failed belongs to
+  `degraded` instead, and no cause is reported in both places.
 - Grep distinguishes returned resources/lines from exact total matching
   resources/lines. Explicit File opt-in adds resource aggregates while keeping
   Document aggregates Document-only. Native results preserve type, revision,
@@ -102,7 +107,7 @@ so a pending request is not briefly displayed as a genuine empty response.
   Degradation reports a component that failed or a hit lost to a stale source
   row; a filter is not one. Excluding the documents the request asked to exclude
   — the default `unarchived` archive scope, for one — leaves the response
-  complete and unflagged, and shows up in the counts rather than in a banner.
+  unflagged and is reported in `excluded` rather than in a banner.
 - During a same-mode refresh the previous ledger is labelled busy; request
   generations prevent late responses from replacing newer results.
 

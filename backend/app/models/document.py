@@ -297,6 +297,24 @@ class SearchResponse(BaseModel):
     (i.e. the pool was filled and there might be more in the corpus).
     `hint` carries a one-line follow-up suggestion when truncated.
 
+    `excluded` is how many candidates a FILTER removed on the way to this
+    page, keyed by cause — `{"archived": 1}`. It is what explains a page
+    shorter than the requested `limit` without claiming anything went wrong:
+    the cause names which part of the request did it, so "your scope removed
+    it" never has to be guessed from a count. Empty (`{}`) when nothing was
+    excluded, and always present, so a caller never distinguishes absent from
+    zero.
+
+    Three boundaries on it. It is page-relative — candidates considered while
+    assembling THIS page, including the refills that replaced a filtered hit —
+    not a property of the pool or the corpus, which is why it carries no name
+    from the `total_*` family. It holds only causes that are not faults; a
+    component that failed or a hit lost to a stale row is `degraded` /
+    `degradation_reason` instead, and no cause appears in both. And its keys
+    are public vocabulary, translated from the internal counter names in
+    `search_service.PUBLIC_DROP_CAUSE_NAMES`, so renaming a diagnostic string
+    is not a breaking API change.
+
     `total` is kept as a deprecated alias of `returned` for backward
     compatibility with existing UI / agent prompts.
     """
@@ -321,6 +339,12 @@ class SearchResponse(BaseModel):
     # `degradation_reason` is a short cause.
     degraded: bool = False
     degradation_reason: str | None = None
+    # The counterpart to `degraded`, for the exclusions that are NOT faults
+    # (akb#608): public cause name -> how many candidates it removed from this
+    # page. `degraded` says something broke; `excluded` says the request itself
+    # took documents out, which is the only other reason a page comes back
+    # short. Never both for one drop — see the docstring above.
+    excluded: dict[str, int] = Field(default_factory=dict)
     results: list[SearchResult]
 
 
