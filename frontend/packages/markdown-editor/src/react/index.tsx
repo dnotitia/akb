@@ -318,6 +318,7 @@ export function useMarkdownTargetResolutions(
     key: string
     resolutions: ReadonlyMap<string, MarkdownTargetResolution>
   }>({ key: '', resolutions: EMPTY_RESOLUTIONS })
+  const [refreshNonce, setRefreshNonce] = useState(0)
 
   useEffect(() => {
     if (!resolver || targets.length === 0) return
@@ -333,11 +334,40 @@ export function useMarkdownTargetResolutions(
     })
 
     return () => controller.abort()
-  }, [commit, document, resolutionKey, resolver, targets, vault])
+  }, [commit, document, refreshNonce, resolutionKey, resolver, targets, vault])
 
-  return resolver && targets.length > 0 && resolutionState.key === resolutionKey
-    ? resolutionState.resolutions
-    : EMPTY_RESOLUTIONS
+  const targetResolutions =
+    resolver && targets.length > 0 && resolutionState.key === resolutionKey
+      ? resolutionState.resolutions
+      : EMPTY_RESOLUTIONS
+
+  const nextRefreshAt = useMemo(() => {
+    let earliest = Number.POSITIVE_INFINITY
+    for (const resolution of targetResolutions.values()) {
+      if (resolution.status !== 'available' || !resolution.expiresAt) continue
+      const timestamp = Date.parse(resolution.expiresAt)
+      if (Number.isFinite(timestamp)) earliest = Math.min(earliest, timestamp)
+    }
+    return Number.isFinite(earliest) ? earliest : null
+  }, [targetResolutions])
+
+  useEffect(() => {
+    if (nextRefreshAt === null) return
+
+    // Re-resolve one second before expiry so a pointer/keyboard activation can
+    // use the refreshed URL without ever writing it back to Markdown.
+    const delay = Math.max(0, nextRefreshAt - Date.now() - 1_000)
+    const timer = window.setTimeout(() => {
+      // Do not leave a stale signed/blob URL actionable while the refresh is
+      // in flight. The surface will render the canonical target as pending
+      // until the new resolution arrives.
+      setResolutionState({ key: '', resolutions: EMPTY_RESOLUTIONS })
+      setRefreshNonce(value => value + 1)
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [nextRefreshAt])
+
+  return targetResolutions
 }
 
 interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {

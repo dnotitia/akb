@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
 import type {
   MarkdownReferenceAdapter,
   MarkdownReferenceContext,
   MarkdownSearchAdapter,
   MarkdownSearchContext,
+  MarkdownTargetKind,
+  MarkdownTargetResolution,
+  MarkdownUnavailableReason,
   MarkdownUploadContext,
 } from "@akb/markdown-editor";
 import {
@@ -23,25 +25,6 @@ import {
 } from "@/lib/image-assets";
 import { docUri, fileUri, parseUri } from "@/lib/uri";
 
-export type AkbMarkdownTargetKind = "document" | "file" | "attachment";
-
-export type AkbMarkdownTargetResolution =
-  | {
-      target: string;
-      kind?: AkbMarkdownTargetKind;
-      status: "available";
-      runtimeUrl: string;
-      label?: string;
-      expiresAt?: string;
-    }
-  | {
-      target: string;
-      kind?: AkbMarkdownTargetKind;
-      status: "unavailable";
-      reason: "inaccessible" | "deleted" | "unsupported" | "cross-vault" | "expired" | "unknown";
-      label?: string;
-    };
-
 export interface AkbMarkdownUploadContext {
   vault: string;
   document?: string;
@@ -52,14 +35,14 @@ export interface AkbMarkdownUploadContext {
 
 function unavailable(
   target: string,
-  kind?: AkbMarkdownTargetKind,
-  reason: "inaccessible" | "deleted" | "unsupported" | "cross-vault" | "expired" | "unknown" = "unknown",
-): AkbMarkdownTargetResolution {
+  kind?: MarkdownTargetKind,
+  reason: MarkdownUnavailableReason = "unknown",
+): MarkdownTargetResolution {
   return { target, kind, status: "unavailable", reason };
 }
 
 /** Classify only the three targets owned by the Markdown resource contract. */
-export function classifyAkbMarkdownTarget(target: string): AkbMarkdownTargetKind | null {
+export function classifyAkbMarkdownTarget(target: string): MarkdownTargetKind | null {
   if (assetIdFromUrl(target)) return "attachment";
   const parsed = parseUri(target);
   if (parsed?.kind === "doc") return "document";
@@ -69,7 +52,7 @@ export function classifyAkbMarkdownTarget(target: string): AkbMarkdownTargetKind
 
 export function canonicalAkbMarkdownTarget(
   target: string,
-  kind?: AkbMarkdownTargetKind,
+  kind?: MarkdownTargetKind,
 ): string | null {
   const attachmentId = assetIdFromUrl(target);
   if (attachmentId && (!kind || kind === "attachment")) {
@@ -80,46 +63,6 @@ export function canonicalAkbMarkdownTarget(
   if (parsed.kind === "doc") return docUri(parsed.vault, parsed.id);
   if (parsed.kind === "file") return fileUri(parsed.vault, parsed.id, parsed.collection);
   return null;
-}
-
-/** Extract only link targets that need a resource resolver; image attachments
- * keep their own bounded byte loader and are intentionally not duplicated. */
-export function extractAkbMarkdownLinkTargets(markdown: string): string[] {
-  const targets: string[] = [];
-  const seen = new Set<string>();
-  const source = markdown.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g, " ");
-  const normalizeReferenceLabel = (label: string) => label.trim().replace(/\s+/g, " ").toLowerCase();
-  const add = (raw: string) => {
-    const target = canonicalAkbMarkdownTarget(raw.trim());
-    if (!target || classifyAkbMarkdownTarget(target) === "attachment" || seen.has(target)) return;
-    seen.add(target);
-    targets.push(target);
-  };
-  const definitions = new Map<string, string>();
-  for (const match of source.matchAll(/^\s{0,3}\[([^\]]+)\]:\s*(<[^>]+>|[^\s]+).*$/gm)) {
-    definitions.set(normalizeReferenceLabel(match[1]), (match[2] ?? "").replace(/^<|>$/g, ""));
-  }
-
-  const pattern = /!?\[[^\]]*\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/g;
-  for (const match of source.matchAll(pattern)) {
-    const raw = (match[1] ?? "").replace(/^<|>$/g, "");
-    add(raw);
-  }
-  for (const match of source.matchAll(/!?\[([^\]]*)\]\[([^\]]*)\]/g)) {
-    const label = normalizeReferenceLabel(match[2] || match[1]);
-    const target = definitions.get(label);
-    if (target) add(target);
-  }
-  // CommonMark shortcut references use one bracket pair: `[Guide]`, with a
-  // matching `[Guide]: target` definition. Skip images, inline links, full /
-  // collapsed references, and the definition declaration itself.
-  for (const match of source.matchAll(/\[([^\]]+)\](?![ \t]*(?:\[|\(|:))/g)) {
-    const index = match.index ?? 0;
-    if (index > 0 && source[index - 1] === "!") continue;
-    const target = definitions.get(normalizeReferenceLabel(match[1]));
-    if (target) add(target);
-  }
-  return targets;
 }
 
 function documentRuntimeUrl(vault: string, path: string, commit?: string): string {
@@ -134,7 +77,7 @@ export function createAkbMarkdownTargetResolver(
     async resolve(
       rawTarget: string,
       context: Partial<AkbMarkdownUploadContext> = {},
-    ): Promise<AkbMarkdownTargetResolution> {
+    ): Promise<MarkdownTargetResolution> {
       const target = canonicalAkbMarkdownTarget(rawTarget);
       const kind = classifyAkbMarkdownTarget(rawTarget) ?? undefined;
       if (!target || !kind) return unavailable(rawTarget, undefined, "unsupported");
@@ -204,77 +147,6 @@ export function createAkbMarkdownTargetResolver(
       return unavailable(target, kind);
     },
   };
-}
-
-const EMPTY_TARGET_RESOLUTIONS: ReadonlyMap<string, AkbMarkdownTargetResolution> = new Map();
-
-/** Resolve editor/viewer links and refresh short-lived runtime URLs in place. */
-export function useAkbMarkdownTargetResolutions(
-  markdown: string,
-  defaults: Partial<AkbMarkdownUploadContext> = {},
-): ReadonlyMap<string, AkbMarkdownTargetResolution> {
-  const { commit, document, vault } = defaults;
-  const targetStrings = useMemo(
-    () => extractAkbMarkdownLinkTargets(markdown),
-    [markdown],
-  );
-  const targetResolver = useMemo(
-    () => (vault ? createAkbMarkdownTargetResolver({ vault, document, commit }) : undefined),
-    [commit, document, vault],
-  );
-  const targetResolutionKey = useMemo(
-    () => [vault ?? "", document ?? "", commit ?? "", ...targetStrings].join("\u0000"),
-    [commit, document, targetStrings, vault],
-  );
-  const [targetResolutionState, setTargetResolutionState] = useState<{
-    key: string;
-    values: ReadonlyMap<string, AkbMarkdownTargetResolution>;
-  }>({ key: "", values: EMPTY_TARGET_RESOLUTIONS });
-  const [refreshNonce, setRefreshNonce] = useState(0);
-
-  useEffect(() => {
-    if (!targetResolver || targetStrings.length === 0) return;
-    const controller = new AbortController();
-    void Promise.all(
-      targetStrings.map(async (target) => [
-        target,
-        await targetResolver.resolve(target, {
-          vault,
-          document,
-          commit,
-          signal: controller.signal,
-        }),
-      ] as const),
-    ).then((entries) => {
-      if (!controller.signal.aborted) {
-        setTargetResolutionState({ key: targetResolutionKey, values: new Map(entries) });
-      }
-    });
-    return () => controller.abort();
-  }, [commit, document, refreshNonce, targetResolutionKey, targetResolver, targetStrings, vault]);
-
-  const targetResolutions =
-    targetResolver && targetResolutionState.key === targetResolutionKey
-      ? targetResolutionState.values
-      : EMPTY_TARGET_RESOLUTIONS;
-  const nextRefreshAt = useMemo(() => {
-    let earliest = Number.POSITIVE_INFINITY;
-    for (const resolution of targetResolutions.values()) {
-      if (resolution.status !== "available" || !resolution.expiresAt) continue;
-      const timestamp = Date.parse(resolution.expiresAt);
-      if (Number.isFinite(timestamp)) earliest = Math.min(earliest, timestamp);
-    }
-    return Number.isFinite(earliest) ? earliest : null;
-  }, [targetResolutions]);
-
-  useEffect(() => {
-    if (nextRefreshAt === null) return;
-    const delay = Math.max(0, nextRefreshAt - Date.now() - 1_000);
-    const timer = window.setTimeout(() => setRefreshNonce((value) => value + 1), delay);
-    return () => window.clearTimeout(timer);
-  }, [nextRefreshAt]);
-
-  return targetResolutions;
 }
 
 export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {

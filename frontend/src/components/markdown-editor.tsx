@@ -17,6 +17,7 @@ import {
 import type {
   MarkdownAsset,
   MarkdownReferenceOptions,
+  MarkdownTargetResolution,
 } from "@akb/markdown-editor";
 import { discardAsset, getAssetBlob } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
@@ -24,7 +25,6 @@ import {
   canonicalAkbMarkdownTarget,
   classifyAkbMarkdownTarget,
   createAkbMarkdownAdapters,
-  type AkbMarkdownTargetResolution,
 } from "@/lib/markdown-adapters";
 import {
   assetIdFromUrl,
@@ -107,7 +107,7 @@ function editorContentElement(root: HTMLDivElement | null): HTMLElement | null {
 
 function applyMarkdownTargetResolutions(
   root: HTMLElement,
-  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
   resolving: boolean,
 ): void {
   const setAttribute = (element: HTMLElement, name: string, value: string) => {
@@ -175,7 +175,7 @@ function applyMarkdownTargetResolutions(
 function useTargetResolutionDom(
   rootRef: React.RefObject<HTMLDivElement | null>,
   editor: MarkdownEditorInstance | null,
-  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
   resolving: boolean,
 ): void {
   React.useLayoutEffect(() => {

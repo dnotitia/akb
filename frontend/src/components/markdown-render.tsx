@@ -15,15 +15,15 @@ import {
   canonicalAkbMarkdownTarget,
   classifyAkbMarkdownTarget,
   createAkbMarkdownAdapters,
-  type AkbMarkdownTargetResolution,
 } from "@/lib/markdown-adapters";
+import type { MarkdownTargetResolution } from "@akb/markdown-editor";
 import { assetIdFromUrl } from "@/lib/image-assets";
 import { parseHeadings, stripFrontmatter } from "@/lib/markdown";
 import { cn } from "@/lib/utils";
 
 function applyViewerTargetResolutions(
   root: HTMLElement,
-  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
   resolving: boolean,
 ): void {
   root.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((link) => {
@@ -90,7 +90,7 @@ function normalizeViewerHeadings(root: HTMLElement, markdown: string): void {
 
 function useViewerTargetDom(
   rootRef: React.RefObject<HTMLDivElement | null>,
-  resolutions: ReadonlyMap<string, AkbMarkdownTargetResolution>,
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
   resolving: boolean,
   editor: ReturnType<typeof useMarkdownEditor>,
 ): void {

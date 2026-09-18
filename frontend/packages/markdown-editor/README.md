@@ -253,8 +253,10 @@ surfaces use the same extension set for a stable viewer/editor meaning model.
 
 Upload, search, and target resolution are adapter interfaces. A `MarkdownAsset` returns the
 canonical `target` that is safe to store in Markdown; `runtimeUrl` exists only on a resolver
-result and is never serialized. `uploadMarkdownBatch` keeps success, failure, and cancellation
-per file so a partial batch can be recovered without losing successful attachments.
+result and is never serialized. A resolver may return `expiresAt` for a short-lived runtime URL;
+the shared `useMarkdownTargetResolutions` hook re-resolves before expiry and discards results from
+an obsolete document context. `uploadMarkdownBatch` keeps success, failure, and cancellation per
+file so a partial batch can be recovered without losing successful attachments.
 
 `MarkdownEditingSurface` can own the complete image flow when a product supplies
 `imageUpload`. The shared surface handles file selection, standalone image paste, drop,
