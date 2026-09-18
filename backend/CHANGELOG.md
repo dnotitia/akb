@@ -7,6 +7,32 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The PostgreSQL image is pinned by digest
+
+- Every reference that actually pulls `pgvector/pgvector:pg16` now carries the
+  multi-architecture index digest alongside the tag: the two Compose files, the
+  Helm values, the Kubernetes StatefulSet, the all-in-one Dockerfile, the CI
+  dependency Compose and the CI service container. The tag stays for
+  readability; the digest is what gets fetched.
+- The tag is mutable and had already moved — from PostgreSQL 16.13 / pgvector
+  0.8.2 to 16.15 / 0.8.6 — while every manifest carried on saying `pg16`. With
+  `imagePullPolicy: IfNotPresent` a running pod keeps its cached layers, so the
+  upgrade would have arrived whenever a pod was rescheduled onto a node without
+  them: real, unannounced, and at a moment nobody chose.
+- The digest names 16.15 / 0.8.6 rather than freezing the older pair, because
+  pgvector 0.8.3 and 0.8.4 fix HNSW index corruption and an unrepaired-graph
+  error during vacuuming, both of which apply to any deployment running HNSW
+  indexes with autovacuum enabled. 0.8.3 through 0.8.6 are bug fixes with no
+  on-disk format change.
+- The runtime-topology contract test now asserts that the Compose PostgreSQL
+  reference *carries* a digest rather than matching one exact string, so the
+  pin cannot be quietly removed and the digest does not have to be edited in
+  two places on every bump.
+- `deploy/k8s/README.md` gains the procedure for moving a pin, including how to
+  resolve the multi-architecture index digest rather than a single-platform
+  manifest — pinning the latter would strand nodes of every other architecture.
+
+
 ### An interrupted BM25 recompute resumes instead of starting over
 
 - The corpus scan behind `recompute_stats()` kept its partial document

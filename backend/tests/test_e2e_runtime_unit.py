@@ -1644,7 +1644,14 @@ async def test_rollout_fault_disable_restores_fixture_before_ack(tmp_path, monke
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
     compose = yaml.safe_load(COMPOSE_FILE.read_text())
     assert set(compose["services"]) == {"postgres", "minio"}
-    assert compose["services"]["postgres"]["image"] == "pgvector/pgvector:pg16"
+    # Asserted as "the pg16 tag, carrying a digest" rather than as one exact
+    # string. A bare tag here would let the e2e runtime drift to whatever
+    # `pg16` resolves to on the day while every deployment manifest is pinned,
+    # which is the disagreement the pinning was meant to remove. Repeating the
+    # digest instead would make this a second place to edit on every bump, and
+    # the two copies would fall out of step the first time someone forgot.
+    postgres_image = compose["services"]["postgres"]["image"]
+    assert postgres_image.startswith("pgvector/pgvector:pg16@sha256:"), postgres_image
     assert compose["services"]["minio"]["image"] == (
         "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
     )

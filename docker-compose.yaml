@@ -28,7 +28,7 @@ services:
     # pgvector/pgvector image ships with the `vector` extension
     # pre-installed, so the same container serves as both the main
     # app DB and the vector store (under a separate schema).
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     environment:
       POSTGRES_DB: akb
       POSTGRES_USER: akb
