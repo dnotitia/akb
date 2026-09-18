@@ -1,5 +1,12 @@
 # PostgreSQL with pgvector - simple StatefulSet deployment
-# Using pgvector/pgvector:pg16 which includes the vector extension pre-installed
+# Using pgvector/pgvector:pg16 which includes the vector extension pre-installed.
+#
+# Pinned by digest, not by the `pg16` tag alone. That tag is mutable: it moved
+# from PostgreSQL 16.13 / pgvector 0.8.2 to 16.15 / 0.8.6 while deployments
+# carried on requesting `pg16`, so a pod rescheduled onto a node without the
+# cached layers would have upgraded its database at a moment nobody chose. The
+# tag stays in the reference for readability; the digest is what is fetched.
+# See deploy/k8s/README.md for how to move it.
 
 apiVersion: apps/v1
 kind: StatefulSet
@@ -19,7 +26,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: pgvector/pgvector:pg16
+          image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
           args:
             - "-c"
             - "shared_buffers=2GB"

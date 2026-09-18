@@ -150,6 +150,34 @@ upgrade until the AKB Kubernetes Secrets are independent from their old
 `--cascade=orphan` is intentional: ordinary deletion would also delete the
 generated Secret children and make the subsequent AKB rollout fail.
 
+## Moving a pinned image
+
+Container images here are pinned as `name:tag@sha256:...`. The tag is there so
+the version is readable; the digest is what actually gets fetched, and it is
+what makes two clusters running "the same manifest" actually run the same
+bytes. A bare tag does not: `pgvector/pgvector:pg16` moved from PostgreSQL
+16.13 to 16.15 without any manifest changing.
+
+To move one, resolve the multi-architecture index digest — not a
+single-platform manifest, or non-amd64 nodes stop scheduling:
+
+```bash
+docker buildx imagetools inspect pgvector/pgvector:pg16 --format '{{json .Manifest.Digest}}'
+```
+
+The plain `docker buildx imagetools inspect pgvector/pgvector:pg16` prints the
+same value on its `Digest:` line, alongside a `MediaType:` that should read
+`application/vnd.oci.image.index.v1+json` (or the Docker manifest-list
+equivalent). If it names a single-platform manifest instead, the reference
+resolved to one architecture and pinning it would strand every other node.
+
+Then update every reference together. For PostgreSQL those are
+`deploy/k8s/postgres.yaml`, `deploy/helm/akb/values.yaml`,
+`deploy/all-in-one/Dockerfile`, `docker-compose.yaml`,
+`eval/longmemeval/docker-compose.yaml`, `scripts/ci/dependency-compose.yaml`
+and `.github/workflows/backend-pytest.yml`. Leaving one behind is worse than
+pinning nothing, because CI then tests a version the deployment does not run.
+
 ## Helm
 
 For a chart-based installation, see [`../helm/akb`](../helm/akb/README.md).
