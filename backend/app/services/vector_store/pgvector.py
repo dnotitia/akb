@@ -83,8 +83,8 @@ def _rrf(*ranked_lists: list[str]) -> dict[str, float]:
 
 def _bm25vector_literal(
     indices: list[int], values: list[float]
-) -> str | None:
-    """`{term_id:tf, …}` — the extension's text input, or None for no terms.
+) -> str:
+    """`{term_id:tf, …}` — the extension's text input; `'{}'` for no terms.
 
     Term ids must be strictly increasing, not merely sorted: the parser rejects
     `{1:2, 5:1, 5:1}` with "Indexes are not increasing", so a repeated id has to
@@ -115,12 +115,20 @@ def _bm25vector_literal(
     counts: dict[int, int] = {}
     for term, weight in zip(indices, values):
         counts[int(term)] = counts.get(int(term), 0) + max(1, round(float(weight)))
-    if not counts:
-        # `'{}'` is a valid vector and is NOT NULL, so it would pass the
-        # `sparse_bm25 IS NOT NULL` guard and score `-0` — exactly the padding
-        # material the ranked-subquery filter exists to keep out. A document
-        # with no terms has no vector.
-        return None
+    # An empty vector is written, not skipped, and the two are not the same
+    # thing: `NULL` means nothing has encoded this row yet, `'{}'` means
+    # something did and the document had no content-bearing terms. Only that
+    # distinction makes `sparse_bm25 IS NULL` an exact statement of work
+    # remaining, which is what a backfill over an existing corpus needs.
+    #
+    # It costs nothing at search time. `'{}'` passes the `IS NOT NULL` guard
+    # and scores `-0`, but `-0 < 0` is false in IEEE 754, so the ranked
+    # subquery's filter drops it exactly as it drops a document holding no
+    # query term. Measured rather than argued: with five real matches and ten
+    # thousand `'{}'` rows under `LIMIT 10`, all five came back — the `-0` rows
+    # sort after every negative score, so they can only occupy slots that no
+    # match wanted. (An earlier version of this comment claimed the opposite
+    # and returned None for it. It was wrong about the filter.)
     return "{" + ", ".join(f"{t}:{counts[t]}" for t in sorted(counts)) + "}"
 
 
