@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.10.0
+
+- Add the common `@` reference menu with product-owned person, issue, document,
+  and file candidates, grouped rendering, keyboard/pointer selection, ARIA
+  state, loading/empty/error states, cancellation, stale-response handling,
+  and IME/read-only/code/link guards.
+- Insert people and issues as product-provided plain text while inserting
+  document/file candidates as canonical Markdown links; runtime or signed URLs
+  are never introduced by the package.
+- Add the public reference adapter/options contract and the React hook bridge
+  for changing product context without replacing the editor instance.
+- Document the pnpm 11 exact `allowBuilds` bootstrap required before the first
+  full-SHA Git subdirectory install, so `prepare` can produce the public
+  `dist` exports for frozen consumer installs.
+
 ## 0.9.0
 
 - Add the shared ten-command slash menu with localized filtering, keyboard and

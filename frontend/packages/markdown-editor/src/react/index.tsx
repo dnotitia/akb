@@ -52,6 +52,22 @@ export type {
   MarkdownSlashCommandOptions,
 } from './markdown-slash-command.js'
 import {
+  createLiveMarkdownReferenceExtension,
+} from './markdown-reference-menu.js'
+export {
+  createMarkdownReferenceExtension,
+  DEFAULT_MARKDOWN_REFERENCE_LABELS,
+  normalizeMarkdownReferenceCandidates,
+} from './markdown-reference-menu.js'
+export type {
+  MarkdownReferenceAdapter,
+  MarkdownReferenceCandidate,
+  MarkdownReferenceContext,
+  MarkdownReferenceKind,
+  MarkdownReferenceLabels,
+  MarkdownReferenceOptions,
+} from './markdown-reference-menu.js'
+import {
   MarkdownImageUploadProvider,
   MarkdownImageUploadStatus,
   MarkdownImageUploadInput,
@@ -85,6 +101,7 @@ import type {
   MarkdownProfile,
   MarkdownSearchAdapter,
   MarkdownSearchContext,
+  MarkdownReferenceOptions,
   MarkdownSlashCommandOptions,
   MarkdownState,
   MarkdownTargetResolution,
@@ -97,12 +114,51 @@ const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
   messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 }
 
+class MarkdownReferenceOptionSource {
+  private value: MarkdownReferenceOptions | false | undefined
+  private readonly listeners = new Set<() => void>()
+
+  constructor(value: MarkdownReferenceOptions | false | undefined) {
+    this.value = value
+  }
+
+  get(): MarkdownReferenceOptions | false | undefined {
+    return this.value
+  }
+
+  set(value: MarkdownReferenceOptions | false | undefined): void {
+    const contextKey = (options: MarkdownReferenceOptions | false | undefined) => {
+      if (options === false || options === undefined) return ''
+      return [
+        options.context?.vault ?? '',
+        options.context?.document ?? '',
+        options.context?.commit ?? '',
+      ].join('\u0000')
+    }
+    const adapter = (options: MarkdownReferenceOptions | false | undefined) => {
+      if (options === false || options === undefined) return undefined
+      return options.adapter
+    }
+    const identityChanged =
+      adapter(this.value) !== adapter(value) || contextKey(this.value) !== contextKey(value)
+    this.value = value
+    if (!identityChanged) return
+    for (const listener of [...this.listeners]) listener()
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+}
+
 export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
+  reference?: MarkdownReferenceOptions | false
 }
 
 export function useMarkdownEditor({
@@ -111,13 +167,27 @@ export function useMarkdownEditor({
   editable = true,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
+  reference,
 }: UseMarkdownEditorOptions = {}): Editor | null {
+  const [referenceSource] = useState(() => new MarkdownReferenceOptionSource(reference))
+  useEffect(() => {
+    referenceSource.set(reference)
+  }, [reference, referenceSource])
+  const referenceExtension = useMemo(
+    () =>
+      createLiveMarkdownReferenceExtension(() => {
+        const current = referenceSource.get()
+        return current || undefined
+      }, listener => referenceSource.subscribe(listener)),
+    [referenceSource],
+  )
   const extensions = useMemo(
     () => [
       ...createMarkdownExtensions({ profile }),
       ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
+      referenceExtension,
     ],
-    [profile, slash],
+    [profile, referenceExtension, slash],
   )
 
   return useEditor({
@@ -642,6 +712,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   readOnly?: boolean
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
+  reference?: MarkdownReferenceOptions | false
   adapters?: MarkdownAdapters
   resolverContext?: MarkdownTargetResolverContext
   imageMenu?: MarkdownImageMenuOptions
@@ -654,6 +725,7 @@ export function MarkdownEditor({
   readOnly = false,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
+  reference,
   adapters,
   resolverContext,
   imageMenu,
@@ -666,6 +738,7 @@ export function MarkdownEditor({
     editable: !readOnly,
     onChange,
     slash,
+    reference,
   })
   const resolutions = useMarkdownTargetResolutions(
     markdown,

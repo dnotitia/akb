@@ -14,7 +14,10 @@ import {
   extractMarkdownTargets,
   serializeEditorMarkdown,
 } from "@akb/markdown-editor";
-import type { MarkdownAsset } from "@akb/markdown-editor";
+import type {
+  MarkdownAsset,
+  MarkdownReferenceOptions,
+} from "@akb/markdown-editor";
 import { discardAsset, getAssetBlob } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
@@ -391,6 +394,19 @@ const AKB_MARKDOWN_SEARCH_LABELS: Partial<MarkdownLinkSearchLabels> = {
   resource: "Resource",
 };
 
+const AKB_MARKDOWN_REFERENCE_LABELS: MarkdownReferenceOptions["labels"] = {
+  header: "Insert Vault reference",
+  sections: {
+    person: "People",
+    issue: "Issues",
+    document: "Documents",
+    file: "Files",
+  },
+  searching: "Searching Vault resources…",
+  empty: "No accessible documents or files found.",
+  error: "Unable to search Vault resources. Check your access and try again.",
+};
+
 export interface MarkdownEditorProps {
   value: string;
   onChange?: (markdown: string, assetIds: readonly string[]) => void;
@@ -404,6 +420,7 @@ export interface MarkdownEditorProps {
   required?: boolean;
   vault: string;
   onSlashOpenChange?: (open: boolean, dismiss?: () => void) => void;
+  onReferenceOpenChange?: (open: boolean, dismiss?: () => void) => void;
   document?: string;
   commit?: string;
   onUploadingChange?: (uploading: boolean) => void;
@@ -430,6 +447,7 @@ export function MarkdownEditor({
   required,
   vault,
   onSlashOpenChange,
+  onReferenceOpenChange,
   document,
   commit,
   onUploadingChange,
@@ -485,6 +503,15 @@ export function MarkdownEditor({
         onOpenChange: onSlashOpenChange,
       }),
       [onSlashOpenChange],
+    ),
+    reference: React.useMemo(
+      () => ({
+        adapter: adapters.reference,
+        context: { vault, document, commit },
+        labels: AKB_MARKDOWN_REFERENCE_LABELS,
+        onOpenChange: onReferenceOpenChange ?? onSlashOpenChange,
+      }),
+      [adapters.reference, commit, document, onReferenceOpenChange, onSlashOpenChange, vault],
     ),
   });
 

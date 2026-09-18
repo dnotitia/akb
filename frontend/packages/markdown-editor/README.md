@@ -65,6 +65,51 @@ Products provide copy with `slash.messages` and may observe its lifecycle with
 `markdown-slash-command-option-selected`. Pass `slash={false}` for a read-only
 or non-WYSIWYG surface such as `MarkdownViewer`.
 
+The WYSIWYG editor also accepts an optional common `@` reference menu through
+`reference`. Products own search, permissions, and context; the package owns
+the menu lifecycle and insertion contract:
+
+```tsx
+import {
+  MarkdownEditor,
+  type MarkdownReferenceAdapter,
+} from '@akb/markdown-editor'
+
+const referenceAdapter: MarkdownReferenceAdapter = {
+  async search(query, context) {
+    return productSearch(query, context?.vault, context?.signal)
+  },
+}
+
+<MarkdownEditor
+  markdown={markdown}
+  onChange={onChange}
+  reference={{
+    adapter: referenceAdapter,
+    context: { vault: activeVault, document: currentDocument, commit },
+    labels: {
+      header: 'Insert reference',
+      empty: 'No accessible references found.',
+    },
+  }}
+/>
+```
+
+`MarkdownReferenceCandidate` uses `kind: 'person' | 'issue' | 'document' |
+'file'`. People and issues use the adapter's exact `value` (falling back to
+`@id` and `id`); documents and files require a durable `target` and insert the
+candidate title as a Markdown link. The adapter must return canonical targets,
+never signed or runtime URLs. Invalid document/file candidates are omitted from
+the selectable list. Results are grouped under `data-reference-section`, and
+the stable styling hooks are `markdown-reference-popup`,
+`markdown-reference-menu`, `markdown-reference-options`,
+`markdown-reference-option`, and `markdown-reference-option-selected`.
+The menu exposes distinct loading, empty, and error states, keeps late or
+cancelled responses from changing the current result, and consumes Escape
+without closing a surrounding product dialog. It is disabled automatically in
+read-only, Source, code, link, and IME-composition contexts. Omit `reference`
+when a product does not provide a search adapter.
+
 Products with a custom editor instance and toolbar can compose the same public
 surface from the `/react` entry point:
 
@@ -74,6 +119,8 @@ import {
   MarkdownEditingSurface,
   MarkdownToolbar,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+  DEFAULT_MARKDOWN_REFERENCE_LABELS,
+  type MarkdownReferenceAdapter,
   type MarkdownTableOptions,
   useMarkdownEditor,
 } from '@akb/markdown-editor/react'
@@ -88,6 +135,11 @@ function ProductEditor({ markdown, onChange, readOnly }) {
     editable: !readOnly,
     onChange,
     slash: { messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES },
+    reference: {
+      adapter: referenceAdapter,
+      context: { vault: activeVault },
+      labels: DEFAULT_MARKDOWN_REFERENCE_LABELS,
+    },
   })
 
   return (
@@ -278,6 +330,13 @@ with a physical OS IME.
 
 ## Versioning
 
+The `0.10.0` public contract adds the common `@` reference menu, the
+`MarkdownReferenceAdapter`/`MarkdownReferenceCandidate` contract, canonical
+document/file link insertion, grouped person/issue/document/file rendering,
+distinct async states, cancellation and stale-response handling, and the live
+React context bridge. It does not add product-specific people, issue, search,
+permission, or persistence behavior.
+
 The `0.9.0` public contract adds the shared ten-command slash menu, localized
 filtering, keyboard/pointer selection, ARIA state, viewport/clipping-boundary
 placement, IME/read-only guards, and the shared task-list command used by the
@@ -303,13 +362,17 @@ styling. It also includes the shared WYSIWYG / Markdown Source surface and
 For a Git consumer, pin both the full commit SHA and the package subdirectory:
 
 ```sh
-pnpm add 'git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/frontend/packages/markdown-editor'
+pnpm --allow-build='@akb/markdown-editor@https://codeload.github.com/dnotitia/akb/tar.gz/<full-40-character-sha>#path:/frontend/packages/markdown-editor' \
+  add 'git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/frontend/packages/markdown-editor'
 ```
 
 The Git dependency runs `prepare` to build its public `dist` exports. With pnpm
-11, add the exact resolved package selector reported by pnpm to the consumer's
-`allowBuilds` map in `pnpm-workspace.yaml`, then commit that configuration and
-the lockfile. Keep this approval scoped to this package.
+11, pass the exact resolved package selector to `--allow-build` on the first
+`pnpm add`; pnpm writes the scoped `allowBuilds` entry to
+`pnpm-workspace.yaml`. Do this before any install or lockfile-only resolution,
+then commit that configuration and the lockfile. Keep this approval scoped to
+this package. Finish a cold consumer setup with `pnpm install --frozen-lockfile`
+before importing either public entry point.
 
 The `0.5.0` public contract adds common document/file search UI to
 `MarkdownToolbar.link`, including `searchAdapter`, `searchContext`,
