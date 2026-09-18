@@ -7,6 +7,28 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Archive scope is a filter, not a failure
+
+- A search that excludes an archived document — exactly as the default
+  `unarchived` scope is supposed to — no longer reports the retrieval service
+  as unavailable. The page can be complete when this happened: the refill loop
+  pulls a replacement from the prefetch pool, so the caller received every
+  result they asked for and was told the search had failed. Raising `limit` on
+  one unchanged query was enough to flip it, because the flag depended only on
+  whether an archived document happened to land in the pool.
+
+  The hydration drop counter is unchanged and still names every cause,
+  including this one, in the operational log. Only the conclusion drawn from it
+  changed: the five causes that mean something is wrong or stale still set the
+  flag, and a leg that raised still outranks them, but a filter honouring the
+  request does not. This is where general-purpose engines draw the same line —
+  Elasticsearch reserves `_shards.failed` and `timed_out` for components that
+  failed and searches cut short, Solr does the same with `partialResults`, and
+  in neither does a filter produce a degradation signal.
+
+  A short page remains visible as the gap between `total_matches` and
+  `returned`.
+
 ### BM25 statistics
 
 - A recompute that cannot take the advisory lock retries briefly instead of
@@ -190,8 +212,8 @@ selects FOR the rare tail and a vault-path top-K would filter down to nothing.
 
 A hit excluded by scope no longer costs a result slot: the page is refilled
 from the rest of the deduped prefetch pool, and the drop is counted as
-`archive_scope_excluded` in the `hydration_dropped` degradation reason, so a
-genuinely short page (an exhausted pool) names its cause. Applying the
+`archive_scope_excluded`, so a genuinely short page (an exhausted pool) has a
+named cause in the operational log. Applying the
 predicate at hydration also closes the window where a document is archived
 between candidate selection and hydration.
 

@@ -99,6 +99,10 @@ so a pending request is not briefly displayed as a genuine empty response.
 - A degraded response is incomplete, whether it contains results or not. It must
   never be labelled a genuine zero-match. Retry is available without changing the
   query, and raw server diagnostic details are not displayed as user guidance.
+  Degradation reports a component that failed or a hit lost to a stale source
+  row; a filter is not one. Excluding the documents the request asked to exclude
+  — the default `unarchived` archive scope, for one — leaves the response
+  complete and unflagged, and shows up in the counts rather than in a banner.
 - During a same-mode refresh the previous ledger is labelled busy; request
   generations prevent late responses from replacing newer results.
 

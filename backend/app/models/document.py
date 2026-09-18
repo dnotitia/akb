@@ -309,10 +309,16 @@ class SearchResponse(BaseModel):
     total_matches: int = 0
     truncated: bool = False
     hint: str | None = None
-    # `degraded` is true when the vector store raised (outage, or a filter-size
-    # overflow on the seahorse drivers) so the result set is incomplete/empty —
-    # distinct from a genuine zero-match. Previously such failures were swallowed
-    # into a silent `[]` (issue #189). `degradation_reason` is a short cause.
+    # `degraded` is true when something FAILED and the result set is therefore
+    # incomplete/empty — distinct from a genuine zero-match. Two families raise
+    # it: a retrieval leg (vector-store outage, a filter-size overflow on the
+    # seahorse drivers, a sparse encoder that is down), and a hit lost between
+    # retrieval and hydration because its source row is gone or stale.
+    # Previously such failures were swallowed into a silent `[]` (issue #189).
+    # A FILTER is not one of them: a document the request asked to exclude —
+    # the default `unarchived` archive scope, for one — is part of the query,
+    # not a fault, and never sets this (akb#604).
+    # `degradation_reason` is a short cause.
     degraded: bool = False
     degradation_reason: str | None = None
     results: list[SearchResult]
