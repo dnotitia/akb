@@ -362,13 +362,17 @@ styling. It also includes the shared WYSIWYG / Markdown Source surface and
 For a Git consumer, pin both the full commit SHA and the package subdirectory:
 
 ```sh
-pnpm add 'git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/frontend/packages/markdown-editor'
+pnpm --allow-build='@akb/markdown-editor@https://codeload.github.com/dnotitia/akb/tar.gz/<full-40-character-sha>#path:/frontend/packages/markdown-editor' \
+  add 'git+https://github.com/dnotitia/akb.git#<full-40-character-sha>&path:/frontend/packages/markdown-editor'
 ```
 
 The Git dependency runs `prepare` to build its public `dist` exports. With pnpm
-11, add the exact resolved package selector reported by pnpm to the consumer's
-`allowBuilds` map in `pnpm-workspace.yaml`, then commit that configuration and
-the lockfile. Keep this approval scoped to this package.
+11, pass the exact resolved package selector to `--allow-build` on the first
+`pnpm add`; pnpm writes the scoped `allowBuilds` entry to
+`pnpm-workspace.yaml`. Do this before any install or lockfile-only resolution,
+then commit that configuration and the lockfile. Keep this approval scoped to
+this package. Finish a cold consumer setup with `pnpm install --frozen-lockfile`
+before importing either public entry point.
 
 The `0.5.0` public contract adds common document/file search UI to
 `MarkdownToolbar.link`, including `searchAdapter`, `searchContext`,

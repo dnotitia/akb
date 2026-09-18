@@ -11,6 +11,9 @@
   are never introduced by the package.
 - Add the public reference adapter/options contract and the React hook bridge
   for changing product context without replacing the editor instance.
+- Document the pnpm 11 exact `allowBuilds` bootstrap required before the first
+  full-SHA Git subdirectory install, so `prepare` can produce the public
+  `dist` exports for frozen consumer installs.
 
 ## 0.9.0
 
