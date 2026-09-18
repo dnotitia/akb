@@ -7,6 +7,32 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### An optional PostgreSQL image with a BM25 index extension
+
+- `deploy/postgres/Dockerfile` builds AKB's PostgreSQL with
+  [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25) added. It is
+  optional and changes nothing by itself: the sparse retrieval leg still works
+  against the `posting` table on the stock image, and the leg selects its
+  implementation separately.
+- The base is the digest already pinned in `deploy/k8s/postgres.yaml`, and the
+  extension is copied from its publisher's image, also pinned by
+  multi-architecture index digest. Two tests hold that: one compares the base
+  against the deployment manifest rather than a literal, so moving the pin does
+  not mean editing a test; the other refuses a bare tag in either stage.
+  Without them, enabling the extension could move the PostgreSQL version at the
+  same time and the two changes would be indistinguishable afterwards.
+- The extension ships no tokenizer. Its vector type is built from an integer
+  array of term ids, which is what `bm25_vocab` already mints, so the Korean
+  tokenizer is unaffected.
+- It installs into its own `bm25_catalog` schema and needs no
+  `shared_preload_libraries` entry, so a database that never runs
+  `CREATE EXTENSION vchord_bm25` behaves exactly like the base image.
+- `vchord_bm25` is AGPLv3 or Elastic License v2 at the recipient's option. It
+  runs inside the PostgreSQL server and is reached over the wire protocol, so
+  it does not change AKB's licensing; `deploy/postgres/README.md` records what
+  distributing a built image would entail.
+
+
 ### The PostgreSQL image is pinned by digest
 
 - Every reference that actually pulls `pgvector/pgvector:pg16` now carries the
