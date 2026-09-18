@@ -1,10 +1,12 @@
 import * as React from "react";
 import {
   EditorContent,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   MarkdownEditingSurface,
   MarkdownToolbar,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
+  type MarkdownSlashCommandOptions,
   type MarkdownImageMenuOptions,
   type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
@@ -28,6 +30,10 @@ import {
 import { cn } from "@/lib/utils";
 
 type MarkdownEditorInstance = NonNullable<ReturnType<typeof useMarkdownEditor>>;
+
+const AKB_MARKDOWN_SLASH_OPTIONS: MarkdownSlashCommandOptions = {
+  messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+};
 
 const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace"> = {
   labels: {
@@ -397,6 +403,7 @@ export interface MarkdownEditorProps {
   ariaLabelledby?: string;
   required?: boolean;
   vault: string;
+  onSlashOpenChange?: (open: boolean, dismiss?: () => void) => void;
   document?: string;
   commit?: string;
   onUploadingChange?: (uploading: boolean) => void;
@@ -422,6 +429,7 @@ export function MarkdownEditor({
   ariaLabelledby,
   required,
   vault,
+  onSlashOpenChange,
   document,
   commit,
   onUploadingChange,
@@ -471,6 +479,13 @@ export function MarkdownEditor({
     profile: "preserve",
     editable: !readOnly,
     onChange: handleChange,
+    slash: React.useMemo(
+      () => ({
+        ...AKB_MARKDOWN_SLASH_OPTIONS,
+        onOpenChange: onSlashOpenChange,
+      }),
+      [onSlashOpenChange],
+    ),
   });
 
   React.useEffect(() => {

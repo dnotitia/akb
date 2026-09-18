@@ -1,4 +1,11 @@
-import { useEffect, useState, type CSSProperties, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 import { DocumentCreateForm } from "@/components/document-create-form";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
@@ -38,6 +45,7 @@ export function DocumentCreateDialog({
   const [discardOpen, setDiscardOpen] = useState(false);
   const [draftAssetIds, setDraftAssetIds] = useState<readonly string[]>([]);
   const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>([]);
+  const slashMenuDismissRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (open) return;
@@ -47,7 +55,29 @@ export function DocumentCreateDialog({
     setDiscardOpen(false);
     setDraftAssetIds([]);
     setUnclaimedAssetIds([]);
+    slashMenuDismissRef.current = null;
   }, [open]);
+
+  const handleSlashOpenChange = useCallback(
+    (slashOpen: boolean, dismiss?: () => void) => {
+      slashMenuDismissRef.current = slashOpen ? dismiss ?? null : null;
+    },
+    [],
+  );
+
+  function handleEscapeKeyDown(event: KeyboardEvent) {
+    const dismissSlashMenu = slashMenuDismissRef.current;
+    if (dismissSlashMenu) {
+      event.preventDefault();
+      event.stopPropagation();
+      slashMenuDismissRef.current = null;
+      dismissSlashMenu();
+      return;
+    }
+
+    event.preventDefault();
+    requestClose();
+  }
 
   function requestClose() {
     if (creating) return;
@@ -76,10 +106,7 @@ export function DocumentCreateDialog({
               "--document-dialog-left": `${desktopLeftOffset}px`,
             } as CSSProperties
           }
-          onEscapeKeyDown={(event) => {
-            event.preventDefault();
-            requestClose();
-          }}
+          onEscapeKeyDown={handleEscapeKeyDown}
           onInteractOutside={(event) => {
             // A document composer is a workbench, not a lightweight prompt.
             // Native file pickers and imprecise background clicks can move
@@ -103,6 +130,7 @@ export function DocumentCreateDialog({
               onDirtyChange={setDirty}
               onCreatingChange={setCreating}
               onUploadingChange={setUploading}
+              onSlashOpenChange={handleSlashOpenChange}
               onAssetIdsChange={setDraftAssetIds}
               onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
             />

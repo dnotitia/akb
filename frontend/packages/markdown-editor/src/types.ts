@@ -158,9 +158,43 @@ export interface MarkdownAdapters {
   targetResolver?: MarkdownTargetResolver
 }
 
-export interface MarkdownSlashContext {
-  editor: Editor
-  position: number
+export type MarkdownSlashCommandCategory = 'text' | 'lists' | 'structure'
+
+export type MarkdownSlashCommandId =
+  | 'heading1'
+  | 'heading2'
+  | 'heading3'
+  | 'quote'
+  | 'bulletList'
+  | 'numberedList'
+  | 'taskList'
+  | 'table'
+  | 'codeBlock'
+  | 'divider'
+
+export interface MarkdownSlashCommandMessages {
+  header: string
+  escapeHint: string
+  sections: Record<MarkdownSlashCommandCategory, string>
+  footer: {
+    navigation: string
+    insert: string
+    close: string
+  }
+  empty: string
+  commands: Record<
+    MarkdownSlashCommandId,
+    {
+      label: string
+      description: string
+    }
+  >
+}
+
+export interface MarkdownSlashCommandOptions {
+  messages?: MarkdownSlashCommandMessages
+  /** Keeps a surrounding Dialog/Sheet open while the menu consumes Escape. */
+  onOpenChange?: (open: boolean, dismiss?: () => void) => void
 }
 
 export type MarkdownHeadingLevel = 1 | 2 | 3
@@ -171,7 +205,6 @@ export interface MarkdownEditorConfig extends MarkdownParseOptions {
   element?: EditorOptions['element']
   adapters?: MarkdownAdapters
   onChange?: (markdown: string, editor: Editor) => void
-  onSlash?: (context: MarkdownSlashContext) => void
 }
 
 export interface MarkdownCommands extends MarkdownTableCommands {
@@ -195,6 +228,7 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   toggleCode(): boolean
   toggleBulletList(): boolean
   toggleOrderedList(): boolean
+  toggleTaskList(): boolean
   toggleBlockquote(): boolean
   toggleCodeBlock(): boolean
   setHorizontalRule(): boolean
@@ -214,6 +248,7 @@ export interface MarkdownActiveState {
   code: boolean
   bulletList: boolean
   orderedList: boolean
+  taskList: boolean
   blockquote: boolean
   codeBlock: boolean
   link: boolean

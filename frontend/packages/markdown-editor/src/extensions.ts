@@ -1,5 +1,4 @@
 import {
-  Extension,
   Node,
   type AnyExtension,
   type MarkdownToken,
@@ -15,10 +14,7 @@ import TableRow from '@tiptap/extension-table-row'
 import TaskItem from '@tiptap/extension-task-item'
 import TaskList from '@tiptap/extension-task-list'
 
-import type {
-  MarkdownProfile,
-  MarkdownSlashContext,
-} from './types.js'
+import type { MarkdownProfile } from './types.js'
 
 type RawMarkdownKind = 'html' | 'mdx'
 
@@ -304,38 +300,12 @@ const RawMarkdownInline = Node.create({
   },
 })
 
-interface MarkdownSlashOptions {
-  onSlash?: (context: MarkdownSlashContext) => void
-}
-
-const MarkdownSlash = Extension.create<MarkdownSlashOptions>({
-  name: 'markdownSlash',
-
-  addOptions() {
-    return { onSlash: undefined }
-  },
-
-  addKeyboardShortcuts() {
-    return {
-      '/': () => {
-        this.options.onSlash?.({
-          editor: this.editor,
-          position: this.editor.state.selection.from,
-        })
-        return false
-      },
-    }
-  },
-})
-
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
-  onSlash?: (context: MarkdownSlashContext) => void
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
-  onSlash,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -362,7 +332,6 @@ export function createMarkdownExtensions({
   }
 
   extensions.push(
-    MarkdownSlash.configure({ onSlash }),
     Markdown.configure({
       markedOptions: {
         gfm: true,

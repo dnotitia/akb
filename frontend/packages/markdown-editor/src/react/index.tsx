@@ -5,6 +5,7 @@ import { EditorContent, useEditor } from '@tiptap/react'
 import type { Editor } from '@tiptap/core'
 import {
   Bold,
+  CheckSquare,
   Code,
   Code2,
   Heading1,
@@ -40,6 +41,17 @@ import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown
 import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
 export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
 import {
+  createMarkdownSlashCommandExtension,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+} from './markdown-slash-command.js'
+export {
+  createMarkdownSlashCommandExtension,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+} from './markdown-slash-command.js'
+export type {
+  MarkdownSlashCommandOptions,
+} from './markdown-slash-command.js'
+import {
   MarkdownImageUploadProvider,
   MarkdownImageUploadStatus,
   MarkdownImageUploadInput,
@@ -73,7 +85,7 @@ import type {
   MarkdownProfile,
   MarkdownSearchAdapter,
   MarkdownSearchContext,
-  MarkdownSlashContext,
+  MarkdownSlashCommandOptions,
   MarkdownState,
   MarkdownTargetResolution,
   MarkdownTargetResolverContext,
@@ -81,13 +93,16 @@ import type {
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
+const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
+  messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+}
 
 export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
   onChange?: MarkdownEditorConfig['onChange']
-  onSlash?: (context: MarkdownSlashContext) => void
+  slash?: MarkdownSlashCommandOptions | false
 }
 
 export function useMarkdownEditor({
@@ -95,11 +110,14 @@ export function useMarkdownEditor({
   profile = 'preserve',
   editable = true,
   onChange,
-  onSlash,
+  slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
 }: UseMarkdownEditorOptions = {}): Editor | null {
   const extensions = useMemo(
-    () => createMarkdownExtensions({ profile, onSlash }),
-    [onSlash, profile],
+    () => [
+      ...createMarkdownExtensions({ profile }),
+      ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
+    ],
+    [profile, slash],
   )
 
   return useEditor({
@@ -142,6 +160,7 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             toggleCode: () => false,
             toggleBulletList: () => false,
             toggleOrderedList: () => false,
+            toggleTaskList: () => false,
             toggleBlockquote: () => false,
             toggleCodeBlock: () => false,
             setHorizontalRule: () => false,
@@ -170,6 +189,7 @@ function readState(editor: Editor): MarkdownState {
       code: editor.isActive('code'),
       bulletList: editor.isActive('bulletList'),
       orderedList: editor.isActive('orderedList'),
+      taskList: editor.isActive('taskList'),
       blockquote: editor.isActive('blockquote'),
       codeBlock: editor.isActive('codeBlock'),
       link: editor.isActive('link'),
@@ -621,7 +641,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   profile?: MarkdownProfile
   readOnly?: boolean
   onChange?: MarkdownEditorConfig['onChange']
-  onSlash?: (context: MarkdownSlashContext) => void
+  slash?: MarkdownSlashCommandOptions | false
   adapters?: MarkdownAdapters
   resolverContext?: MarkdownTargetResolverContext
   imageMenu?: MarkdownImageMenuOptions
@@ -633,7 +653,7 @@ export function MarkdownEditor({
   profile = 'preserve',
   readOnly = false,
   onChange,
-  onSlash,
+  slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   adapters,
   resolverContext,
   imageMenu,
@@ -645,7 +665,7 @@ export function MarkdownEditor({
     profile,
     editable: !readOnly,
     onChange,
-    onSlash,
+    slash,
   })
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -692,6 +712,7 @@ export function MarkdownViewer({
     initialMarkdown: markdown,
     profile,
     editable: false,
+    slash: false,
   })
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -1281,6 +1302,14 @@ export function MarkdownToolbar({
           onClick={() => commands.toggleOrderedList()}
         >
           <ListOrdered className="h-4 w-4" />
+        </MarkdownToolbarButton>
+        <MarkdownToolbarButton
+          label="Task list"
+          active={Boolean(active?.taskList)}
+          disabled={!editable}
+          onClick={() => commands.toggleTaskList()}
+        >
+          <CheckSquare className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
       <MarkdownToolbarGroup label="Blocks">

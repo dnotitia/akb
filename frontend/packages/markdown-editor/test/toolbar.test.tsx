@@ -121,6 +121,7 @@ describe('MarkdownToolbar', () => {
       'Inline code',
       'Bulleted list',
       'Numbered list',
+      'Task list',
       'Blockquote',
       'Code block',
       'Horizontal rule',
