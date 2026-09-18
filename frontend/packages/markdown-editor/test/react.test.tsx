@@ -11,7 +11,13 @@ import {
   MarkdownViewer,
   useMarkdownCommands,
   useMarkdownEditor,
+  useMarkdownTargetResolutions,
   useMarkdownState,
+} from '../src/index.js'
+import type {
+  MarkdownTargetResolution,
+  MarkdownTargetResolver,
+  MarkdownTargetResolverContext,
 } from '../src/index.js'
 
 function HookProbe() {
@@ -24,6 +30,26 @@ function HookProbe() {
       <output data-testid="hook-state">{state?.markdown ?? 'loading'}</output>
       <button type="button" onClick={() => commands.setMarkdown('명령')}>set</button>
     </>
+  )
+}
+
+function ResolutionProbe({
+  markdown,
+  resolver,
+  context,
+}: {
+  markdown: string
+  resolver: MarkdownTargetResolver
+  context?: MarkdownTargetResolverContext
+}) {
+  const resolutions = useMarkdownTargetResolutions(markdown, resolver, context)
+  const target = resolutions.values().next().value as MarkdownTargetResolution | undefined
+  return (
+    <output
+      data-testid="resolution"
+      data-runtime-url={target?.status === 'available' ? target.runtimeUrl : ''}
+      data-markdown={markdown}
+    />
   )
 }
 
@@ -288,6 +314,94 @@ describe('React surfaces', () => {
       expect(image).toHaveAttribute('src', 'blob:runtime-image')
       expect(image).toHaveAttribute('data-markdown-target', target)
     })
+  })
+
+  it('re-resolves expiring targets before expiry without changing canonical Markdown', async () => {
+    vi.useFakeTimers()
+    try {
+      const target = 'akb://fixture/file/expiring.bin'
+      const markdown = `[Download](${target})`
+      let calls = 0
+      const resolver: MarkdownTargetResolver = {
+        resolve: vi.fn(async value => {
+          calls += 1
+          return {
+            target: value,
+            status: 'available' as const,
+            runtimeUrl: `/runtime/${calls}`,
+            expiresAt: new Date(Date.now() + 2_000).toISOString(),
+          }
+        }),
+      }
+
+      render(<ResolutionProbe markdown={markdown} resolver={resolver} />)
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(screen.getByTestId('resolution')).toHaveAttribute('data-runtime-url', '/runtime/1')
+      expect(calls).toBe(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_001)
+      })
+
+      expect(calls).toBe(2)
+      expect(screen.getByTestId('resolution')).toHaveAttribute('data-runtime-url', '/runtime/2')
+      expect(screen.getByTestId('resolution')).toHaveAttribute('data-markdown', markdown)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discards a late resolution from a previous document context', async () => {
+    const target = 'akb://fixture/doc/context.md'
+    const oldResult: MarkdownTargetResolution = {
+      target,
+      status: 'available',
+      runtimeUrl: '/runtime/old',
+    }
+    let releaseOld!: (resolution: MarkdownTargetResolution) => void
+    const oldPromise = new Promise<MarkdownTargetResolution>(resolve => {
+      releaseOld = resolve
+    })
+    const resolver: MarkdownTargetResolver = {
+      resolve: vi.fn((value, context) =>
+        context?.document === 'old'
+          ? oldPromise
+          : Promise.resolve({
+              target: value,
+              status: 'available' as const,
+              runtimeUrl: '/runtime/current',
+            }),
+      ),
+    }
+
+    const { container, rerender } = render(
+      <ResolutionProbe
+        markdown={`[Document](${target})`}
+        resolver={resolver}
+        context={{ document: 'old' }}
+      />,
+    )
+    rerender(
+      <ResolutionProbe
+        markdown={`[Document](${target})`}
+        resolver={resolver}
+        context={{ document: 'current' }}
+      />,
+    )
+
+    const view = within(container)
+    await waitFor(() =>
+      expect(view.getByTestId('resolution')).toHaveAttribute('data-runtime-url', '/runtime/current'),
+    )
+    await act(async () => {
+      releaseOld(oldResult)
+      await oldPromise
+    })
+
+    expect(view.getByTestId('resolution')).toHaveAttribute('data-runtime-url', '/runtime/current')
   })
 
   it('renders an unavailable placeholder while preserving the source target', async () => {

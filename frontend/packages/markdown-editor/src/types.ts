@@ -33,6 +33,11 @@ export type MarkdownTargetResolution =
       status: 'available'
       /** Short-lived runtime URL; never serialized to Markdown. */
       runtimeUrl: string
+      /**
+       * Optional expiry for the runtime URL. Consumers re-resolve before this
+       * instant and keep the canonical target in the editor model.
+       */
+      expiresAt?: string
       label?: string
     }
   | {

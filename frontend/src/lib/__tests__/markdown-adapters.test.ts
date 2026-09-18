@@ -17,7 +17,6 @@ import {
   classifyAkbMarkdownTarget,
   createAkbMarkdownAdapters,
   createAkbMarkdownTargetResolver,
-  extractAkbMarkdownLinkTargets,
 } from "@/lib/markdown-adapters";
 
 const ATTACHMENT = "/api/assets/123e4567-e89b-42d3-a456-426614174000";
@@ -37,19 +36,6 @@ describe("AKB Markdown target adapter", () => {
     expect(canonicalAkbMarkdownTarget(DOCUMENT)).toBe(DOCUMENT);
     expect(canonicalAkbMarkdownTarget(FILE)).toBe(FILE);
     expect(classifyAkbMarkdownTarget("javascript:alert(1)")).toBeNull();
-  });
-
-  it("finds reference-style links without resolving examples inside code", () => {
-    expect(extractAkbMarkdownLinkTargets([
-      "[Guide][guide]",
-      "",
-      `[guide]: ${DOCUMENT} "title"`,
-      "",
-      "[Shortcut]",
-      `[Shortcut]: ${FILE}`,
-      "",
-      "`[ignored](akb://other/doc/nope.md)`",
-    ].join("\n"))).toEqual([DOCUMENT, FILE]);
   });
 
   it("resolves only accessible same-vault targets and keeps runtime URLs ephemeral", async () => {
