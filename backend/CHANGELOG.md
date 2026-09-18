@@ -24,6 +24,10 @@ specifically; the proxy has its own log in
   error during vacuuming, both of which apply to any deployment running HNSW
   indexes with autovacuum enabled. 0.8.3 through 0.8.6 are bug fixes with no
   on-disk format change.
+- The runtime-topology contract test now asserts that the Compose PostgreSQL
+  reference *carries* a digest rather than matching one exact string, so the
+  pin cannot be quietly removed and the digest does not have to be edited in
+  two places on every bump.
 - `deploy/k8s/README.md` gains the procedure for moving a pin, including how to
   resolve the multi-architecture index digest rather than a single-platform
   manifest — pinning the latter would strand nodes of every other architecture.
