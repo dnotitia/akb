@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.services.sparse_shapes import SparseShape
+
 # Code-owned hard floor for the external-git runner's git version.
 # `http.curloptResolve` — the DNS-pin the hermetic runner depends on — is
 # documented from git 2.37, so a git below this cannot enforce the pin. Operators
@@ -1288,7 +1290,9 @@ class Settings(BaseModel):
     # `posting` (separate term_id table, indexed lookups) is the
     # production-recommended shape. `arrays` is retained for the bench
     # harness only — slower at scale.
-    vector_store_sparse_shape: Literal["posting", "arrays"] = "posting"
+    # The members live in `app/services/sparse_shapes.py` so this setting and
+    # the driver argument cannot drift apart (akb#623).
+    vector_store_sparse_shape: SparseShape = "posting"
 
     # Qdrant driver settings.
     vector_url: str = ""  # e.g. http://qdrant:6333

@@ -7,6 +7,24 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### A sparse shape the code does not handle now fails loudly
+
+- `vector_store_sparse_shape` was branched on as a two-way `if` in four places,
+  and the two files that branch disagreed about which way the default went: the
+  driver read "arrays, or else posting", the stats sampler read "posting, or
+  else arrays". A third member would have been two different shapes at once, in
+  the same process, from the same setting — rows in a side table the size
+  reporter had been told not to look at.
+- Every branch now names every member and ends in `assert_never`, so an
+  unhandled shape is a type error at check time and a loud failure at runtime.
+- The members are declared once, in `app/services/sparse_shapes.py`. They were
+  two literals — one in `app/config.py`, one in the pgvector driver — with the
+  same members, different order, and no link. The module is a leaf because
+  `pgvector.py` deliberately does not import config and the vector-store
+  package's `__init__` imports the factory, which does.
+- No behaviour change for either existing shape.
+
+
 ### An optional PostgreSQL image with a BM25 index extension
 
 - `deploy/postgres/Dockerfile` builds AKB's PostgreSQL with

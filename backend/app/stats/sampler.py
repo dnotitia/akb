@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, assert_never
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -74,9 +74,12 @@ def pgvector_relations() -> tuple[str, ...]:
     bytes are not in this database and the field is reported as absent rather
     than as a number that would break that containment.
     """
-    if settings.vector_store_sparse_shape == "posting":
+    shape = settings.vector_store_sparse_shape
+    if shape == "posting":
         return ("chunks", "posting")
-    return ("chunks",)
+    if shape == "arrays":
+        return ("chunks",)
+    assert_never(shape)
 
 _snapshot: dict[str, Any] | None = None
 _last_error: str | None = None

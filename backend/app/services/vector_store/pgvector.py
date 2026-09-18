@@ -34,9 +34,11 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import assert_never
 
 import asyncpg
+
+from app.services.sparse_shapes import SparseShape
 
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
@@ -53,9 +55,6 @@ def _advisory_lock_key(schema: str) -> int:
     return int.from_bytes(digest, "big", signed=True)
 
 logger = logging.getLogger("akb.vector_store.pgvector")
-
-
-SparseShape = Literal["arrays", "posting"]
 
 
 # RRF constant (Qdrant's default). Same value across drivers so the
@@ -311,7 +310,7 @@ class PgvectorStore:
                 )
                 """
             )
-        else:  # posting
+        elif self._sparse_shape == "posting":
             # Fresh databases can score postings without heap reads. Existing
             # tables are intentionally not rebuilt during startup; see the
             # explicit concurrent-index maintenance SQL for upgrades.
@@ -353,6 +352,8 @@ class PgvectorStore:
                 """
             )
 
+        else:
+            assert_never(self._sparse_shape)
         # Existing deployments may have `dense` from the pre-0.6.2
         # NOT NULL era. Drop the constraint idempotently so the
         # sparse-only fallback can actually store a NULL.
@@ -526,7 +527,7 @@ class PgvectorStore:
                         content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
-                else:  # posting
+                elif self._sparse_shape == "posting":
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
@@ -563,6 +564,8 @@ class PgvectorStore:
                                 for t, w in zip(sparse_indices, sparse_values)
                             ],
                         )
+                else:
+                    assert_never(self._sparse_shape)
         except asyncpg.PostgresError as e:
             raise VectorStoreUnavailable(f"upsert failed: {e}") from e
 
@@ -933,7 +936,7 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
-        else:  # posting
+        elif self._sparse_shape == "posting":
             if filter_uuids:
                 if filter_col == "source_id":
                     # Source lists can contain thousands of IDs while a common
@@ -1023,6 +1026,8 @@ class PgvectorStore:
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
 
+        else:
+            assert_never(self._sparse_shape)
         return [r["chunk_id"] for r in rows]
 
     async def _fetch_payloads(
