@@ -120,6 +120,11 @@ so a pending request is not briefly displayed as a genuine empty response.
   fault is reported in `recovered`.
 - During a same-mode refresh the previous ledger is labelled busy; request
   generations prevent late responses from replacing newer results.
+- How often any of this actually fires is countable: the `search` section on
+  `/health` reports responses observed today, how many were degraded, how many
+  of those still carried results, and the breakdown by cause, backed by daily
+  tables that survive a deploy. A decision about how a surface should treat a
+  degraded response belongs to that measurement, not to an estimate.
 
 ## Verification
 

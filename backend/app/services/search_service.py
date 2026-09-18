@@ -16,8 +16,9 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping
-from typing import Literal
+import functools
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Literal, ParamSpec
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -135,6 +136,80 @@ def _fault_drops(dropped: Mapping[str, int]) -> dict[str, int]:
         for cause, count in sorted(dropped.items())
         if cause not in NON_DEGRADING_DROP_CAUSES
     }
+
+
+# `degradation_reason` has exactly two shapes: a retrieval leg's own name, or
+# the hydration causes under this prefix with their counts. Both the writer and
+# the reader below go through this constant and the pair of functions beside it,
+# so the string cannot be reformatted in one place and parsed in another — the
+# defect this whole series has been unwinding is three descriptions of one thing
+# drifting apart, and a free-form string with an outside parser is the same
+# shape of mistake.
+HYDRATION_DROP_REASON_PREFIX = "hydration_dropped:"
+
+
+def _hydration_drop_reason(faults: Mapping[str, int]) -> str:
+    """The `degradation_reason` for a page short because of these faults."""
+    return HYDRATION_DROP_REASON_PREFIX + ",".join(f"{k}={v}" for k, v in faults.items())
+
+
+def degradation_causes(reason: str | None) -> tuple[str, ...]:
+    """The cause name(s) a `degradation_reason` names, for accounting (akb#612).
+
+    A retrieval leg that raised IS its own cause (`sparse_encoder_degraded`,
+    `vector_store_unavailable`, …), so the reason is returned unchanged. A
+    hydration reason names one or more counted causes and yields each of them,
+    because "a write race" and "a stale arm" call for different responses and
+    an aggregate that merged them would answer neither.
+
+    A response naming several hydration causes therefore contributes to each,
+    which is why a per-cause breakdown sums to at least the degraded count and
+    not exactly to it. Empty for an undegraded response, and — deliberately —
+    empty for a reason this cannot parse: a malformed string is not evidence
+    about the corpus, and inventing a cause name from one would put unbounded
+    keys into a counter.
+    """
+    if not reason:
+        return ()
+    if not reason.startswith(HYDRATION_DROP_REASON_PREFIX):
+        return (reason,)
+    body = reason[len(HYDRATION_DROP_REASON_PREFIX):]
+    causes = tuple(
+        cause for part in body.split(",")
+        if (cause := part.partition("=")[0].strip())
+    )
+    return causes
+
+
+_P = ParamSpec("_P")
+
+
+def _counted(
+    fn: Callable[_P, Awaitable[SearchResponse]],
+) -> Callable[_P, Awaitable[SearchResponse]]:
+    """Count every search response on its way out (akb#612).
+
+    A decorator rather than a call before each `return`: `search` has four
+    return sites and adding a fifth is an ordinary edit, so a chokepoint that
+    has to be remembered is one that will eventually be forgotten — and a
+    denominator with a hole in it silently understates every ratio built on it.
+    Wrapping also means a request that raises before producing a response is
+    not counted as one, which is the behaviour we want and would have had to
+    write out otherwise.
+
+    The import is deferred because the counter reads this module's
+    `degradation_causes`; taking it at module scope would be a cycle.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> SearchResponse:
+        response = await fn(*args, **kwargs)
+        from app.services import search_degradation_stats
+
+        search_degradation_stats.record(response)
+        return response
+
+    return wrapper
 
 
 def active_document_source_type(
@@ -782,6 +857,7 @@ class SearchService:
             )
         return candidates, filter_stats
 
+    @_counted
     async def search(
         self,
         query: str,
@@ -1223,8 +1299,7 @@ class SearchService:
         # and only the fault case.
         page_short_of_limit = returned < limit
         hydrate_reason = (
-            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in faults.items())}"
-            if faults and page_short_of_limit else None
+            _hydration_drop_reason(faults) if faults and page_short_of_limit else None
         )
         if hydrate_reason is not None and degraded_reason is None:
             degraded_reason = hydrate_reason

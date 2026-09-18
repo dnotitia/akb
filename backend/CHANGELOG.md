@@ -7,6 +7,55 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Search degradation is counted
+
+- `/health` gains a `search` section: how many search responses were observed
+  today, how many were degraded, how many of those still carried results, and
+  the breakdown by cause.
+
+  Nothing counted this before, and three surfaces looked like they should.
+  `/health` reports a section per indexing queue and search is not a queue —
+  the word `degraded` does appear there, but as the vector store's
+  *reachability* verdict, a different namespace from the search response field.
+  `tool_usage_daily` records `(day, tool, outcome, calls, duration)` and a
+  degraded search is a successful call, so it lands under `ok` beside every
+  healthy one. The only remaining trace was a log line, which lives as long as
+  the pod does.
+
+  So for any deployment, three questions had no answer: how often is a response
+  degraded, which cause dominates, and does the caller still receive results.
+  Those are the questions a consumer's behaviour should be chosen from, and it
+  is being chosen without them — one surface renders the results with a
+  warning, another withholds them entirely, and which is right depends on
+  numbers nobody could look up. `degraded_with_results` is the one that decides
+  it, and the one no existing surface could ever have produced.
+
+  Counts, not a verdict, matching the sections around it; and deliberately
+  outside the top-level `status` aggregate, because a search degraded by an
+  ordinary write race is not queue work left undone.
+
+- Backing it: `search_degradation_daily` and `search_degradation_cause_daily`,
+  one row per day and one per (day, cause). In-process counters reset on every
+  deploy and deploys are frequent, so a process counter could not compare two
+  days; the tables can, and are small enough to keep indefinitely — they are
+  written once per flush tick, not once per response.
+
+  The hot path only touches memory: a dict lookup and a few integer adds behind
+  the response, wrapped so that none of the four return sites can escape
+  counting and so that a request which raised is not counted as a response. The
+  database write is a per-day delta on a timer. What that trades away is stated
+  rather than hidden: a pod killed without a graceful stop loses up to one flush
+  interval, and `pending_flush` in the section is exactly how much is at risk at
+  that moment. A graceful stop drains first, so an ordinary rolling deploy loses
+  nothing, and a flush that fails hands its counts back to be retried rather
+  than dropping them.
+
+  The cause is read out of `degradation_reason` by a parser that lives beside
+  the formatter and shares its prefix constant, so the string cannot be
+  reshaped in one place and misread in another. A reason naming several
+  hydration causes counts under each, so the breakdown sums to at least the
+  degraded total — which is why the total is stored rather than derived.
+
 ### A complete page is no longer called degraded
 
 - `degraded` now means the response is genuinely incomplete, which is what its
