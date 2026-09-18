@@ -403,11 +403,17 @@ TOOLS = [
             "include_archived=true to see them). Nothing went wrong when it is non-empty, so "
             "do not retry: the same request returns the same page. It is `{}` when nothing "
             "was excluded. "
-            "When `degraded=true` the retrieval index hit a transient failure (vector-store "
-            "outage or a degraded leg), so results may be incomplete or empty — this is NOT a "
-            "genuine zero-match; `degradation_reason` names the cause. Retry shortly, or fall "
-            "back to akb_grep for a literal search. A filter never sets this flag and never "
-            "appears in that reason."
+            "When `degraded=true` a retrieval leg failed (vector-store outage, a degraded leg) "
+            "or a hit was lost to a stale source row, AND the page came back short because of "
+            "it, so results are incomplete or empty — this is NOT a genuine zero-match; "
+            "`degradation_reason` names the cause. Retry shortly, or fall back to akb_grep for "
+            "a literal search. A filter never sets this flag and never appears in that reason. "
+            "Neither does a fault the search already made good: when a dropped candidate was "
+            "replaced from the prefetch pool the page is complete, so `degraded` stays false "
+            "and the fault is counted in `recovered` (e.g. `{\"hydration_miss\": 2}`, `{}` when "
+            "there was nothing to replace). `recovered` reports corpus health, not a problem "
+            "with your results — do not retry on it and do not warn the user about it; every "
+            "result you asked for is in `results`."
         ),
         input_schema={
             "type": "object",

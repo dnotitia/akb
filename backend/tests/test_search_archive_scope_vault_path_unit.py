@@ -22,6 +22,14 @@ the response to explain a short page; this field is the replacement, and the
 assertions below hold the split open from both sides — a fault never appears
 in `excluded`, a filter never appears in `degradation_reason`, and a response
 carrying both reports each exactly once.
+
+The last section applies the same reconciliation to the FAULTS (akb#611). The
+refill loop compensates for them too, and a flag set from the presence of a
+fault said a complete page was incomplete. So the fault causes now split by
+what they cost: a drop the refill replaced leaves the page whole and is counted
+in `recovered`, a drop that left the page short of `limit` still degrades, and
+a short page nothing went wrong in stays unflagged. Three fields, three
+outcomes, and no drop reported twice.
 """
 from __future__ import annotations
 
@@ -365,6 +373,222 @@ async def test_the_public_exclusion_names_are_a_translation_not_a_passthrough():
     mixed = {"archive_scope_excluded": 2, "hydration_miss": 1, "stale_arm": 3}
     assert ss._public_exclusions(mixed) == {"archived": 2}
     assert ss._public_exclusions({}) == {}
+
+
+async def test_the_fault_drops_are_the_exact_complement_of_the_exclusions():
+    """Both fault fields are built from one classification (akb#611), so a
+    cause is either named publicly in `excluded` or carried as a fault, never
+    neither and never both. Deriving the complement from the same table — not
+    from a second list of fault names — is what makes that hold by
+    construction rather than by review."""
+    mixed = {"archive_scope_excluded": 2, "hydration_miss": 1, "stale_arm": 3}
+
+    assert ss._fault_drops(mixed) == {"hydration_miss": 1, "stale_arm": 3}
+    assert ss._fault_drops({}) == {}
+    # Partition: every cause lands in exactly one side, and the counts are
+    # preserved whole — neither view invents, merges, or loses a drop.
+    assert set(ss._fault_drops(mixed)) | set(ss.PUBLIC_DROP_CAUSE_NAMES) >= set(mixed)
+    assert not set(ss._fault_drops(mixed)) & set(ss.PUBLIC_DROP_CAUSE_NAMES)
+    assert sum(ss._fault_drops(mixed).values()) + sum(
+        ss._public_exclusions(mixed).values()
+    ) == sum(mixed.values())
+
+
+async def test_a_fault_the_refill_replaced_leaves_a_complete_page_unflagged(monkeypatch):
+    """The first half of akb#611. A hydration fault inside the page is replaced
+    from the spare pool exactly as a filtered hit is, so the caller receives
+    every result they asked for — and a response that gave up nothing must not
+    claim the result set is incomplete.
+
+    This is the observed shape, not a contrived one: `hydration_miss` means a
+    hit survived retrieval and its source row was gone by hydration, which is
+    what an ordinary delete looks like from the search side. The flag was set
+    from the presence of a fault and never reconciled against what came back,
+    so a write race produced eleven consecutive complete-but-degraded pages
+    where a component failure produced none."""
+    ids = [uuid.uuid4() for _ in range(6)]
+    # The second hit of the page has no source row at all — the `hydration_miss`
+    # shape, a genuine fault. The pool has spare candidates behind it.
+    statuses = {doc_id: "draft" for i, doc_id in enumerate(ids) if i != 1}
+    conn = _Conn(statuses)
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 6, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=3)
+
+    # A full page, refilled around the missing row the same way akb#530 refills
+    # around a filtered one.
+    assert response.returned == 3
+    assert [r.title for r in response.results] == [
+        f"Doc {ids[0].int}", f"Doc {ids[2].int}", f"Doc {ids[3].int}",
+    ]
+    assert response.degraded is False
+    assert response.degradation_reason is None
+    # …and the second half: the fault is not thrown away with the flag. A chunk
+    # that pointed at a row that is gone is a corpus-integrity signal worth
+    # chasing even though this response lost nothing, so it is reported as a
+    # count. Keyed by the internal cause name, which is the same word
+    # `degradation_reason` uses for it when it DOES cost something — one fault,
+    # one name, whichever field carries it.
+    assert response.recovered == {"hydration_miss": 1}
+    # A fault is still not an exclusion: `excluded` promises the drops the
+    # REQUEST caused, and nothing in this request removed anything.
+    assert response.excluded == {}
+
+
+async def test_a_fault_that_left_the_page_short_still_degrades(monkeypatch):
+    """The other half of akb#611, and the case the flag exists for. With the
+    pool exhausted the refill has nothing left to substitute, so the caller
+    receives fewer results than they asked for BECAUSE of the fault — the
+    response really is incomplete and says so.
+
+    `recovered` stays empty here. It counts faults that cost nothing, and this
+    one cost a result; reporting it in both places would put the same drop
+    under two explanations, one of which says retrying helps and one of which
+    says nothing is wrong."""
+    ids = [uuid.uuid4() for _ in range(3)]
+    # ids[2] is absent from the join — a fault — and there is no spare pool.
+    conn = _Conn({ids[0]: "draft", ids[1]: "draft"})
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 0, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=3)
+
+    assert response.returned == 2
+    assert response.returned < 3
+    assert response.degraded is True
+    assert response.degradation_reason == "hydration_dropped:hydration_miss=1"
+    assert response.recovered == {}
+
+
+async def test_a_page_short_for_no_fault_at_all_is_not_degraded(monkeypatch):
+    """Why the predicate is a conjunction and not just the page length. A
+    corpus holding fewer matches than `limit` returns a short page with nothing
+    wrong with it, and reading shortness alone as incompleteness would flag
+    every narrow query — the same over-reach as akb#604, from the other
+    direction. The fault has to have cost something."""
+    ids = [uuid.uuid4() for _ in range(2)]
+    conn = _Conn({ids[0]: "draft", ids[1]: "published"})
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 0, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=5)
+
+    assert response.returned == 2
+    assert response.returned < 5
+    assert response.degraded is False
+    assert response.degradation_reason is None
+    assert response.recovered == {}
+    assert response.excluded == {}
+
+
+async def test_a_partly_compensated_fault_is_reported_once_as_the_degradation(monkeypatch):
+    """The page is the unit, not the candidate. Here the refill replaced one
+    dropped hit and then ran out, so some of the fault was paid for and some of
+    it was not — and the response is short, which is the fact that matters.
+
+    Splitting the count across both fields would be arithmetic no caller asked
+    for and would leave `degraded` and `recovered` disagreeing about the same
+    request. `degradation_reason` carries the whole count; `recovered` is empty
+    because the page did not recover."""
+    ids = [uuid.uuid4() for _ in range(5)]
+    # Only ids[1] and ids[2] have source rows; the other three are faults.
+    conn = _Conn({ids[1]: "draft", ids[2]: "draft"})
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 5, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=3)
+
+    assert response.returned == 2
+    assert response.degraded is True
+    assert response.degradation_reason == "hydration_dropped:hydration_miss=3"
+    assert response.recovered == {}
+
+
+async def test_a_complete_page_separates_a_recovered_fault_from_an_excluded_filter(monkeypatch):
+    """Both kinds of drop in one page, both compensated, each reported once and
+    in its own field. This is the three-way split the series arrived at: the
+    request took one candidate out (`excluded`), a fault took another and the
+    refill replaced it (`recovered`), and the response is complete so nothing
+    is degraded."""
+    ids = [uuid.uuid4() for _ in range(6)]
+    # ids[1] archived (a filter), ids[2] absent from the join (a fault).
+    statuses = {
+        doc_id: ("archived" if i == 1 else "draft")
+        for i, doc_id in enumerate(ids) if i != 2
+    }
+    conn = _Conn(statuses)
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 6, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=3)
+
+    assert response.returned == 3
+    assert response.degraded is False
+    assert response.degradation_reason is None
+    assert response.excluded == {"archived": 1}
+    assert response.recovered == {"hydration_miss": 1}
+    # Neither field borrows the other's vocabulary, in either direction.
+    assert "hydration_miss" not in response.excluded
+    assert "archived" not in response.recovered
+    assert "archive_scope_excluded" not in response.recovered
+
+
+async def test_a_clean_search_reports_an_empty_recovered_map(monkeypatch):
+    """`recovered` is unconditional for the same reason `excluded` is: a caller
+    tests it for emptiness, with no absent/zero distinction to get wrong."""
+    ids = [uuid.uuid4() for _ in range(2)]
+    conn = _Conn({ids[0]: "draft", ids[1]: "published"})
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 0, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    response = await service.search("x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=2)
+
+    assert response.returned == 2
+    assert response.recovered == {}
+    assert "recovered" in response.model_dump()
 
 
 async def test_tables_and_files_carry_no_status_and_survive_the_default_scope(monkeypatch):

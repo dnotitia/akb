@@ -1027,13 +1027,26 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     "type": "object",
                     "additionalProperties": {"type": "integer"},
                 },
+                # Fault drops this page RECOVERED from, keyed by internal cause
+                # name (akb#611): `{"hydration_miss": 2}`. Same shape and same
+                # always-emitted guarantee as `excluded`, and populated only
+                # when the page is complete — a fault that left the page short
+                # is named by `degradation_reason` instead, so no drop is
+                # reported twice.
+                "recovered": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
                 "results": {
                     "type": "array",
                     "items": {"$ref": "#/components/schemas/SearchResult"},
                 },
             },
             "Hybrid search success envelope.",
-            required=("kind", "query", "total", "returned", "total_matches", "excluded", "results"),
+            required=(
+                "kind", "query", "total", "returned", "total_matches",
+                "excluded", "recovered", "results",
+            ),
         ),
         "AkbDrillDownEnvelope": _kind_schema(
             "drill_down",

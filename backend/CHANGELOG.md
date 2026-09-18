@@ -7,6 +7,57 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### A complete page is no longer called degraded
+
+- `degraded` now means the response is genuinely incomplete, which is what its
+  own documentation has always said it meant. A hydration fault whose dropped
+  candidate the refill loop replaced from the prefetch pool leaves the caller
+  with every result they asked for, and no longer raises the flag; a fault that
+  left the page short of the requested `limit` still does.
+
+  The flag was set from the presence of a fault and never reconciled against
+  what came back, so the dominant trigger had become an ordinary write race
+  rather than a component failure. `hydration_miss` fires whenever a hit
+  survives retrieval and its source row is gone by hydration — which is what an
+  ordinary delete or replace looks like from the search side — and the refill
+  loop exists precisely to absorb that. Consumers act on the flag: one renders
+  a warning, another empties the result list, and the agent-facing description
+  says the failure is transient and suggests retrying. On a complete page all
+  of that was wrong, and retrying a race that has already resolved returns a
+  response that is no longer degraded, which teaches callers the flag means
+  nothing.
+
+  The predicate is the conjunction, not the page length alone. The refill loop
+  drains the entire spare pool before it will return a short page, so
+  `returned == limit` is exactly the state in which every fault drop was
+  replaced, and `returned < limit` is exactly the state in which the pool ran
+  out with the page unfilled — where the page would have been longer without
+  the fault. A short page with no fault behind it stays unflagged: a corpus
+  with fewer matches than `limit`, or a page shortened by the archive filter,
+  has nothing wrong with it.
+
+- The fault does not disappear with the flag. A complete page reports it as
+  `recovered`: internal cause name → how many candidates that fault removed
+  before the refill replaced them, `{}` when the page needed no repair, and
+  always present. A chunk that pointed at a row that is gone is a
+  corpus-integrity signal worth keeping even when nothing was lost to the
+  caller, and a count is the right shape for it because nothing about the
+  response is wrong.
+
+  A drop is now reported in exactly one of three places, by what it did.
+  `excluded` — the request removed it, and retrying changes nothing.
+  `recovered` — a fault removed it and the page recovered. `degraded` /
+  `degradation_reason` — the response is genuinely short or empty. `recovered`
+  is populated only on a complete page, so it never names a fault that
+  `degradation_reason` is already naming.
+
+  Its keys are the internal cause names rather than a translated vocabulary,
+  unlike `excluded`. These five causes already reach the caller under exactly
+  these names inside `degradation_reason`; a second public word for them would
+  make one fault answer to two names depending on whether the page happened to
+  fill, which is the drift this series exists to remove. Both fields are built
+  from one classification table, so a cause cannot appear in both.
+
 ### Archive scope is a filter, not a failure
 
 - A search that excludes an archived document — exactly as the default

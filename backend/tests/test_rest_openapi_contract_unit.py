@@ -585,6 +585,16 @@ def test_search_openapi_contract_is_codegen_typed():
         "type": "object",
         "additionalProperties": {"type": "integer"},
     }
+    # `recovered` is the fault counterpart and carries the same guarantee
+    # (akb#611): always emitted, integer-valued, tested for emptiness rather
+    # than for presence. Same shape as `excluded` because it answers the same
+    # kind of question — how many candidates a cause removed from this page —
+    # and differs only in which causes it may name.
+    assert "recovered" in schemas["AkbSearchEnvelope"]["required"]
+    assert schemas["AkbSearchEnvelope"]["properties"]["recovered"] == {
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+    }
     assert {"kind", "uri", "sections"}.issubset(schemas["AkbDrillDownEnvelope"]["required"])
     assert {"kind", "pattern", "regex"}.issubset(schemas["AkbGrepEnvelope"]["required"])
 

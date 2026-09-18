@@ -572,6 +572,7 @@ function schemaLines(): string[] {
     "  returned: number;",
     "  total_matches: number;",
     "  excluded: Record<string, number>;",
+    "  recovered: Record<string, number>;",
     "  results: AkbSearchResult[];",
     "  truncated?: boolean;",
     "  hint?: string | null;",
