@@ -331,7 +331,13 @@ export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {
       async search(query: string, context?: MarkdownSearchContext) {
         const vault = context?.vault ?? defaults.vault;
         const response = await searchDocs(query, vault, 20, {}, { signal: context?.signal });
-        if (response.degraded) throw new Error("Search results are temporarily unavailable.");
+        // Degradation only hides a genuine zero-match when it left nothing to
+        // show. A degraded response that still carries hits ran on one
+        // retrieval leg alone: the hits are real, only the ranking is partial,
+        // and discarding them costs most exactly when the backend kept them.
+        if (response.degraded && !response.results?.length) {
+          throw new Error("Search results are temporarily unavailable.");
+        }
         return response.results
           .map((result) => {
             const target = typeof result?.uri === "string" ? canonicalAkbMarkdownTarget(result.uri) : null;
