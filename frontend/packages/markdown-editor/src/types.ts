@@ -115,6 +115,67 @@ export interface MarkdownSearchContext {
   signal?: AbortSignal
 }
 
+export type MarkdownReferenceKind = 'person' | 'issue' | 'document' | 'file'
+
+/**
+ * A candidate returned by the product's common `@` reference search.
+ *
+ * `value` is the exact plain-text Markdown value to insert for people and
+ * issues. Document and file candidates must provide a durable `target`; the
+ * editor never turns a runtime or signed URL into stored Markdown.
+ */
+export interface MarkdownReferenceCandidate {
+  id: string
+  kind: MarkdownReferenceKind
+  title: string
+  subtitle?: string
+  snippet?: string
+  target?: string
+  value?: string
+}
+
+export interface MarkdownReferenceContext extends MarkdownSearchContext {
+  document?: string
+  commit?: string
+}
+
+export interface MarkdownReferenceAdapter {
+  search(
+    query: string,
+    context?: MarkdownReferenceContext,
+  ): Promise<readonly MarkdownReferenceCandidate[]>
+}
+
+export interface MarkdownReferenceLabels {
+  header: string
+  escapeHint: string
+  sections: Record<MarkdownReferenceKind, string>
+  searching: string
+  empty: string
+  error: string
+  footer: {
+    navigation: string
+    insert: string
+    close: string
+  }
+}
+
+export interface MarkdownReferenceOptions {
+  adapter: MarkdownReferenceAdapter
+  context?: Omit<MarkdownReferenceContext, 'signal'>
+  labels?: {
+    header?: string
+    escapeHint?: string
+    searching?: string
+    empty?: string
+    error?: string
+    sections?: Partial<Record<MarkdownReferenceKind, string>>
+    footer?: Partial<MarkdownReferenceLabels['footer']>
+  }
+  className?: string
+  onOpenChange?: (open: boolean, dismiss?: () => void) => void
+}
+
 /**
  * Product policy for link destinations. The editor owns when this function is
  * called; products own any resource-specific canonicalization.

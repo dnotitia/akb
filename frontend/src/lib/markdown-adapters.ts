@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
+  MarkdownReferenceAdapter,
+  MarkdownReferenceContext,
+  MarkdownSearchAdapter,
   MarkdownSearchContext,
   MarkdownUploadContext,
 } from "@akb/markdown-editor";
@@ -276,6 +279,52 @@ export function useAkbMarkdownTargetResolutions(
 
 export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {
   const targetResolver = createAkbMarkdownTargetResolver(defaults);
+  const search: MarkdownSearchAdapter = {
+    async search(query: string, context?: MarkdownSearchContext) {
+      const vault = context?.vault ?? defaults.vault;
+      const response = await searchDocs(query, vault, 20, {}, { signal: context?.signal });
+      // Degradation only hides a genuine zero-match when it left nothing to
+      // show. A degraded response that still carries hits ran on one
+      // retrieval leg alone: the hits are real, only the ranking is partial,
+      // and discarding them costs most exactly when the backend kept them.
+      if (response.degraded && !response.results?.length) {
+        throw new Error("Search results are temporarily unavailable.");
+      }
+      return response.results
+        .map((result) => {
+          const target = typeof result?.uri === "string" ? canonicalAkbMarkdownTarget(result.uri) : null;
+          if (!target) return null;
+          const kind = classifyAkbMarkdownTarget(target);
+          const parsed = parseUri(target);
+          if ((kind !== "document" && kind !== "file") || parsed?.vault !== vault) return null;
+          return {
+            id: target,
+            title: typeof result.title === "string" ? result.title : target,
+            snippet: typeof result.matched_section === "string" ? result.matched_section : undefined,
+            target,
+            kind: kind ?? undefined,
+          };
+        })
+        .filter((result): result is NonNullable<typeof result> => result !== null);
+    },
+  };
+  const reference: MarkdownReferenceAdapter = {
+    async search(query: string, context?: MarkdownReferenceContext) {
+      const results = await search.search(query, context);
+      return results
+        .filter(
+          (result): result is typeof result & { kind: "document" | "file" } =>
+            result.kind === "document" || result.kind === "file",
+        )
+        .map(({ id, title, snippet, target, kind }) => ({
+          id,
+          title,
+          snippet,
+          target,
+          kind,
+        }));
+    },
+  };
   return {
     upload: {
       async upload(file: Blob, context?: MarkdownUploadContext) {
@@ -327,35 +376,8 @@ export function createAkbMarkdownAdapters(defaults: AkbMarkdownUploadContext) {
         };
       },
     },
-    search: {
-      async search(query: string, context?: MarkdownSearchContext) {
-        const vault = context?.vault ?? defaults.vault;
-        const response = await searchDocs(query, vault, 20, {}, { signal: context?.signal });
-        // Degradation only hides a genuine zero-match when it left nothing to
-        // show. A degraded response that still carries hits ran on one
-        // retrieval leg alone: the hits are real, only the ranking is partial,
-        // and discarding them costs most exactly when the backend kept them.
-        if (response.degraded && !response.results?.length) {
-          throw new Error("Search results are temporarily unavailable.");
-        }
-        return response.results
-          .map((result) => {
-            const target = typeof result?.uri === "string" ? canonicalAkbMarkdownTarget(result.uri) : null;
-            if (!target) return null;
-            const kind = classifyAkbMarkdownTarget(target);
-            const parsed = parseUri(target);
-            if ((kind !== "document" && kind !== "file") || parsed?.vault !== vault) return null;
-            return {
-              id: target,
-              title: typeof result.title === "string" ? result.title : target,
-              snippet: typeof result.matched_section === "string" ? result.matched_section : undefined,
-              target,
-              kind: kind ?? undefined,
-            };
-          })
-          .filter((result): result is NonNullable<typeof result> => result !== null);
-      },
-    },
+    search,
+    reference,
     targetResolver,
     /** Explicit action for embedding an existing standalone image File. */
     copyFileToAttachment: (fileId: string) => copyFileToAttachment(defaults.vault, fileId),
