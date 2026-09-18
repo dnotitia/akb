@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
 import sys
 import time
 import uuid
@@ -108,9 +109,22 @@ from app.services.vector_store.pgvector import _bm25vector_literal, PgvectorStor
 # why the batch is encoded with gather() rather than in sequence.
 _BATCH = 500
 
-# How many chunks are encoded at once. Kiwi runs in a process pool, so this
-# bounds both the tokenizer queue and the number of vocab round trips in flight.
-_CONCURRENCY = 16
+# How many chunks one writer encodes at once. Kiwi runs in a process pool, so
+# this bounds both the tokenizer queue and — the part that bit — the number of
+# `bm25_vocab` upserts in flight. It is PER WRITER, so the real number is this
+# times `--writers`; at 16 and four writers that was 64 concurrent upserts into
+# one table, alongside whatever the stats recompute was doing to it, and the
+# sweep deadlocked after 87,720 rows. Four keeps four Kiwi processes fed
+# (tokenizing measured 123 chunks/s) without turning the vocabulary table into
+# a contention point.
+_CONCURRENCY = 4
+
+# A deadlock is not a failure to report, it is a thing to do again. Postgres
+# picks a victim and aborts it; the work is idempotent and the next attempt
+# almost always wins, because the transaction it collided with has committed.
+# Without this the sweep dies on the first one — measured live, after 4% of the
+# corpus, having spent an hour and a half looking alive.
+_DEADLOCK_RETRIES = 5
 
 # How many UPDATE statements run at once, and how long one is given.
 #
@@ -292,7 +306,29 @@ async def _encode(content: str, gate: asyncio.Semaphore) -> str:
     return _bm25vector_literal(idx, vals)
 
 
-async def _apply(pool, schema: str, rows) -> int:
+async def _apply(pool, schema: str, rows, attempts: int = _DEADLOCK_RETRIES) -> int:
+    """Encode and write one batch, retrying a deadlock rather than dying on it.
+
+    Both halves can deadlock, and the retry has to cover both: the write takes
+    row locks on `chunks`, and the encoding upserts into `bm25_vocab`, which
+    every other encoder in this process — and the stats recompute, and the
+    indexer — is also writing. Re-encoding on a retry is wasted work and is
+    the right kind: the alternative is holding an encoding across the retry and
+    writing it onto a row that may have moved in the meantime.
+    """
+    for attempt in range(attempts):
+        try:
+            return await _apply_once(pool, schema, rows)
+        except asyncpg.exceptions.DeadlockDetectedError:
+            if attempt == attempts - 1:
+                raise
+            # Back off unevenly. Two writers that collided and then retried in
+            # lockstep would collide again on the same pair of rows.
+            await asyncio.sleep(0.2 * (attempt + 1) + random.random() * 0.3)
+    raise AssertionError("unreachable")
+
+
+async def _apply_once(pool, schema: str, rows) -> int:
     """Encode the batch and write it, skipping anything that moved underneath.
 
     One rule, and it is about content rather than about NULL: write this
