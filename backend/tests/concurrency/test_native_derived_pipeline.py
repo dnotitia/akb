@@ -441,15 +441,25 @@ async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(m
         #    `akb_revision_m1_measurement`), so the pass measures embedding
         #    pickup only.
         upserts: list[dict] = []
+        encoded_shapes: list[str | None] = []
 
         class _FakeStore:
+            # The weight convention the encoder must produce depends on the
+            # shape, and the store is what knows it — `settings` defaults to
+            # "posting" and does not move when a store is built for another
+            # shape. "arrays" here is deliberately NOT that default, so the
+            # assertion below fails both if the worker stops passing the shape
+            # and if it starts reading the setting instead.
+            sparse_shape = "arrays"
+
             async def upsert_one(self, **kwargs):
                 upserts.append(kwargs)
 
         async def fake_embeddings(texts):
             return [[0.5] * 4 for _ in texts]
 
-        async def fake_sparse(_content):
+        async def fake_sparse(_content, *, sparse_shape=None):
+            encoded_shapes.append(sparse_shape)
             return [1], [1.0]
 
         async def fake_get_pool():
@@ -462,6 +472,7 @@ async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(m
         monkeypatch.setattr(settings, "embed_base_url", "http://embed.invalid/v1")
 
         assert await embed_worker._process_once() == len(derived_chunk_ids)
+        assert encoded_shapes == ["arrays"] * len(derived_chunk_ids)
         assert {uuid.UUID(call["chunk_id"]) for call in upserts} == derived_chunk_ids
         assert {call["source_type"] for call in upserts} == {NATIVE_FILE_SOURCE}
         assert {call["source_id"] for call in upserts} == {str(created.resource_id)}
