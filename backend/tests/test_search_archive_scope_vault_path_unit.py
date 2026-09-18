@@ -591,6 +591,50 @@ async def test_a_clean_search_reports_an_empty_recovered_map(monkeypatch):
     assert "recovered" in response.model_dump()
 
 
+async def test_a_real_search_records_exactly_one_observation(monkeypatch):
+    """The accounting chokepoint, end to end (akb#612). The counter lives here
+    rather than in its own module's tests because this is where a real search
+    can be driven: the unit tests beside it can prove the arithmetic, but only
+    a response that came out of `SearchService.search` proves the wrapper is on
+    the path a caller actually takes.
+
+    One search, one observation — not zero (the decorator was dropped) and not
+    two (the wrapper was applied twice, or a retry was counted as a request).
+    The degraded one is attributed to its cause, which is the parse the section
+    depends on."""
+    from app.services import search_degradation_stats as sds
+
+    ids = [uuid.uuid4() for _ in range(2)]
+    # ids[1] is absent from the join — a fault — and there is no spare pool, so
+    # the page comes back short and the response really is degraded.
+    conn = _Conn({ids[0]: "draft"})
+    _install(monkeypatch, conn)
+    from app.config import settings
+    monkeypatch.setattr(settings, "search_prefetch", 0, raising=False)
+
+    service = SearchService()
+    monkeypatch.setattr(
+        service, "_run_vector_search",
+        AsyncMock(return_value=([_hit(d, score=1.0 - i / 10) for i, d in enumerate(ids)], None)),
+    )
+
+    sds.reset()
+    try:
+        response = await service.search(
+            "x", vault="mine", user_id=str(uuid.UUID(int=1)), limit=2,
+        )
+        assert response.degraded is True
+        assert sds.pending_depth() == 1
+        delta = next(iter(sds._pending.values()))
+        assert delta.observed == 1
+        assert delta.degraded == 1
+        # Short page, one result kept — the `degraded_with_results` shape.
+        assert delta.degraded_with_results == 1
+        assert dict(delta.by_cause) == {"hydration_miss": 1}
+    finally:
+        sds.reset()
+
+
 async def test_tables_and_files_carry_no_status_and_survive_the_default_scope(monkeypatch):
     """Only documents have an archived state. `status_matches(None, …)` keeps
     table/file rows under `unarchived` and `all`, matching what the candidate

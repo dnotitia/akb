@@ -551,6 +551,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         native_derived_worker,
         native_file_projection,
         queue_rescuer,
+        search_degradation_stats,
         sparse_encoder,
         vault_backfill,
     )
@@ -592,6 +593,15 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "native_file_projection": await _safe(native_file_projection.pending_stats),
         "native_derived": await _safe(native_derived_worker.pending_stats),
         "vector_store": vs_info,
+        # Not a queue, and deliberately shaped like one anyway (akb#612): how
+        # often a search response came back `degraded`, which cause, and how
+        # many of those still carried results. Nothing counted this before —
+        # `vector_store.reachable` answers a different question in the same
+        # word, and a degraded search reaches `tool_usage_daily` under `ok`
+        # beside every healthy one. The last number is what the consumer
+        # decision turns on: whether a surface should show partial results
+        # depends on how often they exist.
+        "search": await _safe(search_degradation_stats.snapshot),
     }
 
     # Top-level aggregate (#538): `degraded` when any queue section holds

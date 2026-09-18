@@ -32,6 +32,7 @@ from app.services import (
     notification_worker,
     queue_rescuer,
     s3_delete_worker,
+    search_degradation_stats,
     sparse_encoder,
     tool_usage,
     vault_backfill,
@@ -295,6 +296,14 @@ def _start_api_local(started: list[str]) -> None:
     else:
         logger.info("audit disabled (audit.enabled=false)")
 
+    # Search degradation counters accumulate in the serving process's memory
+    # and are flushed to their daily tables on a timer, so they compose with
+    # the API role exactly like the tool-usage queue — a worker process never
+    # answers a search and has nothing to count.
+    search_degradation_stats.reset()
+    search_degradation_stats.start()
+    started.append("search_degradation_flusher")
+
     tool_usage.start()
     started.append("tool_usage_maintenance")
     if settings.tool_usage.enabled:
@@ -476,6 +485,10 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         components.extend([
             ("audit_uploader", audit_log.stop_uploader),
             ("tool_usage", lambda: tool_usage.stop()),
+            # Drains its un-flushed delta, so an ordinary rolling deploy loses
+            # no counts; an ungraceful kill still loses up to one flush
+            # interval, which `pending_flush` on `/health` makes visible.
+            ("search_degradation", lambda: search_degradation_stats.stop()),
             ("stats_listener", stats_listener.stop),
             ("stats_sampler", stats_sampler.stop),
         ])
@@ -523,6 +536,10 @@ async def stop_api_runtime() -> None:
         asyncio.create_task(
             _stop_component("tool_usage", lambda: tool_usage.stop()),
             name="stop:tool_usage",
+        ),
+        asyncio.create_task(
+            _stop_component("search_degradation", lambda: search_degradation_stats.stop()),
+            name="stop:search_degradation",
         ),
         asyncio.create_task(
             _stop_component("stats_listener", stats_listener.stop),
