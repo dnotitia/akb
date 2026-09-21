@@ -28,6 +28,27 @@ Either run the realm setup script (recommended) or hand-edit the realm
 in the Keycloak admin console. The script is idempotent — re-running
 it is a no-op.
 
+The script needs a Keycloak **admin credential**, and which kind you have
+depends on how Keycloak was started. Give it whichever pair matches; it
+reads them from the environment only, never from the command line.
+
+If you deployed Keycloak from this repo's Kubernetes manifests
+(`deploy/k8s/standalone-sso/`, or the Helm chart's `sso` templates), the
+bootstrap admin is a **service account** — `KC_BOOTSTRAP_ADMIN_CLIENT_ID`
+with a secret, and no admin user exists. Use client credentials:
+
+```bash
+KC_ADMIN_CLIENT_ID=akb-bootstrap-temporary KC_ADMIN_CLIENT_SECRET=<...> \
+    python3 scripts/keycloak/setup-akb-mcp-oauth.py \
+        --kc https://auth.example.com \
+        --realm akb \
+        --audience https://akb.example.com/mcp
+```
+
+If you are running the local dev fixture
+(`deploy/keycloak-dev/broker-chain/compose.yaml`), the bootstrap admin is
+a **user**. Use the password grant:
+
 ```bash
 KC_ADMIN_USER=admin KC_ADMIN_PASS=<...> \
     python3 scripts/keycloak/setup-akb-mcp-oauth.py \
@@ -35,6 +56,14 @@ KC_ADMIN_USER=admin KC_ADMIN_PASS=<...> \
         --realm akb \
         --audience https://akb.example.com/mcp
 ```
+
+Either way the credential lives in the `master` realm, which is not the
+realm being configured. If your admin service account was instead created
+inside the target realm, set `KC_ADMIN_REALM` to that realm's name.
+
+Do not create an admin user just to satisfy the script — that adds an
+account the deployment deliberately did not create. Use the service-account
+form instead.
 
 It will:
 
@@ -102,6 +131,23 @@ curl https://akb.example.com/.well-known/oauth-protected-resource
 Should return JSON with `resource`, `authorization_servers`, and
 `scopes_supported` (including `akb:vault:read`, `akb:vault:write`,
 `offline_access`).
+
+That document describes what AKB *expects*; it says nothing about whether
+the realm was actually configured. For that, check the `mcp_oauth` section
+of `/health`:
+
+```bash
+curl -s https://akb.example.com/health | jq .mcp_oauth
+```
+
+- `"status": "ok"` — the realm advertises a DCR registration endpoint and
+  both vault scopes. The audience mappers and the DCR policies are
+  admin-API state that AKB cannot read, so this is not a full all-clear.
+- `"status": "unconfigured"` — `missing` names what the realm does not
+  advertise, and `detail` names the setup script. Registration or token
+  minting will fail until it is run.
+- `"status": "unknown"` — AKB could not read the IdP's discovery document.
+  That is a statement about reachability, not about the realm.
 
 ## Add AKB to Claude Code
 

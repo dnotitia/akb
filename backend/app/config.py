@@ -1231,7 +1231,16 @@ class Settings(BaseModel):
     # bit-for-bit — stdio clients (Claude Desktop, Codex CLI via
     # akb-mcp) are unaffected even when this is left off.
     #
-    # See docs/designs/mcp-oauth-dcr/00-overview.md.
+    # Realm configuration is a precondition this flag does not create:
+    # the IdP needs the vault client scopes, their audience mappers, and
+    # a DCR policy that accepts an MCP client, or registration fails at
+    # the IdP with a 403 before any AKB code runs. Apply it with
+    # scripts/keycloak/setup-akb-mcp-oauth.py; /health reports the part
+    # of it AKB can observe (app/services/mcp_oauth_preconditions.py).
+    #
+    # See docs/mcp-clients/web-connectors.md for what to configure (it is
+    # the operational authority) and docs/designs/mcp-oauth-dcr/00-overview.md
+    # for why the design is shaped this way.
     mcp_oauth_enabled: bool = False
     # Audience claim the access token must carry to be usable at /mcp.
     # Defaults to `<public_base_url>/mcp`; override only if you front the
@@ -1528,6 +1537,14 @@ class Settings(BaseModel):
     def keycloak_jwks_uri(self) -> str:
         # Server→Keycloak → backchannel issuer.
         return f"{self._keycloak_backchannel_issuer}/protocol/openid-connect/certs"
+
+    @property
+    def keycloak_discovery_url(self) -> str:
+        # Server→Keycloak → backchannel issuer. AKB does not need this to
+        # route OIDC (every endpoint above is derived from the issuer, not
+        # discovered); it is read only to observe what the realm advertises
+        # — see app/services/mcp_oauth_preconditions.py.
+        return f"{self._keycloak_backchannel_issuer}/.well-known/openid-configuration"
     @property
     def keycloak_human_client_ids(self) -> frozenset[str]:
         """OIDC clients allowed to authorize human API access tokens.
