@@ -731,7 +731,8 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
 
 
 @pytest.mark.asyncio
-async def test_native_file_hydration_preserves_public_file_identity(monkeypatch):
+@pytest.mark.parametrize("mapped_path", [False, True, None])
+async def test_native_file_hydration_preserves_public_file_identity(monkeypatch, mapped_path):
     from app.services import search_service
 
     body = b"legacy to native\n"
@@ -740,7 +741,8 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
     row = {
         "chunk_id": chunk_id,
         "resource_id": resource_id,
-        "current_path": "files/cutover.txt",
+        "current_path": "files/cutover.txt" if mapped_path is False else "files/cutover--collision.txt",
+        "cutover_path_current": mapped_path,
         "head_revision_id": "a" * 40,
         "vault_name": "measure",
         "name": "cutover.txt",
@@ -791,6 +793,10 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
         ]
     )
 
+    if mapped_path is None:
+        assert results == []
+        assert dropped["stale_native_file_path"] == 1
+        return
     assert dropped == {}
     assert len(results) == 1
     assert results[0].source_type == "file"

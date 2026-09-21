@@ -313,6 +313,7 @@ jobs:
             tests/test_notification_unwatch_postgres.py
             tests/test_recent_watching_postgres.py
             tests/test_search_update_status_pg.py
+            tests/test_search_file_cutover_receipt_postgres.py
             tests/test_workspace_summary_pg.py
             tests/test_tool_usage_e2e.py
             tests/test_table_if_not_exists_e2e.py
