@@ -5,6 +5,7 @@ import {
   MarkdownSurface,
   MarkdownToolbar,
   useMarkdownEditor,
+  useMarkdownReferenceResolutions,
   useMarkdownTargetResolutions,
   type MarkdownSlashCommandOptions,
   type MarkdownImageMenuOptions,
@@ -250,6 +251,11 @@ export function MarkdownEditor({
     adapters.targetResolver,
     { vault, document, commit },
   );
+  const referenceResolutions = useMarkdownReferenceResolutions(
+    resolutionMarkdown,
+    adapters.reference,
+    { vault, document, commit },
+  );
   React.useEffect(() => {
     setResolutionMarkdown(value);
   }, [value]);
@@ -475,6 +481,8 @@ export function MarkdownEditor({
           editable={!readOnly}
           resolutions={targetResolutions}
           resolvingTargets={Boolean(adapters.targetResolver)}
+          referenceResolutions={referenceResolutions}
+          resolvingReferences={Boolean(adapters.reference?.resolve)}
         >
           <div
             role="status"

@@ -28,9 +28,16 @@ import {
 } from 'lucide-react'
 
 import { createMarkdownExtensions } from '../extensions.js'
-import { extractMarkdownTargets, markdownCommands, serializeEditorMarkdown } from '../core.js'
+import {
+  extractMarkdownReferences,
+  extractMarkdownTargets,
+  markdownCommands,
+  markdownReferenceKey,
+  parseMarkdownReferenceToken,
+  serializeEditorMarkdown,
+} from '../core.js'
 import { normalizeMarkdownLinkUrl } from '../link.js'
-import { resolveMarkdownTargets } from '../adapters.js'
+import { resolveMarkdownReferences, resolveMarkdownTargets } from '../adapters.js'
 import { MarkdownLinkSearch } from './markdown-link-search.js'
 import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
@@ -67,6 +74,10 @@ export type {
   MarkdownReferenceLabels,
   MarkdownReferenceOptions,
 } from './markdown-reference-menu.js'
+export type {
+  MarkdownReferenceResolution,
+  MarkdownReferenceToken,
+} from '../types.js'
 import {
   MarkdownImageUploadProvider,
   MarkdownImageUploadStatus,
@@ -100,9 +111,12 @@ import type {
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
+  MarkdownReferenceAdapter,
+  MarkdownReferenceContext,
   MarkdownSearchAdapter,
   MarkdownSearchContext,
   MarkdownReferenceOptions,
+  MarkdownReferenceResolution,
   MarkdownSlashCommandOptions,
   MarkdownState,
   MarkdownTargetResolution,
@@ -112,6 +126,7 @@ import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 export type { MarkdownImageClassNames, MarkdownImageLabels, MarkdownImageOptions } from '../types.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
+const EMPTY_REFERENCE_RESOLUTIONS: ReadonlyMap<string, MarkdownReferenceResolution> = new Map()
 const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
   messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 }
@@ -401,11 +416,66 @@ export function useMarkdownTargetResolutions(
   return targetResolutions
 }
 
+/**
+ * Resolve stored person/issue tokens for presentation only. The adapter gets
+ * the canonical token and context; the returned runtime data never enters the
+ * editor transaction or Markdown serializer.
+ */
+export function useMarkdownReferenceResolutions(
+  markdown: string,
+  adapter?: MarkdownReferenceAdapter,
+  context: MarkdownReferenceContext = {},
+): ReadonlyMap<string, MarkdownReferenceResolution> {
+  const { commit, document, vault } = context
+  const references = useMemo(() => extractMarkdownReferences(markdown), [markdown])
+  const resolutionKey = useMemo(
+    () => [
+      vault ?? '',
+      document ?? '',
+      commit ?? '',
+      ...references.map(reference => markdownReferenceKey(reference)),
+    ].join('\u0000'),
+    [commit, document, references, vault],
+  )
+  const [resolutionState, setResolutionState] = useState<{
+    adapter?: MarkdownReferenceAdapter
+    key: string
+    resolutions: ReadonlyMap<string, MarkdownReferenceResolution>
+  }>({ key: '', resolutions: EMPTY_REFERENCE_RESOLUTIONS })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    if (!adapter?.resolve || references.length === 0) {
+      return () => controller.abort()
+    }
+
+    void resolveMarkdownReferences(adapter, references, {
+      vault,
+      document,
+      commit,
+      signal: controller.signal,
+    }).then(next => {
+      if (controller.signal.aborted) return
+      setResolutionState({ adapter, key: resolutionKey, resolutions: next })
+    })
+
+    return () => controller.abort()
+  }, [adapter, commit, document, references, resolutionKey, vault])
+
+  return adapter?.resolve &&
+    resolutionState.adapter === adapter &&
+    resolutionState.key === resolutionKey
+    ? resolutionState.resolutions
+    : EMPTY_REFERENCE_RESOLUTIONS
+}
+
 export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: Editor | null
   editable: boolean
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
+  referenceResolutions?: ReadonlyMap<string, MarkdownReferenceResolution>
+  resolvingReferences?: boolean
   image?: MarkdownImageOptions
   children?: ReactNode
 }
@@ -437,6 +507,8 @@ export function MarkdownSurface({
   editable,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
+  referenceResolutions = EMPTY_REFERENCE_RESOLUTIONS,
+  resolvingReferences = false,
   image,
   children,
   ...props
@@ -602,6 +674,7 @@ export function MarkdownSurface({
       })
 
       root.querySelectorAll<HTMLElement>('a[href]').forEach(element => {
+        if (element.dataset.markdownReference === 'true') return
         const target =
           element.dataset.markdownTarget ??
           (element.tagName === 'A' && element.getAttribute('href')?.startsWith('akb://')
@@ -664,6 +737,117 @@ export function MarkdownSurface({
       for (const resolution of imageOverrides.values()) releaseMarkdownResolution(resolution)
     }
   }, [editor, image, resolvingTargets, resolutions])
+
+  useEffect(() => {
+    const root = editor?.view.dom
+    if (!root) return
+
+    const removeReferenceLabel = (element: HTMLElement) => {
+      element.querySelector<HTMLElement>('[data-markdown-reference-label]')?.remove()
+    }
+
+    const applyReference = (element: HTMLElement) => {
+      const tokenElement = element.querySelector<HTMLElement>('[data-markdown-reference-token]')
+      const value = tokenElement?.textContent ?? ''
+      const reference = parseMarkdownReferenceToken(value)
+      const clearRuntime = (removeLabel = true) => {
+        element.removeAttribute('href')
+        element.removeAttribute('target')
+        element.removeAttribute('rel')
+        element.removeAttribute('title')
+        element.removeAttribute('aria-label')
+        element.removeAttribute('aria-disabled')
+        delete element.dataset.markdownReferenceResolution
+        delete element.dataset.markdownReferenceRuntimeUrl
+        delete element.dataset.markdownReferenceTitle
+        if (removeLabel) removeReferenceLabel(element)
+      }
+
+      if (element.dataset.markdownReferenceEscaped === 'true') {
+        clearRuntime()
+        element.dataset.markdownReferenceResolution = 'excluded'
+        return
+      }
+
+      if (!reference) {
+        clearRuntime()
+        element.dataset.markdownReferenceResolution = 'unresolved'
+        return
+      }
+
+      element.dataset.markdownReferenceKind = reference.kind
+      element.dataset.markdownReferenceId = reference.id
+      element.dataset.markdownReferenceValue = reference.value
+      const resolution = referenceResolutions.get(markdownReferenceKey(reference))
+
+      if (!resolution) {
+        clearRuntime()
+        element.dataset.markdownReferenceResolution = resolvingReferences ? 'pending' : 'unresolved'
+        if (resolvingReferences) {
+          element.setAttribute('aria-disabled', 'true')
+          element.setAttribute('title', 'Resolving reference')
+        }
+        return
+      }
+
+      clearRuntime(false)
+      if (resolution.status === 'available') {
+        element.dataset.markdownReferenceResolution = 'available'
+        element.dataset.markdownReferenceTitle = resolution.title
+        element.setAttribute('title', `${reference.value} — ${resolution.title}`)
+        element.setAttribute('aria-label', `${reference.value} ${resolution.title}`)
+        if (resolution.runtimeUrl) {
+          element.setAttribute('href', resolution.runtimeUrl)
+          element.setAttribute('target', '_blank')
+          element.setAttribute('rel', 'noreferrer')
+          element.dataset.markdownReferenceRuntimeUrl = resolution.runtimeUrl
+        }
+        if (resolution.title !== reference.value) {
+          const label =
+            element.querySelector<HTMLElement>('[data-markdown-reference-label]') ??
+            document.createElement('span')
+          label.dataset.markdownReferenceLabel = 'true'
+          label.setAttribute('aria-hidden', 'true')
+          label.setAttribute('contenteditable', 'false')
+          if (label.textContent !== resolution.title) label.textContent = resolution.title
+          if (!label.parentElement) element.append(label)
+        } else removeReferenceLabel(element)
+        return
+      }
+
+      removeReferenceLabel(element)
+      element.dataset.markdownReferenceResolution = 'unavailable'
+      element.setAttribute('aria-disabled', 'true')
+      element.setAttribute('title', resolution.title ?? 'Reference unavailable')
+    }
+
+    const applyReferences = () => {
+      root
+        .querySelectorAll<HTMLElement>('[data-markdown-reference="true"]')
+        .forEach(applyReference)
+    }
+
+    const preventEditorNavigation = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return
+      if (event.target.closest('[data-markdown-reference="true"]')) {
+        event.preventDefault()
+      }
+    }
+
+    applyReferences()
+    editor.on('transaction', applyReferences)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(applyReferences)
+    observer?.observe(root, { childList: true, subtree: true })
+    if (editable) root.addEventListener('click', preventEditorNavigation)
+
+    return () => {
+      editor.off('transaction', applyReferences)
+      observer?.disconnect()
+      if (editable) root.removeEventListener('click', preventEditorNavigation)
+    }
+  }, [editable, editor, referenceResolutions, resolvingReferences])
 
   return (
     <div
@@ -997,6 +1181,14 @@ export function MarkdownEditor({
     adapters?.targetResolver,
     resolverContext,
   )
+  const referenceAdapter = reference === false
+    ? undefined
+    : reference?.adapter ?? adapters?.reference
+  const referenceResolutions = useMarkdownReferenceResolutions(
+    markdown,
+    referenceAdapter,
+    { ...(reference !== false ? reference?.context : undefined), ...resolverContext },
+  )
 
   return (
     <MarkdownEditingSurface
@@ -1014,6 +1206,8 @@ export function MarkdownEditor({
         editable={!readOnly}
         resolutions={resolutions}
         resolvingTargets={Boolean(adapters?.targetResolver)}
+        referenceResolutions={referenceResolutions}
+        resolvingReferences={Boolean(referenceAdapter?.resolve)}
       />
     </MarkdownEditingSurface>
   )
@@ -1023,6 +1217,7 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
   markdown: string
   profile?: MarkdownProfile
   adapters?: MarkdownAdapters
+  reference?: MarkdownReferenceOptions | false
   resolverContext?: MarkdownTargetResolverContext
 }
 
@@ -1030,6 +1225,7 @@ export function MarkdownViewer({
   markdown,
   profile = 'preserve',
   adapters,
+  reference,
   resolverContext,
   ...props
 }: MarkdownViewerProps) {
@@ -1043,6 +1239,14 @@ export function MarkdownViewer({
     markdown,
     adapters?.targetResolver,
     resolverContext,
+  )
+  const referenceAdapter = reference === false
+    ? undefined
+    : reference?.adapter ?? adapters?.reference
+  const referenceResolutions = useMarkdownReferenceResolutions(
+    markdown,
+    referenceAdapter,
+    { ...(reference !== false ? reference?.context : undefined), ...resolverContext },
   )
 
   useEffect(() => {
@@ -1065,6 +1269,8 @@ export function MarkdownViewer({
       editable={false}
       resolutions={resolutions}
       resolvingTargets={Boolean(adapters?.targetResolver)}
+      referenceResolutions={referenceResolutions}
+      resolvingReferences={Boolean(referenceAdapter?.resolve)}
     />
   )
 }

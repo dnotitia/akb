@@ -112,6 +112,52 @@ without closing a surrounding product dialog. It is disabled automatically in
 read-only, Source, code, link, and IME-composition contexts. Omit `reference`
 when a product does not provide a search adapter.
 
+The same adapter can resolve references already stored in a document. Parsing
+recognizes the existing compact and braced person forms (`@alice` and
+`@{Ada Lovelace}`) plus plain issue IDs such as `REEF-123`; the adapter decides
+whether each token exists and supplies its display name and optional runtime
+route. Resolution is presentation-only, so neither the display name nor the
+runtime URL is serialized:
+
+```tsx
+import {
+  MarkdownEditor,
+  MarkdownViewer,
+  extractMarkdownReferences,
+  type MarkdownReferenceAdapter,
+} from '@akb/markdown-editor'
+
+const referenceAdapter: MarkdownReferenceAdapter = {
+  async search(query, context) {
+    return productReferenceSearch(query, context)
+  },
+  async resolve(reference, context) {
+    const result = await productResolveReference(reference, context)
+    return result
+      ? {
+          ...reference,
+          status: 'available',
+          title: result.title,
+          runtimeUrl: result.url,
+        }
+      : { ...reference, status: 'unavailable', reason: 'inaccessible' }
+  },
+}
+
+const stored = extractMarkdownReferences(markdown)
+
+<MarkdownEditor markdown={markdown} reference={{ adapter: referenceAdapter }} />
+<MarkdownViewer markdown={markdown} reference={{ adapter: referenceAdapter }} />
+```
+
+Unknown tokens stay ordinary text. Reference discovery excludes link labels,
+inline/fenced code, and escaped tokens; the public `MarkdownReferenceToken`
+keeps the exact canonical value while `MarkdownReferenceResolution` carries
+only ephemeral product display data. A product can also put the resolver on
+`MarkdownAdapters.reference` when composing the lower-level `/react` surface.
+AKB keeps its existing document/file search adapter and does not enable person
+mentions or issue suggestions.
+
 Products with a custom editor instance and toolbar can compose the same public
 surface from the `/react` entry point:
 
