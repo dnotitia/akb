@@ -279,7 +279,7 @@ class KeycloakStandaloneSSOControl:
             "realm": spec.realm,
             "enabled": True,
             "displayName": "AKB",
-            "registrationAllowed": False,
+            "registrationAllowed": spec.local_realm_self_registration,
             "registrationEmailAsUsername": False,
             "editUsernameAllowed": False,
             "resetPasswordAllowed": False,

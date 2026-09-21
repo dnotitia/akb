@@ -8,6 +8,7 @@ from datetime import datetime
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.util.text import like_escape
 from app.utils import dumps_jsonb
 
@@ -508,8 +509,7 @@ class DocumentRepository:
         # cascade runs.
         await asset_service.retain_document_assets_for_delete(
             conn,
-            document_id=doc_id,
-            vault_id=vault_id,
+            owner=DocumentAssetOwner(vault_id=vault_id, document_id=doc_id),
             document_path=locked["path"],
             commit_hash=locked.get("current_commit"),
         )

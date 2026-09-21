@@ -180,7 +180,10 @@ describe("settings — profile edit", () => {
     fireEvent.click(screen.getByRole("button", { name: "Change password" }));
     await screen.findByText("Password changed");
     expect(api.changePassword).toHaveBeenCalledWith("oldpassword", "newpassword");
-    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    // The flash render does not guarantee the dirty-effect propagation has
+    // settled (#553): wait for the final state instead of reading a
+    // timing-dependent last-call order.
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
     expect(screen.getByLabelText("Current password")).toHaveValue("");
   });
 
@@ -194,7 +197,7 @@ describe("settings — profile edit", () => {
     }
     fireEvent.click(screen.getByRole("button", { name: "Change password" }));
     await screen.findByText("Password changed");
-    expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
   });
 
   it("keeps the compact profile identity once and omits outer cards", () => {

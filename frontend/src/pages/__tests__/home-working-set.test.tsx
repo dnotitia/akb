@@ -2,10 +2,12 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import HomePage from "@/pages/home";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { recordRecentDocumentView } from "@/lib/recent-document-views";
+import { getWorkspaceSummary } from "@/lib/workspace-summary";
 import {
   createPAT,
   getAuthConfig,
@@ -16,7 +18,7 @@ import {
 } from "@/lib/api";
 
 vi.mock("@/lib/api", async () => ({
-  ApiError: (await vi.importActual<typeof import("@/lib/api")>("@/lib/api")).ApiError,
+  ...await vi.importActual<typeof import("@/lib/api")>("@/lib/api"),
   createPAT: vi.fn(),
   createVault: vi.fn(),
   listVaultTemplates: vi.fn().mockResolvedValue([]),
@@ -25,6 +27,10 @@ vi.mock("@/lib/api", async () => ({
   getVaultInfo: vi.fn(),
   listPATs: vi.fn(),
   listVaults: vi.fn(),
+}));
+vi.mock("@/lib/workspace-summary", async () => ({
+  ...await vi.importActual<typeof import("@/lib/workspace-summary")>("@/lib/workspace-summary"),
+  getWorkspaceSummary: vi.fn(),
 }));
 
 const createPATMock = vi.mocked(createPAT);
@@ -71,19 +77,22 @@ function TestLayout() {
 
 function renderPage() {
   return render(
+    <QueryClientProvider client={new QueryClient()}>
     <MemoryRouter initialEntries={["/"]}>
       <Routes>
         <Route element={<TestLayout />}>
           <Route path="/" element={<HomePage />} />
         </Route>
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  vi.mocked(getWorkspaceSummary).mockResolvedValue({ version: 1, scope: "accessible", observed_at: "2026-09-14T00:00:00Z", vault_count: 2, document_count: 300, table_count: 10, file_count: 25 });
   createPATMock.mockResolvedValue({ token: "akb_pat_test" });
   getAuthConfigMock.mockResolvedValue({
     available: false,
@@ -132,7 +141,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Home working set", () => {
-  it("keeps search global and presents Vaults, activity, and inline setup", async () => {
+  it("keeps search global and presents Vaults, activity, summary and one floating connection entry", async () => {
     listPATsMock.mockResolvedValue({ tokens: [] });
     renderPage();
 
@@ -147,12 +156,13 @@ describe("Home working set", () => {
     expect(screen.getByRole("heading", { name: "Recent updates" })).toBeInTheDocument();
     expect(await screen.findByText(/Mina Park/)).toBeInTheDocument();
     expect(screen.getByText(/Deployment checks, rollback signals/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Hide connection guide" })).not.toBeInTheDocument();
     expect(screen.queryByText(/of 3 complete/)).not.toBeInTheDocument();
     expect(screen.queryByText("Knowledge index")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Workspace" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Finish setup" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Set up a connection" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(await within(screen.getByRole("region", { name: "Workspace summary" })).findByText("300")).toBeInTheDocument();
 
     expect(screen.queryByText("Recent changes")).not.toBeInTheDocument();
     expect(screen.queryByText("Mint token")).not.toBeInTheDocument();
@@ -226,7 +236,7 @@ describe("Home working set", () => {
     });
   });
 
-  it("lets a first-run user hide onboarding without opening a forced dialog", async () => {
+  it("keeps vault creation primary and offers setup directly without an automatic dialog", async () => {
     const user = userEvent.setup();
     listVaultsMock.mockResolvedValue({ vaults: [] });
     getRecentMock.mockResolvedValue({ changes: [] });
@@ -235,18 +245,11 @@ describe("Home working set", () => {
     renderPage();
 
     expect(await screen.findByRole("button", { name: "Create a vault" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Minimize connection guide" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "Hide connection guide" }));
-    expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
-    expect(localStorage.getItem("akb.homeConnectionGuideDismissed:user-home")).toBe("1");
-    await waitFor(() => expect(screen.getByRole("button", { name: "Show connection guide" })).toHaveFocus());
-
-    await user.click(screen.getByRole("button", { name: "Show connection guide" }));
-    expect(screen.getByRole("button", { name: "Hide connection guide" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Hide connection guide" })).toHaveFocus());
-    expect(localStorage.getItem("akb.homeConnectionGuideDismissed:user-home")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Connect an agent" }));
+    expect(screen.getByRole("dialog", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "1. Choose your tool" })).toBeInTheDocument();
   });
 
   it("caps a large favorite set and restores focus if an unpinned card leaves Home", async () => {
@@ -257,7 +260,7 @@ describe("Home working set", () => {
     const section = screen.getByRole("region", { name: "Your vaults" });
     await screen.findByRole("heading", { name: "vault-0" });
     expect(within(section).getAllByRole("heading", { level: 3 })).toHaveLength(4);
-    expect(screen.getByRole("link", { name: /View all vaults \(8\)/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View all vaults" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Remove vault-0 from favorites" }));
     expect(screen.queryByRole("heading", { name: "vault-0" })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("link", { name: /View all vaults/ })).toHaveFocus());
@@ -268,9 +271,10 @@ describe("Home working set", () => {
     listVaultsMock.mockResolvedValue({ vaults: [{ id: "v1", name: "legacy", role: "reader" }] });
     getVaultInfoMock.mockResolvedValue({ document_count: 3 });
     renderPage();
-    await screen.findByText("Documents");
-    expect(screen.queryByText("Tables")).not.toBeInTheDocument();
-    expect(screen.queryByText("Files")).not.toBeInTheDocument();
+    const card = within(await screen.findByRole("link", { name: /legacy/ }));
+    await card.findByText("Documents");
+    expect(card.queryByText("Tables")).not.toBeInTheDocument();
+    expect(card.queryByText("Files")).not.toBeInTheDocument();
     expect(screen.queryByText(/A shared knowledge space for your team/)).not.toBeInTheDocument();
     expect(screen.getByText("Read only")).toBeInTheDocument();
     expect(getVaultInfoMock).toHaveBeenCalledTimes(1);

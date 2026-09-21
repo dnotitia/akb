@@ -134,6 +134,10 @@ const app = createControlPlaneAppClient({
   appToken: "app-token",
 });
 admin.apps.get("app-id");
+admin.installations.approveInitialGrant("app-id", "vault-id", {
+  baseline_release_id: "release-id",
+  capabilities: ["installation:read"],
+});
 app.rollouts.get("rollout-id");
 exchangeAppCredential({
   baseUrl: "https://packed.invalid/api/v1",

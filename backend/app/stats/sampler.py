@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, assert_never
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -74,9 +74,18 @@ def pgvector_relations() -> tuple[str, ...]:
     bytes are not in this database and the field is reported as absent rather
     than as a number that would break that containment.
     """
-    if settings.vector_store_sparse_shape == "posting":
+    shape = settings.vector_store_sparse_shape
+    if shape == "posting":
         return ("chunks", "posting")
-    return ("chunks",)
+    # Spelled as two comparisons rather than `in ("arrays", "vchord")`: mypy
+    # does not narrow a Literal out of a tuple membership test, so the `in`
+    # form leaves `assert_never` holding `Literal['arrays', 'vchord']` and the
+    # type gate goes red. Both keep the sparse terms inside `chunks` — `arrays`
+    # as two columns, `vchord` as one `bm25vector` whose index is an index ON
+    # `chunks` and so already inside `pg_total_relation_size('chunks')`.
+    if shape == "arrays" or shape == "vchord":
+        return ("chunks",)
+    assert_never(shape)
 
 _snapshot: dict[str, Any] | None = None
 _last_error: str | None = None

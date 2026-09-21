@@ -22,7 +22,7 @@ embed_dimensions: 1536
 
 s3_auth_mode: default_chain
 s3_endpoint_url: https://storage.example
-s3_public_url: https://files.example
+s3_public_url: "" # retained and ignored
 s3_bucket: tenant-files
 s3_region: us-east-1
 s3_sts_endpoint_url: https://storage.example
@@ -44,12 +44,12 @@ temporary session in memory, and reopens the token file when refreshing it.
 Both S3 endpoint clients share this session. The token path may use Kubernetes
 projection symlinks; no file handle is retained between reads.
 
-S3 clients use SigV4 and custom endpoints use path-style addressing. Browser
-upload/download URLs contain the temporary session token. Each URL is signed
-with a fixed credential snapshot and its lifetime is capped at that snapshot's
-remaining lifetime minus 60 seconds. API `expires_in` reports the actual cap.
-Expired sessions and sessions with less than that safety margin cannot produce
-a URL. See the [S3 presigned URL lifetime contract](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html).
+S3 clients use SigV4 and custom endpoints use path-style addressing. The
+workload session is used only by AKB itself: file upload and download URLs
+name AKB and an opaque capability token, carry no signature and no session
+token, and their lifetime is the grant AKB records rather than anything the
+credential provider controls. The object store is therefore reached from this
+service only, and a client never holds a credential for it.
 
 Managed startup performs `HeadBucket` and fails if identity exchange or bucket
 access fails. It never creates a bucket. The role must authorize the required
@@ -65,10 +65,11 @@ uploader uses the workload session, so the role must separately grant
 file-only audit collection.
 
 The process needs no Kubernetes API permissions. Token audiences, ServiceAccount
-binding, projections, role/bucket policy, and the public endpoint's support for
-temporary-session presigned GET/PUT must be configured by the deployment owner.
-Ordinary AKB database and application secrets remain separate from these
-upstream identity settings.
+binding, projections, and role/bucket policy must be configured by the
+deployment owner. The object store needs no publicly reachable endpoint: file
+bytes travel through AKB's own API, so the role's object permissions are the
+whole requirement. Ordinary AKB database and application secrets remain
+separate from these upstream identity settings.
 
 ## Standalone compatibility
 
@@ -80,13 +81,13 @@ credentials for empty configured keys.
 For native cloud credentials, set `s3_auth_mode: default_chain` and remove both
 static key fields. Leave all three explicit WebIdentity fields blank to use
 the [native Boto3 credential providers](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html),
-including cloud roles and AWS WebIdentity configuration. `s3_endpoint_url` and
-`s3_public_url` may both be blank for AWS S3; set `s3_region` to the bucket's
-region. This explicitly enables storage and cleanup workers without requiring
-a custom endpoint. Buckets must already exist. Temporary credentials with a
-known expiration receive the same presign cap; externally supplied session
-tokens whose provider does not expose an expiration remain subject to the
-provider's actual expiry.
+including cloud roles and AWS WebIdentity configuration. `s3_endpoint_url` may
+be blank for AWS S3; set `s3_region` to the bucket's region. `s3_public_url` is
+retained and ignored, and can be left blank everywhere. This explicitly enables storage and cleanup workers without requiring
+a custom endpoint. Buckets must already exist. Temporary credentials refresh
+through the same provider chain; because no client-facing URL is signed
+against them, a session's remaining lifetime no longer bounds how long a
+transfer stays usable.
 
 A standalone RGW installation can also select `default_chain` and supply the
 complete `s3_web_identity_token_file`, `s3_role_arn`, `s3_sts_endpoint_url` tuple.

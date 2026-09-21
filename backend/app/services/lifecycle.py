@@ -32,6 +32,7 @@ from app.services import (
     notification_worker,
     queue_rescuer,
     s3_delete_worker,
+    search_degradation_stats,
     sparse_encoder,
     tool_usage,
     vault_backfill,
@@ -47,6 +48,7 @@ from app.services.revision_backend import (
     selected_document_revision_backend,
 )
 from app.services.sso_callback_urls import is_backchannel_logout_uri
+from app.services.search_capabilities import metadata_enabled
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import get_vector_store
@@ -294,6 +296,14 @@ def _start_api_local(started: list[str]) -> None:
     else:
         logger.info("audit disabled (audit.enabled=false)")
 
+    # Search degradation counters accumulate in the serving process's memory
+    # and are flushed to their daily tables on a timer, so they compose with
+    # the API role exactly like the tool-usage queue — a worker process never
+    # answers a search and has nothing to count.
+    search_degradation_stats.reset()
+    search_degradation_stats.start()
+    started.append("search_degradation_flusher")
+
     tool_usage.start()
     started.append("tool_usage_maintenance")
     if settings.tool_usage.enabled:
@@ -344,7 +354,8 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # External-Git mirrors are a Bare-Git subsystem. The feature kill-switch
     # still gates it within that mode, while PostgreSQL Native composes no
     # mirror poller because its vault storage has no Git write authority.
-    bare_git_selected = selected_document_revision_backend() == "bare_git"
+    selected_backend = selected_document_revision_backend()
+    bare_git_selected = selected_backend == "bare_git"
     if bare_git_selected and settings.external_git_enabled:
         external_git_poller.start()
     # Auto-backfill vault_id onto pre-upgrade pgvector points (issue #189
@@ -406,9 +417,7 @@ def start_workers(*, include_api_local: bool = True) -> None:
             "metadata_worker disabled (external_git_enabled=false; it only "
             "fills metadata on external_git mirror imports)"
         )
-    elif settings.llm_base_url and (
-        settings.llm_api_key or settings.model_api_governance_mode == "platform_hard"
-    ):
+    elif metadata_enabled(settings, selected_backend):
         metadata_worker.start()
         started.append("metadata_worker")
     else:
@@ -476,6 +485,10 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         components.extend([
             ("audit_uploader", audit_log.stop_uploader),
             ("tool_usage", lambda: tool_usage.stop()),
+            # Drains its un-flushed delta, so an ordinary rolling deploy loses
+            # no counts; an ungraceful kill still loses up to one flush
+            # interval, which `pending_flush` on `/health` makes visible.
+            ("search_degradation", lambda: search_degradation_stats.stop()),
             ("stats_listener", stats_listener.stop),
             ("stats_sampler", stats_sampler.stop),
         ])
@@ -523,6 +536,10 @@ async def stop_api_runtime() -> None:
         asyncio.create_task(
             _stop_component("tool_usage", lambda: tool_usage.stop()),
             name="stop:tool_usage",
+        ),
+        asyncio.create_task(
+            _stop_component("search_degradation", lambda: search_degradation_stats.stop()),
+            name="stop:search_degradation",
         ),
         asyncio.create_task(
             _stop_component("stats_listener", stats_listener.stop),

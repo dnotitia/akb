@@ -264,12 +264,20 @@ async def pool():
         await conn.execute(init_sql)
     # `events` (migration 015) and `s3_delete_outbox` (019) are not in
     # init.sql but are part of the confirm/cleanup contract. Idempotent.
+    #
+    # 055 and 104 join them because reserving an upload now also writes the
+    # capability that authorizes its bytes, into `m1_file_transfer_intents`
+    # and its `object_key` column. Without them the reservation raises
+    # UndefinedTable — and only when this file happens to run before whatever
+    # else creates that table, which randomized ordering makes a coin toss.
     import importlib.util
     for mig_name in (
         "015_events_outbox.py",
         "019_s3_delete_outbox.py",
+        "055_native_revision_m1_file_storage.py",
         "067_vault_file_upload_state.py",
         "068_vault_file_lifecycle_indexes.py",
+        "104_file_write_capability_key.py",
     ):
         mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
         spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
@@ -374,11 +382,6 @@ async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
     monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
     monkeypatch.setattr(fs, "lock_vault_for_child_write", gated_lock)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda key, **_kwargs: fs.s3_adapter.PresignedURL(f"https://storage.invalid/{key}", 3600),
-    )
 
     upload = asyncio.create_task(fs.FileService().initiate_upload(
         vault_name=vault_name,
@@ -606,11 +609,6 @@ async def test_file_initiation_does_not_wait_for_same_key_cleanup(
     monkeypatch.setattr(fs, "get_pool", fake_get_pool)
     monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda key, **_kwargs: fs.s3_adapter.PresignedURL(f"https://storage.invalid/{key}", 3600),
-    )
 
     async with pool.acquire() as cleanup_conn:
         assert await vault_files_repo.try_lock_s3_key_for_cleanup(
@@ -633,8 +631,16 @@ async def test_file_initiation_does_not_wait_for_same_key_cleanup(
                 cleanup_conn, preferred_key,
             )
 
-    assert result["s3_key"] != preferred_key
-    assert result["s3_key"].endswith("_nonblocking.bin")
+    # The reserved key is no longer in the response — it was a storage
+    # locator and the API stopped publishing it — so read what the
+    # reservation actually took.
+    reserved_file_id = uuid.UUID(result["uri"].rsplit("/", 1)[1])
+    async with pool.acquire() as conn:
+        reserved_key = await conn.fetchval(
+            "SELECT s3_key FROM vault_files WHERE id = $1", reserved_file_id,
+        )
+    assert reserved_key != preferred_key
+    assert reserved_key.endswith("_nonblocking.bin")
 
 
 async def test_unprocessed_delete_intent_is_a_durable_key_barrier(

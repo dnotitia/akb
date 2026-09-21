@@ -65,13 +65,39 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
         env:
           POSTGRES_USER: akb
           POSTGRES_PASSWORD: akb  # pragma: allowlist secret
           POSTGRES_DB: akb
         ports:
           - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U akb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      # The BM25 index extension, for `tests/test_vchord_sparse_shape_postgres.py`.
+      # Without this service those tests skip — and a skip here reads exactly
+      # like a pass, which is the failure this job's file list already guards
+      # against for a different reason.
+      #
+      # This is the SAME digest `deploy/postgres/Dockerfile` copies the
+      # extension out of, so CI exercises the version an operator building
+      # that image would get. It is the upstream image rather than ours
+      # because a `services:` entry must be pullable, and this one happens to
+      # ship pgvector too (0.8.1) — enough for the `vector` column the shared
+      # DDL creates. It is NOT the production base: that is
+      # `pgvector/pgvector:pg16`, above, at a newer pgvector. Nothing in these
+      # tests reads a vector, so the difference stays inside the DDL.
+      vchord:
+        image: tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d
+        env:
+          POSTGRES_USER: akb
+          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
+          POSTGRES_DB: akb
+        ports:
+          - 15433:5432
         options: >-
           --health-cmd "pg_isready -U akb"
           --health-interval 5s
@@ -129,6 +155,10 @@ jobs:
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
+          # The vchord service above. The sparse-shape tests create and drop
+          # their own database on it, so it is a separate server, not a
+          # separate database on the one above.
+          AKB_VCHORD_TEST_DSN: postgresql://akb:akb@localhost:15433/akb  # pragma: allowlist secret
         # #215 declarative-DDL integration tests need a live PG too (index
         # ASC/DESC physical order, migration 037 upgrade path, add-unique-key
         # concurrency race). They skip in the DB-free unit job above, so gate
@@ -211,51 +241,102 @@ jobs:
         # The application tests prove early rejection and filtered reads; this
         # live test proves a direct SQL writer cannot create a new cross-vault
         # edge or turn a valid row into one.
-        run: >
-          pytest
-          tests/test_pgvector_ext_bootstrap_e2e.py
-          tests/test_migration_037_upgrade_unit.py
-          tests/test_migration_050_drop_todos_unit.py
-          tests/test_migration_058_publication_identity_unit.py
-          tests/test_index_order_unit.py
-          tests/concurrency/test_alter_unique_race_unit.py
-          tests/test_native_revision_reconcile_pg.py
-          tests/concurrency/test_native_ledger_b_core.py
-          tests/concurrency/test_native_derived_pipeline.py
-          tests/test_m1_file_measurement_pg.py
-          tests/test_native_revision_m1_payload_placement_migration.py
-          tests/concurrency/test_invariants_unit.py
-          tests/test_publication_resolution_vault_binding_unit.py
-          tests/test_publication_path_claim_guard_unit.py
-          tests/test_external_git_cascade_unit.py
-          tests/test_file_idempotent_upload_unit.py
-          tests/test_app_registry_migration_unit.py
-          tests/test_app_identity_postgres.py
-          tests/test_app_inventory_postgres.py
-          tests/test_app_installation_postgres.py
-          tests/test_app_rollout_postgres.py
-          tests/test_recovery_admin_provisioning_postgres.py
-          tests/test_local_session_generation_postgres.py
-          tests/test_account_self_lifecycle_postgres.py
-          tests/test_sso_account_lifecycle_postgres.py
-          tests/test_sso_account_sync_postgres.py
-          tests/test_pat_issuance_postgres.py
-          tests/test_admin_auth_postgres.py
-          tests/test_sso_identity_migration_postgres.py
-          tests/test_pending_admission_postgres.py
-          tests/test_edge_vault_boundary_postgres.py
-          tests/test_workspace_external_identity.py
-          tests/test_authoritative_email_domains_postgres.py
-          tests/test_workspace_account_admin_service.py
-          tests/test_sso_browser_session_postgres.py
-          tests/test_sso_session_epoch_upgrade_postgres.py
-          tests/test_bm25_corpus_revision_postgres.py
-          tests/test_notifications_postgres.py
-          tests/test_notification_native_postgres.py
-          tests/test_notification_unwatch_postgres.py
-          tests/test_recent_watching_postgres.py
-          tests/test_tool_usage_e2e.py
-          tests/test_table_if_not_exists_e2e.py
-          tests/test_kg_document_ref_postgres.py
-          tests/test_search_covering_indexes_e2e.py
-          -v --tb=short
+        run: |
+          # A `run: >` folded these onto one line, where the first `#`
+          # became a shell comment and swallowed every path after it —
+          # 34 of these files had never run. Inside an array literal a
+          # `#` is a comment for its own line only, so the rationale can
+          # stay next to the file it explains.
+          set -euo pipefail
+          FILES=(
+            tests/test_pgvector_ext_bootstrap_e2e.py
+            tests/test_migration_037_upgrade_unit.py
+            tests/test_migration_050_drop_todos_unit.py
+            tests/test_migration_058_publication_identity_unit.py
+            tests/test_migration_107_native_asset_refs_pg.py
+            tests/test_boot_schema_serialization_pg.py
+            tests/test_index_order_unit.py
+            tests/concurrency/test_alter_unique_race_unit.py
+            tests/test_native_revision_reconcile_pg.py
+            # The bridged-body migration is a claim about two stores:
+            # a body moves out of the git working volume into the
+            # payload table and the same bytes come back. Both halves
+            # are PostgreSQL facts — the payload row, the mapping's
+            # digest, the partial index the backfill pages on — so a
+            # fake proves nothing, and off this list the file skips in
+            # the unit job too and the migration ships ungated.
+            tests/test_native_revision_migration_bridge_pg.py
+            tests/test_native_revision_cutover_pg.py
+            tests/test_native_revision_shadow_reader.py
+            tests/concurrency/test_native_ledger_b_core.py
+            tests/concurrency/test_native_derived_pipeline.py
+            tests/test_m1_file_measurement_pg.py
+            tests/test_native_revision_m1_payload_placement_migration.py
+            tests/concurrency/test_invariants_unit.py
+            tests/test_publication_resolution_vault_binding_unit.py
+            tests/test_native_publication_pg.py
+            tests/test_native_publication_binding_pg.py
+            tests/test_publication_path_claim_guard_unit.py
+            tests/test_external_git_cascade_unit.py
+            tests/test_file_idempotent_upload_unit.py
+            # The write-capability resolver belongs here for a reason a review
+            # found the hard way: every other test of it hands it a canned row
+            # from a fake connection, so its SQL was only ever checked by
+            # grepping the text. Turning the JOIN into a LEFT JOIN, or moving
+            # the expiry predicate a century into the past, left all of those
+            # green while the resolver answered for a deleted File and an
+            # expired grant. Only a real database can tell those apart.
+            tests/test_file_capability_resolution_pg.py
+            tests/test_app_registry_migration_unit.py
+            tests/test_app_identity_postgres.py
+            tests/test_app_inventory_postgres.py
+            tests/test_app_installation_postgres.py
+            tests/test_app_legacy_adoption_postgres.py
+            tests/test_app_rollout_postgres.py
+            tests/test_recovery_admin_provisioning_postgres.py
+            tests/test_local_session_generation_postgres.py
+            tests/test_account_self_lifecycle_postgres.py
+            tests/test_sso_account_lifecycle_postgres.py
+            tests/test_sso_account_sync_postgres.py
+            tests/test_pat_issuance_postgres.py
+            tests/test_admin_auth_postgres.py
+            tests/test_sso_identity_migration_postgres.py
+            tests/test_pending_admission_postgres.py
+            tests/test_edge_vault_boundary_postgres.py
+            tests/test_workspace_external_identity.py
+            tests/test_authoritative_email_domains_postgres.py
+            tests/test_workspace_account_admin_service.py
+            tests/test_sso_browser_session_postgres.py
+            tests/test_sso_session_epoch_upgrade_postgres.py
+            tests/test_bm25_corpus_revision_postgres.py
+            tests/test_notifications_postgres.py
+            tests/test_notification_native_postgres.py
+            tests/test_notification_unwatch_postgres.py
+            tests/test_recent_watching_postgres.py
+            tests/test_search_update_status_pg.py
+            tests/test_search_file_cutover_receipt_postgres.py
+            tests/test_workspace_summary_pg.py
+            tests/test_tool_usage_e2e.py
+            tests/test_table_if_not_exists_e2e.py
+            tests/test_kg_document_ref_postgres.py
+            tests/test_search_covering_indexes_e2e.py
+            # Needs the vchord service, not the postgres one. It skips rather
+            # than failing where the extension is absent, so it has to be on a
+            # list that runs somewhere it is present.
+            tests/test_vchord_sparse_shape_postgres.py
+            tests/test_bm25_vector_backfill_postgres.py
+            tests/test_bm25_transition_boundary_postgres.py
+            tests/test_vchord_candidate_budget_postgres.py
+            tests/test_bm25_run_lock.py
+          )
+          # A truncated list is the failure this step has already had
+          # once, and it reads as a pass. Both halves of that are worth
+          # refusing: a path that no longer exists, and a list that
+          # suddenly lost most of itself.
+          for f in "${FILES[@]}"; do
+            [ -f "$f" ] || { echo "missing test file: $f" >&2; exit 1; }
+          done
+          [ "${#FILES[@]}" -ge 40 ] || {
+            echo "live-PG list collapsed to ${#FILES[@]} files" >&2; exit 1; }
+          echo "live-PG lane: ${#FILES[@]} files"
+          pytest "${FILES[@]}" -v --tb=short

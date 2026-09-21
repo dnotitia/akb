@@ -18,6 +18,8 @@ from git import Repo
 from app.exceptions import ConflictError
 from app.models.document import DocumentUpdateRequest
 from app.repositories.native_revision_migration_repo import (
+    BridgeBodyIntegrityError,
+    LegacyMappingAlreadyMigratedError,
     MigrationInventoryDriftError,
     NativeRevisionMigrationRepository,
 )
@@ -30,6 +32,10 @@ from app.services.legacy_revision_bridge import (
     SelectorAmbiguousError,
     SelectorInvalidError,
     SelectorUnknownError,
+)
+from app.services.bridge_body_backfill import (
+    backfill_bridge_bodies,
+    verify_bridge_bodies,
 )
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_document_service import NativeDocumentService
@@ -77,6 +83,12 @@ def _load(filename: str):
 @asynccontextmanager
 async def _fresh_schema(tmp_path: Path):
     if not await _reachable():
+        # The DB-free unit job has nothing on the default DSN, so skipping
+        # there is correct. On the live-PG gate it is not: a skip and a pass
+        # read the same, and every assertion in this file is about what
+        # PostgreSQL stores.
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"the real-PG gate requires a reachable Postgres at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
     name = f"akb_c9_bridge_{uuid.uuid4().hex[:12]}"
@@ -95,6 +107,10 @@ async def _fresh_schema(tmp_path: Path):
             "060_native_revision_migration_bridge.py",
             "097_native_revision_migration_inventory.py",
             "098_native_revision_nul_payload.py",
+            "105_bridge_body_digest.py",
+            # The document write path publishes image references, and 107
+            # is what gives a Native document a column to publish into.
+            "107_native_document_asset_refs.py",
         ):
             await _load(filename).migrate(conn=conn)
         await conn.close()
@@ -1890,3 +1906,488 @@ async def test_manual_fixed_ref_history_missing_repo_is_stable_error(tmp_path):
             "missing.md",
             current_commit="b" * 40,
         )
+
+
+async def _bridged_fixture(pool, tmp_path, *, coverage: str):
+    """A completed cutover: two documents, their old revisions bridged to git."""
+    fixture = await _make_fixture(pool, tmp_path)
+    backfill = NativeRevisionBackfill(pool, git=fixture["git"])
+    run, _ = await backfill.prepare_run(
+        namespace_id=fixture["namespace_id"],
+        fixed_ref=fixture["unrelated_tip"],
+        coverage_version=coverage,
+    )
+    assert (await backfill.backfill_run(run.run_id)).status == "complete"
+    return fixture
+
+
+async def _pending(pool, namespace_id) -> tuple[int, int]:
+    async with pool.acquire() as conn:
+        return await NativeRevisionMigrationRepository.count_unmigrated_bridge_bodies(
+            conn, namespace_id=namespace_id
+        )
+
+
+async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(tmp_path):
+    """The whole point: after the backfill the git volume is not consulted.
+
+    Proven by removing it. A read that still needed git would raise here
+    instead of returning the same bytes.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-move")
+        backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
+
+        before = await backend.document_version(
+            fixture["vault_name"], "same.md", fixture["initial_oid"]
+        )
+        assert before is not None and before[1] == "new v1\n"
+
+        pending_before, _ = await _pending(pool, fixture["namespace_id"])
+        assert pending_before > 0
+
+        report = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert report.migrated == pending_before
+        assert report.unreadable == 0
+        assert report.rejected == 0
+        assert report.stalled is False
+        assert report.pending_after == 0
+        assert report.bytes_stored > 0
+
+        # Take git away entirely. Nothing below may reach for it.
+        git_root = Path(fixture["git"].storage_path)
+        git_root.rename(git_root.parent / "git-removed")
+
+        documents = NativeDocumentService(pool=pool, legacy_git=GitService(storage_path=str(git_root)))
+        after = await NativeRevisionBackend(
+            pool=pool,
+            document_service=documents,
+            legacy_git=GitService(storage_path=str(git_root)),
+        ).document_version(fixture["vault_name"], "same.md", fixture["initial_oid"])
+        assert after is not None
+        assert after[1] == before[1]
+
+
+async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(tmp_path):
+    """Stopping halfway is a supported state, not a broken one."""
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-partial")
+        pending_before, _ = await _pending(pool, fixture["namespace_id"])
+        assert pending_before >= 2
+
+        first = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1
+        )
+        assert first.migrated == 1
+        assert first.pending_after == pending_before - 1
+
+        backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
+        # One revision now comes from PostgreSQL and the other still from git.
+        for oid, expected in (
+            (fixture["initial_oid"], "new v1\n"),
+            (fixture["move_oid"], "new v1\n"),
+        ):
+            version = await backend.document_version(fixture["vault_name"], "same.md", oid)
+            assert version is not None and version[1] == expected
+
+        rest = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert rest.pending_after == 0
+        assert rest.migrated == pending_before - 1
+
+
+async def test_a_dry_run_reads_everything_and_writes_nothing(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-dry")
+        pending_before, _ = await _pending(pool, fixture["namespace_id"])
+        async with pool.acquire() as conn:
+            payloads_before = await conn.fetchval("SELECT count(*) FROM m1_reference_payloads")
+
+        report = await backfill_bridge_bodies(
+            pool=pool,
+            git=fixture["git"],
+            vault=fixture["vault_name"],
+            limit=1000,
+            dry_run=True,
+        )
+        assert report.dry_run is True
+        assert report.migrated == pending_before
+        assert report.bytes_stored > 0
+        assert report.pending_after == pending_before
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM m1_reference_payloads") == payloads_before
+            assert await conn.fetchval(
+                "SELECT count(*) FROM legacy_revision_mappings WHERE body_digest IS NOT NULL"
+            ) == 0
+
+
+async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-absent")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE legacy_revision_mappings
+                   SET path_at_revision = 'never-committed.md'
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                """,
+                fixture["namespace_id"],
+            )
+            pending_before = await conn.fetchval(
+                """
+                SELECT count(*) FROM legacy_revision_mappings
+                 WHERE namespace_id = $1 AND resolution = 'bridge' AND body_digest IS NULL
+                """,
+                fixture["namespace_id"],
+            )
+
+        report = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert report.migrated == 0
+        assert report.unreadable == pending_before
+        assert report.stalled is True
+        assert report.pending_after == pending_before
+        assert any("absent in git" in line for line in report.samples)
+
+
+async def test_backfill_stays_inside_the_vault_it_was_given(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        one = await _bridged_fixture(pool, tmp_path / "one", coverage="c9-bridge-scope-one")
+        two = await _bridged_fixture(pool, tmp_path / "two", coverage="c9-bridge-scope-two")
+        other_before, _ = await _pending(pool, two["namespace_id"])
+        assert other_before > 0
+
+        report = await backfill_bridge_bodies(
+            pool=pool, git=one["git"], vault=one["vault_name"], limit=1000
+        )
+        assert report.pending_after == 0
+
+        other_after, _ = await _pending(pool, two["namespace_id"])
+        assert other_after == other_before
+
+
+async def test_two_passes_cannot_claim_the_same_mapping(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-race")
+        repo = NativeRevisionMigrationRepository(pool)
+        claimed = await repo.claim_unmigrated_bridge_bodies(
+            limit=1, namespace_id=fixture["namespace_id"]
+        )
+        assert claimed
+        mapping = claimed[0]
+        digest = hashlib.sha256(b"claimed once\n").hexdigest()
+
+        async with pool.acquire() as conn, conn.transaction():
+            await M1PgBodyStore(pool).prepare_text_in_conn(
+                conn, namespace_id=mapping.namespace_id, payload=b"claimed once\n"
+            )
+            await repo.attach_bridge_body_digest(
+                conn,
+                namespace_id=mapping.namespace_id,
+                resource_id=mapping.resource_id,
+                legacy_git_oid=mapping.legacy_git_oid,
+                digest=digest,
+            )
+
+        with pytest.raises(LegacyMappingAlreadyMigratedError):
+            async with pool.acquire() as conn, conn.transaction():
+                await repo.attach_bridge_body_digest(
+                    conn,
+                    namespace_id=mapping.namespace_id,
+                    resource_id=mapping.resource_id,
+                    legacy_git_oid=mapping.legacy_git_oid,
+                    digest=digest,
+                )
+
+
+async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(tmp_path):
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-orphan")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE legacy_revision_mappings
+                   SET body_digest = $2
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                """,
+                fixture["namespace_id"],
+                "0" * 64,
+            )
+
+        backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
+        version = await backend.document_version(
+            fixture["vault_name"], "same.md", fixture["initial_oid"]
+        )
+        assert version is not None
+        assert version[1] == "new v1\n"
+
+
+async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(tmp_path):
+    """Defense in depth, proven with the database guard removed.
+
+    The table's own CHECK makes this unreachable in production, which is
+    exactly why the guard has to be tested without it — otherwise the only
+    evidence that it works is that it has never been asked to.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-corrupt")
+        report = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert report.pending_after == 0
+
+        async with pool.acquire() as conn:
+            digest = await conn.fetchval(
+                """
+                SELECT body_digest FROM legacy_revision_mappings
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                   AND body_digest IS NOT NULL LIMIT 1
+                """,
+                fixture["namespace_id"],
+            )
+            # Two database guards stand in front of this: the row is
+            # immutable by trigger, and the digest is CHECKed against the
+            # bytes. Both have to come down for the Python guard to be the
+            # thing under test.
+            await conn.execute(
+                """
+                DROP TRIGGER trg_m1_reference_payloads_immutable
+                    ON m1_reference_payloads;
+                ALTER TABLE m1_reference_payloads
+                    DROP CONSTRAINT m1_reference_payloads_digest_matches;
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE m1_reference_payloads
+                   SET canonical_bytes = $3::bytea, byte_size = octet_length($3::bytea)
+                 WHERE namespace_id = $1 AND digest = $2
+                """,
+                fixture["namespace_id"],
+                digest,
+                b"tampered\n",
+            )
+            with pytest.raises(BridgeBodyIntegrityError):
+                await NativeRevisionMigrationRepository.read_bridge_body(
+                    conn, namespace_id=fixture["namespace_id"], digest=digest
+                )
+
+        # The read path does not fail on it either — it says so and reads git.
+        backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
+        version = await backend.document_version(
+            fixture["vault_name"], "same.md", fixture["initial_oid"]
+        )
+        assert version is not None
+        assert version[1] == "new v1\n"
+
+
+async def test_one_unreadable_body_does_not_block_the_ones_behind_it(tmp_path):
+    """The claim order puts an unmovable row first and leaves it there.
+
+    It keeps `body_digest IS NULL`, so it is first in that order for the whole
+    run. Without a cursor the batch would be spent re-reading it and nothing
+    behind it would ever move.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-head-block")
+        repo = NativeRevisionMigrationRepository(pool)
+        head = (await repo.claim_unmigrated_bridge_bodies(
+            limit=1, namespace_id=fixture["namespace_id"]
+        ))[0]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE legacy_revision_mappings
+                   SET path_at_revision = 'never-committed.md'
+                 WHERE namespace_id = $1 AND resource_id = $2 AND legacy_git_oid = $3
+                """,
+                head.namespace_id, head.resource_id, head.legacy_git_oid,
+            )
+        pending_before, _ = await _pending(pool, fixture["namespace_id"])
+
+        report = await backfill_bridge_bodies(
+            pool=pool,
+            git=fixture["git"],
+            vault=fixture["vault_name"],
+            limit=1000,
+            batch_size=1,  # one row per claim: the cursor is the only way forward
+        )
+        assert report.unreadable == 1
+        assert report.migrated == pending_before - 1
+        assert report.stalled is False
+        assert report.pending_after == 1
+
+
+async def test_verify_re_derives_every_migrated_body_from_git(tmp_path):
+    """Whole-population, not a sample.
+
+    The migration copies; verify re-reads the source and hashes it again. It
+    is only possible because nothing was deleted — which is the same property
+    that makes the migration reversible.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.pending_after == 0
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.checked == moved.migrated
+        assert report.matched == moved.migrated
+        assert report.mismatched == 0
+        assert report.payload_missing == 0
+        assert report.ok is True
+
+
+async def test_verify_names_a_body_that_stopped_agreeing_with_git(tmp_path):
+    """The finding the command exists to produce.
+
+    Repointing a mapping at a payload holding different bytes is the shape of
+    every way this could go wrong, whatever the cause. Verify has to call it,
+    and has to say which revision.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-bad")
+        await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        wrong = hashlib.sha256(b"not what git holds\n").hexdigest()
+        async with pool.acquire() as conn, conn.transaction():
+            await M1PgBodyStore(pool).prepare_text_in_conn(
+                conn, namespace_id=fixture["namespace_id"], payload=b"not what git holds\n"
+            )
+        async with pool.acquire() as conn:
+            victim = await conn.fetchval(
+                """
+                UPDATE legacy_revision_mappings SET body_digest = $2
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                   AND legacy_git_oid = (
+                       SELECT legacy_git_oid FROM legacy_revision_mappings
+                        WHERE namespace_id = $1 AND resolution = 'bridge'
+                        ORDER BY legacy_git_oid LIMIT 1)
+                RETURNING legacy_git_oid
+                """,
+                fixture["namespace_id"], wrong,
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.mismatched == 1
+        assert report.ok is False
+        assert any(victim[:8] in line for line in report.findings)
+
+
+async def test_verify_reports_a_digest_whose_payload_is_gone(tmp_path):
+    """Distinct from a mismatch: the comparison has nothing to compare."""
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-orphan")
+        await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE legacy_revision_mappings SET body_digest = $2
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                """,
+                fixture["namespace_id"], "0" * 64,
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert report.payload_missing == report.checked
+        assert report.mismatched == 0
+        assert report.ok is False
+
+
+async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(tmp_path):
+    """Corruption is the finding, not a reason to stop reporting.
+
+    `read_bridge_body` raises on bytes that do not match their digest — the
+    right answer for a read, and the wrong one for a command whose whole job
+    is to survey the population and say what it found.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-corrupt")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.migrated >= 2
+
+        async with pool.acquire() as conn:
+            digest = await conn.fetchval(
+                """
+                SELECT body_digest FROM legacy_revision_mappings
+                 WHERE namespace_id = $1 AND resolution = 'bridge'
+                   AND body_digest IS NOT NULL
+                 ORDER BY legacy_git_oid LIMIT 1
+                """,
+                fixture["namespace_id"],
+            )
+            await conn.execute(
+                """
+                DROP TRIGGER trg_m1_reference_payloads_immutable
+                    ON m1_reference_payloads;
+                ALTER TABLE m1_reference_payloads
+                    DROP CONSTRAINT m1_reference_payloads_digest_matches;
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE m1_reference_payloads
+                   SET canonical_bytes = $3::bytea, byte_size = octet_length($3::bytea)
+                 WHERE namespace_id = $1 AND digest = $2
+                """,
+                fixture["namespace_id"], digest, b"corrupted\n",
+            )
+
+        report = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        # The survey completes and names it, rather than dying on the first one.
+        assert report.checked == moved.migrated
+        assert report.mismatched >= 1
+        assert report.ok is False
+        assert any("does not hash to its own digest" in line for line in report.findings)
+
+
+async def test_verify_reports_the_share_of_the_population_it_actually_saw(tmp_path):
+    """`ok` on a fraction is the failure this reports against.
+
+    Measured live before this existed: a survey stopped at the backfill's
+    batch default, saw 1,000 of 2,191, and printed `ok: true` with nothing
+    saying it had looked at less than half.
+    """
+    async with _fresh_schema(tmp_path) as pool:
+        fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-coverage")
+        moved = await backfill_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
+        )
+        assert moved.migrated >= 2
+
+        whole = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"]
+        )
+        assert whole.total == moved.migrated
+        assert whole.checked == whole.total
+        assert whole.complete is True
+
+        partial = await verify_bridge_bodies(
+            pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1
+        )
+        assert partial.checked == 1
+        assert partial.total == moved.migrated
+        assert partial.complete is False
+        # Still `ok` — nothing it looked at was wrong. `complete` is the field
+        # that keeps that from being read as "everything is fine".
+        assert partial.ok is True

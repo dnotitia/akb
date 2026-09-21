@@ -18,6 +18,8 @@ def request(**changes):
 @pytest.mark.parametrize("changes", [
     {"contract_version": True}, {"contract_version": 2}, {"unexpected": True}, {"name": " "},
     {"name": "x" * 256}, {"name": "nul\x00name"}, {"name": "bad\ud800"},
+    {"scopes": ["re\x00ad"]}, {"expires_at": "2099-01-01T00:00:00Z\x00"},
+    {"vault_scope": {"prefixes": ["team-\x00"], "extra_vaults": []}},
     {"scopes": []}, {"scopes": ["admin"]}, {"scopes": ["write"]}, {"scopes": ["delete"]},
     {"expires_days": None}, {"expires_days": 0}, {"expires_days": -1}, {"expires_days": True},
     {"expires_days": "30"}, {"expires_days": 1.5}, {"expires_at": None},

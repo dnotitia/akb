@@ -44,13 +44,17 @@ run_psql() {
   fi
 }
 
+# The legacy transport is stateless: `initialize` mints no session, and each
+# request declares its revision instead. This handshakes (proving the endpoint
+# negotiates) and returns the revision the rest of the suite travels under.
 mcp_session() {
   curl -sk -i -X POST "$BASE_URL/mcp/" \
     -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"events-e2e","version":"1.0"}}}' 2>&1 \
-    | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2}'
+    | grep -qi "mcp-session-id" && return 1
+  echo "2025-03-26"
 }
 
 MCP_ID=10
@@ -60,7 +64,7 @@ mcp() {
     -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
-    -H "mcp-session-id: $2" \
+    -H "mcp-protocol-version: $2" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}" 2>&1 \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['content'][0]['text'])" 2>/dev/null
 }
@@ -120,28 +124,28 @@ TBL_PAYLOAD=$(run_psql "SELECT payload->>'table_name' FROM events WHERE vault_id
 echo ""
 echo "▸ 2. table.rows_changed events through MCP akb_sql"
 
-SID=$(mcp_session "$PAT")
-[ -n "$SID" ] && pass "MCP session" || { fail "MCP session" "no session"; exit 1; }
+PV=$(mcp_session "$PAT")
+[ -n "$PV" ] && pass "MCP handshake, no session minted" || { fail "MCP handshake" "a session id was issued"; exit 1; }
 
 ROWS_CHANGED_BASE=$(events_for table.rows_changed)
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES ('one')\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES ('one')\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 1))" ] && pass "single INSERT emits one event" || fail "single INSERT" "response=$R"
 
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES ('bulk-a'), ('bulk-b')\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES ('bulk-a'), ('bulk-b')\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 2))" ] && pass "bulk INSERT emits one event" || fail "bulk INSERT" "response=$R"
 
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"UPDATE $TABLE SET sku = 'updated' WHERE sku LIKE 'bulk-%'\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"UPDATE $TABLE SET sku = 'updated' WHERE sku LIKE 'bulk-%'\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 3))" ] && pass "bulk UPDATE emits one event" || fail "bulk UPDATE" "response=$R"
 
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"UPDATE $TABLE SET sku = 'missing' WHERE sku = 'does-not-exist'\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"UPDATE $TABLE SET sku = 'missing' WHERE sku = 'does-not-exist'\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 3))" ] && pass "no-op UPDATE emits no event" || fail "no-op UPDATE" "response=$R"
 
 # NOT NULL violation aborts the statement transaction after the trigger path
 # would otherwise be eligible, so no wake-up event may survive the rollback.
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES (NULL)\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"INSERT INTO $TABLE (sku) VALUES (NULL)\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 3))" ] && pass "failed INSERT rolls back its event" || fail "failed INSERT rollback" "response=$R"
 
-R=$(mcp "$PAT" "$SID" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"DELETE FROM $TABLE WHERE sku = 'updated'\"}")
+R=$(mcp "$PAT" "$PV" akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"DELETE FROM $TABLE WHERE sku = 'updated'\"}")
 [ "$(events_for table.rows_changed)" = "$((ROWS_CHANGED_BASE + 4))" ] && pass "bulk DELETE emits one event" || fail "bulk DELETE" "response=$R"
 
 ENVELOPE=$(run_psql "SELECT resource_uri || '|' || actor_id || '|' || (payload->>'operation') FROM events WHERE vault_id = '$VAULT_ID' AND kind = 'table.rows_changed' ORDER BY id LIMIT 1")

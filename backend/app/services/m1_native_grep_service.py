@@ -1,9 +1,8 @@
-"""Head-pinned direct PostgreSQL grep candidate for M1 B-grep.
+"""Head-pinned native grep with verified File catalogue coverage.
 
-The service is deliberately internal and measurement-only.  It scans the
-canonical native payload representation after applying vault ACL and containment
-filters, then verifies every result against the exact Head bytes in Python.
-Derived chunks, embeddings, and indexes are never result authority.
+Document matches use canonical Head bytes. File projections must first match
+current authorized catalogue facts in the same snapshot. Derived vector indexes
+are never used to infer exact matches.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
-from app.services.search_filters import ArchiveScope
+from app.services.search_filters import ArchiveScope, collection_predicate
 
 import asyncpg
 
@@ -32,7 +31,7 @@ from app.services.grep_replace import (
     replacement_failure_error,
     validate_max_replacements,
 )
-from app.services.m1_pg_body_store import M1PgBodyStore
+from app.services.m1_pg_body_store import M1PgBodyStore, M1_PG_TEXT_MAX_BYTES
 from app.services.native_payload_verification import (
     payload_store_for_placement,
     verify_native_head_body,
@@ -168,6 +167,8 @@ def _scan_bodies_sync(
     resources: list[dict[str, Any]] = []
     matched_body_indexes: list[int] = []
     total_resources = 0
+    total_documents = 0
+    by_document: dict[str, int] = {}
     total_matches = 0
     materialized_matches = 0
     materialized_bytes = 0
@@ -230,6 +231,10 @@ def _scan_bodies_sync(
         if resource_matches == 0:
             continue
         total_resources += 1
+        if body.surface == "document":
+            total_documents += 1
+            if mode == "count_only":
+                by_document[body.uri] = resource_matches
         total_matches += resource_matches
         if collect_matched_body_indexes:
             matched_body_indexes.append(body_index)
@@ -267,6 +272,8 @@ def _scan_bodies_sync(
         "resources": resources,
         "matched_body_indexes": matched_body_indexes,
         "total_resources": total_resources,
+        "total_documents": total_documents,
+        "by_document": by_document,
         "total_matches": total_matches,
         "materialized_matches": materialized_matches,
         "truncation_reasons": sorted(truncation_reasons),
@@ -303,16 +310,20 @@ def _replace_bodies_sync(
     regex: bool,
     case_sensitive: bool,
 ) -> list[str]:
-    return [
-        apply_grep_replacement(
-            body.search_text,
-            pattern,
-            replace,
-            regex=regex,
-            case_sensitive=case_sensitive,
-        )
-        for body in bodies
-    ]
+    # Grep searches logical lines; whole-body replacement would give anchors
+    # and whitespace a different meaning from the preview. newline="" reads
+    # CR, LF and CRLF without normalizing the stored line endings.
+    results: list[str] = []
+    for body in bodies:
+        parts: list[str] = []
+        for raw_line in io.StringIO(body.search_text, newline=""):
+            line = raw_line.removesuffix("\n").removesuffix("\r")
+            ending = raw_line[len(line):]
+            parts.append(apply_grep_replacement(
+                line, pattern, replace, regex=regex, case_sensitive=case_sensitive,
+            ) + ending)
+        results.append("".join(parts))
+    return results
 
 
 def _regex_child(
@@ -488,6 +499,144 @@ class M1NativeGrepService:
         self.pool = pool
         self.body_store = body_store or M1PgBodyStore(pool)
 
+    async def _verify_file_scope(
+        self, conn, *, user_id: uuid.UUID, vaults: list[str] | None,
+        collection: str | None, resource_id: uuid.UUID | None,
+    ) -> None:
+        """Verify File catalogue coverage in the same snapshot as Head reads.
+
+        A live projection alone proves neither that its source still exists nor
+        that a newly confirmed File has been projected. Inspect both sides.
+        """
+        # Older isolated measurement schemas predate cutover receipts. They
+        # cannot authorize receipt exceptions, but retain ordinary Head checks.
+        has_cutover = await conn.fetchval(
+            "SELECT to_regclass('native_revision_cutover_files') IS NOT NULL"
+        )
+        cutover_join = ""
+        cutover_fields = "FALSE AS cutover_path_current, FALSE AS cutover_binary"
+        if has_cutover:
+            cutover_join = """
+              LEFT JOIN LATERAL (
+                SELECT cf.disposition, cf.applied_path, cf.logical_path,
+                       cf.native_revision_id
+                  FROM native_revision_cutover_files cf
+                  JOIN native_revision_cutover_runs cr USING (cutover_id)
+                 WHERE o.intent_id IS NULL AND cf.file_id = f.id
+                   AND cf.namespace_id = f.vault_id
+                   AND cf.status = 'verified' AND cr.status = 'verified'
+                   AND cf.logical_path = f.source_path AND cf.mime_type = f.mime_type
+                   AND cf.content_hash = f.content_hash AND cf.byte_size = f.size_bytes
+                   AND cf.s3_key = f.s3_key
+                   AND cf.etag IS NOT DISTINCT FROM f.etag
+                   AND cf.storage_version IS NOT DISTINCT FROM f.storage_version
+                 ORDER BY cf.verified_at DESC LIMIT 1
+              ) cf ON TRUE
+            """
+            cutover_fields = """
+                COALESCE(cf.disposition = 'native_text'
+                    AND COALESCE(cf.applied_path, cf.logical_path) = rs.current_path
+                    AND cf.native_revision_id = rs.head_revision_id, FALSE) AS cutover_path_current,
+                COALESCE(cf.disposition = 'preserved_binary', FALSE) AS cutover_binary
+            """
+        params: list[Any] = [user_id, M1_PG_TEXT_MAX_BYTES]
+        scope = ["""(v.owner_id = $1 OR EXISTS (
+            SELECT 1 FROM vault_access va WHERE va.vault_id = v.id AND va.user_id = $1
+        ) OR EXISTS (SELECT 1 FROM users u WHERE u.id = $1 AND u.is_admin = TRUE)
+          OR v.public_access IN ('reader', 'writer'))"""]
+        if vaults:
+            params.append(vaults)
+            scope.append(f"v.name = ANY(${len(params)})")
+        if collection:
+            source_scope = collection_predicate("f.source_path", collection, params)
+            head_scope = collection_predicate("rs.current_path", collection, params)
+            scope.append(f"({source_scope} OR {head_scope})")
+        if resource_id is not None:
+            params.append(resource_id)
+            scope.append(f"COALESCE(f.id, rs.resource_id) = ${len(params)}")
+        rows = await conn.fetch(
+            f"""
+            WITH file_sources AS (
+                SELECT vf.*, CASE WHEN c.path IS NULL THEN vf.name
+                         ELSE c.path || '/' || vf.name END AS source_path
+                  FROM vault_files vf LEFT JOIN collections c ON c.id = vf.collection_id
+                 WHERE vf.kind = 'file' AND vf.upload_state = 'confirmed'
+            ), file_heads AS (
+                SELECT * FROM native_resources
+                 WHERE surface = 'file' AND lifecycle = 'live' AND content_profile = 'text'
+            )
+            SELECT f.id AS file_id, f.vault_id, f.source_path, f.mime_type,
+                   f.size_bytes, f.content_hash, f.hash_verified_at, f.s3_key,
+                   f.storage_driver, f.native_resource_id, f.native_revision_id,
+                   rs.resource_id, rs.namespace_id, rs.current_path, rs.head_revision_id,
+                   pm.digest, pm.byte_size,
+                   o.intent_id, o.source_present, o.logical_path, o.mime_type AS intent_mime,
+                   o.content_hash AS intent_hash, o.byte_size AS intent_size,
+                   o.s3_key AS intent_key, o.completed_at, o.outcome,
+                   {cutover_fields}
+              FROM file_sources f FULL JOIN file_heads rs ON rs.resource_id = f.id
+              JOIN vaults v ON (v.id = f.vault_id OR v.id = rs.namespace_id)
+              LEFT JOIN native_revisions nr ON nr.resource_id = rs.resource_id
+                                          AND nr.revision_id = rs.head_revision_id
+              LEFT JOIN native_payload_manifests pm ON pm.payload_manifest_id = nr.payload_manifest_id
+              LEFT JOIN native_file_projection_outbox o ON o.file_id = f.id
+              {cutover_join}
+             WHERE {' AND '.join(scope)}
+               AND (rs.resource_id IS NOT NULL OR (
+                    lower(f.mime_type) LIKE 'text/%' AND f.size_bytes BETWEEN 0 AND $2
+               ) OR f.storage_driver = 'native_text')
+             LIMIT {NATIVE_GREP_MAX_RESOURCES + 1}
+            """, *params,
+        )
+        if len(rows) > NATIVE_GREP_MAX_RESOURCES:
+            raise ValidationError("native grep File catalogue exceeds resource limit")
+        for row in rows:
+            if (row["cutover_binary"] and row["resource_id"] is None
+                    and row["hash_verified_at"] is not None):
+                continue
+            # A completed exclusion is authoritative only for the exact current
+            # source intent; invalid UTF-8/NUL bytes are legitimate binary Files.
+            source_current = (
+                row["file_id"] is not None and row["hash_verified_at"] is not None
+                and row["source_present"] is True
+                and row["source_path"] == row["logical_path"]
+                and row["mime_type"] == row["intent_mime"]
+                and row["content_hash"] == row["intent_hash"]
+                and row["size_bytes"] == row["intent_size"]
+                and row["s3_key"] == row["intent_key"]
+            )
+            completed = row["completed_at"] is not None and row["outcome"] not in {
+                "abandoned", "superseded",
+            }
+            if (source_current and completed and row["resource_id"] is None
+                    and row["outcome"] in {"already_absent", "deleted"}):
+                continue
+            current = (
+                row["file_id"] is not None and row["resource_id"] == row["file_id"]
+                and (row["storage_driver"] == "native_text" or (
+                    (row["mime_type"] or "").lower().startswith("text/")
+                    and 0 <= row["size_bytes"] <= M1_PG_TEXT_MAX_BYTES
+                ))
+                and row["namespace_id"] == row["vault_id"]
+                and (row["current_path"] == row["source_path"] or row["cutover_path_current"])
+                and row["hash_verified_at"] is not None
+                and row["digest"] == row["content_hash"]
+                and row["byte_size"] == row["size_bytes"]
+            )
+            if row["storage_driver"] == "native_text":
+                current = (current and row["native_resource_id"] == row["resource_id"]
+                           and row["native_revision_id"] == row["head_revision_id"])
+            elif row["intent_id"] is not None:
+                current = current and source_current and completed
+            # No intent: a verified migrated catalogue row must still bind its
+            # identity/path and exact bytes to the Head; hash alone is not enough.
+            if not current:
+                raise AKBError(
+                    "Text File search is not ready for the requested scope",
+                    status_code=409, code="grep_file_projection_not_ready",
+                    hint="Retry after File synchronization completes, or search Documents only.",
+                )
+
     async def _head_bodies(
         self,
         *,
@@ -540,6 +689,11 @@ class M1NativeGrepService:
             # query never joins/selects canonical BYTEA, so an oversized corpus
             # is rejected before asyncpg materializes attacker-controlled bodies.
             async with conn.transaction(isolation="repeatable_read", readonly=True):
+                if "file" in surfaces:
+                    await self._verify_file_scope(
+                        conn, user_id=user_id, vaults=vaults, collection=collection,
+                        resource_id=resource_id,
+                    )
                 aggregate = await conn.fetchrow(
                     f"""
                     SELECT count(*) AS resource_count,
@@ -577,6 +731,9 @@ class M1NativeGrepService:
                     *params,
                 )
 
+        if len(rows) != resource_count:
+            raise AKBError("Native grep payload coverage is incomplete", status_code=409,
+                           code="grep_payload_not_ready")
         return await asyncio.to_thread(_head_bodies_from_rows, rows)
 
     async def _require_write_access(
@@ -626,8 +783,10 @@ class M1NativeGrepService:
             return lambda line: compiled.search(line) is not None
         if case_sensitive:
             return lambda line: pattern in line
-        folded = pattern.casefold()
-        return lambda line: folded in line.casefold()
+        # Match the Unicode case rules used by literal replacement. casefold
+        # expands ß to ss, which re.IGNORECASE cannot replace, and misses İ/i.
+        compiled = re.compile(re.escape(pattern), re.IGNORECASE)
+        return lambda line: compiled.search(line) is not None
 
     @staticmethod
     def _selected_surfaces(*, include_text_files: bool) -> tuple[str, ...]:
@@ -696,7 +855,9 @@ class M1NativeGrepService:
             vaults=vaults,
             collection=collection,
             resource_id=resource_id,
-            surfaces=self._selected_surfaces(include_text_files=include_text_files),
+            surfaces=self._selected_surfaces(
+                include_text_files=include_text_files and not (doc_types or tags) and scope != "archived",
+            ),
         )
         if doc_types or tags or scope != "all":
             bodies = [body for body in bodies if (
@@ -708,14 +869,17 @@ class M1NativeGrepService:
             raise ValidationError(
                 f"native grep candidate bytes exceed {NATIVE_GREP_MAX_SEARCH_BYTES}"
             )
-        if regex:
+        # Unicode-insensitive literals use escaped regex too; repeated-prefix
+        # inputs need the same process deadline as explicit regular expressions.
+        bounded_matcher = regex or not case_sensitive
+        if bounded_matcher:
             try:
                 scanned = await asyncio.to_thread(
                     _run_regex_bounded,
                     _scan_bodies_sync,
                     (bodies, pattern),
                     {
-                        "regex": True,
+                        "regex": regex,
                         "case_sensitive": case_sensitive,
                         "mode": mode,
                         "resource_limit": limit,
@@ -755,6 +919,8 @@ class M1NativeGrepService:
             "searched_resources": len(bodies),
             "searched_bytes": searched_bytes,
             "total_resources": scanned["total_resources"],
+            "total_documents": scanned["total_documents"],
+            "by_document": scanned["by_document"],
             "total_matches": scanned["total_matches"],
         }
         if count_only:
@@ -794,13 +960,13 @@ class M1NativeGrepService:
                 user_id=user_id,
                 namespace_ids={body.namespace_id for body in selected_bodies},
             )
-            if regex:
+            if bounded_matcher:
                 try:
                     replacement_texts = await asyncio.to_thread(
                         _run_regex_bounded,
                         _replace_bodies_sync,
                         (selected_bodies, pattern, replace),
-                        {"regex": True, "case_sensitive": case_sensitive},
+                        {"regex": regex, "case_sensitive": case_sensitive},
                         NATIVE_GREP_REGEX_TIMEOUT_SECONDS,
                     )
                 except _RegexScanTimedOut as exc:
@@ -834,6 +1000,11 @@ class M1NativeGrepService:
                 else:
                     new_text = new_search_text
                 try:
+                    # Rendering may take seconds. Recheck each write so a
+                    # revoked grant stops the batch with recoverable receipts.
+                    await self._require_write_access(
+                        user_id=user_id, namespace_ids={head_body.namespace_id},
+                    )
                     result = await NativeRevisionService(
                         self.pool,
                         payload_store=payload_store,
@@ -902,7 +1073,7 @@ class M1NativeGrepService:
 
     @staticmethod
     def _public_response(*, pattern: str, regex: bool, native: dict[str, Any]) -> dict[str, Any]:
-        """Translate internal resource-neutral facts to the frozen Document grep shape."""
+        """Translate native facts to the public grep shape, preserving Head identity."""
         if "by_resource" in native:
             return {
                 "pattern": pattern,
@@ -928,18 +1099,17 @@ class M1NativeGrepService:
                 "title": row["title"],
                 **({"status": row["status"]} if row.get("status") is not None else {}),
                 "matches": [
-                    {"section": None, "text": match["text"]}
+                    {"section": None, "line": match["line"], "text": match["text"]}
                     for match in row["matches"]
                 ],
             }
-            if row.get("resource_type") == "file":
-                public.update(
-                    {
-                        "resource_type": "file",
-                        "revision": row["revision"],
-                        "content_hash": row["content_hash"],
-                    }
-                )
+            public.update(
+                {
+                    "resource_type": row["resource_type"],
+                    "revision": row["revision"],
+                    "content_hash": row["content_hash"],
+                }
+            )
             # Placement rides on every native row, Document included: the P1
             # observability item exists precisely because Documents moved onto
             # the PG BodyStore, so hiding it from Document rows would leave the
@@ -990,6 +1160,21 @@ class M1NativeGrepService:
                     result[key] = native[key]
         return result
 
-    async def grep_public(self, pattern: str, **kwargs) -> dict[str, Any]:
+    async def grep_public(self, pattern: str, *, resource_output: bool = False, **kwargs) -> dict[str, Any]:
         native = await self.grep(pattern, **kwargs)
-        return self._public_response(pattern=pattern, regex=bool(kwargs.get("regex")), native=native)
+        result = self._public_response(pattern=pattern, regex=bool(kwargs.get("regex")), native=native)
+        if resource_output:
+            result["total_resources"] = native["total_resources"]
+            result["total_docs"] = native["total_documents"]
+            if "by_resource" in native:
+                result["by_resource"] = native["by_resource"]
+                result["by_doc"] = native["by_document"]
+            elif "resources" in native:
+                result["resources"] = native["resources"]
+                result["n_resources"] = native["n_resources"]
+                result["files"] = [r["uri"] for r in native["resources"] if r["resource_type"] == "document"]
+                result["n_files"] = len(result["files"])
+            else:
+                result["returned_resources"] = len(result["results"])
+                result["returned_docs"] = sum(r["resource_type"] == "document" for r in result["results"])
+        return result

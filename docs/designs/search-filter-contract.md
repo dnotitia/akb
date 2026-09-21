@@ -1,5 +1,8 @@
 # Server-driven search filters
 
+[Unified exact grep](../design/accepted/2026-09-16-unified-grep/README.md)
+records the native grep implementation and local validation (2026-09-16).
+
 Search refinement must happen before retrieval limits, not by filtering the
 first page in the browser. Otherwise a matching document outside the first
 25 results can never be discovered by selecting its type or tag.
@@ -41,9 +44,13 @@ Both `/api/v1/search` and `/api/v1/grep` accept repeated `vault`, repeated
   existing include-by-default behavior for older callers. The Search UI sends
   `include_archived=false` explicitly for both modes unless selected otherwise.
 
-Grep remains a document-body search in the UI. The experimental native text-file
-measurement option is not enabled by the UI. Existing measurement callers remain
-unchanged when they omit the new metadata options.
+Native grep defaults to Document bodies. The UI can explicitly request
+`include_text_files=true`; the deprecated `measurement_include_text_files` alias
+remains accepted, and contradictory explicit values are rejected. REST/MCP grep
+limit is 1–50. Document type/tag filters and archived-only scope exclude Files;
+unarchived scope permits Files. Pending or stale File projections return a
+readiness error, never a successful incomplete count. File grep replacement is
+not supported.
 
 ## Candidate selection
 
@@ -64,7 +71,8 @@ of this change.
 ## Browser state
 
 The Search route uses `q`, `v`, `mode`, `source`, repeated `doc_type`, repeated
-`tag`, `collection`, `include_archived`, `regex`, and `case_sensitive` query
+`tag`, `collection`, `include_archived`, `regex`, `case_sensitive`, and
+`include_text_files` query
 parameters. Confirmed changes create history entries; only unsubmitted input
 drafts stay component-local. Reload, browser Back, and document previews preserve
 the search URL. The existing comma-separated `v` URL format remains supported.
@@ -72,7 +80,7 @@ the search URL. The existing comma-separated `v` URL format remains supported.
 Filters remain editable before results and after zero matches. Type/tag selection
 selects document scope; selecting another resource kind clears document metadata
 filters. Literal mode retains the Semantic resource choice in the URL but explicitly
-searches documents only. Tags can be entered independently of the loaded results;
+searches Documents plus explicitly selected text Files. Tags can be entered independently of the loaded results;
 result-derived tags are suggestions, not a complete facet inventory.
 
 The global search panel also sends its selected resource kind to the server and
@@ -83,13 +91,40 @@ so a pending request is not briefly displayed as a genuine empty response.
 
 - Hybrid `returned` is the number of returned resources. `total_matches` is a
   candidate-pool count, **not** a corpus-wide total. The UI labels top results.
-- Grep distinguishes returned documents/lines from total matching documents/lines.
+- `excluded` explains a page shorter than the requested limit: public cause name
+  → how many candidates that filter removed while assembling this page, `{}`
+  when none were. It is page-relative, not a pool or corpus figure, and holds
+  only causes that are not faults — a component that failed belongs to
+  `degraded` instead, and no cause is reported in both places.
+- `recovered` is its fault counterpart: internal cause name → how many
+  candidates a fault removed from this page before the refill loop replaced
+  them, `{}` when the page needed no repair. It is populated only when the page
+  is complete, so it never names a fault `degradation_reason` is already
+  naming. It reports corpus health, not a problem with the response, and is not
+  a reason to retry, warn, or withhold results.
+- Grep distinguishes returned resources/lines from exact total matching
+  resources/lines. Explicit File opt-in adds resource aggregates while keeping
+  Document aggregates Document-only. Native results preserve type, revision,
+  content hash and body-relative line numbers. File links bypass Document previews.
 - Truncation copy is specific to each mode; narrowing scope is the recovery path.
 - A degraded response is incomplete, whether it contains results or not. It must
   never be labelled a genuine zero-match. Retry is available without changing the
   query, and raw server diagnostic details are not displayed as user guidance.
+  Degradation reports a component that failed, or a hit lost to a stale source
+  row that left the page short of the requested limit. Two things are not
+  degradation. A filter is not: excluding the documents the request asked to
+  exclude — the default `unarchived` archive scope, for one — leaves the
+  response unflagged and is reported in `excluded` rather than in a banner. Nor
+  is a fault the search already made good: when the refill loop replaced the
+  dropped candidate the page is complete, so the response is unflagged and the
+  fault is reported in `recovered`.
 - During a same-mode refresh the previous ledger is labelled busy; request
   generations prevent late responses from replacing newer results.
+- How often any of this actually fires is countable: the `search` section on
+  `/health` reports responses observed today, how many were degraded, how many
+  of those still carried results, and the breakdown by cause, backed by daily
+  tables that survive a deploy. A decision about how a surface should treat a
+  degraded response belongs to that measurement, not to an estimate.
 
 ## Verification
 

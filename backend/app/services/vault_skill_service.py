@@ -43,6 +43,7 @@ uses the same exclusion and reports that mirrors do not have an owner guide.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import logging
@@ -91,6 +92,8 @@ _session_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
 # non-mutating.  Challenges are opaque and bound by their map key to the MCP
 # session, vault name, and immutable vault id.
 _acknowledged_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
+# Only the unsigned fallback below stores anything here; the signed challenge
+# is derived, so no replica has to have seen a token to verify it.
 _challenge_map: OrderedDict[
     tuple[str, str, str | None], tuple[str, str]
 ] = OrderedDict()
@@ -127,6 +130,7 @@ def reset() -> None:
     _session_map.clear()
     _acknowledged_map.clear()
     _challenge_map.clear()
+    _last_forced_refresh.clear()
     _pending.clear()
 
 
@@ -163,6 +167,110 @@ def _remember_challenge(
     _challenge_map.move_to_end(key)
     while len(_challenge_map) > _SESSION_MAP_MAX:
         _challenge_map.popitem(last=False)
+
+
+# Domain separator: the same secret signs capability URLs and event-tail
+# cursors, so a vault-skill challenge must not share their message space.
+_ACK_TOKEN_DOMAIN = "akb-vault-skill-ack-v1"
+# `secrets.token_urlsafe(24)` is 32 characters, and a client may already treat
+# that as the token's shape. 192 bits of a SHA-256 HMAC is far more than a
+# challenge needs.
+_ACK_TOKEN_CHARS = 32
+_warned_unsigned_challenge = False
+
+# A presented-but-wrong acknowledgement is the one signal that THIS replica's
+# cached guide may be behind the one that issued the token: the token is a
+# function of the guide version, so two replicas holding different versions
+# derive different tokens and the retry can never match until their caches
+# converge. Re-resolving on that signal closes the window in one round trip
+# instead of waiting out `_CACHE_TTL`.
+#
+# The floor is what stops it becoming an amplifier: a caller sending wrong
+# acknowledgements in a loop can force at most one guide read per key per
+# interval, and `_pending` already collapses concurrent reads for one key.
+_FORCED_REFRESH_MIN_INTERVAL = 5.0
+_last_forced_refresh: OrderedDict[tuple[str, str, str | None], float] = OrderedDict()
+
+
+def _bind(*parts: str) -> bytes:
+    """Length-prefix the signed fields so no two bindings share a message.
+
+    `session_id` is arbitrary client input. A plain separator would let a
+    crafted one shift the field boundaries and mint a token that also verifies
+    for a different session or vault, which is the exact binding the strict
+    contract promises.
+    """
+    out = bytearray()
+    for part in parts:
+        raw = part.encode("utf-8")
+        out += str(len(raw)).encode("ascii") + b":" + raw
+    return bytes(out)
+
+
+def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
+    """The challenge every replica derives, rather than one replica remembers.
+
+    This was `secrets.token_urlsafe(24)` held in `_challenge_map` — process
+    memory. With one replica that is invisible. With two, the retry carrying
+    the token load-balances to the pod that never minted it, which finds no
+    entry, mints a second token and challenges again; the client retries with
+    that one, lands back on the first pod, and so on. No MCP document write
+    could ever be acknowledged, so none could ever commit.
+
+    Deriving the token from the shared HMAC secret makes it a pure function of
+    what it is already bound to — session, vault, vault id, guide version — so
+    any replica verifies a token any other replica issued. Nothing is weakened
+    by the change: the token was already stable for that key until the guide
+    version changed, and without the secret it stays unguessable.
+    """
+    secret = settings.system_hmac_secret_effective
+    if not secret:
+        # Startup refuses to boot without this secret, so this branch is
+        # reachable only from tests. Say so rather than silently returning to
+        # a per-process token that a second replica cannot verify.
+        global _warned_unsigned_challenge
+        if not _warned_unsigned_challenge:
+            _warned_unsigned_challenge = True
+            logger.warning(
+                "vault_skill: no system_hmac_secret; using a per-process "
+                "challenge token that a second replica cannot verify"
+            )
+        challenge = _challenge_map.get(key)
+        if challenge is None or challenge[0] != version:
+            token = secrets.token_urlsafe(24)
+            _remember_challenge(key, version, token)
+            return token
+        _challenge_map.move_to_end(key)
+        return challenge[1]
+
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        _bind(_ACK_TOKEN_DOMAIN, key[0], key[1], key[2] or "", version),
+        hashlib.sha256,
+    ).digest()
+    encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return encoded[:_ACK_TOKEN_CHARS]
+
+
+def _token_matches(acknowledgement: str | None, token: str) -> bool:
+    """Constant-time compare that also rejects a non-string or wrong length."""
+    return (
+        isinstance(acknowledgement, str)
+        and len(acknowledgement) == len(token)
+        and hmac.compare_digest(acknowledgement, token)
+    )
+
+
+def _may_force_refresh(key: tuple[str, str, str | None]) -> bool:
+    now = time.monotonic()
+    last = _last_forced_refresh.get(key)
+    if last is not None and now - last < _FORCED_REFRESH_MIN_INTERVAL:
+        return False
+    _last_forced_refresh[key] = now
+    _last_forced_refresh.move_to_end(key)
+    while len(_last_forced_refresh) > _SESSION_MAP_MAX:
+        _last_forced_refresh.popitem(last=False)
+    return True
 
 
 def _format_payload(
@@ -401,18 +509,24 @@ async def preflight_payload(
             _acknowledged_map.move_to_end(key)
             return None
 
-        challenge = _challenge_map.get(key)
-        if challenge is None or challenge[0] != version:
-            challenge = (version, secrets.token_urlsafe(24))
-            _remember_challenge(key, challenge[0], challenge[1])
-        else:
-            _challenge_map.move_to_end(key)
+        token = _challenge_token(key, version)
 
         if (
-            isinstance(acknowledgement, str)
-            and len(acknowledgement) == len(challenge[1])
-            and hmac.compare_digest(acknowledgement, challenge[1])
+            acknowledgement
+            and not _token_matches(acknowledgement, token)
+            and _may_force_refresh(key)
         ):
+            # Drop this replica's cached guide and read it again: if another
+            # replica has already moved to a newer version, the token the
+            # caller is presenting was derived from THAT one.
+            for cache_key in [k for k in _vault_cache if k[0] == vault]:
+                _vault_cache.pop(cache_key, None)
+            refreshed_version, refreshed_body = await _current(vault, vault_id)
+            if refreshed_version is not None and refreshed_body is not None:
+                version, body = refreshed_version, refreshed_body
+                token = _challenge_token(key, version)
+
+        if _token_matches(acknowledgement, token):
             _remember(_acknowledged_map, key, version)
             _remember(_session_map, key, version)
             _challenge_map.pop(key, None)
@@ -423,7 +537,7 @@ async def preflight_payload(
             version,
             body,
             updated=acknowledged is not None,
-            ack_token=challenge[1],
+            ack_token=token,
         )
     except Exception as e:  # noqa: BLE001 — preflight must never fail a tool call
         logger.warning("vault_skill preflight skipped for %s: %s", vault, e)

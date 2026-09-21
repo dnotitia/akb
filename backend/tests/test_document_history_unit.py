@@ -79,6 +79,7 @@ async def test_history_passes_created_at_as_lineage_boundary(monkeypatch):
         "path": "notes/a.md",
         "vault_name": "v",
         "created_at": created,
+        "source": "manual",
     }
     svc = _service_with_repos(vault_id="v1", doc_row=doc_row)
     svc.git.file_log = MagicMock(return_value=[])
@@ -91,6 +92,26 @@ async def test_history_passes_created_at_as_lineage_boundary(monkeypatch):
     _, kwargs = svc.git.file_log.call_args
     assert kwargs["max_count"] == 7
     assert kwargs["since_epoch"] == int(created.timestamp())
+
+
+@pytest.mark.asyncio
+async def test_external_git_history_does_not_apply_local_created_at_boundary(monkeypatch):
+    """Imported upstream commits predate the local row and remain history."""
+    created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    doc_row = {
+        "path": "notes/a.md",
+        "vault_name": "v",
+        "created_at": created,
+        "source": "external_git",
+    }
+    svc = _service_with_repos(vault_id="v1", doc_row=doc_row)
+    svc.git.file_log = MagicMock(return_value=[])
+    _patch_pool(monkeypatch, fetch_rows=[])
+
+    await svc.history("v", "notes/a.md")
+
+    _, kwargs = svc.git.file_log.call_args
+    assert kwargs["since_epoch"] is None
 
 
 @pytest.mark.asyncio

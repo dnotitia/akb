@@ -43,7 +43,8 @@
   },
   "devDependencies": {
     "typescript": "~5.9.3",
-    "vitest": "^4.1.4"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.11"
   },
   "license": "MIT",
   "repository": {

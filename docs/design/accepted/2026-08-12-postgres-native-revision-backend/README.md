@@ -2,7 +2,7 @@
 status: accepted
 stage: applied
 created: 2026-08-12
-updated: 2026-08-31
+updated: 2026-09-16
 ---
 
 # PostgreSQL Native Document Revision Backend
@@ -99,3 +99,12 @@ and is outside this backend contract.
 See
 [`native-revision-existing-database-cutover.md`](../../../operations/native-revision-existing-database-cutover.md)
 for the thin operator CLI, downtime sequence, and snapshot-backed rollback.
+
+## Unified grep
+
+[Unified exact grep](../2026-09-16-unified-grep/README.md) tracks the
+implemented query/matcher contract and explicit searchable text-File reads
+across the public surfaces. It builds on the stable backend selection above;
+it does not reopen the authority decision or require another cutover. Existing
+Document defaults and measurement-call compatibility remain preserved. Local
+validation is complete; deployment and environment smoke checks remain separate.

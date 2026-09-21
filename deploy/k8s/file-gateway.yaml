@@ -1,0 +1,255 @@
+# Optional: a byte gateway for file downloads.
+#
+# Without it, file bytes are streamed by the API process, which holds a
+# connection and a thread for the whole transfer — fine for small
+# deployments, and the reason this file is not in `kustomization.yaml` by
+# default. With it, the API only authorizes (one database lookup, constant
+# time regardless of file size) and nginx carries the bytes straight from the
+# object store.
+#
+# It changes no address. The gateway answers the same
+# `/api/v1/files/download/{token}` path the API answers, resolved against the
+# same capability table, so tokens issued before the cutover keep working and
+# rolling back is deleting the Ingress below.
+#
+# Requires `file_gateway_key` in the backend configuration and a matching
+# Secret here. Leave both unset and the API's authorization route answers 404
+# — there is nothing to reach.
+#
+#   kubectl -n akb create secret generic akb-file-gateway \
+#     --from-literal=key.conf='proxy_set_header X-AKB-Gateway-Key "<same value>";'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akb-file-gateway-conf
+  namespace: akb
+data:
+  nginx.conf: |
+    # `auto` resolves to the node's CPU count, not the container's limit —
+    # measured at 224 workers on one node. Pick the number deliberately.
+    worker_processes 2;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 16384; }
+    http {
+      access_log off;
+      # The default error page and the Server header both name the nginx
+      # version. The API this replaces advertises neither, and a version is
+      # the first thing worth knowing about a component you intend to
+      # attack.
+      server_tokens off;
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path /tmp/proxy;
+      fastcgi_temp_path /tmp/fastcgi;
+      uwsgi_temp_path /tmp/uwsgi;
+      scgi_temp_path /tmp/scgi;
+
+      upstream akb_backend {
+        server backend.akb.svc.cluster.local:8000;
+        keepalive 32;
+      }
+
+      server {
+        listen 8080;
+
+        # Server level, and nowhere else. A single `add_header` inside a
+        # location drops every header inherited from here, so these two stay
+        # unconditional only as long as no location declares one of its own.
+        # The per-object headers (type, disposition, cache) are not set here:
+        # they are signed into the URL the API hands back, so the object
+        # store emits them.
+        add_header Content-Security-Policy "sandbox allow-same-origin" always;
+        add_header X-Content-Type-Options "nosniff" always;
+
+        proxy_hide_header x-amz-request-id;
+        proxy_hide_header x-amz-storage-class;
+        proxy_hide_header x-rgw-object-type;
+
+        # The token shape the API issues. Anything else is not a capability
+        # this deployment minted and is refused before a subrequest is made.
+        location ~ "^/api/v1/files/download/(?<tok>[A-Za-z0-9_-]{16,128})$" {
+          if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+
+          auth_request /_authz;
+          auth_request_set $s3 $upstream_http_x_akb_s3;
+
+          proxy_buffering off;
+          proxy_max_temp_file_size 0;
+          proxy_http_version 1.1;
+          # The URL is signed for GET. A HEAD forwarded as HEAD fails the
+          # signature, so answer it from a GET whose body we discard.
+          proxy_method GET;
+          # A client's own credentials must not reach the object store: a
+          # bearer token on a signed request is rejected outright, and the
+          # published SDK sends one.
+          proxy_set_header Authorization "";
+          proxy_set_header Cookie "";
+          # Do not set Host here — the signature covers it, and `proxy_pass`
+          # with a variable already takes it from the signed URL.
+          proxy_pass $s3;
+
+          # Without this the object store's own XML error bodies reach the
+          # client, and they name the bucket and the key.
+          proxy_intercept_errors on;
+          error_page 401 = @refused;
+          error_page 403 404 500 502 503 504 = @unavailable;
+          error_page 416 = @range;
+        }
+
+        location = /_authz {
+          internal;
+          proxy_pass http://akb_backend/internal/files/download/$tok;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_pass_request_body off;
+          proxy_set_header Content-Length "";
+          proxy_set_header X-Original-URI $request_uri;
+          # Mounted from the cluster: one line setting the shared header.
+          include /etc/akb-file-gateway/key.conf;
+          proxy_connect_timeout 1s;
+          # Authorization is a database lookup and a signature — about a
+          # millisecond. This is slack for a saturated connection pool, not
+          # for slow work.
+          proxy_read_timeout 5s;
+          proxy_buffer_size 16k;
+          proxy_buffers 4 16k;
+        }
+
+        # A refused capability answers the same status the API answers
+        # today. The body is empty rather than nginx's default page: no
+        # consumer reads it — the published SDK reports `status` and
+        # `statusText` only — and an empty one cannot describe the
+        # deployment to someone probing tokens.
+        # nginx answers 4xx and 5xx from its own error page even when the
+        # return text is empty, so these bodies are its generic page rather
+        # than the API's JSON. Nothing reads them — the published SDK
+        # reports `status` and `statusText` only — and with `server_tokens
+        # off` the page describes nothing.
+        location @refused     { internal; return 404 ""; }
+        # Storage failure, or the API being unreachable. Empty for the same
+        # reason, and because the object store's own error bodies name the
+        # bucket and the key.
+        location @unavailable { internal; return 502 ""; }
+        location @range       { internal; return 416 ""; }
+
+        location = /healthz { access_log off; return 200 "ok\n"; }
+        location / { return 404; }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: akb-file-gateway
+  namespace: akb
+  labels: {app: akb-file-gateway}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: akb-file-gateway}
+  template:
+    metadata:
+      labels: {app: akb-file-gateway}
+    spec:
+      # A transfer in flight is the thing worth protecting here. nginx drains
+      # on SIGQUIT and truncates on SIGTERM, and Kubernetes sends SIGTERM —
+      # so the quit has to be issued from preStop, and the grace period has
+      # to outlast the longest transfer worth finishing. Past it, SIGKILL
+      # cuts the body.
+      terminationGracePeriodSeconds: 900
+      # Two replicas on one node are two replicas until that node reboots.
+      # `ScheduleAnyway` rather than a hard constraint: a gateway that cannot
+      # be scheduled serves nothing, and one node is still better than none.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: akb-file-gateway}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports: [{containerPort: 8080, name: http}]
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 5; nginx -s quit; while pgrep -x nginx >/dev/null; do sleep 1; done"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          # Bytes live in kernel socket buffers, not in nginx: 200 concurrent
+          # streams moved resident memory by well under a megabyte.
+          resources:
+            requests: {cpu: 250m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 20
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+            - {name: key, mountPath: /etc/akb-file-gateway, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: conf, configMap: {name: akb-file-gateway-conf}}
+        - {name: key, secret: {secretName: akb-file-gateway}}  # pragma: allowlist secret
+        - {name: tmp, emptyDir: {}}
+---
+# Voluntary disruption — a drain, an upgrade — must leave one gateway
+# serving. Without this a node drain can take both at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: akb-file-gateway
+  namespace: akb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: akb-file-gateway}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: akb-file-gateway
+  namespace: akb
+spec:
+  selector: {app: akb-file-gateway}
+  ports: [{port: 8080, targetPort: 8080, name: http}]
+---
+# Creating this Ingress is the cutover; deleting it is the rollback. Both are
+# immediate and neither changes an address, because the path is the one the
+# API already answers — a longer prefix than `/api`, so it wins.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: akb-file-gateway
+  namespace: akb
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: akb.example.com
+      http:
+        paths:
+          - path: /api/v1/files/download
+            pathType: Prefix
+            backend:
+              service:
+                name: akb-file-gateway
+                port: {number: 8080}

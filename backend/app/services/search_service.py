@@ -16,7 +16,9 @@ import logging
 import re
 import time
 import uuid
-from typing import Literal
+import functools
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Literal, ParamSpec
 
 from app.config import settings
 from app.db.postgres import get_pool
@@ -43,6 +45,33 @@ from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
+
+# Same receipt contract as M1NativeGrepService._verify_file_scope. A migrated
+# File may have a collision-resolved native path while its public catalog path
+# remains unchanged. Only a verified receipt for this exact source and Head
+# authorizes that exception; any subsequent projection intent supersedes it.
+_VERIFIED_FILE_CUTOVER_PATH_SQL = """
+EXISTS (
+    SELECT 1 FROM native_revision_cutover_files cf
+    JOIN native_revision_cutover_runs cr USING (cutover_id)
+    WHERE cf.file_id = f.id AND cf.namespace_id = f.vault_id
+      AND cf.status = 'verified' AND cr.status = 'verified'
+      AND cf.disposition = 'native_text'
+      AND cf.logical_path = CASE WHEN col.path IS NULL THEN f.name
+                                ELSE col.path || '/' || f.name END
+      AND cf.mime_type = f.mime_type
+      AND cf.content_hash = f.content_hash AND cf.byte_size = f.size_bytes
+      AND cf.s3_key = f.s3_key
+      AND cf.etag IS NOT DISTINCT FROM f.etag
+      AND cf.storage_version IS NOT DISTINCT FROM f.storage_version
+      AND COALESCE(cf.applied_path, cf.logical_path) = r.current_path
+      AND cf.native_revision_id = r.head_revision_id
+      AND f.hash_verified_at IS NOT NULL
+      AND p.digest = f.content_hash AND p.byte_size = f.size_bytes
+      AND NOT EXISTS (SELECT 1 FROM native_file_projection_outbox o
+                      WHERE o.file_id = f.id)
+)
+"""
 
 
 def _log_search_timing(started: float, phases: dict[str, float], returned: int) -> None:
@@ -76,6 +105,138 @@ NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES = 8 * 1024
 # resource_id, so peak memory is page-sized, not scope-sized. Page of 2,000 ×
 # 8KiB slices ≈ 16MiB worst case per page, GC'd before the next page.
 NATIVE_CANDIDATE_PAGE_SIZE = 2_000
+# Hydration drop causes that are NOT faults (akb#604), and the public name each
+# one answers to in `SearchResponse.excluded` (akb#608). `_hydrate_hits` counts
+# six causes; five of them mean something is wrong or stale and belong on the
+# degradation flag. `archive_scope_excluded` is the odd one out: it belongs to
+# the REQUEST, not to a fault — the caller asked for the default `unarchived`
+# scope and hydration gave them exactly that. A filter doing its job is part of
+# the query, which is why neither Elasticsearch (`_shards.failed`, `timed_out`)
+# nor Solr (`partialResults`) raises a partial/failure signal for one. The
+# counter itself is unchanged and still logged; only the conclusion drawn from
+# it changed.
+#
+# The keys on the left are internal diagnostic strings, free to be renamed; the
+# values are API vocabulary and are not. Mapping them explicitly — rather than
+# slicing a suffix off the counter name — is what keeps a rename of the former
+# from breaking the latter. One dict, because excusing a cause from the failure
+# flag and giving it a word the caller sees are the same decision: a cause with
+# no public name would be dropped from the response with nothing to explain the
+# short page, which is the gap akb#608 exists to close.
+PUBLIC_DROP_CAUSE_NAMES = {"archive_scope_excluded": "archived"}
+NON_DEGRADING_DROP_CAUSES = frozenset(PUBLIC_DROP_CAUSE_NAMES)
+
+
+def _public_exclusions(dropped: Mapping[str, int]) -> dict[str, int]:
+    """The non-fault drops, re-keyed to the names `SearchResponse` publishes.
+
+    Fault causes are filtered out here, not merely left unnamed: they are
+    reported by `degradation_reason`, and each fact belongs in exactly one
+    place (akb#608). `dropped` only ever holds positive counts, so an empty
+    result means nothing was excluded.
+    """
+    return {
+        PUBLIC_DROP_CAUSE_NAMES[cause]: count
+        for cause, count in sorted(dropped.items())
+        if cause in PUBLIC_DROP_CAUSE_NAMES
+    }
+
+
+def _fault_drops(dropped: Mapping[str, int]) -> dict[str, int]:
+    """The drops that ARE faults — the exact complement of `_public_exclusions`.
+
+    Two response fields are built from this one dict, and which one gets it is
+    decided by whether the page came back short (akb#611): `degradation_reason`
+    when the fault cost the caller a result, `recovered` when the refill loop
+    replaced it. Deriving both from the same call is what keeps them naming the
+    same set — a cause classified here cannot appear in `excluded`, and a cause
+    named there cannot appear here, because `NON_DEGRADING_DROP_CAUSES` is the
+    single table both consult.
+
+    Keyed by the internal cause name, deliberately: these five causes already
+    reach the caller under exactly these names inside `degradation_reason`, and
+    giving them a second public word would make one fault answer to two names
+    depending on whether the page happened to fill.
+    """
+    return {
+        cause: count
+        for cause, count in sorted(dropped.items())
+        if cause not in NON_DEGRADING_DROP_CAUSES
+    }
+
+
+# `degradation_reason` has exactly two shapes: a retrieval leg's own name, or
+# the hydration causes under this prefix with their counts. Both the writer and
+# the reader below go through this constant and the pair of functions beside it,
+# so the string cannot be reformatted in one place and parsed in another — the
+# defect this whole series has been unwinding is three descriptions of one thing
+# drifting apart, and a free-form string with an outside parser is the same
+# shape of mistake.
+HYDRATION_DROP_REASON_PREFIX = "hydration_dropped:"
+
+
+def _hydration_drop_reason(faults: Mapping[str, int]) -> str:
+    """The `degradation_reason` for a page short because of these faults."""
+    return HYDRATION_DROP_REASON_PREFIX + ",".join(f"{k}={v}" for k, v in faults.items())
+
+
+def degradation_causes(reason: str | None) -> tuple[str, ...]:
+    """The cause name(s) a `degradation_reason` names, for accounting (akb#612).
+
+    A retrieval leg that raised IS its own cause (`sparse_encoder_degraded`,
+    `vector_store_unavailable`, …), so the reason is returned unchanged. A
+    hydration reason names one or more counted causes and yields each of them,
+    because "a write race" and "a stale arm" call for different responses and
+    an aggregate that merged them would answer neither.
+
+    A response naming several hydration causes therefore contributes to each,
+    which is why a per-cause breakdown sums to at least the degraded count and
+    not exactly to it. Empty for an undegraded response, and — deliberately —
+    empty for a reason this cannot parse: a malformed string is not evidence
+    about the corpus, and inventing a cause name from one would put unbounded
+    keys into a counter.
+    """
+    if not reason:
+        return ()
+    if not reason.startswith(HYDRATION_DROP_REASON_PREFIX):
+        return (reason,)
+    body = reason[len(HYDRATION_DROP_REASON_PREFIX):]
+    causes = tuple(
+        cause for part in body.split(",")
+        if (cause := part.partition("=")[0].strip())
+    )
+    return causes
+
+
+_P = ParamSpec("_P")
+
+
+def _counted(
+    fn: Callable[_P, Awaitable[SearchResponse]],
+) -> Callable[_P, Awaitable[SearchResponse]]:
+    """Count every search response on its way out (akb#612).
+
+    A decorator rather than a call before each `return`: `search` has four
+    return sites and adding a fifth is an ordinary edit, so a chokepoint that
+    has to be remembered is one that will eventually be forgotten — and a
+    denominator with a hole in it silently understates every ratio built on it.
+    Wrapping also means a request that raises before producing a response is
+    not counted as one, which is the behaviour we want and would have had to
+    write out otherwise.
+
+    The import is deferred because the counter reads this module's
+    `degradation_causes`; taking it at module scope would be a cycle.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> SearchResponse:
+        response = await fn(*args, **kwargs)
+        from app.services import search_degradation_stats
+
+        search_degradation_stats.record(response)
+        return response
+
+    return wrapper
 
 
 def active_document_source_type(
@@ -723,6 +884,7 @@ class SearchService:
             )
         return candidates, filter_stats
 
+    @_counted
     async def search(
         self,
         query: str,
@@ -1108,9 +1270,10 @@ class SearchService:
         # backward-compatible (doc_id == source_id) while adding table/file.
         phase_started = time.perf_counter()
         # `dropped` counts hits lost between retrieval and hydration by cause
-        # (workbench #1069 G3): any non-empty drop set marks the response
-        # degraded so `total_matches > 0, returned == 0` can never again read
-        # as a silent zero-match.
+        # (workbench #1069 G3), so `total_matches > 0, returned == 0` can never
+        # again read as a silent zero-match. A FAULT cause marks the response
+        # degraded; a cause in `NON_DEGRADING_DROP_CAUSES` does not, because a
+        # filter honouring the request is not a failure (akb#604).
         #
         # The page is the first `limit` deduped hits; `spare` is the rest of
         # the prefetch pool. Hydration can drop rows — archive scope (akb#530),
@@ -1129,13 +1292,59 @@ class SearchService:
             for cause, count in more_dropped.items():
                 dropped[cause] = dropped.get(cause, 0) + count
         results = results[:limit]
+        returned = len(results)
+        # Only the fault causes can reach the flag. `archive_scope_excluded`
+        # stays in `dropped` and is still named by the hydration WARNING, which
+        # is what makes a genuinely short page readable — but it no longer
+        # claims the retrieval service failed (akb#604). Two of the three
+        # consumers of `degraded` discard the whole result set on it, so a page
+        # the refill loop completed was being thrown away because one archived
+        # document happened to pass through the pool.
+        faults = _fault_drops(dropped)
+        # …and a fault only degrades the response if it actually cost the caller
+        # a result (akb#611). The refill loop above drains the ENTIRE spare pool
+        # before it will return a short page, so `returned == limit` is exactly
+        # the state in which every fault drop was replaced, and `returned <
+        # limit` is exactly the state in which the pool ran out with the page
+        # still unfilled. That equivalence is what makes this predicate the
+        # right one rather than an approximation:
+        #
+        #   returned <  limit  →  the pool was exhausted, so the page holds
+        #                         `total_matches` minus every drop. Without the
+        #                         faults it would have held
+        #                         `min(limit, total_matches - filtered)`, which
+        #                         is strictly larger whenever a fault occurred.
+        #                         The fault cost at least one result. Degraded.
+        #   returned == limit  →  the caller received every result they asked
+        #                         for. The cost is zero by construction, whether
+        #                         one candidate was dropped or twenty.
+        #
+        # `returned < limit` on its own would be wrong in the other direction: a
+        # corpus with fewer matches than `limit` returns a short page with
+        # nothing wrong with it, and a page shortened by the archive filter is
+        # akb#604 all over again. The conjunction is what names the fault case
+        # and only the fault case.
+        page_short_of_limit = returned < limit
         hydrate_reason = (
-            f"hydration_dropped:{','.join(f'{k}={v}' for k, v in sorted(dropped.items()))}" if dropped else None
+            _hydration_drop_reason(faults) if faults and page_short_of_limit else None
         )
         if hydrate_reason is not None and degraded_reason is None:
             degraded_reason = hydrate_reason
+        # The compensated half of the same split. A fault the refill loop paid
+        # for is not a failure of this response, but "a chunk pointed at a row
+        # that is gone" is still a corpus-integrity signal, and dropping it
+        # would trade one blind spot for another. It is reported as a count
+        # instead of a flag, and only when the page is complete, so each fault
+        # is stated exactly once: `degradation_reason` when it cost something,
+        # `recovered` when it did not.
+        recovered = {} if page_short_of_limit else faults
+        # The non-fault half (akb#608): the causes that belong to the REQUEST go
+        # to the caller as a count that names them. `dropped` was accumulated
+        # across the initial hydration and every refill pass, so this counts
+        # candidates considered for THIS page — which is the number that
+        # explains a page shorter than `limit`.
+        excluded = _public_exclusions(dropped)
         phases["hydration"] = time.perf_counter() - phase_started
-        returned = len(results)
         _log_search_timing(started, phases, returned)
         hint = (
             "Prefetch pool was capped; the corpus may contain more matches than reported. "
@@ -1153,6 +1362,8 @@ class SearchService:
             hint=hint,
             degraded=degraded_reason is not None,
             degradation_reason=degraded_reason,
+            excluded=excluded,
+            recovered=recovered,
             results=results,
         )
 
@@ -1429,10 +1640,17 @@ class SearchService:
                     raise ValidationError(
                         "native search hydration exceeds the bounded body corpus"
                     )
+                # Older isolated measurement schemas have no receipts and
+                # cannot authorize a collision-path exception.
+                has_cutover = await conn.fetchval(
+                    "SELECT to_regclass('native_revision_cutover_files') IS NOT NULL"
+                )
+                cutover_path_sql = _VERIFIED_FILE_CUTOVER_PATH_SQL if has_cutover else "FALSE"
                 rows = await conn.fetch(
                     f"""
                     SELECT c.id AS chunk_id, r.resource_id, r.current_path,
                            r.head_revision_id, v.name AS vault_name,
+                           {cutover_path_sql} AS cutover_path_current,
                            f.name, f.description, f.mime_type,
                            col.path AS collection,
                            p.payload_id, p.namespace_id, p.content_profile,
@@ -1477,7 +1695,7 @@ class SearchService:
                         if r["collection"]
                         else r["name"]
                     )
-                    if r["current_path"] != catalog_path:
+                    if r["current_path"] != catalog_path and not r["cutover_path_current"]:
                         logger.warning(
                             "hydrate: stale native File path skipped for %s",
                             r["resource_id"],
@@ -1727,7 +1945,12 @@ class SearchService:
         empty/partial result is degraded — not a true zero-match. The store is
         a derived view, so a failure never raises to the caller; PG truth is
         untouched. Previously every failure was swallowed into a silent ``[]``
-        with no signal (issue #189)."""
+        with no signal (issue #189).
+
+        This leg is not the only producer of the response-level flag: hydration
+        raises it too, for a hit whose source row is gone or stale. What both
+        producers have in common is that something WENT WRONG — a filter
+        honouring the request never sets it (akb#604)."""
         sparse_failed = False
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
@@ -1812,11 +2035,12 @@ class SearchService:
         max_replacements: int = DEFAULT_MAX_REPLACEMENTS,
         count_only: bool = False,
         files_with_matches: bool = False,
-        measurement_include_text_files: bool = False,
+        measurement_include_text_files: bool | None = None,
         doc_types: list[str] | None = None,
         tags: list[str] | None = None,
         include_archived: bool = True,
         archive_scope: ArchiveScope | None = None,
+        include_text_files: bool | None = None,
     ) -> dict:
         """Exact text / regex search across document content.
 
@@ -1833,6 +2057,17 @@ class SearchService:
         valid with the default response shape).
         """
         import re as _re
+
+        resource_output = include_text_files is True
+        if (include_text_files is not None and measurement_include_text_files is not None
+                and include_text_files != measurement_include_text_files):
+            raise ValidationError("include_text_files conflicts with measurement_include_text_files")
+        include_text_files = (
+            include_text_files if include_text_files is not None
+            else bool(measurement_include_text_files)
+        )
+        if include_text_files and replace is not None:
+            raise ValidationError("native grep replace does not support File resources")
 
         scope = resolve_archive_scope(archive_scope, include_archived)
         include_archived = scope != "unarchived"
@@ -1872,13 +2107,13 @@ class SearchService:
         limit = clamp_search_limit(limit)
 
         document_source = _configured_document_source_type()
-        if measurement_include_text_files and (
+        if include_text_files and (
             settings.document_revision_backend
             not in {"postgres_native", "native_ledger_m1"}
             or document_source != NATIVE_DOCUMENT_SOURCE
         ):
             raise ValidationError(
-                "measurement_include_text_files requires a native Document backend "
+                "include_text_files requires a native Document backend "
                 "(postgres_native or guarded native_ledger_m1)"
             )
         if document_source == NATIVE_DOCUMENT_SOURCE:
@@ -1899,7 +2134,8 @@ class SearchService:
                 max_replacements=max_replacements,
                 count_only=count_only,
                 files_with_matches=files_with_matches,
-                include_text_files=measurement_include_text_files,
+                include_text_files=include_text_files,
+                resource_output=resource_output,
                 doc_types=doc_types, tags=tags, include_archived=include_archived,
                 archive_scope=scope,
             )
@@ -2187,6 +2423,50 @@ class SearchService:
 
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            from app.services.native_document_service import NativeDocumentService
+            from app.services.index_service import MAX_CHUNK_SIZE, _HEADING_RE
+
+            # Read verified current authority, not a possibly absent/stale derived
+            # chunk or a legacy catalogue row. The adapter resolves IDs/paths/aliases.
+            document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+
+            def native_sections() -> list[dict]:
+                body = document.content or ""
+                headings = list(_HEADING_RE.finditer(body))
+                spans: list[tuple[str, int, int]] = []
+                if not headings:
+                    spans.append(("", 0, len(body)))
+                elif headings[0].start():
+                    spans.append(("", 0, headings[0].start()))
+                hierarchy: list[tuple[int, str]] = []
+                for index, heading in enumerate(headings):
+                    level = len(heading.group(1))
+                    while hierarchy and hierarchy[-1][0] >= level:
+                        hierarchy.pop()
+                    hierarchy.append((level, f"{'#' * level} {heading.group(2).strip()}"))
+                    path = " > ".join(label for _, label in hierarchy)
+                    start = heading.end()
+                    if body[start:start + 1] == "\n":
+                        start += 1  # Only the heading's line terminator belongs to its syntax.
+                    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+                    spans.append((path, start, end))
+
+                rows: list[dict] = []
+                chunk_index = 0
+                for path, start, end in spans:
+                    # Index chunks insert nested overlap and synthetic context.
+                    # Current-body reads instead slice source spans directly:
+                    # no content guessing, no duplicate bytes, bounded rows.
+                    for offset in range(start, max(start + 1, end), MAX_CHUNK_SIZE):
+                        if not section or section.casefold() in path.casefold():
+                            rows.append({"section_path": path,
+                                         "content": body[offset:min(offset + MAX_CHUNK_SIZE, end)],
+                                         "chunk_index": chunk_index})
+                        chunk_index += 1
+                return rows
+
+            return await asyncio.to_thread(native_sections)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -2236,6 +2516,10 @@ class SearchService:
         SQL, before the LIMIT, and the Python pass keeps the contract true
         regardless of how the rows arrive.
         """
+        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
+            rows = await self.drill_down(vault, doc_id)
+            native_headings = list(dict.fromkeys(row["section_path"] for row in rows if row["section_path"]))
+            return native_headings[:limit] if isinstance(limit, int) and limit > 0 else native_headings
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:

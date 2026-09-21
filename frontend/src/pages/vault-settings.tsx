@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
-  Activity,
   AlertTriangle,
   Archive,
   ArrowLeft,
   BookOpen,
   Box,
   CheckCircle2,
-  CircleDashed,
   Globe,
   Lock,
   RotateCcw,
@@ -46,7 +44,8 @@ import { TonalIcon } from "@/components/ui/tonal-icon";
 import { Textarea } from "@/components/ui/textarea";
 import { DeleteVaultDialog } from "@/components/delete-vault-dialog";
 import { RoleBadge, VaultStateBadge } from "@/components/status-badge";
-import { useVaultHealth } from "@/hooks/use-vault-health";
+import { useOptionalSearchStatus } from "@/hooks/use-search-status";
+import { SearchStatusStages } from "@/components/search-status-stages";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 
 interface TableMeta {
@@ -119,7 +118,8 @@ export default function VaultSettingsPage() {
   const generalStatusRef = useRef<HTMLSpanElement>(null);
   const accessStatusRef = useRef<HTMLSpanElement>(null);
   const settingsMainRef = useRef<HTMLElement>(null);
-  const vaultHealth = useVaultHealth(name);
+  const searchStatus = useOptionalSearchStatus();
+  const vaultStatus = searchStatus?.observations.find(row => row.vaultName === name);
 
   const skillQuery = useQuery({
     queryKey: ["document", name, VAULT_SKILL_PATH],
@@ -816,7 +816,7 @@ export default function VaultSettingsPage() {
                     </div>
                   </Panel>
 
-                  {vaultHealth && (
+                  {searchStatus && (
                     <Panel
                       variant="workspace"
                       className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
@@ -826,15 +826,8 @@ export default function VaultSettingsPage() {
                         label="Operations"
                         className="border-border-strong bg-surface-2/55"
                       />
-                      <div className="divide-y divide-border">
-                        <PipelineStatus
-                          label="Indexing"
-                          stats={vaultHealth.vector_store?.backfill?.upsert}
-                        />
-                        <PipelineStatus
-                          label="Metadata"
-                          stats={vaultHealth.metadata_backfill}
-                        />
+                      <div className="space-y-3 p-4">
+                        <SearchStatusStages observation={vaultStatus} />
                       </div>
                       <p className="border-t border-border px-4 py-3 text-xs leading-relaxed text-foreground-muted">
                         New content is processed asynchronously after each
@@ -992,65 +985,6 @@ function SnapshotCell({
       <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">
         {value.toLocaleString()}
       </p>
-    </div>
-  );
-}
-
-interface DiagStats {
-  pending?: number;
-  retrying?: number;
-  abandoned?: number;
-}
-
-function diagVerdict(stats?: DiagStats): {
-  label: string;
-  className: string;
-  Icon: LucideIcon;
-} {
-  const abandoned = stats?.abandoned ?? 0;
-  const inFlight = (stats?.pending ?? 0) + (stats?.retrying ?? 0);
-  if (abandoned > 0) {
-    return {
-      label: `${abandoned.toLocaleString()} need attention`,
-      className: "text-destructive",
-      Icon: AlertTriangle,
-    };
-  }
-  if (inFlight > 0) {
-    return {
-      label: `${inFlight.toLocaleString()} in progress`,
-      className: "text-warning",
-      Icon: CircleDashed,
-    };
-  }
-  return { label: "Caught up", className: "text-success", Icon: CheckCircle2 };
-}
-
-function PipelineStatus({
-  label,
-  stats,
-}: {
-  label: string;
-  stats?: DiagStats;
-}) {
-  const verdict = diagVerdict(stats);
-  const Icon = verdict.Icon;
-  return (
-    <div className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
-      <span className="flex items-center gap-2 text-foreground">
-        {label === "Indexing" ? (
-          <Activity className="h-4 w-4 text-foreground-muted" aria-hidden />
-        ) : (
-          <BookOpen className="h-4 w-4 text-foreground-muted" aria-hidden />
-        )}
-        {label}
-      </span>
-      <span
-        className={`inline-flex items-center gap-1.5 text-xs ${verdict.className}`}
-      >
-        <Icon className="h-3.5 w-3.5" aria-hidden />
-        {verdict.label}
-      </span>
     </div>
   );
 }

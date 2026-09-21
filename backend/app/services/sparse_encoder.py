@@ -468,14 +468,37 @@ _RAW_WEIGHT_DRIVERS: frozenset[str] = frozenset({
 })
 
 
-def _use_raw_weights() -> bool:
-    """True when the active vector_store_driver computes BM25 internally
-    and expects raw TF on the doc side + weight=1.0 on the query side.
-    See module docstring for the convention table."""
-    return settings.vector_store_driver in _RAW_WEIGHT_DRIVERS
+# Pgvector sparse shapes whose store computes BM25 itself. The convention is
+# not a property of the driver alone once one driver can store the terms in
+# more than one way: `pgvector` bakes the weights for `posting` and `arrays`
+# and must NOT for `vchord`, whose index owns k1/b and recomputes the score.
+_RAW_WEIGHT_SHAPES: frozenset[str] = frozenset({"vchord"})
 
 
-async def encode_document(text: str) -> tuple[list[int], list[float]]:
+def _use_raw_weights(sparse_shape: str | None = None) -> bool:
+    """True when the active store computes BM25 internally and expects raw TF
+    on the doc side + weight=1.0 on the query side.
+
+    Keyed on the driver AND, for pgvector, on the sparse shape. Reading the
+    driver alone was correct while every pgvector shape baked its weights;
+    it stops being correct the moment one of them does not, and getting it
+    wrong is the 0.7.7 double-saturation bug again — silently, with no error,
+    just worse ranking. `test_sparse_weight_convention.py` holds the matrix.
+
+    The shape is only consulted for `pgvector`: it is that driver's setting,
+    and a value left over from a previous driver must not change what another
+    driver's encoder produces."""
+    if settings.vector_store_driver in _RAW_WEIGHT_DRIVERS:
+        return True
+    if settings.vector_store_driver == "pgvector":
+        shape = sparse_shape if sparse_shape is not None else settings.vector_store_sparse_shape
+        return shape in _RAW_WEIGHT_SHAPES
+    return False
+
+
+async def encode_document(
+    text: str, *, sparse_shape: str | None = None
+) -> tuple[list[int], list[float]]:
     """Encode a document chunk to a sparse (indices, values) tuple.
 
     Weight convention depends on the active driver (see module
@@ -488,7 +511,7 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
     term_counts = Counter(tokens)
     vocab = await get_or_create_term_ids(term_counts.keys())
 
-    if _use_raw_weights():
+    if _use_raw_weights(sparse_shape):
         # Raw TF. The downstream driver (seahorse-db) feeds these
         # into Coral's inverted index as raw term frequencies; the
         # BM25 saturation/normalization is applied by the index at
@@ -534,7 +557,9 @@ async def encode_document(text: str) -> tuple[list[int], list[float]]:
     return indices, values
 
 
-async def encode_query(text: str) -> tuple[list[int], list[float]]:
+async def encode_query(
+    text: str, *, sparse_shape: str | None = None
+) -> tuple[list[int], list[float]]:
     """Encode a query to a sparse (indices, values) tuple. OOV terms
     are dropped; no new terms are registered.
 
@@ -549,7 +574,7 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
     if not vocab:
         return [], []
 
-    if _use_raw_weights():
+    if _use_raw_weights(sparse_shape):
         # Driver-side BM25: query weight = 1.0; the inverted index
         # multiplies by IDF derived from the per-term-df metadata
         # `hybrid_search` ships. OOV-but-in-vocab terms still pass
@@ -583,21 +608,93 @@ async def encode_query(text: str) -> tuple[list[int], list[float]]:
 _BM25_RECOMPUTE_LOCK_KEY = 987654321
 
 
+async def _open_run(conn, tname: str, tver: str) -> dict:
+    """Resume the run in flight, or start a new one, returning its state.
+
+    A partial run is resumable only while it means the same thing. The
+    tokenizer identity is what decides that: counts produced by a different
+    tokenizer describe a different vocabulary, so they are discarded rather
+    than added to. Nothing else disqualifies a resume — in particular age does
+    not, because the run carries the `source_revision` it started with and a
+    scan that finishes late publishes stats the very next tick will recompute.
+
+    That revision is deliberately NOT re-captured here. It is the boundary that
+    makes writes landing during the scan get revisited; moving it forward on
+    resume would silently narrow the window and let a mid-scan write go
+    uncounted until something else happened to touch the corpus.
+    """
+    row = await conn.fetchrow("SELECT * FROM bm25_recompute_run WHERE id = 1")
+    if (
+        row is not None
+        and row["tokenizer_name"] == tname
+        and row["tokenizer_version"] == tver
+    ):
+        resumed = int(row["resumed"]) + 1
+        await conn.execute(
+            "UPDATE bm25_recompute_run SET resumed = $1, updated_at = NOW()"
+            " WHERE id = 1",
+            resumed,
+        )
+        logger.info(
+            "BM25 recompute resuming: %d documents already counted "
+            "(resume #%d, started %s)",
+            int(row["total_docs"]),
+            resumed,
+            row["started_at"].isoformat() if row["started_at"] else "?",
+        )
+        return dict(row) | {"resumed": resumed}
+
+    async with conn.transaction():
+        await conn.execute("TRUNCATE bm25_recompute_terms")
+        fresh = await conn.fetchrow(
+            """
+            INSERT INTO bm25_recompute_run (
+                id, tokenizer_name, tokenizer_version, source_revision
+            ) VALUES (1, $1, $2, $3)
+            ON CONFLICT (id) DO UPDATE SET
+                tokenizer_name     = EXCLUDED.tokenizer_name,
+                tokenizer_version  = EXCLUDED.tokenizer_version,
+                source_revision    = EXCLUDED.source_revision,
+                cursor_chunk_id    = NULL,
+                total_docs         = 0,
+                total_length       = 0,
+                source_chunk_count = 0,
+                resumed            = 0,
+                started_at         = NOW(),
+                updated_at         = NOW()
+            RETURNING *
+            """,
+            tname,
+            tver,
+            await _current_corpus_revision(conn),
+        )
+    return dict(fresh)
+
+
 async def recompute_stats(batch_size: int = 500) -> dict:
     """Rebuild df (per term) and (total_docs, avgdl). Safe to run repeatedly.
 
     Streams chunks in keyset-paginated batches and accumulates document
-    frequency in a PostgreSQL temporary table.  The old process-global
-    ``Counter`` retained every unique term until the end of the scan, so the
-    function described itself as bounded while backend RSS still grew with
-    corpus vocabulary.  Only one batch's terms now live in Python memory.
+    frequency in PostgreSQL.  The old process-global ``Counter`` retained every
+    unique term until the end of the scan, so the function described itself as
+    bounded while backend RSS still grew with corpus vocabulary.  Only one
+    batch's terms live in Python memory.
+
+    **The scan is resumable; the publish is not, and that asymmetry is the
+    point** (akb#616).  Each batch commits its term contributions and its
+    advanced cursor in ONE transaction, so an interruption — a deploy, an OOM,
+    a dropped connection — costs one batch instead of the whole corpus.  The
+    final write stays atomic because half a corpus's df is worse than none, and
+    it is seconds of work against hours of scan.
 
     Held under a session-scoped PG advisory lock for the duration of the
     scan AND write. Without this, two replicas would each spend minutes
     tokenizing the corpus and then race on the final UPDATE — wasting
     CPU and letting the loser overwrite newer counts with older ones.
     `pg_try_advisory_lock` makes the loser bail out cheaply instead of
-    waiting for the leader to finish.
+    waiting for the leader to finish.  With a durable cursor it does one more
+    thing: the replica that takes the lock next continues the departing one's
+    scan rather than starting over.
     """
     pool = await get_pool()
     tname, tver = tokenizer_info()
@@ -620,29 +717,20 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                 "skipped": True,
             }
         try:
-            # Capture the invalidation boundary before the scan.  Chunk writes
-            # that commit while we are walking the corpus advance the sequence
-            # past this value, so a later tick will conservatively revisit them
-            # even if READ COMMITTED happened to expose some of those rows.
-            source_revision = await _current_corpus_revision(lock_conn)
-            source_chunk_count = 0
-            total_docs = 0
-            total_length = 0
+            # The invalidation boundary belongs to the RUN, not to this call.
+            # Chunk writes that commit while we are walking the corpus advance
+            # the sequence past this value, so a later tick will conservatively
+            # revisit them even if READ COMMITTED happened to expose some of
+            # those rows — and a resumed run keeps the boundary it started
+            # with, which is what makes that guarantee survive a restart.
+            run = await _open_run(lock_conn, tname, tver)
+            source_revision = int(run["source_revision"])
+            source_chunk_count = int(run["source_chunk_count"])
+            total_docs = int(run["total_docs"])
+            total_length = int(run["total_length"])
+            resumed = int(run["resumed"])
 
-            # The advisory lock guarantees a single recompute globally, but a
-            # cancelled prior call can leave its temp table on this pooled
-            # session.  Recreate it explicitly before accumulating this run.
-            await lock_conn.execute("DROP TABLE IF EXISTS bm25_recompute_df")
-            await lock_conn.execute(
-                """
-                CREATE TEMPORARY TABLE bm25_recompute_df (
-                    term TEXT PRIMARY KEY,
-                    df BIGINT NOT NULL
-                ) ON COMMIT PRESERVE ROWS
-                """
-            )
-
-            last_id = None
+            last_id = run["cursor_chunk_id"]
             while True:
                 if last_id is None:
                     rows = await lock_conn.fetch(
@@ -670,23 +758,42 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                     for term in set(toks):
                         batch_df_counts[term] += 1
 
-                if batch_df_counts:
-                    terms, counts = zip(*batch_df_counts.items())
+                # One transaction, both writes. Splitting them would let a
+                # crash land the terms without the cursor (double-counting the
+                # batch on resume) or the cursor without the terms (losing it).
+                async with lock_conn.transaction():
+                    if batch_df_counts:
+                        terms, counts = zip(*batch_df_counts.items())
+                        await lock_conn.execute(
+                            """
+                            INSERT INTO bm25_recompute_terms AS aggregate (term, df)
+                            SELECT * FROM unnest($1::text[], $2::bigint[])
+                            ON CONFLICT (term) DO UPDATE
+                                SET df = aggregate.df + EXCLUDED.df
+                            """,
+                            list(terms),
+                            list(counts),
+                        )
                     await lock_conn.execute(
                         """
-                        INSERT INTO bm25_recompute_df AS aggregate (term, df)
-                        SELECT * FROM unnest($1::text[], $2::bigint[])
-                        ON CONFLICT (term) DO UPDATE
-                            SET df = aggregate.df + EXCLUDED.df
+                        UPDATE bm25_recompute_run
+                           SET cursor_chunk_id    = $1,
+                               total_docs         = $2,
+                               total_length       = $3,
+                               source_chunk_count = $4,
+                               updated_at         = NOW()
+                         WHERE id = 1
                         """,
-                        list(terms),
-                        list(counts),
+                        last_id,
+                        total_docs,
+                        total_length,
+                        source_chunk_count,
                     )
 
             avgdl = (total_length / total_docs) if total_docs else 0.0
             vocab_count = int(
                 await lock_conn.fetchval(
-                    "SELECT COUNT(*) FROM bm25_recompute_df"
+                    "SELECT COUNT(*) FROM bm25_recompute_terms"
                 ) or 0
             )
 
@@ -699,7 +806,7 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                         """
                         INSERT INTO bm25_vocab (term, term_id)
                         SELECT term, nextval('bm25_term_id_seq')
-                          FROM bm25_recompute_df
+                          FROM bm25_recompute_terms
                          ORDER BY term
                         ON CONFLICT (term) DO NOTHING
                         """
@@ -714,7 +821,7 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                         UPDATE bm25_vocab v
                            SET df = c.df,
                                updated_at = NOW()
-                          FROM bm25_recompute_df c
+                          FROM bm25_recompute_terms c
                          WHERE v.term = c.term
                         """
                     )
@@ -735,15 +842,23 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                     source_revision, source_chunk_count,
                 )
 
+                # Clearing the run inside the publishing transaction is what
+                # makes "published" and "no longer resumable" the same event.
+                # Outside it, a failed publish would leave no progress to
+                # resume from, which is the defect this whole path removes.
+                await lock_conn.execute("DELETE FROM bm25_recompute_run WHERE id = 1")
+                await lock_conn.execute("TRUNCATE bm25_recompute_terms")
+
             _invalidate_stats_cache()
             logger.info(
                 "BM25 stats recomputed: source_chunks=%d total_docs=%d "
-                "avgdl=%.2f vocab_size=%d source_revision=%d",
+                "avgdl=%.2f vocab_size=%d source_revision=%d resumed=%d",
                 source_chunk_count,
                 total_docs,
                 avgdl,
                 vocab_count,
                 source_revision,
+                resumed,
             )
             return {
                 "total_docs": total_docs,
@@ -752,9 +867,11 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                 "tokenizer": f"{tname}@{tver}",
                 "source_revision": source_revision,
                 "source_chunk_count": source_chunk_count,
+                "resumed": resumed,
             }
         finally:
-            await lock_conn.execute("DROP TABLE IF EXISTS bm25_recompute_df")
+            # Nothing is dropped here any more. Whatever the scan reached is
+            # the next process's starting point.
             await lock_conn.execute(
                 "SELECT pg_advisory_unlock($1)", _BM25_RECOMPUTE_LOCK_KEY
             )
@@ -867,12 +984,41 @@ async def _should_recompute() -> bool:
     return False
 
 
-async def _refresh_tick() -> int:
+# A skip costs a whole `idle_secs` (six hours), and there is exactly one case
+# where that is the wrong price: a rolling restart. The replaced pod keeps its
+# PostgreSQL session -- and therefore the advisory lock -- until it finishes
+# draining, so the replacement's first tick can find the lock held by a process
+# that is already leaving. Retrying across that window costs a few seconds and
+# saves an interval.
+#
+# It is deliberately bounded and short. A lock still held after this is held by
+# a recompute that is genuinely running on another replica, and skipping THAT is
+# correct -- it will publish the stats this tick wanted. We are outlasting a
+# handover, not waiting out a peer's work.
+_SKIPPED_RETRY_SECS = 20.0
+_SKIPPED_RETRIES = 3
+
+
+async def _refresh_tick(retry_secs: float = _SKIPPED_RETRY_SECS) -> int:
     """One refresher iteration. Returns 0 so `BackfillRunner` always
     treats us as idle and respects the configured `idle_secs` cadence
-    rather than busy-looping."""
-    if await _should_recompute():
-        await recompute_stats()
+    rather than busy-looping.
+
+    `BackfillRunner` has two outcomes: 0 sleeps for the configured interval,
+    anything else drains immediately. Neither fits "could not run, try again
+    shortly", and `configure_idle_secs` refuses while the runner is live, so
+    the wait belongs here.
+    """
+    if not await _should_recompute():
+        return 0
+    for attempt in range(_SKIPPED_RETRIES + 1):
+        if not (await recompute_stats()).get("skipped"):
+            return 0
+        if attempt < _SKIPPED_RETRIES:
+            await asyncio.sleep(retry_secs)
+    logger.info(
+        "BM25 recompute deferred: the lock is held by a running recompute"
+    )
     return 0
 
 
@@ -901,6 +1047,31 @@ async def stop_stats_refresher() -> None:
         await _refresher.stop()
 
 
+async def _run_progress(conn) -> dict | None:
+    """The scan in flight, or None when no run is open.
+
+    Without this, "is the recompute progressing or restarting" is only
+    answerable from log lines, which live as long as the pod — and a pod
+    restart is precisely the event in question (akb#616). `chunks_scanned`
+    measures against the `source_chunk_count` already in this snapshot.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT total_docs, source_chunk_count, resumed, started_at, updated_at
+          FROM bm25_recompute_run WHERE id = 1
+        """
+    )
+    if row is None:
+        return None
+    return {
+        "documents_counted": int(row["total_docs"] or 0),
+        "chunks_scanned": int(row["source_chunk_count"] or 0),
+        "resumed": int(row["resumed"] or 0),
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "advanced_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+    }
+
+
 async def stats_snapshot() -> dict:
     """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
     so a stuck refresher (total_docs=0 while chunks exist) is visible."""
@@ -915,6 +1086,7 @@ async def stats_snapshot() -> dict:
         )
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
         current_revision = await _current_corpus_revision(conn)
+        recompute = await _run_progress(conn)
     if not row:
         return {
             "total_docs": 0, "avgdl": 0.0,
@@ -925,6 +1097,7 @@ async def stats_snapshot() -> dict:
             "current_revision": current_revision,
             "pending_changes": current_revision,
             "last_recomputed_at": None,
+            "recompute_in_flight": recompute,
         }
     source_revision = int(row["source_revision"] or 0)
     return {
@@ -939,4 +1112,5 @@ async def stats_snapshot() -> dict:
         "last_recomputed_at": (
             row["updated_at"].isoformat() if row["updated_at"] else None
         ),
+        "recompute_in_flight": recompute,
     }

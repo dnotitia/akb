@@ -63,22 +63,28 @@ afterEach(() => {
 
 describe("existing-document draft storage", () => {
   it("isolates drafts by user, vault, document, and tab without overwriting another tab", () => {
-    expect(saveDocumentEditDraft(draft())).toBe(true);
-    expect(
-      saveDocumentEditDraft(
-        draft({ draftId: "draft-2", tabId: "tab-2", title: "Other tab" }),
-      ),
-    ).toBe(true);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-09T00:00:00.000Z"));
+    try {
+      expect(saveDocumentEditDraft(draft())).toBe(true);
+      expect(
+        saveDocumentEditDraft(
+          draft({ draftId: "draft-2", tabId: "tab-2", title: "Other tab" }),
+        ),
+      ).toBe(true);
 
-    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1")).toMatchObject({
-      status: "restored",
-      draft: { draftId: "draft-1", title: "Local title" },
-    });
-    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-2")).toMatchObject({
-      status: "restored",
-      draft: { draftId: "draft-2", title: "Other tab" },
-    });
-    expect(window.localStorage.length).toBe(2);
+      expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1")).toMatchObject({
+        status: "restored",
+        draft: { draftId: "draft-1", title: "Local title" },
+      });
+      expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-2")).toMatchObject({
+        status: "restored",
+        draft: { draftId: "draft-2", title: "Other tab" },
+      });
+      expect(window.localStorage.length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not mix a document draft across user, vault, or document identity", () => {

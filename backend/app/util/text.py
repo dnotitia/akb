@@ -27,8 +27,24 @@ from pydantic import BaseModel, model_validator
 
 
 def to_nfc(s: str) -> str:
-    """Return NFC-normalized form. Safe to call on already-NFC text."""
-    return unicodedata.normalize("NFC", s)
+    """Return NFC-normalized form, with NUL bytes removed.
+
+    NUL is dropped here rather than anywhere downstream because this is the
+    boundary every request model already passes user text through, and because
+    PostgreSQL `text` cannot hold the byte at all: a body carrying one is
+    accepted (bodies live in the payload store), and then every attempt to
+    index it raises `CharacterNotInRepertoireError` until the retry ceiling
+    gives up and the document is silently absent from ranked search while
+    staying readable and greppable (akb#527).
+
+    Removing rather than rejecting: a NUL in Markdown is not content a writer
+    meant to send, it arrives from an encoding accident upstream, and refusing
+    the write would fail an operation whose meaning is entirely intact without
+    the byte. Every other character is left exactly as it was.
+
+    Safe to call on already-NFC text.
+    """
+    return unicodedata.normalize("NFC", s).replace("\x00", "")
 
 
 def to_nfc_any(value: Any) -> Any:
@@ -144,6 +160,27 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
             )
         parts.append(raw)
     return "/".join(parts)
+
+
+# RFC 9110 token characters on both halves of a media type. Anything else —
+# a bare word, a path, an empty string — is not a media type.
+_CONTENT_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+)
+GENERIC_CONTENT_TYPE = "application/octet-stream"
+
+
+def normalize_content_type(value: str | None) -> str:
+    """Reduce a declared media type to a bare, lowercased ``type/subtype``.
+
+    Parameters are dropped rather than carried along. Nothing downstream reads
+    them, but every set that classifies a type is keyed on the bare form — so a
+    value that carries one misses those sets, and the same bytes end up treated
+    differently depending on how the type happened to be spelled. A value that
+    is not a media type at all becomes the generic binary type instead of
+    travelling onward as itself."""
+    bare = (value or "").split(";", 1)[0].strip().lower()
+    return bare if _CONTENT_TYPE_RE.fullmatch(bare) else GENERIC_CONTENT_TYPE
 
 
 def validate_file_name(name: str) -> str:

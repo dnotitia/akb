@@ -330,10 +330,15 @@ async function testLegacyBackendFallback() {
     assert.ok(discover);
     assert.ok(initialize, "old backends receive the limited legacy initialize fallback");
     assert.ok(list);
-    assert.equal(initialize.headers["mcp-protocol-version"], undefined);
+    // The legacy revision is declared on every legacy request. A stateless
+    // backend keeps no session to remember the handshake, so this header is
+    // what tells it -- and its audit trail -- which revision the exchange is.
+    assert.equal(initialize.headers["mcp-protocol-version"], "2025-06-18");
     assert.equal(initialize.headers["mcp-session-id"], undefined);
+    // A session id is still echoed back when an older backend hands one out;
+    // a stateless one hands out none and the proxy simply omits it.
     assert.equal(list.headers["mcp-session-id"], "legacy-session");
-    assert.equal(list.headers["mcp-protocol-version"], undefined);
+    assert.equal(list.headers["mcp-protocol-version"], "2025-06-18");
   } finally {
     await backend.close();
   }

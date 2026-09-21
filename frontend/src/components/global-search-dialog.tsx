@@ -272,7 +272,7 @@ export function GlobalSearchDialog() {
           id="global-search-trigger"
           type="button"
           aria-label="Search knowledge"
-          className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface text-left text-sm text-foreground-muted transition-token hover:border-border-strong hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-64 sm:justify-start sm:px-3"
+          className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface text-left text-sm text-foreground-muted transition-token hover:border-border-strong hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-64 sm:min-w-9 sm:shrink sm:justify-start sm:px-3 lg:shrink-0"
         >
           <Search className="h-4 w-4 shrink-0" aria-hidden />
           <span className="hidden truncate sm:inline">Search knowledge…</span>

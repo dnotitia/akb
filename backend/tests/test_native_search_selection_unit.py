@@ -66,6 +66,9 @@ def test_native_public_grep_shape_preserves_document_contract():
                 "vault": body.vault,
                 "path": body.path,
                 "title": body.title,
+                "resource_type": body.surface,
+                "revision": body.revision_id,
+                "content_hash": body.digest,
                 "matches": [{"line": 1, "text": "needle body"}],
             }],
         },
@@ -83,7 +86,10 @@ def test_native_public_grep_shape_preserves_document_contract():
             "vault": "measure",
             "path": "guide.md",
             "title": "Guide",
-            "matches": [{"section": None, "text": "needle body"}],
+            "resource_type": "document",
+            "revision": "a" * 40,
+            "content_hash": "b" * 64,
+            "matches": [{"section": None, "line": 1, "text": "needle body"}],
         }],
     }
 
@@ -150,7 +156,7 @@ def test_rest_grep_model_preserves_bounded_native_truncation_details():
     }
 
 
-def test_additive_grep_only_adds_head_identity_to_file_rows():
+def test_native_grep_preserves_head_identity_for_documents_and_files():
     result = M1NativeGrepService._public_response(
         pattern="needle",
         regex=False,
@@ -169,7 +175,7 @@ def test_additive_grep_only_adds_head_identity_to_file_rows():
                     "resource_type": "document",
                     "revision": "a" * 40,
                     "content_hash": "b" * 64,
-                    "matches": [{"text": "needle"}],
+                    "matches": [{"line": 1, "text": "needle"}],
                 },
                 {
                     "uri": "akb://measure/coll/src/file/00000000-0000-0000-0000-000000000001",
@@ -179,13 +185,15 @@ def test_additive_grep_only_adds_head_identity_to_file_rows():
                     "resource_type": "file",
                     "revision": "c" * 40,
                     "content_hash": "d" * 64,
-                    "matches": [{"text": "needle"}],
+                    "matches": [{"line": 1, "text": "needle"}],
                 },
             ],
         },
     )
 
-    assert set(result["results"][0]) == {"uri", "vault", "path", "title", "matches"}
+    assert result["results"][0]["resource_type"] == "document"
+    assert result["results"][0]["revision"] == "a" * 40
+    assert result["results"][0]["matches"][0]["line"] == 1
     assert result["results"][1]["resource_type"] == "file"
     assert result["results"][1]["revision"] == "c" * 40
     assert result["results"][1]["content_hash"] == "d" * 64
@@ -723,7 +731,8 @@ async def test_native_hydration_verification_and_decode_run_off_event_loop(monke
 
 
 @pytest.mark.asyncio
-async def test_native_file_hydration_preserves_public_file_identity(monkeypatch):
+@pytest.mark.parametrize("mapped_path", [False, True, None])
+async def test_native_file_hydration_preserves_public_file_identity(monkeypatch, mapped_path):
     from app.services import search_service
 
     body = b"legacy to native\n"
@@ -732,7 +741,8 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
     row = {
         "chunk_id": chunk_id,
         "resource_id": resource_id,
-        "current_path": "files/cutover.txt",
+        "current_path": "files/cutover.txt" if mapped_path is False else "files/cutover--collision.txt",
+        "cutover_path_current": mapped_path,
         "head_revision_id": "a" * 40,
         "vault_name": "measure",
         "name": "cutover.txt",
@@ -783,6 +793,10 @@ async def test_native_file_hydration_preserves_public_file_identity(monkeypatch)
         ]
     )
 
+    if mapped_path is None:
+        assert results == []
+        assert dropped["stale_native_file_path"] == 1
+        return
     assert dropped == {}
     assert len(results) == 1
     assert results[0].source_type == "file"

@@ -731,7 +731,15 @@ async def revoke_access(
 # ── Vault members ────────────────────────────────────────────
 
 async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
-    """List all members of a vault. Requires at least reader access."""
+    """List all members of a vault. Requires at least reader access.
+
+    Each row carries the canonical ``id`` alongside the display fields, the
+    same projection ``search_users`` makes (#413, #430). A username can be
+    renamed, so a consumer that keys membership on the id — which is the
+    correct thing to store — needs the roster to be joinable without a
+    round trip per person. An opaque uuid discloses strictly less than the
+    email beside it, so this widens nothing about who can see whom.
+    """
     await check_vault_access(user_id, vault_name, required_role="reader")
 
     pool = await get_pool()
@@ -739,10 +747,11 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         vault = await conn.fetchrow("SELECT id, owner_id FROM vaults WHERE name = $1", vault_name)
 
         # Get owner
-        owner = await conn.fetchrow("SELECT username, display_name, email FROM users WHERE id = $1", vault["owner_id"])
+        owner = await conn.fetchrow("SELECT id, username, display_name, email FROM users WHERE id = $1", vault["owner_id"])
         members = []
         if owner:
             members.append({
+                "id": str(owner["id"]),
                 "username": owner["username"],
                 "display_name": owner["display_name"],
                 "email": owner["email"],
@@ -752,7 +761,7 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         # Get other members
         rows = await conn.fetch(
             """
-            SELECT u.username, u.display_name, u.email, va.role, va.created_at
+            SELECT u.id, u.username, u.display_name, u.email, va.role, va.created_at
             FROM vault_access va
             JOIN users u ON va.user_id = u.id
             WHERE va.vault_id = $1
@@ -762,6 +771,7 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         )
         for r in rows:
             members.append({
+                "id": str(r["id"]),
                 "username": r["username"],
                 "display_name": r["display_name"],
                 "email": r["email"],
@@ -828,6 +838,10 @@ async def explain_vault_access(
     return {
         "vault": vault_name,
         "user": target["username"],
+        # The canonical id, same projection as the member roster (#430): the
+        # explanation is keyed by username but describes one person, and a
+        # consumer holding ids must be able to match it without a round trip.
+        "user_id": str(target["id"]),
         # What the member plane says, and what it is derived from. They are
         # reported separately rather than as one number: if they ever disagree
         # the recompute is broken, and collapsing them would hide exactly that.
@@ -853,59 +867,62 @@ async def explain_vault_access(
     }
 
 
-async def list_accessible_vaults(user_id: str) -> list[dict]:
-    """List all vaults the user has access to, with their role."""
-    pool = await get_pool()
+async def list_accessible_vaults(user_id: str, *, conn=None) -> list[dict]:
+    """List all readable vaults; an optional connection keeps aggregate reads
+    on the same snapshot as this directory's authoritative access policy."""
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as connection:
+            return await list_accessible_vaults(user_id, conn=connection)
     uid = uuid.UUID(user_id)
 
-    async with pool.acquire() as conn:
-        # System admin sees all vaults
-        is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
+    # Read the current account role, rather than trusting a possibly older JWT.
+    is_admin = await conn.fetchval("SELECT is_admin FROM users WHERE id = $1", uid)
 
-        # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
-        # vault_write_policy sidecar in both branches — a vault has at
-        # most one policy row (vault_id is its PK) so this never fans out
-        # rows. NULL (no match) reads as ungoverned, same convention as
-        # `get_vault_info`.
-        if is_admin:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                ORDER BY v.name
-                """,
-                uid,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT v.id, v.name, v.description, v.status, v.created_at,
-                       COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
-                       vwp.managed_by
-                FROM vaults v
-                LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
-                LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
-                WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
-                ORDER BY v.name
-                """,
-                uid,
-            )
+    # P0 S3 (design §5.1a): explicit LEFT JOIN on the 1:1
+    # vault_write_policy sidecar in both branches — a vault has at
+    # most one policy row (vault_id is its PK) so this never fans out
+    # rows. NULL (no match) reads as ungoverned, same convention as
+    # `get_vault_info`.
+    if is_admin:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(CASE WHEN v.owner_id = $1 THEN 'owner' END, 'admin') as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            ORDER BY v.name
+            """,
+            uid,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   COALESCE(va.role, CASE WHEN v.owner_id = $1 THEN 'owner' WHEN v.public_access != 'none' THEN v.public_access END) as role,
+                   vwp.managed_by
+            FROM vaults v
+            LEFT JOIN vault_access va ON v.id = va.vault_id AND va.user_id = $1
+            LEFT JOIN vault_write_policy vwp ON v.id = vwp.vault_id
+            WHERE v.owner_id = $1 OR va.user_id = $1 OR v.public_access != 'none'
+            ORDER BY v.name
+            """,
+            uid,
+        )
 
-        return [
-            {
-                "id": str(r["id"]),
-                "name": r["name"],
-                "description": r["description"],
-                "status": r["status"],
-                "role": r["role"],
-                "managed_by": r["managed_by"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
+    return [
+        {
+            "id": str(r["id"]),
+            "name": r["name"],
+            "description": r["description"],
+            "status": r["status"],
+            "role": r["role"],
+            "managed_by": r["managed_by"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
 
 
 # ── Vault info ───────────────────────────────────────────────

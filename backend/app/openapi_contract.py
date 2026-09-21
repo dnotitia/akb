@@ -929,7 +929,6 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "description": _nullable_string(),
                 "upload_url": {"type": "string"},
                 "download_url": {"type": "string"},
-                "s3_key": {"type": "string"},
                 "content_hash": _nullable_string(),
                 "hash_algorithm": _nullable_string(),
                 "etag": _nullable_string(),
@@ -1020,13 +1019,34 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "hint": _nullable_string(),
                 "degraded": {"type": "boolean"},
                 "degradation_reason": _nullable_string(),
+                # Non-fault exclusions for this page, keyed by public cause
+                # name (akb#608): `{"archived": 1}`. Required because it is
+                # always emitted — a consumer checks it for emptiness, never
+                # for presence — and empty when nothing was excluded.
+                "excluded": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
+                # Fault drops this page RECOVERED from, keyed by internal cause
+                # name (akb#611): `{"hydration_miss": 2}`. Same shape and same
+                # always-emitted guarantee as `excluded`, and populated only
+                # when the page is complete — a fault that left the page short
+                # is named by `degradation_reason` instead, so no drop is
+                # reported twice.
+                "recovered": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
                 "results": {
                     "type": "array",
                     "items": {"$ref": "#/components/schemas/SearchResult"},
                 },
             },
             "Hybrid search success envelope.",
-            required=("kind", "query", "total", "returned", "total_matches", "results"),
+            required=(
+                "kind", "query", "total", "returned", "total_matches",
+                "excluded", "recovered", "results",
+            ),
         ),
         "AkbDrillDownEnvelope": _kind_schema(
             "drill_down",

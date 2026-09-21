@@ -114,8 +114,8 @@ test.describe("document edit recovery mock contract", () => {
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Source revision");
     await expect(editor).toContainText("same draft");
-    await page.getByRole("button", { name: "Save" }).click();
-    await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Save changes" }).click();
+    await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
 
     await page.getByRole("button", { name: "Edit" }).click();
     await page.getByRole("button", { name: "Source" }).click();
@@ -186,7 +186,7 @@ test.describe("document edit recovery mock contract", () => {
     await page.getByRole("button", { name: "WYSIWYG" }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Local draft before another editor saves");
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     const conflict = page
       .getByRole("alert")
       .filter({ hasText: "This document changed on the server" });
@@ -233,8 +233,8 @@ test.describe("document edit recovery mock contract", () => {
     );
 
     await page.getByRole("button", { name: "Apply draft to latest" }).click();
-    await page.getByRole("button", { name: "Save" }).click();
-    await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Save changes" }).click();
+    await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
     await expect(page.getByText("This document changed on the server")).toHaveCount(0);
   });
 
@@ -249,7 +249,7 @@ test.describe("document edit recovery mock contract", () => {
     await source.fill("Draft retained after a retryable server failure");
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await operate(request, recovery.operations!.retryable_save_failure);
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("The server hit an error while saving. Please retry.")).toBeVisible();
 
     await page.reload();
@@ -271,7 +271,7 @@ test.describe("document edit recovery mock contract", () => {
     await page.getByRole("button", { name: "Retry" }).click();
     await expect(page.getByRole("button", { name: /Remove image: recovery/ })).toBeVisible();
 
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("This document changed on the server")).toHaveCount(0);
     await expect
       .poll(

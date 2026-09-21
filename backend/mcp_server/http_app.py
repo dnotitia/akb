@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import Message, Receive, Scope, Send
 
 from mcp.server.auth.middleware.bearer_auth import (
@@ -207,6 +207,16 @@ class MCPApp:
                 app=server,
                 json_response=True,
                 max_request_body_size=DEFAULT_MAX_REQUEST_BODY_SIZE,
+                # The SDK keeps a stateful transport in a per-process dict, so a
+                # session minted on one replica is unknown to the next and the
+                # client gets `Session not found` for roughly half its calls.
+                # Nothing can make that dict shared: it holds live streams, not
+                # data. The state has to go instead, and it costs nothing here --
+                # this server advertises `tools` with `listChanged: false`, answers
+                # with `json_response`, never opens the standalone GET stream and
+                # never sends a server-to-client request, which is the entire set
+                # stateless mode gives up. The modern era already runs this way.
+                stateless=True,
             )
         return self._session_manager
 
@@ -265,6 +275,18 @@ class MCPApp:
         header_version = request.headers.get("mcp-protocol-version")
         if request.method in {"GET", "DELETE"} and not session_id:
             if header_version not in MODERN_PROTOCOL_VERSIONS:
+                if request.method == "DELETE":
+                    # A stateless legacy transport hands out no session, so a
+                    # client terminating one has nothing to address and the
+                    # endpoint's established success body is the honest answer:
+                    # there is no state left to release. Refusing here would
+                    # make a correct client's shutdown look like a failure.
+                    await Response(
+                        content=_LEGACY_DELETE_BODY,
+                        media_type="application/json",
+                    )(scope, receive, send)
+                    return
+                # The standalone GET stream only exists for a stateful session.
                 await JSONResponse(
                     {"error": "Invalid session"},
                     status_code=404,
@@ -367,34 +389,13 @@ class MCPApp:
                 )
                 return
 
-            # A legacy transport may create a stateful SDK session only for
-            # its initial initialize handshake. Reject every other sessionless
-            # POST before the manager can mint a transport (and its response
-            # session header). Unsupported carriers continue to the modern
-            # classifier so they receive their typed version error instead.
-            legacy_carrier = (
-                header_version is None
-                or header_version in HANDSHAKE_PROTOCOL_VERSIONS
-            )
-            legacy_initialize = (
-                decoded is not None
-                and decoded.get("method") == "initialize"
-            )
-            if (
-                request.method == "POST"
-                and session_id is None
-                and legacy_carrier
-                and not legacy_initialize
-            ):
-                await _protocol_error(
-                    scope,
-                    receive,
-                    send,
-                    request_id=request_id,
-                    code=INVALID_REQUEST,
-                    message="Missing session ID",
-                )
-                return
+            # This guard used to reject a sessionless legacy POST so the
+            # manager could not mint a transport (and its response session
+            # header) outside the initialize handshake. A stateless manager
+            # mints nothing, so the premise is gone: a legacy POST is now
+            # self-contained exactly like a modern one, and the principal comes
+            # from this request's own Authorization header rather than from
+            # whichever replica happened to serve `initialize`.
 
             routed_receive = _replay_body(body)
 

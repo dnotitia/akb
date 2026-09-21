@@ -49,6 +49,7 @@ export function TablePublishDialog({
   table,
   columns,
   onPublished,
+  restriction = null,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -56,6 +57,8 @@ export function TablePublishDialog({
   table: string;
   columns: PublishableTableColumn[];
   onPublished: (publication: Publication) => void;
+  /** Current caller-verified access; an open draft must not outlive its proof. */
+  restriction?: string | null;
 }) {
   const safeColumnNames = useMemo(
     () =>
@@ -128,7 +131,7 @@ export function TablePublishDialog({
   const previewIsCurrent = Boolean(preview && query.sql && previewSql === query.sql);
   const busy = previewing || publishing;
   const publishDisabled = Boolean(
-    busy || titleError || accessError || query.error || !previewIsCurrent,
+    busy || restriction || titleError || accessError || query.error || !previewIsCurrent,
   );
 
   function invalidatePreview() {
@@ -138,6 +141,7 @@ export function TablePublishDialog({
   }
 
   async function handlePreview() {
+    if (restriction) return;
     if (query.error || !query.sql) {
       setError(query.error || "The preview query is unavailable.");
       return;
@@ -159,7 +163,7 @@ export function TablePublishDialog({
 
   async function handlePublish(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const validationError = titleError || accessError || query.error;
+    const validationError = restriction || titleError || accessError || query.error;
     if (validationError) {
       setError(validationError);
       return;
@@ -226,6 +230,8 @@ export function TablePublishDialog({
           <Alert variant="warning" title="No sign-in required">
             The selected columns and rows become available to anyone with the link. Table writes are never allowed.
           </Alert>
+
+          {restriction && <Alert variant="info" title="Publishing unavailable">{restriction}</Alert>}
 
           {error && (
             <div ref={errorRef} tabIndex={-1}>
@@ -411,7 +417,7 @@ export function TablePublishDialog({
               type="button"
               variant="outline"
               loading={previewing}
-              disabled={publishing || Boolean(query.error)}
+              disabled={publishing || Boolean(restriction) || Boolean(query.error)}
               onClick={() => void handlePreview()}
             >
               {!previewing && <RefreshCw className="h-4 w-4" aria-hidden />}

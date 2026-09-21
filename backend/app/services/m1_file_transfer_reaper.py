@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from app.services._backfill import BackfillRunner
-from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
+from app.services.m1_file_measurement import reap_transfer_intents
 
 
 REAP_INTERVAL_SECONDS = 60
 
 
 async def _reap_once() -> int:
-    return await MeasurementFileService().reap_transfer_intents()
+    return await reap_transfer_intents()
 
 
 _runner = BackfillRunner(
@@ -22,7 +22,12 @@ _runner = BackfillRunner(
 
 
 def enabled() -> bool:
-    return measurement_enabled()
+    """Always. Both lanes write capabilities to this table, and the one that
+    ships (`s3_current` download capabilities) has no other reaper. Binding
+    this to measurement mode is what left expiry enforced by a single `WHERE`
+    predicate on the read path. An empty table costs one indexed scan a minute
+    (`idx_m1_file_transfer_expiry`, migration 055)."""
+    return True
 
 
 def start() -> None:

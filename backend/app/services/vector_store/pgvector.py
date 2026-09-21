@@ -34,9 +34,11 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import assert_never
 
 import asyncpg
+
+from app.services.sparse_shapes import SparseShape
 
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
 
@@ -55,14 +57,23 @@ def _advisory_lock_key(schema: str) -> int:
 logger = logging.getLogger("akb.vector_store.pgvector")
 
 
-SparseShape = Literal["arrays", "posting"]
-
-
 # RRF constant (Qdrant's default). Same value across drivers so the
 # `score` field has consistent semantics — the absolute number still
 # isn't comparable across drivers (per the VectorHit contract), but
 # at least the formula is identical.
 RRF_K = 60
+
+_VCHORD_MAX_CANDIDATES = 65_535
+
+
+async def _set_vchord_candidate_budget(
+    conn: asyncpg.Connection, budget: int,
+) -> None:
+    if budget != -1 and not 1 <= budget <= _VCHORD_MAX_CANDIDATES:
+        raise ValueError(f"invalid vchord candidate budget: {budget}")
+    # The bounded integer is safe to interpolate into the extension GUC.
+    # SET LOCAL restores the pooled connection at transaction commit.
+    await conn.execute(f"SET LOCAL bm25_catalog.bm25_limit = {budget}")
 
 # Schema name lands in identifier position in DDL; validate to keep
 # operator typos and config-injection-style attacks from blowing up
@@ -79,6 +90,58 @@ def _rrf(*ranked_lists: list[str]) -> dict[str, float]:
         for rank, chunk_id in enumerate(ranked, start=1):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
     return scores
+
+
+
+def _bm25vector_literal(
+    indices: list[int], values: list[float]
+) -> str:
+    """`{term_id:tf, …}` — the extension's text input; `'{}'` for no terms.
+
+    Term ids must be strictly increasing, not merely sorted: the parser rejects
+    `{1:2, 5:1, 5:1}` with "Indexes are not increasing", so a repeated id has to
+    be folded into one entry rather than emitted twice. `encode_document`
+    returns distinct terms today, which is exactly why this is worth doing here
+    — a caller that does not is a silent corruption, and the error only appears
+    once a real database sees the literal.
+
+    Frequencies are integers: the vector counts occurrences, and
+    `encode_document` produced raw counts for this shape.
+
+    The floor is the second of two defences, not a redundant one. `upsert_one`
+    refuses non-integral weights before reaching here, so a pre-baked value
+    arriving through the store is already gone — but that guard passes anything
+    that happens to be whole, and a single-term document of exactly average
+    length gives tf*(k1+1)/(tf + k1*1) = 1.0 exactly. It also does not apply to
+    a caller holding this function directly. So `max(1, round(w))` still has
+    work: rounding rather than truncating, and flooring at one, because
+    `round(0.4)` is 0 and a term the document contains must not vanish.
+    """
+    if len(indices) != len(values):
+        # `zip` would truncate to the shorter one and drop the rest without a
+        # sound. The result would still be a valid vector, so nothing downstream
+        # would notice a document indexed under half its terms.
+        raise ValueError(
+            f"sparse indices and values disagree: {len(indices)} vs {len(values)}"
+        )
+    counts: dict[int, int] = {}
+    for term, weight in zip(indices, values):
+        counts[int(term)] = counts.get(int(term), 0) + max(1, round(float(weight)))
+    # An empty vector is written, not skipped, and the two are not the same
+    # thing: `NULL` means nothing has encoded this row yet, `'{}'` means
+    # something did and the document had no content-bearing terms. Only that
+    # distinction makes `sparse_bm25 IS NULL` an exact statement of work
+    # remaining, which is what a backfill over an existing corpus needs.
+    #
+    # It costs nothing at search time. `'{}'` passes the `IS NOT NULL` guard
+    # and scores `-0`, but `-0 < 0` is false in IEEE 754, so the ranked
+    # subquery's filter drops it exactly as it drops a document holding no
+    # query term. Measured rather than argued: with five real matches and ten
+    # thousand `'{}'` rows under `LIMIT 10`, all five came back — the `-0` rows
+    # sort after every negative score, so they can only occupy slots that no
+    # match wanted. (An earlier version of this comment claimed the opposite
+    # and returned None for it. It was wrong about the filter.)
+    return "{" + ", ".join(f"{t}:{counts[t]}" for t in sorted(counts)) + "}"
 
 
 class PgvectorStore:
@@ -286,6 +349,17 @@ class PgvectorStore:
                 raise VectorStoreUnavailable(f"schema setup failed: {e}") from e
             self._ensured_collection = True
 
+    @property
+    def sparse_shape(self) -> SparseShape:
+        """How this store wants its sparse terms — read by the encoder.
+
+        The convention the encoder must produce depends on it, and the store is
+        the only thing that knows which shape it was actually built with. The
+        setting is not: `tests/bench/sparse_shape_bench.py` constructs one store
+        per shape in a loop while `settings` never moves, and encodes the corpus
+        once for all of them."""
+        return self._sparse_shape
+
     async def _do_ensure(self, conn) -> None:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
@@ -311,7 +385,7 @@ class PgvectorStore:
                 )
                 """
             )
-        else:  # posting
+        elif self._sparse_shape == "posting":
             # Fresh databases can score postings without heap reads. Existing
             # tables are intentionally not rebuilt during startup; see the
             # explicit concurrent-index maintenance SQL for upgrades.
@@ -353,6 +427,50 @@ class PgvectorStore:
                 """
             )
 
+        elif self._sparse_shape == "vchord":
+            # The terms live in one column and the index owns the scoring, so
+            # there is no side table and no stored weights — `bm25vector` holds
+            # {term_id: term_frequency} and k1/b are the index's, not ours.
+            #
+            # `CREATE EXTENSION` here matches what this method already does for
+            # `vector` two statements up: the driver provisions what it needs
+            # and fails visibly if the database cannot supply it. An operator
+            # who has not installed the extension picks a different shape.
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
+            await conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS "{self._schema}".chunks (
+                    chunk_id        UUID PRIMARY KEY,
+                    source_type     TEXT NOT NULL,
+                    source_id       UUID NOT NULL,
+                    vault_id        UUID,
+                    section_path    TEXT,
+                    content         TEXT NOT NULL,
+                    chunk_index     INTEGER NOT NULL,
+                    dense           vector({self._dense_dim}),
+                    sparse_bm25     bm25_catalog.bm25vector,
+                    indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            # Schema-qualified: the extension installs into `bm25_catalog` and
+            # nothing here puts that on `search_path`.
+            await conn.execute(
+                f"""
+                ALTER TABLE "{self._schema}".chunks
+                    ADD COLUMN IF NOT EXISTS sparse_bm25 bm25_catalog.bm25vector
+                """
+            )
+            await conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_vi_chunks_bm25
+                    ON "{self._schema}".chunks
+                 USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
+                """
+            )
+
+        else:
+            assert_never(self._sparse_shape)
         # Existing deployments may have `dense` from the pre-0.6.2
         # NOT NULL era. Drop the constraint idempotently so the
         # sparse-only fallback can actually store a NULL.
@@ -526,7 +644,7 @@ class PgvectorStore:
                         content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
-                else:  # posting
+                elif self._sparse_shape == "posting":
                     await c.execute(
                         f"""
                         INSERT INTO "{self._schema}".chunks
@@ -563,6 +681,65 @@ class PgvectorStore:
                                 for t, w in zip(sparse_indices, sparse_values)
                             ],
                         )
+                elif self._sparse_shape == "vchord":
+                    # One statement, not two: the terms are a column of the row
+                    # being written, so there is no side table to delete from
+                    # and no window in which a chunk exists without its terms.
+                    #
+                    # `sparse_values` are raw term frequencies here — the shape
+                    # is in `_RAW_WEIGHT_SHAPES`, so `encode_document` did not
+                    # bake k1/b into them. The index applies BM25 itself; a
+                    # pre-baked weight arriving at this branch would be
+                    # saturated twice and would only show up as worse ranking.
+                    # Defence in depth, not the barrier. What actually keeps
+                    # pre-baked weights out is that `encode_document` is told
+                    # the store's `sparse_shape`; this only catches a caller
+                    # that went around it, and it catches most rather than all:
+                    # a saturated weight lands in (0, k1+1) and is rarely whole,
+                    # but a single-term document of exactly average length gives
+                    # tf*(k1+1)/(tf + k1*1) = 1.0 exactly. Multi-term documents
+                    # are caught because `any` only needs one fractional weight.
+                    #
+                    # ValueError, not VectorStoreUnavailable: this is a
+                    # deterministic caller error that no retry fixes, and
+                    # `embed_worker` reads VectorStoreUnavailable as a transient
+                    # outage — it would fail the row, hand the rest of the batch
+                    # back and return, halting indexing while reporting that the
+                    # vector store is down. The per-row path is the right one,
+                    # and it is the one `_bm25vector_literal` already uses for
+                    # the same class of mistake.
+                    if any(float(w) != int(float(w)) for w in sparse_values):
+                        raise ValueError(
+                            "vchord shape received non-integral sparse weights: "
+                            "these look pre-baked, and this shape needs raw term "
+                            "frequencies. The encoder decides from the store's "
+                            "`sparse_shape`; a caller that encodes once and then "
+                            "switches shapes has to re-encode."
+                        )
+                    await c.execute(
+                        f"""
+                        INSERT INTO "{self._schema}".chunks
+                            (chunk_id, source_type, source_id, vault_id, section_path,
+                             content, chunk_index, dense, sparse_bm25, indexed_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                                $9::text::bm25_catalog.bm25vector, NOW())
+                        ON CONFLICT (chunk_id) DO UPDATE SET
+                            source_type  = EXCLUDED.source_type,
+                            source_id    = EXCLUDED.source_id,
+                            vault_id     = EXCLUDED.vault_id,
+                            section_path = EXCLUDED.section_path,
+                            content      = EXCLUDED.content,
+                            chunk_index  = EXCLUDED.chunk_index,
+                            dense        = EXCLUDED.dense,
+                            sparse_bm25  = EXCLUDED.sparse_bm25,
+                            indexed_at   = NOW()
+                        """,
+                        cid, source_type, sid, vid, section_path or "",
+                        content, int(chunk_index), dense_param,
+                        _bm25vector_literal(sparse_indices, sparse_values),
+                    )
+                else:
+                    assert_never(self._sparse_shape)
         except asyncpg.PostgresError as e:
             raise VectorStoreUnavailable(f"upsert failed: {e}") from e
 
@@ -576,7 +753,24 @@ class PgvectorStore:
     ) -> None:
         """Fallback batch path — N calls of ``upsert_one``. No native
         batch shape on this driver yet; the loop preserves the
-        Protocol contract while keeping per-call atomicity unchanged."""
+        Protocol contract while keeping per-call atomicity unchanged.
+
+        Note for whoever gives this path a caller:
+
+        * With `conn=None` it is not atomic. `_conn(None)` opens a transaction
+          per call, so a raise partway through leaves the earlier chunks
+          committed and the rest not.
+        * The raise carries no cursor. The caller cannot tell how far it got.
+        * The error policy belongs to the caller, and the two that exist chose
+          differently: `embed_worker` marks the one row failed and continues,
+          the migration script catches the batch and retries it row by row.
+          Swallowing per chunk here would delete that second policy rather than
+          add anything.
+        * None of the above is observed. `loop_upsert_batch` has no caller
+          through any driver today — the only `upsert_batch` call in the tree
+          targets a store with a native implementation — so this is read off
+          the code, not measured. That is also why it is a note and not a fix:
+          a change here has nothing to verify it."""
         from .base import loop_upsert_batch
         await loop_upsert_batch(self, chunks, conn=conn)
 
@@ -933,7 +1127,7 @@ class PgvectorStore:
                 rows = await conn.fetch(
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
-        else:  # posting
+        elif self._sparse_shape == "posting":
             if filter_uuids:
                 if filter_col == "source_id":
                     # Source lists can contain thousands of IDs while a common
@@ -1023,7 +1217,362 @@ class PgvectorStore:
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
 
+        elif self._sparse_shape == "vchord":
+            # Every shape below wraps its ORDER BY ... LIMIT and drops rows whose
+            # score is not negative. `<&>` returns a NEGATIVE BM25 score for a
+            # document holding any query term and exactly `-0` for one holding
+            # none — it is a total order over the whole table, not a filter. So
+            # a plain `ORDER BY ... LIMIT k` pads the result with irrelevant
+            # chunks whenever fewer than k documents match, tied at -0 and in
+            # whatever order the heap gives. With `prefetch_per_leg` at
+            # max(limit*3, 50) that is up to fifty of them entering RRF.
+            #
+            # `posting` never had this: it JOINs on the term, so a chunk without
+            # it is simply absent. The wrap restores the same meaning here, and
+            # returning fewer than k when fewer than k match is the same answer
+            # `posting` gives.
+            #
+            # Wrapping rather than a WHERE on the expression keeps the index
+            # available for the ordering — verified: the plan is still an Index
+            # Scan on the bm25 index with the filter applied above it.
+            #
+            # `< 0` is safe because this extension's IDF is a log1p variant,
+            # which stays positive for every df — so a document holding a query
+            # term always scores strictly negative, even at df = N (measured:
+            # 50 of 50 matching documents scored -0.00985, none cut). Classic
+            # BM25 IDF, log((N-df+0.5)/(df+0.5)), goes negative past df > N/2
+            # and this filter would then discard matches. That is a property of
+            # the pinned extension, not of this code, so it belongs on the
+            # checklist for moving the pin (deploy/postgres/README.md).
+            #
+            # The index scores and orders; the query only says what to filter.
+            # Two shapes, chosen by selectivity, because measurement says no
+            # single one wins (akb#626):
+            #
+            #   filter keeps >= 1% of the corpus  →  let the index lead
+            #   filter keeps <  1%                →  materialise first
+            #
+            # At 0.19% selectivity the second is 21x faster (16ms against
+            # 342ms); at 18% the first is 69x faster (27ms against 1863ms).
+            # Below about 0.05% they converge — the planner reaches the same
+            # place on its own — so the branch is harmless at the small end.
+            #
+            # `plan_cache_mode` is set because asyncpg always prepares, and a
+            # generic plan is built without the filter's values: the same
+            # statement measured 0.8ms for ten executions and then 1500ms once
+            # PostgreSQL switched. SET LOCAL scopes it to this transaction so
+            # the pooled connection is not left altered.
+            query_terms = [int(t) for t in terms]
+            # Read the statistics BEFORE the transaction opens. Inside it, a
+            # server-side error aborts the transaction, and catching the
+            # exception in Python does not un-abort it — the next statement
+            # fails with InFailedSQLTransactionError, which is a PostgresError,
+            # which `hybrid_search` turns into VectorStoreUnavailable and takes
+            # the dense leg down with it. "A statistics read that throws must
+            # not take a search with it" is only true out here.
+            selective = (
+                await self._filter_is_selective(conn, filter_col, filter_uuids)
+                if filter_uuids
+                else False
+            )
+            async with conn.transaction():
+                await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+                # Every name below is schema-qualified, yet the extension's
+                # own `to_bm25query` resolves `bm25vector` unqualified inside
+                # itself and fails with `type "bm25vector" does not exist` —
+                # an error that names the type and is caused by the path. The
+                # This REPLACES the path with a fixed list rather than
+                # appending to whatever was configured — an earlier version of
+                # this comment claimed otherwise. It is safe here and only
+                # here: every name inside the branch is schema-qualified, the
+                # branch is the only thing running in this transaction, and
+                # SET LOCAL puts the pooled connection back at commit.
+                await conn.execute(
+                    "SET LOCAL search_path TO \"$user\", public, bm25_catalog"
+                )
+                requested_limit = int(limit)
+
+                if filter_uuids and selective:
+                    type_pred = (
+                        " AND source_type = ANY($4::text[])" if source_type_values else ""
+                    )
+                    sql = f"""
+                        SELECT chunk_id FROM (
+                          WITH candidate_chunks AS MATERIALIZED (
+                            SELECT chunk_id, sparse_bm25
+                            FROM "{self._schema}".chunks
+                            WHERE {filter_col} = ANY($2::uuid[])
+                              AND sparse_bm25 IS NOT NULL{type_pred}
+                          )
+                          SELECT chunk_id::text AS chunk_id,
+                                 sparse_bm25 <&> bm25_catalog.to_bm25query(
+                                    '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                                    $1::int[]::bm25_catalog.bm25vector) AS score
+                          FROM candidate_chunks
+                          ORDER BY score
+                          LIMIT $3
+                        ) ranked WHERE score < 0
+                        ORDER BY score
+                    """
+                    rows = await conn.fetch(
+                        sql, query_terms, filter_uuids, requested_limit,
+                        *([source_type_values] if source_type_values else []),
+                    )
+                elif filter_uuids or source_type_values:
+                    # Sealed segments can apply executor predicates during the
+                    # extension scan; growing segments score before that hook.
+                    # Preserve the direct fast path, and only use unqualified
+                    # global candidates to choose widening or exact fallback.
+                    configured_budget = int(
+                        await conn.fetchval(
+                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
+                        )
+                    )
+                    return await self._search_vchord_index_led_filtered(
+                        conn,
+                        query_terms=query_terms,
+                        filter_col=filter_col,
+                        filter_uuids=filter_uuids,
+                        source_type_values=source_type_values,
+                        limit=requested_limit,
+                        configured_budget=configured_budget,
+                    )
+                else:
+                    configured_budget = int(
+                        await conn.fetchval(
+                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
+                        )
+                    )
+                    sql = f"""
+                        SELECT chunk_id FROM (
+                          SELECT chunk_id::text AS chunk_id,
+                                 sparse_bm25 <&> bm25_catalog.to_bm25query(
+                                    '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                                    $1::int[]::bm25_catalog.bm25vector) AS score
+                          FROM "{self._schema}".chunks
+                          WHERE sparse_bm25 IS NOT NULL
+                          ORDER BY score
+                          LIMIT $2
+                        ) ranked WHERE score < 0
+                        ORDER BY score
+                    """
+                    candidate_budget = configured_budget
+                    if configured_budget != -1:
+                        candidate_budget = (
+                            -1
+                            if requested_limit > _VCHORD_MAX_CANDIDATES
+                            else max(requested_limit, configured_budget, 1)
+                        )
+                        await _set_vchord_candidate_budget(conn, candidate_budget)
+                    rows = await conn.fetch(sql, query_terms, requested_limit)
+                    if (
+                        candidate_budget != -1
+                        and len(rows) < requested_limit
+                    ):
+                        await _set_vchord_candidate_budget(conn, -1)
+                        rows = await conn.fetch(
+                            sql, query_terms, requested_limit,
+                        )
+
+        else:
+            assert_never(self._sparse_shape)
         return [r["chunk_id"] for r in rows]
+
+    # Below this share of the corpus, filtering first beats letting the BM25
+    # index lead. Measured rather than guessed: 0.19% selectivity is 21x faster
+    # materialised, 2.0% is 1.9x faster index-led, and the crossing sits just
+    # under 1% (akb#626). It is one number and it will age — what keeps it
+    # honest is that both sides of it were measured on a corpus shaped like a
+    # real deployment, and that being wrong costs latency, never correctness:
+    # both shapes return the same rows.
+    _SELECTIVE_FRACTION = 0.01
+
+    async def _filter_is_selective(
+        self,
+        conn: asyncpg.Connection,
+        filter_col: str,
+        filter_uuids: list[uuid.UUID],
+    ) -> bool:
+        """Does this filter keep a small enough slice to be worth materialising?
+
+        Read from the statistics PostgreSQL already keeps rather than counted:
+        a `COUNT(*)` here would be a second round trip on every search, and the
+        answer only has to be right about which side of one threshold it falls.
+        Checked against real vault sizes spanning 0.0005% to 27%, the estimate
+        agreed with the true selectivity on that question 10 times out of 10.
+
+        Any failure answers "not selective", which is the index-led shape — the
+        one that is correct everywhere and merely slower in the small-filter
+        band. A statistics read that throws must not take a search with it.
+        """
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT c.reltuples::float8                     AS total,
+                       s.n_distinct                            AS n_distinct,
+                       s.most_common_vals::text::uuid[]        AS mcv,
+                       s.most_common_freqs                     AS freqs
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  LEFT JOIN pg_stats s
+                         ON s.schemaname = n.nspname
+                        AND s.tablename  = c.relname
+                        AND s.attname    = $2
+                 WHERE n.nspname = $1 AND c.relname = 'chunks'
+                """,
+                self._schema, filter_col,
+            )
+        except asyncpg.PostgresError:
+            return False
+        if not row or not row["total"] or row["total"] <= 0:
+            return False
+
+        total = float(row["total"])
+        mcv = list(row["mcv"] or [])
+        freqs = list(row["freqs"] or [])
+        common = dict(zip(mcv, freqs))
+        n_distinct = float(row["n_distinct"] or 0)
+        # Negative n_distinct is a ratio of the row count, which is how
+        # PostgreSQL records a column whose cardinality grows with the table.
+        distinct = abs(n_distinct) * total if n_distinct < 0 else n_distinct
+        remainder = max(0.0, 1.0 - sum(freqs))
+        others = max(1.0, distinct - len(common))
+        share = sum(common.get(v, remainder / others) for v in filter_uuids)
+        return share < self._SELECTIVE_FRACTION
+
+    async def _search_vchord_index_led_filtered(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        query_terms: list[int],
+        filter_col: str,
+        filter_uuids: list[uuid.UUID] | None,
+        source_type_values: list[str] | None,
+        limit: int,
+        configured_budget: int,
+    ) -> list[str]:
+        """Search an index-led vchord scope without silently losing top-k rows.
+
+        The first query preserves VectorChord's sealed-segment prefilter. If it
+        underfills, a separate global-candidate query counts an unqualified
+        candidate page before choosing bounded widening or exact fallback.
+        Growing segments do not use the extension prefilter, and nonvisible
+        rows can consume an index page, so only the exact fallback proves
+        exhaustion.
+        """
+
+        def scope(
+            first_parameter: int,
+        ) -> tuple[list[str], list[object], int]:
+            predicates: list[str] = []
+            params: list[object] = []
+            parameter = first_parameter
+            if filter_uuids:
+                predicates.append(f"c.{filter_col} = ANY(${parameter}::uuid[])")
+                params.append(filter_uuids)
+                parameter += 1
+            if source_type_values:
+                predicates.append(f"c.source_type = ANY(${parameter}::text[])")
+                params.append(source_type_values)
+                parameter += 1
+            return predicates, params, parameter
+
+        filtered_predicates, filtered_scope_args, filtered_limit_parameter = scope(2)
+        filtered_where = " AND ".join(
+            ["c.sparse_bm25 IS NOT NULL", *filtered_predicates]
+        )
+        filtered_sql = f"""
+            SELECT chunk_id FROM (
+              SELECT c.chunk_id::text AS chunk_id,
+                     c.sparse_bm25 <&> bm25_catalog.to_bm25query(
+                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                        $1::int[]::bm25_catalog.bm25vector) AS score
+              FROM "{self._schema}".chunks c
+              WHERE {filtered_where}
+              ORDER BY score
+              LIMIT ${filtered_limit_parameter}
+            ) ranked WHERE score < 0
+            ORDER BY score
+        """
+        filtered_args: list[object] = [query_terms, *filtered_scope_args, limit]
+
+        async def filtered_hits() -> list[str]:
+            rows = await conn.fetch(filtered_sql, *filtered_args)
+            return [row["chunk_id"] for row in rows]
+
+        # -1 is the extension's exact brute-force mode. A requested SQL page
+        # larger than its finite maximum also needs that mode to remain exact.
+        if configured_budget == -1:
+            return await filtered_hits()
+        if limit > _VCHORD_MAX_CANDIDATES:
+            await _set_vchord_candidate_budget(conn, -1)
+            return await filtered_hits()
+
+        candidate_budget = max(
+            limit,
+            configured_budget if configured_budget > 0 else 1,
+            1,
+        )
+        await _set_vchord_candidate_budget(conn, candidate_budget)
+
+        # Keep the extension's direct filtered path as the fast path. On sealed
+        # segments ENABLE_PREFILTER can apply this scope while scanning.
+        hits = await filtered_hits()
+        if len(hits) >= limit:
+            return hits
+
+        global_predicates, global_scope_args, global_limit_parameter = scope(3)
+        global_where = " AND ".join(global_predicates)
+        global_sql = f"""
+            WITH global_candidates AS MATERIALIZED (
+              SELECT c.chunk_id,
+                     c.sparse_bm25 <&> bm25_catalog.to_bm25query(
+                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                        $1::int[]::bm25_catalog.bm25vector) AS score
+              FROM "{self._schema}".chunks c
+              WHERE c.sparse_bm25 IS NOT NULL
+              ORDER BY score
+              LIMIT $2
+            ),
+            ranked AS (
+              SELECT g.chunk_id::text AS chunk_id, g.score
+              FROM global_candidates g
+              JOIN "{self._schema}".chunks c ON c.chunk_id = g.chunk_id
+              WHERE {global_where} AND g.score < 0
+              ORDER BY g.score
+              LIMIT ${global_limit_parameter}
+            )
+            SELECT
+              (SELECT COUNT(*) FROM global_candidates) AS candidate_count,
+              ARRAY(SELECT chunk_id FROM ranked ORDER BY score) AS chunk_ids
+        """
+
+        while True:
+            probe_args: list[object] = [
+                query_terms,
+                candidate_budget,
+                *global_scope_args,
+                limit,
+            ]
+            probe = await conn.fetchrow(global_sql, *probe_args)
+            assert probe is not None
+            candidate_count = int(probe["candidate_count"])
+            candidate_ids = list(probe["chunk_ids"])
+
+            if len(candidate_ids) >= limit:
+                return candidate_ids
+            if (
+                candidate_count < candidate_budget
+                or candidate_budget == _VCHORD_MAX_CANDIDATES
+            ):
+                await _set_vchord_candidate_budget(conn, -1)
+                return await filtered_hits()
+
+            candidate_budget = min(
+                _VCHORD_MAX_CANDIDATES,
+                candidate_budget * 4,
+            )
+            await _set_vchord_candidate_budget(conn, candidate_budget)
 
     async def _fetch_payloads(
         self,

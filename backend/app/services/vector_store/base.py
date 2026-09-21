@@ -187,8 +187,8 @@ class VectorStore(Protocol):
             ``collection_exists()`` check. Probably fine because Qdrant
             ``create_collection`` is idempotent server-side, but no
             explicit cross-process guard.
-          - ``SeahorseCloudStore``: ⚠ BFF ``_bff_get_table()`` + optional
-            auto-create; same race-window shape as Qdrant.
+          - ``SeahorseCloudStore``: ⚠ management-API ``_bff_get_table()`` +
+            optional auto-create; same race-window shape as Qdrant.
           - ``SeahorseDbStore``: ⚠ Coral ``GET /catalog/tables`` + optional
             auto-create on Coral; same race-window shape as the two ⚠
             above. Coral does serialize concurrent ``POST /catalog/tables``

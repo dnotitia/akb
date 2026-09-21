@@ -1,0 +1,1 @@
+Catalog benchmark local-file fixture.

@@ -30,6 +30,419 @@ noncanonical and overflowing durations are rejected. Stored tokens are unchanged
 Deploy all mint handlers before exposing v1 capabilities; advanced creation never
 silently retries against the legacy endpoint after dropping restrictions.
 
+### A third sparse shape, `vchord`, stores BM25 terms in an index
+
+- `vector_store_sparse_shape` gains `vchord`, which keeps each chunk's terms in
+  a single `bm25vector` column on `chunks` and lets a block-max BM25 index own
+  the scoring, instead of the `posting` side table's row per (term, document).
+  Nothing selects it: the default stays `posting`, and the branch is
+  unreachable until an operator chooses it on a database that has the
+  extension (`deploy/postgres/Dockerfile` builds one).
+- The weight convention is no longer a property of the driver alone. `pgvector`
+  bakes k1/b into document weights for `posting` and `arrays`; for `vchord` the
+  index applies them, so the encoder must emit raw term frequencies. Sending
+  pre-baked weights there would saturate twice — the 0.7.7 bug, which fails as
+  worse ranking and never as an error. `encode_document` now takes the shape
+  from the store rather than from global settings, because the two can differ:
+  the bench harness builds one store per shape while the setting never moves.
+- Filtered searches choose their query shape by selectivity. Letting the index
+  lead is 69x faster when the filter keeps 18% of the corpus; materialising the
+  candidates first is 21x faster at 0.19%, and they converge below 0.05%.
+  `plan_cache_mode` is pinned to a custom plan for the duration: asyncpg always
+  prepares, and a generic plan built without the filter's values took the same
+  statement from 0.8ms to 1501ms on the eleventh execution.
+- The result is filtered on the sign of the score. `<&>` orders the whole table
+  rather than filtering it — a document holding no query term scores exactly
+  `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
+  chunks whenever fewer than k match. `posting` never had this because it joins
+  on the term.
+- A document with no content-bearing terms is stored as an empty vector rather
+  than left NULL. The two are not the same statement: `NULL` means nothing has
+  encoded the row yet, which is what lets a backfill over an existing corpus
+  say exactly how much work is left. It costs nothing at search time — `'{}'`
+  scores `-0` and the sign filter above drops it, measured with five matches
+  against ten thousand empty rows under `LIMIT 10`.
+
+### `scripts/backfill_bm25_vector.py` fills the column on an existing corpus
+
+- A corpus indexed under `posting` has `sparse_bm25` empty, and those rows are
+  excluded from sparse search — so flipping the shape on a populated database
+  would hide every existing chunk until something filled it in. The script
+  fills it ahead of the flip, while `posting` is still serving, so there is no
+  window in which search is worse.
+- It needs no progress table and no dual write. `IS NULL` is the queue, so an
+  interrupted run resumes by asking again; and because the `posting` write path
+  stamps `indexed_at` on every write without touching `sparse_bm25`, a `--since`
+  pass finds both what was inserted and what was rewritten while the previous
+  pass ran. Convergence is the run that writes zero.
+- The index is built `CONCURRENTLY`, outside `_do_ensure`. That method runs its
+  DDL in one transaction, and a build over a corpus this size holds a
+  `ShareLock` against every INSERT for its duration.
+- Writes are conditioned on the row still holding the content that was encoded,
+  so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
+  than being stamped with tokens from text it no longer has.
+- The index is built last, and the writes are split. Running it against a real
+  corpus showed the cost is not where it looked: a 500-row batch spent 4.1
+  seconds tokenizing and 21.8 writing, because adding a column value to a table
+  at the default fillfactor is a non-HOT update (2.5% were HOT) and every one
+  of those inserts into all of the table's indexes — including a 15 GB HNSW
+  that does not fit in shared_buffers, at 938 buffer accesses per row. With the
+  BM25 index also present a batch took 103 seconds rather than 2.5, so
+  `--prepare` now adds only the column and `--index` builds it at the end.
+  `--writers` overlaps the disk waits: one writer measured 4-16 rows/s, two
+  32.3 and 32.5 across two orderings, four 45-62.
+- A deadlock is retried instead of ending the sweep, and each writer encodes
+  four chunks at a time rather than sixteen. The concurrency the previous point
+  added made this reachable: every encode upserts into `bm25_vocab`, which the
+  stats recompute and the indexer also write, and at four writers with sixteen
+  encodes each a four-process cycle formed and the sweep died 4% in. Retrying
+  is the answer rather than avoiding the collision — Postgres aborts one side
+  and the next attempt meets a committed transaction — but the retry is bounded,
+  because retrying forever would turn a real problem into a silent stall.
+
+
+### A sparse shape the code does not handle now fails loudly
+
+- `vector_store_sparse_shape` was branched on as a two-way `if` in four places,
+  and the two files that branch disagreed about which way the default went: the
+  driver read "arrays, or else posting", the stats sampler read "posting, or
+  else arrays". A third member would have been two different shapes at once, in
+  the same process, from the same setting — rows in a side table the size
+  reporter had been told not to look at.
+- Every branch now names every member and ends in `assert_never`, so an
+  unhandled shape is a type error at check time and a loud failure at runtime.
+- The members are declared once, in `app/services/sparse_shapes.py`. They were
+  two literals — one in `app/config.py`, one in the pgvector driver — with the
+  same members, different order, and no link. The module is a leaf because
+  `pgvector.py` deliberately does not import config and the vector-store
+  package's `__init__` imports the factory, which does.
+- No behaviour change for either existing shape.
+
+
+### An optional PostgreSQL image with a BM25 index extension
+
+- `deploy/postgres/Dockerfile` builds AKB's PostgreSQL with
+  [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25) added. It is
+  optional and changes nothing by itself: the sparse retrieval leg still works
+  against the `posting` table on the stock image, and the leg selects its
+  implementation separately.
+- The base is the digest already pinned in `deploy/k8s/postgres.yaml`, and the
+  extension is copied from its publisher's image, also pinned by
+  multi-architecture index digest. Two tests hold that: one compares the base
+  against the deployment manifest rather than a literal, so moving the pin does
+  not mean editing a test; the other refuses a bare tag in either stage.
+  Without them, enabling the extension could move the PostgreSQL version at the
+  same time and the two changes would be indistinguishable afterwards.
+- The extension ships no tokenizer. Its vector type is built from an integer
+  array of term ids, which is what `bm25_vocab` already mints, so the Korean
+  tokenizer is unaffected.
+- It installs into its own `bm25_catalog` schema and needs no
+  `shared_preload_libraries` entry, so a database that never runs
+  `CREATE EXTENSION vchord_bm25` behaves exactly like the base image.
+- `vchord_bm25` is AGPLv3 or Elastic License v2 at the recipient's option. It
+  runs inside the PostgreSQL server and is reached over the wire protocol, so
+  it does not change AKB's licensing; `deploy/postgres/README.md` records what
+  distributing a built image would entail.
+
+
+### The PostgreSQL image is pinned by digest
+
+- Every reference that actually pulls `pgvector/pgvector:pg16` now carries the
+  multi-architecture index digest alongside the tag: the two Compose files, the
+  Helm values, the Kubernetes StatefulSet, the all-in-one Dockerfile, the CI
+  dependency Compose and the CI service container. The tag stays for
+  readability; the digest is what gets fetched.
+- The tag is mutable and had already moved — from PostgreSQL 16.13 / pgvector
+  0.8.2 to 16.15 / 0.8.6 — while every manifest carried on saying `pg16`. With
+  `imagePullPolicy: IfNotPresent` a running pod keeps its cached layers, so the
+  upgrade would have arrived whenever a pod was rescheduled onto a node without
+  them: real, unannounced, and at a moment nobody chose.
+- The digest names 16.15 / 0.8.6 rather than freezing the older pair, because
+  pgvector 0.8.3 and 0.8.4 fix HNSW index corruption and an unrepaired-graph
+  error during vacuuming, both of which apply to any deployment running HNSW
+  indexes with autovacuum enabled. 0.8.3 through 0.8.6 are bug fixes with no
+  on-disk format change.
+- The runtime-topology contract test now asserts that the Compose PostgreSQL
+  reference *carries* a digest rather than matching one exact string, so the
+  pin cannot be quietly removed and the digest does not have to be edited in
+  two places on every bump.
+- `deploy/k8s/README.md` gains the procedure for moving a pin, including how to
+  resolve the multi-architecture index digest rather than a single-platform
+  manifest — pinning the latter would strand nodes of every other architecture.
+
+
+### An interrupted BM25 recompute resumes instead of starting over
+
+- The corpus scan behind `recompute_stats()` kept its partial document
+  frequencies in a session-scoped temporary table and its cursor and running
+  totals in Python locals, so any interruption — a rolling deploy, an OOM, a
+  dropped connection — discarded every document already tokenized. On a large
+  corpus the scan is the expensive part by orders of magnitude and worker
+  shutdown is an absolute deadline, which made routine deployments destroy it.
+- Migration 111 adds `bm25_recompute_run` (one row: cursor, running totals,
+  tokenizer identity, the run's `source_revision`, a resume count) and
+  `bm25_recompute_terms` (the partial per-term frequencies). Each batch commits
+  its term contributions and its advanced cursor in one transaction, so an
+  interruption now costs one batch.
+- The final publish is unchanged and still atomic: a partial scan publishes
+  nothing. Clearing the run happens inside that same transaction, so
+  "published" and "no longer resumable" are one event.
+- A run is resumed only while the tokenizer identity still matches; a tokenizer
+  change discards the partial counts and starts over. The `source_revision`
+  captured when the run first started is carried across resumes, keeping the
+  window in which mid-scan writes are revisited.
+- `/health` gains `bm25.recompute_in_flight`: documents counted, chunks
+  scanned, how many times the run has been resumed, when it started and when it
+  last advanced — `null` when no scan is open.
+
+### Search degradation is counted
+
+- `/health` gains a `search` section: how many search responses were observed
+  today, how many were degraded, how many of those still carried results, and
+  the breakdown by cause.
+
+  Nothing counted this before, and three surfaces looked like they should.
+  `/health` reports a section per indexing queue and search is not a queue —
+  the word `degraded` does appear there, but as the vector store's
+  *reachability* verdict, a different namespace from the search response field.
+  `tool_usage_daily` records `(day, tool, outcome, calls, duration)` and a
+  degraded search is a successful call, so it lands under `ok` beside every
+  healthy one. The only remaining trace was a log line, which lives as long as
+  the pod does.
+
+  So for any deployment, three questions had no answer: how often is a response
+  degraded, which cause dominates, and does the caller still receive results.
+  Those are the questions a consumer's behaviour should be chosen from, and it
+  is being chosen without them — one surface renders the results with a
+  warning, another withholds them entirely, and which is right depends on
+  numbers nobody could look up. `degraded_with_results` is the one that decides
+  it, and the one no existing surface could ever have produced.
+
+  Counts, not a verdict, matching the sections around it; and deliberately
+  outside the top-level `status` aggregate, because a search degraded by an
+  ordinary write race is not queue work left undone.
+
+- Backing it: `search_degradation_daily` and `search_degradation_cause_daily`,
+  one row per day and one per (day, cause). In-process counters reset on every
+  deploy and deploys are frequent, so a process counter could not compare two
+  days; the tables can, and are small enough to keep indefinitely — they are
+  written once per flush tick, not once per response.
+
+  The hot path only touches memory: a dict lookup and a few integer adds behind
+  the response, wrapped so that none of the four return sites can escape
+  counting and so that a request which raised is not counted as a response. The
+  database write is a per-day delta on a timer. What that trades away is stated
+  rather than hidden: a pod killed without a graceful stop loses up to one flush
+  interval, and `pending_flush` in the section is exactly how much is at risk at
+  that moment. A graceful stop drains first, so an ordinary rolling deploy loses
+  nothing, and a flush that fails hands its counts back to be retried rather
+  than dropping them.
+
+  The cause is read out of `degradation_reason` by a parser that lives beside
+  the formatter and shares its prefix constant, so the string cannot be
+  reshaped in one place and misread in another. A reason naming several
+  hydration causes counts under each, so the breakdown sums to at least the
+  degraded total — which is why the total is stored rather than derived.
+
+### A complete page is no longer called degraded
+
+- `degraded` now means the response is genuinely incomplete, which is what its
+  own documentation has always said it meant. A hydration fault whose dropped
+  candidate the refill loop replaced from the prefetch pool leaves the caller
+  with every result they asked for, and no longer raises the flag; a fault that
+  left the page short of the requested `limit` still does.
+
+  The flag was set from the presence of a fault and never reconciled against
+  what came back, so the dominant trigger had become an ordinary write race
+  rather than a component failure. `hydration_miss` fires whenever a hit
+  survives retrieval and its source row is gone by hydration — which is what an
+  ordinary delete or replace looks like from the search side — and the refill
+  loop exists precisely to absorb that. Consumers act on the flag: one renders
+  a warning, another empties the result list, and the agent-facing description
+  says the failure is transient and suggests retrying. On a complete page all
+  of that was wrong, and retrying a race that has already resolved returns a
+  response that is no longer degraded, which teaches callers the flag means
+  nothing.
+
+  The predicate is the conjunction, not the page length alone. The refill loop
+  drains the entire spare pool before it will return a short page, so
+  `returned == limit` is exactly the state in which every fault drop was
+  replaced, and `returned < limit` is exactly the state in which the pool ran
+  out with the page unfilled — where the page would have been longer without
+  the fault. A short page with no fault behind it stays unflagged: a corpus
+  with fewer matches than `limit`, or a page shortened by the archive filter,
+  has nothing wrong with it.
+
+- The fault does not disappear with the flag. A complete page reports it as
+  `recovered`: internal cause name → how many candidates that fault removed
+  before the refill replaced them, `{}` when the page needed no repair, and
+  always present. A chunk that pointed at a row that is gone is a
+  corpus-integrity signal worth keeping even when nothing was lost to the
+  caller, and a count is the right shape for it because nothing about the
+  response is wrong.
+
+  A drop is now reported in exactly one of three places, by what it did.
+  `excluded` — the request removed it, and retrying changes nothing.
+  `recovered` — a fault removed it and the page recovered. `degraded` /
+  `degradation_reason` — the response is genuinely short or empty. `recovered`
+  is populated only on a complete page, so it never names a fault that
+  `degradation_reason` is already naming.
+
+  Its keys are the internal cause names rather than a translated vocabulary,
+  unlike `excluded`. These five causes already reach the caller under exactly
+  these names inside `degradation_reason`; a second public word for them would
+  make one fault answer to two names depending on whether the page happened to
+  fill, which is the drift this series exists to remove. Both fields are built
+  from one classification table, so a cause cannot appear in both.
+
+### Archive scope is a filter, not a failure
+
+- A search that excludes an archived document — exactly as the default
+  `unarchived` scope is supposed to — no longer reports the retrieval service
+  as unavailable. The page can be complete when this happened: the refill loop
+  pulls a replacement from the prefetch pool, so the caller received every
+  result they asked for and was told the search had failed. Raising `limit` on
+  one unchanged query was enough to flip it, because the flag depended only on
+  whether an archived document happened to land in the pool.
+
+  The hydration drop counter is unchanged and still names every cause,
+  including this one, in the operational log. Only the conclusion drawn from it
+  changed: the five causes that mean something is wrong or stale still set the
+  flag, and a leg that raised still outranks them, but a filter honouring the
+  request does not. This is where general-purpose engines draw the same line —
+  Elasticsearch reserves `_shards.failed` and `timed_out` for components that
+  failed and searches cut short, Solr does the same with `partialResults`, and
+  in neither does a filter produce a degradation signal.
+
+  A short page remains visible as the gap between `total_matches` and
+  `returned`, and the next entry gives it a cause.
+
+### A short page now says why it is short
+
+- Search responses carry `excluded`: how many candidates a filter removed on
+  the way to this page, keyed by cause — `{"archived": 1}`. It is `{}` when
+  nothing was excluded, and always present, so a caller checks it for
+  emptiness rather than for presence.
+
+  Until now a caller who asked for `limit` results and received fewer had
+  nothing in the response that explained the difference. `total_matches` could
+  not: it is the size of the prefetch pool measured before hydration, and its
+  own documentation says so in as many words. `truncated` answers a different
+  question again — whether that pool hit its ceiling. The information existed,
+  counted and logged at the point of the drop, and simply never reached the
+  response; wiring it into the failure flag instead is what produced the
+  defect fixed above.
+
+  The two reasons a page comes back short are now one field each. `degraded`
+  means a component failed or a hit was lost to a stale row; `excluded` means
+  the request itself took documents out, which is not a fault and is not worth
+  retrying. No cause appears in both. This follows the shape general-purpose
+  engines use — Elasticsearch reports skipped and failed shards as structured
+  counts under `_shards` rather than as a boolean, and reports how many
+  documents matched separately — and the count, not another flag, is what a
+  caller can act on.
+
+  Its keys are public vocabulary translated from the internal counter names,
+  so renaming a diagnostic string is not a breaking API change. It counts
+  candidates considered for the page that was returned, including the refills
+  that replaced a filtered hit, and deliberately carries no name from the
+  `total_*` family, which describes the pool.
+
+### BM25 statistics
+
+- A recompute that cannot take the advisory lock retries briefly instead of
+  waiting a full refresh interval. A rolling restart leaves the replaced pod
+  holding the lock until it drains, so the replacement's first tick could find
+  it held by a process already leaving and then sleep six hours — three
+  restarts in a day left one deployment's statistics fifteen hours stale while
+  the corpus moved on. The retry is bounded and short: a lock still held after
+  it belongs to a recompute that is really running elsewhere, and skipping that
+  one is correct, because it publishes the statistics the tick wanted.
+
+### Indexing
+
+- A NUL byte in a body no longer costs the document its place in ranked search.
+  Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
+  does not, so indexing raised `CharacterNotInRepertoireError` on every attempt
+  until the retry ceiling abandoned the intent, leaving the document readable
+  and greppable but absent from ranked search. The byte is now removed where
+  every request model already normalizes user text, and again where chunks are
+  built — the second boundary is what lets bodies stored before this be indexed
+  without anyone finding and rewriting them. Nothing else about the text
+  changes, and a write is never refused for carrying one.
+
+### MCP transport
+
+- The legacy MCP transport is stateless. Its session lived in a per-process
+  dict in the SDK, so a client that initialized against one replica got
+  `Session not found` from the next — roughly half its calls on a two-replica
+  deployment. Nothing could make that dict shared: it holds live streams, not
+  data. The state is gone instead, which costs nothing here (this server
+  advertises `tools` with `listChanged: false`, answers with `json_response`,
+  never opens the standalone GET stream and never sends a server-to-client
+  request — the entire set stateless mode gives up). The modern era already
+  worked this way.
+- `initialize` no longer returns `Mcp-Session-Id`, and a legacy request no
+  longer needs one. Clients should send `MCP-Protocol-Version` on each request,
+  as the spec already asks: with no session to remember the handshake, that
+  header is what tells the server — and its audit trail — which revision an
+  exchange belongs to. The bundled proxy now sends it. `DELETE` keeps its
+  `{"terminated": true}` contract and reports success with no session to
+  release, rather than a 404 for one the client was never given.
+
+### Native public links
+
+- Native Document publications bind to vault-scoped Resource identity and read
+  the verified current revision. Moves preserve the selected document; soft
+  deletion revokes its links atomically. Existing verified cutover mappings
+  transfer old links without publishing a new occupant of a reused path.
+- Native section publications return no body or image grants when their section
+  disappears. Public status, unpublish, and oEmbed follow the same identity.
+  Migration 106 adds Native publication bindings and lifecycle enforcement.
+
+### Section-scoped publications
+
+- A section filter that no longer matches resolves to an empty body and an empty
+  image manifest on **every** revision backend, not only the
+  PostgreSQL-authoritative one. The two resolution paths previously disagreed,
+  so the same link disclosed a different amount depending on which backend
+  served it; they now share one rule. The viewer notice says the section is gone
+  rather than announcing a fallback that no longer happens.
+- A section-scoped publication derives its `summary` from the published section
+  instead of carrying the document's stored one. A stored summary describes the
+  whole document — written by the author, derived from its opening at create
+  time, or filled in by the LLM metadata worker on an imported document — and a
+  link cut for one section was never granted the rest of it. Publications
+  without a section filter are unchanged.
+
+### Native Document drill-down
+
+- Native drill-down and section outlines read the verified current Document
+  Head instead of the legacy document/chunk tables. Preserve pre-heading prose,
+  user-authored metadata-shaped text, empty headings, and repeated content in
+  bounded, non-overlapping sections.
+
+### Native grep consistency
+
+- Native grep supports explicit `include_text_files` reads across REST, MCP,
+  SDK and Search UI. The previous measurement option remains an alias; explicit
+  conflicting values fail validation. Resource aggregates accompany Document
+  counts, and File synchronization gaps return a readiness error instead of a
+  misleading empty or stale result.
+- MCP accepts multiple Vaults and the same metadata/lifecycle filters as REST.
+  REST/MCP output limits are aligned at 50. Document replacement rechecks write
+  access per mutation and retains partial receipts on CAS conflicts.
+
+- Native grep now uses the same Unicode case-insensitive matching rules for
+  literal reads and replacements. Full casefold expansions such as `ß`/`ss`
+  no longer match. Regex replacements operate on the same body lines as reads,
+  so anchors and whitespace cannot rewrite unpreviewed cross-line matches.
+- Case-insensitive literal scans and replacements use the existing bounded
+  process worker, including its execution deadline and result-size limits.
+- Native Document and File results retain body-relative line numbers and
+  resource type, searched revision, and content hash through REST/MCP responses.
+  Legacy execution and the prohibition on File grep replacement are unchanged.
+
 ### Safe account lifecycle
 
 Add identity-bound account lifecycle preview, paginated deletion blockers,
@@ -118,8 +531,8 @@ selects FOR the rare tail and a vault-path top-K would filter down to nothing.
 
 A hit excluded by scope no longer costs a result slot: the page is refilled
 from the rest of the deduped prefetch pool, and the drop is counted as
-`archive_scope_excluded` in the `hydration_dropped` degradation reason, so a
-genuinely short page (an exhausted pool) names its cause. Applying the
+`archive_scope_excluded`, so a genuinely short page (an exhausted pool) has a
+named cause in the operational log. Applying the
 predicate at hydration also closes the window where a document is archived
 between candidate selection and hydration.
 

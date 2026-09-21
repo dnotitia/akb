@@ -2022,6 +2022,7 @@ export interface SearchOptions {
   include_archived?: boolean;
   regex?: boolean;
   case_sensitive?: boolean;
+  include_text_files?: boolean;
 }
 
 function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal: boolean) {
@@ -2031,6 +2032,7 @@ function appendSearchOptions(p: URLSearchParams, options: SearchOptions, literal
   for (const tag of options.tags || []) p.append("tags", tag);
   if (options.include_archived !== undefined) p.set("include_archived", String(options.include_archived));
   if (literal) {
+    if (options.include_text_files) p.set("include_text_files", "true");
     if (options.regex !== undefined) p.set("regex", String(options.regex));
     if (options.case_sensitive !== undefined) p.set("case_sensitive", String(options.case_sensitive));
   } else if (options.source_type) p.set("source_type", options.source_type);
@@ -2050,10 +2052,14 @@ export const searchDocs = (
 };
 
 export interface GrepMatch {
+  line?: number | null;
   section: string | null;
   text: string;
 }
 export interface GrepDoc {
+  resource_type?: string | null;
+  revision?: string | null;
+  content_hash?: string | null;
   status?: string | null;
   uri: string;
   vault: string;
@@ -2067,6 +2073,8 @@ export interface GrepDoc {
 // matches than the response surfaces — switch to count_only or
 // files_with_matches at the agent / caller level (backend #76 / 0.2.4).
 export interface GrepResponse {
+  total_resources?: number;
+  returned_resources?: number;
   archive_scope?: ArchiveScope;
   pattern: string;
   regex: boolean;

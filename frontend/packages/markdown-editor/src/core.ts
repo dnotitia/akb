@@ -1,7 +1,9 @@
 import { Editor, type JSONContent } from '@tiptap/core'
 import { MarkdownManager } from '@tiptap/markdown'
+import { closeHistory } from '@tiptap/pm/history'
 
 import { createMarkdownExtensions } from './extensions.js'
+import { markdownTableCommands } from './table.js'
 import type {
   MarkdownCommands,
   MarkdownDocument,
@@ -116,7 +118,6 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
     element,
     editable = true,
     onChange,
-    onSlash,
   } = options
 
   const resolvedElement =
@@ -124,7 +125,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
 
   return new Editor({
     element: resolvedElement,
-    extensions: createMarkdownExtensions({ profile, onSlash }),
+    extensions: createMarkdownExtensions({ profile }),
     content: initialMarkdown,
     contentType: 'markdown',
     editable,
@@ -134,6 +135,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
 
 export function markdownCommands(editor: Editor): MarkdownCommands {
   return {
+    ...markdownTableCommands(editor),
     setMarkdown: markdown => editor.commands.setContent(markdown, { contentType: 'markdown' }),
     insertMarkdown: markdown =>
       editor.commands.insertContent(markdown, { contentType: 'markdown' }),
@@ -142,6 +144,72 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
         type: 'image',
         attrs: { target, alt, title: title ?? null },
       }),
+    replaceImageAt: (position, target, alt = '', title) => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        typeof target !== 'string' ||
+        !target ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .updateAttributes('image', { target, alt, title: title ?? null })
+        .focus()
+        .run()
+    },
+    setImageAltAt: (position, alt) => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        typeof alt !== 'string' ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .updateAttributes('image', { alt })
+        .focus()
+        .run()
+    },
+    deleteImageAt: position => {
+      if (
+        !editor.isEditable ||
+        !Number.isInteger(position) ||
+        position < 0 ||
+        editor.state.doc.nodeAt(position)?.type.name !== 'image'
+      ) {
+        return false
+      }
+
+      return editor
+        .chain()
+        .command(({ tr }) => {
+          closeHistory(tr)
+          return true
+        })
+        .setNodeSelection(position)
+        .deleteSelection()
+        .focus()
+        .run()
+    },
     setLink: href =>
       editor.chain().focus().extendMarkRange('link').setLink({ href }).run(),
     insertLink: (text, href) =>
@@ -164,6 +232,7 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
     toggleCode: () => editor.commands.toggleCode(),
     toggleBulletList: () => editor.commands.toggleBulletList(),
     toggleOrderedList: () => editor.commands.toggleOrderedList(),
+    toggleTaskList: () => editor.commands.toggleTaskList(),
     toggleBlockquote: () => editor.commands.toggleBlockquote(),
     toggleCodeBlock: () => editor.commands.toggleCodeBlock(),
     setHorizontalRule: () => editor.commands.setHorizontalRule(),

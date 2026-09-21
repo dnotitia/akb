@@ -26,11 +26,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from app.config import NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME, settings
+from app.config import settings
 from app.db.postgres import get_pool
 from app.services import sparse_encoder
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
 from app.services.index_service import generate_embeddings
+from app.services.search_capabilities import file_projection_enabled, native_derived_enabled
 from app.services.vector_store import VectorStoreUnavailable, get_vector_store
 from app.services.vector_store.base import has_dense
 
@@ -154,20 +155,8 @@ async def _process_once() -> int:
     # pipeline from durable native invalidation intents. This hook runs before
     # the normal claim so newly materialized chunks can be indexed in the same
     # pass; unguarded/default deployments never import or execute the consumer.
-    native_document_selected = settings.document_revision_backend in {
-        "postgres_native",
-        "native_ledger_m1",
-    }
-    native_file_measurement = settings.native_revision_m1_file_driver != "s3_current"
-    if (
-        native_document_selected
-        or (
-            native_file_measurement
-            and settings.native_revision_m1_measurement_only
-            and settings.db_name == NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME
-        )
-    ):
-        if settings.document_revision_backend == "postgres_native":
+    if native_derived_enabled(settings):
+        if file_projection_enabled(settings):
             from app.services.native_file_projection import NativeFileProjectionWorker
 
             native_processed += await NativeFileProjectionWorker(pool).process_once()
@@ -239,7 +228,9 @@ async def _process_once() -> int:
     for position, (row, dense) in enumerate(zip(batch, embeddings_padded)):
         content = row["content"] or ""
         try:
-            sparse_idx, sparse_vals = await sparse_encoder.encode_document(content)
+            sparse_idx, sparse_vals = await sparse_encoder.encode_document(
+                content, sparse_shape=getattr(store, "sparse_shape", None),
+            )
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"],

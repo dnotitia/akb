@@ -1,16 +1,18 @@
-import { useState } from "react";
+import { useState, type RefObject } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ConnectionSetup } from "@/components/connection-setup";
+import { isModalOpen } from "@/lib/modal-visibility";
 
 export const QUICKSTART_DISMISS_KEY = "akb.quickstartDismissed";
 
-export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthEnabled }: {
+export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthEnabled, returnFocusRef }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onTokenCreated?: () => void;
   mcpOauthEnabled: boolean;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [hasSecret, setHasSecret] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -28,7 +30,16 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
   }
   return <>
     <Dialog open={open} onOpenChange={requestClose}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl" onCloseAutoFocus={event => {
+        if (!returnFocusRef) return;
+        event.preventDefault();
+        // The floating trigger becomes visible after the last modal releases
+        // ownership. Never steal focus from another modal or a new route.
+        requestAnimationFrame(() => {
+          const target = returnFocusRef.current;
+          if (target?.isConnected && !isModalOpen()) target.focus({ preventScroll: true });
+        });
+      }}>
         <DialogHeader>
           <DialogTitle>Connect an agent</DialogTitle>
           <DialogDescription>Choose your AI tool, add AKB, then try a read-only request.</DialogDescription>

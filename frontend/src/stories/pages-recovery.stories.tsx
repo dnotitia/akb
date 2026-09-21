@@ -25,8 +25,8 @@ export const AppRouteNotFound: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText(/Page not found/i)).toBeInTheDocument();
-    await expect(await canvas.findByRole("navigation", { name: "Primary" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Page not found" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },
 };

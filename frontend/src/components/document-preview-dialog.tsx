@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId } from "@/lib/document-preview-navigation";
+import { isModalOpen } from "@/lib/modal-visibility";
 
 function readWorkspaceLeftOffset() {
   if (typeof document === "undefined" || typeof window === "undefined") return 32;
@@ -42,13 +43,6 @@ export function DocumentPreviewDialog() {
     if (closingRef.current) return;
     closingRef.current = true;
     navigate(-1);
-    if (!returnFocusId) return;
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        (document.getElementById(returnFocusId) ??
-          (returnFocusFallbackId ? document.getElementById(returnFocusFallbackId) : null))?.focus();
-      });
-    });
   }
 
   return (
@@ -78,7 +72,17 @@ export function DocumentPreviewDialog() {
           event.preventDefault();
           contentRef.current?.focus();
         }}
-        onCloseAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          if (!closingRef.current || !returnFocusId) return;
+          // Navigation can commit later than a fixed number of frames. Wait
+          // until the dialog's focus scope actually releases the background.
+          window.requestAnimationFrame(() => {
+            if (isModalOpen()) return;
+            (document.getElementById(returnFocusId) ??
+              (returnFocusFallbackId ? document.getElementById(returnFocusFallbackId) : null))?.focus({ preventScroll: true });
+          });
+        }}
       >
         <DialogTitle className="sr-only">Document preview</DialogTitle>
         <DialogDescription className="sr-only">

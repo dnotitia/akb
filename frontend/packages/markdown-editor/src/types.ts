@@ -1,5 +1,8 @@
 import type { Editor, EditorOptions, FocusPosition, JSONContent } from '@tiptap/core'
 import type { MarkdownExtensionOptions } from '@tiptap/markdown'
+import type { MarkdownTableCommands, MarkdownTableState } from './table.js'
+
+export type { MarkdownTableInsertionOptions, MarkdownTableState } from './table.js'
 
 export type MarkdownProfile = 'structured' | 'preserve'
 
@@ -30,7 +33,16 @@ export type MarkdownTargetResolution =
       status: 'available'
       /** Short-lived runtime URL; never serialized to Markdown. */
       runtimeUrl: string
+      /**
+       * Optional expiry for the runtime URL. Consumers re-resolve before this
+       * instant and keep the canonical target in the editor model.
+       */
+      expiresAt?: string
       label?: string
+      /** Release short-lived runtime resources owned by this resolution. */
+      release?: () => void
+      /** Retry a runtime resource after a browser decode/request failure. */
+      refresh?: (context?: MarkdownTargetRefreshContext) => Promise<MarkdownTargetResolution>
     }
   | {
       target: string
@@ -40,6 +52,26 @@ export type MarkdownTargetResolution =
       label?: string
     }
 
+export interface MarkdownTargetRefreshContext {
+  signal?: AbortSignal
+}
+
+export interface MarkdownImageLabels {
+  loading: (alt: string) => string
+  unavailable: (alt: string) => string
+}
+
+export interface MarkdownImageClassNames {
+  frame?: string
+  image?: string
+  message?: string
+}
+
+export interface MarkdownImageOptions {
+  labels?: Partial<MarkdownImageLabels>
+  classNames?: MarkdownImageClassNames
+}
+
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile
   markedOptions?: MarkdownExtensionOptions['markedOptions']
@@ -47,7 +79,8 @@ export interface MarkdownParseOptions {
 
 export interface MarkdownUploadContext {
   vault?: string
-  documentId?: string
+  document?: string
+  commit?: string
   draftId?: string
   target?: string
   signal?: AbortSignal
@@ -88,6 +121,11 @@ export interface MarkdownUploadBatchResult {
   partial: boolean
 }
 
+export interface MarkdownUploadBatchOptions {
+  onFileStart?: (file: Blob, index: number, total: number) => void
+  onFileSettled?: (item: MarkdownUploadItem, index: number, total: number) => void
+}
+
 export interface MarkdownSearchResult {
   id: string
   title: string
@@ -104,6 +142,67 @@ export interface MarkdownSearchAdapter {
 export interface MarkdownSearchContext {
   vault?: string
   signal?: AbortSignal
+}
+
+export type MarkdownReferenceKind = 'person' | 'issue' | 'document' | 'file'
+
+/**
+ * A candidate returned by the product's common `@` reference search.
+ *
+ * `value` is the exact plain-text Markdown value to insert for people and
+ * issues. Document and file candidates must provide a durable `target`; the
+ * editor never turns a runtime or signed URL into stored Markdown.
+ */
+export interface MarkdownReferenceCandidate {
+  id: string
+  kind: MarkdownReferenceKind
+  title: string
+  subtitle?: string
+  snippet?: string
+  target?: string
+  value?: string
+}
+
+export interface MarkdownReferenceContext extends MarkdownSearchContext {
+  document?: string
+  commit?: string
+}
+
+export interface MarkdownReferenceAdapter {
+  search(
+    query: string,
+    context?: MarkdownReferenceContext,
+  ): Promise<readonly MarkdownReferenceCandidate[]>
+}
+
+export interface MarkdownReferenceLabels {
+  header: string
+  escapeHint: string
+  sections: Record<MarkdownReferenceKind, string>
+  searching: string
+  empty: string
+  error: string
+  footer: {
+    navigation: string
+    insert: string
+    close: string
+  }
+}
+
+export interface MarkdownReferenceOptions {
+  adapter: MarkdownReferenceAdapter
+  context?: Omit<MarkdownReferenceContext, 'signal'>
+  labels?: {
+    header?: string
+    escapeHint?: string
+    searching?: string
+    empty?: string
+    error?: string
+    sections?: Partial<Record<MarkdownReferenceKind, string>>
+    footer?: Partial<MarkdownReferenceLabels['footer']>
+  }
+  className?: string
+  onOpenChange?: (open: boolean, dismiss?: () => void) => void
 }
 
 /**
@@ -149,9 +248,43 @@ export interface MarkdownAdapters {
   targetResolver?: MarkdownTargetResolver
 }
 
-export interface MarkdownSlashContext {
-  editor: Editor
-  position: number
+export type MarkdownSlashCommandCategory = 'text' | 'lists' | 'structure'
+
+export type MarkdownSlashCommandId =
+  | 'heading1'
+  | 'heading2'
+  | 'heading3'
+  | 'quote'
+  | 'bulletList'
+  | 'numberedList'
+  | 'taskList'
+  | 'table'
+  | 'codeBlock'
+  | 'divider'
+
+export interface MarkdownSlashCommandMessages {
+  header: string
+  escapeHint: string
+  sections: Record<MarkdownSlashCommandCategory, string>
+  footer: {
+    navigation: string
+    insert: string
+    close: string
+  }
+  empty: string
+  commands: Record<
+    MarkdownSlashCommandId,
+    {
+      label: string
+      description: string
+    }
+  >
+}
+
+export interface MarkdownSlashCommandOptions {
+  messages?: MarkdownSlashCommandMessages
+  /** Keeps a surrounding Dialog/Sheet open while the menu consumes Escape. */
+  onOpenChange?: (open: boolean, dismiss?: () => void) => void
 }
 
 export type MarkdownHeadingLevel = 1 | 2 | 3
@@ -162,13 +295,18 @@ export interface MarkdownEditorConfig extends MarkdownParseOptions {
   element?: EditorOptions['element']
   adapters?: MarkdownAdapters
   onChange?: (markdown: string, editor: Editor) => void
-  onSlash?: (context: MarkdownSlashContext) => void
 }
 
-export interface MarkdownCommands {
+export interface MarkdownCommands extends MarkdownTableCommands {
   setMarkdown(markdown: string): boolean
   insertMarkdown(markdown: string): boolean
   insertImage(target: string, alt?: string, title?: string): boolean
+  /** Replace one image occurrence at this ProseMirror document position. */
+  replaceImageAt(position: number, target: string, alt?: string, title?: string): boolean
+  /** Update only the image node at this ProseMirror document position. */
+  setImageAltAt(position: number, alt: string): boolean
+  /** Remove only the image node at this ProseMirror document position. */
+  deleteImageAt(position: number): boolean
   setLink(href: string): boolean
   insertLink(text: string, href: string): boolean
   unsetLink(): boolean
@@ -180,6 +318,7 @@ export interface MarkdownCommands {
   toggleCode(): boolean
   toggleBulletList(): boolean
   toggleOrderedList(): boolean
+  toggleTaskList(): boolean
   toggleBlockquote(): boolean
   toggleCodeBlock(): boolean
   setHorizontalRule(): boolean
@@ -199,6 +338,7 @@ export interface MarkdownActiveState {
   code: boolean
   bulletList: boolean
   orderedList: boolean
+  taskList: boolean
   blockquote: boolean
   codeBlock: boolean
   link: boolean
@@ -218,6 +358,7 @@ export interface MarkdownState {
   markdown: string
   isEmpty: boolean
   isEditable: boolean
+  table: MarkdownTableState
   active: MarkdownActiveState
   link: MarkdownLinkState
   canUndo: boolean

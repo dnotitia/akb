@@ -147,6 +147,21 @@ def vault_document_count_sql() -> str:
     return _VAULT_COUNT_NATIVE if native_documents_are_authoritative() else _VAULT_COUNT_LEGACY
 
 
+def scoped_document_count_sql() -> str:
+    """Count documents in an authorized UUID array bound to `$1`.
+
+    Empty arrays return zero. This is a set aggregate, not a per-Vault detail
+    fanout; archived documents retain the same counting semantics as above.
+    """
+    if native_documents_are_authoritative():
+        return (
+            "SELECT COUNT(*) FROM native_resources "
+            "WHERE namespace_id = ANY($1::uuid[]) "
+            "AND surface = 'document' AND lifecycle = 'live'"
+        )
+    return "SELECT COUNT(*) FROM documents WHERE vault_id = ANY($1::uuid[])"
+
+
 def vault_last_activity_sql() -> str:
     """Newest `(updated_at, created_by)` in a vault, bound to `$1 = vault id`."""
     return (

@@ -103,10 +103,12 @@ for (const width of [1440, 1024, 640, 375]) for (const dark of [false, true]) {
     await expect(reader).toBeVisible();
     await expect(panel).toHaveCount(0);
     expect(writes).toEqual([{ read: true, version: "v1" }]);
-    const watch = reader.getByRole("button", { name: "Watch", exact: true });
+    await reader.getByRole("button", { name: /^Actions for / }).click();
+    const watch = page.getByRole("menuitemcheckbox", { name: "Watch", exact: true });
     await expect(watch).toBeEnabled();
     await watch.click();
-    await expect(reader.getByRole("button", { name: "Unwatch", exact: true })).toBeVisible();
+    await expect(page.getByRole("menuitemcheckbox", { name: "Unwatch", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
     await page.keyboard.press("Escape");
     await expect(page).toHaveURL(/\/notifications\?state=all/);
     await expect(page.getByRole("button", { name: "Notifications, 0 unread" })).toBeFocused();

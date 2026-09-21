@@ -1,4 +1,5 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { flushSync } from "react-dom";
 import {
   Link,
@@ -11,26 +12,16 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
-  Box,
   CheckCircle2,
   ChevronRight,
-  Clock3,
-  ExternalLink,
-  FileText,
-  FolderTree,
   GitCompareArrows,
-  GitCommitHorizontal,
   History,
   Info,
   Link2,
   ListTree,
-  Loader2,
-  Lock,
   Maximize2,
   PanelRightClose,
-  PanelRightOpen,
   Pencil,
-  Share2,
 } from "lucide-react";
 import {
   ApiError,
@@ -47,7 +38,7 @@ import {
   unpublishDoc,
   updateDocument,
 } from "@/lib/api";
-import { cn, timeAgo } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { DocumentWatch } from "@/components/document-watch";
 import { WorkspacePin } from "@/components/workspace-pin";
@@ -56,6 +47,12 @@ import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
+import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentSummary } from "@/components/document-reading-controls";
+import { DocumentPublicationControl } from "@/components/document-publication-control";
+import { ResourceCommandRow } from "@/components/resource-command-row";
+import { ResourceBreadcrumb } from "@/components/resource-breadcrumb";
+import { usePublishResourceLocation } from "@/contexts/resource-location-context";
+import { useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { SummaryFold } from "@/components/summary-fold";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -74,7 +71,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
 import { relationIsInVault } from "@/components/relations/relation-row-utils";
-import { useCurrentUser } from "@/contexts/current-user-context";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
@@ -153,11 +150,21 @@ interface DocumentPageProps {
   presentation?: "page" | "preview";
 }
 
-export default function DocumentPage({
+export default function DocumentPage(props: DocumentPageProps) {
+  const user = useCurrentUser();
+  // Local drafts and editor state must never survive an account switch.
+  return <DocumentPageContent key={user?.user_id ?? "anonymous"} {...props} />;
+}
+
+function DocumentPageContent({
   presentation = "page",
 }: DocumentPageProps) {
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
+  const { checking: accessChecking, revision: accessRevision } = useAccessVerification();
+  const resourceScope = JSON.stringify([name, id, currentUser?.user_id, accessRevision]);
+  const viewId = useId();
+  const [readingWidth, setReadingWidth] = useState<"standard" | "wide">("standard");
   const navigate = useNavigate();
   const routeLocation = useLocation();
   const queryClient = useQueryClient();
@@ -182,15 +189,13 @@ export default function DocumentPage({
   const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [pendingView, setPendingView] = useState<DocView | null>(null);
+  const [pendingNavigation, setPendingNavigation] = useState<string | null>(null);
+  const navigationFocusRef = useRef<HTMLElement | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
-  const [docOverride, setDocOverride] = useState<any>(null);
-  const [publishing, setPublishing] = useState(false);
-  const [publishError, setPublishError] = useState("");
-  const [copied, setCopied] = useState(false);
+  const [override, setOverride] = useState<{ scope: string; value: any } | null>(null);
+  const docOverride = override?.scope === resourceScope ? override.value : null;
+  const setDocOverride = (value: any) => setOverride(value ? { scope: resourceScope, value } : null);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
-  const [vaultRole, setVaultRole] = useState<string | null>(null);
-  const [vaultKind, setVaultKind] = useState<"normal" | "mirror" | "error" | null>(null);
-  const [vaultReadOnly, setVaultReadOnly] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -200,8 +205,15 @@ export default function DocumentPage({
   const [publishOpen, setPublishOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("info");
-  const detailsToggleRef = useRef<HTMLButtonElement | null>(null);
+  const actionsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const publicationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
+  const transferDetailsFocusRef = useRef(false);
+  const openDetailsFromMenu = (tab: typeof detailsTab) => {
+    transferDetailsFocusRef.current = true;
+    setDetailsTab(tab);
+    setDetailsOpen(true);
+  };
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const editTitleRef = useRef<HTMLInputElement | null>(null);
@@ -270,6 +282,15 @@ export default function DocumentPage({
   const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
   const isDirty = contentChanged || titleChanged;
   const hasUnsavedWork = isDirty || uploadingImage || unclaimedAssetIds.length > 0;
+  const confirmResourceNavigation = useCallback((href: string) => {
+    setPendingNavigation(href);
+    return false;
+  }, []);
+  useResourceNavigationGuard(
+    presentation === "page" && view === "edit" && (hasUnsavedWork || savingBody)
+      ? confirmResourceNavigation
+      : null,
+  );
 
   useEffect(() => {
     editingSnapshotRef.current = {
@@ -436,36 +457,27 @@ export default function DocumentPage({
     setView("edit");
   }
 
-  useEffect(() => {
-    if (!name) return;
-    setVaultRole(null);
-    setVaultKind(null);
-    setVaultReadOnly(true);
-    getVaultInfo(name)
-      .then((d) => {
-        setVaultRole(d?.role || null);
-        setVaultKind(d?.is_external_git ? "mirror" : "normal");
-        setVaultReadOnly(Boolean(d?.is_archived || d?.is_external_git));
-      })
-      .catch(() => {
-        setVaultRole(null);
-        setVaultKind("error");
-        setVaultReadOnly(true);
-      });
-  }, [name]);
+  const vaultInfoQuery = useQuery({
+    queryKey: ["document-vault-info", name, currentUser?.user_id, accessRevision],
+    queryFn: () => getVaultInfo(name!),
+    enabled: Boolean(name) && !accessChecking,
+    retry: false,
+  });
+  const verifiedVault = !accessChecking && !vaultInfoQuery.isError ? vaultInfoQuery.data : null;
+  const vaultRole = verifiedVault?.role ?? null;
+  const vaultKind = vaultInfoQuery.isError ? "error" : verifiedVault ? (verifiedVault.is_external_git ? "mirror" : "normal") : null;
+  const vaultReadOnly = !verifiedVault || Boolean(verifiedVault.is_archived || verifiedVault.is_external_git);
 
   useEffect(() => {
     if (!detailsOpen) return;
 
-    const focusFrame = window.matchMedia?.("(max-width: 1023px)").matches
-      ? window.requestAnimationFrame(() => detailsCloseRef.current?.focus())
-      : null;
+    const focusFrame = window.requestAnimationFrame(() => detailsCloseRef.current?.focus());
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       setDetailsOpen(false);
-      window.requestAnimationFrame(() => detailsToggleRef.current?.focus());
+      window.requestAnimationFrame(() => actionsTriggerRef.current?.focus());
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -483,9 +495,9 @@ export default function DocumentPage({
   }, [view]);
 
   const docQuery = useQuery({
-    queryKey: ["document", name, docId, documentVersion],
+    queryKey: ["document", name, docId, documentVersion, currentUser?.user_id, accessRevision],
     queryFn: () => getDocument(name!, docId, documentVersion),
-    enabled: !!name && !!docId,
+    enabled: !!name && !!docId && !accessChecking,
     retry: false,
   });
 
@@ -501,6 +513,26 @@ export default function DocumentPage({
   }, [docId, name, queryClient]);
 
   const doc = docOverride ?? docQuery.data ?? null;
+  useEffect(() => {
+    // Access verification intentionally removes the previous query's data.
+    // If that temporarily unmounts a dirty editor, seed its next mount from
+    // the in-memory draft, not the original server body. This does not carry
+    // authorized resource data across scopes; a new resource resets the seed
+    // in the identity hydration effect below.
+    if (!doc && view === "edit" && documentIdentityRef.current) {
+      setEditorInitialContent(editingSnapshotRef.current.content);
+      editorHydrationModeRef.current = "draft";
+    }
+  }, [doc, view]);
+  // Publish only the current query's resolved identity, never an optimistic
+  // override left over from the preceding resource or a denied background read.
+  const resolvedLocation = name && docQuery.data && !docQuery.isError && !accessChecking ? {
+    vault: name,
+    title: docQuery.data.title || "Untitled document",
+    kind: "Document" as const,
+    collectionPath: documentCollection(docQuery.data.path || ""),
+  } : null;
+  usePublishResourceLocation(resolvedLocation, presentation === "page");
   const historyQuery = useQuery({
     queryKey: ["document-history", name, doc?.path],
     queryFn: () => getDocumentHistoryWithFallback(name!, doc!.path, 20),
@@ -571,9 +603,9 @@ export default function DocumentPage({
   // genuinely older one. The key matches the un-pinned docQuery key so the two
   // share a cache entry rather than double-fetching HEAD.
   const headQuery = useQuery({
-    queryKey: ["document", name, docId, undefined],
+    queryKey: ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
     queryFn: () => getDocument(name!, docId),
-    enabled: !!name && !!docId && !!commitHash && !isDiffMode,
+    enabled: !!name && !!docId && !!commitHash && !isDiffMode && !accessChecking,
     retry: false,
   });
   const headCommit = commitHash
@@ -592,6 +624,21 @@ export default function DocumentPage({
     !isHistorical &&
     !isDiffMode &&
     (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
+
+  // Publishing has its own policy: the guide's owner-only editing restriction
+  // does not apply to public links, but historical/diff views must not publish HEAD.
+  const publishDisabledReason = accessChecking || vaultInfoQuery.isPending
+    ? "Checking publishing access…"
+    : !verifiedVault ? "Publishing access could not be verified."
+    : isHistorical || isDiffMode ? "Open the latest document to manage public links."
+    : verifiedVault.is_archived ? "Restore this Vault before managing public links."
+    : verifiedVault.is_external_git ? "External Git vaults are read-only."
+    : !["writer", "admin", "owner"].includes(vaultRole ?? "") ? "Writer access or higher is required to publish."
+    : undefined;
+
+  useEffect(() => {
+    if (publishDisabledReason) setPublishOpen(false);
+  }, [publishDisabledReason]);
 
   const selectedHistoryIndex = useMemo(
     () =>
@@ -982,7 +1029,7 @@ export default function DocumentPage({
       setBaseCommit(latest.current_commit);
       setDocOverride(latest);
       queryClient.setQueryData(
-        ["document", name, docId, undefined],
+        ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
         latest,
       );
       setLatestServer(null);
@@ -1015,6 +1062,10 @@ export default function DocumentPage({
     titleConflictPolicy: "allow" | "reject" = "reject",
   ) {
     if (!name || !docId || uploadingImage) return;
+    if (!canEdit) {
+      setBodyError("Editing is unavailable with the current vault access. Your draft is preserved.");
+      return;
+    }
     setTitleTouched(true);
     if (!normalizedEditingTitle) {
       window.requestAnimationFrame(() => editTitleRef.current?.focus());
@@ -1070,7 +1121,7 @@ export default function DocumentPage({
       setBaseCommit(savedCommit);
       setDocOverride(nextDoc);
       queryClient.setQueryData(
-        ["document", name, docId, undefined],
+        ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
         (cached: Record<string, unknown> | undefined) => ({
           ...(cached || {}),
           ...nextDoc,
@@ -1251,6 +1302,43 @@ export default function DocumentPage({
     setSaveConflict(null);
   }
 
+  // Same-account access verification can temporarily remove authorized query
+  // data while preserving editor state. Its navigation confirmation must stay
+  // available even when the resource itself shows loading or an access error.
+  const navigationDialog = (
+    <ConfirmDialog
+      open={pendingNavigation !== null}
+      onOpenChange={(open) => !open && setPendingNavigation(null)}
+      title="Leave this document?"
+      description={savingBody
+        ? "Your document is still saving. Wait for the save to finish before leaving."
+        : uploadingImage
+          ? "An image is still uploading. Wait for the upload to finish before leaving."
+          : hasUnsavedWork
+            ? draftStatus === "error" || draftStatus === "unavailable"
+              ? "Your changes have not been saved to the Vault, and this browser could not save a local draft. If you leave, these changes may be lost."
+              : "Your changes have not been saved to the Vault. A local draft may be available in this browser, but recovery depends on browser storage and draft or attachment expiry."
+            : "There are no unsaved document changes. You can now leave this page."}
+      confirmLabel="Leave document"
+      confirmDisabled={savingBody || uploadingImage}
+      cancelLabel="Keep editing"
+      variant="destructive"
+      returnFocusRef={doc && view === "edit" && !savingBody ? editTitleRef : navigationFocusRef}
+      onConfirm={() => {
+        if (savingBody || uploadingImage) {
+          throw new Error(savingBody
+            ? "Wait for the document save to finish before leaving."
+            : "Wait for the image upload to finish before leaving.");
+        }
+        const destination = pendingNavigation;
+        setPendingNavigation(null);
+        // The existing unmount handler attempts draft persistence. Leaving is
+        // not a discard: do not clear local drafts or delete uploaded assets.
+        if (destination) navigate(destination);
+      }}
+    />
+  );
+
   // The vault guide is system-managed: its only editing surface is the guide
   // section in vault settings, so the plain full-page viewer bounces there.
   // Search preview is exempt so every document result keeps the same modal
@@ -1272,7 +1360,7 @@ export default function DocumentPage({
   if (docQuery.isError && !doc) {
     const errorMsg = (docQuery.error as Error)?.message ?? "Unknown error";
     return (
-      <div className="py-8 fade-up">
+      <div ref={(element) => { navigationFocusRef.current = element; }} tabIndex={-1} className="py-8 fade-up">
         <div className="coord-spark mb-2">⚠ Error</div>
         <p className="text-destructive mb-6 max-w-xl">{errorMsg}</p>
         <Button asChild variant="outline">
@@ -1281,37 +1369,19 @@ export default function DocumentPage({
             Back to {name}
           </Link>
         </Button>
+        {navigationDialog}
       </div>
     );
   }
 
   if (!doc) {
-    return <DocumentPageLoading presentation={presentation} />;
+    return <><DocumentPageLoading presentation={presentation} />{navigationDialog}</>;
   }
 
   async function handleUnpublish() {
-    setPublishing(true);
-    setPublishError("");
-    try {
-      await unpublishDoc(name!, docId);
-      setDocOverride({ ...doc, is_public: false, public_slug: null });
-    } catch (e: any) {
-      setPublishError(e?.message || "Failed to unpublish");
-    }
-    setPublishing(false);
-  }
-
-  async function copyPublicLink() {
-    const url = `${location.origin}/p/${doc.public_slug}`;
-    // clipboard is undefined on insecure (plain-HTTP) origins — guard so the
-    // copy never throws an unhandled rejection and the UI doesn't stick.
-    try {
-      await navigator.clipboard?.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* clipboard blocked — link stays visible to copy manually */
-    }
+    if (publishDisabledReason) throw new Error(publishDisabledReason);
+    await unpublishDoc(name!, docId);
+    setDocOverride({ ...doc, is_public: false, public_slug: null });
   }
 
   const commitShort = (commitHash || headCommit)?.slice(0, 7);
@@ -1367,133 +1437,106 @@ export default function DocumentPage({
 
   const closeDetails = () => {
     setDetailsOpen(false);
-    window.requestAnimationFrame(() => detailsToggleRef.current?.focus());
+    window.requestAnimationFrame(() => actionsTriggerRef.current?.focus());
   };
 
   return (
     <>
       <section
         aria-label="Document workspace"
-        className="flex h-full min-h-0 flex-col overflow-hidden bg-background fade-in"
+        className="@container/reader flex h-full min-h-0 flex-col overflow-hidden bg-surface"
         data-presentation={presentation}
       >
-        <header
-          className={cn(
-            "relative z-[var(--z-sticky)] flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface pl-3 sm:pl-4 lg:pl-5",
-            presentation === "preview"
-              ? "pr-12 sm:pr-14"
-              : "pr-3 sm:pr-4 lg:pr-5",
+        <h1 id="doc-title" className="sr-only">{doc.title || "Untitled document"}</h1>
+        {presentation === "preview" && (
+          <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border bg-surface py-1 pl-4 pr-12 sm:pr-14">
+            {resolvedLocation ? <ResourceBreadcrumb className="flex-1" location={resolvedLocation} /> : <span className="flex-1 text-sm text-foreground-muted">Document</span>}
+            <Button type="button" variant="ghost" size="sm" className="h-11 shrink-0 gap-2 text-link sm:h-9"
+              onClick={() => openFullPage(view)} aria-label="Open document in vault">
+              <span>Open in vault</span><Maximize2 className="h-4 w-4" aria-hidden />
+            </Button>
+          </div>
+        )}
+        <ResourceCommandRow
+          appearance="reader"
+          meta={inEditMode ? (
+            <span role="status" aria-live="polite" className="text-xs text-foreground-muted">
+              {accessChecking || vaultInfoQuery.isPending ? "Checking access…" : !canEdit ? "Read-only · Draft preserved" : uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : draftStatus === "saving" ? "Saving draft locally…" : draftStatus === "saved" ? "Draft saved locally" : "No changes"}
+            </span>
+          ) : (
+            <div className="flex min-w-0 items-center gap-3">
+              {doc.status === "draft" && !isHistorical && !isDiffMode && <Badge variant="draft">Draft</Badge>}
+              {savedAt && <span role="status" className="inline-flex shrink-0 items-center gap-1 text-xs text-success"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Saved</span>}
+              <span className="hidden @[48rem]/reader:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
+              <span className="hidden min-w-0 @[72rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
+            </div>
           )}
         >
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-primary/20 bg-surface-selected text-surface-selected-foreground sm:flex">
-              <FileText className="h-4 w-4" aria-hidden />
+          {inEditMode ? <>
+            <Button ref={cancelEditButtonRef} type="button" variant="outline" size="sm" data-reader-control onClick={handleCancelBody} disabled={savingBody}>Cancel</Button>
+            <Button type="button" variant="accent" size="sm" aria-label="Save changes" loading={savingBody}
+              data-reader-control onClick={() => void handleSaveDocument("reject")} disabled={!canEdit || uploadingImage || !isDirty}>
+              {savingBody ? "Saving…" : "Save changes"}
+            </Button>
+          </> : <>
+            {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
+            <div role="group" aria-label="Document actions" className={cn("document-command-group", !isDiffMode && "document-command-divider")}>
+              <DocumentCopyButton content={doc.content || ""} />
+              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
+                <Pencil className="h-4 w-4" aria-hidden />
+              </DocumentIconButton>}
             </div>
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <h1 id="doc-title" className="truncate font-display text-base font-semibold text-foreground sm:text-lg">
-                  {doc.title}
-                </h1>
-                {isDiffMode ? (
-                  <Badge variant="info-outline">Comparing</Badge>
-                ) : isHistorical ? (
-                  <Badge variant="warning">Historical</Badge>
-                ) : (
-                  <Badge variant={doc.status === "archived" ? "archived" : doc.status === "draft" ? "draft" : "active"}>
-                    {doc.status || "Current"}
-                  </Badge>
-                )}
-              </div>
-              <p className="truncate text-xs text-foreground-muted">
-                {presentation === "preview" ? (
-                  <Link
-                    to={`/vault/${name}`}
-                    aria-label={`Open ${name} Vault overview`}
-                    className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] font-medium text-link transition-token hover:text-link-hover hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-                  >
-                    <Box className="h-3 w-3" aria-hidden />
-                    {name}
-                  </Link>
-                ) : (
-                  <span className="inline-flex items-center gap-1 font-medium text-foreground">
-                    <Box className="h-3 w-3" aria-hidden />
-                    {name}
-                  </span>
-                )}
-                <span aria-hidden> · </span>
-                <span>{collectionPath}</span>
-              </p>
+            <div role="group" aria-label="Publishing and more options" className="document-command-group">
+            <DocumentPublicationControl key={resourceScope} vault={name!}
+              publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
+              disabledReason={publishDisabledReason} onPublish={() => setPublishOpen(true)}
+              onUnpublish={handleUnpublish} triggerRef={publicationTriggerRef} />
+            <ResourceActionsMenu
+              triggerRef={actionsTriggerRef}
+              resourceName={doc.title || fileName}
+              archiveAction={doc.status === "archived" ? "restore" : "archive"}
+              archiveDisabledReason={archiveDisabledReason}
+              onArchiveAction={() => setArchiveOpen(true)}
+              moveLabel="Move document"
+              onMove={moveDisabledReason ? undefined : () => setMoveOpen(true)}
+              moveDisabledReason={moveDisabledReason || undefined}
+              deleteLabel={canDelete ? "Delete document" : undefined}
+              onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
+              readerControl
+              onCloseAutoFocus={event => {
+                if (!transferDetailsFocusRef.current) return;
+                transferDetailsFocusRef.current = false;
+                event.preventDefault();
+                window.requestAnimationFrame(() => detailsCloseRef.current?.focus());
+              }}
+            >
+              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("info")}
+                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
+                <Info className="h-4 w-4 text-foreground-muted" aria-hidden />Document info
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("outline")}
+                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
+                <ListTree className="h-4 w-4 text-foreground-muted" aria-hidden />Table of contents
+              </DropdownMenu.Item>
+              {!isHistorical && !isDiffMode && <DocumentWatch key={docUri(name!, doc.path)} uri={docUri(name!, doc.path)} presentation="menu" />}
+              {!isHistorical && !isDiffMode && <WorkspacePin item={{ kind: "document", vault: name!, path: doc.path, title: doc.title || doc.path }} presentation="menu" />}
+              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("history")}
+                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
+                <History className="h-4 w-4 text-foreground-muted" aria-hidden />History
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator className="my-1 h-px bg-border" />
+              <DropdownMenu.Label className="px-2.5 py-1.5 text-xs text-foreground-muted">Reading width</DropdownMenu.Label>
+              <DropdownMenu.RadioGroup value={readingWidth} onValueChange={value => setReadingWidth(value as "standard" | "wide")} aria-label="Reading width">
+                {(["standard", "wide"] as const).map(width => <DropdownMenu.RadioItem key={width} value={width}
+                  className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
+                  <span className="w-4"><DropdownMenu.ItemIndicator><CheckCircle2 className="h-4 w-4 text-link" aria-hidden /></DropdownMenu.ItemIndicator></span>
+                  {width === "standard" ? "Standard" : "Wide"}
+                </DropdownMenu.RadioItem>)}
+              </DropdownMenu.RadioGroup>
+            </ResourceActionsMenu>
             </div>
-          </div>
-
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <div className="mr-1 hidden items-center gap-2 text-xs text-foreground-muted xl:flex" role="status" aria-live="polite">
-              {savedAt ? (
-                <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden />
-              ) : (
-                <GitCommitHorizontal className="h-3.5 w-3.5" aria-hidden />
-              )}
-              <span>{savedAt ? "Saved just now" : doc.updated_at ? `Changed ${timeAgo(doc.updated_at)}` : "Versioned in Git"}</span>
-            </div>
-            {presentation === "preview" && !inEditMode && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => openFullPage(view)}
-                aria-label="Open document in vault"
-              >
-                <Maximize2 className="h-4 w-4" aria-hidden />
-                <span className="hidden sm:inline">Open in vault</span>
-              </Button>
-            )}
-            {inEditMode ? (
-              <>
-                <Button
-                  ref={cancelEditButtonRef}
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCancelBody}
-                  disabled={savingBody}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  variant="accent"
-                  size="sm"
-                  aria-label="Save"
-                  loading={savingBody}
-                  onClick={() => void handleSaveDocument("reject")}
-                  disabled={uploadingImage || !isDirty}
-                >
-                  {savingBody ? "Saving…" : "Save changes"}
-                </Button>
-              </>
-            ) : (
-              <>
-                {canEdit && (
-                  <Button ref={editButtonRef} type="button" size="sm" onClick={requestEdit}>
-                    <Pencil className="h-4 w-4" aria-hidden />
-                    <span className="hidden sm:inline">Edit</span>
-                  </Button>
-                )}
-                <ResourceActionsMenu
-                  resourceName={doc.title || fileName}
-                  archiveAction={doc.status === "archived" ? "restore" : "archive"}
-                  archiveDisabledReason={archiveDisabledReason}
-                  onArchiveAction={() => setArchiveOpen(true)}
-                  moveLabel="Move document"
-                  onMove={moveDisabledReason ? undefined : () => setMoveOpen(true)}
-                  moveDisabledReason={moveDisabledReason || undefined}
-                  deleteLabel={canDelete ? "Delete document" : undefined}
-                  onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
-                />
-              </>
-            )}
-          </div>
-        </header>
+          </>}
+        </ResourceCommandRow>
 
         {archiveNotice && <Alert variant="success" className="shrink-0">{archiveNotice}<Button variant="ghost" size="sm" onClick={() => setArchiveNotice("")}>Dismiss</Button></Alert>}
         {doc.status === "archived" && !isHistorical && !isDiffMode && view !== "edit" && (
@@ -1550,11 +1593,6 @@ export default function DocumentPage({
           </div>
         ) : null}
 
-        {publishError && (
-          <div className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
-            <Alert variant="destructive">{publishError}</Alert>
-          </div>
-        )}
         {docQuery.isRefetchError && (
           <div className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
             <Alert variant="warning" title="Couldn’t refresh the document">
@@ -1567,9 +1605,11 @@ export default function DocumentPage({
 
         <div className="relative min-h-0 flex-1 overflow-hidden">
           <main
+            ref={navigationFocusRef}
             id="document-reading-canvas"
+            tabIndex={-1}
             className={cn(
-              "h-full bg-background",
+              "h-full bg-surface rail-scroll rail-scroll-auto",
               isDiffMode ? "overflow-hidden" : "overflow-y-auto",
             )}
           >
@@ -1581,95 +1621,13 @@ export default function DocumentPage({
                 inEditMode
                   ? "px-3 py-4 sm:px-4 sm:py-5 lg:px-5 xl:px-6 2xl:px-8"
                   : isDiffMode
-                    ? "flex h-full min-h-0 flex-col p-2 sm:p-3"
-                    : "p-2 sm:p-3",
+                    ? "flex h-full min-h-0 flex-col"
+                    : "min-h-full",
               )}
             >
-              <div className="mb-3 flex min-h-11 shrink-0 min-w-0 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
-                <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
-                  <FolderTree className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-                  <span className="truncate font-medium text-foreground">{collectionPath}</span>
-                  {authorName && (
-                    <span className="hidden shrink-0 items-center gap-1.5 border-l border-border pl-3 xl:inline-flex">
-                      <span
-                        className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-surface-selected text-[10px] font-semibold uppercase text-surface-selected-foreground"
-                        aria-hidden
-                      >
-                        {authorName.trim()[0] || "?"}
-                      </span>
-                      <span className="font-medium text-foreground">{authorName}</span>
-                    </span>
-                  )}
-                </div>
-                <div className="ml-auto flex shrink-0 items-center gap-3 text-xs text-foreground-muted">
-                  {commitShort && (
-                    <span className="inline-flex items-center gap-1.5">
-                      <GitCommitHorizontal className="h-3.5 w-3.5" aria-hidden />
-                      <code className="font-mono text-foreground">{commitShort}</code>
-                    </span>
-                  )}
-                  {doc.updated_at && (
-                    <span className="inline-flex items-center gap-1.5">
-                      <Clock3 className="h-3.5 w-3.5" aria-hidden />
-                      {timeAgo(doc.updated_at)}
-                    </span>
-                  )}
-                  {!isHistorical && <DocumentWatch key={docUri(name!, doc.path)} uri={docUri(name!, doc.path)} />}
-                  {!isHistorical && <WorkspacePin item={{ kind: "document", vault: name!, path: doc.path, title: doc.title || doc.path }} />}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDetailsOpen(true);
-                      setDetailsTab("history");
-                    }}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <History className="h-3.5 w-3.5" aria-hidden />
-                    <span className="hidden sm:inline">History</span>
-                  </button>
-                  <button
-                    ref={detailsToggleRef}
-                    type="button"
-                    aria-label={detailsOpen ? "Hide document panel" : "Open document panel"}
-                    title={detailsOpen ? "Hide document panel" : "Open document panel"}
-                    aria-controls="document-details-panel"
-                    aria-expanded={detailsOpen}
-                    onClick={() => {
-                      if (detailsOpen) closeDetails();
-                      else setDetailsOpen(true);
-                    }}
-                    className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-foreground-muted transition-token hover:border-border-strong hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {detailsOpen ? (
-                      <PanelRightClose className="h-3.5 w-3.5" aria-hidden />
-                    ) : (
-                      <PanelRightOpen className="h-3.5 w-3.5" aria-hidden />
-                    )}
-                  </button>
-                </div>
-              </div>
 
               {inEditMode ? (
-                <section className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm">
-                  <div
-                    className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3"
-                  >
-                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-foreground">
-                      <Pencil className="h-3.5 w-3.5" aria-hidden />
-                      Editing document
-                    </span>
-                    <span role="status" aria-live="polite" className="ml-auto text-xs text-foreground-muted">
-                      {uploadingImage
-                        ? "Uploading image…"
-                        : isDirty
-                          ? "Unsaved changes"
-                          : draftStatus === "saving"
-                            ? "Saving draft locally…"
-                            : draftStatus === "saved"
-                              ? "Draft saved locally"
-                              : "No changes"}
-                    </span>
-                  </div>
+                <section className="min-w-0 bg-surface">
                   <div
                     className="p-4 sm:p-6"
                   >
@@ -1761,7 +1719,7 @@ export default function DocumentPage({
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
                         ariaLabel="Document body (markdown)"
                         autoFocus
-                        readOnly={savingBody}
+                        readOnly={savingBody || !canEdit}
                         vault={name!}
                         document={doc?.path}
                         commit={editBaseCommit ?? undefined}
@@ -1771,6 +1729,7 @@ export default function DocumentPage({
                           if (uploading) setClaimedAssetIds(null);
                         }}
                         preserveUploadsOnUnmount={
+                          pendingNavigation !== null ||
                           savingBody ||
                           draftStatus === "saving" ||
                           draftStatus === "saved" ||
@@ -1854,6 +1813,9 @@ export default function DocumentPage({
                   view={view === "raw" ? "raw" : "rendered"}
                   onViewChange={(next) => setView(next)}
                   appearance="file"
+                  bodyOnly
+                  readingWidth={readingWidth}
+                  idPrefix={viewId}
                 />
               )}
             </article>
@@ -1875,16 +1837,15 @@ export default function DocumentPage({
                 aria-hidden={!detailsOpen}
                 inert={!detailsOpen}
                 className={cn(
-                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-lg flex-col overflow-hidden border-l border-border bg-surface shadow-xl transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-96",
+                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-lg flex-col overflow-hidden border-l border-border bg-surface transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-96",
                   detailsOpen
-                    ? "translate-x-0"
+                    ? "translate-x-0 shadow-xl"
                     : "pointer-events-none translate-x-full",
                 )}
               >
               <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
                 <div>
                   <h2 className="text-sm font-semibold text-foreground">Document panel</h2>
-                  <p className="text-xs text-foreground-muted">Info, structure, links and versions</p>
                 </div>
                 <Button
                   ref={detailsCloseRef}
@@ -1943,6 +1904,7 @@ export default function DocumentPage({
                   )}
                 </div>
                 <dl className="space-y-2.5 text-xs">
+                  <PropertyRow label="Size"><DocumentStatistics content={doc.content || ""} labelled={false} /></PropertyRow>
                   {doc.summary && (
                     <div className="mb-3 rounded-[var(--radius-md)] bg-surface-2 px-3 py-2.5">
                       <dt className="mb-1 text-[11px] font-medium text-foreground-muted">Summary</dt>
@@ -1952,7 +1914,7 @@ export default function DocumentPage({
                     </div>
                   )}
                   <PropertyRow label="Title">
-                    <span className="block truncate text-foreground" title={doc.title}>{doc.title}</span>
+                    <span className="block break-words text-foreground">{doc.title}</span>
                   </PropertyRow>
                   {authorName && (
                     <PropertyRow label="Author">
@@ -2022,27 +1984,6 @@ export default function DocumentPage({
                   </dl>
                 </details>
 
-                {!isHistorical && (
-                  <div className="mt-4 grid grid-cols-2 gap-2">
-                    {doc.is_public && doc.public_slug ? (
-                      <>
-                        <Button type="button" variant="outline" size="sm" onClick={copyPublicLink}>
-                          {copied ? <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden /> : <ExternalLink className="h-3.5 w-3.5" aria-hidden />}
-                          {copied ? "Copied" : "Copy link"}
-                        </Button>
-                        <Button type="button" variant="outline" size="sm" onClick={handleUnpublish} disabled={publishing}>
-                          {publishing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Lock className="h-3.5 w-3.5" aria-hidden />}
-                          Unpublish
-                        </Button>
-                      </>
-                    ) : (
-                      <Button type="button" variant="outline" size="sm" className="col-span-2" onClick={() => setPublishOpen(true)} disabled={publishing}>
-                        <Share2 className="h-3.5 w-3.5" aria-hidden />
-                        Publish document
-                      </Button>
-                    )}
-                  </div>
-                )}
               </section>
 
                 </TabsContent>
@@ -2139,7 +2080,7 @@ export default function DocumentPage({
             updated_at: changedAt,
           };
           queryClient.setQueryData(
-            ["document", name, result.path, undefined],
+            ["document", name, result.path, undefined, currentUser?.user_id, accessRevision],
             nextDoc,
           );
           setDocOverride(nextDoc);
@@ -2171,8 +2112,11 @@ export default function DocumentPage({
       />
 
       <PublishOptionsDialog
-        open={publishOpen}
-        onOpenChange={setPublishOpen}
+        open={publishOpen && !publishDisabledReason}
+        onOpenChange={(open) => {
+          setPublishOpen(open);
+          if (!open) window.requestAnimationFrame(() => publicationTriggerRef.current?.focus());
+        }}
         vault={name!}
         docId={docId}
         onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
@@ -2221,6 +2165,8 @@ export default function DocumentPage({
           if (commitHash) openVersion(undefined, { replace: true });
         }}
       />
+
+      {navigationDialog}
 
       <ConfirmDialog
         open={pendingExistingPath !== null}
@@ -2377,55 +2323,18 @@ function DocumentDiffModuleLoading() {
 
 function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {
   return (
-    <LoadingState
-      label="Loading document"
-      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
-    >
-      <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        <header
-          className={cn(
-            "flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface pl-3 sm:pl-4 lg:pl-5",
-            presentation === "preview" ? "pr-12 sm:pr-14" : "pr-3 sm:pr-4 lg:pr-5",
-          )}
-        >
-          <Skeleton className="hidden h-9 w-9 shrink-0 rounded-[var(--radius-md)] sm:block" />
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-5 w-2/3 max-w-56 rounded-[var(--radius-sm)]" />
-            <Skeleton className="h-3 w-1/2 max-w-40 rounded-[var(--radius-sm)]" />
-          </div>
-          <div className="flex shrink-0 gap-2">
-            <Skeleton className="h-8 w-20 rounded-[var(--radius-md)]" />
-            <Skeleton className="hidden h-8 w-24 rounded-[var(--radius-md)] sm:block" />
-          </div>
-        </header>
-
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <main className="h-full overflow-hidden bg-background p-2 sm:p-3">
-            <div className="mb-3 flex min-h-11 items-center gap-3 rounded-[var(--radius-lg)] border border-border bg-surface px-3 shadow-xs">
-              <Skeleton className="h-4 w-4 shrink-0 rounded-[var(--radius-sm)]" />
-              <Skeleton className="h-3 w-2/3 max-w-64 rounded-[var(--radius-sm)]" />
-              <Skeleton className="ml-auto hidden h-3 w-32 rounded-[var(--radius-sm)] sm:block" />
-            </div>
-
-            <section className="min-h-[32rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm">
-              <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
-                <Skeleton className="h-7 w-24 rounded-[var(--radius-sm)]" />
-                <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
-                <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
-              </div>
-              <div className="mx-auto max-w-4xl space-y-4 px-5 py-8 sm:px-8 lg:px-12">
-                <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
-                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
-                <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
-                <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
-                <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
-                <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
-                <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
-                <Skeleton className="mt-6 h-32 w-full rounded-[var(--radius-lg)]" />
-              </div>
-            </section>
-          </main>
-        </div>
+    <LoadingState label="Loading document" className="flex h-full min-h-0 flex-col overflow-hidden bg-surface">
+      {presentation === "preview" && <div className="flex h-14 items-center gap-3 border-b border-border px-4"><Skeleton className="h-4 w-2/3" /></div>}
+      <div className="flex min-h-10 shrink-0 items-center gap-3 border-b border-border px-4 py-1">
+        <Skeleton className="h-8 w-28" />
+        <Skeleton className="hidden h-3 w-28 sm:block" />
+        <Skeleton className="ml-auto h-8 w-48" />
+      </div>
+      <div className="mx-auto w-full max-w-5xl space-y-4 px-4 py-5 sm:px-6">
+        <Skeleton className="h-8 w-3/5" />
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-11/12" />
+        <Skeleton className="h-4 w-4/5" />
       </div>
     </LoadingState>
   );

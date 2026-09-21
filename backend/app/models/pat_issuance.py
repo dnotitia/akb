@@ -51,6 +51,24 @@ class PATIssuanceRequest(NFCModel):
     expires_days: StrictInt | None = Field(default=None, gt=0)
     expires_at: AwareDatetime | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_nul_before_normalization(cls, data):
+        # The shared NFC normalizer strips NULs for document ingestion. This
+        # strict issuance contract must reject, never repair, authority inputs.
+        def check(value, path):
+            if isinstance(value, str) and "\x00" in value:
+                raise field_error(path or "form", "invalid_nul", "NUL characters are not allowed.")
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    check(key, path)
+                    check(item, f"{path}.{key}" if path else str(key))
+            elif isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    check(item, f"{path}.{index}")
+        check(data, "")
+        return data
+
     @field_validator("contract_version")
     @classmethod
     def version(cls, value):

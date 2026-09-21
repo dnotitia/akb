@@ -92,6 +92,43 @@ def test_install_returns_202_and_replay_returns_200(monkeypatch):
     assert calls[0]["kwargs"]["mode"] == "install"
 
 
+def test_initial_grant_approval_returns_202_and_replay_returns_200(monkeypatch):
+    app_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    release_id = uuid.uuid4()
+    calls: list[dict] = []
+
+    async def fake_approval(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        replayed = len(calls) == 2
+        return {
+            **_projection(app_id, vault_id),
+            "command_status": "already_applied" if replayed else "accepted",
+            "replayed": replayed,
+        }
+
+    monkeypatch.setattr(app_installations, "approve_initial_installation_grant", fake_approval)
+    client = _client(user=_user())
+    body = {
+        "baseline_release_id": str(release_id),
+        "capabilities": ["installation:read"],
+    }
+    first = client.post(
+        f"/api/v1/apps/{app_id}/installations/{vault_id}/grant",
+        json=body,
+    )
+    second = client.post(
+        f"/api/v1/apps/{app_id}/installations/{vault_id}/grant",
+        json=body,
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 200
+    assert first.headers["cache-control"] == "no-store"
+    assert second.headers["pragma"] == "no-cache"
+    assert calls[0]["kwargs"]["baseline_release_id"] == release_id
+
+
 def test_app_status_uses_principal_app_and_cannot_select_another_app(monkeypatch):
     app_id = uuid.uuid4()
     vault_id = uuid.uuid4()

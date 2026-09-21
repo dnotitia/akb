@@ -74,6 +74,16 @@ STANDALONE_SSO_BOOTSTRAP_USAGE = (
     "--product-admin-password-file PATH"
 )
 
+BRIDGE_BODY_BACKFILL_USAGE = (
+    "Usage: python -m app.cli bridge-body-backfill "
+    "[--vault NAME] [--limit N] [--batch-size N] [--dry-run|--verify]"
+)
+
+NATIVE_ASSET_REFS_USAGE = (
+    "Usage: python -m app.cli native-asset-refs-backfill "
+    "[--vault NAME] [--limit N] [--dry-run]"
+)
+
 MIGRATE_REVISION_BACKEND_USAGE = (
     "Usage: python -m app.cli migrate-revision-backend "
     "{plan --coverage-version VERSION|apply|verify|commit|abort --cutover-id UUID|"
@@ -502,6 +512,7 @@ async def _bootstrap_standalone_sso(args: list[str]) -> int:
             backchannel_logout_uri=(settings.keycloak_backchannel_logout_uri_effective),
             upgrade_client_id=parsed.upgrade_client_id,
             upgrade_client_secret=upgrade_secret,
+            local_realm_self_registration=settings.sso_local_realm_self_registration,
         )
         await _initialize_operator_database()
         control = KeycloakStandaloneSSOControl(verify_ssl=settings.keycloak_verify_ssl)
@@ -833,6 +844,142 @@ async def _migrate_revision_backend(args: list[str]) -> int:
     return 0
 
 
+async def _native_asset_refs_backfill(args: list[str]) -> int:
+    """Publish live image references for Native documents written without them.
+
+    Re-runnable: the sync replaces a document's live set rather than appending,
+    so a second pass over an already-correct document changes nothing.
+    """
+    from app.db.postgres import close_pool
+    from app.services.native_asset_ref_backfill import backfill_native_asset_refs
+
+    vault = None
+    limit = None
+    dry_run = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg in ("--vault", "--limit"):
+            index += 1
+            if index >= len(args):
+                print(NATIVE_ASSET_REFS_USAGE, file=sys.stderr)
+                return 2
+            if arg == "--vault":
+                vault = args[index]
+            else:
+                try:
+                    limit = int(args[index])
+                except ValueError:
+                    print("--limit must be an integer", file=sys.stderr)
+                    return 2
+        else:
+            print(f"Unknown native-asset-refs-backfill option: {arg}", file=sys.stderr)
+            return 2
+        index += 1
+
+    try:
+        report = await backfill_native_asset_refs(
+            vault=vault, limit=limit, dry_run=dry_run,
+        )
+        print(json.dumps(report.to_dict(), sort_keys=True))
+        # A run that stopped at --limit has not seen the population, so it
+        # must not read as a clean result.
+        return 0 if report.complete and not report.failed else 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        await close_pool()
+
+
+async def _bridge_body_backfill(args: list[str]) -> int:
+    """Copy bridged revision bodies from the git volume into PostgreSQL.
+
+    Resumable by construction: every mapping is its own transaction, so a run
+    that is interrupted simply leaves fewer rows for the next one. Re-running
+    with the same arguments continues where it stopped.
+    """
+    from app.db.postgres import close_pool
+    from app.exceptions import ValidationError
+    from app.services.bridge_body_backfill import (
+        DEFAULT_BATCH_SIZE,
+        backfill_bridge_bodies,
+        verify_bridge_bodies,
+    )
+
+    vault = None
+    # Unset until the operator says otherwise: the two modes want different
+    # defaults. A backfill is a bounded amount of work, so 1000 is a sane
+    # batch. A survey that stops at 1000 and still reports `ok` is the exact
+    # shape of a check that passes by not looking, so verify defaults to the
+    # whole population.
+    limit = None
+    batch_size = DEFAULT_BATCH_SIZE
+    dry_run = False
+    verify = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dry-run":
+            dry_run = True
+        elif arg == "--verify":
+            verify = True
+        elif arg in ("--vault", "--limit", "--batch-size"):
+            index += 1
+            if index >= len(args):
+                print(BRIDGE_BODY_BACKFILL_USAGE, file=sys.stderr)
+                return 2
+            if arg == "--vault":
+                vault = args[index]
+            else:
+                try:
+                    value = int(args[index])
+                except ValueError:
+                    print(f"{arg} must be an integer", file=sys.stderr)
+                    return 2
+                if arg == "--limit":
+                    limit = value
+                else:
+                    batch_size = value
+        else:
+            print(f"Unknown bridge-body-backfill option: {arg}", file=sys.stderr)
+            return 2
+        index += 1
+
+    if dry_run and verify:
+        print("--dry-run and --verify ask different questions", file=sys.stderr)
+        return 2
+
+    try:
+        if verify:
+            checked = await verify_bridge_bodies(
+                vault=vault, limit=limit or 100_000_000, batch_size=batch_size
+            )
+            print(json.dumps(checked.to_dict(), sort_keys=True))
+            if not checked.complete:
+                print(
+                    f"surveyed {checked.checked} of {checked.total} migrated bodies",
+                    file=sys.stderr,
+                )
+            # A body that no longer agrees with the git it came from is the
+            # one result that must not be exited over quietly.
+            return 0 if checked.ok else 1
+        report = await backfill_bridge_bodies(
+            vault=vault, limit=limit or 1000, batch_size=batch_size, dry_run=dry_run
+        )
+    except ValidationError as error:
+        print(f"bridge_body_backfill_failed: {error}", file=sys.stderr)
+        return 2
+    finally:
+        await close_pool()
+    print(json.dumps(report.to_dict(), sort_keys=True))
+    # A run that moved nothing and still has work left is a result an operator
+    # must look at, not a success to schedule around.
+    return 1 if report.stalled else 0
+
+
 def _okf_validate(args: list[str]) -> int:
     """`okf-validate <bundle-dir>` — check a directory against OKF v0.1."""
     from pathlib import Path
@@ -911,6 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "initialize-postgres-native, migrate-revision-backend, "
+            "bridge-body-backfill, native-asset-refs-backfill, "
             "okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
             file=sys.stderr,
@@ -936,6 +1084,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_initialize_postgres_native(argv[1:]))
     if cmd == "migrate-revision-backend":
         return asyncio.run(_migrate_revision_backend(argv[1:]))
+    if cmd == "bridge-body-backfill":
+        return asyncio.run(_bridge_body_backfill(argv[1:]))
+    if cmd == "native-asset-refs-backfill":
+        return asyncio.run(_native_asset_refs_backfill(argv[1:]))
     if cmd == "okf-validate":
         return _okf_validate(argv[1:])
     if cmd == "okf-export":

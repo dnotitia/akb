@@ -530,7 +530,7 @@ async def test_public_asset_grant_never_increments_publication_view(
         captured.update(file_id=requested, vault_id=requested_vault)
         return {"id": file_id}
 
-    async def fake_response(_row, *, public: bool):
+    async def fake_response(_row, *, public: bool, request=None):
         captured["public"] = public
         return Response(content=b"image", media_type="image/png")
 
@@ -590,15 +590,27 @@ async def test_public_asset_manifest_cache_does_not_retain_document_body(
     hidden = uuid.uuid4()
     reads = 0
 
-    class _Git:
-        def read_file(self, vault, path, commit):
+    class _DocService:
+        """Only the document-service interface — deliberately no `.git`.
+
+        The previous stub was a `SimpleNamespace(git=...)`, which modelled the
+        Git arm's storage handle instead of the interface. The publication
+        path reached for that attribute and passed here while failing on every
+        PostgreSQL-authoritative deployment, where the composed service has
+        none. `.content` is the frontmatter-stripped body, as both real
+        services return.
+        """
+
+        async def get_at_commit(self, vault, path, commit):
             nonlocal reads
             reads += 1
             assert (vault, path, commit) == ("team", "weekly.md", "a" * 40)
-            return (
-                "---\ntitle: Weekly\n---\n"
-                f"# Public\n\n![shown](/api/assets/{visible})\n\n"
-                f"# Private\n\n![hidden](/api/assets/{hidden})\n"
+            return SimpleNamespace(
+                content=(
+                    f"# Public\n\n![shown](/api/assets/{visible})\n\n"
+                    f"# Private\n\n![hidden](/api/assets/{hidden})\n"
+                ),
+                current_commit="a" * 40,
             )
 
     row = {
@@ -626,7 +638,7 @@ async def test_public_asset_manifest_cache_does_not_retain_document_body(
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
-        lambda: SimpleNamespace(git=_Git()),
+        lambda: _DocService(),
     )
     monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
     try:
@@ -662,18 +674,30 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
     reads = 0
     heads = 0
 
-    class _Git:
-        def current_commit(self, vault):
+    class _DocService:
+        """Interface-shaped stub; see the note on the sibling test.
+
+        A row with a NULL `current_commit` used to send the publication path
+        to `.git.current_commit` for a vault-wide HEAD. It now asks the
+        service for the document, so `get` is what resolves the commit and
+        `heads` counts those calls.
+        """
+
+        async def get(self, vault, path):
             nonlocal heads
             heads += 1
-            assert vault == "team"
-            return "c" * 40
+            assert (vault, path) == ("team", "legacy.md")
+            return SimpleNamespace(
+                content=f"![shown](/api/assets/{visible})", current_commit="c" * 40,
+            )
 
-        def read_file(self, vault, path, commit):
+        async def get_at_commit(self, vault, path, commit):
             nonlocal reads
             reads += 1
             assert (vault, path, commit) == ("team", "legacy.md", "c" * 40)
-            return f"---\ntitle: Legacy\n---\n![shown](/api/assets/{visible})"
+            return SimpleNamespace(
+                content=f"![shown](/api/assets/{visible})", current_commit="c" * 40,
+            )
 
     row = {
         "path": "legacy.md",
@@ -700,7 +724,7 @@ async def test_legacy_public_document_resolves_head_into_pinned_cache(
     monkeypatch.setattr(
         publication_service,
         "_get_doc_service",
-        lambda: SimpleNamespace(git=_Git()),
+        lambda: _DocService(),
     )
     monkeypatch.setattr(publication_service, "_find_published_document", fake_find)
     try:
@@ -1012,7 +1036,10 @@ async def test_asset_response_heads_then_streams_without_buffering(
             assets.asset_service.IMAGE_ASSET_MAX_BYTES,
         ),
     ]
-    assert response.headers["cache-control"] == "private, no-store"
+    # `no-cache` is "cache, and revalidate every time", not "do not cache".
+    # Authorization still runs on every request; what it buys is a 304 in
+    # place of re-sending the object.
+    assert response.headers["cache-control"] == "private, no-cache"
     assert response.headers["vary"] == "Authorization"
 
 
@@ -1288,9 +1315,17 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
     assert storage_touched is False
 
 
+@pytest.mark.parametrize("arm", ["document_id", "native_document_id"])
 @pytest.mark.asyncio
-async def test_sync_references_retains_previous_and_publishes_current() -> None:
+async def test_sync_references_retains_previous_and_publishes_current(arm) -> None:
+    """The same sequence runs for either arm, against that arm's column.
+
+    Parametrized rather than duplicated: the Native arm regressed precisely
+    because its half of this behaviour did not exist, and a test that only ever
+    exercised `document_id` could not notice.
+    """
     from app.repositories import vault_files_repo
+    from app.repositories.vault_files_repo import DocumentAssetOwner
 
     document_id = uuid.uuid4()
     vault_id = uuid.uuid4()
@@ -1302,10 +1337,10 @@ async def test_sync_references_retains_previous_and_publishes_current() -> None:
         async def execute(self, sql, *args):
             calls.append((" ".join(sql.split()), args))
 
+    owner = DocumentAssetOwner(vault_id=vault_id, **{arm: document_id})
     await vault_files_repo.sync_document_asset_references(
         _Connection(),
-        document_id=document_id,
-        vault_id=vault_id,
+        owner=owner,
         document_path="new/doc.md",
         commit_hash="b" * 40,
         asset_ids={asset_id},
@@ -1321,6 +1356,33 @@ async def test_sync_references_retains_previous_and_publishes_current() -> None:
     assert "INSERT INTO document_asset_refs" in calls[2][0]
     assert "INSERT INTO document_asset_revision_refs" in calls[3][0]
     assert calls[3][1][1:4] == ("new/doc.md", "b" * 40, [asset_id])
+
+    # Every statement that selects the document's own rows must do so through
+    # the arm it was given, and never through the other one.
+    other = "native_document_id" if arm == "document_id" else "document_id"
+    for sql, args in calls[:3]:
+        assert f"live.{arm}" in sql or f" {arm} =" in sql or f"({arm}," in sql, sql
+        assert f"live.{other}" not in sql and f" {other} =" not in sql, sql
+        assert args[0] == document_id
+
+
+@pytest.mark.asyncio
+async def test_a_document_asset_owner_names_exactly_one_arm() -> None:
+    """Neither column and both columns are equally meaningless."""
+    from app.repositories.vault_files_repo import DocumentAssetOwner
+
+    vault_id = uuid.uuid4()
+    with pytest.raises(ValueError):
+        DocumentAssetOwner(vault_id=vault_id)
+    with pytest.raises(ValueError):
+        DocumentAssetOwner(
+            vault_id=vault_id,
+            document_id=uuid.uuid4(),
+            native_document_id=uuid.uuid4(),
+        )
+    native = DocumentAssetOwner(vault_id=vault_id, native_document_id=uuid.uuid4())
+    assert native.column == "native_document_id"
+    assert native.document_key == native.native_document_id
 
 
 @pytest.mark.asyncio
@@ -1390,7 +1452,7 @@ async def test_private_preview_uses_the_delegated_upload_actor(monkeypatch) -> N
             return None
         return {"id": file_id, "s3_key": "key", "size_bytes": 1}
 
-    async def fake_response(row):
+    async def fake_response(row, *, request=None):
         return row
 
     async def fake_pool():
@@ -1446,7 +1508,7 @@ async def test_claimed_private_image_does_not_require_delegated_writer(monkeypat
         assert kwargs["created_by"] == "reader-service"
         return {"id": file_id, "s3_key": "key", "size_bytes": 1}
 
-    async def fake_response(row):
+    async def fake_response(row, *, request=None):
         return row
 
     async def fake_pool():
@@ -1809,3 +1871,137 @@ async def test_s3_delete_worker_continues_when_failure_recording_also_fails(
 
     assert await s3_delete_worker._process_deletes_once() == 1
     assert deletes == ["vault/first.bin", "vault/second.bin"]
+
+
+# --- revalidation: keep the bytes off the wire, keep the decision on it ---
+
+
+class _IfNoneMatchRequest:
+    def __init__(self, value: str | None):
+        self.headers = {} if value is None else {"if-none-match": value}
+
+
+@pytest.mark.asyncio
+async def test_a_matching_validator_answers_304_without_touching_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revalidation that ends in 304 has no reason to cost an object HEAD.
+
+    This is the whole point of the change: document inline images re-render
+    constantly, and every one of those renders used to re-transfer the object
+    through this process."""
+    from app.api.routes import assets
+
+    def _never_head(*_a, **_k):
+        raise AssertionError("a 304 must not reach the object store")
+
+    def _never_stream(*_a, **_k):
+        raise AssertionError("a 304 must not stream a body")
+
+    monkeypatch.setattr(assets.file_service, "head_object", _never_head)
+    monkeypatch.setattr(assets.file_service, "iter_object_chunks", _never_stream)
+
+    digest = "a" * 64
+    response = await assets.image_asset_response(
+        {
+            "id": uuid.uuid4(),
+            "s3_key": "team/.akb-assets/id/image.png",
+            "mime_type": "image/png",
+            "size_bytes": 5,
+            "content_hash": digest,
+        },
+        request=_IfNoneMatchRequest(f'"{digest}"'),
+    )
+
+    assert response.status_code == 304
+    assert response.headers["etag"] == f'"{digest}"'
+    assert response.headers["cache-control"] == "private, no-cache"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_validator_still_sends_the_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator is the content digest, so a mismatch means different
+    bytes — and different bytes must be sent."""
+    from app.api.routes import assets
+
+    monkeypatch.setattr(
+        assets.file_service, "head_object", lambda _k: {"ContentLength": 5},
+    )
+
+    def _stream(_key, max_bytes=None):
+        async def _gen():
+            yield b"image"
+        return _gen()
+
+    monkeypatch.setattr(assets.file_service, "iter_object_chunks", _stream)
+
+    response = await assets.image_asset_response(
+        {
+            "id": uuid.uuid4(),
+            "s3_key": "team/.akb-assets/id/image.png",
+            "mime_type": "image/png",
+            "size_bytes": 5,
+            "content_hash": "b" * 64,
+        },
+        request=_IfNoneMatchRequest('"' + "a" * 64 + '"'),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["etag"] == '"' + "b" * 64 + '"'
+
+
+@pytest.mark.asyncio
+async def test_an_asset_without_a_digest_carries_no_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No digest, no ETag — and therefore no 304 path to get wrong."""
+    from app.api.routes import assets
+
+    monkeypatch.setattr(
+        assets.file_service, "head_object", lambda _k: {"ContentLength": 5},
+    )
+
+    def _stream(_key, max_bytes=None):
+        async def _gen():
+            yield b"image"
+        return _gen()
+
+    monkeypatch.setattr(assets.file_service, "iter_object_chunks", _stream)
+
+    response = await assets.image_asset_response(
+        {
+            "id": uuid.uuid4(),
+            "s3_key": "team/.akb-assets/id/image.png",
+            "mime_type": "image/png",
+            "size_bytes": 5,
+        },
+        request=_IfNoneMatchRequest('"anything"'),
+    )
+
+    assert response.status_code == 200
+    assert "etag" not in {k.lower() for k in response.headers}
+
+
+@pytest.mark.parametrize(
+    "header,etag,expected",
+    [
+        ('"abc"', '"abc"', True),
+        ('W/"abc"', '"abc"', True),
+        ('"abc"', 'W/"abc"', True),
+        ('*', '"abc"', True),
+        ('"abc", "def"', '"def"', True),
+        ('"abc"', '"def"', False),
+        (None, '"abc"', False),
+        ('"abc"', None, False),
+        ('', '"abc"', False),
+    ],
+)
+def test_validator_comparison_follows_the_spec(header, etag, expected) -> None:
+    """A browser may send a list, a weak validator, or `*`. Getting this
+    wrong in the permissive direction serves a stale image; in the strict
+    direction it just costs bytes."""
+    from app.api.routes import assets
+
+    assert assets._etag_matches(header, etag) is expected

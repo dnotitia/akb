@@ -1,23 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { ArrowRight, Box, FileText, FolderPlus, PlugZap, Plus, Star } from "lucide-react";
+import { ArrowRight, Box, FileText, FolderPlus, Plus, Star } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
 import { Badge } from "@/components/ui/badge";
 import { Alert } from "@/components/ui/alert";
 import { LoadingState } from "@/components/ui/loading-state";
 import { RelativeTime } from "@/components/ui/relative-time";
-import { QuickstartDialog } from "@/components/quickstart-dialog";
+import { HomeConnectionInvitation } from "@/components/home-connection-invitation";
+import { HomeWorkspaceSummary } from "@/components/home-workspace-summary";
 import { VaultCreateDialog } from "@/components/vault-create-dialog";
 import { HomeRecentUpdates } from "@/components/home-recent-updates";
 import type { VaultRow } from "@/components/vault-list";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
-import { useCurrentUser } from "@/contexts/current-user-context";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { listVaults, getVaultInfo, listPATs, getAuthConfig } from "@/lib/api";
 import { readRecentDocumentViews, type RecentDocumentView } from "@/lib/recent-document-views";
 
 const PREVIEW_LIMIT = 4;
-const GUIDE_KEY = "akb.homeConnectionGuideDismissed";
 const focus = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 const cardGrid = "grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4";
 
@@ -27,31 +27,27 @@ interface VaultMetrics {
   file_count?: number;
 }
 
-function guideHidden(userId: string) {
-  try { return localStorage.getItem(`${GUIDE_KEY}:${userId}`) === "1"; }
-  catch { return false; }
-}
-
 export default function HomePage() {
   const user = useCurrentUser();
+  const access = useAccessVerification();
   // Personal history and pending requests must never survive an account switch.
-  return <HomeWorkspace key={user?.user_id ?? "anonymous"} userId={user?.user_id ?? ""} />;
+  return <HomeWorkspace key={user?.user_id ?? "anonymous"} userId={user?.user_id ?? ""} accessChecking={access.checking} accessRevision={access.revision} />;
 }
 
-function HomeWorkspace({ userId }: { userId: string }) {
+function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: string; accessChecking: boolean; accessRevision: number }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [vaults, setVaults] = useState<VaultRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [directoryRevision, setDirectoryRevision] = useState(-1);
   const [metrics, setMetrics] = useState<Record<string, VaultMetrics>>({});
   const [metricsDone, setMetricsDone] = useState<Set<string>>(new Set());
   const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const [connection, setConnection] = useState<"loading" | "unused" | "used" | "unknown">("loading");
   const [oauthEnabled, setOauthEnabled] = useState(false);
-  const [guideDismissed, setGuideDismissed] = useState(() => guideHidden(userId));
-  const [quickstartOpen, setQuickstartOpen] = useState(false);
+  const [setupAvailable, setSetupAvailable] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const createTrigger = useRef<HTMLButtonElement | null>(null);
   const generation = useRef(0);
@@ -61,13 +57,17 @@ function HomeWorkspace({ userId }: { userId: string }) {
     setLoading(true); setError(false);
     try {
       const data = await listVaults();
-      if (request === generation.current) setVaults(data.vaults || []);
+      if (request === generation.current) {
+        if (!Array.isArray(data.vaults)) throw new Error("Invalid Vault directory");
+        setVaults(data.vaults);
+        setDirectoryRevision(accessRevision);
+      }
     } catch {
       if (request === generation.current) setError(true);
     } finally {
       if (request === generation.current) setLoading(false);
     }
-  }, []);
+  }, [accessRevision]);
 
   useEffect(() => {
     const requests = generation;
@@ -80,11 +80,13 @@ function HomeWorkspace({ userId }: { userId: string }) {
     // Token presence suppresses the optional nudge; it is not agent-health proof.
     listPATs().then(data => {
       if (cancelled) return;
-      const tokens = data.tokens || [];
-      setConnection(tokens.length > 0 ? "used" : "unused");
+      setConnection(Array.isArray(data.tokens) ? data.tokens.length > 0 ? "used" : "unused" : "unknown");
     }).catch(() => { if (!cancelled) setConnection("unknown"); });
     getAuthConfig().then(config => {
-      if (!cancelled) setOauthEnabled(config.available && config.mcp_oauth.enabled);
+      if (!cancelled) {
+        setOauthEnabled(config.available && config.mcp_oauth.enabled);
+        setSetupAvailable(config.available);
+      }
     }).catch(() => { /* Optional: token connection remains available. */ });
     return () => { cancelled = true; };
   }, []);
@@ -137,15 +139,6 @@ function HomeWorkspace({ userId }: { userId: string }) {
     return () => cancelAnimationFrame(frame);
   }, [location.hash, location.key]);
 
-  function dismissGuide(hidden: boolean) {
-    setGuideDismissed(hidden);
-    try {
-      if (hidden) localStorage.setItem(`${GUIDE_KEY}:${userId}`, "1");
-      else localStorage.removeItem(`${GUIDE_KEY}:${userId}`);
-    } catch { /* The guide remains usable when browser storage is blocked. */ }
-    requestAnimationFrame(() => document.getElementById("home-show-guide")?.focus());
-  }
-
   function toggleVaultFavorite(vault: VaultRow) {
     toggleFavorite(vault.id);
     requestAnimationFrame(() => {
@@ -153,32 +146,24 @@ function HomeWorkspace({ userId }: { userId: string }) {
     });
   }
 
-  const showGuide = connection === "unused" && !guideDismissed;
   const noVaults = !loading && !error && vaults.length === 0;
-  const connectionControl = !showGuide && <Button id="home-show-guide" variant="ghost" size="sm" aria-expanded={connection === "unused" ? false : undefined} onClick={() => {
-    if (connection === "unused") dismissGuide(false);
-    else setQuickstartOpen(true);
-  }}><PlugZap className="h-4 w-4" aria-hidden />{connection === "unused" ? "Show connection guide" : "Connect an agent"}</Button>;
+  const directoryKey = `${accessRevision}:${JSON.stringify(vaults.map(vault => vault.id).sort())}`;
+  const verifyingDirectory = accessChecking || loading || (!error && directoryRevision !== accessRevision);
 
-  return <><h1 className="sr-only">Home</h1><div className="w-full space-y-7 lg:space-y-8">
-      {showGuide && <div id="home-connection-guide" className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 border-y border-border py-3 text-sm">
-        <p className="text-foreground-muted">Use your vaults in an AI tool. Optional — you can keep working here without a connection.</p>
-        <div className="flex shrink-0 items-center gap-3">
-          <Button variant="link" size="sm" className="px-0" onClick={() => setQuickstartOpen(true)}>Set up a connection<ArrowRight className="h-4 w-4" aria-hidden /></Button>
-          <Button id="home-show-guide" variant="ghost" size="sm" aria-expanded={true} aria-controls="home-connection-guide" onClick={() => dismissGuide(true)}>Hide connection guide</Button>
-        </div>
-      </div>}
+  return <><h1 className="sr-only">Home</h1>
+    <HomeWorkspaceSummary userId={userId} directoryKey={directoryKey} vaultCount={!verifyingDirectory && !error ? vaults.length : undefined} directoryLoading={verifyingDirectory} />
+    <div className="w-full space-y-7 pb-[calc(5rem+env(safe-area-inset-bottom))] lg:space-y-8">
 
     {recentlyViewed.length > 0 && <section aria-labelledby="home-viewed-heading">
-      <SectionHeader id="home-viewed-heading" title="Recently viewed" accessory={<div className="flex flex-wrap items-center gap-3"><span className="text-xs text-foreground-muted">On this browser</span>{connectionControl}</div>} />
+      <SectionHeader id="home-viewed-heading" title="Recently viewed" accessory={<span className="text-xs text-foreground-muted">On this browser</span>} />
       <ul className={recentlyViewed.length === 1 ? "grid grid-cols-1" : cardGrid}>
         {recentlyViewed.map(item => <li key={`${item.vault}:${item.path}`} className="min-w-0"><RecentDocumentCard item={item} compact={recentlyViewed.length === 1} /></li>)}
       </ul>
     </section>}
 
     <section id="vaults" className="scroll-mt-24" aria-labelledby="home-vaults-heading" aria-busy={loading}>
-      <SectionHeader id="home-vaults-heading" title="Your vaults" accessory={<div className="flex flex-wrap items-center gap-3">{recentlyViewed.length === 0 && connectionControl}<Link id="home-vaults-link" to="/vault" className={`inline-flex min-h-9 items-center gap-2 rounded-[var(--radius-sm)] text-sm text-link hover:text-link-hover ${focus}`}>
-        View all vaults{!loading && !error && vaults.length > 0 ? ` (${vaults.length})` : ""}<ArrowRight className="h-4 w-4" aria-hidden />
+      <SectionHeader id="home-vaults-heading" title="Your vaults" accessory={<div className="flex flex-wrap items-center gap-3"><Link id="home-vaults-link" to="/vault" className={`inline-flex min-h-9 items-center gap-2 rounded-[var(--radius-sm)] text-sm text-link hover:text-link-hover ${focus}`}>
+        View all vaults<ArrowRight className="h-4 w-4" aria-hidden />
       </Link></div>} />
       {loading && vaults.length === 0 ? <LoadingState label="Loading your vaults"><div className={cardGrid}>
         {Array.from({ length: 4 }, (_, i) => <Panel key={i} className="min-h-36 space-y-4 p-4"><div className="h-5 w-2/3 rounded bg-surface-2" /><div className="h-9 rounded bg-surface-2" /><div className="h-4 w-1/2 rounded bg-surface-2" /></Panel>)}
@@ -201,7 +186,7 @@ function HomeWorkspace({ userId }: { userId: string }) {
       <section className="min-w-0" aria-label="Watched document updates"><HomeRecentUpdates scope="watching" /></section>
     </div>
 
-    <QuickstartDialog open={quickstartOpen} onOpenChange={setQuickstartOpen} onTokenCreated={() => setConnection("used")} mcpOauthEnabled={oauthEnabled} />
+    <HomeConnectionInvitation userId={userId} eligible={connection === "unused" && setupAvailable && !verifyingDirectory && !error && vaults.length > 0} oauthEnabled={oauthEnabled} onTokenCreated={() => setConnection("used")} />
     <VaultCreateDialog open={createOpen} onOpenChange={setCreateOpen} returnFocusRef={createTrigger}
       onCreated={name => navigate(`/vault/${encodeURIComponent(name)}`)} onOpenExisting={name => navigate(`/vault/${encodeURIComponent(name)}`)} />
   </div></>;

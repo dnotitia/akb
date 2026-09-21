@@ -10,10 +10,8 @@ import {
   Braces,
   CalendarClock,
   Columns3,
-  Database,
   Fingerprint,
   Hash,
-  Info,
   KeyRound,
   MoreHorizontal,
   PanelRightClose,
@@ -29,11 +27,9 @@ import {
 } from "lucide-react";
 import {
   ResourceCanvas,
-  ResourceContextBar,
-  ResourceViewerFrame,
   ResourceWorkspace,
-  ResourceWorkspaceHeader,
 } from "@/components/resource-workspace";
+import { ResourceCommandRow } from "@/components/resource-command-row";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -52,6 +48,8 @@ import {
   TablePagination,
 } from "@/components/table-query-controls";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { usePublishResourceLocation } from "@/contexts/resource-location-context";
 import {
   ApiError,
   deleteVaultTable,
@@ -91,6 +89,18 @@ const SYSTEM_COLUMN_TYPES: Record<string, string> = {
 
 export default function TablePage() {
   const { name: vault, table } = useParams<{ name: string; table: string }>();
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
+  const accountScope = user?.user_id ?? "";
+  return <TablePageContent key={`${accountScope}:${vault}:${table}`} accountScope={accountScope} accessChecking={checking} accessRevision={revision} />;
+}
+
+function TablePageContent({ accountScope, accessChecking, accessRevision }: {
+  accountScope: string;
+  accessChecking: boolean;
+  accessRevision: number;
+}) {
+  const { name: vault, table } = useParams<{ name: string; table: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -106,6 +116,7 @@ export default function TablePage() {
   const [rowNotice, setRowNotice] = useState("");
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
+  const loadedAccessRevision = useRef(accessRevision);
   const queryState = useMemo(() => parseTableQueryState(searchParams), [searchParams]);
 
   const setQueryState = useCallback(
@@ -116,20 +127,23 @@ export default function TablePage() {
   );
 
   const vaultInfoQuery = useQuery({
-    queryKey: ["vault-info", vault],
-    queryFn: () => getVaultInfo(vault!),
-    enabled: Boolean(vault),
+    queryKey: ["vault-info", vault, accountScope],
+    queryFn: async () => ({ ...await getVaultInfo(vault!), queryAccessRevision: accessRevision }),
+    enabled: Boolean(vault) && !accessChecking,
+    staleTime: 0,
   });
   const catalogQuery = useQuery({
-    queryKey: ["vault-tables", vault],
-    queryFn: () => listVaultTables(vault!),
-    enabled: Boolean(vault),
+    queryKey: ["vault-tables", vault, accountScope],
+    queryFn: async () => ({ ...await listVaultTables(vault!), queryAccessRevision: accessRevision }),
+    enabled: Boolean(vault) && !accessChecking,
+    staleTime: 0,
   });
   const rowsQuery = useQuery({
     queryKey: [
       "vault-table-rows",
       vault,
       table,
+      accountScope,
       queryState.pageIndex,
       queryState.pageSize,
       queryState.sort,
@@ -149,7 +163,7 @@ export default function TablePage() {
         queryPageSize: queryState.pageSize,
       };
     },
-    enabled: Boolean(vault && table),
+    enabled: Boolean(vault && table) && !accessChecking,
     placeholderData: keepPreviousData,
   });
 
@@ -159,10 +173,28 @@ export default function TablePage() {
   const cols = rowsQuery.data?.columns || [];
   const total = rowsQuery.data?.total ?? 0;
   const roleRank = ROLE_RANK[vaultInfoQuery.data?.role as Role] ?? 0;
-  const writeRestriction = rowWriteRestriction(vaultInfoQuery.data, roleRank);
+  const accessRefreshing = accessChecking || (
+    !vaultInfoQuery.isError && vaultInfoQuery.data?.queryAccessRevision !== accessRevision
+  );
+  // Failed refetches retain cached data. Never reactivate writes using that
+  // previous role when the current access proof could not be obtained.
+  const accessFailed = !accessChecking && vaultInfoQuery.isError;
+  const writeRestriction = accessFailed
+    ? "Permissions could not be verified. Retry before making changes."
+    : accessRefreshing
+      ? "Permissions are being refreshed. Row changes will be available once access is verified."
+      : rowWriteRestriction(vaultInfoQuery.data, roleRank);
   const canManageRows = writeRestriction === null;
   const canPublish = roleRank >= ROLE_RANK.writer && !writeRestriction;
   const canDelete = roleRank >= ROLE_RANK.admin && !writeRestriction;
+
+  useEffect(() => {
+    if (accessChecking || loadedAccessRevision.current === accessRevision) return;
+    loadedAccessRevision.current = accessRevision;
+    void queryClient.invalidateQueries({ queryKey: ["vault-info", vault, accountScope] });
+    void queryClient.invalidateQueries({ queryKey: ["vault-tables", vault, accountScope] });
+    void queryClient.invalidateQueries({ queryKey: ["vault-table-rows", vault, table, accountScope] });
+  }, [accessChecking, accessRevision, accountScope, queryClient, table, vault]);
 
   const closeSchema = useCallback(() => {
     setSchemaOpen(false);
@@ -216,11 +248,14 @@ export default function TablePage() {
     info?.columns?.filter((column) => column.required || column.primary_key).length || 0;
   const displayPageIndex = rowsQuery.data?.queryPageIndex ?? queryState.pageIndex;
   const displayPageSize = rowsQuery.data?.queryPageSize ?? queryState.pageSize;
-  const pageStart = total === 0 ? 0 : displayPageIndex * displayPageSize + 1;
-  const pageEnd = total === 0 ? 0 : Math.min(pageStart + rows.length - 1, total);
   const activeSort = queryState.sort || DEFAULT_TABLE_SORT;
   const availableColumns = Array.from(columnByName.values());
   const queryError = tableRowsError(rowsQuery.error, Boolean(info));
+  const resolvedLocation = vault && info && !accessRefreshing && catalogQuery.data?.queryAccessRevision === accessRevision
+      && !vaultInfoQuery.isError && !catalogQuery.isError && !rowsQuery.isError && !rowsQuery.isPending
+      ? { vault, title: info.name, kind: "Table" as const, collectionPath: info.collection || undefined }
+      : null;
+  usePublishResourceLocation(resolvedLocation);
 
   if (vaultInfoQuery.isPending || catalogQuery.isPending || rowsQuery.isPending) {
     return <TablePageLoading />;
@@ -248,25 +283,15 @@ export default function TablePage() {
   }
 
   return (
-    <ResourceWorkspace label="Table workspace">
-      <ResourceWorkspaceHeader
-        icon={Table2}
-        iconTone="data"
-        title={table || "Table"}
-        subtitle={
-          <>
-            Table <span aria-hidden>·</span>{" "}
-            <span className="font-medium text-foreground">{vault}</span>
-          </>
-        }
+    <ResourceWorkspace label="Table workspace" variant="reading">
+      <h1 className="sr-only">{info?.name || "Table"}</h1>
+      <ResourceCommandRow
         meta={
-          <Badge variant={canManageRows ? "success" : "outline"}>
-            {canManageRows ? "Editable" : "Read only"}
-          </Badge>
-        }
-        actions={
           <>
-            <div className="mr-1 hidden items-center gap-3 text-xs text-foreground-muted xl:flex">
+            <Badge variant={canManageRows ? "success" : "outline"}>
+              {canManageRows ? "Editable" : "Read only"}
+            </Badge>
+            <div className="hidden shrink-0 items-center gap-3 text-xs text-foreground-muted xl:flex">
               <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
                 <Rows3 className="h-3.5 w-3.5" aria-hidden />
                 {rowCount} rows
@@ -276,10 +301,20 @@ export default function TablePage() {
                 {visibleColumnCount} columns
               </span>
             </div>
+            {info?.description && (
+              <TooltipText tip={info.description} className="hidden min-w-0 truncate 2xl:block">
+                {info.description}
+              </TooltipText>
+            )}
+          </>
+        }
+      >
             <Button
               type="button"
               variant="accent"
               size="sm"
+              className="min-h-11 sm:min-h-0"
+              aria-label="Add row"
               onClick={() => {
                 setSelectedRow(null);
                 setRowDialogMode("create");
@@ -291,13 +326,15 @@ export default function TablePage() {
               }
             >
               <Plus className="h-4 w-4" aria-hidden />
-              <span className="hidden sm:inline">Add row</span>
+              Add row
             </Button>
             <Button
               ref={schemaToggleRef}
               type="button"
               variant="outline"
               size="sm"
+              className="min-h-11 sm:min-h-0"
+              aria-label="Schema"
               aria-controls="table-schema-panel"
               aria-expanded={schemaOpen}
               onClick={() => (schemaOpen ? closeSchema() : setSchemaOpen(true))}
@@ -307,7 +344,7 @@ export default function TablePage() {
               ) : (
                 <PanelRightOpen className="h-4 w-4" aria-hidden />
               )}
-              <span className="hidden sm:inline">Schema</span>
+              Schema
             </Button>
             {(canPublish || canDelete) && (
               <ResourceActionsMenu
@@ -318,9 +355,7 @@ export default function TablePage() {
                 onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
               />
             )}
-          </>
-        }
-      />
+      </ResourceCommandRow>
 
       {published && (
         <PublicationSuccessBanner
@@ -332,51 +367,22 @@ export default function TablePage() {
       )}
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        <ResourceCanvas>
-          <ResourceContextBar
-            trailing={
-              rowNotice ? (
-                <span role="status" className="font-medium text-success">
-                  {rowNotice}
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
-                  <Rows3 className="h-3.5 w-3.5" aria-hidden />
-                  {pageStart}–{pageEnd} of {total}
-                </span>
-              )
-            }
-          >
-            <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
-              <Info className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-              <TooltipText
-                tip={info?.description || "Browse records in this Vault table."}
-                className="truncate"
-              >
-                {info?.description || "Browse records in this Vault table."}
-              </TooltipText>
-              {writeRestriction && (
-                <>
-                  <span aria-hidden>·</span>
-                  <span className="truncate">{writeRestriction}</span>
-                </>
-              )}
+        <ResourceCanvas variant="reading">
+          {writeRestriction && (
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2 text-xs text-foreground-muted">
+              <p role={accessFailed ? "status" : undefined}>{writeRestriction}</p>
+              {accessFailed && <Button type="button" variant="outline" size="sm"
+                loading={vaultInfoQuery.isFetching} onClick={() => void vaultInfoQuery.refetch()}>
+                Retry permissions
+              </Button>}
             </div>
-          </ResourceContextBar>
-
-          <ResourceViewerFrame
-            icon={Database}
-            label="Records"
-            meta={
-              <>
-                <span className="tabular-nums">{cols.length} columns</span>
-                <span className="hidden sm:inline">
-                  {queryState.filters.length > 0 ? `${total} matching` : `${total} rows`}
-                </span>
-              </>
-            }
-            bodyClassName="overflow-hidden"
-          >
+          )}
+          {rowNotice && (
+            <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-xs font-medium text-success">
+              {rowNotice}
+            </p>
+          )}
+          <section aria-label="Records" className="min-h-0 flex-1 overflow-hidden">
             <div className="flex h-full min-h-0 flex-col">
               <TableFilterBar
                 filters={queryState.filters}
@@ -578,7 +584,7 @@ export default function TablePage() {
                 />
               )}
             </div>
-          </ResourceViewerFrame>
+          </section>
         </ResourceCanvas>
 
         {schemaOpen && (
@@ -595,8 +601,8 @@ export default function TablePage() {
           aria-hidden={!schemaOpen}
           inert={!schemaOpen}
           className={cn(
-            "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-xl flex-col overflow-hidden border-l border-border bg-surface shadow-xl transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-[30rem]",
-            schemaOpen ? "translate-x-0" : "pointer-events-none translate-x-full",
+            "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-xl flex-col overflow-hidden border-l border-border bg-surface transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-[30rem]",
+            schemaOpen ? "translate-x-0 shadow-xl" : "pointer-events-none translate-x-full",
           )}
         >
           <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
@@ -616,6 +622,7 @@ export default function TablePage() {
             </Button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-4 rail-scroll">
+            {info?.description && <p className="mb-4 text-sm text-foreground-muted">{info.description}</p>}
             {info?.columns?.length ? (
               <>
                 <section aria-labelledby="schema-overview-title">
@@ -695,6 +702,7 @@ export default function TablePage() {
         name={table || "Table"}
         rowCount={rowCount}
         onConfirm={async () => {
+          if (!canDelete) throw new Error(writeRestriction || "Admin access is required to delete tables.");
           await deleteVaultTable(vault!, table!);
           refetchTree();
           navigate(`/vault/${vault}`);
@@ -706,6 +714,7 @@ export default function TablePage() {
         vault={vault!}
         table={table!}
         columns={info?.columns || []}
+        restriction={writeRestriction ?? (catalogQuery.isError || !info ? "Table columns could not be verified. Retry before publishing." : null)}
         onPublished={setPublished}
       />
       <TableFilterDialog
@@ -733,6 +742,7 @@ export default function TablePage() {
         row={selectedRow}
         onSave={async (values, options) => {
           if (!vault || !table) return;
+          if (writeRestriction) throw new Error(writeRestriction);
           if (rowDialogMode === "edit") {
             const rowId = selectedRow?.id;
             if (typeof rowId !== "string") throw new Error("This row does not have a valid id.");
@@ -775,6 +785,7 @@ export default function TablePage() {
         confirmLabel="Delete row"
         variant="destructive"
         onConfirm={async () => {
+          if (writeRestriction) throw new Error(writeRestriction);
           if (!vault || !table || typeof rowToDelete?.id !== "string") {
             throw new Error("This row does not have a valid id.");
           }
@@ -983,20 +994,17 @@ function TablePageLoading() {
   return (
     <LoadingState
       label="Loading rows"
-      className="flex h-full min-h-0 flex-col overflow-hidden bg-background"
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-surface"
     >
       <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        <header className="flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-3 sm:px-4 lg:px-5">
-          <Skeleton className="hidden h-9 w-9 shrink-0 rounded-[var(--radius-md)] sm:block" />
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-5 w-2/3 max-w-48 rounded-[var(--radius-sm)]" />
-            <Skeleton className="h-3 w-1/2 max-w-36 rounded-[var(--radius-sm)]" />
-          </div>
+        <header className="flex min-h-14 shrink-0 items-center gap-3 border-b border-border px-3 sm:h-10 sm:min-h-10 sm:px-4 lg:px-5">
+          <Skeleton className="h-6 w-24 rounded-[var(--radius-sm)]" />
+          <Skeleton className="hidden h-4 w-24 rounded-[var(--radius-sm)] sm:block" />
+          <Skeleton className="ml-auto h-8 w-20 rounded-[var(--radius-md)]" />
           <Skeleton className="h-8 w-20 rounded-[var(--radius-md)]" />
         </header>
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-2 sm:p-3">
-          <Skeleton className="mb-3 h-11 w-full shrink-0 rounded-[var(--radius-lg)]" />
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-surface-2/60 px-3">
               <Skeleton className="h-4 w-28 rounded-[var(--radius-sm)]" />
               <Skeleton className="ml-auto h-3 w-24 rounded-[var(--radius-sm)]" />

@@ -297,6 +297,42 @@ class SearchResponse(BaseModel):
     (i.e. the pool was filled and there might be more in the corpus).
     `hint` carries a one-line follow-up suggestion when truncated.
 
+    `excluded` is how many candidates a FILTER removed on the way to this
+    page, keyed by cause — `{"archived": 1}`. It is what explains a page
+    shorter than the requested `limit` without claiming anything went wrong:
+    the cause names which part of the request did it, so "your scope removed
+    it" never has to be guessed from a count. Empty (`{}`) when nothing was
+    excluded, and always present, so a caller never distinguishes absent from
+    zero.
+
+    Three boundaries on it. It is page-relative — candidates considered while
+    assembling THIS page, including the refills that replaced a filtered hit —
+    not a property of the pool or the corpus, which is why it carries no name
+    from the `total_*` family. It holds only causes that are not faults; a
+    component that failed or a hit lost to a stale row is `degraded` /
+    `degradation_reason` instead, and no cause appears in both. And its keys
+    are public vocabulary, translated from the internal counter names in
+    `search_service.PUBLIC_DROP_CAUSE_NAMES`, so renaming a diagnostic string
+    is not a breaking API change.
+
+    `recovered` is the fault counterpart of `excluded`: how many candidates a
+    FAULT removed on the way to this page **after** the refill loop replaced
+    every one of them, keyed by cause. It is the corpus-integrity signal a
+    complete page would otherwise hide — a chunk that pointed at a row that is
+    gone is worth chasing whether or not the page filled — and it is a count
+    rather than a flag precisely because nothing about the response is wrong.
+    Empty (`{}`) when the page needed no repair, and always present.
+
+    It is populated only when the response is NOT short, which is what keeps a
+    fault in exactly one place: a fault that cost the caller a result is named
+    by `degradation_reason` and is absent from here; a fault that cost nothing
+    is counted here and does not raise `degraded` (akb#611). Its keys are the
+    same internal cause names `degradation_reason` already publishes for these
+    five causes — a second public word for them would make one fault answer to
+    two names depending on whether the page happened to fill — so callers test
+    it for emptiness and read the keys as diagnostics, not as a vocabulary to
+    branch on.
+
     `total` is kept as a deprecated alias of `returned` for backward
     compatibility with existing UI / agent prompts.
     """
@@ -309,12 +345,37 @@ class SearchResponse(BaseModel):
     total_matches: int = 0
     truncated: bool = False
     hint: str | None = None
-    # `degraded` is true when the vector store raised (outage, or a filter-size
-    # overflow on the seahorse drivers) so the result set is incomplete/empty —
-    # distinct from a genuine zero-match. Previously such failures were swallowed
-    # into a silent `[]` (issue #189). `degradation_reason` is a short cause.
+    # `degraded` is true when something FAILED **and the result set is
+    # therefore incomplete** — distinct from a genuine zero-match. Both halves
+    # are load-bearing, and the second is checked, not assumed (akb#611). Two
+    # families raise it: a retrieval leg (vector-store outage, a filter-size
+    # overflow on the seahorse drivers, a sparse encoder that is down), and a
+    # hit lost between retrieval and hydration because its source row is gone
+    # or stale. Previously such failures were swallowed into a silent `[]`
+    # (issue #189).
+    # Two things never set it. A FILTER is not a failure: a document the
+    # request asked to exclude — the default `unarchived` archive scope, for
+    # one — is part of the query, and is reported in `excluded` (akb#604).
+    # And a hydration fault the refill loop replaced from the prefetch pool
+    # cost the caller nothing, so it leaves the response complete and is
+    # reported in `recovered` (akb#611); a fault that left the page short of
+    # the requested `limit` still raises this flag, which is the case the
+    # signal exists for.
+    # `degradation_reason` is a short cause.
     degraded: bool = False
     degradation_reason: str | None = None
+    # The counterpart to `degraded`, for the exclusions that are NOT faults
+    # (akb#608): public cause name -> how many candidates it removed from this
+    # page. `degraded` says something broke; `excluded` says the request itself
+    # took documents out, which is the only other reason a page comes back
+    # short. Never both for one drop — see the docstring above.
+    excluded: dict[str, int] = Field(default_factory=dict)
+    # The third and last place a drop can be reported (akb#611): internal cause
+    # name -> how many candidates a fault removed from this page that the refill
+    # loop then replaced. Non-empty only on a COMPLETE page, so it never
+    # overlaps `degradation_reason`, which names the faults that made a page
+    # short. Read it as corpus health, not as a problem with this response.
+    recovered: dict[str, int] = Field(default_factory=dict)
     results: list[SearchResult]
 
 
@@ -338,20 +399,21 @@ class GrepMatch(BaseModel):
     """Single matched line within a grep result."""
 
     section: str | None = None
+    # One-based searched-body line; Documents exclude parsed frontmatter.
+    line: int | None = Field(default=None, ge=1)
     text: str
 
 
 class GrepResult(BaseModel):
-    """Single document returned by grep."""
+    """Single Document or text File returned by grep."""
 
     uri: str
     vault: str
     path: str
     title: str
     status: str | None = None
-    # Additive native measurement identity. Legacy Document grep leaves these
-    # unset, preserving its frozen response; W3b needs them to distinguish an
-    # admitted searchable text File and bind the result to its current Head.
+    # Native Document and text File results identify the Head that was read.
+    # Legacy chunk-based grep leaves this additive identity unset.
     resource_type: str | None = None
     revision: str | None = None
     content_hash: str | None = None
@@ -408,12 +470,17 @@ class GrepResponse(BaseModel):
     returned_docs: int | None = None
     returned_matches: int | None = None
     total_docs: int | None = None
+    total_resources: int | None = None
+    returned_resources: int | None = None
     total_matches: int | None = None
     truncated: bool | None = None
     truncation: GrepTruncation | None = None
     hint: str | None = None
     results: list[GrepResult] | None = None
     by_doc: dict[str, int] | None = None
+    by_resource: dict[str, int] | None = None
+    resources: list[dict[str, str]] | None = None
+    n_resources: int | None = None
     n_files: int | None = None
     files: list[str] | None = None
     replace: str | None = None

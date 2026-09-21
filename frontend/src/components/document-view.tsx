@@ -2,12 +2,14 @@ import { useMemo, useState } from "react";
 import { Check, Code2, Copy, Eye } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
+import { formatByteSize, formatLineCount, getDocumentStats } from "@/lib/document-statistics";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 
 type ViewMode = "rendered" | "raw";
 
@@ -27,13 +29,18 @@ interface DocumentViewProps {
   version?: string;
   /** Framed file-viewer treatment used by the Vault document workspace. */
   appearance?: "plain" | "file";
+  /** The resource shell owns commands; render only the reading surface. */
+  bodyOnly?: boolean;
+  readingWidth?: "standard" | "wide";
+  idPrefix?: string;
 }
 
 /**
  * Self-sufficient doc body: fetches the document, renders the
  * rendered/raw segmented control, and shows the markdown content.
  *
- * Query key is ["document", vault, docId, version] — matches DocumentPage
+ * Query key includes document, vault, docId, version, user, and access revision.
+ * It matches DocumentPage
  * exactly so TanStack Query dedupes when both are mounted. Without
  * `version` in the key, historical-view URLs would render HEAD because
  * the un-versioned key collides with DocumentPage's versioned fetch
@@ -51,7 +58,12 @@ export function DocumentView({
   onViewChange,
   version,
   appearance = "plain",
+  bodyOnly = false,
+  readingWidth = "standard",
+  idPrefix = "docview",
 }: DocumentViewProps) {
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
   const [localView, setLocalView] = useState<ViewMode>("rendered");
 
   // Controlled vs. uncontrolled view mode
@@ -65,9 +77,9 @@ export function DocumentView({
   };
 
   const { data: doc, isLoading, error } = useQuery({
-    queryKey: ["document", vault, docId, version],
+    queryKey: ["document", vault, docId, version, user?.user_id, revision],
     queryFn: () => getDocument(vault, docId, version),
-    enabled: !!vault && !!docId,
+    enabled: !!vault && !!docId && !checking,
     retry: false,
   });
 
@@ -106,7 +118,7 @@ export function DocumentView({
     <section
       aria-label="Document content"
       className={cn(
-        fileAppearance &&
+        fileAppearance && !bodyOnly &&
           "overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
       )}
     >
@@ -116,7 +128,7 @@ export function DocumentView({
          points at its panel via aria-controls so screen readers
          announce the relationship. Editing is a document action in
          the workspace header, not a third read-mode tab. */}
-      <TabStrip
+      {!bodyOnly && <TabStrip
         view={view}
         onSelect={setView}
         appearance={appearance}
@@ -125,23 +137,23 @@ export function DocumentView({
         lineCount={contentStats.lineCount}
         byteCount={contentStats.byteCount}
         summary={doc.summary}
-      />
+      />}
 
       {/* ── Doc body ──────────────────────────────────────────────── */}
       {view === "rendered" ? (
         <div
-          id="docview-panel-rendered"
+          id={`${idPrefix}-panel-rendered`}
           role="tabpanel"
-          aria-labelledby="docview-tab-rendered"
+          aria-labelledby={`${idPrefix}-tab-rendered`}
           className={cn(
             "min-w-0",
-            fileAppearance && "min-h-80 px-5 py-7 sm:px-8 sm:py-9 lg:px-10",
+            fileAppearance && (bodyOnly ? "px-4 py-5 sm:px-6" : "px-5 py-7 sm:px-8 sm:py-9 lg:px-10"),
           )}
           style={{ maxWidth: "100%" }}
         >
           <MarkdownRender
             markdown={doc.content || ""}
-            className={fileAppearance ? "document-reading-flow" : undefined}
+            className={fileAppearance ? cn("document-reading-flow", readingWidth === "wide" && "document-reading-wide") : undefined}
             assetContext={{
               mode: "authenticated",
               vault,
@@ -152,15 +164,15 @@ export function DocumentView({
         </div>
       ) : (
         <div
-          id="docview-panel-raw"
+          id={`${idPrefix}-panel-raw`}
           role="tabpanel"
-          aria-labelledby="docview-tab-raw"
+          aria-labelledby={`${idPrefix}-tab-raw`}
           className={cn(
             "relative",
-            fileAppearance && "min-h-80 bg-surface-muted/40 p-4 sm:p-6",
+            fileAppearance && "bg-surface p-4 sm:p-6",
           )}
         >
-          {!fileAppearance && (
+          {!fileAppearance && !bodyOnly && (
             <button
               type="button"
               onClick={copyRaw}
@@ -175,7 +187,7 @@ export function DocumentView({
             className={cn(
               "font-mono text-[13px] leading-[1.65] whitespace-pre-wrap overflow-x-auto",
               fileAppearance
-                ? "m-0 min-h-64 wrap-anywhere text-foreground"
+                ? "m-0 wrap-anywhere text-foreground"
                 : "bg-surface-muted p-4 border border-border rounded-[var(--radius-lg)]",
             )}
           >
@@ -359,31 +371,4 @@ function TabStrip({
       </div>
     </div>
   );
-}
-
-function getDocumentStats(content: string) {
-  const normalized = content.replace(/\r\n?/g, "\n");
-  const withoutTerminalNewline = normalized.endsWith("\n")
-    ? normalized.slice(0, -1)
-    : normalized;
-
-  return {
-    lineCount:
-      normalized.length === 0 ? 0 : withoutTerminalNewline.split("\n").length,
-    byteCount: new TextEncoder().encode(content).byteLength,
-  };
-}
-
-function formatLineCount(count: number) {
-  return `${count} ${count === 1 ? "line" : "lines"}`;
-}
-
-function formatByteSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} ${bytes === 1 ? "Byte" : "Bytes"}`;
-  if (bytes < 1024 * 1024) return `${formatUnit(bytes / 1024)} KB`;
-  return `${formatUnit(bytes / (1024 * 1024))} MB`;
-}
-
-function formatUnit(value: number) {
-  return value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
 }

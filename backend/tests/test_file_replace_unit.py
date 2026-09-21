@@ -78,6 +78,15 @@ def _row(
     }
 
 
+def _never(message: str):
+    """A stand-in that fails the test if the step it replaces ever runs."""
+
+    async def _fail(*_args, **_kwargs):
+        pytest.fail(message)
+
+    return _fail
+
+
 async def _service(monkeypatch):
     monkeypatch.setattr(fs, "measurement_enabled", lambda: False)
     pool = _Pool()
@@ -97,9 +106,9 @@ async def test_initiate_replace_rejects_stale_hash_before_issuing_upload(monkeyp
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_args, **_kwargs: pytest.fail("stale request must not receive an upload URL"),
+        fs,
+        "_issue_write_capability",
+        _never("stale request must not receive an upload URL"),
     )
 
     with pytest.raises(ConflictError, match="content_hash moved") as exc:
@@ -107,6 +116,7 @@ async def test_initiate_replace_rejects_stale_hash_before_issuing_upload(monkeyp
             "team",
             _row()["vault_id"],
             str(_row()["id"]),
+            actor_id="tester",
             content_hash=_NEW_HASH,
             expected_content_hash="0" * 64,
         )
@@ -125,11 +135,9 @@ async def test_replace_routes_do_not_treat_document_images_as_files(monkeypatch)
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs, "_discard_replacement_objects", _discard)
     monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_args, **_kwargs: pytest.fail(
-            "a document image must not receive a File replacement URL"
-        ),
+        fs,
+        "_issue_write_capability",
+        _never("a document image must not receive a File replacement URL"),
     )
     monkeypatch.setattr(
         fs.s3_adapter,
@@ -144,6 +152,7 @@ async def test_replace_routes_do_not_treat_document_images_as_files(monkeypatch)
             "team",
             _row()["vault_id"],
             str(_row()["id"]),
+            actor_id="tester",
             content_hash=_NEW_HASH,
         )
     with pytest.raises(NotFoundError):
@@ -165,9 +174,9 @@ async def test_initiate_replace_rejects_stale_version(monkeypatch):
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_args, **_kwargs: pytest.fail("stale request must not receive an upload URL"),
+        fs,
+        "_issue_write_capability",
+        _never("stale request must not receive an upload URL"),
     )
 
     with pytest.raises(ConflictError, match="file version moved") as exc:
@@ -175,6 +184,7 @@ async def test_initiate_replace_rejects_stale_version(monkeypatch):
             "team",
             _row()["vault_id"],
             str(_row()["id"]),
+            actor_id="tester",
             content_hash=_NEW_HASH,
             expected_content_hash=_OLD_HASH,
             expected_version="etag-stale",
@@ -190,15 +200,16 @@ async def test_initiate_replace_skips_identical_content(monkeypatch):
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(
-        fs.s3_adapter,
-        "presign_put",
-        lambda *_args, **_kwargs: pytest.fail("identical content must not be uploaded"),
+        fs,
+        "_issue_write_capability",
+        _never("identical content must not be uploaded"),
     )
 
     result = await service.initiate_replace(
         "team",
         _row()["vault_id"],
         str(_row()["id"]),
+        actor_id="tester",
         content_hash=_OLD_HASH,
         expected_content_hash=_OLD_HASH,
         expected_version="etag-old",
@@ -220,38 +231,49 @@ async def test_initiate_replace_schedules_abandoned_staging_cleanup(monkeypatch)
         scheduled.append((key, delay_seconds))
         return len(scheduled)
 
+    granted: list[dict] = []
+
+    async def _issue(_conn, **kwargs):
+        granted.append(kwargs)
+        return "T" * 43
+
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_put",
-        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://upload.test", 123),
-    )
+    monkeypatch.setattr(fs, "_issue_write_capability", _issue)
     monkeypatch.setattr(fs, "_enqueue_s3_delete", _enqueue)
 
     result = await service.initiate_replace(
         "team",
         _row()["vault_id"],
         str(_row()["id"]),
+        actor_id="tester",
         content_hash=_NEW_HASH,
     )
 
+    staging_key = fs._replacement_staging_key(
+        "team", _row()["id"], uuid.UUID(result["replacement_id"]),
+    )
     assert result["unchanged"] is False
-    assert result["upload_url"] == "https://upload.test"
-    assert result["expires_in"] == 123
-    assert scheduled == [
-        (
-            fs._replacement_staging_key(
-                "team",
-                _row()["id"],
-                uuid.UUID(result["replacement_id"]),
-            ),
-            fs._REPLACEMENT_STAGING_DELETE_DELAY,
-        )
-    ]
+    assert result["upload_url"].endswith("/api/v1/files/upload/" + "T" * 43)
+    assert result["expires_in"] == fs._PRESIGN_UPLOAD_TTL
+    assert scheduled == [(staging_key, fs._REPLACEMENT_STAGING_DELETE_DELAY)]
+    # The capability must name the staging key. Bound to the live key it would
+    # let a caller overwrite the object the replacement is meant to supersede
+    # without ever passing the optimistic-concurrency recheck.
+    assert granted[0]["object_key"] == staging_key
+    assert granted[0]["object_key"] != _row()["s3_key"]
 
 
-async def test_upload_response_reports_actual_signing_lifetime(monkeypatch):
-    service, _pool = await _service(monkeypatch)
+async def test_upload_url_carries_no_locator_and_never_signs(monkeypatch):
+    """`upload_url` names this service and an opaque token, nothing else.
+
+    A presigned PUT URL carried the object store's endpoint, the bucket, the
+    key and a signature, and the response repeated the key in `s3_key`. What a
+    caller does is unchanged — PUT the bytes to an absolute URL with no
+    Authorization header — but the storage topology is no longer part of the
+    public contract, and `s3_key` is gone because nothing ever read it."""
+    service, pool = await _service(monkeypatch)
+    written: list[tuple] = []
 
     async def allowed(*_args, **_kwargs):
         return True
@@ -259,35 +281,73 @@ async def test_upload_response_reports_actual_signing_lifetime(monkeypatch):
     async def inserted(_conn, **kwargs):
         return kwargs["file_id"]
 
+    async def _execute(*args):
+        written.append(args)
+
+    monkeypatch.setattr(pool.conn, "execute", _execute)
     monkeypatch.setattr(fs, "lock_vault_for_child_write", allowed)
     monkeypatch.setattr(fs.vault_files_repo, "s3_key_available_for_registration", allowed)
     monkeypatch.setattr(fs.vault_files_repo, "insert_or_adopt", inserted)
     monkeypatch.setattr(fs.s3_adapter, "ensure_bucket", lambda _bucket: None)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_put",
-        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://upload.test", 234),
-    )
+
     result = await service.initiate_upload(
         "team", _row()["vault_id"], "", "test.bin", actor_id="tester",
     )
-    assert result["upload_url"] == "https://upload.test"
-    assert result["expires_in"] == 234
+
+    assert "s3_key" not in result
+    assert "/api/v1/files/upload/" in result["upload_url"]
+    for leaked in ("X-Amz-", "akb-files", "?", "team/"):
+        assert leaked not in result["upload_url"], leaked
+    assert result["expires_in"] == fs._PRESIGN_UPLOAD_TTL
+    # The grant is written in the same transaction as the reservation, and it
+    # names the key — that binding is what the route resolves.
+    grants = [a for a in written if "m1_file_transfer_intents" in a[0]]
+    assert grants, "an upload grant must be recorded"
+    assert "'PUT'" in grants[0][0]
 
 
-async def test_download_response_reports_actual_signing_lifetime(monkeypatch):
-    service, _pool = await _service(monkeypatch)
+async def test_download_reports_the_capability_lifetime_and_never_signs(monkeypatch):
+    """`expires_in` must equal how long the URL actually works.
+
+    A presigned URL could have its life cut short by the S3 session's own
+    expiry, so the response had to report the shortened figure. A capability's
+    life is the row this call writes, so the two cannot drift — but the
+    contract a caller reads is unchanged, and one consumer treats
+    `expires_in <= 0` as already-expired.
+
+    The stronger assertion here is the negative one: a download must not reach
+    the object store at all. That is the whole point of the change."""
+    service, pool = await _service(monkeypatch)
+    written: list[tuple] = []
+
+    async def _execute(*args):
+        written.append(args)
+
+    monkeypatch.setattr(pool.conn, "execute", _execute)
 
     async def find(*_args):
         return {**_row(), "upload_state": "confirmed", "hash_algorithm": "sha256"}
 
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", find)
-    monkeypatch.setattr(
-        fs.s3_adapter, "presign_get",
-        lambda *_args, **_kwargs: fs.s3_adapter.PresignedURL("https://download.test", 345),
-    )
+    # The guard that used to stand here monkeypatched `presign_get` to fail.
+    # That function no longer exists, which is a stronger statement than any
+    # stub could make: there is no way to sign a download for a client.
+    assert not hasattr(fs.s3_adapter, "presign_get")
+
     result = await service.get_download_url(_row()["vault_id"], str(_row()["id"]))
-    assert result["download_url"] == "https://download.test"
-    assert result["expires_in"] == 345
+
+    assert result["expires_in"] == fs._PRESIGN_DOWNLOAD_TTL
+    assert result["expires_in"] > 0
+    # The lifetime written to the grant is the one reported back. Asserted by
+    # meaning rather than by position — the parameter list grows.
+    assert written, "a grant must be recorded"
+    sql, *params = written[0]
+    assert "INSERT INTO m1_file_transfer_intents" in sql
+    assert result["expires_in"] in params
+    # No locator, no signature — only this service and an opaque token.
+    assert "/api/v1/files/download/" in result["download_url"]
+    for leaked in ("X-Amz-", "akb-files", "?"):
+        assert leaked not in result["download_url"], leaked
 
 
 async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monkeypatch):

@@ -70,6 +70,22 @@ DEFAULT_MINIO_PORT = 9000
 DEFAULT_COMPOSE_PROJECT = "akb-e2e"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PROFILE = "tool-only"
+SOURCE_REVISION_ENV = "AKB_E2E_SOURCE_REVISION"
+MINIO_RESET_MAX_ATTEMPTS = 3
+MINIO_RESET_BACKOFF_SECONDS = (0.05, 0.1)
+MINIO_DELETE_BATCH_SIZE = 1000
+MINIO_RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "InternalError",
+        "InternalFailure",
+        "OperationAborted",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+    }
+)
 
 
 def _canonical_fixture_json(value: object) -> bytes:
@@ -303,9 +319,8 @@ _PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
     "transport-proxy": frozenset({"http", "pat", "stdio"}),
     "oidc-resource-server": frozenset({"http", "pat", "oidc"}),
     "transport-oidc": frozenset({"http", "pat", "stdio", "oidc"}),
-    # The common runtime never starts Keycloak.  Selecting this profile is an
-    # explicit request for the specialist overlay and therefore fails closed
-    # unless the orchestrator supplies that separate runtime.
+    # The common runtime never starts Keycloak. Selecting this profile is an
+    # explicit request for a specialist overlay and therefore fails closed.
     "keycloak-overlay": frozenset({"http", "pat", "keycloak"}),
 }
 _CAPABILITY_ALIASES = {
@@ -357,6 +372,33 @@ def select_capability_profile(
 
 class ProvisioningFailure(RuntimeError):
     """A dependency, process, or fixture precondition failed."""
+
+
+class MinioResetFailure(ProvisioningFailure):
+    """A bounded MinIO reset failed with sanitized operation evidence."""
+
+    def __init__(self, detail: str, evidence: dict[str, object]) -> None:
+        super().__init__(detail)
+        self.evidence = evidence
+
+
+class _MinioResetOperationError(RuntimeError):
+    """An S3 reset operation failed, with an explicit retry classification."""
+
+    def __init__(
+        self,
+        operation: str,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        exception_type: str = "S3ResponseError",
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.code = code
+        self.retryable = retryable
+        self.exception_type = exception_type
 
 
 class BlockedRuntimeConfig(ProvisioningFailure):
@@ -616,6 +658,23 @@ class E2ERuntime:
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
         self._stdio_next_id = 2
+        self._dependency_identity: dict[str, object] | None = None
+        self._dependency_reset_count = 0
+        self._dependency_reset_wall_seconds = 0.0
+        self._dependency_reset_evidence: dict[str, object] = {
+            "strategy": "in_place",
+            "preserves": [
+                "postgres_container",
+                "minio_container",
+                "compose_network",
+                "compose_volumes",
+                "backend_process",
+                "embedding_process",
+                "stdio_process",
+            ],
+            "count": 0,
+            "wall_seconds": 0.0,
+        }
         self.oidc_fixture: OIDCFixture | None = (
             OIDCFixture(
                 origin=config.fixture_origin,
@@ -642,6 +701,14 @@ class E2ERuntime:
         return tuple(sorted(self.profile.capabilities))
 
     def _source_revision(self) -> str:
+        explicit = os.environ.get(SOURCE_REVISION_ENV)
+        if explicit is not None:
+            if re.fullmatch(r"[0-9a-f]{40}", explicit) is None:
+                raise BlockedRuntimeConfig(
+                    f"{SOURCE_REVISION_ENV} must be a full 40-hex Git SHA"
+                )
+            self._candidate_revision = explicit
+            return explicit
         if self._candidate_revision is not None:
             return self._candidate_revision
         try:
@@ -654,7 +721,11 @@ class E2ERuntime:
             )
         except OSError:
             completed = None
-        revision = completed.stdout.strip() if completed and completed.returncode == 0 else "unknown"
+        revision = completed.stdout.strip() if completed and completed.returncode == 0 else ""
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise BlockedRuntimeConfig(
+                f"exact source revision requires {SOURCE_REVISION_ENV} in a raw checkout"
+            )
         self._candidate_revision = revision
         return revision
 
@@ -729,7 +800,13 @@ class E2ERuntime:
             },
             "fixture": fixture,
             "failure_stages": ["provisioning", "product_assertion"],
+            "dependency_reset": dict(self._dependency_reset_evidence),
         }
+        if self._dependency_identity is not None:
+            evidence["dependency_identity"] = self._dependency_identity
+        process_identity = self._process_identity_snapshot()
+        if process_identity:
+            evidence["process_identity"] = process_identity
         if self.config.frontend_enabled:
             origins = evidence["origin"]
             assert isinstance(origins, dict)
@@ -1638,6 +1715,331 @@ class E2ERuntime:
             lambda status, _body: status == 200,
         )
         await asyncio.to_thread(self._ensure_minio_bucket)
+        self._dependency_identity = await asyncio.to_thread(self._dependency_identity_snapshot)
+
+    def _dependency_identity_snapshot(self) -> dict[str, object]:
+        """Capture identities that an in-place fixture reset must preserve."""
+
+        docker = os.environ.get("AKB_DOCKER_BIN", "docker")
+        services: dict[str, object] = {}
+        for service in ("postgres", "minio"):
+            try:
+                listed = subprocess.run(
+                    self._compose_command("ps", "-q", service),
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}") from None
+            container_ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+            if listed.returncode != 0 or len(container_ids) != 1:
+                raise ProvisioningFailure(f"dependency identity is unavailable for {service}")
+            try:
+                inspected = subprocess.run(
+                    [docker, "inspect", container_ids[0]],
+                    cwd=str(self.config.runtime_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}") from None
+            if inspected.returncode != 0:
+                raise ProvisioningFailure(f"dependency identity inspection failed for {service}")
+            try:
+                payload = json.loads(inspected.stdout)
+                container = payload[0]
+                networks = container.get("NetworkSettings", {}).get("Networks", {})
+                mounts = container.get("Mounts", [])
+            except (IndexError, TypeError, ValueError, AttributeError):
+                raise ProvisioningFailure(f"dependency identity inspection returned invalid data for {service}") from None
+            network_ids = sorted(
+                str(network.get("NetworkID"))
+                for network in networks.values()
+                if isinstance(network, dict) and network.get("NetworkID")
+            )
+            volume_names = sorted(
+                str(mount.get("Name") or mount.get("Source"))
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Type") == "volume"
+            )
+            container_id = container.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                raise ProvisioningFailure(f"dependency identity inspection returned no container id for {service}")
+            services[service] = {
+                "container_id": container_id,
+                "network_ids": network_ids,
+                "volume_names": volume_names,
+            }
+        return {"services": services}
+
+    async def _reset_postgres_in_place(self) -> None:
+        """Clear application rows while keeping the database schema and process alive."""
+
+        try:
+            import asyncpg
+
+            connection = await asyncpg.connect(
+                host="127.0.0.1",
+                port=self.config.postgres_port,
+                user="akb",
+                password="akb",
+                database="akb",
+            )
+            try:
+                await connection.execute(
+                    """
+                    DO $cleanup$
+                    DECLARE table_list text;
+                    BEGIN
+                        SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+                          INTO table_list
+                          FROM pg_tables
+                         WHERE schemaname NOT LIKE 'pg_%'
+                           AND schemaname <> 'information_schema'
+                           AND tablename NOT IN (
+                               'schema_migrations',
+                               'users',
+                               'tokens',
+                               'auth_runtime_epoch_upgrade',
+                               'auth_runtime_state',
+                               'bm25_stats',
+                               'document_revision_bootstrap_claims',
+                               'document_revision_authority_pending',
+                               'document_revision_authority_marker',
+                               'native_revision_existing_authority_fence',
+                               'native_revision_existing_authority',
+                               'native_revision_legacy_write_fence'
+                           );
+                        IF table_list IS NOT NULL THEN
+                            EXECUTE format('TRUNCATE TABLE %s RESTART IDENTITY CASCADE', table_list);
+                        END IF;
+                    END
+                    $cleanup$
+                    """
+                )
+                username, _password = self.config.credentials.values()
+                await connection.execute(
+                    """
+                    DELETE FROM tokens
+                     WHERE user_id NOT IN (
+                         SELECT id FROM users WHERE username = $1
+                     )
+                    """,
+                    username,
+                )
+                await connection.execute(
+                    "DELETE FROM users WHERE username <> $1",
+                    username,
+                )
+            finally:
+                await connection.close()
+        except Exception as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            detail = f"{type(exc).__name__}"
+            if sqlstate:
+                detail += f" sqlstate={sqlstate}"
+            message = str(exc)
+            for private in self._fixture_private_values:
+                if private:
+                    message = message.replace(private, "[REDACTED]")
+            if message:
+                detail += f": {message[:1000]}"
+            LOGGER.error("PostgreSQL in-place fixture reset failed: %s", detail)
+            raise ProvisioningFailure(
+                f"PostgreSQL in-place fixture reset failed: {detail}"
+            ) from None
+
+    def _minio_exception_code(self, error: BaseException) -> tuple[str, int | None]:
+        response = getattr(error, "response", None)
+        if isinstance(response, dict):
+            error_payload = response.get("Error")
+            code = error_payload.get("Code") if isinstance(error_payload, dict) else None
+            metadata = response.get("ResponseMetadata")
+            status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+            return (
+                str(code) if code is not None else type(error).__name__,
+                status if isinstance(status, int) else None,
+            )
+        return type(error).__name__, None
+
+    def _minio_retryable_exception(self, error: BaseException) -> bool:
+        try:
+            from botocore.exceptions import (
+                ConnectTimeoutError,
+                ConnectionClosedError,
+                EndpointConnectionError,
+                ProxyConnectionError,
+                ReadTimeoutError,
+            )
+
+            if isinstance(
+                error,
+                (
+                    ConnectTimeoutError,
+                    ConnectionClosedError,
+                    EndpointConnectionError,
+                    ProxyConnectionError,
+                    ReadTimeoutError,
+                ),
+            ):
+                return True
+        except ImportError:
+            pass
+        code, status = self._minio_exception_code(error)
+        return code in MINIO_RETRYABLE_ERROR_CODES or (status is not None and status >= 500)
+
+    def _redact_minio_message(self, message: str) -> str:
+        redacted = message
+        for private in self._fixture_private_values:
+            if private:
+                redacted = redacted.replace(private, "[REDACTED]")
+        return redacted[:500]
+
+    def _minio_operation_error(self, operation: str, error: BaseException) -> _MinioResetOperationError:
+        code, status = self._minio_exception_code(error)
+        if status is not None:
+            code = f"{code} http={status}"
+        return _MinioResetOperationError(
+            operation,
+            code,
+            self._redact_minio_message(str(error)),
+            retryable=self._minio_retryable_exception(error),
+            exception_type=type(error).__name__,
+        )
+
+    def _minio_list_keys(self, client) -> list[str]:
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            keys: list[str] = []
+            for page in paginator.paginate(Bucket="akb-files"):
+                contents = page.get("Contents", [])
+                if not isinstance(contents, list):
+                    raise ValueError("Contents is not a list")
+                for item in contents:
+                    if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
+                        raise ValueError("object listing contains an invalid key")
+                    keys.append(item["Key"])
+            return keys
+        except _MinioResetOperationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify and redact below
+            raise self._minio_operation_error("list", exc) from None
+
+    def _minio_reset_pass(self, client) -> None:
+        keys = self._minio_list_keys(client)
+        for offset in range(0, len(keys), MINIO_DELETE_BATCH_SIZE):
+            batch = keys[offset : offset + MINIO_DELETE_BATCH_SIZE]
+            try:
+                response = client.delete_objects(
+                    Bucket="akb-files",
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+                )
+            except Exception as exc:  # noqa: BLE001 - classify and redact below
+                raise self._minio_operation_error("delete", exc) from None
+            errors = response.get("Errors", []) if isinstance(response, dict) else None
+            if not isinstance(errors, list):
+                raise _MinioResetOperationError(
+                    "delete", "InvalidResponse", "delete response Errors is not a list", retryable=False
+                )
+            if errors:
+                first = errors[0] if isinstance(errors[0], dict) else {}
+                code = str(first.get("Code", "UnknownError"))
+                message = self._redact_minio_message(str(first.get("Message", "delete response returned an error")))
+                status = first.get("HTTPStatusCode")
+                retryable = code in MINIO_RETRYABLE_ERROR_CODES or (
+                    isinstance(status, int) and status >= 500
+                )
+                raise _MinioResetOperationError(
+                    "delete", code, message, retryable=retryable, exception_type="S3ResponseError"
+                )
+        remaining = self._minio_list_keys(client)
+        if remaining:
+            raise _MinioResetOperationError(
+                "verify",
+                "BucketNotEmpty",
+                f"bucket still contains {len(remaining)} object(s)",
+                retryable=True,
+            )
+
+    def _clear_minio_objects(self) -> dict[str, object]:
+        """Delete scenario objects, preserving the bucket and volume identities."""
+
+        started = time.perf_counter()
+        evidence: dict[str, object] = {
+            "status": "failed",
+            "attempts": 0,
+            "retry_count": 0,
+            "wall_seconds": 0.0,
+        }
+        try:
+            import boto3
+
+            client = boto3.client(
+                "s3",
+                endpoint_url=self.config.minio_origin,
+                aws_access_key_id="akb-ci",
+                aws_secret_access_key="akb-ci-secret",
+            )
+        except Exception as exc:  # noqa: BLE001 - classify and redact below
+            operation_error = self._minio_operation_error("list", exc)
+            evidence.update({"attempts": 1, "last_failure": str(operation_error)})
+            evidence["wall_seconds"] = time.perf_counter() - started
+            raise MinioResetFailure(
+                f"MinIO in-place fixture reset failed: operation=list attempt=1/{MINIO_RESET_MAX_ATTEMPTS} "
+                f"exception={type(exc).__name__} s3_code={operation_error.code}: {operation_error}",
+                evidence,
+            ) from None
+
+        for attempt in range(1, MINIO_RESET_MAX_ATTEMPTS + 1):
+            evidence["attempts"] = attempt
+            try:
+                self._minio_reset_pass(client)
+                evidence["status"] = "recovered" if attempt > 1 else "success"
+                evidence["retry_count"] = attempt - 1
+                evidence["wall_seconds"] = time.perf_counter() - started
+                return evidence
+            except _MinioResetOperationError as exc:
+                detail = (
+                    f"MinIO in-place fixture reset failed: operation={exc.operation} "
+                    f"attempt={attempt}/{MINIO_RESET_MAX_ATTEMPTS} exception={exc.exception_type} "
+                    f"s3_code={exc.code}: {exc}"
+                )
+                evidence["last_failure"] = detail
+                if not exc.retryable or attempt >= MINIO_RESET_MAX_ATTEMPTS:
+                    evidence["retry_count"] = attempt - 1
+                    evidence["wall_seconds"] = time.perf_counter() - started
+                    raise MinioResetFailure(detail, evidence) from None
+                evidence["retry_count"] = attempt
+                time.sleep(MINIO_RESET_BACKOFF_SECONDS[min(attempt - 1, len(MINIO_RESET_BACKOFF_SECONDS) - 1)])
+            except Exception as exc:  # noqa: BLE001 - bounded diagnostic fallback
+                operation_error = self._minio_operation_error("list", exc)
+                detail = (
+                    f"MinIO in-place fixture reset failed: operation=list "
+                    f"attempt={attempt}/{MINIO_RESET_MAX_ATTEMPTS} exception={type(exc).__name__} "
+                    f"s3_code={operation_error.code}: {operation_error}"
+                )
+                evidence["last_failure"] = detail
+                evidence["retry_count"] = attempt - 1
+                evidence["wall_seconds"] = time.perf_counter() - started
+                raise MinioResetFailure(detail, evidence) from None
+        raise AssertionError("MinIO reset retry loop did not terminate")
+
+    def _process_identity_snapshot(self) -> dict[str, object]:
+        """Capture managed process identities that a fixture reset must preserve."""
+
+        return {
+            name: {
+                "pid": managed.process.pid,
+                "running": managed.process.returncode is None,
+            }
+            for name, managed in sorted(self._children.items())
+            if name in {"backend", "embed", "stdio"}
+        }
 
     def _ensure_minio_bucket(self) -> None:
         try:
@@ -1980,6 +2382,10 @@ class E2ERuntime:
         grants: list[tuple[uuid.UUID, str]],
         granted_by: uuid.UUID,
     ) -> tuple[uuid.UUID, str]:
+        if any(role == "owner" for _user_id, role in grants):
+            raise ProvisioningFailure(
+                "fixture vault owner access must be represented by owner_id, not vault_access"
+            )
         vault_id = uuid.uuid4()
         name = f"{namespace}-vault-{label}"
         await connection.execute(
@@ -2003,7 +2409,39 @@ class E2ERuntime:
                 role,
                 granted_by,
             )
+        await asyncio.to_thread(self._ensure_fixture_git_repository, name)
         return vault_id, name
+
+    def _ensure_fixture_git_repository(self, vault_name: str) -> str:
+        """Ensure a seeded bare-Git vault has the repository expected by writes."""
+
+        from git import Repo
+        from git.exc import GitError, InvalidGitRepositoryError
+
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", vault_name) is None:
+            raise ProvisioningFailure("fixture vault repository name is invalid")
+        storage_root = self.config.vault_dir.resolve(strict=True)
+        candidate = storage_root / f"{vault_name}.git"
+        if candidate.is_symlink():
+            raise ProvisioningFailure("fixture vault repository is a symlink")
+        bare_path = candidate.resolve()
+        if not bare_path.is_relative_to(storage_root):
+            raise ProvisioningFailure("fixture vault repository escaped runtime storage")
+        if bare_path.exists() and not bare_path.is_dir():
+            raise ProvisioningFailure("fixture vault repository is not a directory")
+        if bare_path.exists():
+            try:
+                repo = Repo(str(bare_path), search_parent_directories=False)
+                repo.close()
+            except (InvalidGitRepositoryError, OSError):
+                raise ProvisioningFailure("fixture vault repository is invalid") from None
+            return str(bare_path)
+        try:
+            repo = Repo.init(str(bare_path), bare=True)
+            repo.close()
+        except (GitError, OSError):
+            raise ProvisioningFailure("fixture vault repository initialization failed") from None
+        return str(bare_path)
 
     async def _insert_fixture_release(
         self,
@@ -2012,6 +2450,9 @@ class E2ERuntime:
         app_id: uuid.UUID,
         version: str,
         schema_tables: Sequence[dict[str, object]] = (),
+        transition_plans: Sequence[
+            tuple[object, Sequence[dict[str, object]]]
+        ] | None = None,
     ) -> uuid.UUID:
         app_key = await connection.fetchval(
             "SELECT app_key FROM app_definitions WHERE id=$1", app_id
@@ -2022,6 +2463,7 @@ class E2ERuntime:
             app_key=app_key,
             version=version,
             tables=schema_tables,
+            transition_plans=transition_plans,
         )
         encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
         release_id = uuid.uuid4()
@@ -2196,7 +2638,7 @@ class E2ERuntime:
                 }
             ]
         )
-        target_grants = [(owner_id, "owner")]
+        target_grants: list[tuple[uuid.UUID, str]] = []
         installations: list[dict[str, object]] = []
         tables: list[dict[str, object]] = []
         for target_index in range(13):
@@ -2611,6 +3053,7 @@ class E2ERuntime:
         self,
         connection: Any,
         *,
+        password_hash: str,
         system_admin_id: uuid.UUID,
     ) -> None:
         """Add valid restore/fresh installations to the control-plane scenario."""
@@ -2629,6 +3072,34 @@ class E2ERuntime:
             raise ProvisioningFailure("control-plane lifecycle fixture coordinates are unavailable")
         app_uuid = uuid.UUID(target_app_id)
         owner_uuid = uuid.UUID(owner_id)
+        reader_username = f"{namespace}-catalog-reader"
+        reader_id = await self._insert_fixture_user(
+            connection,
+            username=reader_username,
+            password_hash=password_hash,
+            label=f"{namespace}-catalog-reader",
+        )
+        actors["reader"] = {
+            "id": str(reader_id),
+            "username": reader_username,
+            "role": "reader",
+            "vault_role": "reader",
+            "vault_scope": "target",
+        }
+        authorization_vault_id, authorization_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace="catalog-bench",
+            label="authorization",
+            owner_id=owner_uuid,
+            grants=[(reader_id, "reader")],
+            granted_by=system_admin_id,
+        )
+        vaults = self._fixture_catalog.setdefault("vaults", {})
+        if isinstance(vaults, dict):
+            vaults["authorization"] = {
+                "id": str(authorization_vault_id),
+                "name": authorization_vault_name,
+            }
         restore_release_id = await self._insert_fixture_release(
             connection,
             app_id=app_uuid,
@@ -2639,7 +3110,7 @@ class E2ERuntime:
             app_id=app_uuid,
             version="4.0.0",
         )
-        grants = [(owner_uuid, "owner")]
+        grants: list[tuple[uuid.UUID, str]] = []
         restore_vault_id, restore_vault_name = await self._insert_fixture_vault(
             connection,
             namespace=namespace,
@@ -2725,6 +3196,7 @@ class E2ERuntime:
         self,
         connection: Any,
         *,
+        password_hash: str,
         system_admin_id: uuid.UUID,
     ) -> None:
         """Seed one explicit table baseline for the adoption scenario.
@@ -2743,9 +3215,9 @@ class E2ERuntime:
         owner = actors.get("target_owner")
         if not isinstance(target, dict) or not isinstance(owner, dict):
             raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
-        target_app_id = target.get("id")
+        _rollout_app_id = target.get("id")
         owner_id = owner.get("id")
-        if not isinstance(target_app_id, str) or not isinstance(owner_id, str):
+        if not isinstance(_rollout_app_id, str) or not isinstance(owner_id, str):
             raise ProvisioningFailure("legacy adoption fixture coordinates are unavailable")
 
         table_name = "legacy_orders"
@@ -2759,30 +3231,127 @@ class E2ERuntime:
             "unique_keys": [],
             "indexes": [],
         }
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                [descriptor],
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        ).hexdigest()
-        app_uuid = uuid.UUID(target_app_id)
+        fingerprint = _fixture_schema_fingerprint([descriptor])
         owner_uuid = uuid.UUID(owner_id)
+        owner_username = await connection.fetchval(
+            "SELECT username FROM users WHERE id=$1",
+            owner_uuid,
+        )
+        if not isinstance(owner_username, str):
+            raise ProvisioningFailure("legacy adoption fixture owner is unavailable")
+        actors["target_owner"].update(
+            {
+                "username": owner_username,
+                "vault_role": "owner",
+                "vault_scope": "legacy_adoption",
+            }
+        )
+        actor_specs = (
+            ("target_admin", "target-admin", "admin"),
+            ("reader", "reader", "reader"),
+            ("writer", "writer", "writer"),
+            ("foreign_admin", "foreign-admin", "owner"),
+        )
+        actor_ids: dict[str, uuid.UUID] = {}
+        for role, label, vault_role in actor_specs:
+            username = f"{namespace}-{label}"
+            actor_id = await self._insert_fixture_user(
+                connection,
+                username=username,
+                password_hash=password_hash,
+                label=f"{namespace}-{label}",
+            )
+            actor_ids[role] = actor_id
+            actors[role] = {
+                "id": str(actor_id),
+                "username": username,
+                "role": role,
+                "vault_role": vault_role,
+                "vault_scope": (
+                    "legacy_adoption"
+                    if role != "foreign_admin"
+                    else "legacy_foreign"
+                ),
+            }
+
+        legacy_app_id = uuid.uuid4()
+        legacy_app_key = f"{namespace}-legacy-target"
+        await connection.execute(
+            "INSERT INTO app_definitions(id, app_key, display_name) VALUES($1, $2, $3)",
+            legacy_app_id,
+            legacy_app_key,
+            "Runtime Legacy Adoption Target",
+        )
         release_id = await self._insert_fixture_release(
             connection,
-            app_id=app_uuid,
+            app_id=legacy_app_id,
             version="5.0.0",
             schema_tables=[descriptor],
         )
+        baseline_checksum = await connection.fetchval(
+            "SELECT manifest_checksum FROM app_releases WHERE id=$1",
+            release_id,
+        )
+        if not isinstance(baseline_checksum, str):
+            raise ProvisioningFailure("legacy adoption baseline checksum is unavailable")
         vault_id, vault_name = await self._insert_fixture_vault(
             connection,
             namespace=namespace,
             label="legacy-adoption",
             owner_id=owner_uuid,
-            grants=[(owner_uuid, "owner")],
+            grants=[
+                (actor_ids["target_admin"], "admin"),
+                (actor_ids["reader"], "reader"),
+                (actor_ids["writer"], "writer"),
+            ],
             granted_by=system_admin_id,
         )
+        foreign_vault_id, foreign_vault_name = await self._insert_fixture_vault(
+            connection,
+            namespace=namespace,
+            label="legacy-foreign",
+            owner_id=actor_ids["foreign_admin"],
+            grants=[],
+            granted_by=system_admin_id,
+        )
+        next_release = await self._insert_fixture_release(
+            connection,
+            app_id=legacy_app_id,
+            version="6.0.0",
+            schema_tables=[descriptor],
+            transition_plans=[
+                (
+                    "fresh",
+                    [
+                        {
+                            "id": f"create_{table_name}",
+                            "phase": "expand",
+                            "operation": "create_table",
+                            "payload": {
+                                "table": table_name,
+                                "columns": baseline_columns,
+                                "unique_keys": [],
+                                "indexes": [],
+                            },
+                        }
+                    ],
+                ),
+                (
+                    {
+                        "release_version": "5.0.0",
+                        "schema_fingerprint": fingerprint,
+                    },
+                    [],
+                )
+            ],
+        )
+        next_checksum = await connection.fetchval(
+            "SELECT manifest_checksum FROM app_releases WHERE id=$1",
+            next_release,
+        )
+        if not isinstance(next_checksum, str):
+            raise ProvisioningFailure("legacy adoption no-op checksum is unavailable")
+        apps["legacy"] = {"id": str(legacy_app_id)}
         physical = f"vt_{re.sub(r'[^a-z0-9]', '_', vault_name.lower())}__{table_name}"
         if not re.fullmatch(r"[a-z0-9_]+", physical):
             raise ProvisioningFailure("legacy adoption fixture identifier is invalid")
@@ -2817,10 +3386,15 @@ class E2ERuntime:
         fixture_id = "legacy-adoption"
         fixture = {
             "fixture_id": fixture_id,
-            "app_id": target_app_id,
+            "app_id": str(legacy_app_id),
             "vault_id": str(vault_id),
             "vault_name": vault_name,
             "release_id": str(release_id),
+            "baseline_version": "5.0.0",
+            "baseline_manifest_checksum": baseline_checksum,
+            "next_release_id": str(next_release),
+            "next_version": "6.0.0",
+            "next_manifest_checksum": next_checksum,
             "table_name": table_name,
             "table_allowlist": [table_name],
             "expected_schema_fingerprint": fingerprint,
@@ -2834,10 +3408,28 @@ class E2ERuntime:
                 "schema_fingerprint": fingerprint,
                 "row_count": 3,
             },
-            "after": {
+            "after_adoption": {
                 "lifecycle": "active",
                 "desired_current_release_id": str(release_id),
                 "grant_generation": 0,
+                "observed_grant_generation": 0,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+            "after_initial_grant": {
+                "lifecycle": "active",
+                "desired_current_release_id": str(release_id),
+                "grant_generation": 1,
+                "observed_grant_generation": 1,
+                "schema_fingerprint": fingerprint,
+                "row_count": 3,
+            },
+            "after": {
+                "lifecycle": "active",
+                "desired_current_release_id": str(next_release),
+                "grant_generation": 1,
+                "observed_grant_generation": 1,
+                "observed_release_version": "6.0.0",
                 "schema_fingerprint": fingerprint,
                 "row_count": 3,
             },
@@ -2851,26 +3443,39 @@ class E2ERuntime:
                 "id": str(vault_id),
                 "name": vault_name,
             }
+            vaults["legacy_foreign"] = {
+                "id": str(foreign_vault_id),
+                "name": foreign_vault_name,
+            }
         releases = self._fixture_catalog.setdefault("releases", {})
         if isinstance(releases, dict):
             releases["target_legacy_adoption"] = {
                 "id": str(release_id),
                 "version": "5.0.0",
+                "manifest_checksum": baseline_checksum,
                 "expected_schema_fingerprint": fingerprint,
+            }
+            releases["target_legacy_adoption_next"] = {
+                "id": str(next_release),
+                "version": "6.0.0",
+                "manifest_checksum": next_checksum,
+                "source_release_version": "5.0.0",
+                "source_schema_fingerprint": fingerprint,
             }
         coordinates = self._fixture_catalog.setdefault("coordinates", {})
         if isinstance(coordinates, dict):
             admin = coordinates.setdefault("admin", {})
             if isinstance(admin, dict):
                 admin["legacy_adoption"] = {
-                    "app_id": target_app_id,
+                    "app_id": str(legacy_app_id),
                     "vault_id": str(vault_id),
                     "baseline_release_id": str(release_id),
+                    "allowed_actors": ["system_admin", "target_owner", "target_admin"],
                     "table_allowlist": [table_name],
                     "create": {
                         "service": "app",
                         "method": "POST",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions",
                         "headers": {"Idempotency-Key": "uuid-v4"},
                         "body": {
                             "baseline_release_id": str(release_id),
@@ -2885,14 +3490,103 @@ class E2ERuntime:
                     "status": {
                         "service": "app",
                         "method": "GET",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions/{{adoption_id}}",
                     },
                     "apply": {
                         "service": "app",
                         "method": "POST",
-                        "path": f"/api/v1/apps/{target_app_id}/legacy-adoptions/{{adoption_id}}/apply",
+                        "path": f"/api/v1/apps/{legacy_app_id}/legacy-adoptions/{{adoption_id}}/apply",
                     },
                 }
+                capabilities = [
+                    "installation:read",
+                    "inventory:read",
+                    "rollout:read",
+                    "rollout:request",
+                ]
+                admin["legacy_initial_grant"] = {
+                    "app_id": str(legacy_app_id),
+                    "vault_id": str(vault_id),
+                    "baseline_release_id": str(release_id),
+                    "allowed_actors": ["system_admin", "target_owner", "target_admin"],
+                    "capabilities": capabilities,
+                    "request": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{legacy_app_id}/installations/{vault_id}/grant",
+                        "body": {
+                            "baseline_release_id": str(release_id),
+                            "capabilities": capabilities,
+                        },
+                    },
+                    "status": {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{legacy_app_id}/installations/{vault_id}",
+                    },
+                }
+                admin["legacy_noop_rollout"] = {
+                    "app_id": str(legacy_app_id),
+                    "vault_id": str(vault_id),
+                    "release_id": str(next_release),
+                    "manifest_checksum": next_checksum,
+                    "request": {
+                        "service": "app",
+                        "method": "POST",
+                        "path": f"/api/v1/apps/{legacy_app_id}/rollouts",
+                        "headers": {"Idempotency-Key": "uuid-v4"},
+                        "body": {
+                            "release_id": str(next_release),
+                            "manifest_checksum": next_checksum,
+                            "idempotency_key": "uuid-v4",
+                        },
+                    },
+                    "status": {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{legacy_app_id}/rollouts/{{rollout_id}}",
+                    },
+                }
+            app = coordinates.setdefault("legacy_app", {})
+            if isinstance(app, dict):
+                app.update(
+                    {
+                        "app_id": str(legacy_app_id),
+                        "credential": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": f"/api/v1/apps/{legacy_app_id}/credentials",
+                            "body": {"deployment": "legacy-adoption-fixture"},
+                        },
+                        "exchange": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/auth/app-token",
+                            "body": {"credential": "<issued-value>"},
+                        },
+                        "status": {
+                            "service": "app",
+                            "method": "GET",
+                            "path": f"/api/v1/app/installations/{vault_id}",
+                        },
+                        "inventory": {
+                            "service": "app",
+                            "method": "GET",
+                            "path": "/api/v1/app/inventory",
+                        },
+                        "rollout": {
+                            "service": "app",
+                            "method": "POST",
+                            "path": "/api/v1/app/rollouts",
+                            "headers": {"Idempotency-Key": "uuid-v4"},
+                            "body": {
+                                "release_id": str(next_release),
+                                "manifest_checksum": next_checksum,
+                                "idempotency_key": "uuid-v4",
+                            },
+                        },
+                    }
+                )
 
     async def _seed_app_installation_lifecycle(
         self,
@@ -2939,7 +3633,6 @@ class E2ERuntime:
             }
 
         target_grants = [
-            (actor_ids["target_owner"], "owner"),
             (actor_ids["target_admin"], "admin"),
             (actor_ids["reader"], "reader"),
             (actor_ids["writer"], "writer"),
@@ -2974,7 +3667,7 @@ class E2ERuntime:
             namespace=namespace,
             label="foreign",
             owner_id=actor_ids["foreign_admin"],
-            grants=[(actor_ids["foreign_admin"], "owner")],
+            grants=[],
             granted_by=system_admin_id,
         )
         vaults["foreign"] = {"id": str(foreign_vault_id), "name": foreign_vault_name}
@@ -3309,7 +4002,6 @@ class E2ERuntime:
             )
             self._fixture_private_marker = f"runtime-private-{uuid.uuid4().hex}"
             self._fixture_private_values = (username, password, self._fixture_private_marker)
-            system_admin_id = uuid.uuid4()
             connection = await asyncpg.connect(
                 host="127.0.0.1",
                 port=self.config.postgres_port,
@@ -3318,17 +4010,37 @@ class E2ERuntime:
                 database="akb",
             )
             try:
-                await connection.execute(
-                    """
-                    INSERT INTO users
-                        (id, username, email, password_hash, is_admin)
-                    VALUES ($1, $2, $3, $4, TRUE)
-                    """,
-                    system_admin_id,
+                system_admin_id = await connection.fetchval(
+                    "SELECT id FROM users WHERE username = $1",
                     username,
-                    f"runtime-{uuid.uuid4().hex}@invalid.akb",
-                    password_hash,
                 )
+                if system_admin_id is None:
+                    system_admin_id = uuid.uuid4()
+                    await connection.execute(
+                        """
+                        INSERT INTO users
+                            (id, username, email, password_hash, is_admin)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        system_admin_id,
+                        username,
+                        f"runtime-{uuid.uuid4().hex}@invalid.akb",
+                        password_hash,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE users
+                           SET password_hash = $2,
+                               is_admin = TRUE,
+                               account_status = 'active',
+                               credential_change_required = FALSE,
+                               updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        system_admin_id,
+                        password_hash,
+                    )
                 if self.config.scenario == "app-installation-lifecycle":
                     await self._seed_app_installation_lifecycle(
                         connection,
@@ -3349,10 +4061,12 @@ class E2ERuntime:
                     )
                     await self._seed_control_plane_installation_lifecycle(
                         connection,
+                        password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
                     await self._seed_control_plane_legacy_adoption(
                         connection,
+                        password_hash=password_hash,
                         system_admin_id=system_admin_id,
                     )
                 else:
@@ -3414,6 +4128,7 @@ class E2ERuntime:
 
     async def prepare(self) -> None:
         self._validate_checkout()
+        self._source_revision()
         self._validate_profile()
         prepare_private_runtime_root(self.config.runtime_root)
         self._write_config()
@@ -3432,29 +4147,86 @@ class E2ERuntime:
         async with self._reset_lock:
             if not self._prepared:
                 raise ProvisioningFailure("fixture reset requested before runtime readiness")
+            started = time.perf_counter()
+            identity_before: dict[str, object] | None = None
+            identity_after: dict[str, object] | None = None
+            process_before: dict[str, object] = {}
+            process_after: dict[str, object] = {}
+            minio_reset_evidence: dict[str, object] = {
+                "status": "not_run",
+                "attempts": 0,
+                "retry_count": 0,
+                "wall_seconds": 0.0,
+            }
+            preserved = False
             self._lifecycle_generation += 1
             self._resetting = True
             try:
+                identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
+                process_before = self._process_identity_snapshot()
                 self._fixture_controls.clear()
-                await self._stop_named_process("stdio")
                 self._stdio_initialize_observed = False
                 self._stdio_tools_list_observed = False
                 self._stdio_read_call_observed = False
                 self._stdio_next_id = 2
-                await self._stop_named_process("backend")
-                await self._stop_named_process("embed")
-                await self._compose("down", "--volumes", "--remove-orphans", check=False)
+                await self._reset_postgres_in_place()
+                try:
+                    minio_reset_evidence = await asyncio.to_thread(self._clear_minio_objects)
+                except MinioResetFailure as exc:
+                    minio_reset_evidence = dict(exc.evidence)
+                    raise
                 if self.config.vault_dir.exists():
                     shutil.rmtree(self.config.vault_dir)
                 self.config.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(self.config.vault_dir, 0o700)
-                await self._start_dependencies()
-                await self._start_embed_stub()
-                await self._bootstrap_backend_and_seed()
-                if self.profile.needs_stdio:
-                    await self._start_stdio_proxy()
+                for directory in (
+                    self.config.vault_dir / "_worktrees",
+                    self.config.vault_dir / ".akb-write-locks",
+                    self.config.vault_dir / ".akb-create-locks",
+                ):
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    os.chmod(directory, 0o700)
+                await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
+                await self._wait_http(
+                    "MinIO",
+                    f"{self.config.minio_origin}/minio/health/live",
+                    lambda status, _body: status == 200,
+                )
+                await asyncio.to_thread(self._ensure_minio_bucket)
+                await self._seed_external_credential()
+                await self._mint_runtime_pat()
+                identity_after = await asyncio.to_thread(self._dependency_identity_snapshot)
+                process_after = self._process_identity_snapshot()
+                if identity_before != identity_after or process_before != process_after:
+                    raise ProvisioningFailure("in-place fixture reset changed a runtime identity")
+                self._dependency_identity = identity_after
+                preserved = True
             finally:
                 self._resetting = False
+                self._dependency_reset_count += 1
+                elapsed = time.perf_counter() - started
+                self._dependency_reset_wall_seconds += elapsed
+                self._dependency_reset_evidence = {
+                    "strategy": "in_place",
+                    "preserves": [
+                        "postgres_container",
+                        "minio_container",
+                        "compose_network",
+                        "compose_volumes",
+                        "backend_process",
+                        "embedding_process",
+                        "stdio_process",
+                    ],
+                    "count": self._dependency_reset_count,
+                    "wall_seconds": self._dependency_reset_wall_seconds,
+                    "last_preserved": preserved,
+                    "minio_reset": minio_reset_evidence,
+                    "process_identity_before": process_before,
+                    "process_identity_after": process_after,
+                }
+                if preserved and identity_before is not None and identity_after is not None:
+                    self._dependency_reset_evidence["identity_before"] = identity_before
+                    self._dependency_reset_evidence["identity_after"] = identity_after
 
     async def _serve_foreground(self) -> int:
         stop_task = asyncio.create_task(self._stop_event.wait(), name="serve-stop")
@@ -3783,6 +4555,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     parser.add_argument("--frontend-port", type=int, default=DEFAULT_FRONTEND_PORT)
     parser.add_argument("--embed-port", type=int, default=DEFAULT_EMBED_PORT)
     parser.add_argument("--fixture-port", type=int, default=DEFAULT_FIXTURE_PORT)
+    parser.add_argument("--postgres-port", type=int, default=DEFAULT_POSTGRES_PORT)
+    parser.add_argument("--minio-port", type=int, default=DEFAULT_MINIO_PORT)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--username-env", default=DEFAULT_USERNAME_ENV)
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV)
@@ -3841,6 +4615,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         frontend_port=args.frontend_port,
         embed_port=args.embed_port,
         fixture_port=args.fixture_port,
+        postgres_port=args.postgres_port,
+        minio_port=args.minio_port,
         timeout_seconds=args.timeout_seconds,
         credentials=CredentialNames(args.username_env, args.password_env, args.pat_env),
         scenario=args.scenario,

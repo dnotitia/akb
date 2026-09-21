@@ -366,6 +366,11 @@ app.include_router(agent_sessions.router, prefix="/api/v1", tags=["agent-session
 app.include_router(tables.router, prefix="/api/v1", tags=["tables"])
 app.include_router(knowledge_io.router, prefix="/api/v1", tags=["export-import"])
 app.include_router(files.router, prefix="/api/v1", tags=["files"])
+# `/internal` is deliberately not `/api`: every ingress in the deployment maps
+# `/api`, `/mcp`, `/.well-known` and the probes to this service and everything
+# else to the frontend, so this prefix has no route from outside. The byte
+# gateway reaches it over the cluster network with a shared key.
+app.include_router(files.internal_router, prefix="/internal", include_in_schema=False)
 app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
 app.include_router(assets.stable_router, prefix="/api", tags=["assets"])
 app.include_router(public.router, prefix="/api/v1", tags=["public"])
@@ -466,6 +471,63 @@ async def readyz():
     return _ready_response(_ready_state, cached=False)
 
 
+def _terminal(section: dict | None) -> tuple[int, int]:
+    """(exhausted, abandoned) of one queue section, tolerantly.
+
+    Sections are not uniform — some expose `status`, some only counters,
+    and a failed reporter is `{"error": ...}` — so read the counters, not
+    the verdict. Unknown shapes contribute nothing rather than failing
+    the whole response: a health endpoint must not 500 because one queue
+    changed its stats dict.
+
+    A section that distinguishes its live counts from its ledger reports
+    both, suffixed `_at_head`, and that pair wins: an item given up on and
+    later superseded by one that succeeded is history, not a fault, and a
+    verdict that cannot tell the two apart says `degraded` forever after a
+    single repaired loss. Sections without the suffix are unaffected.
+    """
+    if not isinstance(section, dict):
+        return (0, 0)
+
+    def _count(name: str) -> int:
+        key = f"{name}_at_head" if f"{name}_at_head" in section else name
+        try:
+            return int(section.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (_count("exhausted"), _count("abandoned"))
+
+
+def _aggregate_status(sections: list[dict | None]) -> str:
+    """Top-level verdict over the queue sections (#538).
+
+    `degraded` when any section holds terminal work (exhausted or
+    abandoned) — a queue that gave up on an item drains to `pending: 0`
+    exactly like one that finished, so progress alone reads as complete
+    while documents are missing. Otherwise `reconciling` while anything
+    is still pending/retrying, else `ok`. Sections that only expose
+    counters without terminal fields simply contribute zeros.
+
+    "Terminal" is what `_terminal` says it is, which for a section that keeps
+    a ledger means the part of it that is still true.
+    """
+    pending_work = False
+    for section in sections:
+        if not isinstance(section, dict) or section.get("error"):
+            continue
+        exhausted, abandoned = _terminal(section)
+        if exhausted or abandoned:
+            return "degraded"
+        try:
+            pending_work = pending_work or bool(
+                int(section.get("pending") or 0) or int(section.get("retrying") or 0)
+            )
+        except (TypeError, ValueError):
+            continue
+    return "reconciling" if pending_work else "ok"
+
+
 @app.get("/health")
 async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     """Detailed system health for dashboards.
@@ -498,6 +560,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         native_derived_worker,
         native_file_projection,
         queue_rescuer,
+        search_degradation_stats,
         sparse_encoder,
         vault_backfill,
     )
@@ -528,7 +591,6 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
             return {"error": str(e)}
 
     result: dict = {
-        "status": "ok",
         "service": "akb",
         "workers": worker_lifecycle_snapshot(),
         "queue_claims": queue_rescuer.snapshot(),
@@ -540,7 +602,36 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         "native_file_projection": await _safe(native_file_projection.pending_stats),
         "native_derived": await _safe(native_derived_worker.pending_stats),
         "vector_store": vs_info,
+        # Not a queue, and deliberately shaped like one anyway (akb#612): how
+        # often a search response came back `degraded`, which cause, and how
+        # many of those still carried results. Nothing counted this before —
+        # `vector_store.reachable` answers a different question in the same
+        # word, and a degraded search reaches `tool_usage_daily` under `ok`
+        # beside every healthy one. The last number is what the consumer
+        # decision turns on: whether a surface should show partial results
+        # depends on how often they exist.
+        "search": await _safe(search_degradation_stats.snapshot),
     }
+
+    # Top-level aggregate (#538): `degraded` when any queue section holds
+    # terminal work, else `reconciling` while work is pending, else `ok`.
+    # Computed AFTER the sections so the verdict always describes this
+    # response, never a previous one. `vector_store.backfill.upsert` and
+    # `.delete` are nested one level deeper than the flat sections, so they
+    # join as their own entries; anything that failed to report (an
+    # `{"error": ...}` dict, a missing key) contributes nothing.
+    _backfill = vs_info.get("backfill") if isinstance(vs_info, dict) else None
+    _upsert = _backfill.get("upsert") if isinstance(_backfill, dict) else None
+    _delete = _backfill.get("delete") if isinstance(_backfill, dict) else None
+    result["status"] = _aggregate_status([
+        result["external_git"],
+        result["metadata_backfill"],
+        result["events"],
+        result["native_file_projection"],
+        result["native_derived"],
+        _upsert,
+        _delete,
+    ])
 
     # Queue-head age, promoted to the top level because it is a named term in
     # the tenant-monitoring contract and that contract must not depend on the

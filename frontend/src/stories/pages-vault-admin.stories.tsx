@@ -46,11 +46,7 @@ const adminShellHandlers = [
 async function expectVaultShell(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-  // Operational Vault routes intentionally start with Collections folded so
-  // their ledger/form owns the working width. The reveal control is the stable
-  // shell contract for Publications, Activity, Members, and Settings.
-  await expect(await canvas.findByRole("button", { name: "Show collection tree" })).toBeInTheDocument();
-  await expect(canvas.queryByRole("tree", { name: "akb explorer" })).not.toBeInTheDocument();
+  await expect(await canvas.findByRole("tree", { name: "akb explorer" })).toBeInTheDocument();
 }
 
 export const PublicationsList: Story = {
@@ -69,7 +65,7 @@ export const PublicationsList: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Published" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Published links" })).toBeInTheDocument();
     await expect(await canvas.findByText("Storybook rollout")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -89,7 +85,7 @@ export const PublicationsEmpty: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("No publications yet")).toBeInTheDocument();
+    await expect(await canvas.findByText("Nothing is public")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -134,7 +130,7 @@ export const PublicationsError: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Couldn't load publications")).toBeInTheDocument();
+    await expect(await canvas.findByText("Couldn't load published links")).toBeInTheDocument();
     await expect(await canvas.findByText("Publications unavailable")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -156,7 +152,7 @@ export const MembersOwner: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Members" })).toBeInTheDocument();
-    await expect(await canvas.findByRole("button", { name: "Invite" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("button", { name: "Invite member" })).toBeInTheDocument();
     await expect(await canvas.findByText("Story Writer")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -177,8 +173,8 @@ export const MembersReadOnly: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText(/Roster is read-only/i)).toBeInTheDocument();
-    await expect(canvas.queryByRole("button", { name: "Invite" })).not.toBeInTheDocument();
+    await expect(await canvas.findByText(/Your current role comes from this vault's public access policy/i)).toBeInTheDocument();
+    await expect(canvas.queryByRole("button", { name: "Invite member" })).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -243,7 +239,7 @@ export const VaultSettingsOwner: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await expect(await canvas.findByText("Danger zone")).toBeInTheDocument();
+    await expect((await canvas.findAllByText("Danger zone")).length).toBeGreaterThan(0);
     // Active vault + write role → the guide is editable here.
     await expect(
       await canvas.findByRole("button", { name: /reset to template/i }),
@@ -267,7 +263,7 @@ export const VaultSettingsReadOnly: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText(/Read-only view/i)).toBeInTheDocument();
+    await expect(await canvas.findByText(/only the vault owner can change them/i)).toBeInTheDocument();
     await expect(canvas.queryByText("Danger zone")).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -289,7 +285,7 @@ export const VaultSettingsArchived: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Archived")).toBeInTheDocument();
+    await expect(await canvas.findByText("archived", { exact: true })).toBeInTheDocument();
     await expect(await canvas.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
     // Owner, but the vault is server-side read-only: the guide section renders
     // its read surfaces (await one so the negatives below aren't just "not

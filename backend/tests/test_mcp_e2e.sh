@@ -56,7 +56,11 @@ SID=$(echo "$INIT_RESP" | grep -i "mcp-session-id" | tr -d '\r' | awk '{print $2
 INIT_BODY=$(echo "$INIT_RESP" | tail -1)
 PROTO=$(echo "$INIT_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['protocolVersion'])" 2>/dev/null)
 
-[ -n "$SID" ] && pass "MCP session ID received" || fail "MCP session ID" "missing"
+# The legacy transport is stateless, so no session is minted. That is the
+# property worth asserting: a session is what binds a client to the replica
+# that answered `initialize`, and behind a load balancer that costs it roughly
+# half its calls.
+[ -z "$SID" ] && pass "MCP mints no session (any replica can answer)" || fail "MCP session" "a session id was issued: $SID"
 [ "$PROTO" = "2025-03-26" ] && pass "MCP protocol version negotiated" || fail "MCP protocol" "expected 2025-03-26, got $PROTO"
 
 curl -sk -X POST "$BASE_URL/mcp/" \
@@ -79,6 +83,20 @@ TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>&1)
 TOOL_COUNT=$(echo "$TOOLS_RESP" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 [ "$TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "MCP tools/list exposes $TOOL_COUNT tools" || fail "MCP tools/list" "expected >=22, got $TOOL_COUNT"
+
+# Repeat the call: behind two replicas a stateful transport failed roughly half
+# of these with `Session not found`, and a single sample would have missed it.
+MCP_OK=0
+for _ in $(seq 1 12); do
+  RC=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/mcp/" \
+    -H "Authorization: Bearer $PAT" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "mcp-protocol-version: 2025-03-26" \
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' 2>/dev/null)
+  [ "$RC" = "200" ] && MCP_OK=$((MCP_OK+1))
+done
+[ "$MCP_OK" = "12" ] && pass "MCP legacy tools/list 12/12 across replicas" || fail "MCP replica spread" "$MCP_OK/12 succeeded"
 
 # ── 2. Direct REST shape checks retained from the mixed suite ─
 echo ""

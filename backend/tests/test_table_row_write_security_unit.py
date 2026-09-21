@@ -84,13 +84,13 @@ def test_update_set_values_are_always_bound(value: str) -> None:
         table_name="incidents",
         columns=COLUMNS,
         body={"title": value},
-        query_params=[("severity", "eq.high")],
+        query_params=[("severity", "eq.high"), ("expected_row_commit", "eq.tok-9")],
         prefer_header="return=representation",
     )
 
     _assert_single_statement_and_values_bound(compiled)
     assert not isinstance(compiled, dict)
-    assert compiled.params == [value, "high"]
+    assert compiled.params == [value, "high", "tok-9"]
 
 
 @settings(max_examples=60, deadline=None)
@@ -127,7 +127,7 @@ def test_curated_adversarial_values_are_bound_across_write_frontends(value: str)
         table_name="incidents",
         columns=COLUMNS,
         body={"title": marker},
-        query_params=[("severity", "eq.high")],
+        query_params=[("severity", "eq.high"), ("expected_row_commit", "eq.tok-9")],
     )
     ast = compile_ast_mutation(
         vault_name="eng",
@@ -136,6 +136,7 @@ def test_curated_adversarial_values_are_bound_across_write_frontends(value: str)
         ast={
             "update": {"title": marker},
             "where": {"col": "severity", "op": "eq", "val": marker},
+            "cas": "tok-9",
             "returning": "*",
         },
         actor_id="alice",
@@ -144,6 +145,9 @@ def test_curated_adversarial_values_are_bound_across_write_frontends(value: str)
     _assert_single_statement_and_values_bound(insert)
     _assert_single_statement_and_values_bound(update)
     _assert_single_statement_and_values_bound(ast)
+    # The CAS token is caller data too: bound as a param, never inlined.
+    assert not isinstance(update, dict) and "tok-9" not in update.sql
+    assert update.params[-1] == "tok-9"
 
 
 @pytest.mark.parametrize(

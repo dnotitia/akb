@@ -219,6 +219,11 @@ export interface InstallationCommandRequest {
   mode?: "install" | "restore" | "fresh";
 }
 
+export interface InitialGrantApprovalRequest {
+  baseline_release_id: ControlPlaneUuid;
+  capabilities: string[];
+}
+
 export interface ReleaseReference {
   id?: ControlPlaneUuid | null;
   version?: string | null;
@@ -434,6 +439,7 @@ export interface ControlPlaneOperations {
   authExchangeAppCredential: ControlPlaneOperation<never, CredentialExchangeRequest, CredentialExchangeProjection>;
   appAuthorize: ControlPlaneOperation<never, AuthorizeRequest, AuthorizeProjection>;
   appsApplyInstallation: ControlPlaneOperation<{ path: { app_id: string; vault_id: string } }, InstallationCommandRequest, InstallationProjection>;
+  appsApproveInitialGrant: ControlPlaneOperation<{ path: { app_id: string; vault_id: string } }, InitialGrantApprovalRequest, InstallationProjection>;
   appsGetInstallation: ControlPlaneOperation<{ path: { app_id: string; vault_id: string } }, never, InstallationProjection>;
   appsUninstallInstallation: ControlPlaneOperation<{ path: { app_id: string; vault_id: string } }, never, InstallationProjection>;
   appGetInstallation: ControlPlaneOperation<{ path: { vault_id: string } }, never, InstallationProjection>;

@@ -5,20 +5,24 @@ import { EditorContent, useEditor } from '@tiptap/react'
 import type { Editor } from '@tiptap/core'
 import {
   Bold,
+  CheckSquare,
   Code,
   Code2,
   Heading1,
   Heading2,
   Heading3,
+  ImagePlus,
   Italic,
   Link2,
   List,
   ListOrdered,
+  Loader2,
   Minus,
   Pilcrow,
   Quote,
   Redo2,
   Strikethrough,
+  Table,
   Undo2,
   X,
 } from 'lucide-react'
@@ -30,30 +34,146 @@ import { resolveMarkdownTargets } from '../adapters.js'
 import { MarkdownLinkSearch } from './markdown-link-search.js'
 import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
+import { MarkdownImageMenuControls } from './markdown-image-menu.js'
+import type { MarkdownImageMenuOptions } from './markdown-image-menu.js'
+export type { MarkdownImageMenuClassNames, MarkdownImageMenuLabels, MarkdownImageMenuOptions } from './markdown-image-menu.js'
+import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown-table.js'
+import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+import {
+  createMarkdownSlashCommandExtension,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+} from './markdown-slash-command.js'
+export {
+  createMarkdownSlashCommandExtension,
+  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+} from './markdown-slash-command.js'
+export type {
+  MarkdownSlashCommandOptions,
+} from './markdown-slash-command.js'
+import {
+  createLiveMarkdownReferenceExtension,
+} from './markdown-reference-menu.js'
+export {
+  createMarkdownReferenceExtension,
+  DEFAULT_MARKDOWN_REFERENCE_LABELS,
+  normalizeMarkdownReferenceCandidates,
+} from './markdown-reference-menu.js'
+export type {
+  MarkdownReferenceAdapter,
+  MarkdownReferenceCandidate,
+  MarkdownReferenceContext,
+  MarkdownReferenceKind,
+  MarkdownReferenceLabels,
+  MarkdownReferenceOptions,
+} from './markdown-reference-menu.js'
+import {
+  MarkdownImageUploadProvider,
+  MarkdownImageUploadStatus,
+  MarkdownImageUploadInput,
+  useMarkdownImageUpload,
+  useMarkdownImageUploadContext,
+} from './markdown-image-upload.js'
+export type {
+  MarkdownImageUploadClassNames,
+  MarkdownImageUploadController,
+  MarkdownImageUploadFailure,
+  MarkdownImageUploadLabels,
+  MarkdownImageUploadOptions,
+  MarkdownImageUploadState,
+} from './markdown-image-upload.js'
+export {
+  DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS,
+  MarkdownImageUploadProvider,
+  MarkdownImageUploadStatus,
+  MarkdownImageUploadInput,
+  useMarkdownImageUpload,
+  useMarkdownImageUploadContext,
+} from './markdown-image-upload.js'
+import { markdownTableState } from '../table.js'
 import type {
   MarkdownAdapters,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
+  MarkdownImageOptions,
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
   MarkdownSearchAdapter,
   MarkdownSearchContext,
-  MarkdownSlashContext,
+  MarkdownReferenceOptions,
+  MarkdownSlashCommandOptions,
   MarkdownState,
   MarkdownTargetResolution,
   MarkdownTargetResolverContext,
 } from '../types.js'
+import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
+export type { MarkdownImageClassNames, MarkdownImageLabels, MarkdownImageOptions } from '../types.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
+const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
+  messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+}
+
+function releaseMarkdownResolutions(
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
+): void {
+  for (const resolution of resolutions.values()) {
+    if (resolution.status !== 'available' || !resolution.release) continue
+    try {
+      resolution.release()
+    } catch {
+      // A product release hook must never break the editor cleanup path.
+    }
+  }
+}
+
+class MarkdownReferenceOptionSource {
+  private value: MarkdownReferenceOptions | false | undefined
+  private readonly listeners = new Set<() => void>()
+
+  constructor(value: MarkdownReferenceOptions | false | undefined) {
+    this.value = value
+  }
+
+  get(): MarkdownReferenceOptions | false | undefined {
+    return this.value
+  }
+
+  set(value: MarkdownReferenceOptions | false | undefined): void {
+    const contextKey = (options: MarkdownReferenceOptions | false | undefined) => {
+      if (options === false || options === undefined) return ''
+      return [
+        options.context?.vault ?? '',
+        options.context?.document ?? '',
+        options.context?.commit ?? '',
+      ].join('\u0000')
+    }
+    const adapter = (options: MarkdownReferenceOptions | false | undefined) => {
+      if (options === false || options === undefined) return undefined
+      return options.adapter
+    }
+    const identityChanged =
+      adapter(this.value) !== adapter(value) || contextKey(this.value) !== contextKey(value)
+    this.value = value
+    if (!identityChanged) return
+    for (const listener of [...this.listeners]) listener()
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+}
 
 export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
   onChange?: MarkdownEditorConfig['onChange']
-  onSlash?: (context: MarkdownSlashContext) => void
+  slash?: MarkdownSlashCommandOptions | false
+  reference?: MarkdownReferenceOptions | false
 }
 
 export function useMarkdownEditor({
@@ -61,11 +181,28 @@ export function useMarkdownEditor({
   profile = 'preserve',
   editable = true,
   onChange,
-  onSlash,
+  slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
+  reference,
 }: UseMarkdownEditorOptions = {}): Editor | null {
+  const [referenceSource] = useState(() => new MarkdownReferenceOptionSource(reference))
+  useEffect(() => {
+    referenceSource.set(reference)
+  }, [reference, referenceSource])
+  const referenceExtension = useMemo(
+    () =>
+      createLiveMarkdownReferenceExtension(() => {
+        const current = referenceSource.get()
+        return current || undefined
+      }, listener => referenceSource.subscribe(listener)),
+    [referenceSource],
+  )
   const extensions = useMemo(
-    () => createMarkdownExtensions({ profile, onSlash }),
-    [onSlash, profile],
+    () => [
+      ...createMarkdownExtensions({ profile }),
+      ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
+      referenceExtension,
+    ],
+    [profile, referenceExtension, slash],
   )
 
   return useEditor({
@@ -87,9 +224,19 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             setMarkdown: () => false,
             insertMarkdown: () => false,
             insertImage: () => false,
+            replaceImageAt: () => false,
+            setImageAltAt: () => false,
+            deleteImageAt: () => false,
             setLink: () => false,
             insertLink: () => false,
             unsetLink: () => false,
+            insertTable: () => false,
+            addTableRowAfter: () => false,
+            addTableColumnAfter: () => false,
+            deleteTableRow: () => false,
+            deleteTableColumn: () => false,
+            deleteTable: () => false,
+            continueBelowTable: () => false,
             setParagraph: () => false,
             toggleHeading: () => false,
             toggleBold: () => false,
@@ -98,6 +245,7 @@ export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
             toggleCode: () => false,
             toggleBulletList: () => false,
             toggleOrderedList: () => false,
+            toggleTaskList: () => false,
             toggleBlockquote: () => false,
             toggleCodeBlock: () => false,
             setHorizontalRule: () => false,
@@ -114,6 +262,7 @@ function readState(editor: Editor): MarkdownState {
     markdown: editor.getMarkdown(),
     isEmpty: editor.isEmpty,
     isEditable: editor.isEditable,
+    table: markdownTableState(editor),
     active: {
       paragraph: editor.isActive('paragraph'),
       heading1: editor.isActive('heading', { level: 1 }),
@@ -125,6 +274,7 @@ function readState(editor: Editor): MarkdownState {
       code: editor.isActive('code'),
       bulletList: editor.isActive('bulletList'),
       orderedList: editor.isActive('orderedList'),
+      taskList: editor.isActive('taskList'),
       blockquote: editor.isActive('blockquote'),
       codeBlock: editor.isActive('codeBlock'),
       link: editor.isActive('link'),
@@ -182,51 +332,276 @@ export function useMarkdownTargetResolutions(
   const [resolutionState, setResolutionState] = useState<{
     key: string
     resolutions: ReadonlyMap<string, MarkdownTargetResolution>
-  }>({ key: '', resolutions: EMPTY_RESOLUTIONS })
+    nonce: number
+  }>({ key: '', resolutions: EMPTY_RESOLUTIONS, nonce: -1 })
+  const [refreshNonce, setRefreshNonce] = useState(0)
 
   useEffect(() => {
-    if (!resolver || targets.length === 0) return
-
     const controller = new AbortController()
+    let ownedResolutions: ReadonlyMap<string, MarkdownTargetResolution> | null = null
+
+    if (!resolver || targets.length === 0) {
+      return () => controller.abort()
+    }
+
     void resolveMarkdownTargets(resolver, targets, {
       vault,
       document,
       commit,
       signal: controller.signal,
     }).then(next => {
-      if (!controller.signal.aborted) setResolutionState({ key: resolutionKey, resolutions: next })
+      if (controller.signal.aborted) {
+        releaseMarkdownResolutions(next)
+        return
+      }
+      ownedResolutions = next
+      setResolutionState({ key: resolutionKey, resolutions: next, nonce: refreshNonce })
     })
 
-    return () => controller.abort()
-  }, [commit, document, resolutionKey, resolver, targets, vault])
+    return () => {
+      controller.abort()
+      if (ownedResolutions) releaseMarkdownResolutions(ownedResolutions)
+    }
+  }, [commit, document, refreshNonce, resolutionKey, resolver, targets, vault])
 
-  return resolver && targets.length > 0 && resolutionState.key === resolutionKey
-    ? resolutionState.resolutions
-    : EMPTY_RESOLUTIONS
+  const targetResolutions =
+    resolver &&
+    targets.length > 0 &&
+    resolutionState.key === resolutionKey &&
+    resolutionState.nonce === refreshNonce
+      ? resolutionState.resolutions
+      : EMPTY_RESOLUTIONS
+
+  const nextRefreshAt = useMemo(() => {
+    let earliest = Number.POSITIVE_INFINITY
+    for (const resolution of targetResolutions.values()) {
+      if (resolution.status !== 'available' || !resolution.expiresAt) continue
+      const timestamp = Date.parse(resolution.expiresAt)
+      if (Number.isFinite(timestamp)) earliest = Math.min(earliest, timestamp)
+    }
+    return Number.isFinite(earliest) ? earliest : null
+  }, [targetResolutions])
+
+  useEffect(() => {
+    if (nextRefreshAt === null) return
+
+    // Re-resolve one second before expiry so a pointer/keyboard activation can
+    // use the refreshed URL without ever writing it back to Markdown.
+    const delay = Math.max(0, nextRefreshAt - Date.now() - 1_000)
+    const timer = window.setTimeout(() => {
+      // Do not leave a stale signed/blob URL actionable while the refresh is
+      // in flight. The surface will render the canonical target as pending
+      // until the new resolution arrives.
+      setResolutionState({ key: '', resolutions: EMPTY_RESOLUTIONS, nonce: refreshNonce })
+      setRefreshNonce(value => value + 1)
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [nextRefreshAt, refreshNonce])
+
+  return targetResolutions
 }
 
-interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
+export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: Editor | null
   editable: boolean
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
+  image?: MarkdownImageOptions
   children?: ReactNode
 }
 
-function MarkdownSurface({
+const DEFAULT_MARKDOWN_IMAGE_LABELS = {
+  loading: (alt: string) => (alt ? `Loading image: ${alt}` : 'Loading image'),
+  unavailable: (alt: string) => (alt ? `Image unavailable: ${alt}` : 'Image unavailable'),
+}
+
+const DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES = {
+  frame: 'my-2 block max-w-full align-top',
+  image: 'block h-auto max-w-full',
+  message: 'flex min-h-24 max-w-full items-center justify-center rounded-[var(--radius-md)] bg-surface-2 px-4 py-6 text-sm text-foreground-muted',
+}
+
+type MarkdownImageDisplayState = 'available' | 'loading' | 'unavailable' | 'decode'
+
+function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefined): void {
+  if (resolution?.status !== 'available' || !resolution.release) return
+  try {
+    resolution.release()
+  } catch {
+    // Product cleanup is best effort and cannot interrupt the surface.
+  }
+}
+
+export function MarkdownSurface({
   editor,
   editable,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
+  image,
   children,
   ...props
 }: MarkdownSurfaceProps) {
+  useLayoutEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
+
   useEffect(() => {
     const root = editor?.view.dom
     if (!root) return
 
+    const labels = { ...DEFAULT_MARKDOWN_IMAGE_LABELS, ...image?.labels }
+    const classNames = { ...DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES, ...image?.classNames }
+    const imageOverrides = new Map<HTMLImageElement, MarkdownTargetResolution>()
+    const imageControllers = new Map<HTMLImageElement, AbortController>()
+    const imageListeners = new Map<HTMLImageElement, { error: () => void; load: () => void }>()
+    const imageForcedStates = new Map<
+      HTMLImageElement,
+      Exclude<MarkdownImageDisplayState, 'available'>
+    >()
+    const retryAttempted = new WeakSet<HTMLImageElement>()
+
+    const imageTarget = (frame: HTMLElement, element: HTMLImageElement): string | null =>
+      frame.dataset.markdownTarget ?? element.dataset.markdownTarget ?? null
+
+    const setImageMessage = (message: HTMLElement, value: string, visible: boolean) => {
+      if (message.textContent !== value) message.textContent = value
+      message.hidden = !visible
+      message.setAttribute('aria-hidden', visible ? 'false' : 'true')
+    }
+
+    const applyImage = (
+      frame: HTMLElement,
+      element: HTMLImageElement,
+      target: string,
+      forcedState?: Exclude<MarkdownImageDisplayState, 'available'>,
+      managedTarget = true,
+    ) => {
+      const message = frame.querySelector<HTMLElement>('[data-markdown-image-message]')
+      const alt = element.getAttribute('alt') ?? ''
+      const resolution = imageOverrides.get(element) ?? resolutions.get(target)
+      const state: MarkdownImageDisplayState = forcedState ?? imageForcedStates.get(element) ?? (
+        !resolution
+          ? resolvingTargets && managedTarget ? 'loading' : 'available'
+          : resolution.status === 'available' && resolution.runtimeUrl
+            ? 'available'
+            : 'unavailable'
+      )
+
+      frame.classList.add(...classNames.frame.split(/\s+/).filter(Boolean))
+      element.classList.add(...classNames.image.split(/\s+/).filter(Boolean))
+      if (message) message.classList.add(...classNames.message.split(/\s+/).filter(Boolean))
+      frame.style.display = 'block'
+      frame.style.maxWidth = '100%'
+      element.style.display = 'block'
+      element.style.maxWidth = '100%'
+      element.style.height = 'auto'
+      frame.dataset.markdownImageState = state
+      frame.dataset.markdownTarget = target
+      element.dataset.markdownTarget = target
+      element.dataset.markdownResolution = state === 'available' ? 'available' : state
+
+      if (state === 'available') {
+        const runtimeUrl = resolution?.status === 'available' && resolution.runtimeUrl
+          ? resolution.runtimeUrl
+          : target
+        element.setAttribute('src', runtimeUrl)
+        element.hidden = false
+        element.removeAttribute('aria-hidden')
+        frame.removeAttribute('role')
+        frame.removeAttribute('aria-label')
+        frame.removeAttribute('aria-live')
+        if (message) setImageMessage(message, '', false)
+        return
+      }
+
+      element.removeAttribute('src')
+      element.hidden = true
+      element.setAttribute('aria-hidden', 'true')
+      const label = state === 'loading' ? labels.loading(alt) : labels.unavailable(alt)
+      frame.setAttribute('role', state === 'loading' ? 'status' : 'img')
+      frame.setAttribute('aria-label', label)
+      if (state === 'loading') frame.setAttribute('aria-live', 'polite')
+      else frame.removeAttribute('aria-live')
+      if (message) setImageMessage(message, label, true)
+    }
+
+    const attachImageListeners = (frame: HTMLElement, element: HTMLImageElement, target: string) => {
+      if (imageListeners.has(element)) return
+      const load = () => {
+        retryAttempted.delete(element)
+        imageForcedStates.delete(element)
+      }
+      const error = () => {
+        const resolution = imageOverrides.get(element) ?? resolutions.get(target)
+        if (
+          resolution?.status === 'available' &&
+          resolution.refresh &&
+          !retryAttempted.has(element)
+        ) {
+          retryAttempted.add(element)
+          const previousController = imageControllers.get(element)
+          previousController?.abort()
+          const controller = new AbortController()
+          imageControllers.set(element, controller)
+          imageForcedStates.set(element, 'loading')
+          applyImage(frame, element, target, 'loading')
+          void resolution.refresh({ signal: controller.signal }).then(next => {
+            if (controller.signal.aborted) {
+              releaseMarkdownResolution(next)
+              return
+            }
+            const previous = imageOverrides.get(element)
+            if (previous && previous !== next) releaseMarkdownResolution(previous)
+            imageOverrides.set(element, next)
+            imageControllers.delete(element)
+            if (next.status === 'available' && next.runtimeUrl) {
+              imageForcedStates.delete(element)
+              applyImage(frame, element, target)
+            } else {
+              imageForcedStates.set(element, 'decode')
+              applyImage(frame, element, target, 'decode')
+            }
+          }).catch(() => {
+            if (controller.signal.aborted) return
+            imageControllers.delete(element)
+            imageForcedStates.set(element, 'decode')
+            applyImage(frame, element, target, 'decode')
+          })
+          return
+        }
+        imageForcedStates.set(element, 'decode')
+        applyImage(frame, element, target, 'decode')
+      }
+      element.addEventListener('load', load)
+      element.addEventListener('error', error)
+      imageListeners.set(element, { error, load })
+    }
+
     const applyResolutions = () => {
-      root.querySelectorAll<HTMLElement>('img[data-markdown-target], a[href]').forEach(element => {
+      const managedTargets = new Set(
+        extractMarkdownTargets(editor.getMarkdown()).map(({ target }) => target),
+      )
+      const frames = [...root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]')]
+      const framedImages = new Set<HTMLImageElement>()
+      for (const frame of frames) {
+        const element = frame.querySelector<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]')
+        if (!element) continue
+        const target = imageTarget(frame, element)
+        if (!target) continue
+        framedImages.add(element)
+        attachImageListeners(frame, element, target)
+        applyImage(frame, element, target, undefined, managedTargets.has(target))
+      }
+
+      root.querySelectorAll<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]').forEach(element => {
+        if (framedImages.has(element)) return
+        const target = element.dataset.markdownTarget
+        if (!target) return
+        attachImageListeners(element, element, target)
+        applyImage(element, element, target, undefined, managedTargets.has(target))
+      })
+
+      root.querySelectorAll<HTMLElement>('a[href]').forEach(element => {
         const target =
           element.dataset.markdownTarget ??
           (element.tagName === 'A' && element.getAttribute('href')?.startsWith('akb://')
@@ -240,12 +615,10 @@ function MarkdownSurface({
           if (resolvingTargets) {
             element.dataset.markdownResolution = 'pending'
             element.setAttribute('aria-disabled', 'true')
-            if (element.tagName === 'IMG') element.removeAttribute('src')
-            else element.setAttribute('href', '#')
+            element.setAttribute('href', '#')
             return
           }
-          if (element.tagName === 'IMG') element.setAttribute('src', target)
-          else element.setAttribute('href', target)
+          element.setAttribute('href', target)
           if (previousResolution === 'unavailable') element.removeAttribute('aria-label')
           element.removeAttribute('aria-disabled')
           delete element.dataset.markdownResolution
@@ -262,21 +635,35 @@ function MarkdownSurface({
         }
 
         element.dataset.markdownResolution = 'unavailable'
-        element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
-        if (element.tagName === 'IMG') element.removeAttribute('src')
-        else {
-          element.setAttribute('href', '#')
-          element.setAttribute('aria-disabled', 'true')
+        if (element.tagName === 'A') {
+          element.setAttribute('title', resolution.label ?? 'Reference unavailable')
+          element.removeAttribute('aria-label')
+        } else {
+          element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
         }
+        element.setAttribute('href', '#')
+        element.setAttribute('aria-disabled', 'true')
       })
     }
 
     applyResolutions()
     editor.on('transaction', applyResolutions)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(applyResolutions)
+    observer?.observe(root, { childList: true, subtree: true })
+
     return () => {
       editor.off('transaction', applyResolutions)
+      observer?.disconnect()
+      for (const [element, listeners] of imageListeners) {
+        element.removeEventListener('load', listeners.load)
+        element.removeEventListener('error', listeners.error)
+      }
+      for (const controller of imageControllers.values()) controller.abort()
+      for (const resolution of imageOverrides.values()) releaseMarkdownResolution(resolution)
     }
-  }, [editor, resolvingTargets, resolutions])
+  }, [editor, image, resolvingTargets, resolutions])
 
   return (
     <div
@@ -298,6 +685,21 @@ export interface MarkdownEditingSurfaceLabels {
   sourceField: string
 }
 
+function normalizeEditorBody(editor: Editor): void {
+  const document = editor.getJSON()
+  if (document.content?.some(node => node.type === 'image')) {
+    const content = document.content.map(node =>
+      node.type === 'image' ? { type: 'paragraph', content: [node] } : node,
+    )
+    editor.commands.setContent({ ...document, content }, { emitUpdate: false })
+  }
+
+  const last = editor.state.doc.lastChild
+  if (!last || last.type.name !== 'paragraph') {
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' })
+  }
+}
+
 const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
   group: 'Editor mode',
   wysiwyg: 'WYSIWYG',
@@ -314,6 +716,9 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   readOnly?: boolean
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
+  table?: MarkdownTableOptions
+  imageMenu?: MarkdownImageMenuOptions
+  imageUpload?: MarkdownImageUploadOptions
   sourcePlaceholder?: string
   sourceLabel?: string
   sourceAriaLabel?: string
@@ -340,6 +745,9 @@ export function MarkdownEditingSurface({
   readOnly = false,
   modeSwitchDisabled = false,
   toolbar,
+  table,
+  imageMenu,
+  imageUpload,
   sourcePlaceholder = 'Write Markdown source…',
   sourceLabel,
   sourceAriaLabel,
@@ -353,6 +761,7 @@ export function MarkdownEditingSurface({
   className,
   ...props
 }: MarkdownEditingSurfaceProps) {
+  const imageUploadController = useMarkdownImageUpload(editor, imageUpload, readOnly)
   const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
   const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
   const [source, setSource] = useState(markdown)
@@ -363,7 +772,46 @@ export function MarkdownEditingSurface({
   const sourceInputRef = useRef<HTMLTextAreaElement>(null)
   const sourceInputId = useId()
   const sourceInputLabelId = `${sourceInputId}-label`
+  const surfaceRef = useRef<HTMLDivElement>(null)
   const resolvedSourceLabel = sourceLabel ?? labels.sourceField
+  const effectiveImageMenu = imageUploadController && imageMenu
+    ? {
+        ...imageMenu,
+        onReplace: (position: number) => imageUploadController.beginReplacement(position),
+      }
+    : imageMenu
+  const effectiveModeSwitchDisabled = modeSwitchDisabled || Boolean(imageUploadController?.state.uploading)
+
+  const handleWysiwygDragOverCapture: DragEventHandler<HTMLDivElement> = event => {
+    imageUploadController?.handleDragOver(event)
+    onWysiwygDragOverCapture?.(event)
+  }
+  const handleWysiwygDropCapture: DragEventHandler<HTMLDivElement> = event => {
+    imageUploadController?.handleDrop(event)
+    onWysiwygDropCapture?.(event)
+  }
+
+  const wysiwygPanel = (
+    <div
+      hidden={mode !== 'wysiwyg'}
+      data-markdown-mode-panel="wysiwyg"
+      onDragOverCapture={handleWysiwygDragOverCapture}
+      onDropCapture={handleWysiwygDropCapture}
+      onPasteCapture={event => imageUploadController?.handlePaste(event)}
+    >
+      {mode === 'wysiwyg' ? toolbar : null}
+      {imageUploadController ? (
+        <MarkdownImageUploadStatus options={imageUpload} />
+      ) : null}
+      {children}
+      {imageUploadController ? (
+        <MarkdownImageUploadInput
+          accept={imageUpload?.accept}
+          className={imageUpload?.classNames?.input}
+        />
+      ) : null}
+    </div>
+  )
 
   useLayoutEffect(() => {
     if (sourceDirtyRef.current) return
@@ -381,9 +829,14 @@ export function MarkdownEditingSurface({
         contentType: 'markdown',
         emitUpdate: false,
       })
+      normalizeEditorBody(editor)
       onMarkdownApplied?.(editor)
     }
   }, [editor, markdown, mode, onMarkdownApplied])
+
+  useLayoutEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
 
   useEffect(() => {
     if (editor && editor.isEditable !== !readOnly) editor.setEditable(!readOnly, false)
@@ -412,6 +865,7 @@ export function MarkdownEditingSurface({
           contentType: 'markdown',
           emitUpdate: false,
         })
+        normalizeEditorBody(editor)
         onMarkdownApplied?.(editor)
       }
       sourceDirtyRef.current = false
@@ -424,7 +878,7 @@ export function MarkdownEditingSurface({
     <button
       type="button"
       aria-pressed={mode === target}
-      disabled={!editor || modeSwitchDisabled}
+      disabled={!editor || effectiveModeSwitchDisabled}
       onClick={() => selectMode(target)}
       className={joinClasses(
         'inline-flex h-8 items-center justify-center rounded-[var(--radius-sm)] px-3 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:cursor-not-allowed disabled:opacity-50',
@@ -440,7 +894,8 @@ export function MarkdownEditingSurface({
   return (
     <div
       {...props}
-      className={joinClasses('min-w-0', className)}
+      ref={surfaceRef}
+      className={joinClasses('relative min-w-0', className)}
       data-markdown-mode={mode}
     >
       <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
@@ -455,15 +910,11 @@ export function MarkdownEditingSurface({
         </div>
       </div>
 
-      <div
-        hidden={mode !== 'wysiwyg'}
-        data-markdown-mode-panel="wysiwyg"
-        onDragOverCapture={onWysiwygDragOverCapture}
-        onDropCapture={onWysiwygDropCapture}
-      >
-        {mode === 'wysiwyg' ? toolbar : null}
-        {children}
-      </div>
+      {imageUploadController ? (
+        <MarkdownImageUploadProvider controller={imageUploadController}>
+          {wysiwygPanel}
+        </MarkdownImageUploadProvider>
+      ) : wysiwygPanel}
 
       <div hidden={mode !== 'source'} data-markdown-mode-panel="source">
         <label id={sourceInputLabelId} htmlFor={sourceInputId} className="sr-only">
@@ -496,6 +947,13 @@ export function MarkdownEditingSurface({
           }
         />
       </div>
+      <MarkdownTableControls editor={editor} readOnly={readOnly} options={table} />
+      <MarkdownImageMenuControls
+        editor={editor}
+        rootRef={surfaceRef}
+        readOnly={readOnly}
+        options={effectiveImageMenu}
+      />
     </div>
   )
 }
@@ -505,9 +963,12 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   profile?: MarkdownProfile
   readOnly?: boolean
   onChange?: MarkdownEditorConfig['onChange']
-  onSlash?: (context: MarkdownSlashContext) => void
+  slash?: MarkdownSlashCommandOptions | false
+  reference?: MarkdownReferenceOptions | false
   adapters?: MarkdownAdapters
   resolverContext?: MarkdownTargetResolverContext
+  imageMenu?: MarkdownImageMenuOptions
+  imageUpload?: MarkdownImageUploadOptions
 }
 
 export function MarkdownEditor({
@@ -515,9 +976,12 @@ export function MarkdownEditor({
   profile = 'preserve',
   readOnly = false,
   onChange,
-  onSlash,
+  slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
+  reference,
   adapters,
   resolverContext,
+  imageMenu,
+  imageUpload,
   ...props
 }: MarkdownEditorProps) {
   const editor = useMarkdownEditor({
@@ -525,7 +989,8 @@ export function MarkdownEditor({
     profile,
     editable: !readOnly,
     onChange,
-    onSlash,
+    slash,
+    reference,
   })
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -540,6 +1005,8 @@ export function MarkdownEditor({
       markdown={markdown}
       profile={profile}
       readOnly={readOnly}
+      imageMenu={imageMenu}
+      imageUpload={imageUpload}
       onSourceChange={(next, sourceEditor) => onChange?.(next, sourceEditor)}
     >
       <MarkdownSurface
@@ -570,6 +1037,7 @@ export function MarkdownViewer({
     initialMarkdown: markdown,
     profile,
     editable: false,
+    slash: false,
   })
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -583,7 +1051,12 @@ export function MarkdownViewer({
     }
 
     editor.commands.setContent(markdown, { contentType: 'markdown' })
+    normalizeEditorBody(editor)
   }, [editor, markdown])
+
+  useEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
 
   return (
     <MarkdownSurface
@@ -962,6 +1435,7 @@ export interface MarkdownToolbarProps {
   className?: string
   'aria-label'?: string
   link?: MarkdownToolbarLinkOptions
+  table?: MarkdownTableOptions
 }
 
 export interface MarkdownToolbarLinkOptions {
@@ -986,14 +1460,17 @@ export function MarkdownToolbar({
   className,
   'aria-label': ariaLabel = 'Text formatting',
   link,
+  table,
 }: MarkdownToolbarProps) {
   const state = useMarkdownState(editor)
   const commands = useMarkdownCommands(editor)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const [linkOpen, setLinkOpen] = useState(false)
+  const imageUpload = useMarkdownImageUploadContext()
   const editable = Boolean(editor && state?.isEditable)
   const active = state?.active
   const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
+  const tableLabels: MarkdownTableLabels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...table?.labels }
   const linkDisabled = !editable || link?.disabled === true
 
   useLayoutEffect(() => {
@@ -1156,6 +1633,14 @@ export function MarkdownToolbar({
         >
           <ListOrdered className="h-4 w-4" />
         </MarkdownToolbarButton>
+        <MarkdownToolbarButton
+          label="Task list"
+          active={Boolean(active?.taskList)}
+          disabled={!editable}
+          onClick={() => commands.toggleTaskList()}
+        >
+          <CheckSquare className="h-4 w-4" />
+        </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
       <MarkdownToolbarGroup label="Blocks">
         <MarkdownToolbarButton
@@ -1184,6 +1669,13 @@ export function MarkdownToolbar({
       </MarkdownToolbarGroup>
       <MarkdownToolbarGroup label="Insert">
         <MarkdownToolbarButton
+          label={tableLabels.insertTable}
+          disabled={!editable || !state?.table.canInsert}
+          onClick={() => commands.insertTable()}
+        >
+          <Table className="h-4 w-4" />
+        </MarkdownToolbarButton>
+        <MarkdownToolbarButton
           label={active?.link ? linkLabels.editButton : linkLabels.insertButton}
           active={Boolean(active?.link)}
           disabled={linkDisabled}
@@ -1192,6 +1684,21 @@ export function MarkdownToolbar({
           <Link2 className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
+      {imageUpload && (
+        <MarkdownToolbarGroup label={imageUpload.labels.group}>
+          <MarkdownToolbarButton
+            label={imageUpload.state.uploading ? imageUpload.labels.uploading : imageUpload.labels.insert}
+            disabled={!editable || imageUpload.state.uploading}
+            onClick={imageUpload.openPicker}
+          >
+            {imageUpload.state.uploading ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <ImagePlus className="h-4 w-4" />
+            )}
+          </MarkdownToolbarButton>
+        </MarkdownToolbarGroup>
+      )}
       <MarkdownToolbarGroup label="History">
         <MarkdownToolbarButton
           label="Undo"

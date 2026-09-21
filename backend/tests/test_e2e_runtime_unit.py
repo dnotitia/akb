@@ -8,11 +8,14 @@ import json
 import stat
 import subprocess
 import sys
+import uuid
+from types import SimpleNamespace
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_DIR = REPO_ROOT / "scripts" / "ci"
@@ -24,7 +27,12 @@ from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
+    ProvisioningFailure,
+    MinioResetFailure,
+    SOURCE_REVISION_ENV,
     RuntimeConfig,
+    _fixture_schema_fingerprint,
+    _fixture_v2_manifest,
     _parse_args,
     prepare_private_runtime_root,
     select_capability_profile,
@@ -55,6 +63,227 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
 LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
+class _FakeMinioPaginator:
+    def __init__(self, client) -> None:
+        self.client = client
+
+    def paginate(self, *, Bucket: str):
+        return self.client.pages(Bucket)
+
+
+class _FakeMinioClient:
+    def __init__(self, pages, delete_results=None) -> None:
+        self._pages = pages
+        self._delete_results = list(delete_results or [])
+        self.delete_calls: list[list[str]] = []
+        self.paginate_calls = 0
+
+    def get_paginator(self, _name: str) -> _FakeMinioPaginator:
+        return _FakeMinioPaginator(self)
+
+    def pages(self, _bucket: str):
+        self.paginate_calls += 1
+        result = self._pages[self.paginate_calls - 1]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def delete_objects(self, *, Bucket: str, Delete: dict[str, object]):
+        keys = [item["Key"] for item in Delete["Objects"]]
+        self.delete_calls.append(keys)
+        if self._delete_results:
+            result = self._delete_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return {}
+
+
+def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
+    path = REPO_ROOT / "eval" / "mcp-catalog" / "fixtures" / "sample-image.png"
+
+    assert path.stat().st_size <= 64 * 1024
+    with Image.open(path) as image:
+        assert image.format == "PNG"
+        image.load()
+        assert image.size == (400, 400)
+
+
+def test_authorization_fixture_vault_repository_is_initialized_idempotently(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime.config.vault_dir.mkdir(parents=True)
+
+    first = runtime._ensure_fixture_git_repository("catalog-bench-vault-authorization")
+    second = runtime._ensure_fixture_git_repository("catalog-bench-vault-authorization")
+
+    assert first == second
+    bare = Path(first)
+    assert bare.is_dir()
+    assert (bare / "HEAD").is_file()
+    assert (bare / "objects").is_dir()
+
+
+def _install_fake_minio(monkeypatch: pytest.MonkeyPatch, client: object) -> None:
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *_args, **_kwargs: client))
+
+
+def test_minio_reset_retries_endpoint_failure_and_reports_recovery(monkeypatch, tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [
+            EndpointConnectionError(endpoint_url="http://minio.invalid"),
+            [{"Contents": []}],
+            [{"Contents": []}],
+        ]
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "recovered"
+    assert evidence["attempts"] == 2
+    assert evidence["retry_count"] == 1
+    assert evidence["wall_seconds"] >= 0
+    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
+    assert client.delete_calls == []
+
+
+def test_minio_reset_retries_partial_delete_and_verifies_empty(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [
+            [{"Contents": [{"Key": "a"}, {"Key": "b"}]}],
+            [{"Contents": [{"Key": "b"}]}],
+            [{"Contents": []}],
+        ],
+        delete_results=[
+            {"Errors": [{"Key": "b", "Code": "SlowDown", "Message": "retry"}]},
+            {},
+        ],
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "recovered"
+    assert evidence["attempts"] == 2
+    assert client.delete_calls == [["a", "b"], ["b"]]
+    assert sleeps == [e2e_runtime.MINIO_RESET_BACKOFF_SECONDS[0]]
+
+
+def test_minio_reset_chunks_large_delete_requests_to_s3_limit(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    keys = [{"Key": f"object-{index}"} for index in range(e2e_runtime.MINIO_DELETE_BATCH_SIZE + 1)]
+    client = _FakeMinioClient(
+        [[{"Contents": keys}], [{"Contents": []}]],
+        delete_results=[{}, {}],
+    )
+    _install_fake_minio(monkeypatch, client)
+
+    evidence = runtime._clear_minio_objects()
+
+    assert evidence["status"] == "success"
+    assert [len(batch) for batch in client.delete_calls] == [1000, 1]
+
+
+def test_minio_reset_rejects_non_retryable_delete_error_without_retry(monkeypatch, tmp_path):
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._fixture_private_values = ("fixture-password",)
+    client = _FakeMinioClient(
+        [[{"Contents": [{"Key": "a"}]}]],
+        delete_results=[
+            {
+                "Errors": [
+                    {
+                        "Key": "a",
+                        "Code": "AccessDenied",
+                        "Message": "fixture-password is not allowed",
+                    }
+                ]
+            }
+        ],
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    with pytest.raises(MinioResetFailure) as raised:
+        runtime._clear_minio_objects()
+
+    assert "operation=delete" in str(raised.value)
+    assert "s3_code=AccessDenied" in str(raised.value)
+    assert "attempt=1/" in str(raised.value)
+    assert "fixture-password" not in str(raised.value)
+    assert sleeps == []
+    assert raised.value.evidence["retry_count"] == 0
+
+
+def test_minio_reset_reports_exhausted_retryable_failure(monkeypatch, tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    runtime = E2ERuntime(make_config(tmp_path))
+    client = _FakeMinioClient(
+        [EndpointConnectionError(endpoint_url="http://minio.invalid")] * e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
+    )
+    sleeps: list[float] = []
+    _install_fake_minio(monkeypatch, client)
+    monkeypatch.setattr(e2e_runtime.time, "sleep", sleeps.append)
+
+    with pytest.raises(MinioResetFailure) as raised:
+        runtime._clear_minio_objects()
+
+    assert "operation=list" in str(raised.value)
+    assert "attempt=3/3" in str(raised.value)
+    assert raised.value.evidence["status"] == "failed"
+    assert raised.value.evidence["attempts"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS
+    assert raised.value.evidence["retry_count"] == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
+    assert len(sleeps) == e2e_runtime.MINIO_RESET_MAX_ATTEMPTS - 1
+
+
+@pytest.mark.asyncio
+async def test_same_runtime_reset_attempts_are_serialized_and_evidence_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime._prepared = True
+    runtime.config.vault_dir.mkdir(parents=True)
+    state = {"active": 0, "max_active": 0, "calls": 0}
+
+    async def postgres_reset() -> None:
+        state["active"] += 1
+        state["max_active"] = max(state["max_active"], state["active"])
+        await asyncio.sleep(0)
+        state["active"] -= 1
+
+    def minio_reset() -> dict[str, object]:
+        state["calls"] += 1
+        return {"status": "recovered", "attempts": 2, "retry_count": 1, "wall_seconds": 0.01}
+
+    identity = {"services": {"minio": {"container_id": "m"}, "postgres": {"container_id": "p"}}}
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
+    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: {"backend": {"pid": 1, "running": True}})
+    monkeypatch.setattr(runtime, "_reset_postgres_in_place", postgres_reset)
+    monkeypatch.setattr(runtime, "_clear_minio_objects", minio_reset)
+    monkeypatch.setattr(runtime, "_seed_external_credential", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_mint_runtime_pat", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+    monkeypatch.setattr(runtime, "_wait_tcp", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(runtime, "_wait_http", lambda *_args, **_kwargs: asyncio.sleep(0))
+
+    await asyncio.gather(runtime.reset_scenario(), runtime.reset_scenario())
+
+    assert state["max_active"] == 1
+    assert state["calls"] == 2
+    assert runtime._dependency_reset_evidence["minio_reset"]["retry_count"] == 1
+
+
 def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
     return RuntimeConfig(
         checkout=REPO_ROOT,
@@ -64,6 +293,63 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
         compose_project="akb-e2e-unit",
         credentials=CredentialNames("TEST_USERNAME_ENV", "TEST_PASSWORD_ENV"),
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_reset_preserves_diagnostic_and_recovers_on_next_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "fixture-user")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "fixture-password")
+    state = {"fail_once": True, "execute_calls": 0, "close_calls": 0}
+
+    class Connection:
+        async def execute(self, *_args: object) -> None:
+            state["execute_calls"] += 1
+            if state["fail_once"]:
+                state["fail_once"] = False
+                raise RuntimeError("deadlock detected while truncating fixture")
+
+        async def close(self) -> None:
+            state["close_calls"] += 1
+
+    connection = Connection()
+
+    async def connect(**_kwargs: object) -> Connection:
+        return connection
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+
+    with pytest.raises(ProvisioningFailure, match="deadlock detected while truncating fixture"):
+        await runtime._reset_postgres_in_place()
+    await runtime._reset_postgres_in_place()
+
+    assert state["execute_calls"] == 4
+    assert state["close_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fixture_vault_rejects_owner_access_grants_before_writing(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    executed: list[object] = []
+
+    class Connection:
+        async def execute(self, *args: object) -> None:
+            executed.append(args)
+
+    with pytest.raises(ProvisioningFailure, match="owner_id"):
+        await runtime._insert_fixture_vault(
+            Connection(),
+            namespace="fixture",
+            label="owner-grant",
+            owner_id=uuid.uuid4(),
+            grants=[(uuid.uuid4(), "owner")],
+            granted_by=uuid.uuid4(),
+        )
+
+    assert executed == []
 
 
 def test_descriptor_is_schema_v2_and_never_contains_credential_values(tmp_path, monkeypatch):
@@ -178,6 +464,21 @@ def test_frontend_runtime_requires_explicit_flag_and_supports_isolated_port():
     )
     assert configured.frontend_enabled is True
     assert configured.frontend_port == 3017
+
+
+def test_runtime_accepts_explicit_dependency_ports():
+    configured = _parse_args(
+        [
+            "serve",
+            "--postgres-port",
+            "15532",
+            "--minio-port",
+            "9100",
+        ]
+    )
+
+    assert configured.postgres_port == 15532
+    assert configured.minio_port == 9100
 
 
 def test_frontend_owns_package_script_and_toolchain_contract():
@@ -426,6 +727,79 @@ def test_app_control_plane_descriptor_keeps_schema_v2_discovery_contract(tmp_pat
     assert discovery["coordinates"]["self_app"]["resume"]["path"] == "/api/v1/app/rollouts/{rollout_id}/resume"
 
 
+def test_raw_checkout_uses_explicit_source_revision_in_descriptor_and_discovery(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    revision = "c" * 40
+    monkeypatch.setenv(SOURCE_REVISION_ENV, revision)
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path),
+            checkout=raw_checkout,
+            profile="transport-proxy",
+            scenario="app-control-plane",
+        )
+    )
+
+    descriptor = runtime.descriptor()
+    discovery = runtime.fixture_discovery()
+
+    assert descriptor["evidence"]["source_revision"] == revision
+    assert discovery["runtime"]["source_revision"] == revision
+    assert SOURCE_REVISION_ENV not in json.dumps(descriptor)
+    assert SOURCE_REVISION_ENV not in json.dumps(discovery)
+
+
+@pytest.mark.parametrize("value", ["", "not-a-sha", "a" * 39, "g" * 40, "a" * 41])
+def test_invalid_explicit_source_revision_fails_closed(value, tmp_path, monkeypatch):
+    monkeypatch.setenv(SOURCE_REVISION_ENV, value)
+    runtime = E2ERuntime(make_config(tmp_path))
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        runtime._source_revision()
+
+
+def test_raw_checkout_without_explicit_source_revision_fails_closed(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=raw_checkout))
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        runtime._source_revision()
+
+
+@pytest.mark.asyncio
+async def test_raw_checkout_preparation_blocks_before_creating_resources(tmp_path, monkeypatch):
+    raw_checkout = tmp_path / "raw-checkout"
+    raw_checkout.mkdir()
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=raw_checkout))
+    monkeypatch.setattr(runtime, "_validate_checkout", lambda: None)
+    monkeypatch.setattr(runtime, "_validate_profile", lambda: None)
+    monkeypatch.setattr(
+        e2e_runtime,
+        "prepare_private_runtime_root",
+        lambda _path: pytest.fail("raw source revision must block before runtime setup"),
+    )
+
+    with pytest.raises(BlockedRuntimeConfig, match="blocked_runtime_config"):
+        await runtime.prepare()
+
+    assert runtime._children == {}
+    assert runtime._fixture_task is None
+
+
+def test_git_checkout_remains_the_fallback_source_revision_authority(tmp_path, monkeypatch):
+    monkeypatch.delenv(SOURCE_REVISION_ENV, raising=False)
+    runtime = E2ERuntime(make_config(tmp_path))
+
+    revision = runtime._source_revision()
+
+    assert len(revision) == 40
+    assert all(character in "0123456789abcdef" for character in revision)
+
+
 def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_control(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), scenario="app-control-plane")
@@ -438,7 +812,19 @@ def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_co
                 "fixture_id": "legacy-adoption",
                 "vault_id": "vault-legacy",
                 "before": {"row_count": 3},
-                "after": {"grant_generation": 0},
+                "after_adoption": {
+                    "grant_generation": 0,
+                    "observed_grant_generation": 0,
+                },
+                "after_initial_grant": {
+                    "grant_generation": 1,
+                    "observed_grant_generation": 1,
+                },
+                "after": {
+                    "grant_generation": 1,
+                    "observed_grant_generation": 1,
+                    "desired_current_release_id": "release-next",
+                },
             }
         },
     }
@@ -452,7 +838,62 @@ def test_app_control_plane_discovery_exposes_legacy_adoption_target_and_drift_co
         "target_type": "legacy_adoption",
     } in control["targets"]
     assert discovery["fixtures"]["legacy_adoption"]["before"]["row_count"] == 3
-    assert discovery["fixtures"]["legacy_adoption"]["after"]["grant_generation"] == 0
+    assert discovery["fixtures"]["legacy_adoption"]["after_adoption"]["grant_generation"] == 0
+    assert discovery["fixtures"]["legacy_adoption"]["after_initial_grant"]["grant_generation"] == 1
+    assert discovery["fixtures"]["legacy_adoption"]["after"]["desired_current_release_id"] == "release-next"
+
+
+def test_legacy_noop_release_fixture_has_fresh_and_exact_source_plans():
+    table = {
+        "name": "legacy_orders",
+        "columns": [
+            {"name": "amount", "type": "numeric"},
+            {"name": "state", "type": "text"},
+        ],
+        "unique_keys": [],
+        "indexes": [],
+    }
+    fingerprint = _fixture_schema_fingerprint([table])
+    manifest, checksum = _fixture_v2_manifest(
+        app_key="fixture-legacy-target",
+        version="6.0.0",
+        tables=[table],
+        transition_plans=[
+            (
+                "fresh",
+                [
+                    {
+                        "id": "create_legacy_orders",
+                        "phase": "expand",
+                        "operation": "create_table",
+                        "payload": {
+                            "table": "legacy_orders",
+                            "columns": table["columns"],
+                            "unique_keys": [],
+                            "indexes": [],
+                        },
+                    }
+                ],
+            ),
+            (
+                {
+                    "release_version": "5.0.0",
+                    "schema_fingerprint": fingerprint,
+                },
+                [],
+            ),
+        ],
+    )
+
+    assert len(checksum) == 64
+    assert manifest["schema"]["fingerprint"] == fingerprint
+    assert manifest["transition_plans"][1] == {
+        "source": {
+            "release_version": "5.0.0",
+            "schema_fingerprint": fingerprint,
+        },
+        "steps": [],
+    }
 
 
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):
@@ -635,7 +1076,8 @@ def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
 
 
 @pytest.mark.asyncio
-async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd):
+async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd, monkeypatch):
+    monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
     checkout = tmp_path / "checkout"
     suite_path = checkout / "scripts" / "ci" / "e2e_suite_runner.py"
     suite_path.parent.mkdir(parents=True)
@@ -705,14 +1147,38 @@ async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp
     async def fake_wait_http(*_args: object) -> bytes:
         return b""
 
+    dependency_identity = {
+        "services": {
+            "postgres": {
+                "container_id": "postgres-container",
+                "network_ids": ["runtime-network"],
+                "volume_names": ["runtime-postgres-volume"],
+            },
+            "minio": {
+                "container_id": "minio-container",
+                "network_ids": ["runtime-network"],
+                "volume_names": ["runtime-minio-volume"],
+            },
+        }
+    }
+    identity_calls = 0
+
+    def fake_dependency_identity_snapshot() -> dict[str, object]:
+        nonlocal identity_calls
+        identity_calls += 1
+        return dependency_identity
+
     monkeypatch.setattr(runtime, "_compose", fake_compose)
     monkeypatch.setattr(runtime, "_wait_tcp", fake_wait_tcp)
     monkeypatch.setattr(runtime, "_wait_http", fake_wait_http)
     monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", fake_dependency_identity_snapshot)
 
     await runtime._start_dependencies()
 
     assert compose_calls == [(("up", "--detach", "--wait"), {})]
+    assert identity_calls == 1
+    assert runtime._dependency_identity == dependency_identity
 
 
 class FakeFixtureRuntime:
@@ -1178,7 +1644,14 @@ async def test_rollout_fault_disable_restores_fixture_before_ack(tmp_path, monke
 def test_compose_and_hosted_workflow_preserve_the_live_topology():
     compose = yaml.safe_load(COMPOSE_FILE.read_text())
     assert set(compose["services"]) == {"postgres", "minio"}
-    assert compose["services"]["postgres"]["image"] == "pgvector/pgvector:pg16"
+    # Asserted as "the pg16 tag, carrying a digest" rather than as one exact
+    # string. A bare tag here would let the e2e runtime drift to whatever
+    # `pg16` resolves to on the day while every deployment manifest is pinned,
+    # which is the disagreement the pinning was meant to remove. Repeating the
+    # digest instead would make this a second place to edit on every bump, and
+    # the two copies would fall out of step the first time someone forgot.
+    postgres_image = compose["services"]["postgres"]["image"]
+    assert postgres_image.startswith("pgvector/pgvector:pg16@sha256:"), postgres_image
     assert compose["services"]["minio"]["image"] == (
         "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
     )

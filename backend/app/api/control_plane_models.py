@@ -248,6 +248,11 @@ class InstallationCommandRequest(ControlPlaneRequest):
     mode: Literal["install", "restore", "fresh"] = "install"
 
 
+class InitialGrantApprovalRequest(ControlPlaneRequest):
+    baseline_release_id: uuid.UUID
+    capabilities: list[str] = Field(min_length=1, max_length=32)
+
+
 class ReleaseReference(ControlPlaneModel):
     id: uuid.UUID | None = None
     version: str | None = None

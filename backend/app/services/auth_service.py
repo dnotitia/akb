@@ -265,9 +265,15 @@ async def register(username: str, email: str, password: str, display_name: str |
     user_id = uuid.uuid4()
 
     async with pool.acquire() as conn:
-        # Check duplicates
+        # Check duplicates. Email compares case-insensitively (#551): the
+        # adopt lookup matches on lower(email), so a case variant registered
+        # here would later make that lookup find two rows and refuse with
+        # identity_conflict — a pre-registration that blocks the victim's
+        # sign-in until an admin approves them. The UNIQUE index on
+        # lower(email) (migration 109) is the race-proof backstop; this
+        # check is the friendly 409 before it.
         existing = await conn.fetchrow(
-            "SELECT id FROM users WHERE username = $1 OR email = $2",
+            "SELECT id FROM users WHERE username = $1 OR lower(email) = lower($2)",
             username,
             email,
         )

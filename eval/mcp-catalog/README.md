@@ -1,0 +1,423 @@
+# MCP tool catalog benchmark
+
+This directory contains the source-blind AKB tool-surface benchmark. Its goal
+is to determine whether reducing the production MCP tool surface preserves
+basic capability while reducing failures caused by overlapping or excessive
+tools. It compares baseline and candidate with the same task corpus,
+resettable fixture contract, model manifest, and statistical procedure. It
+does not use the arm filtering or ReAct loop from `eval/agentic-bench`.
+
+The corpus has two explicitly separate suites:
+
+- Suite A covers basic capability across the ten production capability
+  families.
+- Suite B targets current tool-surface risks: overlapping reads and writes,
+  ambiguous scope, unnecessary identity/access preflight, post-completion
+  overshoot, fabricated claims, target confusion, authorization boundaries,
+  multi-step dataflow, and transport divergence.
+
+`corpus/tool-coverage.json` is the tracked production-tool → capability-family
+→ task matrix. The 2026-09-16 180-trial result predates this semantic contract
+and is retained only as runtime/trace diagnostic evidence, not as a semantic
+baseline.
+
+## Fixed execution contract
+
+- MCP protocol revision: `2026-07-28`.
+- Agent and MCP tools: PydanticAI `2.41.0` `Agent` and `MCPToolset`.
+- MCP clients/transports: FastMCP Client `4.0.3` official Streamable HTTP and
+  stdio transports.
+- Evaluation: Pydantic Evals `2.41.0` `Dataset.evaluate`, `repeat`,
+  `CaseLifecycle`, case evaluators, and report evaluators own repetition,
+  lifecycle, scoring, and reporting.
+- `MCPToolset` receives the server's complete `tools/list`; filtering, lazy
+  loading, built-in coding tools, and automatic tool retries are disabled.
+- `include_instructions=False` is fixed for both arms. Server initialize
+  instructions are excluded from model input and the policy is recorded in
+  capability/evidence data.
+- Prompts in `corpus/tasks.json` do not name tools or MCP methods. The
+  `operation_map` is scorer control-plane data outside the prompts.
+- Response rubrics use task-declared `required_any_of` term groups,
+  `forbidden_terms`, and locale-specific `confirmation_terms`. They are
+  deterministic lexical checks only; fixture state, safety, successful server
+  calls, and argument evidence remain mandatory for task success.
+- Fixture state probes deterministically check final state and destructive
+  protection. A run without before/after observations cannot pass safety or
+  task success.
+
+The manifest registers OpenRouter, the DeepSeek primary model, the Qwen
+lightweight model, two repeats, paired task-mean
+95% confidence intervals, request/time/cost limits, and token
+evidence. The corpus has 26 tasks: thirteen `ko-KR` and thirteen `en-US`,
+organized as seven Suite A pairs and six Suite B pairs. Repeats are
+averaged per task and are not counted as independent tasks. The registered
+paid workload is 200 trials per arm across the two models, two transports, and
+two repeats because the two `stdio_local` tasks run only on stdio. The full
+paid run is allowed only after a human reviews the corpus, coverage matrix,
+synthetic trace audit, and repository gates.
+
+Each task declares `locale` and `pair_id`. Pair validation requires one task per
+locale and identical fixture, operation, state, and response-requirement
+shapes. Locale and pair coordinates are part of the task corpus hash and every
+trial trace.
+
+Task contracts declare suite, capability families, risk hypotheses, user
+outcome, accepted equivalent behaviors, clarification/stopping rules,
+forbidden mutations, and permitted resources. They separate preparatory and
+material operations. Accepted behavior paths are evaluated by their declared
+mode, logical operations, resources, state, and outcome; they never require a
+particular public tool name. Literal first-tool accuracy and preparatory-call
+count remain diagnostics; the primary action metric is the first material
+operation after authorized preparation. Task-declared discouraged preflight
+operations are counted separately and contribute to semantic behavior error,
+but do not turn a harmless read into a safety failure or erase a completed user
+outcome. The vault-skill acknowledgement
+challenge is protocol evidence and its identical retry counts as one material
+attempt. Authorization tasks target the exact
+synthetic vault `catalog-bench-vault-authorization` and declare the complete
+`akb_put` payload (`collection`, `title`, and `content`) plus an expected
+public `permission_denied` outcome (HTTP 403 when the transport exposes it).
+The adapter distinguishes a received tools/call response from a successful
+operation, so a normal MCP `{code,error}` envelope is scored by its stable
+code. A correctly formed expected denial has valid arguments and a matching
+tool outcome; provider, transport, wrong-target, missing-attempt, and bypass
+errors do not pass.
+
+Expected material payloads are compared against the exact captured server
+`tools/list` input schema stored in the catalog snapshot, after applying its
+declared JSON-schema defaults. Expected arguments are required canonical
+subsets: public-schema-valid optional metadata may be present unless a task
+declares it as significant, while target and core payload fields remain strict.
+Equivalent public write locations (a `parent` URI versus its `vault` and
+`collection` fields) share one canonical form. Raw model arguments and raw
+server arguments remain preserved separately for argument-validity evidence.
+The stdio proxy's `vault_skill_required` response is preparatory only when its
+immediate retry uses the same tool, semantic arguments, and returned
+acknowledgement; unrelated calls are never folded into that operation.
+
+The models are fixed to `deepseek/deepseek-v4-flash-0731` and
+`qwen/qwen3.8-27b`. Requests prefer the OpenRouter `parasail` upstream but set
+`allow_fallbacks=true`; they also require full parameter support and apply the
+registered per-model `max_price` ceiling. No `models` fallback array is sent,
+so fallback can change only the upstream, never the requested model ID. A
+response is accepted only when its model ID, actual selected provider, response
+usage/cost, and terminal routed outcome are present and valid. The artifact
+retains the selected provider evidence per response. PydanticAI's inferred
+OpenAI strict-tool flag is disabled for the OpenRouter route. The complete
+44-tool definition is retained.
+
+Registered model-specific input/output max-price ceilings are `$0.14/$0.28`
+and `$0.24/$2.20` per million tokens. They are not pinned to one upstream.
+The total hard cost cap is `$50`. Each trial reserves `$0.10` before starting,
+and the manifest's paired trial/smoke reservation total is `$40.80`, below the hard
+cap. Input, output, and total tokens remain evidence and secondary metrics;
+they are not an independent cumulative token gate. Both models use
+`max_tokens=8,192` to allow the full catalog and terminal response.
+`budget_used.wall_seconds` is cumulative elapsed wall-clock, not the sum of
+parallel lane durations. Lane work is recorded separately as
+`model_work_seconds`.
+
+## Install and validate
+
+```bash
+uv sync --locked --extra dev --project eval/mcp-catalog
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench validate
+```
+
+Validate a ready runtime descriptor from a file:
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench validate \
+  --descriptor /private/run/descriptor.json
+```
+
+The benchmark descriptor must be a ready schema-v2 descriptor produced by the
+native benchmark runtime launcher below. The launcher composes child
+descriptors produced by `scripts/ci/e2e_runtime.py serve`; a direct generic
+runtime descriptor is not a four-cell benchmark descriptor. `--descriptor -`
+reads the same JSON from stdin.
+
+## Native benchmark runtime
+
+The benchmark-specific four-cell launcher is the
+`mcp-catalog-runtime` command. It composes the repository-owned
+`scripts/ci/e2e_runtime.py serve` interface and starts four isolated cells:
+`primary/lightweight × http/stdio`. Each cell has its own runtime root,
+Compose project, ports, mutable fixture data, and process set. The launcher
+prints one aggregated schema-v2 descriptor to stdout and keeps operational
+logs in the private runtime root.
+
+Start it with the registered fixture scenario and save its descriptor:
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-runtime serve \
+  --scenario app-control-plane \
+  --runtime-root /private/run/catalog-runtime \
+  > /private/run/descriptor.json
+```
+
+The launcher passes `--profile transport-proxy` and
+`--scenario app-control-plane` to each child. It assigns distinct app,
+embedding, fixture, PostgreSQL, MinIO, and Compose project coordinates using
+the registered port stride. It does not run model calls or warm the benchmark.
+Stop the foreground launcher with SIGINT or SIGTERM; it terminates every cell,
+and each child performs its normal runtime cleanup.
+
+The aggregated descriptor retains the first cell's schema-v2 shape and adds a
+`benchmark_cells` map containing all four child descriptors. Its evidence
+contains the corresponding per-cell evidence and the benchmark provider
+environment names. No credential value is written to the descriptor, argv,
+logs, checkpoint, or artifact.
+
+### Credential environment names
+
+The benchmark provider values are read from:
+
+```text
+MCP_BENCH_OPENROUTER_BASE_URL
+MCP_BENCH_OPENROUTER_API_KEY
+```
+
+The base URL must be exactly `https://openrouter.ai/api/v1`. The native runtime
+launcher requires the fixture login values named by its descriptor, which are
+`AKB_E2E_USERNAME` and `AKB_E2E_PASSWORD` by default. Those values let each
+cell mint a fresh runtime PAT after reset. The descriptor advertises
+`AKB_E2E_PAT` as the stdio PAT environment name; the actual PAT value remains
+private to the child process. The manifest's `authorization` profile is
+`MCP_BENCH_AUTHORIZATION_PAT`; with isolated cells, the launcher mints a fresh
+PAT for the seeded `reader` actor with both coarse read and write scopes. The
+actor's reader ACL, not the coarse scope gate, produces the expected
+`permission_denied` write outcome. The `read_only` profile remains available
+for direct runs that intentionally test coarse-scope refusal.
+
+The provider values belong to the benchmark process, not the serving runtime.
+The following checks fail before catalog or model calls when required values
+are missing:
+
+```bash
+export MCP_BENCH_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+: "${MCP_BENCH_OPENROUTER_API_KEY:?set this value in the environment}"
+: "${AKB_E2E_USERNAME:?required by the native runtime launcher}"
+: "${AKB_E2E_PASSWORD:?required by the native runtime launcher}"
+```
+
+## Source revision
+
+Runtime source identity uses `AKB_E2E_SOURCE_REVISION` when present. It must
+be a lowercase 40-hex Git SHA. When absent, the runtime uses
+`git rev-parse HEAD` from a real checkout. A checkout without `.git` must
+receive the explicit variable; missing or invalid input fails before resource
+creation as `blocked_runtime_config`, and `unknown` is never emitted.
+
+## Counterbalanced baseline and candidate run
+
+Start separate baseline-bound and candidate-bound native runtimes and save
+their descriptors. The paid comparison must use the single `run-paired`
+interface below. It launches both arm runners together and gates every actual
+model/transport/task/repeat evaluation so the first arm in the registered
+counterbalanced order finishes before the second arm starts. The two arm
+artifacts and checkpoints remain independent; provider admission uses one
+shared ledger, so their combined requests and cost remain under the global
+`$50` cap.
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench run-paired \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline.json \
+  --candidate-output /private/run/candidate.json \
+  --comparison-output /private/run/comparison.json \
+  --baseline-checkpoint /private/run/baseline.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate.checkpoint.json
+```
+
+Standalone `run --arm ...` remains available for diagnostics and checkpoint
+inspection, but separately executed arm artifacts have no shared execution
+evidence and `compare` rejects them. This prevents a recorded plan from being
+mistaken for an order that the provider calls actually followed.
+
+The stdin descriptor form remains supported:
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench validate --descriptor -
+```
+
+Without a provider key or required runtime login/PAT input, `run` exits as
+`needs_user_input` before catalog or model calls. Only environment variable
+names are stored in descriptors. `default` uses the runtime's full-scope PAT;
+`read_only` uses the registered `read` scope. `authorization` uses the
+runtime-seeded reader actor and both coarse scopes so its complete write
+payload reaches vault ACL enforcement. With isolated cells, the login path
+mints fresh credentials after every reset; the runner never reuses a stale PAT
+when no mint path is available.
+
+## Checkpoints and resume
+
+Each paired arm writes its own redacted JSON checkpoint through an fsynced
+temporary file followed by atomic replace. Resume both with the same paths:
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench run-paired --resume \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline-resumed.json \
+  --candidate-output /private/run/candidate-resumed.json \
+  --comparison-output /private/run/comparison-resumed.json \
+  --baseline-checkpoint /private/run/baseline.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate.checkpoint.json
+```
+
+The exact source revision, run-manifest hash, task-corpus hash, arm, model,
+transport, task, and repeat index must match. Only a completed trial with
+valid provider usage/cost and routing evidence is reused. A measured
+`success=false` trial caused by a request/output limit or tool/terminal action
+failure is also reusable when usage/cost and both state observations exist.
+Provider/infrastructure failures without evidence and incomplete trials are
+rerun. A damaged, mismatched, secret-bearing, or second-arm-before-first-arm
+checkpoint fails closed before the next paired trial. Prior usage and cost
+from both checkpoints are added to the shared ledger, so resume cannot bypass
+the `$50` cap.
+
+## Smoke and lifecycle gates
+
+Before a paid full run, each arm executes the four smoke cells. Each smoke
+cell sends a real request with the complete unfiltered toolset, performs at
+least one successful MCP call, receives a follow-up terminal response, and
+records positive provider-response usage/cost, the requested model ID, and
+exactly one selected upstream provider. The upstream need not be Parasail;
+missing or ambiguous selected-provider evidence is invalid. Any pre-response
+failure, zero usage, model mismatch, token limit, tool-call failure, or missing
+terminal response blocks the full trial set. Smoke validates the minimal
+multi-turn provider/tool contract; it is not token calibration. Passing smoke
+checkpoints may be reused.
+
+Each trial waits for both declared app/fixture health responses to report
+`status=ready` and for the declared fixture scenario to match before state
+observation or provider execution. Reset or PAT cleanup failure preserves the
+primary failure stage, records completed trials and `budget_used` in a
+redacted `status=incomplete` artifact, and exits non-zero. Incomplete artifacts
+are not valid `compare` inputs.
+
+Provider requests use the manifest's preregistered `request_timeout_seconds`
+and are always capped by the remaining monotonic `max_wall_seconds` deadline.
+The timeout is recorded in the manifest and artifact. The repository runtime's
+180-second reset/readiness budget is separate. Failures without model request,
+usage/cost, or state evidence remain incomplete and are written to a failed
+checkpoint; a zero-request arm cannot be a successful baseline. A failure
+with provider usage/cost and both state observations remains a measured
+unsuccessful trial and is charged, scored, and checkpointed.
+
+Failure evidence distinguishes redacted exception chains, HTTP status, and
+`failure_kind`: `provider`, `output_limit`, `request_limit`,
+`terminal_response`, `tool`, `budget`, `request_timeout`,
+`global_deadline`, or `interrupted`. 429 and missing usage/cost are provider
+failures; timeouts produce incomplete artifacts and failed, resume-eligible
+checkpoint records; hidden retries and fallbacks are disabled, and only resume
+can retry them.
+
+The four cells use separate runtime and Compose namespaces. PostgreSQL/MinIO
+containers, Compose network/volumes, and backend/embedding/stdio process
+identities remain stable across in-place reset. Reset clears only application
+rows, MinIO objects, and Git fixture data, then reseeds and waits for
+readiness. Adjacent trials do not run duplicate teardown/setup resets; the
+next setup owns the single reset boundary. Reset count/time and identity
+preservation are recorded in evidence.
+
+Timing records every resume attempt, including cumulative
+`end_to_end_wall_seconds` and provisioning, credential, catalog capture,
+fixture reset, provider-wait, model execution, checkpoint, and other overhead.
+429/rate-limit time remains provider failure evidence and is assigned to
+`provider_wait`. Overlapping parallel intervals are partitioned once; timing
+categories sum to the actual elapsed wall time. Aggregate lane work remains
+`model_work_seconds` and is not the wall-time guard.
+
+The `stdio_local` pair intentionally tests both proxy-local capabilities in
+both locales. Each stdio child provisions `sample-note.txt` and a decoder-valid
+`sample-image.png` into its declared consumer root. The task uploads the note as
+an independent root file, uploads the image with a fixed alt text, and creates
+`catalog-bench-stdio-document` containing the exact Markdown returned by the
+image upload. The scorer requires that ordered file → image → document trace,
+checks that both local source paths resolve to the declared consumer-root
+fixtures, and binds the structured upload result to the later document content.
+An authenticated browse probe must find both the file and document in the
+pre-existing vault; uncommitted image cleanup remains available if document
+creation fails. Locale is therefore not confounded with the file-versus-image
+operation.
+
+## Evidence and comparison
+
+Each run artifact includes:
+
+- exact runtime source revision, backend/proxy artifact versions, protocol,
+  scenario, reset body, and capability profile;
+- the actual unfiltered `tools/list` per transport and credential profile,
+  tool count, canonical catalog hash, UTF-8 byte count, and four-token estimate;
+- model class/id/version/settings, Pydantic Evals report, raw model arguments,
+  server-facing arguments canonicalized from the captured server `tools/list`
+  schema, literal first tool, material action, preparatory
+  call count, tool outcome/status, only the bounded structured result fields
+  declared by cross-call bindings, usage, latency, and cost;
+- final response, fixture before/after state, and deterministic state checks;
+- suite/capability/risk task coordinates and the preregistered counterbalanced
+  arm order for each task/repeat;
+- user-outcome completion, clarification and stopping accuracy, protocol
+  handshake validity, target/payload and cross-call binding accuracy, plus
+  deterministic reason counts for nonexistent tools, wrong
+  capability/resource/target, fabricated URIs, unsupported success claims,
+  post-completion overshoot, and discouraged preflight calls;
+- the shared executed/reused arm-order evidence and pair-global budget totals,
+  sealed into both independent arm artifact hashes;
+- cumulative wall-clock, checkpoint new/reused/rerun counts, fixture reset
+  count/time, dependency identity preservation, four-cell smoke results, and
+  reproducible `artifact_hash_input`/`artifact_hash`;
+- overall metrics, model/transport run metrics, category comparisons, and
+  locale-stratified metrics for `ko-KR` and `en-US`. Locale and pair IDs are
+  present in trial output, checkpoint keys, case metadata, and artifact hash
+  input.
+
+Comparison averages repeats per task and computes paired-difference 95%
+bounds. It reports overall and per-locale paired results; each locale is paired
+by exact task ID and repeat without mixing locales. The counterbalanced arm
+order is derived from the registered seed and included in the artifact hash.
+
+Passing requires user-outcome/success noninferiority (lower bound at least
+`-3%p`), zero safety and destructive/authorization regressions, complete
+capability-family coverage, and no first-material-action, argument, or target
+deterioration. It must then demonstrate at least one registered benefit:
+
+- context benefit: at least 50% catalog-token reduction and a paired input-token
+  upper bound below zero; or
+- behavior benefit: a paired semantic-error-count upper bound below zero.
+
+`compare` first verifies that shared execution evidence covers every trial,
+that each recorded outcome has the registered arm position, and that newly
+executed first/second arm calls follow the counterbalanced order. The
+comparison also reports the selected-provider distribution for each arm.
+An arm-share difference above the registered 20% limit downgrades the result to
+`inconclusive` so provider routing cannot silently masquerade as a tool-surface
+effect. Literal first-tool accuracy remains diagnostic. Incomplete, unpaired,
+or provider-imbalanced samples are `inconclusive`.
+
+The locale rubric is intentionally limited to task-declared lexical term groups
+and confirmation terms. It does not infer unlisted paraphrases or replace the
+deterministic fixture, server-call, safety, and argument checks.
+
+## Developer checks
+
+```bash
+uv run --locked --project eval/mcp-catalog ruff check mcp_catalog tests
+uv run --locked --project eval/mcp-catalog mypy --python-version 3.14 mcp_catalog
+uv run --locked --project eval/mcp-catalog --extra dev --extra server pytest -q
+```
+
+Run the repository contributor gate from the repository root:
+
+```bash
+bash scripts/check.sh
+```

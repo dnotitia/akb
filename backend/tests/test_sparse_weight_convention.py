@@ -28,6 +28,7 @@ import pytest
 
 from app.config import Settings
 from app.services import sparse_encoder
+from app.services.sparse_shapes import SPARSE_SHAPES
 
 
 # The driver Literal's declared values, looked up via typing so the
@@ -56,6 +57,83 @@ _EXPECTED: dict[str, str] = {
     "seahorse-db":      "raw_tf",
     "seahorse-db-grpc": "raw_tf",
 }
+
+
+# The convention stopped being a property of the driver alone when one driver
+# gained a shape whose store computes BM25 itself. `pgvector` bakes k1/b into
+# the document weights for `posting` and `arrays`; for `vchord` the index owns
+# them, and sending pre-baked weights there saturates twice — the 0.7.7 bug,
+# silently, as worse ranking rather than an error.
+#
+# Only `pgvector` reads the shape, so every other driver is declared once and
+# the shape is recorded as irrelevant. Writing them out per shape anyway is
+# what makes "irrelevant" a statement the test can check rather than an
+# assumption nobody wrote down.
+_EXPECTED_BY_SHAPE: dict[tuple[str, str], str] = {
+    **{("pgvector", shape): "pre_baked" for shape in ("posting", "arrays")},
+    ("pgvector", "vchord"): "raw_tf",
+    **{
+        (driver, shape): expected
+        for driver, expected in (
+            ("qdrant", "pre_baked"),
+            ("seahorse-cloud", "pre_baked"),
+            ("seahorse-db", "raw_tf"),
+            ("seahorse-db-grpc", "raw_tf"),
+        )
+        for shape in SPARSE_SHAPES
+    },
+}
+
+
+def test_every_driver_and_shape_pair_has_a_declared_convention() -> None:
+    """A new shape is as capable of resurrecting 0.7.7 as a new driver was.
+
+    `_EXPECTED` above covers drivers; this covers the pairs. Adding a shape
+    without saying what it expects fails here rather than in the ranking."""
+    missing = {
+        (d, s) for d in _DRIVER_VALUES for s in SPARSE_SHAPES
+    } - set(_EXPECTED_BY_SHAPE)
+    assert not missing, (
+        f"convention 이 선언되지 않은 (driver, shape) 쌍: {sorted(missing)!r}. "
+        f"_EXPECTED_BY_SHAPE 에 적고, raw TF 를 기대한다면 "
+        f"sparse_encoder._RAW_WEIGHT_SHAPES 도 갱신할 것."
+    )
+
+
+@pytest.mark.parametrize(
+    "driver,shape",
+    sorted(_EXPECTED_BY_SHAPE),
+    ids=lambda v: str(v),
+)
+def test_encoder_flag_matches_the_pair(
+    driver: str, shape: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _EXPECTED_BY_SHAPE[(driver, shape)]
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", driver)
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_sparse_shape", shape)
+    actual_raw = sparse_encoder._use_raw_weights()
+    assert actual_raw is (expected == "raw_tf"), (
+        f"({driver!r}, {shape!r}) 는 {expected} 를 기대하는데 encoder 는 "
+        f"{'raw' if actual_raw else 'pre-baked'} 를 돌려줬다"
+    )
+
+
+def test_a_shape_left_over_from_another_driver_does_not_leak() -> None:
+    """`vector_store_sparse_shape` is pgvector's setting. A value left in the
+    config while another driver is active must not change that driver's
+    convention — the shape is only consulted for the driver it belongs to."""
+    for driver in _DRIVER_VALUES:
+        if driver == "pgvector":
+            continue
+        flags = set()
+        for shape in SPARSE_SHAPES:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(sparse_encoder.settings, "vector_store_driver", driver)
+                mp.setattr(sparse_encoder.settings, "vector_store_sparse_shape", shape)
+                flags.add(sparse_encoder._use_raw_weights())
+        assert len(flags) == 1, (
+            f"{driver!r} 의 규약이 pgvector 전용 설정에 따라 달라진다"
+        )
 
 
 def test_every_driver_has_a_declared_convention() -> None:
