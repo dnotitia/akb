@@ -142,7 +142,7 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("home")).toBeTruthy();
     const status = screen.getByTestId("header-indexing-status");
-    const search = screen.getByRole("button", { name: "Search knowledge" });
+    const search = screen.getByRole("button", { name: "Search all vaults" });
     expect(status).toHaveAttribute("role", "status");
     expect(within(status).queryByRole("button")).toBeNull();
     expect(status).toBeEmptyDOMElement();
@@ -224,7 +224,7 @@ describe("Layout — auth gate", () => {
     expect(screen.getByRole("main").firstElementChild).toHaveClass(
       "px-[var(--workspace-gutter)]",
     );
-    expect(screen.getByRole("navigation", { name: "Current page" }).parentElement).toHaveClass("lg:pl-5");
+    expect(screen.getByRole("navigation", { name: "Current page" }).parentElement).toHaveClass("lg:px-5");
   });
 
   it("does not reserve a second root scrollbar gutter for vault workspaces", async () => {

@@ -423,7 +423,7 @@ export function VaultShell() {
                 data-slot="vault-route-viewport"
                 className={cn(
                   "min-h-0 min-w-0 flex-1 bg-background",
-                  isSettings || isMembers
+                  isSettings
                     ? "overflow-y-auto xl:overflow-hidden"
                     : "overflow-y-auto",
                 )}
@@ -431,11 +431,11 @@ export function VaultShell() {
                 <div
                   className={cn(
                     "w-full",
-                    isSettings || isMembers
+                    isSettings
                       ? "min-h-full xl:h-full xl:min-h-0"
                       : isOverview
                         ? "min-h-full px-2 py-3 lg:p-0"
-                        : isActivity || isPublications
+                        : isActivity || isPublications || isMembers
                           ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
                           : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
                   )}

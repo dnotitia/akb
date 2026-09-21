@@ -92,7 +92,7 @@ describe("GlobalSearchDialog", () => {
     searchDocsMock.mockResolvedValue({ ...response, degraded: true });
     const user = userEvent.setup();
     renderDialog();
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     const input = screen.getByRole("combobox");
     await user.type(input, "postgres");
     await screen.findByText(/Search is incomplete/);
@@ -108,7 +108,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderDialog();
 
-    const trigger = screen.getByRole("button", { name: "Search knowledge" });
+    const trigger = screen.getByRole("button", { name: "Search all vaults" });
     await user.click(trigger);
 
     expect(screen.getByTestId("location")).toHaveTextContent("/");
@@ -134,7 +134,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderDialog();
 
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     const input = screen.getByRole("combobox", { name: "Search all accessible vaults" });
     await user.type(input, "postgres");
 
@@ -170,7 +170,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderAuthenticatedDialog();
 
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     expect(screen.getByRole("heading", { name: "Recent searches" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /postgres tuning/i }));
 
@@ -195,7 +195,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderAuthenticatedDialog();
 
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     expect(
       await screen.findByRole("heading", { name: "Recently viewed" }),
     ).toBeInTheDocument();
@@ -242,7 +242,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderDialog();
 
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     await user.type(
       screen.getByRole("combobox", { name: "Search all accessible vaults" }),
       "platform",
@@ -264,7 +264,7 @@ describe("GlobalSearchDialog", () => {
     const user = userEvent.setup();
     renderDialog();
 
-    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.click(screen.getByRole("button", { name: "Search all vaults" }));
     searchDocsMock.mockResolvedValueOnce({ query: "postgres", total: 0, returned: 0, total_matches: 0, results: [] });
     await user.click(screen.getByRole("button", { name: "Tables" }));
     await user.type(

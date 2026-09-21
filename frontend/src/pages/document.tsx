@@ -16,11 +16,7 @@ import {
   ChevronRight,
   GitCompareArrows,
   History,
-  Info,
-  Link2,
-  ListTree,
   Maximize2,
-  PanelRightClose,
   Pencil,
 } from "lucide-react";
 import {
@@ -42,12 +38,12 @@ import { cn } from "@/lib/utils";
 import { docUri } from "@/lib/uri";
 import { DocumentWatch } from "@/components/document-watch";
 import { WorkspacePin } from "@/components/workspace-pin";
-import { parseHeadings } from "@/lib/markdown";
 import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { DocumentOutline } from "@/components/doc-outline";
 import { DocumentView } from "@/components/document-view";
-import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentSummary } from "@/components/document-reading-controls";
+import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentSummary, DocumentTimestamp } from "@/components/document-reading-controls";
+import { DocumentContextPanel } from "@/components/document-context-panel";
 import { DocumentPublicationControl } from "@/components/document-publication-control";
 import { ResourceCommandRow } from "@/components/resource-command-row";
 import { ResourceBreadcrumb } from "@/components/resource-breadcrumb";
@@ -58,19 +54,16 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { HistoryList } from "@/components/history-list";
 import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { PublishOptionsDialog } from "@/components/publish-options-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { RelationsPanel } from "@/components/relations/relations-panel";
-import { relationIsInVault } from "@/components/relations/relation-row-utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
@@ -202,18 +195,9 @@ function DocumentPageContent({
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [archiveNotice, setArchiveNotice] = useState("");
   const [archivePending, setArchivePending] = useState<{ vault: string; ref: string; status: "active" | "archived" } | null>(null);
-  const [publishOpen, setPublishOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("info");
   const actionsTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const publicationTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
-  const transferDetailsFocusRef = useRef(false);
-  const openDetailsFromMenu = (tab: typeof detailsTab) => {
-    transferDetailsFocusRef.current = true;
-    setDetailsTab(tab);
-    setDetailsOpen(true);
-  };
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const editTitleRef = useRef<HTMLInputElement | null>(null);
@@ -391,10 +375,6 @@ function DocumentPageContent({
   }, [moveNotice]);
 
   const docId = id ? decodeURIComponent(id) : "";
-  const visibleRelationCount = useMemo(
-    () => relations.filter((row) => name && relationIsInVault(row, name)).length,
-    [name, relations],
-  );
 
   const applyView = (next: DocView) => {
     const p = new URLSearchParams(searchParams);
@@ -469,25 +449,6 @@ function DocumentPageContent({
   const vaultReadOnly = !verifiedVault || Boolean(verifiedVault.is_archived || verifiedVault.is_external_git);
 
   useEffect(() => {
-    if (!detailsOpen) return;
-
-    const focusFrame = window.requestAnimationFrame(() => detailsCloseRef.current?.focus());
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
-      event.preventDefault();
-      setDetailsOpen(false);
-      window.requestAnimationFrame(() => actionsTriggerRef.current?.focus());
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [detailsOpen]);
-
-  useEffect(() => {
     if (view === "edit" || !restoreEditFocusRef.current) return;
     restoreEditFocusRef.current = false;
     const frame = window.requestAnimationFrame(() => editButtonRef.current?.focus());
@@ -513,6 +474,9 @@ function DocumentPageContent({
   }, [docId, name, queryClient]);
 
   const doc = docOverride ?? docQuery.data ?? null;
+  // Local content/property overrides can outlive a metadata refetch. Dates
+  // always come from the current server snapshot, never an optimistic clock.
+  const lastEditedAt = docQuery.data?.updated_at;
   useEffect(() => {
     // Access verification intentionally removes the previous query's data.
     // If that temporarily unmounts a dirty editor, seed its next mount from
@@ -636,10 +600,6 @@ function DocumentPageContent({
     : !["writer", "admin", "owner"].includes(vaultRole ?? "") ? "Writer access or higher is required to publish."
     : undefined;
 
-  useEffect(() => {
-    if (publishDisabledReason) setPublishOpen(false);
-  }, [publishDisabledReason]);
-
   const selectedHistoryIndex = useMemo(
     () =>
       commitHash
@@ -674,9 +634,6 @@ function DocumentPageContent({
     });
     return () => window.cancelAnimationFrame(firstFrame);
   }, [isDiffMode]);
-  // Parse headings once for the outline-tab count (the outline + renderer each
-  // re-scan internally; this removes the third pass that ran on every render).
-  const headingSlugs = useMemo(() => parseHeadings(doc?.content || ""), [doc?.content]);
 
   // Re-pull relations after an add/remove from the Relations panel. Keyed off
   // the doc *path* (the GET response has no internal id — see the load effect).
@@ -1103,19 +1060,17 @@ function DocumentPageContent({
       if (!validRevision(savedCommit)) {
         throw new Error("The server did not return a document revision after saving.");
       }
-      const now = new Date().toISOString();
       const titleToSave = titleChanged ? normalizedEditingTitle : originalTitle;
       const hasFollowupEdits = draftRevisionRef.current !== saveRevision;
       const followup = editingSnapshotRef.current;
-      // Optimistically advance content + updated_at so the byline reads
-      // "last changed just now" without waiting for a refetch. DocumentView
-      // consumes the same query key independently, so update that cache too;
-      // a local page override alone leaves its Rendered tab stale.
+      // Advance the body immediately, but don't fabricate an exact server
+      // timestamp from the browser clock. The post-save read fills it in.
+      // DocumentView consumes this same query key independently.
       const nextDoc = {
         ...(doc || {}),
         content: contentToSave,
         title: titleToSave,
-        updated_at: now,
+        updated_at: typeof saved.updated_at === "string" ? saved.updated_at : undefined,
         current_commit: savedCommit,
       };
       setBaseCommit(savedCommit);
@@ -1181,6 +1136,8 @@ function DocumentPageContent({
       p.delete("commit");
       restoreEditFocusRef.current = true;
       updateRouteParams(p, { replace: true });
+      void queryClient.invalidateQueries({ queryKey: ["document", name, docId] });
+      void queryClient.invalidateQueries({ queryKey: ["document-history", name] });
     } catch (e: unknown) {
       const conflict = documentTitleConflictFromError(e);
       if (conflict) {
@@ -1435,11 +1392,6 @@ function DocumentPageContent({
     updateRouteParams(params, { replace: false });
   };
 
-  const closeDetails = () => {
-    setDetailsOpen(false);
-    window.requestAnimationFrame(() => actionsTriggerRef.current?.focus());
-  };
-
   return (
     <>
       <section
@@ -1457,18 +1409,21 @@ function DocumentPageContent({
             </Button>
           </div>
         )}
+        <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
         <ResourceCommandRow
           appearance="reader"
+          className="document-metadata-row"
           meta={inEditMode ? (
             <span role="status" aria-live="polite" className="text-xs text-foreground-muted">
               {accessChecking || vaultInfoQuery.isPending ? "Checking access…" : !canEdit ? "Read-only · Draft preserved" : uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : draftStatus === "saving" ? "Saving draft locally…" : draftStatus === "saved" ? "Draft saved locally" : "No changes"}
             </span>
           ) : (
-            <div className="flex min-w-0 items-center gap-3">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
               {doc.status === "draft" && !isHistorical && !isDiffMode && <Badge variant="draft">Draft</Badge>}
               {savedAt && <span role="status" className="inline-flex shrink-0 items-center gap-1 text-xs text-success"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Saved</span>}
-              <span className="hidden @[48rem]/reader:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
-              <span className="hidden min-w-0 @[72rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
+              <DocumentTimestamp value={isHistorical || isDiffMode ? selectedHistoryEntry?.date : lastEditedAt}
+                label={isHistorical || isDiffMode ? "Version saved" : "Last edited"} compact />
+              <span className="hidden min-w-0 @[48rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
             </div>
           )}
         >
@@ -1479,18 +1434,12 @@ function DocumentPageContent({
               {savingBody ? "Saving…" : "Save changes"}
             </Button>
           </> : <>
-            {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
-            <div role="group" aria-label="Document actions" className={cn("document-command-group", !isDiffMode && "document-command-divider")}>
-              <DocumentCopyButton content={doc.content || ""} />
-              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
-                <Pencil className="h-4 w-4" aria-hidden />
-              </DocumentIconButton>}
-            </div>
             <div role="group" aria-label="Publishing and more options" className="document-command-group">
-            <DocumentPublicationControl key={resourceScope} vault={name!}
+            <DocumentPublicationControl key={resourceScope} vault={name!} docId={docId}
               publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
-              disabledReason={publishDisabledReason} onPublish={() => setPublishOpen(true)}
-              onUnpublish={handleUnpublish} triggerRef={publicationTriggerRef} />
+              disabledReason={publishDisabledReason}
+              onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
+              onUnpublish={handleUnpublish} />
             <ResourceActionsMenu
               triggerRef={actionsTriggerRef}
               resourceName={doc.title || fileName}
@@ -1503,27 +1452,9 @@ function DocumentPageContent({
               deleteLabel={canDelete ? "Delete document" : undefined}
               onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
               readerControl
-              onCloseAutoFocus={event => {
-                if (!transferDetailsFocusRef.current) return;
-                transferDetailsFocusRef.current = false;
-                event.preventDefault();
-                window.requestAnimationFrame(() => detailsCloseRef.current?.focus());
-              }}
             >
-              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("info")}
-                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
-                <Info className="h-4 w-4 text-foreground-muted" aria-hidden />Document info
-              </DropdownMenu.Item>
-              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("outline")}
-                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
-                <ListTree className="h-4 w-4 text-foreground-muted" aria-hidden />Table of contents
-              </DropdownMenu.Item>
               {!isHistorical && !isDiffMode && <DocumentWatch key={docUri(name!, doc.path)} uri={docUri(name!, doc.path)} presentation="menu" />}
               {!isHistorical && !isDiffMode && <WorkspacePin item={{ kind: "document", vault: name!, path: doc.path, title: doc.title || doc.path }} presentation="menu" />}
-              <DropdownMenu.Item onSelect={() => openDetailsFromMenu("history")}
-                className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm outline-none data-[highlighted]:bg-surface-hover">
-                <History className="h-4 w-4 text-foreground-muted" aria-hidden />History
-              </DropdownMenu.Item>
               <DropdownMenu.Separator className="my-1 h-px bg-border" />
               <DropdownMenu.Label className="px-2.5 py-1.5 text-xs text-foreground-muted">Reading width</DropdownMenu.Label>
               <DropdownMenu.RadioGroup value={readingWidth} onValueChange={value => setReadingWidth(value as "standard" | "wide")} aria-label="Reading width">
@@ -1537,6 +1468,23 @@ function DocumentPageContent({
             </div>
           </>}
         </ResourceCommandRow>
+
+        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
+        {!inEditMode && (
+          <div role="group" aria-label="Document reading tools" data-slot="document-reading-toolbar"
+            className="document-command-inner flex min-h-10 shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
+            <div className="flex min-w-0 items-center gap-3">
+              {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
+              <span className="hidden @min-[32rem]/resource-commands:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
+            </div>
+            <div role="group" aria-label="Document actions" className="document-command-group">
+              <DocumentCopyButton content={doc.content || ""} />
+              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
+                <Pencil className="h-4 w-4" aria-hidden />
+              </DocumentIconButton>}
+            </div>
+          </div>
+        )}
 
         {archiveNotice && <Alert variant="success" className="shrink-0">{archiveNotice}<Button variant="ghost" size="sm" onClick={() => setArchiveNotice("")}>Dismiss</Button></Alert>}
         {doc.status === "archived" && !isHistorical && !isDiffMode && view !== "edit" && (
@@ -1603,13 +1551,13 @@ function DocumentPageContent({
           </div>
         )}
 
-        <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div className="relative flex min-h-0 flex-1 overflow-hidden">
           <main
             ref={navigationFocusRef}
             id="document-reading-canvas"
             tabIndex={-1}
             className={cn(
-              "h-full bg-surface rail-scroll rail-scroll-auto",
+              "h-full min-w-0 flex-1 bg-surface rail-scroll rail-scroll-auto",
               isDiffMode ? "overflow-hidden" : "overflow-y-auto",
             )}
           >
@@ -1822,89 +1770,17 @@ function DocumentPageContent({
           </main>
 
           {!inEditMode && (
-            <>
-              {detailsOpen && (
-                <button
-                  type="button"
-                  aria-label="Dismiss document panel"
-                  onClick={closeDetails}
-                  className="absolute inset-0 z-[var(--z-raised)] bg-black/40 lg:hidden"
-                />
-              )}
-              <aside
-                id="document-details-panel"
-                aria-label="Document panel"
-                aria-hidden={!detailsOpen}
-                inert={!detailsOpen}
-                className={cn(
-                  "absolute inset-y-0 right-0 z-[var(--z-overlay)] flex w-full max-w-lg flex-col overflow-hidden border-l border-border bg-surface transition-transform duration-[var(--duration-base)] ease-[var(--ease-out)] lg:w-96",
-                  detailsOpen
-                    ? "translate-x-0 shadow-xl"
-                    : "pointer-events-none translate-x-full",
-                )}
-              >
-              <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
-                <div>
-                  <h2 className="text-sm font-semibold text-foreground">Document panel</h2>
-                </div>
-                <Button
-                  ref={detailsCloseRef}
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label="Close document panel"
-                  onClick={closeDetails}
-                >
-                  <PanelRightClose className="h-4 w-4" aria-hidden />
-                </Button>
-              </div>
-
-              <Tabs
-                value={detailsTab}
-                onValueChange={(value) => setDetailsTab(value as typeof detailsTab)}
-                className="flex min-h-0 flex-1 flex-col"
-              >
-                <TabsList
-                  aria-label="Document detail views"
-                  className="mx-4 mt-3 w-[calc(100%-2rem)] shrink-0"
-                >
-                  <TabsTrigger value="info" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <Info className="h-3.5 w-3.5" aria-hidden />
-                    Info
-                  </TabsTrigger>
-                  <TabsTrigger value="outline" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <ListTree className="h-3.5 w-3.5" aria-hidden />
-                    Outline
-                    <span className="coord tabular-nums">{headingSlugs.length}</span>
-                  </TabsTrigger>
-                  <TabsTrigger value="relations" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <Link2 className="h-3.5 w-3.5" aria-hidden />
-                    Relations
-                    {visibleRelationCount > 0 && <span className="coord tabular-nums">{visibleRelationCount}</span>}
-                  </TabsTrigger>
-                  <TabsTrigger value="history" className="min-w-0 flex-1 gap-1 px-2 text-xs">
-                    <History className="h-3.5 w-3.5" aria-hidden />
-                    History
-                    {provenance.length > 0 && <span className="coord tabular-nums">{provenance.length}</span>}
-                  </TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="info" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+            <DocumentContextPanel open={detailsOpen} onOpenChange={setDetailsOpen} view={detailsTab} onViewChange={setDetailsTab}>
+              {detailsTab === "info" && <>
               <section aria-labelledby="document-properties-heading">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <h3 id="document-properties-heading" className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                    <Info className="h-4 w-4 text-link" aria-hidden />
-                    Properties
-                  </h3>
+                <h3 id="document-properties-heading" className="sr-only">Document properties</h3>
                   {canEdit && (
-                    <Button type="button" variant="ghost" size="sm" onClick={() => setEditOpen(true)}>
+                    <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => setEditOpen(true)}>
                       <Pencil className="h-3.5 w-3.5" aria-hidden />
-                      Edit
+                      Edit properties
                     </Button>
                   )}
-                </div>
                 <dl className="space-y-2.5 text-xs">
-                  <PropertyRow label="Size"><DocumentStatistics content={doc.content || ""} labelled={false} /></PropertyRow>
                   {doc.summary && (
                     <div className="mb-3 rounded-[var(--radius-md)] bg-surface-2 px-3 py-2.5">
                       <dt className="mb-1 text-[11px] font-medium text-foreground-muted">Summary</dt>
@@ -1916,6 +1792,14 @@ function DocumentPageContent({
                   <PropertyRow label="Title">
                     <span className="block break-words text-foreground">{doc.title}</span>
                   </PropertyRow>
+                  <PropertyRow label={isHistorical || isDiffMode ? "Latest edit" : "Last edited"}>
+                    <DocumentTimestamp value={lastEditedAt} />
+                  </PropertyRow>
+                  {(isHistorical || isDiffMode) && <PropertyRow label="Version saved">
+                    <DocumentTimestamp value={selectedHistoryEntry?.date} />
+                  </PropertyRow>}
+                  <PropertyRow label="Created"><DocumentTimestamp value={doc.created_at} /></PropertyRow>
+                  <PropertyRow label="Size"><DocumentStatistics content={doc.content || ""} labelled={false} /></PropertyRow>
                   {authorName && (
                     <PropertyRow label="Author">
                       <span className="text-foreground">{authorName}</span>
@@ -1986,16 +1870,17 @@ function DocumentPageContent({
 
               </section>
 
-                </TabsContent>
+                </>}
 
-                <TabsContent value="outline" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
-                  <div className="mb-3 border-b border-border pb-3">
-                    <h3 className="text-sm font-semibold text-foreground">On this page</h3>
-                    <p className="mt-0.5 text-xs text-foreground-muted">Jump to a heading without leaving the document.</p>
-                  </div>
-                  <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
-                </TabsContent>
-                <TabsContent value="relations" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
+                {detailsTab === "outline" && (
+                  isDiffMode ? <p className="text-sm leading-relaxed text-foreground-muted">
+                    Return to the document to navigate its headings. The table of contents is not available in a change comparison.
+                  </p> : view === "raw" ? <div className="space-y-3">
+                    <p className="text-sm leading-relaxed text-foreground-muted">Headings are available in the rendered document.</p>
+                    <Button type="button" variant="outline" size="sm" onClick={() => setView("rendered")}>Show rendered document</Button>
+                  </div> : <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
+                )}
+                {detailsTab === "relations" && <>
                   <RelationsPanel
                     vault={name!}
                     sourceUri={doc.path ? docUri(name!, doc.path) : ""}
@@ -2005,12 +1890,9 @@ function DocumentPageContent({
                     graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
                     onReload={reloadRelations}
                   />
-                </TabsContent>
-                <TabsContent value="history" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3 rail-scroll">
-                  <div className="mb-3 border-b border-border pb-3">
-                    <h3 className="text-sm font-semibold text-foreground">Version history</h3>
-                    <p className="mt-0.5 text-xs text-foreground-muted">Open a version or inspect what changed from its parent.</p>
-                  </div>
+                </>}
+                {detailsTab === "history" && <>
+                  <p className="mb-3 text-xs text-foreground-muted">Open a version or compare its changes.</p>
                   {historyQuery.isPending ? (
                     <LoadingState label="Loading version history" className="space-y-2">
                       <Skeleton className="h-16 w-full rounded-[var(--radius-md)]" />
@@ -2041,11 +1923,11 @@ function DocumentPageContent({
                       />
                     </div>
                   )}
-                </TabsContent>
-              </Tabs>
-              </aside>
-            </>
+                </>}
+            </DocumentContextPanel>
           )}
+        </div>
+        </div>
         </div>
       </section>
 
@@ -2071,13 +1953,12 @@ function DocumentPageContent({
         title={doc.title || fileName}
         onOpenDocument={openExistingDocument}
         onMoved={(result) => {
-          const changedAt = new Date().toISOString();
           const nextDoc = {
             ...doc,
             uri: result.uri,
             path: result.path,
             current_commit: result.current_commit ?? result.commit_hash,
-            updated_at: changedAt,
+            updated_at: undefined,
           };
           queryClient.setQueryData(
             ["document", name, result.path, undefined, currentUser?.user_id, accessRevision],
@@ -2109,17 +1990,6 @@ function DocumentPageContent({
             { replace: true, state: routeLocation.state },
           );
         }}
-      />
-
-      <PublishOptionsDialog
-        open={publishOpen && !publishDisabledReason}
-        onOpenChange={(open) => {
-          setPublishOpen(open);
-          if (!open) window.requestAnimationFrame(() => publicationTriggerRef.current?.focus());
-        }}
-        vault={name!}
-        docId={docId}
-        onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
       />
 
       <ResourceDeleteDialog
@@ -2323,18 +2193,30 @@ function DocumentDiffModuleLoading() {
 
 function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {
   return (
-    <LoadingState label="Loading document" className="flex h-full min-h-0 flex-col overflow-hidden bg-surface">
+    <LoadingState label="Loading document" className="@container/reader flex h-full min-h-0 flex-col overflow-hidden bg-surface [&>div]:contents">
       {presentation === "preview" && <div className="flex h-14 items-center gap-3 border-b border-border px-4"><Skeleton className="h-4 w-2/3" /></div>}
-      <div className="flex min-h-10 shrink-0 items-center gap-3 border-b border-border px-4 py-1">
-        <Skeleton className="h-8 w-28" />
-        <Skeleton className="hidden h-3 w-28 sm:block" />
-        <Skeleton className="ml-auto h-8 w-48" />
-      </div>
-      <div className="mx-auto w-full max-w-5xl space-y-4 px-4 py-5 sm:px-6">
-        <Skeleton className="h-8 w-3/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-11/12" />
-        <Skeleton className="h-4 w-4/5" />
+      <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
+        <ResourceCommandRow appearance="reader" className="document-metadata-row" meta={<Skeleton className="h-3 w-28" />}>
+          <Skeleton data-reader-control className="w-28" />
+        </ResourceCommandRow>
+        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
+          <div className="document-command-inner flex min-h-10 shrink-0 items-center gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
+            <Skeleton data-reader-control className="w-28" />
+            <Skeleton className="hidden h-3 w-24 @min-[32rem]/resource-commands:block" />
+            <Skeleton data-reader-control className="ml-auto w-20" />
+          </div>
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            <div className="mx-auto min-w-0 flex-1 max-w-5xl space-y-4 px-4 py-5 sm:px-6">
+              <Skeleton className="h-8 w-3/5" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-11/12" />
+              <Skeleton className="h-4 w-4/5" />
+            </div>
+            <div className="w-12 shrink-0 space-y-6 border-l border-border px-4 py-5">
+              {[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-5 w-4" />)}
+            </div>
+          </div>
+        </div>
       </div>
     </LoadingState>
   );

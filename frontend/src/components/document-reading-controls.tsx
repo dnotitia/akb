@@ -3,8 +3,27 @@ import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
+import { cn, timeAgo } from "@/lib/utils";
 import { formatByteSize, formatLineCount, getDocumentStats } from "@/lib/document-statistics";
+
+export function DocumentTimestamp({ value, label = "Last edited", compact = false }: {
+  value?: string | null; label?: string; compact?: boolean;
+}) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return compact ? null : <span>Not available</span>;
+  const exact = date.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" });
+  if (!compact) return <time dateTime={date.toISOString()}>{exact}</time>;
+  return <TooltipProvider delayDuration={250}><Tooltip>
+    <TooltipTrigger asChild>
+      <time dateTime={date.toISOString()} tabIndex={0}
+        className="min-w-0 truncate @[48rem]/reader:shrink-0 rounded-[var(--radius-sm)] text-xs text-foreground-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <span aria-hidden>{label} {timeAgo(value)}</span>
+        <span className="sr-only">{label}: {exact}</span>
+      </time>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">{label}: {exact}</TooltipContent>
+  </Tooltip></TooltipProvider>;
+}
 
 export function DocumentStatistics({ content, labelled = true }: { content: string; labelled?: boolean }) {
   const { lineCount, byteCount } = getDocumentStats(content);
@@ -19,8 +38,8 @@ export function DocumentSummary({ summary }: { summary?: string | null }) {
   if (!summary) return null;
   return <>
     <button type="button" aria-label="Read document summary" onClick={() => setOpen(true)}
-      className="min-w-0 truncate rounded-[var(--radius-sm)] text-left text-xs text-foreground-muted hover:text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-      {summary}
+      className="block max-w-full truncate rounded-[var(--radius-sm)] text-left text-xs text-foreground-muted hover:text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <span className="font-medium">Summary:</span> {summary}
     </button>
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent>
@@ -75,7 +94,7 @@ export function DocumentReadModes({ view, onChange, idPrefix }: {
   return <div role="tablist" aria-label="Document view" className="document-read-modes inline-flex shrink-0 items-center gap-0.5 rounded-[var(--radius-sm)] bg-surface-2 ring-1 ring-inset ring-border">
     {(["rendered", "raw"] as const).map((mode, index) => <button key={mode} type="button" role="tab"
       id={`${idPrefix}-tab-${mode}`} aria-selected={view === mode} aria-controls={`${idPrefix}-panel-${mode}`}
-      aria-label={mode === "rendered" ? "Rendered" : "Raw"}
+      aria-label={mode === "rendered" ? "Preview" : "Raw"}
       tabIndex={view === mode ? 0 : -1} onClick={() => onChange(mode)}
       onKeyDown={event => {
         const next = event.key === "Home" ? 0 : event.key === "End" ? 1 : ["ArrowLeft", "ArrowRight"].includes(event.key) ? 1 - index : null;
@@ -86,7 +105,7 @@ export function DocumentReadModes({ view, onChange, idPrefix }: {
       data-reader-control
       className={cn("relative inline-flex items-center justify-center px-2.5 font-medium transition-token cursor-pointer focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         view === mode ? "bg-surface-selected text-surface-selected-foreground ring-1 ring-inset ring-border-strong" : "text-foreground-muted hover:bg-surface-hover hover:text-foreground")}>
-      {mode === "rendered" ? <><span className="@min-[32rem]/resource-commands:hidden">Read</span><span className="hidden @min-[32rem]/resource-commands:inline">Rendered</span></> : "Raw"}
+      {mode === "rendered" ? "Preview" : "Raw"}
     </button>)}
   </div>;
 }

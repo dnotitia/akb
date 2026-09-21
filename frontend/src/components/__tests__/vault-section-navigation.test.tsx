@@ -25,12 +25,12 @@ describe("VaultSectionNavigation", () => {
     expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Search this vault" })).toHaveTextContent("Search");
+    expect(screen.getByRole("link", { name: "Search" })).toHaveTextContent(/^Search$/);
     for (const link of screen.getAllByRole("link")) expect(link.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
   });
 
   it.each([
-    ["", "Overview"], ["/search", "Search this vault"], ["/graph", "Graph"],
+    ["", "Overview"], ["/search", "Search"], ["/graph", "Graph"],
     ["/publications", "Public links"], ["/members", "Members"], ["/settings", "Settings"],
   ])("marks only the exact working-page destination current on %s", (suffix, label) => {
     renderNavigation(`/vault/team${suffix}?filter=anything`);
@@ -69,7 +69,7 @@ describe("VaultSectionNavigation", () => {
     expect(overview).toHaveFocus();
     expect(overview).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
     await user.tab();
-    const search = screen.getByRole("link", { name: "Search this vault" });
+    const search = screen.getByRole("link", { name: "Search" });
     expect(search).toHaveFocus();
     expect(search).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault/search");
     await user.keyboard("{Enter}");
@@ -107,15 +107,15 @@ describe("VaultSectionNavigation", () => {
     await user.keyboard("{Enter}");
     const menu = screen.getByRole("menu", { name: "More vault pages" });
     expect(within(menu).getAllByRole("menuitem").map(item => item.textContent)).toEqual(["Search", "Graph", "Public links", "Members"]);
-    expect(within(menu).getByRole("menuitem", { name: "Search this vault" })).toHaveAttribute("href", "/vault/team/search");
+    expect(within(menu).getByRole("menuitem", { name: "Search" })).toHaveAttribute("href", "/vault/team/search");
     await user.keyboard("{Escape}");
     expect(more).toHaveFocus();
     await user.keyboard("{Enter}");
-    expect(screen.getByRole("menuitem", { name: "Search this vault" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Search" })).toHaveFocus();
     await act(async () => { available = 900; resize(); });
     expect(screen.queryByRole("button", { name: "More vault pages" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("link")).toHaveLength(6);
-    expect(screen.getByRole("link", { name: "Search this vault" })).toHaveFocus();
+    expect(screen.getByRole("link", { name: "Search" })).toHaveFocus();
     screen.getByRole("link", { name: "Graph" }).focus();
     await act(async () => { available = 320; resize(); });
     expect(screen.getByRole("button", { name: "More vault pages" })).toHaveFocus();
