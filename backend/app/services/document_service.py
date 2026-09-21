@@ -154,6 +154,7 @@ from app.services.index_service import (
 )
 from app.services.kg_service import (
     delete_document_relations,
+    relink_resource_edges,
     store_document_relations,
     validate_new_structured_relation_refs,
 )
@@ -600,32 +601,6 @@ class DocumentService:
         # Unreachable in practice (full uuid is unique); fall through to the
         # full-hex form and let the UNIQUE constraint surface any true clash.
         return f"{stem}-{hexs}.md"
-
-    @staticmethod
-    async def _relink_edges(conn, vault_id, column: str, old_uri: str, new_uri: str) -> None:
-        """Repoint edges referencing ``old_uri`` to ``new_uri`` on ``column``
-        ('source_uri' or 'target_uri') during a move. Rows that would duplicate
-        an edge already present at ``new_uri`` are skipped by the UPDATE (the
-        UNIQUE(source_uri, target_uri, relation_type) guard) and then dropped,
-        since they ARE such duplicates. ``column`` comes from a fixed internal
-        set, so the f-string interpolation is not an injection surface."""
-        other = "target_uri" if column == "source_uri" else "source_uri"
-        await conn.execute(
-            f"""
-            UPDATE edges e SET {column} = $1
-             WHERE e.vault_id = $2 AND e.{column} = $3
-               AND NOT EXISTS (
-                 SELECT 1 FROM edges x
-                  WHERE x.vault_id = $2 AND x.{column} = $1
-                    AND x.{other} = e.{other}
-                    AND x.relation_type = e.relation_type)
-            """,
-            new_uri, vault_id, old_uri,
-        )
-        await conn.execute(
-            f"DELETE FROM edges WHERE vault_id = $1 AND {column} = $2",
-            vault_id, old_uri,
-        )
 
     # ── Put ───────────────────────────────────────────────────
 
@@ -1470,8 +1445,7 @@ class DocumentService:
             # would throw a UniqueViolation and abort the whole move.
             old_uri = doc_uri(vault, old_path)
             new_uri = doc_uri(vault, new_path)
-            await self._relink_edges(conn, vault_id, "source_uri", old_uri, new_uri)
-            await self._relink_edges(conn, vault_id, "target_uri", old_uri, new_uri)
+            await relink_resource_edges(conn, vault_id, old_uri, new_uri)
             # A move does NOT change which document a publication is bound to:
             # `publications.document_id` is the binding and identity is what a
             # move preserves. This rewrite keeps the DERIVED half — the
