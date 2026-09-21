@@ -46,6 +46,33 @@ from app.services.uri_service import parse_uri
 
 logger = logging.getLogger("akb.search")
 
+# Same receipt contract as M1NativeGrepService._verify_file_scope. A migrated
+# File may have a collision-resolved native path while its public catalog path
+# remains unchanged. Only a verified receipt for this exact source and Head
+# authorizes that exception; any subsequent projection intent supersedes it.
+_VERIFIED_FILE_CUTOVER_PATH_SQL = """
+EXISTS (
+    SELECT 1 FROM native_revision_cutover_files cf
+    JOIN native_revision_cutover_runs cr USING (cutover_id)
+    WHERE cf.file_id = f.id AND cf.namespace_id = f.vault_id
+      AND cf.status = 'verified' AND cr.status = 'verified'
+      AND cf.disposition = 'native_text'
+      AND cf.logical_path = CASE WHEN col.path IS NULL THEN f.name
+                                ELSE col.path || '/' || f.name END
+      AND cf.mime_type = f.mime_type
+      AND cf.content_hash = f.content_hash AND cf.byte_size = f.size_bytes
+      AND cf.s3_key = f.s3_key
+      AND cf.etag IS NOT DISTINCT FROM f.etag
+      AND cf.storage_version IS NOT DISTINCT FROM f.storage_version
+      AND COALESCE(cf.applied_path, cf.logical_path) = r.current_path
+      AND cf.native_revision_id = r.head_revision_id
+      AND f.hash_verified_at IS NOT NULL
+      AND p.digest = f.content_hash AND p.byte_size = f.size_bytes
+      AND NOT EXISTS (SELECT 1 FROM native_file_projection_outbox o
+                      WHERE o.file_id = f.id)
+)
+"""
+
 
 def _log_search_timing(started: float, phases: dict[str, float], returned: int) -> None:
     """Operational timing only; never log query text, user IDs or result data."""
@@ -1613,10 +1640,17 @@ class SearchService:
                     raise ValidationError(
                         "native search hydration exceeds the bounded body corpus"
                     )
+                # Older isolated measurement schemas have no receipts and
+                # cannot authorize a collision-path exception.
+                has_cutover = await conn.fetchval(
+                    "SELECT to_regclass('native_revision_cutover_files') IS NOT NULL"
+                )
+                cutover_path_sql = _VERIFIED_FILE_CUTOVER_PATH_SQL if has_cutover else "FALSE"
                 rows = await conn.fetch(
                     f"""
                     SELECT c.id AS chunk_id, r.resource_id, r.current_path,
                            r.head_revision_id, v.name AS vault_name,
+                           {cutover_path_sql} AS cutover_path_current,
                            f.name, f.description, f.mime_type,
                            col.path AS collection,
                            p.payload_id, p.namespace_id, p.content_profile,
@@ -1661,7 +1695,7 @@ class SearchService:
                         if r["collection"]
                         else r["name"]
                     )
-                    if r["current_path"] != catalog_path:
+                    if r["current_path"] != catalog_path and not r["cutover_path_current"]:
                         logger.warning(
                             "hydrate: stale native File path skipped for %s",
                             r["resource_id"],
