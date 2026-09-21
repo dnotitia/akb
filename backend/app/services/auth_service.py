@@ -1148,6 +1148,9 @@ async def create_pat(
     vault_scope: VaultScope | None = None,
     scopes: list[str] | None = None,
     key_class: str = "pat",
+    expires_at: datetime | None = None,
+    issuer: AuthenticatedUser | None = None,
+    admin_issuance: bool = False,
 ) -> dict:
     """Issue a token backed by the existing tokens table.
 
@@ -1171,22 +1174,50 @@ async def create_pat(
         except AttributeError, TypeError, ValueError:
             raise ValidationError("token_id must be a UUID") from None
 
-    expires_at = None
-    if expires_days:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+    from app.models.pat_issuance import field_error
+    from app.services.token_issuer_policy import require_issuer_carrier, validate_locked_issuer
+    if issuer is not None:
+        require_issuer_carrier(issuer, admin_route=admin_issuance)
+        if not admin_issuance and uuid.UUID(issuer.user_id) != uuid.UUID(user_id):
+            raise ConflictError("The signed-in account changed.", code="token_issuer_identity_changed")
+    if expires_days is not None and (type(expires_days) is not int or expires_days < 0):
+        raise field_error("expires_days", "invalid_expiration_days", "Expiration days must be a nonnegative integer.")
+    if expires_days is not None and expires_at is not None:
+        raise field_error("expires_at", "expiration_conflict", "Choose either a duration or an absolute expiration.")
+    if expires_at is not None and (expires_at.tzinfo is None or expires_at.utcoffset() is None):
+        raise field_error("expires_at", "invalid_expiration", "Expiration must include a timezone.")
 
     vault_scope_json = json.dumps(vault_scope.to_db_json()) if vault_scope else None
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            user_row = await conn.fetchrow(
-                "SELECT account_status FROM users WHERE id = $1 FOR UPDATE",
-                uuid.UUID(user_id),
-            )
+            if issuer is None:
+                user_row = await conn.fetchrow("SELECT account_status FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
+            else:
+                await conn.execute("SET LOCAL lock_timeout='5s'")
+                user_rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                                            sorted({uuid.UUID(user_id), uuid.UUID(issuer.user_id)}))
+                by_id = {row["id"]: row for row in user_rows}
+                await validate_locked_issuer(conn, issuer, by_id.get(uuid.UUID(issuer.user_id)),
+                                             admin_route=admin_issuance, key_class=key_class)
+                user_row = by_id.get(uuid.UUID(user_id))
             if user_row is None:
                 raise NotFoundError("User", user_id)
             if user_row["account_status"] != "active":
                 raise AccountSuspendedError()
+            issued_at = datetime.now(timezone.utc)
+            if expires_days:
+                try:
+                    expires_at = issued_at + timedelta(days=expires_days)
+                except OverflowError:
+                    raise field_error("expires_days", "expiration_overflow", "Expiration is beyond the supported date range.") from None
+            if expires_at is not None:
+                try:
+                    expires_at = expires_at.astimezone(timezone.utc)
+                except OverflowError:
+                    raise field_error("expires_at", "expiration_overflow", "Expiration is beyond the supported date range.") from None
+                if expires_at <= issued_at:
+                    raise field_error("expires_at", "expiration_in_past", "Expiration must be in the future.")
             await conn.execute(
                 """
                 INSERT INTO tokens (
@@ -1205,6 +1236,13 @@ async def create_pat(
                 key_class,
                 expires_at,
             )
+            if issuer is not None:
+                await emit_event(conn, "auth.token_issued", actor_id=issuer.user_id, payload={
+                    "issuer_token_id": issuer.token_id, "user_id": user_id,
+                    "token_id": str(resolved_token_id), "key_class": key_class,
+                    "scopes": token_scopes, "vault_scope": vault_scope.to_db_json() if vault_scope else None,
+                    "expires_at": expires_at.isoformat() if expires_at else None,
+                })
 
     # PG-native RBAC (surface 2): provision the narrow akb_token_<tid> role for
     # a SCOPED PAT so akb_sql run under it is PG-confined to the scope. Best-
@@ -1221,6 +1259,8 @@ async def create_pat(
     return {
         "token": raw_token,
         "token_id": str(resolved_token_id),
+        "user_id": user_id,
+        "issued_at": issued_at.isoformat(),
         "name": name,
         "prefix": token_prefix,
         "scopes": token_scopes,
@@ -1236,7 +1276,7 @@ async def list_pats(user_id: str) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, name, token_prefix, scopes, key_class, expires_at, last_used_at, created_at
+            SELECT id, name, token_prefix, scopes, vault_scope, key_class, expires_at, last_used_at, created_at
             FROM tokens WHERE user_id = $1 ORDER BY created_at DESC
             """,
             uuid.UUID(user_id),
@@ -1247,6 +1287,7 @@ async def list_pats(user_id: str) -> list[dict]:
                 "name": r["name"],
                 "prefix": r["token_prefix"],
                 "scopes": list(r["scopes"]) if r["scopes"] else [],
+                "vault_scope": (scope.to_db_json() if (scope := VaultScope.from_db_json(r["vault_scope"])) is not None else None),
                 "key_class": r["key_class"] or "pat",
                 "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
                 "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None,

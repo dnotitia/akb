@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 
 import pytest
 from fastapi import HTTPException
@@ -306,7 +307,7 @@ async def test_admin_mint_forwards_caller_selected_token_id(monkeypatch):
     )
 
     result = await access.admin_mint_managed_user_token(
-        str(user_id), request, _user(admin=True)
+        str(user_id), request, replace(_user(admin=True), auth_method="jwt", account_kind="human", key_class=None)
     )
 
     assert result["token_id"] == str(token_id)

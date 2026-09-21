@@ -508,6 +508,12 @@ notification_retention_days: 90
 # Account deletion also requires the cleanup worker heartbeat to be healthy.
 account_self_service_enabled: false
 
+# Audit/migrate existing token-provisioning automation before upgrading. All PAT
+# callers are refused by self/admin mint routes. Only the exact listed active,
+# unscoped admin service keys with read+write may use admin issuance routes.
+# Ordinary human JWT/SSO sessions need no allowlist. IDs are not token secrets.
+admin_token_issuer_ids: []
+
 # Optional Keycloak-owned account disable/delete detection (read-only management
 # client needs realm and user read access). Checks 25 existing identities per tick;
 # detection latency includes a full paginated sweep and upstream availability.

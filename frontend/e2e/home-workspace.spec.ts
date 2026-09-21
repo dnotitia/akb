@@ -165,6 +165,12 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await expect(connection.getByText(/This browser cannot verify/)).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("connection-setup.png"), fullPage: true });
     await page.keyboard.press("Escape");
+    const closeConfirmation = page.getByRole("dialog", { name: "Have you saved your token?" });
+    await expect(closeConfirmation).toBeVisible();
+    await closeConfirmation.getByRole("button", { name: "Keep setup open" }).click();
+    await expect(connection.getByLabel("Full saved token")).toHaveValue("akb_fixture_example_only");
+    await connection.getByRole("button", { name: "Close", exact: true }).click();
+    await closeConfirmation.getByRole("button", { name: "I've saved it — close" }).click();
     await expect(connection).not.toBeVisible();
     await expect(connectionLauncher).toBeFocused();
     await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", "false");
