@@ -63,6 +63,18 @@ logger = logging.getLogger("akb.vector_store.pgvector")
 # at least the formula is identical.
 RRF_K = 60
 
+_VCHORD_MAX_CANDIDATES = 65_535
+
+
+async def _set_vchord_candidate_budget(
+    conn: asyncpg.Connection, budget: int,
+) -> None:
+    if budget != -1 and not 1 <= budget <= _VCHORD_MAX_CANDIDATES:
+        raise ValueError(f"invalid vchord candidate budget: {budget}")
+    # The bounded integer is safe to interpolate into the extension GUC.
+    # SET LOCAL restores the pooled connection at transaction commit.
+    await conn.execute(f"SET LOCAL bm25_catalog.bm25_limit = {budget}")
+
 # Schema name lands in identifier position in DDL; validate to keep
 # operator typos and config-injection-style attacks from blowing up
 # the cluster. Plain ASCII identifier is enough — pgvector's own
@@ -1278,49 +1290,58 @@ class PgvectorStore:
                 await conn.execute(
                     "SET LOCAL search_path TO \"$user\", public, bm25_catalog"
                 )
-                if filter_uuids:
+                requested_limit = int(limit)
+
+                if filter_uuids and selective:
                     type_pred = (
                         " AND source_type = ANY($4::text[])" if source_type_values else ""
                     )
-                    if selective:
-                        sql = f"""
-                            SELECT chunk_id FROM (
-                              WITH candidate_chunks AS MATERIALIZED (
-                                SELECT chunk_id, sparse_bm25
-                                FROM "{self._schema}".chunks
-                                WHERE {filter_col} = ANY($2::uuid[])
-                                  AND sparse_bm25 IS NOT NULL{type_pred}
-                              )
-                              SELECT chunk_id::text AS chunk_id,
-                                     sparse_bm25 <&> bm25_catalog.to_bm25query(
-                                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                                        $1::int[]::bm25_catalog.bm25vector) AS score
-                              FROM candidate_chunks
-                              ORDER BY score
-                              LIMIT $3
-                            ) ranked WHERE score < 0
-                        """
-                    else:
-                        sql = f"""
-                            SELECT chunk_id FROM (
-                              SELECT chunk_id::text AS chunk_id,
-                                     sparse_bm25 <&> bm25_catalog.to_bm25query(
-                                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                                        $1::int[]::bm25_catalog.bm25vector) AS score
-                              FROM "{self._schema}".chunks
-                              WHERE {filter_col} = ANY($2::uuid[])
-                                AND sparse_bm25 IS NOT NULL{type_pred}
-                              ORDER BY score
-                              LIMIT $3
-                            ) ranked WHERE score < 0
-                        """
+                    sql = f"""
+                        SELECT chunk_id FROM (
+                          WITH candidate_chunks AS MATERIALIZED (
+                            SELECT chunk_id, sparse_bm25
+                            FROM "{self._schema}".chunks
+                            WHERE {filter_col} = ANY($2::uuid[])
+                              AND sparse_bm25 IS NOT NULL{type_pred}
+                          )
+                          SELECT chunk_id::text AS chunk_id,
+                                 sparse_bm25 <&> bm25_catalog.to_bm25query(
+                                    '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                                    $1::int[]::bm25_catalog.bm25vector) AS score
+                          FROM candidate_chunks
+                          ORDER BY score
+                          LIMIT $3
+                        ) ranked WHERE score < 0
+                        ORDER BY score
+                    """
                     rows = await conn.fetch(
-                        sql, query_terms, filter_uuids, int(limit),
+                        sql, query_terms, filter_uuids, requested_limit,
                         *([source_type_values] if source_type_values else []),
                     )
+                elif filter_uuids or source_type_values:
+                    # Sealed segments can apply executor predicates during the
+                    # extension scan; growing segments score before that hook.
+                    # Preserve the direct fast path, and only use unqualified
+                    # global candidates to choose widening or exact fallback.
+                    configured_budget = int(
+                        await conn.fetchval(
+                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
+                        )
+                    )
+                    return await self._search_vchord_index_led_filtered(
+                        conn,
+                        query_terms=query_terms,
+                        filter_col=filter_col,
+                        filter_uuids=filter_uuids,
+                        source_type_values=source_type_values,
+                        limit=requested_limit,
+                        configured_budget=configured_budget,
+                    )
                 else:
-                    type_pred = (
-                        " AND source_type = ANY($3::text[])" if source_type_values else ""
+                    configured_budget = int(
+                        await conn.fetchval(
+                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
+                        )
                     )
                     sql = f"""
                         SELECT chunk_id FROM (
@@ -1329,15 +1350,29 @@ class PgvectorStore:
                                     '"{self._schema}".idx_vi_chunks_bm25'::regclass,
                                     $1::int[]::bm25_catalog.bm25vector) AS score
                           FROM "{self._schema}".chunks
-                          WHERE sparse_bm25 IS NOT NULL{type_pred}
+                          WHERE sparse_bm25 IS NOT NULL
                           ORDER BY score
                           LIMIT $2
                         ) ranked WHERE score < 0
+                        ORDER BY score
                     """
-                    rows = await conn.fetch(
-                        sql, query_terms, int(limit),
-                        *([source_type_values] if source_type_values else []),
-                    )
+                    candidate_budget = configured_budget
+                    if configured_budget != -1:
+                        candidate_budget = (
+                            -1
+                            if requested_limit > _VCHORD_MAX_CANDIDATES
+                            else max(requested_limit, configured_budget, 1)
+                        )
+                        await _set_vchord_candidate_budget(conn, candidate_budget)
+                    rows = await conn.fetch(sql, query_terms, requested_limit)
+                    if (
+                        candidate_budget != -1
+                        and len(rows) < requested_limit
+                    ):
+                        await _set_vchord_candidate_budget(conn, -1)
+                        rows = await conn.fetch(
+                            sql, query_terms, requested_limit,
+                        )
 
         else:
             assert_never(self._sparse_shape)
@@ -1404,6 +1439,140 @@ class PgvectorStore:
         others = max(1.0, distinct - len(common))
         share = sum(common.get(v, remainder / others) for v in filter_uuids)
         return share < self._SELECTIVE_FRACTION
+
+    async def _search_vchord_index_led_filtered(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        query_terms: list[int],
+        filter_col: str,
+        filter_uuids: list[uuid.UUID] | None,
+        source_type_values: list[str] | None,
+        limit: int,
+        configured_budget: int,
+    ) -> list[str]:
+        """Search an index-led vchord scope without silently losing top-k rows.
+
+        The first query preserves VectorChord's sealed-segment prefilter. If it
+        underfills, a separate global-candidate query counts an unqualified
+        candidate page before choosing bounded widening or exact fallback.
+        Growing segments do not use the extension prefilter, and nonvisible
+        rows can consume an index page, so only the exact fallback proves
+        exhaustion.
+        """
+
+        def scope(
+            first_parameter: int,
+        ) -> tuple[list[str], list[object], int]:
+            predicates: list[str] = []
+            params: list[object] = []
+            parameter = first_parameter
+            if filter_uuids:
+                predicates.append(f"c.{filter_col} = ANY(${parameter}::uuid[])")
+                params.append(filter_uuids)
+                parameter += 1
+            if source_type_values:
+                predicates.append(f"c.source_type = ANY(${parameter}::text[])")
+                params.append(source_type_values)
+                parameter += 1
+            return predicates, params, parameter
+
+        filtered_predicates, filtered_scope_args, filtered_limit_parameter = scope(2)
+        filtered_where = " AND ".join(
+            ["c.sparse_bm25 IS NOT NULL", *filtered_predicates]
+        )
+        filtered_sql = f"""
+            SELECT chunk_id FROM (
+              SELECT c.chunk_id::text AS chunk_id,
+                     c.sparse_bm25 <&> bm25_catalog.to_bm25query(
+                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                        $1::int[]::bm25_catalog.bm25vector) AS score
+              FROM "{self._schema}".chunks c
+              WHERE {filtered_where}
+              ORDER BY score
+              LIMIT ${filtered_limit_parameter}
+            ) ranked WHERE score < 0
+            ORDER BY score
+        """
+        filtered_args: list[object] = [query_terms, *filtered_scope_args, limit]
+
+        async def filtered_hits() -> list[str]:
+            rows = await conn.fetch(filtered_sql, *filtered_args)
+            return [row["chunk_id"] for row in rows]
+
+        # -1 is the extension's exact brute-force mode. A requested SQL page
+        # larger than its finite maximum also needs that mode to remain exact.
+        if configured_budget == -1:
+            return await filtered_hits()
+        if limit > _VCHORD_MAX_CANDIDATES:
+            await _set_vchord_candidate_budget(conn, -1)
+            return await filtered_hits()
+
+        candidate_budget = max(
+            limit,
+            configured_budget if configured_budget > 0 else 1,
+            1,
+        )
+        await _set_vchord_candidate_budget(conn, candidate_budget)
+
+        # Keep the extension's direct filtered path as the fast path. On sealed
+        # segments ENABLE_PREFILTER can apply this scope while scanning.
+        hits = await filtered_hits()
+        if len(hits) >= limit:
+            return hits
+
+        global_predicates, global_scope_args, global_limit_parameter = scope(3)
+        global_where = " AND ".join(global_predicates)
+        global_sql = f"""
+            WITH global_candidates AS MATERIALIZED (
+              SELECT c.chunk_id,
+                     c.sparse_bm25 <&> bm25_catalog.to_bm25query(
+                        '"{self._schema}".idx_vi_chunks_bm25'::regclass,
+                        $1::int[]::bm25_catalog.bm25vector) AS score
+              FROM "{self._schema}".chunks c
+              WHERE c.sparse_bm25 IS NOT NULL
+              ORDER BY score
+              LIMIT $2
+            ),
+            ranked AS (
+              SELECT g.chunk_id::text AS chunk_id, g.score
+              FROM global_candidates g
+              JOIN "{self._schema}".chunks c ON c.chunk_id = g.chunk_id
+              WHERE {global_where} AND g.score < 0
+              ORDER BY g.score
+              LIMIT ${global_limit_parameter}
+            )
+            SELECT
+              (SELECT COUNT(*) FROM global_candidates) AS candidate_count,
+              ARRAY(SELECT chunk_id FROM ranked ORDER BY score) AS chunk_ids
+        """
+
+        while True:
+            probe_args: list[object] = [
+                query_terms,
+                candidate_budget,
+                *global_scope_args,
+                limit,
+            ]
+            probe = await conn.fetchrow(global_sql, *probe_args)
+            assert probe is not None
+            candidate_count = int(probe["candidate_count"])
+            candidate_ids = list(probe["chunk_ids"])
+
+            if len(candidate_ids) >= limit:
+                return candidate_ids
+            if (
+                candidate_count < candidate_budget
+                or candidate_budget == _VCHORD_MAX_CANDIDATES
+            ):
+                await _set_vchord_candidate_budget(conn, -1)
+                return await filtered_hits()
+
+            candidate_budget = min(
+                _VCHORD_MAX_CANDIDATES,
+                candidate_budget * 4,
+            )
+            await _set_vchord_candidate_budget(conn, candidate_budget)
 
     async def _fetch_payloads(
         self,
