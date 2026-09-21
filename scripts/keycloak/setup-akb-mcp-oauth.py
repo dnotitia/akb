@@ -220,6 +220,79 @@ def resolve_admin_credential(env: Mapping[str, str]) -> AdminCredential:
 CLIENT_SCOPE_POLICY_PROVIDER = "allowed-client-templates"
 
 
+TRUSTED_HOSTS_POLICY_PROVIDER = "trusted-hosts"
+
+
+def configure_trusted_hosts(
+    base: str,
+    token: str,
+    components: object,
+    hosts: "list[str]",
+    *,
+    request=http,
+) -> str:
+    """Open the realm's trusted-hosts policy for clients that move around.
+
+    Returns what happened: ``absent``, ``updated`` or ``no-op``.
+
+    **An absent policy is a configuration, not damage.** Keycloak ships this
+    policy and refuses to leave both of its checks off ("At least one of
+    hosts verification or client URIs validation must be enabled"), and its
+    URI check validates a client's informational ``client_uri`` exactly like
+    a redirect URI — so a public MCP client whose ``client_uri`` points at
+    its own homepage is rejected for a field that is never redirected to. A
+    deployment that wants loopback redirects and nothing more therefore
+    deletes this policy and enforces redirects through a client policy
+    instead. That realm is precisely the one that still needs every step
+    after this one, so absence skips this step rather than ending the run.
+
+    A refused write is different, and still stops: it means the realm has
+    the policy and would not take the change.
+    """
+    policy = None
+    if isinstance(components, list):
+        policy = next(
+            (
+                component
+                for component in components
+                if isinstance(component, dict)
+                and component.get("providerId") == TRUSTED_HOSTS_POLICY_PROVIDER
+            ),
+            None,
+        )
+    if policy is None:
+        print("    absent — skipping (this realm enforces redirect URIs elsewhere;")
+        print("    the steps below do not depend on this policy)")
+        return "absent"
+
+    config = policy.setdefault("config", {})
+    current = set(config.get("trusted-hosts", []) or [])
+    print(f"    current: {sorted(current)}")
+    desired = current | set(hosts)
+    changed = False
+    if desired != current:
+        config["trusted-hosts"] = sorted(desired)
+        changed = True
+    # The sender-host check rejects every legitimate DCR from a moving
+    # client (Claude Code on a laptop, claude.ai's egress, etc.) because
+    # those hosts can't be allowlisted upfront. The redirect-URI check is
+    # the meaningful guard; turn the sender-host check off so DCR actually
+    # works from anywhere a client lives.
+    if config.get("host-sending-registration-request-must-match") != ["false"]:
+        config["host-sending-registration-request-must-match"] = ["false"]
+        changed = True
+    if not changed:
+        print("    no-op (already permissive on sender + contains requested hosts)")
+        return "no-op"
+    status, payload, _ = request(
+        "PUT", f"{base}/components/{policy['id']}", token, body=policy
+    )
+    if status not in (200, 204):
+        sys.exit(f"PUT trusted-hosts failed: {status} {payload}")
+    print(f"    updated: trusted-hosts={config['trusted-hosts']} sender-check=off")
+    return "updated"
+
+
 def client_scope_policies(components: object) -> list[dict]:
     """Every "Allowed Client Scopes" registration policy in a realm, both subtypes.
 
@@ -330,31 +403,7 @@ def main() -> int:
     )
     if status != 200 or not isinstance(comps, list):
         sys.exit(f"failed to list registration policies: {status} {comps}")
-    th = next((c for c in comps if c.get("providerId") == "trusted-hosts"), None)
-    if not th:
-        sys.exit("trusted-hosts policy missing from realm (unexpected — Keycloak ships it by default)")
-    current = set(th.get("config", {}).get("trusted-hosts", []) or [])
-    print(f"    current: {sorted(current)}")
-    desired = current | set(args.trusted_host)
-    changed = False
-    if desired != current:
-        th["config"]["trusted-hosts"] = sorted(desired)
-        changed = True
-    # The sender-host check rejects every legitimate DCR from a moving
-    # client (Claude Code on a laptop, claude.ai's egress, etc.) because
-    # those hosts can't be allowlisted upfront. The redirect-URI check
-    # below is the meaningful guard; turn the sender-host check off so
-    # DCR actually works from anywhere a client lives.
-    if th.get("config", {}).get("host-sending-registration-request-must-match") != ["false"]:
-        th["config"]["host-sending-registration-request-must-match"] = ["false"]
-        changed = True
-    if changed:
-        s, r, _ = http("PUT", f"{base}/components/{th['id']}", token, body=th)
-        if s not in (200, 204):
-            sys.exit(f"PUT trusted-hosts failed: {s} {r}")
-        print(f"    updated: trusted-hosts={th['config']['trusted-hosts']} sender-check=off")
-    else:
-        print("    no-op (already permissive on sender + contains requested hosts)")
+    configure_trusted_hosts(base, token, comps, args.trusted_host)
 
     # ── 1b. allowed-client-templates ──────────────────────────
     # The default "Allowed Client Scopes" policy rejects any DCR body

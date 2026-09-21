@@ -208,6 +208,92 @@ def test_a_non_list_or_ragged_response_selects_nothing_rather_than_raising(paylo
     assert setup_script.client_scope_policies(payload) == []
 
 
+# ── trusted-hosts: absence is a configuration, not a failure ──────────
+
+
+def _trusted_hosts(hosts=("localhost",), sender_check="true") -> dict:
+    return {
+        "id": "th-1",
+        "providerId": "trusted-hosts",
+        "config": {
+            "trusted-hosts": list(hosts),
+            "host-sending-registration-request-must-match": [sender_check],
+            "client-uris-must-match": ["true"],
+        },
+    }
+
+
+class _Recorder:
+    """Stands in for the script's HTTP call and remembers what it was asked."""
+
+    def __init__(self, status: int = 204):
+        self.calls: list[tuple] = []
+        self.status = status
+
+    def __call__(self, method, url, token=None, body=None, **_):
+        self.calls.append((method, url, body))
+        return self.status, {}, {}
+
+
+def test_a_realm_without_the_policy_is_configured_not_broken():
+    """The regression. A realm that enforces redirects through a client policy
+    has no trusted-hosts policy, and it is exactly the realm that still needs
+    every later step. Stopping here skipped all of them."""
+    http = _Recorder()
+    outcome = setup_script.configure_trusted_hosts(
+        "https://kc.example/admin/realms/r", "tok", [_policy("anonymous")],
+        ["localhost"], request=http,
+    )
+    assert outcome == "absent"
+    assert http.calls == []
+
+
+def test_a_present_policy_is_opened_for_moving_clients():
+    http = _Recorder()
+    outcome = setup_script.configure_trusted_hosts(
+        "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
+        ["127.0.0.1"], request=http,
+    )
+    assert outcome == "updated"
+    assert len(http.calls) == 1
+    method, url, body = http.calls[0]
+    assert method == "PUT"
+    assert url.endswith("/components/th-1")
+    assert body["config"]["trusted-hosts"] == ["127.0.0.1", "localhost"]
+    assert body["config"]["host-sending-registration-request-must-match"] == ["false"]
+
+
+def test_a_policy_that_already_says_it_is_not_written_again():
+    http = _Recorder()
+    outcome = setup_script.configure_trusted_hosts(
+        "https://kc.example/admin/realms/r", "tok",
+        [_trusted_hosts(hosts=("localhost",), sender_check="false")],
+        ["localhost"], request=http,
+    )
+    assert outcome == "no-op"
+    assert http.calls == []
+
+
+def test_a_write_that_fails_still_stops_the_run():
+    """Absence is tolerated; a refused write is not."""
+    http = _Recorder(status=500)
+    with pytest.raises(SystemExit):
+        setup_script.configure_trusted_hosts(
+            "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
+            ["127.0.0.1"], request=http,
+        )
+
+
+@pytest.mark.parametrize("payload", [None, {}, "nope", [None, 3, "x"]])
+def test_a_ragged_component_list_reads_as_absent_rather_than_raising(payload):
+    http = _Recorder()
+    assert setup_script.configure_trusted_hosts(
+        "https://kc.example/admin/realms/r", "tok", payload, ["localhost"],
+        request=http,
+    ) == "absent"
+    assert http.calls == []
+
+
 def test_verify_step_names_the_subtypes_still_present():
     subtypes = setup_script._policy_subtypes([_policy("anonymous"), _policy("authenticated")])
     assert sorted(subtypes) == ["anonymous", "authenticated"]
