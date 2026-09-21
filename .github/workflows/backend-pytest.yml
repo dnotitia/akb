@@ -323,6 +323,7 @@ jobs:
             # list that runs somewhere it is present.
             tests/test_vchord_sparse_shape_postgres.py
             tests/test_bm25_vector_backfill_postgres.py
+            tests/test_bm25_run_lock.py
           )
           # A truncated list is the failure this step has already had
           # once, and it reads as a pass. Both halves of that are worth
