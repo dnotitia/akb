@@ -15,6 +15,8 @@ import {
   getAssetBlob,
   getDocument,
   getVaultFileDownloadUrl,
+  publicationAssetUrl,
+  refreshPublicationViewGrant,
   searchDocs,
   uploadAsset,
 } from "@/lib/api";
@@ -114,27 +116,40 @@ export function createAkbMarkdownTargetResolver(
 
         const attachmentId = assetIdFromUrl(target);
         if (attachmentId) {
-          // The actual private-image request is made by AssetImage so it can
-          // retain its bounded blob cache and historical source identity.
-          // This resolver call verifies that the target has a usable runtime
-          // address without placing a signed/blob URL in Markdown.
           const metadata = await getAttachmentMetadata(vault, attachmentId, {
             document: context.document ?? defaults.document,
             commit: context.commit ?? defaults.commit,
           });
           if (metadata.status === "expired") return unavailable(target, kind, "expired");
-          const query = new URLSearchParams({ vault });
-          if (context.document ?? defaults.document) {
-            query.set("document", context.document ?? defaults.document!);
+          const blob = await getAssetBlob(
+            attachmentId,
+            vault,
+            context.signal,
+            (context.document ?? defaults.document) && (context.commit ?? defaults.commit)
+              ? {
+                  document: context.document ?? defaults.document!,
+                  commit: context.commit ?? defaults.commit!,
+                }
+                : undefined,
+          );
+          if (context.signal?.aborted) {
+            throw new DOMException("Image resolution cancelled", "AbortError");
           }
-          if (context.commit ?? defaults.commit) {
-            query.set("commit", context.commit ?? defaults.commit!);
+          if (typeof URL.createObjectURL !== "function") {
+            return unavailable(target, kind);
           }
+          const runtimeUrl = URL.createObjectURL(blob);
+          let released = false;
           return {
             target,
             kind,
             status: "available",
-            runtimeUrl: `/api/assets/${attachmentId}?${query}`,
+            runtimeUrl,
+            release: () => {
+              if (released) return;
+              released = true;
+              URL.revokeObjectURL?.(runtimeUrl);
+            },
           };
         }
       } catch {
@@ -145,6 +160,39 @@ export function createAkbMarkdownTargetResolver(
       }
 
       return unavailable(target, kind);
+    },
+  };
+}
+
+/** Resolve public publication attachments through the grant-aware product URL. */
+export function createAkbMarkdownPublicationTargetResolver(slug: string) {
+  return {
+    async resolve(rawTarget: string, context: Partial<AkbMarkdownUploadContext> = {}) {
+      const target = canonicalAkbMarkdownTarget(rawTarget, "attachment");
+      const attachmentId = target ? assetIdFromUrl(target) : null;
+      if (!target || !attachmentId) return unavailable(rawTarget, "attachment", "unsupported");
+
+      const available = (): MarkdownTargetResolution => ({
+        target,
+        kind: "attachment",
+        status: "available",
+        runtimeUrl: publicationAssetUrl(slug, attachmentId),
+        refresh: async ({ signal } = {}) => {
+          if (signal?.aborted) {
+            throw new DOMException("Image refresh cancelled", "AbortError");
+          }
+          await refreshPublicationViewGrant(slug);
+          if (signal?.aborted) {
+            throw new DOMException("Image refresh cancelled", "AbortError");
+          }
+          return available();
+        },
+      });
+
+      if (context.signal?.aborted) {
+        throw new DOMException("Image resolution cancelled", "AbortError");
+      }
+      return available();
     },
   };
 }

@@ -64,13 +64,28 @@ export const MarkdownImage = Node.create({
   renderHTML({ node }) {
     const target = String(node.attrs.target || node.attrs.src || '')
     return [
-      'img',
+      'span',
       {
-        src: target,
-        alt: String(node.attrs.alt ?? ''),
-        ...(node.attrs.title ? { title: String(node.attrs.title) } : {}),
+        'data-markdown-image-frame': 'true',
         'data-markdown-target': target,
       },
+      [
+        'img',
+        {
+          src: target,
+          alt: String(node.attrs.alt ?? ''),
+          ...(node.attrs.title ? { title: String(node.attrs.title) } : {}),
+          'data-markdown-image': 'true',
+          'data-markdown-target': target,
+        },
+      ],
+      [
+        'span',
+        {
+          'data-markdown-image-message': 'true',
+          'aria-hidden': 'true',
+        },
+      ],
     ]
   },
 

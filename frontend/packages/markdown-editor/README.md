@@ -14,11 +14,13 @@ The package is built against the exact Tiptap `3.31.3` package set and React 19.
 import {
   MarkdownEditor,
   MarkdownEditingSurface,
+  MarkdownSurface,
   MarkdownViewer,
   MarkdownToolbar,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   type MarkdownTableOptions,
   type MarkdownSlashCommandMessages,
+  type MarkdownImageOptions,
   canonicalizeMarkdown,
   parseMarkdown,
   serializeEditorMarkdown,
@@ -316,6 +318,47 @@ The viewer/editor apply resolver results to their rendered DOM only. The editor 
 `getMarkdown()` continue to contain the original canonical target, including when a resource is
 unavailable.
 
+`MarkdownSurface` is the shared image renderer for products that own an editor instance. It keeps
+the canonical target, `alt`, and `title` in the Tiptap node, while a resolver supplies only the
+ephemeral `runtimeUrl`. Available images use `max-width: 100%` and `height: auto`; loading,
+inaccessible, and browser decode failures are rendered as accessible text states in both editor
+and viewer surfaces. A resolution may provide `release()` for object URLs and `refresh()` for a
+grant-bearing URL that failed to load. Both callbacks are cancelled and cleaned up when the
+document, resource context, or surface changes.
+
+```tsx
+import {
+  MarkdownSurface,
+  useMarkdownEditor,
+  useMarkdownTargetResolutions,
+  type MarkdownImageOptions,
+} from '@akb/markdown-editor/react'
+
+function ProductSurface({ markdown, resolver }: Props) {
+  const editor = useMarkdownEditor({ initialMarkdown: markdown })
+  const resolutions = useMarkdownTargetResolutions(markdown, resolver, {
+    vault: 'team',
+    document: 'notes/guide.md',
+  })
+  const image: MarkdownImageOptions = {
+    labels: {
+      loading: alt => alt ? `Loading ${alt}` : 'Loading image',
+      unavailable: alt => alt ? `Unavailable: ${alt}` : 'Image unavailable',
+    },
+  }
+
+  return (
+    <MarkdownSurface
+      editor={editor}
+      editable
+      image={image}
+      resolutions={resolutions}
+      resolvingTargets={Boolean(resolver)}
+    />
+  )
+}
+```
+
 ## Contributor commands
 
 ```sh
@@ -331,6 +374,13 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.11.0` public contract adds the common image rendering surface and
+resource lifecycle hooks. `MarkdownSurface`, `MarkdownEditor`, and
+`MarkdownViewer` share canonical target preservation, aspect-ratio-safe sizing,
+loading/access/decode failure states, cancellation, object-URL release, and
+grant refresh. Products still own authentication, publication policy, storage,
+upload, and copy.
 
 The `0.10.0` public contract adds the common `@` reference menu, the
 `MarkdownReferenceAdapter`/`MarkdownReferenceCandidate` contract, canonical

@@ -8,6 +8,7 @@ import {
   EditorContent,
   MarkdownEditor,
   MarkdownEditingSurface,
+  MarkdownSurface,
   MarkdownViewer,
   useMarkdownCommands,
   useMarkdownEditor,
@@ -316,6 +317,136 @@ describe('React surfaces', () => {
     })
   })
 
+  it('keeps editor and viewer image semantics, sizing, and failure copy aligned', async () => {
+    const target = '/api/assets/00000000-0000-4000-8000-000000000002'
+    const resolver: MarkdownTargetResolver = {
+      resolve: async value => ({
+        target: value,
+        status: 'available' as const,
+        runtimeUrl: 'blob:shared-image',
+      }),
+    }
+    const markdown = `![Transparent diagram](${target} "Original title")`
+    const onChange = vi.fn()
+    const { container } = render(
+      <>
+        <MarkdownEditor markdown={markdown} onChange={onChange} adapters={{ targetResolver: resolver }} />
+        <MarkdownViewer markdown={markdown} adapters={{ targetResolver: resolver }} />
+      </>,
+    )
+
+    await waitFor(() => {
+      const images = [...container.querySelectorAll<HTMLImageElement>('img[data-markdown-target]')]
+      expect(images).toHaveLength(2)
+      expect(images.every(image => image.getAttribute('src') === 'blob:shared-image')).toBe(true)
+    })
+    const images = [...container.querySelectorAll<HTMLImageElement>('img[data-markdown-target]')]
+    for (const image of images) {
+      expect(image).toHaveAttribute('src', 'blob:shared-image')
+      expect(image).toHaveAttribute('alt', 'Transparent diagram')
+      expect(image).toHaveAttribute('title', 'Original title')
+      expect(image).toHaveClass('block', 'h-auto', 'max-w-full')
+      expect(image.closest('[data-markdown-image-frame]')).toHaveClass('max-w-full')
+    }
+    expect(onChange).not.toHaveBeenCalled()
+
+    for (const image of images) fireEvent.error(image)
+    expect(container.querySelectorAll('[data-markdown-image-state="decode"]')).toHaveLength(2)
+    expect(screen.getAllByRole('img', { name: 'Image unavailable: Transparent diagram' })).toHaveLength(2)
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('renders request failures as accessible image placeholders without losing the target', async () => {
+    const target = '/api/assets/00000000-0000-4000-8000-000000000003'
+    const resolver: MarkdownTargetResolver = {
+      resolve: async value => ({
+        target: value,
+        status: 'unavailable' as const,
+        reason: 'inaccessible' as const,
+      }),
+    }
+    const { container } = render(
+      <MarkdownViewer
+        markdown={`![Restricted diagram](${target})`}
+        adapters={{ targetResolver: resolver }}
+      />,
+    )
+
+    await waitFor(() => {
+      const frame = container.querySelector('[data-markdown-image-frame]')
+      expect(frame).toHaveAttribute('data-markdown-image-state', 'unavailable')
+      expect(frame).toHaveAttribute('data-markdown-target', target)
+    })
+    expect(screen.getByRole('img', { name: 'Image unavailable: Restricted diagram' })).toBeVisible()
+    expect(container.querySelector('img[data-markdown-target]')).toHaveAttribute(
+      'data-markdown-target',
+      target,
+    )
+    expect(container.querySelector('img[data-markdown-target]')).not.toHaveAttribute('src')
+  })
+
+  it('releases runtime image resources on context changes and unmount', async () => {
+    const target = '/api/assets/00000000-0000-4000-8000-000000000004'
+    const releases: Array<ReturnType<typeof vi.fn>> = []
+    const resolver: MarkdownTargetResolver = {
+      resolve: vi.fn(async (value, context) => {
+        const release = vi.fn()
+        releases.push(release)
+        return {
+          target: value,
+          status: 'available' as const,
+          runtimeUrl: `blob:${context?.document ?? 'initial'}`,
+          release,
+        }
+      }),
+    }
+    const { container, rerender, unmount } = render(
+      <MarkdownEditor
+        markdown={`![Diagram](${target})`}
+        adapters={{ targetResolver: resolver }}
+        resolverContext={{ document: 'first.md' }}
+      />,
+    )
+
+    await waitFor(() => expect(container.querySelector('img')).toHaveAttribute('src', 'blob:first.md'))
+    rerender(
+      <MarkdownEditor
+        markdown={`![Diagram](${target})`}
+        adapters={{ targetResolver: resolver }}
+        resolverContext={{ document: 'second.md' }}
+      />,
+    )
+    await waitFor(() => expect(container.querySelector('img')).toHaveAttribute('src', 'blob:second.md'))
+    expect(releases[0]).toHaveBeenCalledTimes(1)
+    unmount()
+    expect(releases[1]).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps image-only documents paragraph-safe and serializes without a caret paragraph', async () => {
+    const target = 'https://example.com/standalone.png'
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ImageOnlySurface() {
+      const editor = useMarkdownEditor({ initialMarkdown: `![Only image](${target})` })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+      return <MarkdownSurface editor={editor} editable />
+    }
+
+    const { container } = render(<ImageOnlySurface />)
+    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    expect(container.querySelector('.ProseMirror > p > [data-markdown-image-frame]')).toBeInTheDocument()
+    expect(activeEditor!.getMarkdown()).toBe(`![Only image](${target})`)
+
+    await act(async () => {
+      activeEditor!.commands.focus('end')
+      activeEditor!.commands.insertContent('Continue below')
+    })
+    expect(activeEditor!.getMarkdown()).toContain(`![Only image](${target})`)
+    expect(activeEditor!.getMarkdown()).toContain('Continue below')
+  })
+
   it('re-resolves expiring targets before expiry without changing canonical Markdown', async () => {
     vi.useFakeTimers()
     try {
@@ -425,6 +556,36 @@ describe('React surfaces', () => {
       expect(link).toHaveAttribute('data-markdown-resolution', 'unavailable')
       expect(link).toHaveAttribute('href', '#')
       expect(link).toHaveAttribute('data-markdown-target', target)
+    })
+  })
+
+  it('keeps external images visible when a target resolver is present', async () => {
+    const externalTarget = 'https://example.com/external.png'
+    const managedTarget = '/api/assets/00000000-0000-4000-8000-000000000099'
+    const resolver = {
+      resolve: async (value: string) => ({
+        target: value,
+        status: 'unavailable' as const,
+        reason: 'unknown' as const,
+      }),
+    }
+    const { container } = render(
+      <MarkdownViewer
+        markdown={`![External](${externalTarget})\n\n![Managed](${managedTarget})`}
+        adapters={{ targetResolver: resolver }}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(container.querySelector(`img[data-markdown-target="${externalTarget}"]`)).toHaveAttribute(
+        'src',
+        externalTarget,
+      )
+    })
+    await waitFor(() => {
+      const managedImage = container.querySelector(`img[data-markdown-target="${managedTarget}"]`)
+      expect(managedImage).toHaveAttribute('data-markdown-resolution', 'unavailable')
+      expect(managedImage).not.toHaveAttribute('src')
     })
   })
 

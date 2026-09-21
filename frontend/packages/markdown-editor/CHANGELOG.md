@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0
+
+- Add the public `MarkdownSurface` image renderer shared by editor and viewer
+  consumers, with canonical target/alt/title preservation and aspect-ratio-safe
+  runtime sizing.
+- Add common loading, inaccessible, and browser decode-failure states with
+  product-provided labels and class names.
+- Add resolver `release()` and `refresh()` lifecycle hooks so object URLs and
+  grant-bearing image URLs are cleaned up or retried without changing Markdown.
+- Normalize image-only viewer bodies and keep the terminal editor paragraph out
+  of serialized Markdown.
+
 ## 0.10.0
 
 - Add the common `@` reference menu with product-owned person, issue, document,

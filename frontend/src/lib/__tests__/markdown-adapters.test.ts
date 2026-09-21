@@ -6,6 +6,8 @@ const apiMocks = vi.hoisted(() => ({
   getAttachmentMetadata: vi.fn(),
   getDocument: vi.fn(),
   getVaultFileDownloadUrl: vi.fn(),
+  publicationAssetUrl: vi.fn(),
+  refreshPublicationViewGrant: vi.fn(),
   searchDocs: vi.fn(),
   uploadAsset: vi.fn(),
 }));
@@ -16,6 +18,7 @@ import {
   canonicalAkbMarkdownTarget,
   classifyAkbMarkdownTarget,
   createAkbMarkdownAdapters,
+  createAkbMarkdownPublicationTargetResolver,
   createAkbMarkdownTargetResolver,
 } from "@/lib/markdown-adapters";
 
@@ -26,6 +29,15 @@ const FILE = "akb://team/coll/notes/file/123e4567-e89b-42d3-a456-426614174001";
 describe("AKB Markdown target adapter", () => {
   beforeEach(() => {
     Object.values(apiMocks).forEach((mock) => mock.mockReset());
+    apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:adapter-image"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
   });
 
   it("classifies and canonicalizes the three durable target kinds", () => {
@@ -66,11 +78,23 @@ describe("AKB Markdown target adapter", () => {
       runtimeUrl: "https://signed.example/file?expires=60",
     });
     expect(fileResolution.status === "available" && fileResolution.expiresAt).toBeTruthy();
-    await expect(resolver.resolve(ATTACHMENT)).resolves.toMatchObject({
+    const attachmentResolution = await resolver.resolve(ATTACHMENT);
+    expect(attachmentResolution).toMatchObject({
       target: ATTACHMENT,
       kind: "attachment",
       status: "available",
     });
+    expect(attachmentResolution.status === "available" && attachmentResolution.runtimeUrl).toBe(
+      "blob:adapter-image",
+    );
+    expect(apiMocks.getAssetBlob).toHaveBeenCalledWith(
+      "123e4567-e89b-42d3-a456-426614174000",
+      "team",
+      undefined,
+      undefined,
+    );
+    if (attachmentResolution.status === "available") attachmentResolution.release?.();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:adapter-image");
     await expect(resolver.resolve("akb://other/doc/private.md")).resolves.toMatchObject({
       target: "akb://other/doc/private.md",
       status: "unavailable",
@@ -80,6 +104,24 @@ describe("AKB Markdown target adapter", () => {
       document: undefined,
       commit: undefined,
     });
+  });
+
+  it("refreshes public publication URLs without fetching private bytes", async () => {
+    apiMocks.publicationAssetUrl.mockReturnValue("/public/asset?grant=old");
+    apiMocks.refreshPublicationViewGrant.mockResolvedValue("new");
+    const resolver = createAkbMarkdownPublicationTargetResolver("release");
+
+    const initial = await resolver.resolve(ATTACHMENT);
+    expect(initial).toMatchObject({
+      target: ATTACHMENT,
+      status: "available",
+      runtimeUrl: "/public/asset?grant=old",
+    });
+    if (initial.status !== "available") throw new Error("expected available publication image");
+    const refreshed = await initial.refresh?.();
+    expect(refreshed).toMatchObject({ status: "available" });
+    expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledWith("release");
+    expect(apiMocks.getAssetBlob).not.toHaveBeenCalled();
   });
 
   it("returns canonical upload and search values without runtime URLs", async () => {

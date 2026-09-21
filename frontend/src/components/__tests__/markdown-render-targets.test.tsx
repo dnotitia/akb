@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMocks = vi.hoisted(() => ({
@@ -20,6 +20,7 @@ const ATTACHMENT = "/api/assets/123e4567-e89b-42d3-a456-426614174000";
 
 beforeEach(() => {
   Object.values(apiMocks).forEach((mock) => mock.mockReset());
+  apiMocks.getAttachmentMetadata.mockResolvedValue({ status: "claimed" });
   Object.defineProperty(URL, "createObjectURL", {
     configurable: true,
     value: vi.fn(() => "blob:claimed-attachment"),
@@ -81,5 +82,37 @@ describe("MarkdownRender resource targets", () => {
     const image = await screen.findByRole("img", { name: "Fixture attachment" });
     expect(image).toHaveAttribute("src", "blob:claimed-attachment");
     expect(image).toHaveAttribute("data-markdown-target", ATTACHMENT);
+  });
+
+  it("refreshes a public image grant through the common renderer", async () => {
+    let grant = "expired";
+    apiMocks.publicationAssetUrl.mockImplementation(
+      (_slug: string, assetId: string) => `/public/${assetId}?grant=${grant}`,
+    );
+    apiMocks.refreshPublicationViewGrant.mockImplementation(async () => {
+      grant = "renewed";
+      return grant;
+    });
+
+    render(
+      <MarkdownRender
+        markdown={`![Published diagram](${ATTACHMENT})`}
+        assetContext={{ mode: "publication", slug: "release" }}
+      />,
+    );
+
+    const image = await screen.findByRole("img", { name: "Published diagram" });
+    expect(image).toHaveAttribute(
+      "src",
+      `/public/123e4567-e89b-42d3-a456-426614174000?grant=expired`,
+    );
+    fireEvent.error(image);
+    await waitFor(() =>
+      expect(image).toHaveAttribute(
+        "src",
+        `/public/123e4567-e89b-42d3-a456-426614174000?grant=renewed`,
+      ),
+    );
+    expect(apiMocks.refreshPublicationViewGrant).toHaveBeenCalledWith("release");
   });
 });

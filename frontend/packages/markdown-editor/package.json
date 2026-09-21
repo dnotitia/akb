@@ -1,6 +1,6 @@
 {
   "name": "@akb/markdown-editor",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Product-neutral Tiptap Markdown editor, viewer, and conformance contract for AKB and Reef.",
   "type": "module",
   "sideEffects": false,

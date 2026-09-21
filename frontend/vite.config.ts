@@ -10,7 +10,11 @@ const target = process.env.AKB_FRONTEND_BACKEND_URL || "http://localhost:8000";
 const cacheDir = process.env.AKB_FRONTEND_CACHE_DIR;
 const isHttps = false;
 const requestedMockScenario = process.env.AKB_FE_E2E_SCENARIO || "empty";
-const mockScenario = ["document-edit-recovery", "markdown-reference-adapters"].includes(requestedMockScenario)
+const mockScenario = [
+  "document-edit-recovery",
+  "markdown-reference-adapters",
+  "markdown-image-rendering",
+].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
 const FIXTURE_PNG = Buffer.from(
@@ -41,6 +45,7 @@ type MockFixtureAsset = {
   filename: string;
   status: "unclaimed" | "claimed" | "discarded";
   expires_at?: string;
+  content?: "valid" | "invalid";
 };
 
 type MockFixtureState = {
@@ -71,6 +76,23 @@ function createMockFixtureState(): MockFixtureState {
         status: "claimed" as const,
         expires_at: "2099-01-01T00:00:00.000Z",
       }]
+    : mockScenario === "markdown-image-rendering"
+      ? [
+          {
+            id: "123e4567-e89b-42d3-a456-426614174000",
+            filename: "available.png",
+            status: "claimed" as const,
+            expires_at: "2099-01-01T00:00:00.000Z",
+            content: "valid" as const,
+          },
+          {
+            id: "123e4567-e89b-42d3-a456-426614174002",
+            filename: "decode-failure.png",
+            status: "claimed" as const,
+            expires_at: "2099-01-01T00:00:00.000Z",
+            content: "invalid" as const,
+          },
+        ]
     : [];
   return {
     remote_document: null,
@@ -107,25 +129,49 @@ function currentFixtureDocument(): MockFixtureDocument {
       ].join("\n"),
     };
   }
+  if (mockScenario === "markdown-image-rendering") {
+    return {
+      ...BASE_FIXTURE_DOCUMENT,
+      title: "Image rendering fixture",
+      content: [
+        "# Image rendering fixture",
+        "",
+        "![Available image](/api/assets/123e4567-e89b-42d3-a456-426614174000)",
+        "",
+        "![Request failure](/api/assets/123e4567-e89b-42d3-a456-426614174001)",
+        "",
+        "![Decode failure](/api/assets/123e4567-e89b-42d3-a456-426614174002)",
+      ].join("\n"),
+    };
+  }
   return BASE_FIXTURE_DOCUMENT;
 }
 
 function fixtureStateSnapshot() {
   const document = currentFixtureDocument();
   const referenceScenario = mockScenario === "markdown-reference-adapters";
+  const imageScenario = mockScenario === "markdown-image-rendering";
   return {
     scenario: mockScenario,
     reset_generation: mockResetGeneration,
     identity: {
       user_id: "u-jylkim",
       vault: "fixture",
-      document_path: referenceScenario ? "notes/references.md" : "notes/recovery.md",
+      document_path: referenceScenario
+        ? "notes/references.md"
+        : imageScenario
+          ? "notes/images.md"
+          : "notes/recovery.md",
       document_uri: referenceScenario
         ? "akb://fixture/coll/notes/doc/references.md"
-        : "akb://fixture/coll/notes/doc/recovery.md",
+        : imageScenario
+          ? "akb://fixture/coll/notes/doc/images.md"
+          : "akb://fixture/coll/notes/doc/recovery.md",
       start_url: referenceScenario
         ? "/vault/fixture/doc/notes%2Freferences.md"
-        : "/vault/fixture/doc/notes%2Frecovery.md?view=edit",
+        : imageScenario
+          ? "/vault/fixture/doc/notes%2Fimages.md"
+          : "/vault/fixture/doc/notes%2Frecovery.md?view=edit",
       actors: ["editor-a", "editor-b"],
     },
     document,
@@ -209,7 +255,7 @@ function mockDescriptor(origin: string) {
           },
         },
       }
-    : mockScenario === "markdown-reference-adapters"
+      : mockScenario === "markdown-reference-adapters"
       ? {
           identity: {
             user_id: "u-jylkim",
@@ -238,6 +284,25 @@ function mockDescriptor(origin: string) {
             },
           },
         }
+      : mockScenario === "markdown-image-rendering"
+        ? {
+            identity: {
+              user_id: "u-jylkim",
+              vault: "fixture",
+              document_path: "notes/images.md",
+              document_uri: "akb://fixture/coll/notes/doc/images.md",
+              start_url: `${origin}/vault/fixture/doc/notes%2Fimages.md`,
+              actors: ["reader-a", "editor-a"],
+            },
+            operations: {
+              state: { method: "GET", url: `${origin}/__akb_mock__/fixture/state` },
+              refetch: {
+                method: "POST",
+                url: `${origin}/__akb_mock__/fixture/refetch`,
+                body: {},
+              },
+            },
+          }
       : null;
   return {
     schema_version: 2,
