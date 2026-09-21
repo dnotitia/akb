@@ -1175,12 +1175,44 @@ async def _batch_resolve_names(
 
 # ── Helpers ───────────────────────────────────────────────────
 
+_DOC_EXISTS_LEGACY = "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2"
+_DOC_EXISTS_NATIVE = (
+    "SELECT 1 FROM native_resources WHERE namespace_id = $1 "
+    "AND surface = 'document' AND lifecycle = 'live' AND current_path = $2"
+)
+
+
+async def _document_exists(conn, vault_id: uuid.UUID, path: str) -> bool:
+    """True when either authority serves a document at ``path``.
+
+    The legacy `documents` catalog is written only by the bare-Git path; on
+    `postgres_native` the native arm writes `native_resources` and never
+    touches it (`document_service.newest_public_slug` — "the native-ledger arm
+    keeps no legacy projection"). Asking the catalog alone therefore answers
+    "no such document" for everything written after a vault's cutover, which
+    made `akb_link` reject a freshly created document as a missing endpoint
+    while `akb_get` served it — and silently dropped the body-link edges that
+    `_store_edge` extracts from it.
+
+    Both arms are asked on a native installation rather than only the
+    authoritative one, because a cutover leaves the pre-cutover documents in
+    the catalog: an endpoint that resolved yesterday must not stop resolving.
+    `lifecycle` matches `document_counters`' population — a deleted resource is
+    not an endpoint; an archived one is still live here.
+    """
+    if await conn.fetchval(_DOC_EXISTS_LEGACY, vault_id, path):
+        return True
+    from app.services.document_counters import native_documents_are_authoritative
+
+    if not native_documents_are_authoritative():
+        return False
+    return bool(await conn.fetchval(_DOC_EXISTS_NATIVE, vault_id, path))
+
+
 async def _resource_exists(conn, vault_id: uuid.UUID, rtype: str, identifier: str) -> bool:
     """Check if a resource actually exists in the database."""
     if rtype == "doc":
-        return bool(await conn.fetchval(
-            "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2", vault_id, identifier,
-        ))
+        return await _document_exists(conn, vault_id, identifier)
     elif rtype == "table":
         return bool(await conn.fetchval(
             "SELECT 1 FROM vault_tables WHERE vault_id = $1 AND name = $2", vault_id, identifier,

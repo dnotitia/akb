@@ -260,3 +260,75 @@ async def test_overview_and_health_scope_counts_to_both_uri_authorities(monkeypa
         for query, args in observed
         if "FROM edges" in query
     )
+
+
+# ── Native-ledger endpoints (akb#525 follow-up) ───────────────
+#
+# A document written by the native arm has no `documents` row, so a graph
+# endpoint check that only reads the legacy catalog rejects it.
+
+
+class _DocCatalogConnection:
+    """Answers the two document-existence queries, tracking which ran."""
+
+    def __init__(self, *, legacy: bool, native: bool) -> None:
+        self.legacy = legacy
+        self.native = native
+        self.queries: list[str] = []
+
+    async def fetchval(self, query: str, *_args):
+        self.queries.append(query)
+        if "FROM documents" in query:
+            return 1 if self.legacy else None
+        if "FROM native_resources" in query:
+            return 1 if self.native else None
+        return None
+
+
+@pytest.mark.asyncio
+async def test_native_only_document_is_a_valid_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: True,
+    )
+    conn = _DocCatalogConnection(legacy=False, native=True)
+
+    assert await kg_service._resource_exists(conn, VAULT_ID, "doc", "specs/a.md") is True
+    assert any("native_resources" in q for q in conn.queries)
+
+
+@pytest.mark.asyncio
+async def test_pre_cutover_document_still_resolves_on_a_native_installation(monkeypatch):
+    """A cutover leaves pre-cutover documents in the catalog — keep them linkable."""
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: True,
+    )
+    conn = _DocCatalogConnection(legacy=True, native=False)
+
+    assert await kg_service._resource_exists(conn, VAULT_ID, "doc", "specs/a.md") is True
+    assert not any("native_resources" in q for q in conn.queries)
+
+
+@pytest.mark.asyncio
+async def test_legacy_installation_never_queries_the_native_ledger(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: False,
+    )
+    conn = _DocCatalogConnection(legacy=False, native=True)
+
+    assert await kg_service._resource_exists(conn, VAULT_ID, "doc", "specs/a.md") is False
+    assert not any("native_resources" in q for q in conn.queries)
+
+
+@pytest.mark.asyncio
+async def test_missing_document_is_rejected_by_both_arms(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: True,
+    )
+    conn = _DocCatalogConnection(legacy=False, native=False)
+
+    assert await kg_service._resource_exists(conn, VAULT_ID, "doc", "specs/gone.md") is False
+    assert sum("FROM documents" in q or "FROM native_resources" in q for q in conn.queries) == 2
