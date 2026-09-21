@@ -27,6 +27,7 @@ import hashlib
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 import asyncpg
 
@@ -34,6 +35,11 @@ from app.db.postgres import get_pool
 from app.services import delete_worker
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.document_service import _parse_markdown
+from app.services.kg_service import (
+    delete_document_relations,
+    delete_implicit_document_relations,
+    store_document_relations,
+)
 from app.services.index_service import (
     Chunk,
     build_doc_metadata_header,
@@ -88,6 +94,35 @@ def _indexable(canonical_text: str) -> str:
     whole entry in ranked search are not comparable losses.
     """
     return canonical_text.replace("\x00", "")
+
+
+class DocumentRelations(NamedTuple):
+    """The graph inputs one document body carries."""
+
+    depends_on: list[str]
+    related_to: list[str]
+    implements: list[str]
+    body: str
+
+
+def build_native_document_relations(canonical_text: str) -> DocumentRelations:
+    """Frontmatter relation lists + the body the link scanner reads.
+
+    Kept beside the chunk builder because both are pure parses of the same
+    verified Head body and both belong to one derived rewrite.
+    """
+    metadata, body = _parse_markdown(_indexable(canonical_text))
+
+    def refs(key: str) -> list[str]:
+        value = metadata.get(key)
+        return [str(ref) for ref in value] if isinstance(value, list) else []
+
+    return DocumentRelations(
+        depends_on=refs("depends_on"),
+        related_to=refs("related_to"),
+        implements=refs("implements"),
+        body=body,
+    )
 
 
 def build_native_document_chunks(
@@ -501,7 +536,13 @@ class NativeDerivedWorker:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 resource = await conn.fetchrow(
-                    "SELECT lifecycle, head_revision_id FROM native_resources WHERE resource_id = $1 FOR UPDATE",
+                    """
+                    SELECT r.lifecycle, r.head_revision_id, r.current_path, r.surface,
+                           v.name AS vault_name
+                      FROM native_resources r
+                      JOIN vaults v ON v.id = r.namespace_id
+                     WHERE r.resource_id = $1 FOR UPDATE OF r
+                    """,
                     intent["resource_id"],
                 )
                 if resource is None or resource["head_revision_id"] != intent["revision_id"]:
@@ -533,6 +574,12 @@ class NativeDerivedWorker:
                     intent["resource_id"],
                     source_type_for_surface(intent["surface"]),
                 )
+                if resource["surface"] == "document":
+                    # A deleted document is not a graph endpoint any more, in
+                    # either direction — the legacy delete clears the same rows.
+                    await delete_document_relations(
+                        conn, resource["vault_name"], resource["current_path"],
+                    )
                 await conn.execute(
                     "DELETE FROM native_derived_heads WHERE resource_id = $1",
                     intent["resource_id"],
@@ -551,7 +598,7 @@ class NativeDerivedWorker:
     async def _apply_live(self, intent: dict, head: dict) -> int:
         source_type = source_type_for_surface(intent["surface"])
 
-        def prepare() -> tuple[str, list[Chunk]]:
+        def prepare() -> tuple[str, list[Chunk], DocumentRelations | None]:
             canonical = verify_native_head_body(head)
             canonical_text = canonical.decode("utf-8", errors="strict")
             if intent["surface"] == "file":
@@ -561,15 +608,17 @@ class NativeDerivedWorker:
                     resource_id=head["resource_id"],
                     canonical_text=canonical_text,
                 )
+                relations = None
             else:
                 chunks = build_native_document_chunks(
                     vault_name=head["vault_name"],
                     path=head["current_path"],
                     canonical_text=canonical_text,
                 )
-            return hashlib.sha256(canonical).hexdigest(), chunks
+                relations = build_native_document_relations(canonical_text)
+            return hashlib.sha256(canonical).hexdigest(), chunks, relations
 
-        digest, chunks = await asyncio.to_thread(
+        digest, chunks, relations = await asyncio.to_thread(
             prepare,
         )
         async with self.pool.acquire() as conn:
@@ -599,6 +648,30 @@ class NativeDerivedWorker:
                     )
                     return 0
                 await self._drop_chunks(conn, intent["resource_id"], source_type)
+                if relations is not None:
+                    # The graph half of the same rewrite. `store_document_relations`
+                    # clears the implicit rows under the path it is about to write,
+                    # so only a path change needs the previous one cleared too — a
+                    # move otherwise leaves the old URI's body links behind. Explicit
+                    # `akb_link` rows are never touched here; the move carries them.
+                    previous_path = await conn.fetchval(
+                        "SELECT path FROM native_derived_heads WHERE resource_id = $1",
+                        intent["resource_id"],
+                    )
+                    if previous_path and previous_path != resource["current_path"]:
+                        await delete_implicit_document_relations(
+                            conn, head["vault_name"], previous_path,
+                        )
+                    await store_document_relations(
+                        conn,
+                        intent["namespace_id"],
+                        head["vault_name"],
+                        resource["current_path"],
+                        relations.depends_on,
+                        relations.related_to,
+                        relations.implements,
+                        relations.body,
+                    )
                 await conn.execute(
                     """
                     INSERT INTO native_derived_heads (

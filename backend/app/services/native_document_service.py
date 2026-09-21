@@ -68,7 +68,10 @@ from app.services.document_service import (
 )
 from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.kg_service import validate_new_structured_relation_refs
+from app.services.kg_service import (
+    relink_resource_edges,
+    validate_new_structured_relation_refs,
+)
 from app.services.native_revision_service import (
     Failpoint,
     NativeRevisionService,
@@ -140,6 +143,61 @@ class NativeDocumentService(DocumentService):
         if vault_id is None:
             raise NotFoundError("Vault", vault)
         return vault_id
+
+    async def _register_collection(self, vault_id: uuid.UUID, path: str) -> None:
+        """Keep the `collections` catalog in step with a native write.
+
+        Browse renders folders from `collections` rows, which only the legacy
+        write path maintained (`document_service` calls the same
+        `get_or_create` for put and move). Without this a native document is
+        served at its path and counted in its collection's totals, while the
+        folder itself is missing from the parent listing — `akb_browse` on the
+        parent shows nothing, and deleting the "collection" reports it absent.
+
+        Mirrors the legacy arm exactly: the document's own collection, never
+        its ancestors, and nothing for a vault-root document.
+
+        Best-effort on purpose. The Revision is already committed and is the
+        authority; a catalog row that could not be written is a browse defect,
+        not a lost write, and the next document into the same collection
+        retries it. Failing the call here would report a successful write as
+        an error.
+        """
+        collection = path.rsplit("/", 1)[0] if "/" in path else ""
+        if not collection:
+            return
+        try:
+            await CollectionRepository(await self._pool()).get_or_create(vault_id, collection)
+        except Exception:
+            logger.warning(
+                "native write: collection catalog row not written for %s (vault %s)",
+                collection, vault_id, exc_info=True,
+            )
+
+    async def _relink_moved_edges(
+        self, vault_id: uuid.UUID, vault: str, *, old_path: str, new_path: str,
+    ) -> None:
+        """Carry the moved document's graph edges to its new URI.
+
+        The legacy move does this inline; both arms now call the same helper.
+        Explicit `akb_link` edges name a URI, and a move changes it — without
+        the rewrite an agent's links point at a path nothing writes to, and
+        `akb_relations` on the moved document comes back empty even though the
+        old URI still resolves through the move alias.
+
+        Implicit body-link edges are rewritten here too rather than left for
+        the derived worker: the worker re-extracts them from the new Head, but
+        only after the invalidation intent is applied, and it would otherwise
+        leave the old URI's rows behind until then.
+        """
+        if old_path == new_path:
+            return
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await relink_resource_edges(
+                    conn, vault_id, doc_uri(vault, old_path), doc_uri(vault, new_path),
+                )
 
     @staticmethod
     def _has_complete_native_frontmatter(frontmatter: dict) -> bool:
@@ -737,6 +795,7 @@ class NativeDocumentService(DocumentService):
                 asset_ids=asset_ids,
             )
         content_hash = _certified_content_hash(raw)
+        await self._register_collection(vault_id, final_path)
         return DocumentPutResponse(
             uri=doc_uri(req.vault, final_path),
             vault=req.vault,
@@ -1127,6 +1186,10 @@ class NativeDocumentService(DocumentService):
                 previous_revision=result.parent_revision_id,
                 previous_path=current.path,
             )
+        await self._relink_moved_edges(
+            vault_id, vault, old_path=current.path, new_path=result.path,
+        )
+        await self._register_collection(vault_id, result.path)
         return DocumentPutResponse(
             uri=doc_uri(vault, result.path),
             vault=vault,
