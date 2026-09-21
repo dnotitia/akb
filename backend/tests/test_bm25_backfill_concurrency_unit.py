@@ -158,11 +158,70 @@ async def test_writer_failure_drains_other_writer_before_pass_returns(monkeypatc
     monkeypatch.setattr(cli, "_apply", apply)
     try:
         with pytest.raises(ValueError, match="writer failed"):
-            await cli._pass(Pool(rows(4)), "v", None, writers=2)
+            await cli._pass(
+                Pool(rows(4)), "v", None, writers=2, write_batch_size=2,
+            )
         assert cleaned.is_set()
         assert not tasks
     finally:
         await cancel(tasks)
+
+
+async def test_pass_uses_bounded_writer_waves_and_pauses_after_cleanup(monkeypatch):
+    active = 0
+    peak = 0
+    applied = []
+    pauses = []
+    real_sleep = asyncio.sleep
+
+    async def apply(pool, schema, part):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        applied.append(len(part))
+        try:
+            # Give every task in this wave a chance to enter concurrently.
+            await real_sleep(0)
+            return len(part)
+        finally:
+            active -= 1
+
+    async def sleep(delay):
+        # A pause may not hold a writer task, transaction, or pool checkout.
+        assert active == 0
+        pauses.append(delay)
+
+    monkeypatch.setattr(cli, "_apply", apply)
+    monkeypatch.setattr(cli.asyncio, "sleep", sleep)
+
+    assert await cli._pass(
+        Pool(rows(7)),
+        "v",
+        None,
+        writers=2,
+        write_batch_size=2,
+        write_pause_secs=0.25,
+    ) == 7
+    assert applied == [2, 2, 2, 1]
+    assert peak == 2
+    assert pauses == [0.25]
+
+
+async def test_pass_default_preserves_four_balanced_writers_without_pause(monkeypatch):
+    applied = []
+
+    async def apply(pool, schema, part):
+        applied.append(len(part))
+        return len(part)
+
+    async def unexpected_sleep(_delay):
+        pytest.fail("the single default writer wave must not pause")
+
+    monkeypatch.setattr(cli, "_apply", apply)
+    monkeypatch.setattr(cli.asyncio, "sleep", unexpected_sleep)
+
+    assert await cli._pass(Pool(rows(cli._BATCH)), "v", None) == cli._BATCH
+    assert applied == [125, 125, 125, 125]
 
 
 async def test_retry_exhaustion_does_not_swallow_deadlock(monkeypatch):

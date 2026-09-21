@@ -84,14 +84,18 @@ Two things follow, and both are in this script rather than in advice:
   that index's cost is dominated by vocabulary breadth. `--prepare` adds only
   the column; `--index` builds it CONCURRENTLY at the end, over a column that
   is already full, so the build does not hold a ShareLock against every INSERT.
-- **The writes are split.** Overlapping the disk waits is the only lever that
-  works here: one writer measured 4-16 rows/s, two 32.3 and 32.5 (two
-  orderings, 0.6% apart), four 45-62. `--writers` defaults to four.
+- **The writes can be split and paced.** Overlapping the disk waits is the only
+  throughput lever that worked here: one writer measured 4-16 rows/s, two 32.3
+  and 32.5 (two orderings, 0.6% apart), four 45-62. `--write-batch-size`
+  bounds each statement, `--writers` bounds a concurrent wave, and
+  `--write-pause-secs` yields between completed waves. Conservative canaries
+  can tune those independently without changing the 500-row read page.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import random
 import sys
 import time
@@ -103,7 +107,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncpg
 
-from scripts.bm25_run_lock import run_exclusive
+from scripts.bm25_run_lock import run_bulk_exclusive, run_exclusive
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
@@ -390,8 +394,14 @@ async def _apply_once(pool, schema: str, rows) -> int:
     return int(res.split()[-1]) if res.startswith("UPDATE") else 0
 
 
-async def _pass(pool, schema: str, since: datetime | None,
-                writers: int = _WRITERS) -> int:
+async def _pass(
+    pool,
+    schema: str,
+    since: datetime | None,
+    writers: int = _WRITERS,
+    write_batch_size: int = _BATCH,
+    write_pause_secs: float = 0.0,
+) -> int:
     """One forward sweep over the primary key.
 
     Keyset pagination rather than a bare `WHERE ... LIMIT`: with the latter,
@@ -418,6 +428,7 @@ async def _pass(pool, schema: str, since: datetime | None,
     written = 0
     seen = 0
     started = time.monotonic()
+    completed_wave = False
     while True:
         async with pool.acquire() as c:
             args = (cursor, since) if since is not None else (cursor,)
@@ -426,20 +437,54 @@ async def _pass(pool, schema: str, since: datetime | None,
             break
         cursor = rows[-1]["chunk_id"]
         seen += len(rows)
-        # Split the batch and write the parts at once. Encoding still happens
-        # inside each part, so the tokenizer stays busy while the writes wait
-        # on disk — which is the whole reason this is split.
-        size = -(-len(rows) // writers)
-        parts = [rows[i:i + size] for i in range(0, len(rows), size)]
-        written += sum(await _gather_drained(
-            *(_apply(pool, schema, part) for part in parts)
-        ))
+        # Fixed-size write batches make the load knob independent from the
+        # reader page and writer count. Run only one writer-bounded wave at a
+        # time, and pause between completed waves only after every write task
+        # has returned (and therefore released its transaction and connection).
+        # Preserve the historical default split: one read page is balanced
+        # across the configured writers. The explicit batch size is a ceiling,
+        # so a smaller value can create additional paced waves without a larger
+        # value making the default writers ineffective.
+        balanced_size = -(-len(rows) // writers)
+        statement_size = min(write_batch_size, balanced_size)
+        parts = [
+            rows[i:i + statement_size]
+            for i in range(0, len(rows), statement_size)
+        ]
+        for i in range(0, len(parts), writers):
+            if completed_wave and write_pause_secs:
+                await asyncio.sleep(write_pause_secs)
+            wave = parts[i:i + writers]
+            written += sum(await _gather_drained(
+                *(_apply(pool, schema, part) for part in wave)
+            ))
+            completed_wave = True
         elapsed = time.monotonic() - started
         print(f"\r  {seen} read · {written} written · "
               f"{seen / elapsed:.0f}/s", end="", flush=True)
     if seen:
         print()
     return written
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _finite_nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number") from None
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return parsed
 
 
 async def main() -> None:
@@ -459,13 +504,23 @@ async def main() -> None:
                          "(ISO 8601); use the start of the previous pass")
     ap.add_argument("--tokenizer-processes", type=int, default=None,
                     help="Kiwi process pool size (default: the app setting)")
-    ap.add_argument("--writers", type=int, default=_WRITERS,
+    ap.add_argument("--writers", type=_positive_int, default=_WRITERS,
                     help=f"UPDATE statements in flight at once (default {_WRITERS}); "
                          "the write is disk-latency bound, so this is the knob "
                          "that matters")
+    ap.add_argument(
+        "--write-batch-size",
+        type=_positive_int,
+        default=_BATCH,
+        help=f"maximum rows per UPDATE statement (default {_BATCH})",
+    )
+    ap.add_argument(
+        "--write-pause-secs",
+        type=_finite_nonnegative_float,
+        default=0.0,
+        help="seconds to pause between writer waves (default 0)",
+    )
     args = ap.parse_args()
-    if args.writers < 1:
-        ap.error("--writers must be positive")
 
     since = datetime.fromisoformat(args.since) if args.since else None
     if since is not None and since.tzinfo is None:
@@ -511,7 +566,14 @@ async def main() -> None:
 
             sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
             try:
-                written = await _pass(pool, schema, since, args.writers)
+                written = await _pass(
+                    pool,
+                    schema,
+                    since,
+                    args.writers,
+                    args.write_batch_size,
+                    args.write_pause_secs,
+                )
             finally:
                 sparse_encoder.stop_tokenizer_pool()
 
@@ -531,7 +593,10 @@ async def main() -> None:
         if args.check:
             await execute()
         else:
-            await run_exclusive(pool, schema, execute, announce=True)
+            async def execute_with_vector_ownership():
+                await run_exclusive(pool, schema, execute, announce=True)
+
+            await run_bulk_exclusive(execute_with_vector_ownership)
     finally:
         if pool is not None:
             await pool.close()
