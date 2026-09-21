@@ -208,6 +208,13 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     details = exc.errors()
+    if request.url.path == "/api/v1/auth/tokens/issuance":
+        fields = [{"field": ".".join(str(part) for part in error["loc"] if part != "body") or "form",
+                   "code": error["type"], "message": error["msg"]} for error in details]
+        return JSONResponse(status_code=422, content=_error_payload(422, {
+            "code": "token_issuance_validation", "message": "Token issuance validation failed",
+            "details": {"fields": fields},
+        }))
     if request.url.path == "/api/v1/my/account/deletion":
         # Validation must never echo the password (including malformed request bodies).
         details = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in details]
@@ -324,6 +331,8 @@ async def _no_store_public_surfaces(request: Request, call_next):
             break
     if (
         path == "/api/v1/auth/config"
+        or path == "/api/v1/auth/tokens"
+        or path.startswith("/api/v1/auth/tokens/")
         or path.startswith("/api/v1/admin/")
         or path.startswith("/api/v1/app/installations/")
         or path.startswith("/api/v1/app/rollouts")

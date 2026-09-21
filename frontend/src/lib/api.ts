@@ -1114,7 +1114,7 @@ export const keycloakExchange = (code: string) =>
 
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>
   api<any>("/auth/tokens", { method: "POST", body: JSON.stringify({ name, scopes, expires_days }) });
-export const listPATs = () => api<{ tokens: any[] }>("/auth/tokens");
+export const listPATs = () => api<{ tokens: import("./api-pat-issuance").PatMetadata[] }>("/auth/tokens");
 export const revokePAT = (id: string) => api<any>(`/auth/tokens/${id}`, { method: "DELETE" });
 
 // ── Vaults ──

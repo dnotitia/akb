@@ -7,7 +7,7 @@ from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, StrictInt, field_validator
 
 from app.api.deps import get_credential_change_user, get_current_user
 from app.config import settings
@@ -16,7 +16,10 @@ from app.exceptions import (
     BrowserSessionNotReadyError,
     ForbiddenError,
     NotFoundError,
+    ConflictError,
 )
+from app.models.pat_issuance import NAME_MAX_LENGTH, PATIssuanceRequest
+from app.services.token_issuer_policy import require_issuer_carrier, validate_locked_issuer
 from app.services.access_service import VALID_WRITE_ACTIONS, check_vault_access
 from app.services.auth_service import (
     AuthenticatedUser,
@@ -69,7 +72,7 @@ class LoginRequest(NFCModel):
 
 class CreatePATRequest(NFCModel):
     name: str
-    expires_days: int | None = None
+    expires_days: StrictInt | None = Field(default=None, ge=0)
     scopes: list[str] | None = None
     key_class: str = "pat"
     # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
@@ -687,6 +690,7 @@ async def update_my_profile(
 async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(get_current_user)):
     from app.models.vault_scope import VaultScope
 
+    require_issuer_carrier(user)
     if req.key_class != "pat" and not user.is_admin:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -700,7 +704,36 @@ async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(
         vault_scope=scope,
         scopes=req.scopes,
         key_class=req.key_class,
+        issuer=user,
     )
+
+
+@router.get("/auth/tokens/capabilities", summary="Inspect versioned PAT issuance support")
+async def token_issuance_capabilities(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
+    from app.db.postgres import get_pool
+    require_issuer_carrier(user)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM users WHERE id=$1 FOR SHARE", uuid.UUID(user.user_id))
+            await validate_locked_issuer(conn, user, row, admin_route=False, key_class="pat")
+    response.headers["Cache-Control"] = "no-store"
+    return {"contract_version": 1, "user_id": user.user_id,
+            "permission_presets": [["read"], ["read", "write"]],
+            "expiration_modes": ["none", "days", "absolute"], "name_max_length": NAME_MAX_LENGTH,
+            "vault_scope_semantics": "write_restriction_sql_read_write"}
+
+
+@router.post("/auth/tokens/issuance", summary="Issue a PAT using a strict versioned contract")
+async def issue_token(req: PATIssuanceRequest, user: AuthenticatedUser = Depends(get_current_user)):
+    from app.models.vault_scope import VaultScope
+    require_issuer_carrier(user)
+    if req.expected_user_id != uuid.UUID(user.user_id):
+        raise ConflictError("The signed-in account changed. Review issuance again.", code="token_issuer_identity_changed")
+    result = await create_pat(user.user_id, req.name, issuer=user, scopes=req.scopes,
+                             vault_scope=VaultScope.parse_input(req.vault_scope.model_dump() if req.vault_scope else None),
+                             expires_days=req.expires_days, expires_at=req.expires_at)
+    return {"contract_version": 1, **result}
 
 
 @router.get("/auth/tokens", summary="List your PATs")

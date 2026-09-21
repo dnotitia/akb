@@ -4,7 +4,8 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import SettingsPage from "../settings";
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async () => ({
+  ...await vi.importActual<typeof import("@/lib/api")>("@/lib/api"),
   getMe: vi.fn().mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false }),
   listPATs: vi.fn(),
   adminListUsers: vi.fn(),

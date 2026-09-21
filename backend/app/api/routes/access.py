@@ -4,7 +4,7 @@ from typing import Literal
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt
 
 from app.api.deps import get_current_user
 from app.config import settings
@@ -931,7 +931,7 @@ async def admin_reset_user_password(
 
 class AdminMintTokenRequest(NFCModel):
     name: str
-    expires_days: int | None = None
+    expires_days: StrictInt | None = Field(default=None, ge=0)
     scopes: list[str] | None = None
     key_class: str = "pat"
     # Per-PAT vault scope (Option B). Optional ``{prefixes, extra_vaults}``;
@@ -964,7 +964,7 @@ async def admin_mint_user_token(
     token once, same shape as ``/auth/tokens``.
     """
     _require_admin(user)
-    return await _mint_admin_user_token(user_ref, req)
+    return await _mint_admin_user_token(user_ref, req, issuer=user)
 
 
 @router.post(
@@ -977,19 +977,23 @@ async def admin_mint_managed_user_token(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     _require_admin(user)
-    return await _mint_admin_user_token(user_ref, req, token_id=req.token_id)
+    return await _mint_admin_user_token(user_ref, req, issuer=user, token_id=req.token_id)
 
 
 async def _mint_admin_user_token(
     user_ref: str,
     req: AdminMintTokenRequest,
     *,
+    issuer: AuthenticatedUser,
     token_id: str | None = None,
 ):
     import uuid as _uuid
     from app.db.postgres import get_pool
     from app.models.vault_scope import VaultScope
     from app.services.auth_service import create_pat
+    from app.services.token_issuer_policy import require_issuer_carrier
+
+    require_issuer_carrier(issuer, admin_route=True)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1011,6 +1015,8 @@ async def _mint_admin_user_token(
         vault_scope=VaultScope.parse_input(req.vault_scope),
         scopes=req.scopes,
         key_class=req.key_class,
+        issuer=issuer,
+        admin_issuance=True,
     )
 
 

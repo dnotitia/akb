@@ -1345,6 +1345,9 @@ class Settings(BaseModel):
     # but otherwise not auto-recovered). Set to 0 to disable.
     # Enable only after every local-session issuer/verifier supports generation claims.
     account_self_service_enabled: bool = False
+    # Explicit machine authority for admin token provisioning only. PAT callers
+    # are never eligible; listed IDs must resolve to unscoped admin service keys.
+    admin_token_issuer_ids: list[uuid.UUID] = Field(default_factory=list)
 
     role_sync_reconcile_interval_secs: int = 3600
 

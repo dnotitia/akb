@@ -33,10 +33,10 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
           <DialogTitle>Connect an agent</DialogTitle>
           <DialogDescription>Choose your AI tool, add AKB, then try a read-only request.</DialogDescription>
         </DialogHeader>
-        {open && <ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onSecretCreated={() => setHasSecret(true)} onBusyChange={setBusy} />}
+        {open && <ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} />}
         <DialogFooter><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
       </DialogContent>
     </Dialog>
-    <ConfirmDialog open={confirmClose} onOpenChange={setConfirmClose} title="Have you saved your token?" description="This token cannot be shown again after closing. Save the token or client configuration somewhere private first. Closing does not revoke it." confirmLabel="I've saved it — close" cancelLabel="Keep setup open" onConfirm={close} />
+    <ConfirmDialog open={confirmClose} onOpenChange={setConfirmClose} title="Have you saved your token?" description="Unsaved token options will be discarded. Any new token cannot be shown again after closing; save it or its configuration somewhere private first. Closing does not revoke it." confirmLabel="I've saved it — close" cancelLabel="Keep setup open" onConfirm={close} />
   </>;
 }

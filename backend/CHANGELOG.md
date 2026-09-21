@@ -7,6 +7,29 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Personal access token issuance options
+
+Add versioned PAT capability discovery and strict issuance with permission
+presets, relative or absolute expiration, and Vault write restrictions. Shared
+connection setup exposes advanced options and a pre-submit authority summary;
+token metadata includes Vault scope, and replacement preserves restrictions and
+the original absolute expiration before separately revoking the old token.
+
+Ordinary document reads retain the user's readable Vault access; Vault scope
+limits writes and also confines raw SQL reads. This is not a new general-purpose
+Vault read isolation model. Token secrets remain visible only in the current
+creation session.
+
+**Compatibility:** PAT credentials can no longer mint tokens through self or
+administrator issuance routes. Machine provisioning requires an active service
+key explicitly listed in `admin_token_issuer_ids`, an administrator owner,
+unrestricted Vault scope and read/write authority. The allowlist defaults empty;
+operators must migrate control-plane callers before rollout. Legacy omitted,
+null or zero `expires_days` retains unlimited expiration, while negative,
+noncanonical and overflowing durations are rejected. Stored tokens are unchanged.
+Deploy all mint handlers before exposing v1 capabilities; advanced creation never
+silently retries against the legacy endpoint after dropping restrictions.
+
 ### Safe account lifecycle
 
 Add identity-bound account lifecycle preview, paginated deletion blockers,

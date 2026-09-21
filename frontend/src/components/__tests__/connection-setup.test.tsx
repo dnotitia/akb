@@ -1,18 +1,19 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionSetup } from "../connection-setup";
 import { QuickstartDialog } from "../quickstart-dialog";
-import { createPAT } from "@/lib/api";
+import { configureAuthTransport, setToken } from "@/lib/api";
+import { issuePat, getPatCapabilities } from "@/lib/api-pat-issuance";
 
-vi.mock("@/lib/api", () => ({ createPAT: vi.fn() }));
+vi.mock("@/lib/api-pat-issuance", async () => ({ ...await vi.importActual<typeof import("@/lib/api-pat-issuance")>("@/lib/api-pat-issuance"), issuePat: vi.fn(), getPatCapabilities: vi.fn() }));
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); configureAuthTransport("local"); setToken("fixture-session"); vi.mocked(getPatCapabilities).mockResolvedValue({ contract_version: 1, user_id: "00000000-0000-0000-0000-000000000001", name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" }); });
 
 describe("Connection setup", () => {
   it("does not create credentials or offer a placeholder config on open", () => {
     render(<ConnectionSetup mcpOauthEnabled={false} />);
-    expect(createPAT).not.toHaveBeenCalled();
+    expect(issuePat).not.toHaveBeenCalled();
     expect(screen.getByLabelText("AI tool")).toBeVisible();
     expect(screen.getByLabelText("Token name")).toBeVisible();
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
@@ -22,15 +23,16 @@ describe("Connection setup", () => {
 
   it("guards repeated submission and keeps failure recoverable", async () => {
     let reject!: (error: Error) => void;
-    vi.mocked(createPAT).mockImplementation(() => new Promise((_, no) => { reject = no; }));
+    vi.mocked(issuePat).mockImplementation(() => new Promise((_, no) => { reject = no; }));
     render(<ConnectionSetup mcpOauthEnabled={false} />);
     fireEvent.change(screen.getByLabelText("Token name"), { target: { value: "laptop" } });
     const form = screen.getByLabelText("Token name").closest("form")!;
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
     fireEvent.submit(form);
     fireEvent.submit(form);
-    expect(createPAT).toHaveBeenCalledTimes(1);
+    expect(issuePat).toHaveBeenCalledTimes(1);
     await act(async () => reject(new Error("Token creation unavailable")));
-    expect(screen.getByRole("alert")).toHaveTextContent("Token creation unavailable");
+    expect(screen.getByRole("alert")).toHaveTextContent("Creation result needs checking");
     expect(screen.getByLabelText("Token name")).toHaveValue("laptop");
   });
 
@@ -40,7 +42,7 @@ describe("Connection setup", () => {
     expect(screen.queryByLabelText("Token name")).toBeNull();
     expect(screen.getByText(/--transport http/)).toBeVisible();
     expect(screen.getByText(/This browser cannot verify/)).toBeVisible();
-    expect(createPAT).not.toHaveBeenCalled();
+    expect(issuePat).not.toHaveBeenCalled();
   });
 
   it("rejects a token prefix instead of putting it into a command", async () => {
@@ -59,7 +61,7 @@ describe("Connection setup", () => {
     await user.type(screen.getByLabelText("Full saved token"), "akb_complete_saved_secret");
     expect(screen.getByText(/npx akb-mcp/)).toHaveTextContent("akb_complete_saved_secret");
     expect(screen.getByText("3. Try it in your agent")).toBeVisible();
-    expect(createPAT).not.toHaveBeenCalled();
+    expect(issuePat).not.toHaveBeenCalled();
   });
 
   it("preserves an explicit token choice when the client changes", async () => {
@@ -76,7 +78,7 @@ describe("Connection setup", () => {
   });
 
   it("keeps a new secret available until closing is acknowledged", async () => {
-    vi.mocked(createPAT).mockResolvedValue({ token: "akb_fresh_secret", token_id: "t1", name: "laptop", prefix: "akb_fresh" });
+    vi.mocked(issuePat).mockResolvedValue({ token: "akb_fresh_secret", token_id: "t1", name: "laptop", prefix: "akb_fresh", verified: true });
     const user = userEvent.setup();
     const onOpenChange = vi.fn();
     render(<QuickstartDialog open onOpenChange={onOpenChange} mcpOauthEnabled={false} />);
@@ -91,7 +93,7 @@ describe("Connection setup", () => {
   });
 
   it("invalidates only a matching freshly created token", async () => {
-    vi.mocked(createPAT).mockResolvedValue({ token: "akb_fresh_secret", token_id: "fresh-id" });
+    vi.mocked(issuePat).mockResolvedValue({ token: "akb_fresh_secret", token_id: "fresh-id", name: "laptop", prefix: "akb_fresh", verified: true });
     const user = userEvent.setup();
     const { rerender } = render(<ConnectionSetup mcpOauthEnabled={false} />);
     await user.type(screen.getByLabelText("Token name"), "laptop");
