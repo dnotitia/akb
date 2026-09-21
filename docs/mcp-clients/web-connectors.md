@@ -28,6 +28,27 @@ Either run the realm setup script (recommended) or hand-edit the realm
 in the Keycloak admin console. The script is idempotent — re-running
 it is a no-op.
 
+The script needs a Keycloak **admin credential**, and which kind you have
+depends on how Keycloak was started. Give it whichever pair matches; it
+reads them from the environment only, never from the command line.
+
+If you deployed Keycloak from this repo's Kubernetes manifests
+(`deploy/k8s/standalone-sso/`, or the Helm chart's `sso` templates), the
+bootstrap admin is a **service account** — `KC_BOOTSTRAP_ADMIN_CLIENT_ID`
+with a secret, and no admin user exists. Use client credentials:
+
+```bash
+KC_ADMIN_CLIENT_ID=akb-bootstrap-temporary KC_ADMIN_CLIENT_SECRET=<...> \
+    python3 scripts/keycloak/setup-akb-mcp-oauth.py \
+        --kc https://auth.example.com \
+        --realm akb \
+        --audience https://akb.example.com/mcp
+```
+
+If you are running the local dev fixture
+(`deploy/keycloak-dev/broker-chain/compose.yaml`), the bootstrap admin is
+a **user**. Use the password grant:
+
 ```bash
 KC_ADMIN_USER=admin KC_ADMIN_PASS=<...> \
     python3 scripts/keycloak/setup-akb-mcp-oauth.py \
@@ -36,16 +57,54 @@ KC_ADMIN_USER=admin KC_ADMIN_PASS=<...> \
         --audience https://akb.example.com/mcp
 ```
 
+Either way the credential lives in the `master` realm, which is not the
+realm being configured. If your admin service account was instead created
+inside the target realm, set `KC_ADMIN_REALM` to that realm's name.
+
+Do not create an admin user just to satisfy the script — that adds an
+account the deployment deliberately did not create. Use the service-account
+form instead.
+
 It will:
 
 1. Add `localhost`, `127.0.0.1` to the realm's DCR `trusted-hosts`
-   policy (so Claude Code on the operator's laptop can DCR-register).
-2. Create `akb:vault:read` and `akb:vault:write` scopes with audience
+   policy (so Claude Code on the operator's laptop can DCR-register), and
+   turn OFF that policy's sender-host check.
+2. Delete the `Allowed Client Scopes` registration policy — **both**
+   subtypes, `anonymous` and `authenticated`. See the note on Protected
+   DCR below for why the authenticated one matters.
+3. Create `akb:vault:read` and `akb:vault:write` scopes with audience
    mappers pinned to the AKB `/mcp` URL.
-3. Add both scopes to `defaultOptionalClientScopes` so DCR clients can
+4. Add both scopes to `defaultOptionalClientScopes` so DCR clients can
    request them.
 
 If the realm already had any of the above, those steps no-op.
+
+### If you use Protected DCR (Initial Access Tokens)
+
+An Initial Access Token does **not** bypass client-registration policies.
+It switches which subtype applies: `anonymous` → `authenticated`. Keycloak
+ships `Allowed Client Scopes` on both, and both reject a spec-compliant DCR
+body for the same reason — it carries `scope=openid`, and `openid` is the
+OIDC sentinel rather than an entry in the realm's client-scope catalog, so
+no setting of the policy can permit it.
+
+Removing only the anonymous copy therefore leaves the *hardened* path
+broken while the open one works:
+
+```
+IAT + scope "openid profile email akb:vault:read akb:vault:write offline_access"
+  → 403 {"error":"insufficient_scope",
+         "error_description":"Policy 'Allowed Client Scopes' rejected request to
+          client-registration service. Details: Not permitted to use specified clientScope"}
+
+IAT, scope field omitted
+  → 201
+```
+
+The setup script removes both, so Protected DCR works after running it. The
+IAT is the gate on that path; `Consent Required`, `Trusted Hosts` (the
+redirect-URI check) and `Max Clients Limit` remain the other guards.
 
 ### Hand-edit checklist (if you skip the script)
 
@@ -60,11 +119,15 @@ In the Keycloak admin console, in your realm:
     redirect-URI guard is the meaningful check; the sender-IP check
     rejects every legitimate registration if left on.
 - **Realm Settings → Client Registration → Policies → Allowed Client
-  Scopes (anonymous)**: **Delete this policy.** Keycloak does not
-  list the OIDC sentinel scope `openid` in its client-scope catalog,
-  so the default policy rejects every spec-compliant DCR request
-  (Claude Code, claude.ai, ChatGPT all include `openid` in the DCR
-  scope field). The `Consent Required`, `Trusted Hosts` (URI), and
+  Scopes**: **Delete this policy from BOTH the anonymous and the
+  authenticated policy set.** Keycloak does not list the OIDC sentinel
+  scope `openid` in its client-scope catalog, so the default policy
+  rejects every spec-compliant DCR request (Claude Code, claude.ai,
+  ChatGPT all include `openid` in the DCR scope field) — and no
+  configuration of the policy permits it, because the value it would have
+  to allow is not a client scope. The authenticated copy is the one an
+  Initial Access Token registration hits; see the Protected DCR note
+  above. The `Consent Required`, `Trusted Hosts` (URI), and
   `Max Clients Limit` policies stay as the meaningful guards.
 - **Client Scopes → Create**: add `akb:vault:read` and `akb:vault:write`
   with the listed display + consent text. Add an `oidc-audience-mapper`
@@ -102,6 +165,23 @@ curl https://akb.example.com/.well-known/oauth-protected-resource
 Should return JSON with `resource`, `authorization_servers`, and
 `scopes_supported` (including `akb:vault:read`, `akb:vault:write`,
 `offline_access`).
+
+That document describes what AKB *expects*; it says nothing about whether
+the realm was actually configured. For that, check the `mcp_oauth` section
+of `/health`:
+
+```bash
+curl -s https://akb.example.com/health | jq .mcp_oauth
+```
+
+- `"status": "ok"` — the realm advertises a DCR registration endpoint and
+  both vault scopes. The audience mappers and the DCR policies are
+  admin-API state that AKB cannot read, so this is not a full all-clear.
+- `"status": "unconfigured"` — `missing` names what the realm does not
+  advertise, and `detail` names the setup script. Registration or token
+  minting will fail until it is run.
+- `"status": "unknown"` — AKB could not read the IdP's discovery document.
+  That is a statement about reachability, not about the realm.
 
 ## Add AKB to Claude Code
 

@@ -30,6 +30,38 @@ noncanonical and overflowing durations are rejected. Stored tokens are unchanged
 Deploy all mint handlers before exposing v1 capabilities; advanced creation never
 silently retries against the legacy endpoint after dropping restrictions.
 
+### The graph and the collections catalog follow the active authority
+
+- A document written by the native arm has no legacy `documents` row — that is
+  the design. The graph layer resolved endpoints through that catalog alone, so
+  on a `postgres_native` installation every document created after the vault's
+  cutover was rejected as a missing `akb_link` endpoint while `akb_get` served
+  it, and the `links_to` edges extracted from a body naming it were dropped.
+  `_resource_exists` now asks the native ledger through the same selector and
+  population the counters use, and keeps asking the catalog too: a cutover
+  leaves pre-cutover documents there, and an endpoint that resolved yesterday
+  must keep resolving (#637).
+- Browse renders a folder from a `collections` row, which only the legacy write
+  path maintained. A native document was served at its path and counted in its
+  collection's totals while the folder itself was absent from the parent
+  listing — and deleting that "collection" reported it missing. Native `put`
+  and `move` now register the document's own collection exactly as the legacy
+  arm does. Best-effort: the Revision is already committed and is the
+  authority, so a row that could not be written is a browse defect, not a lost
+  write (#638).
+- A native `move` kept the edges pointing at the old URI. The rewrite the
+  legacy move has always done is now one helper both arms call, so an agent's
+  explicit links survive a move (#638).
+- Frontmatter relations and body links become edges on the native arm again.
+  They belong to the derived rewrite, beside chunking: the worker already
+  re-reads the verified Head under a lock and replaces derived state in one
+  transaction. It clears the previous path's implicit rows when the path
+  changed, and drops every edge of a deleted document (#638).
+- Known gap: `akb_relations` names a native endpoint by its path rather than
+  its title. The name is present either way; resolving the human title means
+  reading and verifying the Head payload the way search hydration does, and
+  that join is not worth copying into the graph module (#638).
+
 ### A third sparse shape, `vchord`, stores BM25 terms in an index
 
 - `vector_store_sparse_shape` gains `vchord`, which keeps each chunk's terms in

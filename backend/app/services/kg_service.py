@@ -277,6 +277,63 @@ async def delete_document_relations(conn, vault_name: str, doc_path: str) -> Non
     await delete_resource_edges(conn, uri)
 
 
+async def delete_implicit_document_relations(conn, vault_name: str, doc_path: str) -> None:
+    """Drop only the body/frontmatter-derived edges a document owns at ``doc_path``.
+
+    `store_document_relations` clears the implicit rows under the URI it is
+    about to rewrite, which leaves the rows the document owned under a PREVIOUS
+    path when it moves. The derived rewrite calls this for the path it is
+    replacing; explicit `akb_link` rows are never touched — they are carried to
+    the new URI by :func:`relink_resource_edges`, not deleted.
+    """
+    await conn.execute(
+        "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
+        doc_uri(vault_name, doc_path),
+    )
+
+
+async def _relink_edge_column(conn, vault_id, column: str, old_uri: str, new_uri: str) -> None:
+    """Repoint edges referencing ``old_uri`` to ``new_uri`` on ``column``
+    ('source_uri' or 'target_uri') during a move. Rows that would duplicate an
+    edge already present at ``new_uri`` are skipped by the UPDATE (the
+    UNIQUE(source_uri, target_uri, relation_type) guard) and then dropped,
+    since they ARE such duplicates. ``column`` comes from a fixed internal set,
+    so the f-string interpolation is not an injection surface."""
+    other = "target_uri" if column == "source_uri" else "source_uri"
+    await conn.execute(
+        f"""
+        UPDATE edges e SET {column} = $1
+         WHERE e.vault_id = $2 AND e.{column} = $3
+           AND NOT EXISTS (
+             SELECT 1 FROM edges x
+              WHERE x.vault_id = $2 AND x.{column} = $1
+                AND x.{other} = e.{other}
+                AND x.relation_type = e.relation_type)
+        """,
+        new_uri, vault_id, old_uri,
+    )
+    await conn.execute(
+        f"DELETE FROM edges WHERE vault_id = $1 AND {column} = $2",
+        vault_id, old_uri,
+    )
+
+
+async def relink_resource_edges(conn, vault_id, old_uri: str, new_uri: str) -> None:
+    """Carry a moved resource's edges from its old URI to its new one.
+
+    Both endpoints are rewritten: the resource's own outgoing edges and every
+    edge that pointed at it. Without this a move silently drops the explicit
+    links an agent made with `akb_link` — the old URI keeps resolving through
+    the move alias, but the graph rows still name a path nothing writes to.
+
+    One helper for both revision arms. The legacy move had this inline; the
+    native move needs the identical behaviour, and two copies of a rewrite
+    whose correctness rests on a UNIQUE guard is how they drift.
+    """
+    await _relink_edge_column(conn, vault_id, "source_uri", old_uri, new_uri)
+    await _relink_edge_column(conn, vault_id, "target_uri", old_uri, new_uri)
+
+
 # ── Explicit link/unlink (agent-driven) ───────────────────────
 
 def canonicalize_resource_uri(parsed) -> str | None:
@@ -1175,12 +1232,44 @@ async def _batch_resolve_names(
 
 # ── Helpers ───────────────────────────────────────────────────
 
+_DOC_EXISTS_LEGACY = "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2"
+_DOC_EXISTS_NATIVE = (
+    "SELECT 1 FROM native_resources WHERE namespace_id = $1 "
+    "AND surface = 'document' AND lifecycle = 'live' AND current_path = $2"
+)
+
+
+async def _document_exists(conn, vault_id: uuid.UUID, path: str) -> bool:
+    """True when either authority serves a document at ``path``.
+
+    The legacy `documents` catalog is written only by the bare-Git path; on
+    `postgres_native` the native arm writes `native_resources` and never
+    touches it (`document_service.newest_public_slug` — "the native-ledger arm
+    keeps no legacy projection"). Asking the catalog alone therefore answers
+    "no such document" for everything written after a vault's cutover, which
+    made `akb_link` reject a freshly created document as a missing endpoint
+    while `akb_get` served it — and silently dropped the body-link edges that
+    `_store_edge` extracts from it.
+
+    Both arms are asked on a native installation rather than only the
+    authoritative one, because a cutover leaves the pre-cutover documents in
+    the catalog: an endpoint that resolved yesterday must not stop resolving.
+    `lifecycle` matches `document_counters`' population — a deleted resource is
+    not an endpoint; an archived one is still live here.
+    """
+    if await conn.fetchval(_DOC_EXISTS_LEGACY, vault_id, path):
+        return True
+    from app.services.document_counters import native_documents_are_authoritative
+
+    if not native_documents_are_authoritative():
+        return False
+    return bool(await conn.fetchval(_DOC_EXISTS_NATIVE, vault_id, path))
+
+
 async def _resource_exists(conn, vault_id: uuid.UUID, rtype: str, identifier: str) -> bool:
     """Check if a resource actually exists in the database."""
     if rtype == "doc":
-        return bool(await conn.fetchval(
-            "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2", vault_id, identifier,
-        ))
+        return await _document_exists(conn, vault_id, identifier)
     elif rtype == "table":
         return bool(await conn.fetchval(
             "SELECT 1 FROM vault_tables WHERE vault_id = $1 AND name = $2", vault_id, identifier,

@@ -53,6 +53,7 @@ from kiwipiepy import Kiwi
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.services import bm25_maintenance
 
 logger = logging.getLogger("akb.sparse_encoder")
 
@@ -605,7 +606,9 @@ async def encode_query(
 # ── Corpus stats recompute ────────────────────────────────────────
 
 
-_BM25_RECOMPUTE_LOCK_KEY = 987654321
+# Keep the private name as a rolling-compatibility alias for callers/tests
+# that still import it. The value is owned by the shared maintenance module.
+_BM25_RECOMPUTE_LOCK_KEY = bm25_maintenance.BM25_RECOMPUTE_LOCK_KEY
 
 
 async def _open_run(conn, tname: str, tver: str) -> dict:
@@ -671,7 +674,11 @@ async def _open_run(conn, tname: str, tver: str) -> dict:
     return dict(fresh)
 
 
-async def recompute_stats(batch_size: int = 500) -> dict:
+async def recompute_stats(
+    batch_size: int = 500,
+    *,
+    defer_if_vector_queue: bool = False,
+) -> dict:
     """Rebuild df (per term) and (total_docs, avgdl). Safe to run repeatedly.
 
     Streams chunks in keyset-paginated batches and accumulates document
@@ -695,6 +702,10 @@ async def recompute_stats(batch_size: int = 500) -> dict:
     waiting for the leader to finish.  With a durable cursor it does one more
     thing: the replica that takes the lock next continues the departing one's
     scan rather than starting over.
+
+    ``defer_if_vector_queue`` is enabled by the background refresher. Direct
+    callers retain the historical manual/initialization behavior and may
+    intentionally rebuild stats while chunks are waiting for vector indexing.
     """
     pool = await get_pool()
     tname, tver = tokenizer_info()
@@ -715,8 +726,30 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                 "vocab_size": None,
                 "tokenizer": f"{tname}@{tver}",
                 "skipped": True,
+                "skip_reason": bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD,
             }
         try:
+            # Take the exclusive legacy lock before observing the queue. The
+            # bulk maintenance guard holds a shared lock on this same key, so
+            # this ordering keeps the queue check and the start of the scan
+            # inside the race-free bulk exclusion boundary.
+            if (
+                defer_if_vector_queue
+                and await bm25_maintenance.vector_upsert_queue_nonempty(lock_conn)
+            ):
+                logger.info(
+                    "BM25 recompute deferred: vector upsert queue is nonempty"
+                )
+                return {
+                    "total_docs": None,
+                    "avgdl": None,
+                    "vocab_size": None,
+                    "tokenizer": f"{tname}@{tver}",
+                    "skipped": True,
+                    "skip_reason": (
+                        bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_VECTOR_QUEUE
+                    ),
+                }
             # The invalidation boundary belongs to the RUN, not to this call.
             # Chunk writes that commit while we are walking the corpus advance
             # the sequence past this value, so a later tick will conservatively
@@ -1011,13 +1044,18 @@ async def _refresh_tick(retry_secs: float = _SKIPPED_RETRY_SECS) -> int:
     """
     if not await _should_recompute():
         return 0
+    last_skip_reason = bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD
     for attempt in range(_SKIPPED_RETRIES + 1):
-        if not (await recompute_stats()).get("skipped"):
+        outcome = await recompute_stats(defer_if_vector_queue=True)
+        if not outcome.get("skipped"):
             return 0
+        reason = outcome.get("skip_reason")
+        if reason in bm25_maintenance.BM25_RECOMPUTE_SKIP_REASONS:
+            last_skip_reason = reason
         if attempt < _SKIPPED_RETRIES:
             await asyncio.sleep(retry_secs)
     logger.info(
-        "BM25 recompute deferred: the lock is held by a running recompute"
+        "BM25 recompute deferred after retries: %s", last_skip_reason
     )
     return 0
 
@@ -1087,6 +1125,7 @@ async def stats_snapshot() -> dict:
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
         current_revision = await _current_corpus_revision(conn)
         recompute = await _run_progress(conn)
+        recompute_active = await bm25_maintenance.active_bm25_recompute(conn)
     if not row:
         return {
             "total_docs": 0, "avgdl": 0.0,
@@ -1098,6 +1137,7 @@ async def stats_snapshot() -> dict:
             "pending_changes": current_revision,
             "last_recomputed_at": None,
             "recompute_in_flight": recompute,
+            "recompute_active": recompute_active,
         }
     source_revision = int(row["source_revision"] or 0)
     return {
@@ -1113,4 +1153,5 @@ async def stats_snapshot() -> dict:
             row["updated_at"].isoformat() if row["updated_at"] else None
         ),
         "recompute_in_flight": recompute,
+        "recompute_active": recompute_active,
     }

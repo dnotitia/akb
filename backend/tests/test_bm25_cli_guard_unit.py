@@ -11,6 +11,7 @@ pytestmark = pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [[], ["--prepare"], ["--index"], ["--check"]])
 async def test_modes_hold_ownership_except_read_only_check(monkeypatch, capsys, mode):
     calls = []
+    sweep_options = []
 
     class Connection:
         async def fetchval(self, query):
@@ -38,13 +39,19 @@ async def test_modes_hold_ownership_except_read_only_check(monkeypatch, capsys, 
 
     async def sweep(*args):
         calls.append("sweep")
+        sweep_options.append(args[-3:])
         return 0
 
     async def owned(pool, schema, operation, **kwargs):
         assert kwargs["announce"] is True
-        calls.append("locked")
+        calls.append("vector locked")
         await operation()
-        calls.append("unlocked")
+        calls.append("vector unlocked")
+
+    async def bulk_owned(operation):
+        calls.append("main locked")
+        await operation()
+        calls.append("main unlocked")
 
     monkeypatch.setattr(cli.sys, "argv", ["backfill", *mode])
     for name in ("init_db", "close_pool", "_prepare", "_build_index"):
@@ -54,17 +61,35 @@ async def test_modes_hold_ownership_except_read_only_check(monkeypatch, capsys, 
     monkeypatch.setattr(cli, "_counts", counts)
     monkeypatch.setattr(cli, "_pass", sweep)
     monkeypatch.setattr(cli, "run_exclusive", owned)
+    monkeypatch.setattr(cli, "run_bulk_exclusive", bulk_owned)
     monkeypatch.setattr(cli.sparse_encoder, "start_tokenizer_pool", lambda *_: None)
     monkeypatch.setattr(cli.sparse_encoder, "stop_tokenizer_pool", lambda: None)
     await cli.main()
-    assert ("locked" in calls) == (mode != ["--check"])
+    assert ("vector locked" in calls) == (mode != ["--check"])
+    assert ("main locked" in calls) == (mode != ["--check"])
     if not mode:
-        assert calls.index("locked") < calls.index("sweep") < calls.index("unlocked")
+        assert calls.index("main locked") < calls.index("vector locked")
+        assert calls.index("vector locked") < calls.index("sweep")
+        assert calls.index("sweep") < calls.index("vector unlocked")
+        assert calls.index("vector unlocked") < calls.index("main unlocked")
+        assert sweep_options == [(cli._WRITERS, cli._BATCH, 0.0)]
         assert "safe to flip" not in capsys.readouterr().out
     assert calls[-1] == "pool closed"
 
 
-@pytest.mark.parametrize("args", [["--check", "--prepare"], ["--index", "--check"], ["--writers", "0"]])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--check", "--prepare"],
+        ["--index", "--check"],
+        ["--writers", "0"],
+        ["--write-batch-size", "0"],
+        ["--write-batch-size", "nope"],
+        ["--write-pause-secs", "-0.1"],
+        ["--write-pause-secs", "nan"],
+        ["--write-pause-secs", "inf"],
+    ],
+)
 async def test_invalid_modes_rejected_before_connecting(monkeypatch, args):
     async def unexpected():
         pytest.fail("invalid arguments must not initialize DB")
