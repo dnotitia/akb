@@ -96,6 +96,7 @@ import type {
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
+  MarkdownImageOptions,
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
@@ -108,10 +109,24 @@ import type {
   MarkdownTargetResolverContext,
 } from '../types.js'
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
+export type { MarkdownImageClassNames, MarkdownImageLabels, MarkdownImageOptions } from '../types.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
   messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+}
+
+function releaseMarkdownResolutions(
+  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
+): void {
+  for (const resolution of resolutions.values()) {
+    if (resolution.status !== 'available' || !resolution.release) continue
+    try {
+      resolution.release()
+    } catch {
+      // A product release hook must never break the editor cleanup path.
+    }
+  }
 }
 
 class MarkdownReferenceOptionSource {
@@ -317,27 +332,43 @@ export function useMarkdownTargetResolutions(
   const [resolutionState, setResolutionState] = useState<{
     key: string
     resolutions: ReadonlyMap<string, MarkdownTargetResolution>
-  }>({ key: '', resolutions: EMPTY_RESOLUTIONS })
+    nonce: number
+  }>({ key: '', resolutions: EMPTY_RESOLUTIONS, nonce: -1 })
   const [refreshNonce, setRefreshNonce] = useState(0)
 
   useEffect(() => {
-    if (!resolver || targets.length === 0) return
-
     const controller = new AbortController()
+    let ownedResolutions: ReadonlyMap<string, MarkdownTargetResolution> | null = null
+
+    if (!resolver || targets.length === 0) {
+      return () => controller.abort()
+    }
+
     void resolveMarkdownTargets(resolver, targets, {
       vault,
       document,
       commit,
       signal: controller.signal,
     }).then(next => {
-      if (!controller.signal.aborted) setResolutionState({ key: resolutionKey, resolutions: next })
+      if (controller.signal.aborted) {
+        releaseMarkdownResolutions(next)
+        return
+      }
+      ownedResolutions = next
+      setResolutionState({ key: resolutionKey, resolutions: next, nonce: refreshNonce })
     })
 
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      if (ownedResolutions) releaseMarkdownResolutions(ownedResolutions)
+    }
   }, [commit, document, refreshNonce, resolutionKey, resolver, targets, vault])
 
   const targetResolutions =
-    resolver && targets.length > 0 && resolutionState.key === resolutionKey
+    resolver &&
+    targets.length > 0 &&
+    resolutionState.key === resolutionKey &&
+    resolutionState.nonce === refreshNonce
       ? resolutionState.resolutions
       : EMPTY_RESOLUTIONS
 
@@ -361,37 +392,216 @@ export function useMarkdownTargetResolutions(
       // Do not leave a stale signed/blob URL actionable while the refresh is
       // in flight. The surface will render the canonical target as pending
       // until the new resolution arrives.
-      setResolutionState({ key: '', resolutions: EMPTY_RESOLUTIONS })
+      setResolutionState({ key: '', resolutions: EMPTY_RESOLUTIONS, nonce: refreshNonce })
       setRefreshNonce(value => value + 1)
     }, delay)
     return () => window.clearTimeout(timer)
-  }, [nextRefreshAt])
+  }, [nextRefreshAt, refreshNonce])
 
   return targetResolutions
 }
 
-interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
+export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: Editor | null
   editable: boolean
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
+  image?: MarkdownImageOptions
   children?: ReactNode
 }
 
-function MarkdownSurface({
+const DEFAULT_MARKDOWN_IMAGE_LABELS = {
+  loading: (alt: string) => (alt ? `Loading image: ${alt}` : 'Loading image'),
+  unavailable: (alt: string) => (alt ? `Image unavailable: ${alt}` : 'Image unavailable'),
+}
+
+const DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES = {
+  frame: 'my-2 block max-w-full align-top',
+  image: 'block h-auto max-w-full',
+  message: 'flex min-h-24 max-w-full items-center justify-center rounded-[var(--radius-md)] bg-surface-2 px-4 py-6 text-sm text-foreground-muted',
+}
+
+type MarkdownImageDisplayState = 'available' | 'loading' | 'unavailable' | 'decode'
+
+function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefined): void {
+  if (resolution?.status !== 'available' || !resolution.release) return
+  try {
+    resolution.release()
+  } catch {
+    // Product cleanup is best effort and cannot interrupt the surface.
+  }
+}
+
+export function MarkdownSurface({
   editor,
   editable,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
+  image,
   children,
   ...props
 }: MarkdownSurfaceProps) {
+  useLayoutEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
+
   useEffect(() => {
     const root = editor?.view.dom
     if (!root) return
 
+    const labels = { ...DEFAULT_MARKDOWN_IMAGE_LABELS, ...image?.labels }
+    const classNames = { ...DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES, ...image?.classNames }
+    const imageOverrides = new Map<HTMLImageElement, MarkdownTargetResolution>()
+    const imageControllers = new Map<HTMLImageElement, AbortController>()
+    const imageListeners = new Map<HTMLImageElement, { error: () => void; load: () => void }>()
+    const imageForcedStates = new Map<
+      HTMLImageElement,
+      Exclude<MarkdownImageDisplayState, 'available'>
+    >()
+    const retryAttempted = new WeakSet<HTMLImageElement>()
+
+    const imageTarget = (frame: HTMLElement, element: HTMLImageElement): string | null =>
+      frame.dataset.markdownTarget ?? element.dataset.markdownTarget ?? null
+
+    const setImageMessage = (message: HTMLElement, value: string, visible: boolean) => {
+      if (message.textContent !== value) message.textContent = value
+      message.hidden = !visible
+      message.setAttribute('aria-hidden', visible ? 'false' : 'true')
+    }
+
+    const applyImage = (
+      frame: HTMLElement,
+      element: HTMLImageElement,
+      target: string,
+      forcedState?: Exclude<MarkdownImageDisplayState, 'available'>,
+      managedTarget = true,
+    ) => {
+      const message = frame.querySelector<HTMLElement>('[data-markdown-image-message]')
+      const alt = element.getAttribute('alt') ?? ''
+      const resolution = imageOverrides.get(element) ?? resolutions.get(target)
+      const state: MarkdownImageDisplayState = forcedState ?? imageForcedStates.get(element) ?? (
+        !resolution
+          ? resolvingTargets && managedTarget ? 'loading' : 'available'
+          : resolution.status === 'available' && resolution.runtimeUrl
+            ? 'available'
+            : 'unavailable'
+      )
+
+      frame.classList.add(...classNames.frame.split(/\s+/).filter(Boolean))
+      element.classList.add(...classNames.image.split(/\s+/).filter(Boolean))
+      if (message) message.classList.add(...classNames.message.split(/\s+/).filter(Boolean))
+      frame.style.display = 'block'
+      frame.style.maxWidth = '100%'
+      element.style.display = 'block'
+      element.style.maxWidth = '100%'
+      element.style.height = 'auto'
+      frame.dataset.markdownImageState = state
+      frame.dataset.markdownTarget = target
+      element.dataset.markdownTarget = target
+      element.dataset.markdownResolution = state === 'available' ? 'available' : state
+
+      if (state === 'available') {
+        const runtimeUrl = resolution?.status === 'available' && resolution.runtimeUrl
+          ? resolution.runtimeUrl
+          : target
+        element.setAttribute('src', runtimeUrl)
+        element.hidden = false
+        element.removeAttribute('aria-hidden')
+        frame.removeAttribute('role')
+        frame.removeAttribute('aria-label')
+        frame.removeAttribute('aria-live')
+        if (message) setImageMessage(message, '', false)
+        return
+      }
+
+      element.removeAttribute('src')
+      element.hidden = true
+      element.setAttribute('aria-hidden', 'true')
+      const label = state === 'loading' ? labels.loading(alt) : labels.unavailable(alt)
+      frame.setAttribute('role', state === 'loading' ? 'status' : 'img')
+      frame.setAttribute('aria-label', label)
+      if (state === 'loading') frame.setAttribute('aria-live', 'polite')
+      else frame.removeAttribute('aria-live')
+      if (message) setImageMessage(message, label, true)
+    }
+
+    const attachImageListeners = (frame: HTMLElement, element: HTMLImageElement, target: string) => {
+      if (imageListeners.has(element)) return
+      const load = () => {
+        retryAttempted.delete(element)
+        imageForcedStates.delete(element)
+      }
+      const error = () => {
+        const resolution = imageOverrides.get(element) ?? resolutions.get(target)
+        if (
+          resolution?.status === 'available' &&
+          resolution.refresh &&
+          !retryAttempted.has(element)
+        ) {
+          retryAttempted.add(element)
+          const previousController = imageControllers.get(element)
+          previousController?.abort()
+          const controller = new AbortController()
+          imageControllers.set(element, controller)
+          imageForcedStates.set(element, 'loading')
+          applyImage(frame, element, target, 'loading')
+          void resolution.refresh({ signal: controller.signal }).then(next => {
+            if (controller.signal.aborted) {
+              releaseMarkdownResolution(next)
+              return
+            }
+            const previous = imageOverrides.get(element)
+            if (previous && previous !== next) releaseMarkdownResolution(previous)
+            imageOverrides.set(element, next)
+            imageControllers.delete(element)
+            if (next.status === 'available' && next.runtimeUrl) {
+              imageForcedStates.delete(element)
+              applyImage(frame, element, target)
+            } else {
+              imageForcedStates.set(element, 'decode')
+              applyImage(frame, element, target, 'decode')
+            }
+          }).catch(() => {
+            if (controller.signal.aborted) return
+            imageControllers.delete(element)
+            imageForcedStates.set(element, 'decode')
+            applyImage(frame, element, target, 'decode')
+          })
+          return
+        }
+        imageForcedStates.set(element, 'decode')
+        applyImage(frame, element, target, 'decode')
+      }
+      element.addEventListener('load', load)
+      element.addEventListener('error', error)
+      imageListeners.set(element, { error, load })
+    }
+
     const applyResolutions = () => {
-      root.querySelectorAll<HTMLElement>('img[data-markdown-target], a[href]').forEach(element => {
+      const managedTargets = new Set(
+        extractMarkdownTargets(editor.getMarkdown()).map(({ target }) => target),
+      )
+      const frames = [...root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]')]
+      const framedImages = new Set<HTMLImageElement>()
+      for (const frame of frames) {
+        const element = frame.querySelector<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]')
+        if (!element) continue
+        const target = imageTarget(frame, element)
+        if (!target) continue
+        framedImages.add(element)
+        attachImageListeners(frame, element, target)
+        applyImage(frame, element, target, undefined, managedTargets.has(target))
+      }
+
+      root.querySelectorAll<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]').forEach(element => {
+        if (framedImages.has(element)) return
+        const target = element.dataset.markdownTarget
+        if (!target) return
+        attachImageListeners(element, element, target)
+        applyImage(element, element, target, undefined, managedTargets.has(target))
+      })
+
+      root.querySelectorAll<HTMLElement>('a[href]').forEach(element => {
         const target =
           element.dataset.markdownTarget ??
           (element.tagName === 'A' && element.getAttribute('href')?.startsWith('akb://')
@@ -405,12 +615,10 @@ function MarkdownSurface({
           if (resolvingTargets) {
             element.dataset.markdownResolution = 'pending'
             element.setAttribute('aria-disabled', 'true')
-            if (element.tagName === 'IMG') element.removeAttribute('src')
-            else element.setAttribute('href', '#')
+            element.setAttribute('href', '#')
             return
           }
-          if (element.tagName === 'IMG') element.setAttribute('src', target)
-          else element.setAttribute('href', target)
+          element.setAttribute('href', target)
           if (previousResolution === 'unavailable') element.removeAttribute('aria-label')
           element.removeAttribute('aria-disabled')
           delete element.dataset.markdownResolution
@@ -427,21 +635,35 @@ function MarkdownSurface({
         }
 
         element.dataset.markdownResolution = 'unavailable'
-        element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
-        if (element.tagName === 'IMG') element.removeAttribute('src')
-        else {
-          element.setAttribute('href', '#')
-          element.setAttribute('aria-disabled', 'true')
+        if (element.tagName === 'A') {
+          element.setAttribute('title', resolution.label ?? 'Reference unavailable')
+          element.removeAttribute('aria-label')
+        } else {
+          element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
         }
+        element.setAttribute('href', '#')
+        element.setAttribute('aria-disabled', 'true')
       })
     }
 
     applyResolutions()
     editor.on('transaction', applyResolutions)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(applyResolutions)
+    observer?.observe(root, { childList: true, subtree: true })
+
     return () => {
       editor.off('transaction', applyResolutions)
+      observer?.disconnect()
+      for (const [element, listeners] of imageListeners) {
+        element.removeEventListener('load', listeners.load)
+        element.removeEventListener('error', listeners.error)
+      }
+      for (const controller of imageControllers.values()) controller.abort()
+      for (const resolution of imageOverrides.values()) releaseMarkdownResolution(resolution)
     }
-  }, [editor, resolvingTargets, resolutions])
+  }, [editor, image, resolvingTargets, resolutions])
 
   return (
     <div
@@ -829,7 +1051,12 @@ export function MarkdownViewer({
     }
 
     editor.commands.setContent(markdown, { contentType: 'markdown' })
+    normalizeEditorBody(editor)
   }, [editor, markdown])
+
+  useEffect(() => {
+    if (editor) normalizeEditorBody(editor)
+  }, [editor])
 
   return (
     <MarkdownSurface

@@ -39,6 +39,10 @@ export type MarkdownTargetResolution =
        */
       expiresAt?: string
       label?: string
+      /** Release short-lived runtime resources owned by this resolution. */
+      release?: () => void
+      /** Retry a runtime resource after a browser decode/request failure. */
+      refresh?: (context?: MarkdownTargetRefreshContext) => Promise<MarkdownTargetResolution>
     }
   | {
       target: string
@@ -47,6 +51,26 @@ export type MarkdownTargetResolution =
       reason: MarkdownUnavailableReason
       label?: string
     }
+
+export interface MarkdownTargetRefreshContext {
+  signal?: AbortSignal
+}
+
+export interface MarkdownImageLabels {
+  loading: (alt: string) => string
+  unavailable: (alt: string) => string
+}
+
+export interface MarkdownImageClassNames {
+  frame?: string
+  image?: string
+  message?: string
+}
+
+export interface MarkdownImageOptions {
+  labels?: Partial<MarkdownImageLabels>
+  classNames?: MarkdownImageClassNames
+}
 
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile

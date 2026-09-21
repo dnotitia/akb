@@ -64,7 +64,13 @@ type FixtureState = {
   refetch_generation?: number;
   expire_draft_generation?: number;
   faults?: { save?: number; upload?: number };
-  assets?: Array<{ id: string; filename: string; status: string; expires_at?: string }>;
+  assets?: Array<{
+    id: string;
+    filename: string;
+    status: string;
+    expires_at?: string;
+    content?: "valid" | "invalid";
+  }>;
 };
 
 let fixtureState: FixtureState = {};
@@ -111,9 +117,29 @@ const referenceDocument = {
   ].join("\n"),
 };
 
+const imageRenderingDocument = {
+  ...baseDocument,
+  uri: "akb://fixture/coll/notes/doc/images.md",
+  path: "notes/images.md",
+  title: "Image rendering fixture",
+  content: [
+    "# Image rendering fixture",
+    "",
+    "![Available image](/api/assets/123e4567-e89b-42d3-a456-426614174000)",
+    "",
+    "![Request failure](/api/assets/123e4567-e89b-42d3-a456-426614174001)",
+    "",
+    "![Decode failure](/api/assets/123e4567-e89b-42d3-a456-426614174002)",
+  ].join("\n"),
+};
+
 function documentForState(): typeof baseDocument {
   const remote = fixtureState.document;
-  const template = isReferenceScenario() ? referenceDocument : baseDocument;
+  const template = isReferenceScenario()
+    ? referenceDocument
+    : isImageRenderingScenario()
+      ? imageRenderingDocument
+      : baseDocument;
   return remote
     ? { ...template, ...remote }
     : { ...template };
@@ -125,11 +151,17 @@ function documentForPath(path: string): typeof baseDocument {
 }
 
 function isDocumentScenario(): boolean {
-  return activeScenario === "document-edit-recovery" || activeScenario === "markdown-reference-adapters";
+  return activeScenario === "document-edit-recovery" ||
+    activeScenario === "markdown-reference-adapters" ||
+    activeScenario === "markdown-image-rendering";
 }
 
 function isReferenceScenario(): boolean {
   return activeScenario === "markdown-reference-adapters";
+}
+
+function isImageRenderingScenario(): boolean {
+  return activeScenario === "markdown-image-rendering";
 }
 
 function documentIdentity(): string {
@@ -286,7 +318,15 @@ const handlers = [
     await syncPublicReset();
     return HttpResponse.json({
       vaults: isDocumentScenario()
-        ? [{ name: "fixture", role: "owner", description: isReferenceScenario() ? "Reference adapter fixture" : "Document recovery fixture" }]
+        ? [{
+            name: "fixture",
+            role: "owner",
+            description: isReferenceScenario()
+              ? "Reference adapter fixture"
+              : isImageRenderingScenario()
+                ? "Image rendering fixture"
+                : "Document recovery fixture",
+          }]
         : [],
     });
   }),
@@ -294,7 +334,11 @@ const handlers = [
     await syncPublicReset();
     return HttpResponse.json({
       name: "fixture",
-      description: isReferenceScenario() ? "Reference adapter fixture" : "Document recovery fixture",
+      description: isReferenceScenario()
+        ? "Reference adapter fixture"
+        : isImageRenderingScenario()
+          ? "Image rendering fixture"
+          : "Document recovery fixture",
       role: "owner",
       member_count: 1,
       owner_display_name: "JY Kim",
@@ -551,9 +595,14 @@ const handlers = [
     if (!asset || asset.status === "discarded") {
       return new HttpResponse(null, { status: 404 });
     }
-    return new HttpResponse(fixturePngBlob(), {
+    return new HttpResponse(
+      asset.content === "invalid"
+        ? new Blob(["fixture-decode-failure"], { type: "image/png" })
+        : fixturePngBlob(),
+      {
       headers: { "Content-Type": "image/png" },
-    });
+      },
+    );
   }),
   http.get(`${API}/recent`, () => HttpResponse.json({ changes: [] })),
   http.get(`${API}/auth/tokens`, () => HttpResponse.json({ tokens: [] })),

@@ -1,8 +1,8 @@
 import * as React from "react";
 import {
-  EditorContent,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   MarkdownEditingSurface,
+  MarkdownSurface,
   MarkdownToolbar,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
@@ -17,13 +17,11 @@ import {
 import type {
   MarkdownAsset,
   MarkdownReferenceOptions,
-  MarkdownTargetResolution,
 } from "@akb/markdown-editor";
-import { discardAsset, getAssetBlob } from "@/lib/api";
+import { discardAsset } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
   canonicalAkbMarkdownTarget,
-  classifyAkbMarkdownTarget,
   createAkbMarkdownAdapters,
 } from "@/lib/markdown-adapters";
 import {
@@ -103,232 +101,6 @@ function imageAssetIdsFromMarkdown(markdown: string): string[] {
 
 function editorContentElement(root: HTMLDivElement | null): HTMLElement | null {
   return root?.querySelector<HTMLElement>(".ProseMirror") ?? null;
-}
-
-function applyMarkdownTargetResolutions(
-  root: HTMLElement,
-  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
-  resolving: boolean,
-): void {
-  const setAttribute = (element: HTMLElement, name: string, value: string) => {
-    if (element.getAttribute(name) !== value) element.setAttribute(name, value);
-  };
-  const removeAttribute = (element: HTMLElement, name: string) => {
-    if (element.hasAttribute(name)) element.removeAttribute(name);
-  };
-  root
-    .querySelectorAll<HTMLElement>("img[data-markdown-target], a[href]")
-    .forEach((element) => {
-      const rawTarget =
-        element.dataset.markdownTarget ??
-        (element.tagName === "A" ? element.getAttribute("href") : null);
-      if (!rawTarget) return;
-
-      const target = canonicalAkbMarkdownTarget(rawTarget);
-      const kind = target ? classifyAkbMarkdownTarget(target) : null;
-      if (!target || !kind) return;
-
-      setAttribute(element, "data-markdown-target", target);
-      // Private attachment bytes are loaded through the authenticated adapter
-      // below. Never replace that source with an unauthenticated browser URL.
-      if (element.tagName === "IMG" && kind === "attachment") return;
-
-      const resolution = resolutions.get(target);
-      if (!resolution) {
-        if (!resolving) return;
-        setAttribute(element, "data-markdown-resolution", "pending");
-        setAttribute(element, "aria-disabled", "true");
-        if (element.tagName === "A") setAttribute(element, "href", "#");
-        return;
-      }
-
-      if (resolution.status === "available" && resolution.runtimeUrl) {
-        if (element.tagName === "IMG")
-          setAttribute(element, "src", resolution.runtimeUrl);
-        else setAttribute(element, "href", resolution.runtimeUrl);
-        setAttribute(element, "data-markdown-resolution", "available");
-        removeAttribute(element, "aria-disabled");
-        removeAttribute(element, "aria-label");
-        removeAttribute(element, "title");
-        return;
-      }
-
-      setAttribute(element, "data-markdown-resolution", "unavailable");
-      if (element.tagName === "A") {
-        setAttribute(
-          element,
-          "title",
-          resolution.label ?? "Reference unavailable",
-        );
-        removeAttribute(element, "aria-label");
-      } else
-        setAttribute(
-          element,
-          "aria-label",
-          resolution.label ?? "Reference unavailable",
-        );
-      setAttribute(element, "aria-disabled", "true");
-      if (element.tagName === "A") setAttribute(element, "href", "#");
-    });
-}
-
-function useTargetResolutionDom(
-  rootRef: React.RefObject<HTMLDivElement | null>,
-  editor: MarkdownEditorInstance | null,
-  resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
-  resolving: boolean,
-): void {
-  React.useLayoutEffect(() => {
-    if (!editor) return;
-    const root = editor.view.dom as HTMLElement;
-
-    const apply = () => {
-      applyMarkdownTargetResolutions(root, resolutions, resolving);
-    };
-    apply();
-    let retryCount = 0;
-    let timer: number | null = null;
-    const retry = () => {
-      apply();
-      retryCount += 1;
-      if (retryCount < 8) timer = window.setTimeout(retry, 10);
-    };
-    retry();
-    editor.on("transaction", apply);
-    const observer =
-      typeof MutationObserver === "undefined"
-        ? null
-        : new MutationObserver(apply);
-    observer?.observe(root, {
-      attributes: true,
-      attributeFilter: ["href", "aria-disabled", "data-markdown-resolution"],
-      childList: true,
-      subtree: true,
-    });
-    return () => {
-      editor.off("transaction", apply);
-      observer?.disconnect();
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [editor, resolutions, resolving, rootRef]);
-}
-
-/** Load private assets with the authenticated API while leaving Markdown's
- * canonical `/api/assets/<uuid>` target unchanged in the editor model. */
-function usePrivateImageSources(
-  rootRef: React.RefObject<HTMLDivElement | null>,
-  editor: MarkdownEditorInstance | null,
-  vault: string,
-  document?: string,
-  commit?: string,
-): void {
-  const entriesRef = React.useRef(
-    new Map<string, { controller: AbortController; url?: string }>(),
-  );
-
-  React.useEffect(() => {
-    if (!editor) return;
-    const root = editor.view.dom as HTMLElement;
-
-    const contextKey = `${vault}\u0000${document ?? ""}\u0000${commit ?? ""}`;
-    const sync = () => {
-      const images = [
-        ...root.querySelectorAll<HTMLImageElement>("img[data-markdown-target]"),
-      ];
-      const seen = new Set<string>();
-
-      for (const image of images) {
-        const target = canonicalAkbMarkdownTarget(
-          image.dataset.markdownTarget ?? "",
-          "attachment",
-        );
-        const assetId = target ? assetIdFromUrl(target) : null;
-        if (!target || !assetId) continue;
-
-        const key = `${contextKey}\u0000${assetId}`;
-        seen.add(key);
-        const existing = entriesRef.current.get(key);
-        if (existing) {
-          if (existing.url) image.src = existing.url;
-          continue;
-        }
-
-        const controller = new AbortController();
-        entriesRef.current.set(key, { controller });
-        void getAssetBlob(
-          assetId,
-          vault,
-          controller.signal,
-          document && commit ? { document, commit } : undefined,
-        )
-          .then((blob) => {
-            if (controller.signal.aborted) return;
-            const url =
-              typeof URL.createObjectURL === "function"
-                ? URL.createObjectURL(blob)
-                : target;
-            entriesRef.current.set(key, { controller, url });
-            root
-              .querySelectorAll<HTMLImageElement>(
-                `img[data-markdown-target="${target}"]`,
-              )
-              .forEach((element) => {
-                element.src = url;
-                element.dataset.markdownResolution = "available";
-              });
-          })
-          .catch(() => {
-            if (controller.signal.aborted) return;
-            root
-              .querySelectorAll<HTMLImageElement>(
-                `img[data-markdown-target="${target}"]`,
-              )
-              .forEach((element) => {
-                element.removeAttribute("src");
-                element.dataset.markdownResolution = "unavailable";
-                element.setAttribute("aria-label", "Image unavailable");
-              });
-            entriesRef.current.set(key, { controller });
-          });
-      }
-
-      for (const [key, entry] of entriesRef.current) {
-        if (seen.has(key)) continue;
-        entry.controller.abort();
-        if (
-          entry.url?.startsWith("blob:") &&
-          typeof URL.revokeObjectURL === "function"
-        ) {
-          URL.revokeObjectURL(entry.url);
-        }
-        entriesRef.current.delete(key);
-      }
-    };
-
-    sync();
-    editor.on("transaction", sync);
-    const observer =
-      typeof MutationObserver === "undefined"
-        ? null
-        : new MutationObserver(sync);
-    observer?.observe(root, { childList: true, subtree: true });
-    const entries = entriesRef.current;
-
-    return () => {
-      editor.off("transaction", sync);
-      observer?.disconnect();
-      for (const entry of entries.values()) {
-        entry.controller.abort();
-        if (
-          entry.url?.startsWith("blob:") &&
-          typeof URL.revokeObjectURL === "function"
-        ) {
-          URL.revokeObjectURL(entry.url);
-        }
-      }
-      entries.clear();
-    };
-  }, [commit, document, editor, rootRef, vault]);
 }
 
 interface EditorToolbarProps {
@@ -459,6 +231,7 @@ export function MarkdownEditor({
   onUnclaimedAssetIdsChange,
 }: MarkdownEditorProps) {
   const rootRef = React.useRef<HTMLDivElement>(null);
+  const [resolutionMarkdown, setResolutionMarkdown] = React.useState(value);
   const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
   const unclaimedAssetExpirationsRef = React.useRef(
     new Map(Object.entries(initialUnclaimedAssetExpirations)),
@@ -473,21 +246,24 @@ export function MarkdownEditor({
     [commit, document, vault],
   );
   const targetResolutions = useMarkdownTargetResolutions(
-    value,
+    resolutionMarkdown,
     adapters.targetResolver,
     { vault, document, commit },
   );
+  React.useEffect(() => {
+    setResolutionMarkdown(value);
+  }, [value]);
   const handleChange = React.useCallback(
     (_: string, editor: MarkdownEditorInstance) => {
-      onChange?.(
-        serializeEditorMarkdown(editor, { profile: "preserve" }),
-        imageAssetIds(editor),
-      );
+      const next = serializeEditorMarkdown(editor, { profile: "preserve" });
+      setResolutionMarkdown(next);
+      onChange?.(next, imageAssetIds(editor));
     },
     [onChange],
   );
   const handleSourceChange = React.useCallback(
     (markdown: string) => {
+      setResolutionMarkdown(markdown);
       onChange?.(markdown, imageAssetIdsFromMarkdown(markdown));
     },
     [onChange],
@@ -626,14 +402,6 @@ export function MarkdownEditor({
     if (autoFocus && !readOnly)
       requestAnimationFrame(() => editor.commands.focus());
   }, [autoFocus, editor, readOnly]);
-  useTargetResolutionDom(
-    rootRef,
-    editor,
-    targetResolutions,
-    Boolean(adapters.targetResolver),
-  );
-  usePrivateImageSources(rootRef, editor, vault, document, commit);
-
   const editorClassName = cn(
     "akb-markdown-content prose dark:prose-invert !max-w-none !min-h-96 w-full cursor-text outline-none font-sans text-[15px] leading-7 text-foreground",
     appearance === "canvas"
@@ -702,19 +470,20 @@ export function MarkdownEditor({
         sourceRequired={required}
         sourceClassName={sourceClassName}
       >
-        <div className="relative min-w-0">
-          {editor ? (
-            <EditorContent editor={editor} />
-          ) : (
-            <div
-              role="status"
-              aria-live="polite"
-              className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
-            >
-              Loading editor…
-            </div>
-          )}
-        </div>
+        <MarkdownSurface
+          editor={editor}
+          editable={!readOnly}
+          resolutions={targetResolutions}
+          resolvingTargets={Boolean(adapters.targetResolver)}
+        >
+          <div
+            role="status"
+            aria-live="polite"
+            className="min-h-96 bg-surface-2 p-5 text-sm text-foreground-muted"
+          >
+            Loading editor…
+          </div>
+        </MarkdownSurface>
       </MarkdownEditingSurface>
     </div>
   );

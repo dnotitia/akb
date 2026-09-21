@@ -8,6 +8,7 @@ const apiMocks = vi.hoisted(() => ({
   uploadAsset: vi.fn(),
   discardAsset: vi.fn(),
   getAssetBlob: vi.fn(),
+  getAttachmentMetadata: vi.fn(),
   publicationAssetUrl: vi.fn(),
   refreshPublicationViewGrant: vi.fn(),
   ApiError: class ApiError extends Error {
@@ -26,6 +27,8 @@ describe("MarkdownEditor image insertion", () => {
     apiMocks.discardAsset.mockResolvedValue(undefined);
     apiMocks.getAssetBlob.mockReset();
     apiMocks.getAssetBlob.mockResolvedValue(new Blob(["image"], { type: "image/png" }));
+    apiMocks.getAttachmentMetadata.mockReset();
+    apiMocks.getAttachmentMetadata.mockResolvedValue({ status: "claimed" });
     Object.defineProperty(URL, "createObjectURL", {
       configurable: true,
       value: vi.fn(() => "blob:editor-image"),
@@ -459,7 +462,7 @@ describe("MarkdownEditor image insertion", () => {
       files[2],
       files[1],
     ]);
-    expect(screen.getAllByRole("img")).toHaveLength(3);
+    await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(3));
   });
 
   it("does not offer a futile retry for a server size rejection", async () => {
