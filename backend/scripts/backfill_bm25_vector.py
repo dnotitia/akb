@@ -32,21 +32,26 @@ happen during a pass both visible afterwards:
     chunk rewritten  sparse_bm25 STALE   indexed_at finds it
     chunk deleted    row gone            nothing to do
 
-A `--since` pass looks for BOTH, so convergence is one question rather than two
-that could each be answered while the other drifted. Each run prints the instant
-to hand the next one, and the run that writes 0 is the one that found nothing
-left:
+A `--since` pass looks for BOTH. A NULL-only restart cannot repair non-NULL
+rows rewritten since an interrupted run began: retain the earliest unresolved
+window, including earlier partial attempts. Each run prints its DB start time
+as a candidate next window, not a proof that concurrent writes are covered:
 
     --prepare                      the column, milliseconds
     (no flag)                      the bulk of it, hours
     --since <that run's instant>   minutes
-    --since <that run's instant>   until it writes 0
+    --since <protected instant>    catch up, preserving unresolved transactions
     --index                        once, over a full column
     flip vector_store_sparse_shape to vchord
-    --since <the flip's instant>   once
+    --since <protected instant>    covers index build AND the entire rollout
 
-After the flip the store writes the column itself, so anything touched later is
-correct without help.
+Do not replace the protected instant with the flip time: that drops edits made
+during index construction. `indexed_at = NOW()` records transaction START, not
+commit; a writer begun before a candidate window may commit after the sweep
+has passed its row. Retain overlap covering outstanding transactions, or drain
+all old-shape writers before the authoritative final sweep. Zero writes plus
+zero NULLs is not a freshness proof while writers race the sweep. Once every
+writer uses the new shape, subsequent writes maintain the new column directly.
 
 CONCURRENCY
 -----------
@@ -97,6 +102,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncpg
+
+from scripts.bm25_run_lock import run_exclusive
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
@@ -159,6 +166,7 @@ async def _vector_pool(writers: int = 1):
     by design, and `writers` of them run at once plus the reader — borrowing
     that many connections from the pool the request path shares would be
     taking them from the thing this migration is supposed to leave alone.
+    Two extra connections remain reserved for migration ownership guards.
     """
     store = get_vector_store()
     if not isinstance(store, PgvectorStore):
@@ -168,7 +176,7 @@ async def _vector_pool(writers: int = 1):
         )
     dsn = store._dsn or settings.database_url
     return await asyncpg.create_pool(
-        dsn, min_size=1, max_size=writers + 1, command_timeout=_WRITE_TIMEOUT,
+        dsn, min_size=1, max_size=writers + 3, command_timeout=_WRITE_TIMEOUT,
     )
 
 
@@ -306,6 +314,18 @@ async def _encode(content: str, gate: asyncio.Semaphore) -> str:
     return _bm25vector_literal(idx, vals)
 
 
+async def _gather_drained(*operations):
+    """Propagate failure only after every sibling has finished cleanup."""
+    tasks = [asyncio.create_task(operation) for operation in operations]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def _apply(pool, schema: str, rows, attempts: int = _DEADLOCK_RETRIES) -> int:
     """Encode and write one batch, retrying a deadlock rather than dying on it.
 
@@ -347,7 +367,7 @@ async def _apply_once(pool, schema: str, rows) -> int:
     whose content had not moved. Content identity is the whole question.
     """
     gate = asyncio.Semaphore(_CONCURRENCY)
-    encoded = await asyncio.gather(
+    encoded = await _gather_drained(
         *(_encode(r["content"] or "", gate) for r in rows)
     )
     sql = f"""
@@ -411,7 +431,7 @@ async def _pass(pool, schema: str, since: datetime | None,
         # on disk — which is the whole reason this is split.
         size = -(-len(rows) // writers)
         parts = [rows[i:i + size] for i in range(0, len(rows), size)]
-        written += sum(await asyncio.gather(
+        written += sum(await _gather_drained(
             *(_apply(pool, schema, part) for part in parts)
         ))
         elapsed = time.monotonic() - started
@@ -426,11 +446,12 @@ async def main() -> None:
     ap = argparse.ArgumentParser(
         description="Backfill sparse_bm25 on pgvector points (akb#615)."
     )
-    ap.add_argument("--check", action="store_true",
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true",
                     help="report what is left, then exit")
-    ap.add_argument("--prepare", action="store_true",
+    mode.add_argument("--prepare", action="store_true",
                     help="add the column (not the index), then exit")
-    ap.add_argument("--index", action="store_true",
+    mode.add_argument("--index", action="store_true",
                     help="build the index CONCURRENTLY once the sweep has "
                          "converged, then exit")
     ap.add_argument("--since", metavar="TIMESTAMP",
@@ -443,6 +464,8 @@ async def main() -> None:
                          "the write is disk-latency bound, so this is the knob "
                          "that matters")
     args = ap.parse_args()
+    if args.writers < 1:
+        ap.error("--writers must be positive")
 
     since = datetime.fromisoformat(args.since) if args.since else None
     if since is not None and since.tzinfo is None:
@@ -454,58 +477,61 @@ async def main() -> None:
     try:
         pool = await _vector_pool(max(1, args.writers))
 
-        if args.prepare:
-            await _prepare(pool, schema)
-            return
+        async def execute():
+            if args.prepare:
+                await _prepare(pool, schema)
+                return
 
-        if args.index:
+            if args.index:
+                if not await _column_exists(pool, schema):
+                    raise SystemExit(
+                        f'"{schema}".chunks has no sparse_bm25 column — '
+                        "run --prepare first."
+                    )
+                await _build_index(pool, schema)
+                return
+
             if not await _column_exists(pool, schema):
                 raise SystemExit(
-                    f'"{schema}".chunks has no sparse_bm25 column — '
-                    "run --prepare first."
+                    f'"{schema}".chunks has no sparse_bm25 column — run --prepare first.'
                 )
-            await _build_index(pool, schema)
-            return
 
-        if not await _column_exists(pool, schema):
-            raise SystemExit(
-                f'"{schema}".chunks has no sparse_bm25 column — run --prepare first.'
-            )
+            if args.check:
+                nulls, owed = await _counts(pool, schema, since)
+                print(f"{nulls} never encoded"
+                      + (f" · {owed} in a pass from {since.isoformat()}"
+                         if since is not None else ""))
+                return
 
+            # Candidate next-window start, not a commit-order watermark.
+            # Keep an earlier protected window for transactions that began
+            # before this instant but commit after this sweep visits their row.
+            async with pool.acquire() as c:
+                started_at = await c.fetchval("SELECT now()")
+
+            sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
+            try:
+                written = await _pass(pool, schema, since, args.writers)
+            finally:
+                sparse_encoder.stop_tokenizer_pool()
+
+            nulls, _ = await _counts(pool, schema, since)
+            print(f"wrote {written} · {nulls} never encoded")
+
+            # Re-counting the SAME --since window includes rows just written.
+            # Zero writes is a progress signal only; concurrent identity-guard
+            # skips and late commits still require final freshness verification.
+            if written == 0 and nulls == 0:
+                print("  no writes or NULLs observed in this pass; final writer-drain "
+                      "and freshness verification are still required before a shape flip.")
+            else:
+                print("  not converged yet; run again with:")
+            print(f"  python -m scripts.backfill_bm25_vector "
+                  f"--since '{started_at.isoformat()}'")
         if args.check:
-            nulls, owed = await _counts(pool, schema, since)
-            print(f"{nulls} never encoded"
-                  + (f" · {owed} in a pass from {since.isoformat()}"
-                     if since is not None else ""))
-            return
-
-        # The instant to hand the NEXT pass. Read before any work, so a chunk
-        # rewritten while this pass runs falls inside the next one's window
-        # rather than between the two.
-        async with pool.acquire() as c:
-            started_at = await c.fetchval("SELECT now()")
-
-        sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
-        try:
-            written = await _pass(pool, schema, since, args.writers)
-        finally:
-            sparse_encoder.stop_tokenizer_pool()
-
-        nulls, _ = await _counts(pool, schema, since)
-        print(f"wrote {written} · {nulls} never encoded")
-
-        # `written == 0` is the convergence signal, not the count above: after a
-        # `--since` pass the rows it fixed still fall inside its own window, so
-        # re-counting with the SAME instant can never reach zero. Each pass
-        # hands the next one a later window, and the run that writes nothing is
-        # the one that found nothing left.
-        if written == 0 and nulls == 0:
-            print("  nothing left in this window — safe to flip the shape, then "
-                  "run once more with the instant below to catch the flip itself.")
+            await execute()
         else:
-            print("  not converged yet; run again with:")
-        print(f"  python -m scripts.backfill_bm25_vector "
-              f"--since '{started_at.isoformat()}'")
+            await run_exclusive(pool, schema, execute, announce=True)
     finally:
         if pool is not None:
             await pool.close()
