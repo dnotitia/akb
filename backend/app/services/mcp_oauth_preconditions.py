@@ -59,7 +59,14 @@ RUNBOOK = "docs/mcp-clients/web-connectors.md"
 # The scopes `/.well-known/oauth-protected-resource` advertises and the
 # consent screen has to be able to offer. Keycloak lists a realm client
 # scope in `scopes_supported` once it is a default or optional scope,
-# which is the state step 3 of the setup script leaves behind.
+# which is the state the setup script leaves behind.
+#
+# These are the DISCRIMINATING signal, measured on a live realm: they
+# appear in the discovery document only after the setup script has run.
+# `registration_endpoint` is advertised either way, so its presence
+# proves nothing about whether the realm was configured — it is checked
+# below because an IdP that offers no DCR at all cannot serve this path,
+# not because it separates a configured realm from an unconfigured one.
 REQUIRED_SCOPES = ("akb:vault:read", "akb:vault:write")
 
 # A settled answer is cheap to keep: realm configuration changes on

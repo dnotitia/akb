@@ -8,7 +8,12 @@ What it does (in order):
 
 1. Add ``localhost`` / ``127.0.0.1`` to the realm's DCR ``trusted-hosts``
    policy so a local Claude Code (or another DCR-capable MCP client
-   running on the operator's laptop) can register itself dynamically.
+   running on the operator's laptop) can register itself dynamically,
+   and turn that policy's sender-host check off.
+1b. Delete the ``Allowed Client Scopes`` registration policy from BOTH
+   the ``anonymous`` and the ``authenticated`` policy set — an Initial
+   Access Token switches which set applies rather than bypassing it, so
+   Protected DCR hits the same wall.
 2. Create the ``akb:vault:read`` client scope (if absent) with an
    ``oidc-audience-mapper`` whose ``included.custom.audience`` is the
    AKB ``/mcp`` URL the realm should mint tokens for.
@@ -212,6 +217,37 @@ def resolve_admin_credential(env: Mapping[str, str]) -> AdminCredential:
     raise AdminCredentialError(_CREDENTIAL_HELP)
 
 
+CLIENT_SCOPE_POLICY_PROVIDER = "allowed-client-templates"
+
+
+def client_scope_policies(components: object) -> list[dict]:
+    """Every "Allowed Client Scopes" registration policy in a realm, both subtypes.
+
+    Keycloak ships this policy twice: ``anonymous`` gates open DCR, and
+    ``authenticated`` gates DCR made with an Initial Access Token. Both
+    reject a spec-compliant DCR body for the same reason — it contains
+    ``scope=openid``, and ``openid`` is the OIDC sentinel rather than an
+    entry in the realm's client-scope catalog, so no configuration of the
+    policy can permit it. Removing only the anonymous one leaves the
+    Protected-DCR path (the one an operator hardening an
+    internet-reachable IdP is told to use) failing exactly the way this
+    script exists to fix.
+    """
+    if not isinstance(components, list):
+        return []
+    return [
+        component
+        for component in components
+        if isinstance(component, dict)
+        and component.get("providerId") == CLIENT_SCOPE_POLICY_PROVIDER
+    ]
+
+
+def _policy_subtypes(components: object) -> list[str]:
+    """Subtypes of the client-scope policies still present. For the verify step."""
+    return [str(p.get("subType") or "unknown") for p in client_scope_policies(components)]
+
+
 def get_admin_token(kc_url: str, credential: AdminCredential) -> str:
     status, payload, _ = http(
         "POST",
@@ -321,27 +357,36 @@ def main() -> int:
         print("    no-op (already permissive on sender + contains requested hosts)")
 
     # ── 1b. allowed-client-templates ──────────────────────────
-    # The default "Allowed Client Scopes" anonymous-DCR policy rejects
-    # any DCR body that includes `scope=openid` because Keycloak does
-    # not list `openid` in the realm's client-scope catalog (it is the
-    # OIDC sentinel, not a Keycloak scope). MCP-spec clients (Claude
-    # Code, claude.ai, ChatGPT) always send `openid` in the DCR scope
-    # field, so this policy must be removed for anonymous DCR. The
-    # `consent-required`, `trusted-hosts` (URI), and `max-clients`
-    # policies remain as the meaningful guards. The [authenticated]
-    # variant of this policy stays — it gates registrations made with
-    # an Initial Access Token, which is the operator-controlled path.
-    print("\n[1b] allowed-client-templates policy (anonymous)")
-    actp = next(
-        (c for c in comps if c.get("providerId") == "allowed-client-templates"
-         and c.get("subType") == "anonymous"),
-        None,
-    )
-    if actp:
-        s, r, _ = http("DELETE", f"{base}/components/{actp['id']}", token)
-        if s not in (200, 204):
-            sys.exit(f"DELETE allowed-client-templates failed: {s} {r}")
-        print("    removed (was rejecting DCR bodies that include scope=openid)")
+    # The default "Allowed Client Scopes" policy rejects any DCR body
+    # that includes `scope=openid`, because Keycloak does not list
+    # `openid` in the realm's client-scope catalog (it is the OIDC
+    # sentinel, not a Keycloak scope). MCP-spec clients (Claude Code,
+    # claude.ai, ChatGPT) always send `openid` in the DCR scope field,
+    # so the policy is incompatible with spec-compliant DCR and no
+    # setting of it helps — the value it would have to allow cannot be
+    # added. The `consent-required`, `trusted-hosts` (URI), and
+    # `max-clients` policies remain as the meaningful guards.
+    #
+    # BOTH subtypes go, and the [authenticated] one is the less obvious
+    # half. An Initial Access Token does not bypass registration
+    # policies, it switches which subtype applies — so Protected DCR,
+    # the option the design offers for hostile internet exposure, runs
+    # into this same wall. Measured on a realm this script had already
+    # configured: an IAT registration carrying the scope field returned
+    # 403 "Policy 'Allowed Client Scopes' rejected request ... Not
+    # permitted to use specified clientScope", and returned 201 only
+    # with the scope field omitted. Leaving the authenticated policy in
+    # place meant the open path worked and the hardened path did not,
+    # which is backwards. The IAT itself is the gate on that path.
+    print("\n[1b] allowed-client-templates policies")
+    policies = client_scope_policies(comps)
+    if policies:
+        for policy in policies:
+            subtype = policy.get("subType") or "unknown"
+            s, r, _ = http("DELETE", f"{base}/components/{policy['id']}", token)
+            if s not in (200, 204):
+                sys.exit(f"DELETE allowed-client-templates [{subtype}] failed: {s} {r}")
+            print(f"    removed [{subtype}] (was rejecting DCR bodies that include scope=openid)")
     else:
         print("    no-op (already removed)")
 
@@ -450,9 +495,23 @@ def main() -> int:
         f"{base}/components?type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy",
         token,
     )
-    th2 = next(c for c in comps if c.get("providerId") == "trusted-hosts")
-    print(f"    trusted-hosts: {th2['config'].get('trusted-hosts')}")
+    # Every read below is `object` as far as the type system knows, because
+    # `http` cannot promise a shape. Narrow each one instead of indexing on
+    # faith: an error body here used to reach `for c in comps` as a
+    # TypeError, and the missing-policy case reached `next()` as a bare
+    # StopIteration — two ways for a verification step to fail as something
+    # other than "verification failed".
+    if not isinstance(comps, list):
+        sys.exit(f"verify: could not list registration policies: {s} {comps}")
+    th2 = next(
+        (c for c in comps if isinstance(c, dict) and c.get("providerId") == "trusted-hosts"),
+        None,
+    )
+    print(f"    trusted-hosts: {th2['config'].get('trusted-hosts') if th2 else 'MISSING'}")
+    print(f"    allowed-client-templates: {sorted(_policy_subtypes(comps)) or 'removed'}")
     s, scopes, _ = http("GET", f"{base}/client-scopes", token)
+    if not isinstance(scopes, list):
+        sys.exit(f"verify: could not list client scopes: {s} {scopes}")
     by_name = {x["name"]: x for x in scopes if isinstance(x, dict)}
     for sp in scopes_to_create:
         x = by_name.get(sp["name"])
@@ -461,13 +520,19 @@ def main() -> int:
         s2, m, _ = http(
             "GET", f"{base}/client-scopes/{x['id']}/protocol-mappers/models", token,
         )
-        a = next(
-            (mm for mm in m if mm.get("protocolMapper") == "oidc-audience-mapper"),
-            None,
-        )
-        print(f"    {sp['name']}: id={x['id'][:8]}.. aud={a['config'].get('included.custom.audience') if a else 'MISSING'}")
+        a = None
+        if isinstance(m, list):
+            a = next(
+                (mm for mm in m
+                 if isinstance(mm, dict) and mm.get("protocolMapper") == "oidc-audience-mapper"),
+                None,
+            )
+        aud = a["config"].get("included.custom.audience") if a else "MISSING"
+        print(f"    {sp['name']}: id={x['id'][:8]}.. aud={aud}")
     s, opt, _ = http("GET", f"{base}/default-optional-client-scopes", token)
-    print(f"    defaultOptionalClientScopes: {sorted(x['name'] for x in opt)}")
+    if not isinstance(opt, list):
+        sys.exit(f"verify: could not read optional scopes: {s} {opt}")
+    print(f"    defaultOptionalClientScopes: {sorted(x['name'] for x in opt if isinstance(x, dict))}")
     print("\nDONE.")
     return 0
 

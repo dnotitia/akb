@@ -178,7 +178,13 @@ so the design reads whole; the runbook is what an operator applies.
   every legitimate registration. The runbook has the exact settings and the
   reasoning.
 - Optional: Initial Access Token requirement (Protected DCR) for hostile
-  internet exposure. Mint a one-shot token per partner.
+  internet exposure. Mint a one-shot token per partner. Note that an IAT
+  does not bypass client-registration policies — it switches which policy
+  subtype applies, `anonymous` → `authenticated`. Keycloak's
+  `Allowed Client Scopes` policy exists on both and rejects a
+  spec-compliant DCR body in both, so hardening this way is only safe
+  once that policy is gone from both sets. The setup script removes both;
+  the runbook shows the measured 403.
 - Optional: client policies forcing PKCE S256 on all dynamically
   registered clients.
 

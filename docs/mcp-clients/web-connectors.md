@@ -68,13 +68,43 @@ form instead.
 It will:
 
 1. Add `localhost`, `127.0.0.1` to the realm's DCR `trusted-hosts`
-   policy (so Claude Code on the operator's laptop can DCR-register).
-2. Create `akb:vault:read` and `akb:vault:write` scopes with audience
+   policy (so Claude Code on the operator's laptop can DCR-register), and
+   turn OFF that policy's sender-host check.
+2. Delete the `Allowed Client Scopes` registration policy — **both**
+   subtypes, `anonymous` and `authenticated`. See the note on Protected
+   DCR below for why the authenticated one matters.
+3. Create `akb:vault:read` and `akb:vault:write` scopes with audience
    mappers pinned to the AKB `/mcp` URL.
-3. Add both scopes to `defaultOptionalClientScopes` so DCR clients can
+4. Add both scopes to `defaultOptionalClientScopes` so DCR clients can
    request them.
 
 If the realm already had any of the above, those steps no-op.
+
+### If you use Protected DCR (Initial Access Tokens)
+
+An Initial Access Token does **not** bypass client-registration policies.
+It switches which subtype applies: `anonymous` → `authenticated`. Keycloak
+ships `Allowed Client Scopes` on both, and both reject a spec-compliant DCR
+body for the same reason — it carries `scope=openid`, and `openid` is the
+OIDC sentinel rather than an entry in the realm's client-scope catalog, so
+no setting of the policy can permit it.
+
+Removing only the anonymous copy therefore leaves the *hardened* path
+broken while the open one works:
+
+```
+IAT + scope "openid profile email akb:vault:read akb:vault:write offline_access"
+  → 403 {"error":"insufficient_scope",
+         "error_description":"Policy 'Allowed Client Scopes' rejected request to
+          client-registration service. Details: Not permitted to use specified clientScope"}
+
+IAT, scope field omitted
+  → 201
+```
+
+The setup script removes both, so Protected DCR works after running it. The
+IAT is the gate on that path; `Consent Required`, `Trusted Hosts` (the
+redirect-URI check) and `Max Clients Limit` remain the other guards.
 
 ### Hand-edit checklist (if you skip the script)
 
@@ -89,11 +119,15 @@ In the Keycloak admin console, in your realm:
     redirect-URI guard is the meaningful check; the sender-IP check
     rejects every legitimate registration if left on.
 - **Realm Settings → Client Registration → Policies → Allowed Client
-  Scopes (anonymous)**: **Delete this policy.** Keycloak does not
-  list the OIDC sentinel scope `openid` in its client-scope catalog,
-  so the default policy rejects every spec-compliant DCR request
-  (Claude Code, claude.ai, ChatGPT all include `openid` in the DCR
-  scope field). The `Consent Required`, `Trusted Hosts` (URI), and
+  Scopes**: **Delete this policy from BOTH the anonymous and the
+  authenticated policy set.** Keycloak does not list the OIDC sentinel
+  scope `openid` in its client-scope catalog, so the default policy
+  rejects every spec-compliant DCR request (Claude Code, claude.ai,
+  ChatGPT all include `openid` in the DCR scope field) — and no
+  configuration of the policy permits it, because the value it would have
+  to allow is not a client scope. The authenticated copy is the one an
+  Initial Access Token registration hits; see the Protected DCR note
+  above. The `Consent Required`, `Trusted Hosts` (URI), and
   `Max Clients Limit` policies stay as the meaningful guards.
 - **Client Scopes → Create**: add `akb:vault:read` and `akb:vault:write`
   with the listed display + consent text. Add an `oidc-audience-mapper`

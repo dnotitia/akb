@@ -143,6 +143,77 @@ def test_describe_identifies_the_credential_without_leaking_it():
     assert "hunter2" not in password.describe()
 
 
+# ── the "Allowed Client Scopes" policy, both subtypes ──────────────
+#
+# Keycloak ships this policy twice. It rejects any spec-compliant DCR body
+# for the same reason in both: the body carries `scope=openid`, and `openid`
+# is the OIDC sentinel rather than an entry in the realm's client-scope
+# catalog, so no setting of the policy can permit it. The script used to
+# remove only the `anonymous` one.
+#
+# The `authenticated` one is what an Initial Access Token registration hits
+# — an IAT does not bypass registration policies, it switches which subtype
+# applies. So Protected DCR, the option the design offers for hostile
+# internet exposure, ran into the wall this script exists to remove, while
+# the open path worked. Measured on a realm the script had already
+# configured: IAT + a scope field → 403 "Policy 'Allowed Client Scopes'
+# rejected request … Not permitted to use specified clientScope"; the same
+# registration with the scope field omitted → 201.
+
+
+def _policy(subtype: str, provider: str = "allowed-client-templates") -> dict:
+    return {"id": f"id-{provider}-{subtype}", "providerId": provider, "subType": subtype}
+
+
+def test_both_policy_subtypes_are_selected_for_removal():
+    components = [
+        _policy("anonymous"),
+        _policy("authenticated"),
+        _policy("anonymous", provider="trusted-hosts"),
+        _policy("anonymous", provider="max-clients"),
+    ]
+    selected = setup_script.client_scope_policies(components)
+    assert [p["subType"] for p in selected] == ["anonymous", "authenticated"]
+
+
+def test_the_authenticated_policy_alone_is_still_selected():
+    """The state the old script left behind, and the one that traps Protected DCR.
+
+    A realm the previous version had "configured" has only the
+    authenticated policy left. Selecting nothing here is exactly the
+    regression: the open path works and the hardened path does not.
+    """
+    assert setup_script.client_scope_policies([_policy("authenticated")]) != []
+
+
+def test_other_registration_policies_are_left_alone():
+    # `consent-required`, `trusted-hosts` (URI) and `max-clients` are the
+    # meaningful guards and must survive.
+    components = [
+        _policy("anonymous", provider="trusted-hosts"),
+        _policy("anonymous", provider="consent-required"),
+        _policy("anonymous", provider="max-clients"),
+    ]
+    assert setup_script.client_scope_policies(components) == []
+
+
+def test_a_realm_already_cleaned_selects_nothing():
+    assert setup_script.client_scope_policies([]) == []
+
+
+@pytest.mark.parametrize("payload", [None, "error body", {"error": "nope"}, [None, "x", 3]])
+def test_a_non_list_or_ragged_response_selects_nothing_rather_than_raising(payload):
+    # `http()` hands back whatever the admin API said; an error body used to
+    # reach `.get()` on a string as an AttributeError.
+    assert setup_script.client_scope_policies(payload) == []
+
+
+def test_verify_step_names_the_subtypes_still_present():
+    subtypes = setup_script._policy_subtypes([_policy("anonymous"), _policy("authenticated")])
+    assert sorted(subtypes) == ["anonymous", "authenticated"]
+    assert setup_script._policy_subtypes([]) == []
+
+
 # ── the manifest facts that make the above required ────────────────
 
 
