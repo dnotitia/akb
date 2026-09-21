@@ -8,7 +8,12 @@ What it does (in order):
 
 1. Add ``localhost`` / ``127.0.0.1`` to the realm's DCR ``trusted-hosts``
    policy so a local Claude Code (or another DCR-capable MCP client
-   running on the operator's laptop) can register itself dynamically.
+   running on the operator's laptop) can register itself dynamically,
+   and turn that policy's sender-host check off.
+1b. Delete the ``Allowed Client Scopes`` registration policy from BOTH
+   the ``anonymous`` and the ``authenticated`` policy set — an Initial
+   Access Token switches which set applies rather than bypassing it, so
+   Protected DCR hits the same wall.
 2. Create the ``akb:vault:read`` client scope (if absent) with an
    ``oidc-audience-mapper`` whose ``included.custom.audience`` is the
    AKB ``/mcp`` URL the realm should mint tokens for.
@@ -17,19 +22,46 @@ What it does (in order):
    public client can request them at the authorize endpoint.
 5. Verify everything by re-reading state.
 
-Reads admin credentials from ``KC_ADMIN_USER`` / ``KC_ADMIN_PASS`` env
-vars; never accepts them on the command line so they cannot land in
-shell history or process listings.
+Reads the Keycloak admin credential from the environment; it is never
+accepted on the command line, so it cannot land in shell history or a
+process listing. Two credential shapes are supported, because the two
+ways this repo ships Keycloak bootstrap two different kinds of admin:
+
+* ``KC_ADMIN_CLIENT_ID`` / ``KC_ADMIN_CLIENT_SECRET`` — client
+  credentials for an admin **service account**. This is what both
+  Kubernetes paths create: ``deploy/k8s/standalone-sso/keycloak.yaml``
+  and ``deploy/helm/akb/templates/sso.yaml`` set
+  ``KC_BOOTSTRAP_ADMIN_CLIENT_ID`` / ``KC_BOOTSTRAP_ADMIN_CLIENT_SECRET``
+  and create no admin user at all.
+* ``KC_ADMIN_USER`` / ``KC_ADMIN_PASS`` — password grant on
+  ``admin-cli``. This is what the local dev fixture creates
+  (``deploy/keycloak-dev/broker-chain/compose.yaml`` sets
+  ``KC_BOOTSTRAP_ADMIN_USERNAME`` / ``KC_BOOTSTRAP_ADMIN_PASSWORD``).
+
+``KC_ADMIN_REALM`` (default ``master``) names the realm the credential
+itself lives in, which is not the realm being configured: the bootstrap
+admin is a ``master``-realm identity, while ``--realm`` is the realm
+whose scopes and policies this script edits. Point it at the target
+realm only if the admin service account was created there instead.
 
 Usage:
+    # Kubernetes (service account — the shipped manifests' bootstrap)
+    KC_ADMIN_CLIENT_ID=akb-bootstrap-temporary KC_ADMIN_CLIENT_SECRET=... \\
+        python3 scripts/keycloak/setup-akb-mcp-oauth.py \\
+            --kc https://auth.example.com \\
+            --realm akb \\
+            --audience https://akb.example.com/mcp
+
+    # Local dev compose fixture (admin user)
     KC_ADMIN_USER=admin KC_ADMIN_PASS=... \\
         python3 scripts/keycloak/setup-akb-mcp-oauth.py \\
             --kc https://auth.example.com \\
             --realm akb \\
             --audience https://akb.example.com/mcp
 
-See docs/designs/mcp-oauth-dcr/00-overview.md for the rationale and
-docs/mcp-clients/web-connectors.md for the end-to-end client walkthrough.
+See docs/mcp-clients/web-connectors.md for the end-to-end client
+walkthrough (it is the operational authority for realm settings) and
+docs/designs/mcp-oauth-dcr/00-overview.md for the design rationale.
 """
 from __future__ import annotations
 
@@ -40,6 +72,9 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal
 
 
 def http(method: str, url: str, token: str | None = None, body=None,
@@ -65,23 +100,166 @@ def http(method: str, url: str, token: str | None = None, body=None,
         return e.code, e.read().decode(), dict(e.headers)
 
 
-def get_admin_token(kc_url: str, user: str, password: str) -> str:
+class AdminCredentialError(RuntimeError):
+    """The environment does not carry a usable Keycloak admin credential."""
+
+
+@dataclass(frozen=True)
+class AdminCredential:
+    """One resolved way to obtain an admin token, and how to ask for it.
+
+    ``shadowed`` names the env vars of a second, also-complete credential
+    that was not used, so a stale export in the operator's shell shows up
+    in the run output instead of silently deciding which identity edits
+    the realm.
+    """
+
+    kind: Literal["client_credentials", "password"]
+    realm: str
+    client_id: str
+    client_secret: str | None = None
+    username: str | None = None
+    password: str | None = None
+    shadowed: tuple[str, ...] = ()
+
+    def describe(self) -> str:
+        """Human-readable identity for logs. Never includes the secret."""
+        if self.kind == "client_credentials":
+            return f"client credentials as '{self.client_id}' in realm '{self.realm}'"
+        return f"password grant as '{self.username}' on '{self.client_id}' in realm '{self.realm}'"
+
+    def token_request_body(self) -> dict[str, str]:
+        if self.kind == "client_credentials":
+            return {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret or "",
+            }
+        return {
+            "grant_type": "password",
+            "client_id": self.client_id,
+            "username": self.username or "",
+            "password": self.password or "",
+        }
+
+
+# Both halves of a pair must be present. Naming the missing half is the
+# whole point: "KC_ADMIN_CLIENT_SECRET is not set" is actionable, and a
+# generic "credentials required" is what sent an operator looking for an
+# admin user the deployment never created.
+_CREDENTIAL_HELP = (
+    "No Keycloak admin credential in the environment. Set ONE of these pairs "
+    "temporarily for this run (the script never persists them):\n"
+    "  KC_ADMIN_CLIENT_ID + KC_ADMIN_CLIENT_SECRET\n"
+    "      Admin service account. This is what the Kubernetes manifests in this "
+    "repo bootstrap (KC_BOOTSTRAP_ADMIN_CLIENT_ID / KC_BOOTSTRAP_ADMIN_CLIENT_SECRET "
+    "in deploy/k8s/standalone-sso/keycloak.yaml and "
+    "deploy/helm/akb/templates/sso.yaml); they create no admin user.\n"
+    "  KC_ADMIN_USER + KC_ADMIN_PASS\n"
+    "      Password grant on admin-cli. This is what the local dev fixture "
+    "bootstraps (KC_BOOTSTRAP_ADMIN_USERNAME / KC_BOOTSTRAP_ADMIN_PASSWORD in "
+    "deploy/keycloak-dev/broker-chain/compose.yaml).\n"
+    "KC_ADMIN_REALM (default: master) names the realm the credential lives in, "
+    "not the realm being configured."
+)
+
+
+def _present(value: str | None) -> bool:
+    """A variable exported as empty or whitespace counts as unset."""
+    return value is not None and value.strip() != ""
+
+
+def resolve_admin_credential(env: Mapping[str, str]) -> AdminCredential:
+    """Pick the admin credential to use, or raise naming what is missing.
+
+    Client credentials win when both pairs are complete: it is the shape
+    the shipped deployments actually produce, so preferring it makes the
+    supported path the default one.
+    """
+    realm = env.get("KC_ADMIN_REALM", "").strip() or "master"
+    client_id = env.get("KC_ADMIN_CLIENT_ID")
+    client_secret = env.get("KC_ADMIN_CLIENT_SECRET")
+    user = env.get("KC_ADMIN_USER")
+    pwd = env.get("KC_ADMIN_PASS")
+
+    client_pair = (_present(client_id), _present(client_secret))
+    password_pair = (_present(user), _present(pwd))
+
+    if any(client_pair) and not all(client_pair):
+        missing = "KC_ADMIN_CLIENT_SECRET" if client_pair[0] else "KC_ADMIN_CLIENT_ID"
+        raise AdminCredentialError(
+            f"{missing} is not set. Client-credentials auth needs both "
+            "KC_ADMIN_CLIENT_ID and KC_ADMIN_CLIENT_SECRET.\n\n" + _CREDENTIAL_HELP
+        )
+    if any(password_pair) and not all(password_pair):
+        missing = "KC_ADMIN_PASS" if password_pair[0] else "KC_ADMIN_USER"
+        raise AdminCredentialError(
+            f"{missing} is not set. Password auth needs both KC_ADMIN_USER and "
+            "KC_ADMIN_PASS.\n\n" + _CREDENTIAL_HELP
+        )
+
+    if all(client_pair):
+        return AdminCredential(
+            kind="client_credentials",
+            realm=realm,
+            client_id=(client_id or "").strip(),
+            client_secret=client_secret,
+            shadowed=("KC_ADMIN_USER", "KC_ADMIN_PASS") if all(password_pair) else (),
+        )
+    if all(password_pair):
+        return AdminCredential(
+            kind="password",
+            realm=realm,
+            client_id="admin-cli",
+            username=(user or "").strip(),
+            password=pwd,
+        )
+    raise AdminCredentialError(_CREDENTIAL_HELP)
+
+
+CLIENT_SCOPE_POLICY_PROVIDER = "allowed-client-templates"
+
+
+def client_scope_policies(components: object) -> list[dict]:
+    """Every "Allowed Client Scopes" registration policy in a realm, both subtypes.
+
+    Keycloak ships this policy twice: ``anonymous`` gates open DCR, and
+    ``authenticated`` gates DCR made with an Initial Access Token. Both
+    reject a spec-compliant DCR body for the same reason — it contains
+    ``scope=openid``, and ``openid`` is the OIDC sentinel rather than an
+    entry in the realm's client-scope catalog, so no configuration of the
+    policy can permit it. Removing only the anonymous one leaves the
+    Protected-DCR path (the one an operator hardening an
+    internet-reachable IdP is told to use) failing exactly the way this
+    script exists to fix.
+    """
+    if not isinstance(components, list):
+        return []
+    return [
+        component
+        for component in components
+        if isinstance(component, dict)
+        and component.get("providerId") == CLIENT_SCOPE_POLICY_PROVIDER
+    ]
+
+
+def _policy_subtypes(components: object) -> list[str]:
+    """Subtypes of the client-scope policies still present. For the verify step."""
+    return [str(p.get("subType") or "unknown") for p in client_scope_policies(components)]
+
+
+def get_admin_token(kc_url: str, credential: AdminCredential) -> str:
     status, payload, _ = http(
         "POST",
-        f"{kc_url}/realms/master/protocol/openid-connect/token",
-        body={
-            "grant_type": "password",
-            "client_id": "admin-cli",
-            "username": user,
-            "password": password,
-        },
+        f"{kc_url}/realms/{credential.realm}/protocol/openid-connect/token",
+        body=credential.token_request_body(),
         ctype="application/x-www-form-urlencoded",
     )
     if status != 200 or not isinstance(payload, dict):
-        sys.exit(f"admin auth failed: {status} {payload}")
+        sys.exit(f"admin auth failed ({credential.describe()}): {status} {payload}")
     tok = payload.get("access_token")
     if not tok:
-        sys.exit(f"admin auth: no access_token in {payload}")
+        sys.exit(f"admin auth ({credential.describe()}): no access_token in {payload}")
     return tok
 
 
@@ -107,13 +285,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    user = os.environ.get("KC_ADMIN_USER")
-    pwd = os.environ.get("KC_ADMIN_PASS")
-    if not user or not pwd:
-        sys.exit(
-            "KC_ADMIN_USER and KC_ADMIN_PASS env vars are required. "
-            "Set them temporarily for this run; the script never persists them."
-        )
+    try:
+        credential = resolve_admin_credential(os.environ)
+    except AdminCredentialError as exc:
+        sys.exit(str(exc))
+    print(f"admin auth: {credential.describe()}")
+    if credential.shadowed:
+        print(f"    note: {' + '.join(credential.shadowed)} also set — ignored")
 
     kc = args.kc.rstrip("/")
     base = f"{kc}/admin/realms/{args.realm}"
@@ -121,7 +299,7 @@ def main() -> int:
     def fresh_token() -> str:
         # Admin tokens default to 300s; refresh on each section so a
         # long run does not stall halfway through.
-        return get_admin_token(kc, user, pwd)
+        return get_admin_token(kc, credential)
 
     scopes_to_create = [
         {
@@ -179,27 +357,36 @@ def main() -> int:
         print("    no-op (already permissive on sender + contains requested hosts)")
 
     # ── 1b. allowed-client-templates ──────────────────────────
-    # The default "Allowed Client Scopes" anonymous-DCR policy rejects
-    # any DCR body that includes `scope=openid` because Keycloak does
-    # not list `openid` in the realm's client-scope catalog (it is the
-    # OIDC sentinel, not a Keycloak scope). MCP-spec clients (Claude
-    # Code, claude.ai, ChatGPT) always send `openid` in the DCR scope
-    # field, so this policy must be removed for anonymous DCR. The
-    # `consent-required`, `trusted-hosts` (URI), and `max-clients`
-    # policies remain as the meaningful guards. The [authenticated]
-    # variant of this policy stays — it gates registrations made with
-    # an Initial Access Token, which is the operator-controlled path.
-    print("\n[1b] allowed-client-templates policy (anonymous)")
-    actp = next(
-        (c for c in comps if c.get("providerId") == "allowed-client-templates"
-         and c.get("subType") == "anonymous"),
-        None,
-    )
-    if actp:
-        s, r, _ = http("DELETE", f"{base}/components/{actp['id']}", token)
-        if s not in (200, 204):
-            sys.exit(f"DELETE allowed-client-templates failed: {s} {r}")
-        print("    removed (was rejecting DCR bodies that include scope=openid)")
+    # The default "Allowed Client Scopes" policy rejects any DCR body
+    # that includes `scope=openid`, because Keycloak does not list
+    # `openid` in the realm's client-scope catalog (it is the OIDC
+    # sentinel, not a Keycloak scope). MCP-spec clients (Claude Code,
+    # claude.ai, ChatGPT) always send `openid` in the DCR scope field,
+    # so the policy is incompatible with spec-compliant DCR and no
+    # setting of it helps — the value it would have to allow cannot be
+    # added. The `consent-required`, `trusted-hosts` (URI), and
+    # `max-clients` policies remain as the meaningful guards.
+    #
+    # BOTH subtypes go, and the [authenticated] one is the less obvious
+    # half. An Initial Access Token does not bypass registration
+    # policies, it switches which subtype applies — so Protected DCR,
+    # the option the design offers for hostile internet exposure, runs
+    # into this same wall. Measured on a realm this script had already
+    # configured: an IAT registration carrying the scope field returned
+    # 403 "Policy 'Allowed Client Scopes' rejected request ... Not
+    # permitted to use specified clientScope", and returned 201 only
+    # with the scope field omitted. Leaving the authenticated policy in
+    # place meant the open path worked and the hardened path did not,
+    # which is backwards. The IAT itself is the gate on that path.
+    print("\n[1b] allowed-client-templates policies")
+    policies = client_scope_policies(comps)
+    if policies:
+        for policy in policies:
+            subtype = policy.get("subType") or "unknown"
+            s, r, _ = http("DELETE", f"{base}/components/{policy['id']}", token)
+            if s not in (200, 204):
+                sys.exit(f"DELETE allowed-client-templates [{subtype}] failed: {s} {r}")
+            print(f"    removed [{subtype}] (was rejecting DCR bodies that include scope=openid)")
     else:
         print("    no-op (already removed)")
 
@@ -308,9 +495,23 @@ def main() -> int:
         f"{base}/components?type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy",
         token,
     )
-    th2 = next(c for c in comps if c.get("providerId") == "trusted-hosts")
-    print(f"    trusted-hosts: {th2['config'].get('trusted-hosts')}")
+    # Every read below is `object` as far as the type system knows, because
+    # `http` cannot promise a shape. Narrow each one instead of indexing on
+    # faith: an error body here used to reach `for c in comps` as a
+    # TypeError, and the missing-policy case reached `next()` as a bare
+    # StopIteration — two ways for a verification step to fail as something
+    # other than "verification failed".
+    if not isinstance(comps, list):
+        sys.exit(f"verify: could not list registration policies: {s} {comps}")
+    th2 = next(
+        (c for c in comps if isinstance(c, dict) and c.get("providerId") == "trusted-hosts"),
+        None,
+    )
+    print(f"    trusted-hosts: {th2['config'].get('trusted-hosts') if th2 else 'MISSING'}")
+    print(f"    allowed-client-templates: {sorted(_policy_subtypes(comps)) or 'removed'}")
     s, scopes, _ = http("GET", f"{base}/client-scopes", token)
+    if not isinstance(scopes, list):
+        sys.exit(f"verify: could not list client scopes: {s} {scopes}")
     by_name = {x["name"]: x for x in scopes if isinstance(x, dict)}
     for sp in scopes_to_create:
         x = by_name.get(sp["name"])
@@ -319,13 +520,19 @@ def main() -> int:
         s2, m, _ = http(
             "GET", f"{base}/client-scopes/{x['id']}/protocol-mappers/models", token,
         )
-        a = next(
-            (mm for mm in m if mm.get("protocolMapper") == "oidc-audience-mapper"),
-            None,
-        )
-        print(f"    {sp['name']}: id={x['id'][:8]}.. aud={a['config'].get('included.custom.audience') if a else 'MISSING'}")
+        a = None
+        if isinstance(m, list):
+            a = next(
+                (mm for mm in m
+                 if isinstance(mm, dict) and mm.get("protocolMapper") == "oidc-audience-mapper"),
+                None,
+            )
+        aud = a["config"].get("included.custom.audience") if a else "MISSING"
+        print(f"    {sp['name']}: id={x['id'][:8]}.. aud={aud}")
     s, opt, _ = http("GET", f"{base}/default-optional-client-scopes", token)
-    print(f"    defaultOptionalClientScopes: {sorted(x['name'] for x in opt)}")
+    if not isinstance(opt, list):
+        sys.exit(f"verify: could not read optional scopes: {s} {opt}")
+    print(f"    defaultOptionalClientScopes: {sorted(x['name'] for x in opt if isinstance(x, dict))}")
     print("\nDONE.")
     return 0
 

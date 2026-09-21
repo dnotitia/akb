@@ -546,8 +546,14 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     never be chunked or embedded; `vector_store.backfill.upsert` is the
     chunk-level one below it; `native_file_projection` is the S3-to-Native
     admission ahead of both.
+
+    `mcp_oauth` is not a queue: it reports whether the OIDC realm behind
+    `mcp_oauth_enabled` advertises the DCR endpoint and vault scopes that
+    path needs, and names the setup script when it does not. `unknown`
+    means the IdP could not be read, which is not a verdict on the realm.
     """
     from app.services import (
+        mcp_oauth_preconditions,
         native_derived_worker,
         native_file_projection,
         queue_rescuer,
@@ -602,6 +608,15 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         # decision turns on: whether a surface should show partial results
         # depends on how often they exist.
         "search": await _safe(search_degradation_stats.snapshot),
+        # Not a queue either, and the only section here about a dependency
+        # AKB does not own: whether the OIDC realm was ever given the client
+        # scopes and DCR policy the MCP OAuth path needs (akb#635). An
+        # unconfigured realm fails at the IdP with a bare 403 before any AKB
+        # code runs, so this is the one place AKB can say which script fixes
+        # it. Stays on the unauthenticated half because every input is a
+        # public discovery document; see the module docstring for why it is
+        # here rather than at startup, and for what it cannot see.
+        "mcp_oauth": await _safe(mcp_oauth_preconditions.health_section),
     }
 
     # Top-level aggregate (#538): `degraded` when any queue section holds

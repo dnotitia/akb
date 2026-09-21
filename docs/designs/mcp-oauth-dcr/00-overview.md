@@ -157,22 +157,46 @@ additional coarse gate that the IdP can present at consent time.
 
 ## What the operator configures (Keycloak example)
 
-This is **realm configuration**, not AKB code:
+This is **realm configuration**, not AKB code. The authority for the
+exact settings is the runbook,
+[`docs/mcp-clients/web-connectors.md`](../../mcp-clients/web-connectors.md)
+— follow it, not this section. What is here is the shape of the problem,
+so the design reads whole; the runbook is what an operator applies.
 
 - Realm: `akb` (the existing realm from the `keycloak-oidc` design)
 - Client scopes:
   - `akb:vault:read` — consent text: *"Read your AKB vaults"*
   - `akb:vault:write` — consent text: *"Create, edit, and delete AKB content"*
-- DCR: enable "Trusted Hosts" policy (default Keycloak DCR is open;
-  Trusted Hosts limits which client `redirect_uris` are accepted at
-  registration time — set to `claude.ai`, `chat.openai.com`, etc.)
+  - each needs an `oidc-audience-mapper` pinned to the AKB `/mcp` URL, or
+    the token the user consents to is rejected at the resource server
+- DCR: the "Trusted Hosts" policy has **two independent checks**, and this
+  design originally treated them as one. Keep the redirect-URI check; turn
+  the sender-host check (`Host sending registration request must match`)
+  **off**. An MCP client registers from whatever address it happens to have
+  — a laptop on the move, a hosted client's egress — so an allowlist of
+  remote origins satisfies neither check for a local client and rejects
+  every legitimate registration. The runbook has the exact settings and the
+  reasoning.
 - Optional: Initial Access Token requirement (Protected DCR) for hostile
-  internet exposure. Mint a one-shot token per partner.
+  internet exposure. Mint a one-shot token per partner. Note that an IAT
+  does not bypass client-registration policies — it switches which policy
+  subtype applies, `anonymous` → `authenticated`. Keycloak's
+  `Allowed Client Scopes` policy exists on both and rejects a
+  spec-compliant DCR body in both, so hardening this way is only safe
+  once that policy is gone from both sets. The setup script removes both;
+  the runbook shows the measured 403.
 - Optional: client policies forcing PKCE S256 on all dynamically
   registered clients.
 
-Recommended: ship `deploy/k8s/internal/keycloak-realm-akb.json` with the
-above scopes + policies pre-defined so operators only need to import it.
+**The supported way to apply all of this is
+`scripts/keycloak/setup-akb-mcp-oauth.py`.** An earlier draft of this
+design recommended shipping a `deploy/k8s/internal/keycloak-realm-akb.json`
+realm bundle to import instead; that promise is withdrawn. Two reasons: a
+committed bundle is a second source of realm truth that drifts silently
+from the script the moment either changes, and `deploy/k8s/internal/` is
+git-ignored precisely because it holds operator-specific values — a file
+shipped there would have reached no operator anyway. The script is
+idempotent and re-runnable, which a one-shot import is not.
 
 ## Flow
 
@@ -298,8 +322,11 @@ Sized rough; refine in implementation PR.
 5. Patch `backend/mcp_server/http_app.py` token branch + 401
    `WWW-Authenticate` header.
 6. Add `oauth_metadata.py` route + mount in `main.py`.
-7. Realm config bundle in `deploy/k8s/internal/keycloak-realm-akb.json`
-   (scopes + Trusted Hosts policy).
+7. Realm setup in `scripts/keycloak/setup-akb-mcp-oauth.py` (scopes +
+   audience mappers + DCR policies), idempotent and re-runnable. Shipped.
+   This step originally named a `deploy/k8s/internal/keycloak-realm-akb.json`
+   bundle to import; see "What the operator configures" above for why that
+   is withdrawn rather than outstanding.
 8. Tests:
    - Unit: JWT with wrong `aud` rejected; missing scope → 403;
      PAT still works; both token types in mixed traffic; metadata
