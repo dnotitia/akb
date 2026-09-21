@@ -19,13 +19,13 @@ This implementation covers the shared connection setup on Home and Settings → 
 connections, token-list metadata, and safe replacement of an existing token. It
 applies to both local human authentication and SSO. It does not add token-secret
 recovery, service-key UI, organizational lifetime policy, or a new Vault read
-isolation model. Deployment and live Vault updates are outside this implementation.
+isolation model.
 
 **Accepted approach:** a shared advanced form backed by a versioned issuance
 contract, with backend enforcement before exposing the UI. A purely
 frontend change would preserve unsafe compatibility and replacement behavior.
 
-## 2. Findings from the current code
+## 2. Baseline behavior and rationale
 
 | Evidence at the baseline | Consequence for this design |
 | --- | --- |
@@ -40,11 +40,6 @@ frontend change would preserve unsafe compatibility and replacement behavior.
 | [handleReissue](../../../../frontend/src/pages/settings/tokens-section.tsx) revokes first and then calls `createPAT(p.name)` | Reissue loses expiration/permission/Vault restrictions; replacement must review and preserve them |
 | [REST authorization](../../../../backend/app/api/deps.py) permits a write PAT to reach the existing mint route; create_token does not attenuate against the caller's token restrictions | A restricted PAT can mint an unrestricted child. Close this path on the legacy route as well as the new route before shipping the feature |
 | [Administrator mint routes](../../../../backend/app/api/routes/access.py) check is_admin and call the same mint service without parent restrictions | A scoped administrator PAT can use the admin aliases to mint an unrestricted token for itself; self-route checks alone are insufficient |
-
-Read-only route reproduction confirmed the last issue with an injected write-only
-PAT carrying prefix `restricted-`: a name-only child request reaches create_pat
-with no Vault scope, no expiration, and default read+write. This was a mocked
-authorization/route reproduction, not an exploit against a deployed tenant.
 
 ### Authority model to communicate
 
@@ -214,8 +209,8 @@ documented managed-control-plane use needs an explicit machine issuer exception:
 - Inventory and migrate existing control-plane consumers before enforcement.
   Existing administrator PAT automation must move to an explicitly provisioned
   service issuer; never allow all administrator PATs as a compatibility fallback.
-  The actual external consumer inventory is an implementation prerequisite, not
-  something established by this repository-only investigation.
+  Operators must inventory external consumers before rollout; repository tests
+  cannot verify deployment-specific integrations.
 
 Centralize this policy at the two production mint call sites (auth routes and
 the shared administrator mint helper), passing the issuer to authorization. Test
@@ -342,7 +337,7 @@ Required regression cases:
 
 Run frontend design:check/typecheck/lint/test and repository scripts/check.sh for
 implementation. Use real PostgreSQL and the repository-owned isolated runtime for
-scope/expiry/credential behavior. The implemented validation results are recorded below.
+scope/expiry/credential behavior. The verification entry points are listed below.
 
 ## 8. Alternatives and research
 
@@ -359,44 +354,38 @@ scope/expiry/credential behavior. The implemented validation results are recorde
 supports choosing expiration and limited permissions/resources. Adopt those UI
 patterns, but do not copy GitHub repository-isolation semantics onto AKB's Vault
 write scope. [W3C's form notification guidance](https://www.w3.org/WAI/tutorials/forms/notifications/)
-supports field-associated errors and a keyboard-reachable error summary. The
-local UI/UX skill's form-validation recommendations agree with this approach.
+supports field-associated errors and a keyboard-reachable error summary.
 
 These are AKB design decisions, not externally imposed policy. Research reviewed
 on 2026-09-15; baseline references above document the pre-change findings.
 
-## 9. Design review status
+## 9. Verification and rollout
 
-Read-only backend investigation and a separate design review found and addressed
-the administrator mint alias, missing list scope, and the risk of widening SQL
-reads when switching to Read only. The accepted design is implemented. External
-control-plane consumer migration remains a release prerequisite; deployment has
-not been performed.
+The implementation includes regression coverage for:
 
-## 10. Implementation and verification
+- Strict schema validation, expiration boundaries, transaction rollback, issuer
+  changes, administrator aliases, and SSO browser CSRF. The PostgreSQL issuance
+  suite is registered in CI.
+- Capability negotiation, receipt verification, field errors, uncertain creation
+  outcomes, secret visibility, session changes, and exact replacement settings.
+- Credential-mode changes: saved-token and OAuth switches retain the draft and
+  uncertain-result warning. Another mint requires explicit result review and
+  preserves the selected expiration, permissions, and Vault restriction.
+- UTC conversion overflow and malformed input rejection before shared text
+  normalization can alter the submitted values.
 
-- The shared advanced form is available in Home connection setup and Settings →
-  Agent connections. Token metadata and explicit create-then-revoke replacement
-  use the same reviewed options.
-- Backend validation: 134 unique unit, real PostgreSQL, and compatibility tests passed,
-  including exact expiry, transaction rollback, issuer changes, public mint
-  aliases, and SSO browser CSRF. The new PostgreSQL suite is registered in CI.
-- All required frontend gates passed: design checks, type checks, lint, and
-  1,029 tests across 133 files. Explicit America/New_York timezone tests also
-  passed. The repository-wide `scripts/check.sh` passed, including a secret scan
-  of new files through a temporary index; the actual Git index was not changed.
-- Independent backend review identified UTC conversion overflow at supported
-  year boundaries. Both schema and service now return a field validation error;
-  regression tests cover the upper and lower boundaries.
-- A real browser test passed against the disposable repository runtime: 30-day
-  scoped issuance, allowed/denied writes, ordinary read semantics, child-mint
-  denial, exact replacement expiry/scope, and explicit original revocation.
-  Desktop and 390px mobile screenshots were inspected; mobile has no horizontal
-  overflow. No existing developer deployment was modified.
+Run `bash scripts/check.sh` from the repository root for static analysis, package
+checks, frontend unit tests, and secret scanning. Run the PAT backend suites from
+`backend/` with the test PostgreSQL service configured as described in
+[the CI runtime guide](../../../../scripts/ci/README.md):
 
-To repeat the browser scenario, start the repository-owned local runtime with
-frontend support as described in [the CI runtime guide](../../../../scripts/ci/README.md),
-then run against its frontend origin (replace the example port if necessary):
+```sh
+pytest tests/test_pat_issuance_unit.py tests/test_pat_issuance_postgres.py \
+  tests/test_workspace_account_admin_routes.py -q
+```
+
+For the browser scenario, start the repository-owned local runtime with frontend
+support, then use its frontend origin (replace the example port if necessary):
 
 ```sh
 cd frontend
@@ -405,14 +394,11 @@ AKB_FE_E2E_MODE=real AKB_PAT_ISSUANCE_E2E=1 \
   pnpm exec playwright test e2e/pat-issuance-live.spec.ts --project=chromium
 ```
 
-The test creates and deletes its own user and Vaults. It requires local
+The browser test creates and deletes its own user and Vaults. It requires local
 registration and account self-service cleanup enabled in the isolated runtime.
+It exercises scoped issuance, denied writes, ordinary read behavior, child-mint
+denial, exact replacement settings, and explicit original revocation.
 
-### Review follow-up — 2026-09-21
-
-Fixed the P2 credential-mode switching issue by keeping the issuance form mounted
-once opened and hiding it when another mode is selected. Two regression scenarios
-(saved token and OAuth) first failed against the old behavior, then passed after
-the fix. They cover retained dirty state, uncertain-result warnings, prevention of
-another mint until explicit review, and preservation of the read-only, 30-day,
-Vault-prefix restrictions on the next explicitly requested issuance.
+Before deployment, migrate administrator-PAT provisioning integrations to the
+explicit service-issuer policy and ensure all replicas enforce the issuance
+boundary. This requirement applies independently of test results.
