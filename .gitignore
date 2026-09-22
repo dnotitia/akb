@@ -99,3 +99,8 @@ Desktop.ini
 # stray local screenshots (Playwright/manual)
 /*.png
 .playwright-mcp/
+
+# Operator-generated Native deployment configuration and persisted identity.
+/deploy/k8s/native/app.yaml
+# Documented opt-in Native app/secret configuration and session private keys.
+/config/native/

@@ -182,3 +182,11 @@ pinning nothing, because CI then tests a version the deployment does not run.
 
 For a chart-based installation, see [`../helm/akb`](../helm/akb/README.md).
 The Helm chart renders the same standalone and standalone-SSO shapes.
+
+## Opt-in PostgreSQL Native
+
+For a never-used database, the `native/` overlay adds explicit bootstrap before
+API/worker startup and uses empty read-only Git storage. Generate and preserve
+installation identity, provision secrets, and pin all three backend images as
+specified in [Native installation and configuration upgrades](../../docs/operations/native-installation.md).
+Do not apply the new-install overlay to an existing Bare Git/cutover database.

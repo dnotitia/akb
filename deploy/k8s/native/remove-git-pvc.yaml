@@ -1,0 +1,8 @@
+# Exclude the unused Git PVC from this NEW-install render. This is a Kustomize
+# resource deletion, not an instruction to delete an existing cluster's PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: akb-vaultdata
+  namespace: akb
+$patch: delete

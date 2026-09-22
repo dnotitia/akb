@@ -1,0 +1,34 @@
+# Explicit NEW-database Native installation. Requires Compose >= 2.24.4.
+# Generate persistent config/identity first; see docs/operations/native-installation.md.
+# Always use a pinned, prebuilt backend image and `up --no-build`.
+services:
+  native-bootstrap:
+    image: ${AKB_NATIVE_IMAGE:?Set the pinned backend image}
+    command: ["python", "-m", "app.cli", "initialize-postgres-native"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${AKB_NATIVE_CONFIG_DIR:?Set the persistent Native config directory}:/etc/akb:ro
+    tmpfs:
+      - /data/vaults:ro
+
+  backend:
+    image: ${AKB_NATIVE_IMAGE:?Set the pinned backend image}
+    build: !reset null
+    depends_on:
+      native-bootstrap:
+        condition: service_completed_successfully
+    volumes: !override
+      - ${AKB_NATIVE_CONFIG_DIR:?Set the persistent Native config directory}:/etc/akb:ro
+    tmpfs:
+      - /data/vaults:ro
+
+  worker:
+    image: ${AKB_NATIVE_IMAGE:?Set the pinned backend image}
+    build: !reset null
+    volumes: !override
+      - ${AKB_NATIVE_CONFIG_DIR:?Set the persistent Native config directory}:/etc/akb:ro
+    tmpfs:
+      - /data/vaults:ro
