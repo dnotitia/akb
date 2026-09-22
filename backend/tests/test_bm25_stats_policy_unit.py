@@ -18,7 +18,7 @@ from app.services import sparse_encoder
     ("seahorse-db-grpc", "posting", "seahorse-db-grpc"),
 ])
 def test_existing_consumers_keep_external_stats(driver, shape, consumer):
-    configured = Settings(vector_store_driver=driver, vector_store_sparse_shape=shape)
+    configured = Settings(document_revision_backend="bare_git", vector_store_driver=driver, vector_store_sparse_shape=shape)
     assert configured.bm25_external_stats_mode == "required"
     assert configured.bm25_external_stats_consumers == [consumer]
 
@@ -30,13 +30,13 @@ def test_existing_consumers_keep_external_stats(driver, shape, consumer):
 ])
 def test_external_stats_opt_out_rejects_a_live_consumer(driver, shape):
     with pytest.raises(ValidationError, match="requires pgvector/vchord"):
-        Settings(vector_store_driver=driver, vector_store_sparse_shape=shape,
+        Settings(document_revision_backend="bare_git", vector_store_driver=driver, vector_store_sparse_shape=shape,
                  bm25_external_stats_mode="vchord_only_verified")
 
 
 @pytest.mark.asyncio
 async def test_verified_vchord_only_skips_startup_and_periodic_work(monkeypatch):
-    configured = Settings(vector_store_driver="pgvector", vector_store_sparse_shape="vchord",
+    configured = Settings(document_revision_backend="bare_git", vector_store_driver="pgvector", vector_store_sparse_shape="vchord",
                           bm25_external_stats_mode="vchord_only_verified")
     monkeypatch.setattr(sparse_encoder, "settings", configured)
     runner = Mock()
@@ -59,7 +59,7 @@ async def test_verified_vchord_only_skips_startup_and_periodic_work(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_vchord_with_posting_rollback_still_refreshes(monkeypatch):
-    configured = Settings(vector_store_driver="pgvector", vector_store_sparse_shape="vchord")
+    configured = Settings(document_revision_backend="bare_git", vector_store_driver="pgvector", vector_store_sparse_shape="vchord")
     monkeypatch.setattr(sparse_encoder, "settings", configured)
     runner = Mock()
     runner.is_running.return_value = False
@@ -81,7 +81,7 @@ async def test_disabled_health_retains_shared_success_and_progress(monkeypatch, 
     from datetime import datetime, timezone
     from unittest.mock import MagicMock
 
-    configured = Settings(vector_store_driver="pgvector", vector_store_sparse_shape="vchord",
+    configured = Settings(document_revision_backend="bare_git", vector_store_driver="pgvector", vector_store_sparse_shape="vchord",
                           bm25_external_stats_mode="vchord_only_verified")
     monkeypatch.setattr(sparse_encoder, "settings", configured)
     success = datetime(2026, 1, 1, tzinfo=timezone.utc)

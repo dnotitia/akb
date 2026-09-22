@@ -277,3 +277,77 @@ def test_cli_errors_do_not_echo_yaml_or_unrecognized_argument(request_config, ca
     assert "do-not-print-this-password" not in capsys.readouterr().err
     assert cli.main([*args, "--do-not-print-this-password"]) == 2
     assert "do-not-print-this-password" not in capsys.readouterr().err
+
+
+def _isolated_selection(tmp_path, values):
+    """Load real Settings in a fresh process, outside pytest's legacy config."""
+    config = tmp_path / "config"
+    config.mkdir(exist_ok=True)
+    (config / "app.yaml").write_text(yaml.safe_dump({"auth_mode": "local", **values}))
+    code = """
+import json
+from app.config import settings
+from app.services import revision_backend
+from app.services.native_document_service import NativeDocumentService
+
+def no_git(*args, **kwargs):
+    raise AssertionError("default-selected Native must never fall back to Git")
+
+revision_backend.GitService = no_git
+revision_backend.LegacyRevisionBackend = no_git
+service = revision_backend.get_document_service()
+assert isinstance(service, NativeDocumentService)
+assert revision_backend.get_document_service() is service
+print(json.dumps({"backend": settings.document_revision_backend,
+                  "database_id": str(settings.document_revision_database_id)}))
+"""
+    return subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_prepared_example_and_omitted_selector_choose_native_in_real_process(tmp_path):
+    source = Path(__file__).resolve().parents[2] / "config" / "app.yaml.example"
+    raw = yaml.safe_load(source.read_text())
+    assert raw["document_revision_backend"] == "postgres_native"
+    assert not raw.get("document_revision_database_id")
+    secret = tmp_path / "secret.yaml"
+    secret.write_text("{}\n")
+    output = tmp_path / "prepared.yaml"
+    receipt = prepare_native_config(
+        source=source, secret=secret, output=output,
+        tenant_id="fresh", namespace="fresh", image_digest=DIGEST,
+    )
+    values = yaml.safe_load(output.read_text())
+    # No fixture or monkeypatch supplies the selector in this process.
+    values.pop("document_revision_backend")
+    first = _isolated_selection(tmp_path, values)
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout) == {
+        "backend": "postgres_native", "database_id": receipt["database_id"],
+    }
+    second = _isolated_selection(tmp_path, values)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == first.stdout
+
+
+def test_unprepared_omitted_selector_fails_before_backend_composition(tmp_path):
+    result = _isolated_selection(tmp_path, {})
+    assert result.returncode != 0
+    assert "postgres_native requires document_revision_tenant_id" in result.stderr
+    assert "default-selected Native must never fall back" not in result.stderr
+
+
+def test_preserved_omitted_selector_loads_as_legacy_after_default_change(tmp_path):
+    from app.config import Settings
+
+    source, secret, output = (tmp_path / name for name in ("old.yaml", "secret.yaml", "preserved.yaml"))
+    source.write_text("auth_mode: local\ndb_name: existing\n")
+    secret.write_text("{}\n")
+    preserve_revision_config(source=source, secret=secret, output=output)
+    configured = Settings.model_validate(yaml.safe_load(output.read_text()))
+    assert configured.document_revision_backend == "bare_git"
+    assert configured.document_revision_database_id is None
+    assert source.read_text() == "auth_mode: local\ndb_name: existing\n"

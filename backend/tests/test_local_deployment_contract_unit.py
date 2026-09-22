@@ -83,8 +83,9 @@ def test_dev_keycloak_uses_the_kubernetes_version():
     assert compose["services"]["keycloak"]["image"] == expected
 
 
-def test_local_runtime_defaults_match_kubernetes_except_topology():
+def test_local_runtime_defaults_match_kubernetes_except_topology(tmp_path):
     from app.config import Settings
+    from app.services.revision_install_config import prepare_native_config
 
     resources = list(yaml.safe_load_all((ROOT / "deploy/k8s/backend.yaml").read_text()))
     config = next(r for r in resources if r and r["kind"] == "ConfigMap")
@@ -100,9 +101,24 @@ def test_local_runtime_defaults_match_kubernetes_except_topology():
         "s3_endpoint_url",
         "redis_url",
     }
-    for path in (ROOT / "config/app.yaml.example", DEMO / "app.yaml"):
+    source = ROOT / "config/app.yaml.example"
+    assert yaml.safe_load(source.read_text())["document_revision_backend"] == "postgres_native"
+    assert expected["document_revision_backend"] == "bare_git"
+    prepared = tmp_path / "native.yaml"
+    secret = tmp_path / "secret.yaml"
+    secret.write_text("{}\n")
+    prepare_native_config(
+        source=source, secret=secret, output=prepared,
+        tenant_id="deployment-test", namespace="deployment-test",
+        image_digest="sha256:" + "a" * 64,
+    )
+    for path in (prepared, DEMO / "app.yaml"):
         actual = Settings.model_validate(yaml.safe_load(path.read_text())).model_dump()
+        assert actual["document_revision_backend"] == ("postgres_native" if path == prepared else "bare_git")
         for key, value in expected.items():
+            # Base manifest/demo stay Bare Git; the prepared quickstart is Native.
+            if key.startswith("document_revision_"):
+                continue
             if key not in environment_keys:
                 assert actual[key] == value, (path, key)
 
@@ -164,6 +180,8 @@ def test_demo_yaml_preserves_values_and_mounted_overrides(tmp_path, demo_env):
     )
     app = yaml.safe_load((output / "app.yaml").read_text())
     private = yaml.safe_load((output / "secret.yaml").read_text())
+    assert app["document_revision_backend"] == "bare_git"
+    assert app["git_storage_path"] == "/data/vaults"
     assert app["embed_model"] == "custom-model"
     assert app["embed_dimensions"] == 768
     assert app["rerank_enabled"] is True
@@ -176,6 +194,7 @@ def test_demo_yaml_preserves_values_and_mounted_overrides(tmp_path, demo_env):
     (inputs / "app.yaml").unlink()
     configure.render(DEMO / "app.yaml", inputs, output, demo_env)
     app = yaml.safe_load((output / "app.yaml").read_text())
+    assert app["document_revision_backend"] == "bare_git"
     assert app["embed_model"] == "text-embedding-3-small"
     assert app["rerank_enabled"] is False
 
@@ -209,3 +228,18 @@ def test_root_compose_creates_managed_volumes_for_fresh_installations():
     assert root["volumes"]["vault_data"]["name"] == "akb-contract_vault_data"
     for volume in root["volumes"].values():
         assert not volume.get("external", False)
+
+
+@pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])
+def test_demo_rejects_native_override_without_explicit_bootstrap(tmp_path, demo_env, filename):
+    (tmp_path / filename).write_text("document_revision_backend: postgres_native\n")
+    with pytest.raises(ValueError, match="document_revision_backend is owned by the demo bootstrap"):
+        configure.render(DEMO / "app.yaml", tmp_path, tmp_path / "output", demo_env)
+
+
+@pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])
+def test_demo_preserves_existing_bare_git_alias(tmp_path, demo_env, filename):
+    (tmp_path / filename).write_text("document_revision_backend: bare_git_current\n")
+    output = tmp_path / "output"
+    configure.render(DEMO / "app.yaml", tmp_path, output, demo_env)
+    assert yaml.safe_load((output / filename).read_text())["document_revision_backend"] == "bare_git_current"

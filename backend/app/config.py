@@ -600,11 +600,13 @@ class Settings(BaseModel):
     # Git storage root (bare repos live here)
     git_storage_path: str = "/data/vaults"
 
-    # Stable document revision selector. ``bare_git`` is the default. The two
+    # Stable document revision selector. New installations default to Native.
+    # Existing omitted-selector configs must be pinned with preserve-revision-config
+    # before upgrade; never infer authority from a database. The two
     # legacy values remain accepted for receipt compatibility; they are not
     # rendered by new deployment surfaces.
     document_revision_backend: Literal["bare_git", "postgres_native", "bare_git_current", "native_ledger_m1"] = (
-        "bare_git"
+        "postgres_native"
     )
     # Positive new-database Native authority bootstrap identity. These values
     # are deliberately YAML-only and are required only by postgres_native.
@@ -1689,8 +1691,11 @@ def _find_config_dir() -> Path:
     searched = ", ".join(str(c.resolve()) for c in _CONFIG_CANDIDATES)
     raise RuntimeError(
         "AKB config not found. Looked for app.yaml in: " + searched + ". "
-        "Copy config/app.yaml.example → config/app.yaml and "
-        "config/secret.yaml.example → config/secret.yaml, then fill in values."
+        "For a new installation, use prepare-native-config and explicit "
+        "initialize-postgres-native bootstrap as documented in "
+        "docs/operations/native-installation.md. For an existing installation, "
+        "run preserve-revision-config before upgrading; copying the template "
+        "alone does not provision Native identity."
     )
 
 

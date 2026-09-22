@@ -72,7 +72,7 @@ def test_platform_hard_config_rejects_direct_or_uncredentialed_model_routes():
         llm_base_url="https://gateway.example/v1", rerank_enabled=True,
     ))
     assert configured.model_api_governance_mode == "platform_hard"
-    standalone = Settings(embed_base_url="https://api.openai.com/v1")
+    standalone = Settings(document_revision_backend="bare_git", embed_base_url="https://api.openai.com/v1")
     assert standalone.embed_base_url == "https://api.openai.com/v1"
 
 

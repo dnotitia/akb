@@ -28,13 +28,20 @@ def _native_settings(tmp_path, **overrides) -> Settings:
     return Settings(**values)
 
 
-def test_omitted_selector_defaults_to_stable_bare_git(tmp_path):
+def test_omitted_selector_defaults_to_native_with_persisted_identity(tmp_path):
     from app.services.revision_backend import canonical_document_revision_backend
 
-    configured = Settings(git_storage_path=str(tmp_path))
+    values = _native_settings(tmp_path).model_dump()
+    values.pop("document_revision_backend")
+    configured = Settings(**values)
 
-    assert configured.document_revision_backend == "bare_git"
-    assert canonical_document_revision_backend(configured.document_revision_backend) == "bare_git"
+    assert configured.document_revision_backend == "postgres_native"
+    assert canonical_document_revision_backend(configured.document_revision_backend) == "postgres_native"
+
+
+def test_omitted_selector_without_identity_fails_closed():
+    with pytest.raises(ValueError, match="postgres_native requires document_revision_tenant_id"):
+        Settings()
 
 
 @pytest.mark.parametrize(

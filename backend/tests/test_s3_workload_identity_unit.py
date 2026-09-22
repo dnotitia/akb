@@ -204,7 +204,7 @@ def test_managed_static_client_factory_is_not_an_escape(storage):
     ("static", False, True), ("default_chain", False, False), ("default_chain", True, False),
 ])
 def test_bucket_creation_only_exists_for_standalone_static(monkeypatch, mode, managed, creates):
-    values = managed_values() if managed else {}
+    values = managed_values() if managed else {"document_revision_backend": "bare_git"}
     monkeypatch.setattr(s3_adapter, "settings", Settings(**{**values, "s3_auth_mode": mode}))
     monkeypatch.setattr(s3_adapter, "_bucket_verified", set())
 
@@ -249,7 +249,7 @@ def test_standalone_native_chain_uses_standard_environment(monkeypatch, tmp_path
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "cloud-fixture")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-fixture-secret")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "cloud-session")
-    monkeypatch.setattr(s3_adapter, "settings", Settings(s3_auth_mode="default_chain", s3_region="us-east-1"))
+    monkeypatch.setattr(s3_adapter, "settings", Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain", s3_region="us-east-1"))
     for name in ("_internal_client", "_internal_presign_client", "_session"):
         monkeypatch.setattr(s3_adapter, name, None, raising=False)
     signed = _sign("native-cloud")
@@ -261,6 +261,7 @@ def test_standalone_static_presign_keeps_existing_keys(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
     monkeypatch.setattr(s3_adapter, "settings", Settings(
+        document_revision_backend="bare_git",
         s3_endpoint_url="http://minio:9000", s3_access_key="local-key",
         s3_secret_key="local-fixture",  # pragma: allowlist secret -- offline test fixture
     ))
@@ -290,7 +291,7 @@ def test_standalone_native_webidentity_provider_is_preserved(storage, monkeypatc
     monkeypatch.setenv("AWS_ROLE_ARN", storage.settings.s3_role_arn)
     monkeypatch.setenv("AWS_ENDPOINT_URL_STS", "https://sts.example")
     monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://storage.example")
-    monkeypatch.setattr(s3_adapter, "settings", Settings(s3_auth_mode="default_chain", s3_region="us-east-1"))
+    monkeypatch.setattr(s3_adapter, "settings", Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain", s3_region="us-east-1"))
     signed = _sign("native-webidentity")
     assert _query(signed)["X-Amz-Security-Token"] == ["temporary-session-1"]
     assert 3500 <= signed.expires_in <= 3540
@@ -308,6 +309,7 @@ def test_failed_mandatory_refresh_does_not_use_expired_session(storage):
 
 def test_standalone_audit_credentials_remain_isolated(monkeypatch, tmp_path):
     configured = Settings(
+        document_revision_backend="bare_git",
         s3_endpoint_url="http://minio:9000", s3_access_key="file-key",
         s3_secret_key="file-fixture",  # pragma: allowlist secret -- offline test fixture
         audit={"access_key": "audit-key", "secret_key": "audit-fixture"},  # pragma: allowlist secret -- offline fixture

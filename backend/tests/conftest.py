@@ -33,6 +33,9 @@ _EXAMPLE_APP_YAML = _REPO_ROOT / "config" / "app.yaml.example"
 if not _BACKEND_APP_YAML.exists() and _EXAMPLE_APP_YAML.exists():
     _BACKEND_CFG_DIR.mkdir(parents=True, exist_ok=True)
     bootstrap_config = yaml.safe_load(_EXAMPLE_APP_YAML.read_text())
+    # Collection exercises legacy Git services. Pin only this import fixture;
+    # Settings defaults and isolated Native subprocess tests stay untouched.
+    bootstrap_config["document_revision_backend"] = "bare_git"
     bootstrap_config["local_session_private_key_path"] = str(
         _BACKEND_LOCAL_KEY_DIR / "private.pem"
     )
