@@ -14,6 +14,14 @@ Authority/identity mismatches fail closed. Helm, all-in-one, standalone SSO
 and Git-oriented CI remain explicit legacy Bare Git paths. Historical
 migration/history/diff/activity compatibility is retained.
 
+Two smaller breaks ride along. `deploy/k8s/deploy.sh` no longer defaults to
+`AKB_PROFILE=standalone`: it exits 2 before any cluster access, so an
+invocation that relied on the implicit profile must now name it. And
+`config/app.yaml.example` is a new-install Native template whose identity
+fields are deliberately empty, so copying it is no longer a runnable
+configuration — `CONTRIBUTING.md` pins `bare_git` for a development stack, and
+`prepare-native-config` generates the identity for a real one.
+
 See [installation and upgrade order](../docs/operations/native-installation.md).
 Publish this change only with an explicitly announced default-change release;
 this entry does not bump a version, publish an artifact or authorize rollout.

@@ -2,7 +2,7 @@
 status: accepted
 stage: applied
 created: 2026-08-12
-updated: 2026-09-16
+updated: 2026-09-22
 ---
 
 # PostgreSQL Native Document Revision Backend
@@ -12,8 +12,8 @@ updated: 2026-09-16
 AKB exposes two stable, process-scoped document revision backends:
 
 ```yaml
-document_revision_backend: bare_git       # default
-# document_revision_backend: postgres_native
+document_revision_backend: postgres_native   # new-install default
+# document_revision_backend: bare_git
 ```
 
 Both implementations ship in the same backend image and preserve the public
@@ -88,7 +88,9 @@ and is outside this backend contract.
 
 ## Scope and non-goals
 
-- Bare Git remains the default.
+- New installations default to Native; an existing installation keeps its
+  backend by pinning it with `preserve-revision-config` before upgrading.
+  An omitted selector fails closed rather than choosing for the operator.
 - Selection is immutable for the backend process; there is no request- or
   Vault-level split and no dual canonical write.
 - Existing-tenant activation requires the explicit stopped, snapshot-backed,
