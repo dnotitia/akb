@@ -250,6 +250,14 @@ async def test_candidate_http_catalog_and_action_validation(
         return user
 
     monkeypatch.setattr(http_app, "resolve_mcp_authorization", resolve)
+    activity_calls: list[dict] = []
+    activity_key = ("akb_document_read", "activity")
+
+    async def activity_stub(args, _uid, _user):
+        activity_calls.append(args)
+        return {"unexpected": True}
+
+    monkeypatch.setitem(CANDIDATE_REGISTRY._handlers, activity_key, activity_stub)
 
     headers = {
         "authorization": "Bearer test-token",
@@ -349,6 +357,35 @@ async def test_candidate_http_catalog_and_action_validation(
                 read_mutation_rejected.json()["result"]["content"][0]["text"]
             )
             assert read_mutation_body["code"] == "unknown_argument"
+
+            unknown_activity_argument = await client.post(
+                "/mcp/",
+                headers={
+                    **headers,
+                    "mcp-method": "tools/call",
+                    "mcp-name": "akb_document_read",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_document_read",
+                        "arguments": {
+                            "action": "activity",
+                            "vault": "candidate-vault",
+                            "user": "nobody",
+                        },
+                        "_meta": meta,
+                    },
+                },
+            )
+            unknown_activity_body = json.loads(
+                unknown_activity_argument.json()["result"]["content"][0]["text"]
+            )
+            assert unknown_activity_body["code"] == "unknown_argument"
+            assert "author" in unknown_activity_body.get("hint", "")
+            assert activity_calls == []
 
             call_headers = {**headers, "mcp-method": "tools/call", "mcp-name": "akb_document_read"}
             rejected = await client.post(

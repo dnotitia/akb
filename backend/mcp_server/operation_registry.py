@@ -16,6 +16,8 @@ from typing import Any, Literal
 from jsonschema import Draft202012Validator
 from mcp.types import Tool, ToolAnnotations
 
+from app.util.text import fuzzy_hint
+
 
 READ_SCOPE = "akb:vault:read"
 WRITE_SCOPE = "akb:vault:write"
@@ -281,6 +283,7 @@ class OperationRegistry:
                 f"Unknown argument '{bad}' for action '{action}'",
                 code="unknown_argument",
                 action=action,
+                hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
                 available_arguments=sorted(allowed),
             )
 
