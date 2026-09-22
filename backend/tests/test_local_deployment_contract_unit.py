@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 
 import pytest
 import yaml
@@ -243,3 +244,44 @@ def test_demo_preserves_existing_bare_git_alias(tmp_path, demo_env, filename):
     output = tmp_path / "output"
     configure.render(DEMO / "app.yaml", tmp_path, output, demo_env)
     assert yaml.safe_load((output / filename).read_text())["document_revision_backend"] == "bare_git_current"
+
+
+def test_sso_broker_chain_fixture_writes_a_config_that_loads():
+    """The fixture writes its whole app.yaml, so it owns the revision selector.
+
+    It runs the real Settings loader from its own run directory. When the
+    selector was omitted it inherited the new Native default and the run died
+    in config validation, before Keycloak was ever contacted — a failure that
+    reads as an unreachable broker. Load the exact bytes the script writes.
+    """
+    from app.config import Settings
+
+    script = (ROOT / "deploy/keycloak-dev/broker-chain/run.sh").read_text()
+    body = script.split('cat >"$fixture_run_dir/config/app.yaml" <<YAML\n', 1)[1]
+    body = body.split("\nYAML\n", 1)[0]
+    values = yaml.safe_load(body.replace("$sso_session_epoch", str(uuid.uuid4())))
+
+    assert values["document_revision_backend"] == "bare_git"
+    assert Settings.model_validate(values).document_revision_backend == "bare_git"
+
+
+def test_contributor_setup_recipe_produces_a_loadable_config(tmp_path):
+    """CONTRIBUTING's copy-and-pin recipe must actually start.
+
+    `app.yaml.example` is a new-install Native template whose identity fields
+    are empty on purpose, so the plain copy the guide used to prescribe fails
+    Settings validation. Run the guide's own commands against the real files.
+    """
+    from app.config import Settings
+
+    guide = (ROOT / "CONTRIBUTING.md").read_text()
+    pin = "sed -i 's/^document_revision_backend: .*/document_revision_backend: bare_git/' config/app.yaml"
+    assert pin in guide, "CONTRIBUTING no longer pins the selector it tells contributors to pin"
+
+    config = tmp_path / "config"
+    config.mkdir()
+    shutil.copyfile(ROOT / "config/app.yaml.example", config / "app.yaml")
+    subprocess.run(["sed", "-i", pin.split("'")[1], "config/app.yaml"], cwd=tmp_path, check=True)
+
+    loaded = Settings.model_validate(yaml.safe_load((config / "app.yaml").read_text()))
+    assert loaded.document_revision_backend == "bare_git"
