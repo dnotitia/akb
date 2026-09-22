@@ -939,6 +939,9 @@ async def _bridge_body_backfill(args: list[str]) -> int:
                 except ValueError:
                     print(f"{arg} must be an integer", file=sys.stderr)
                     return 2
+                if value <= 0:
+                    print(f"{arg} must be positive", file=sys.stderr)
+                    return 2
                 if arg == "--limit":
                     limit = value
                 else:
@@ -955,7 +958,7 @@ async def _bridge_body_backfill(args: list[str]) -> int:
     try:
         if verify:
             checked = await verify_bridge_bodies(
-                vault=vault, limit=limit or 100_000_000, batch_size=batch_size
+                vault=vault, limit=100_000_000 if limit is None else limit, batch_size=batch_size
             )
             print(json.dumps(checked.to_dict(), sort_keys=True))
             if not checked.complete:
@@ -967,7 +970,7 @@ async def _bridge_body_backfill(args: list[str]) -> int:
             # one result that must not be exited over quietly.
             return 0 if checked.ok else 1
         report = await backfill_bridge_bodies(
-            vault=vault, limit=limit or 1000, batch_size=batch_size, dry_run=dry_run
+            vault=vault, limit=1000 if limit is None else limit, batch_size=batch_size, dry_run=dry_run
         )
     except ValidationError as error:
         print(f"bridge_body_backfill_failed: {error}", file=sys.stderr)

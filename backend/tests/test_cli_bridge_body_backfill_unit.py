@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,6 +71,30 @@ def test_a_non_numeric_limit_does_not_start_a_run(monkeypatch, capsys) -> None:
     assert calls == []
 
 
+@pytest.mark.parametrize("mode", [[], ["--verify"]], ids=["backfill", "verify"])
+@pytest.mark.parametrize("option", ["--limit", "--batch-size"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_nonpositive_bounds_are_rejected_before_service_or_pool_work(
+    monkeypatch, capsys, mode, option, value,
+) -> None:
+    backfill = AsyncMock(return_value=BridgeBodyBackfillReport(dry_run=False))
+    verify = AsyncMock(return_value=bridge_body_backfill.BridgeBodyVerifyReport())
+    close_pool = AsyncMock()
+    monkeypatch.setattr(bridge_body_backfill, "backfill_bridge_bodies", backfill)
+    monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", verify)
+    monkeypatch.setattr("app.db.postgres.close_pool", close_pool)
+
+    code = cli.main(["bridge-body-backfill", *mode, option, value])
+
+    backfill.assert_not_awaited()
+    verify.assert_not_awaited()
+    close_pool.assert_not_awaited()
+    assert code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert f"{option} must be positive" in output.err
+
+
 def test_a_missing_vault_is_reported_as_usage_not_a_crash(monkeypatch, capsys) -> None:
     from app.exceptions import ValidationError
 
@@ -129,7 +154,7 @@ def test_verify_without_a_limit_surveys_the_whole_population(monkeypatch, capsys
 
     monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
     assert cli.main(["bridge-body-backfill", "--vault", "v", "--verify"]) == 0
-    assert seen[0] > 1000
+    assert seen == [100_000_000]
     printed = json.loads(capsys.readouterr().out)
     assert printed["complete"] is True
 
@@ -144,6 +169,9 @@ def test_a_partial_survey_says_so_instead_of_looking_complete(monkeypatch, capsy
     from app.services.bridge_body_backfill import BridgeBodyVerifyReport
 
     async def fake(**kwargs):
+        assert kwargs == {
+            "vault": None, "limit": 1000, "batch_size": bridge_body_backfill.DEFAULT_BATCH_SIZE,
+        }
         return BridgeBodyVerifyReport(checked=1000, total=2191, matched=1000)
 
     monkeypatch.setattr(bridge_body_backfill, "verify_bridge_bodies", fake)
