@@ -35,6 +35,12 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Changed
+
+- Reserved vault-skill system-path policy denials now expose the stable
+  `reserved_system_path` error code while retaining the existing HTTP 403
+  envelope.
+
 ### Personal access token issuance options
 
 Add versioned PAT capability discovery and strict issuance with permission

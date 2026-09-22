@@ -16,7 +16,7 @@ through any API surface.
 
 from __future__ import annotations
 
-from app.exceptions import ForbiddenError
+from app.exceptions import ForbiddenError, ReservedSystemPathError
 
 # Canonical location. `mcp_server/help.py` imports this constant (single
 # source of truth — it previously lived there).
@@ -51,9 +51,9 @@ def check_put(collection: str | None, doc_type: str, *, internal: bool = False) 
     if internal:
         return
     if is_reserved_collection(collection):
-        raise ForbiddenError(_RESERVED_MSG)
+        raise ReservedSystemPathError(_RESERVED_MSG)
     if doc_type == SKILL_DOC_TYPE:
-        raise ForbiddenError(_SKILL_TYPE_MSG)
+        raise ReservedSystemPathError(_SKILL_TYPE_MSG)
 
 
 def check_update(
@@ -65,6 +65,10 @@ def check_update(
     owner check, or to the seed/backfill writers.  Keeping the default closed
     here also covers less obvious writers such as bulk grep/replace.
     """
+    if path == VAULT_SKILL_PATH and new_type and new_type != SKILL_DOC_TYPE:
+        raise ReservedSystemPathError(
+            "The vault-skill document's type is pinned to 'skill'."
+        )
     if path == VAULT_SKILL_PATH and not internal:
         raise ForbiddenError(
             "Only the vault owner can edit the vault-skill document."
@@ -75,13 +79,9 @@ def check_update(
     if not new_type:
         return
     if path == VAULT_SKILL_PATH:
-        if new_type != SKILL_DOC_TYPE:
-            raise ForbiddenError(
-                "The vault-skill document's type is pinned to 'skill'."
-            )
         return
     if new_type == SKILL_DOC_TYPE:
-        raise ForbiddenError(_SKILL_TYPE_MSG)
+        raise ReservedSystemPathError(_SKILL_TYPE_MSG)
 
 
 def check_update_type(path: str, new_type: str | None) -> None:
@@ -93,7 +93,7 @@ def check_move(old_path: str, new_path: str, *, internal: bool = False) -> None:
     if internal:
         return
     if is_reserved_path(old_path) or is_reserved_path(new_path):
-        raise ForbiddenError(
+        raise ReservedSystemPathError(
             "Documents cannot be moved into or out of the reserved 'overview' "
             "system collection."
         )
@@ -103,7 +103,7 @@ def check_delete(path: str, *, internal: bool = False) -> None:
     if internal:
         return
     if is_reserved_path(path):
-        raise ForbiddenError(
+        raise ReservedSystemPathError(
             "The vault-skill document cannot be deleted. Use reset-to-template "
             "instead (vault settings, or overwrite the body with akb_update)."
         )
@@ -117,7 +117,7 @@ def check_collection_create(path: str) -> None:
     stray row into permanent, undeletable litter.
     """
     if is_reserved_collection(path):
-        raise ForbiddenError(
+        raise ReservedSystemPathError(
             "Creating collections inside the reserved 'overview' system "
             "namespace is not allowed."
         )
@@ -125,7 +125,7 @@ def check_collection_create(path: str) -> None:
 
 def check_collection_delete(path: str) -> None:
     if path == SKILL_COLLECTION:
-        raise ForbiddenError(
+        raise ReservedSystemPathError(
             "'overview' is a reserved system collection and cannot be deleted."
         )
 
@@ -133,7 +133,7 @@ def check_collection_delete(path: str) -> None:
 def check_resource_collection(collection: str | None) -> None:
     """Files and tables may not be created under the reserved namespace."""
     if is_reserved_collection(collection):
-        raise ForbiddenError(
+        raise ReservedSystemPathError(
             "'overview' is a reserved system collection: files and tables "
             "cannot be created there."
         )
