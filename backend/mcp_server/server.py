@@ -1985,8 +1985,9 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         try:
             candidate_spec = CANDIDATE_REGISTRY.validate(name, args)
         except OperationValidationError as exc:
-            validation_code = UNKNOWN_ARGUMENT if exc.code == "unknown_argument" else INVALID_ARGUMENT
-            return err(str(exc), code=validation_code, **exc.details)
+            if exc.code == "unknown_argument":
+                return err(str(exc), code=UNKNOWN_ARGUMENT, **exc.details)
+            return err(str(exc), code=INVALID_ARGUMENT, **exc.details)
         handler = CANDIDATE_REGISTRY.handler_for(candidate_spec)
         # Legacy handlers remain implementation units only. The public action
         # discriminator is consumed at the registry boundary.

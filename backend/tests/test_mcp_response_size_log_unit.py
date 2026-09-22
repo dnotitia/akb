@@ -44,10 +44,12 @@ def test_one_line_per_call_carries_tool_bytes_and_duration(monkeypatch, caplog, 
     monkeypatch.setattr(srv, "_dispatch", _dispatch)
 
     with caplog.at_level(logging.INFO, logger=srv.RESPONSE_SIZE_LOGGER):
-        out = asyncio.run(srv.call_tool("akb_search", {"query": "seam"}))
+        out = asyncio.run(
+            srv.call_tool("akb_discover", {"action": "search", "query": "seam"})
+        )
 
     (record,) = _records(caplog)
-    assert record.tool == "akb_search"
+    assert record.tool == "akb_discover"
     assert record.result_bytes == len(out.content[0].text.encode("utf-8"))
     assert record.duration_ms >= 0
     assert "tools/call" in record.getMessage()
@@ -60,7 +62,9 @@ def test_the_logged_size_is_bytes_not_characters(monkeypatch, caplog, quiet_sink
     monkeypatch.setattr(srv, "_dispatch", _dispatch)
 
     with caplog.at_level(logging.INFO, logger=srv.RESPONSE_SIZE_LOGGER):
-        out = asyncio.run(srv.call_tool("akb_search", {"query": "본문"}))
+        out = asyncio.run(
+            srv.call_tool("akb_discover", {"action": "search", "query": "본문"})
+        )
 
     (record,) = _records(caplog)
     text = out.content[0].text
@@ -75,10 +79,12 @@ def test_a_failing_call_is_measured_too(monkeypatch, caplog, quiet_sinks):
     monkeypatch.setattr(srv, "_dispatch", _dispatch)
 
     with caplog.at_level(logging.INFO, logger=srv.RESPONSE_SIZE_LOGGER):
-        out = asyncio.run(srv.call_tool("akb_search", {"query": "seam"}))
+        out = asyncio.run(
+            srv.call_tool("akb_discover", {"action": "search", "query": "seam"})
+        )
 
     (record,) = _records(caplog)
-    assert record.tool == "akb_search"
+    assert record.tool == "akb_discover"
     assert record.result_bytes == len(out.content[0].text.encode("utf-8"))
     assert "error" in json.loads(out.content[0].text)
 
@@ -93,6 +99,8 @@ def test_a_broken_logger_cannot_fail_the_call(monkeypatch, caplog, quiet_sinks):
     monkeypatch.setattr(srv, "_dispatch", _dispatch)
     monkeypatch.setattr(srv.logger_response, "info", explode)
 
-    out = asyncio.run(srv.call_tool("akb_search", {"query": "seam"}))
+    out = asyncio.run(
+        srv.call_tool("akb_discover", {"action": "search", "query": "seam"})
+    )
 
     assert json.loads(out.content[0].text) == {"ok": True}
