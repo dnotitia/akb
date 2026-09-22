@@ -165,6 +165,8 @@ describe("MarkdownEditor formatting toolbar", () => {
     const editor = await screen.findByRole("textbox", { name: "Document content" });
     const checkboxes = within(editor).getAllByRole("checkbox");
     expect(checkboxes).toHaveLength(2);
+    expect(checkboxes[0]).toHaveAccessibleName("Task item checkbox for Parent task");
+    expect(checkboxes[1]).toHaveAccessibleName("Task item checkbox for Child task");
     expect(checkboxes[0]).not.toBeChecked();
     expect(checkboxes[1]).toBeChecked();
 

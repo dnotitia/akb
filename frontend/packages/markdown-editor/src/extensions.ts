@@ -680,6 +680,10 @@ export function createMarkdownExtensions({
     TaskItem.configure({
       nested: true,
       HTMLAttributes: { 'data-markdown-task-item': 'true' },
+      a11y: {
+        checkboxLabel: node =>
+          `Task item checkbox for ${node.firstChild?.textContent || 'empty task item'}`,
+      },
     }),
     Mathematics.configure({
       katexOptions: { throwOnError: false },

@@ -27,10 +27,7 @@ import {
   X,
 } from 'lucide-react'
 
-import {
-  createMarkdownExtensions,
-  DEFAULT_MARKDOWN_CODE_LABELS,
-} from '../extensions.js'
+import { createMarkdownExtensions } from '../extensions.js'
 import {
   extractMarkdownReferences,
   extractMarkdownTargets,
@@ -484,7 +481,6 @@ export function useMarkdownReferenceResolutions(
 export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: Editor | null
   editable: boolean
-  code?: MarkdownCodeOptions
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
   referenceResolutions?: ReadonlyMap<string, MarkdownReferenceResolution>
@@ -518,7 +514,6 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
 export function MarkdownSurface({
   editor,
   editable,
-  code,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
   referenceResolutions = EMPTY_REFERENCE_RESOLUTIONS,
@@ -756,35 +751,12 @@ export function MarkdownSurface({
     const root = editor?.view.dom
     if (!root) return
 
-    const labels = { ...DEFAULT_MARKDOWN_CODE_LABELS, ...code?.labels }
-
-    const applyBlockSemantics = () => {
-      root.querySelectorAll<HTMLElement>('pre:not([data-markdown-raw])').forEach(block => {
-        const codeElement = block.querySelector<HTMLElement>(':scope > code')
-        if (!codeElement) return
-
-        const language = codeElement.className
-          .split(/\s+/u)
-          .find(className => className.startsWith('language-'))
-          ?.slice('language-'.length)
-
-        block.dataset.markdownCode = 'true'
-        if (language) block.dataset.markdownCodeLanguage = language
-        else delete block.dataset.markdownCodeLanguage
-        block.tabIndex = 0
-        block.setAttribute('role', 'region')
-        block.setAttribute('aria-label', labels.region(language))
-      })
-
+    const applyTaskSemantics = () => {
       root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(taskItem => {
         const checkbox = taskItem.querySelector<HTMLInputElement>('input[type="checkbox"]')
         if (!checkbox) return
 
         checkbox.disabled = !editable
-        if (!checkbox.getAttribute('aria-label') && !checkbox.getAttribute('aria-labelledby')) {
-          const label = taskItem.textContent?.trim() || 'empty task item'
-          checkbox.setAttribute('aria-label', `Task item checkbox for ${label}`)
-        }
       })
     }
 
@@ -793,15 +765,15 @@ export function MarkdownSurface({
       if (delayedApply !== undefined) clearTimeout(delayedApply)
       delayedApply = setTimeout(() => {
         delayedApply = undefined
-        applyBlockSemantics()
+        applyTaskSemantics()
       }, 0)
     }
     const handleTransaction = () => {
-      applyBlockSemantics()
+      applyTaskSemantics()
       applyAfterRender()
     }
 
-    applyBlockSemantics()
+    applyTaskSemantics()
     applyAfterRender()
     editor.on('transaction', handleTransaction)
 
@@ -809,7 +781,7 @@ export function MarkdownSurface({
       editor.off('transaction', handleTransaction)
       if (delayedApply !== undefined) clearTimeout(delayedApply)
     }
-  }, [code, editable, editor])
+  }, [editable, editor])
 
   useEffect(() => {
     const root = editor?.view.dom
@@ -1219,6 +1191,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   markdown: string
   profile?: MarkdownProfile
   readOnly?: boolean
+  code?: MarkdownCodeOptions
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
   reference?: MarkdownReferenceOptions | false
@@ -1279,7 +1252,6 @@ export function MarkdownEditor({
       <MarkdownSurface
         editor={editor}
         editable={!readOnly}
-        code={code}
         resolutions={resolutions}
         resolvingTargets={Boolean(adapters?.targetResolver)}
         referenceResolutions={referenceResolutions}
@@ -1292,6 +1264,7 @@ export function MarkdownEditor({
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
+  code?: MarkdownCodeOptions
   adapters?: MarkdownAdapters
   reference?: MarkdownReferenceOptions | false
   resolverContext?: MarkdownTargetResolverContext
@@ -1345,7 +1318,6 @@ export function MarkdownViewer({
       {...props}
       editor={editor}
       editable={false}
-      code={code}
       resolutions={resolutions}
       resolvingTargets={Boolean(adapters?.targetResolver)}
       referenceResolutions={referenceResolutions}

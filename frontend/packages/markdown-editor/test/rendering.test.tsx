@@ -74,8 +74,8 @@ describe('Markdown block rendering', () => {
     )
     const checkboxes = view.getAllByRole('checkbox')
     expect(checkboxes).toHaveLength(2)
-    expect(checkboxes[0]).toHaveAccessibleName(/Parent task/i)
-    expect(checkboxes[1]).toHaveAccessibleName(/Child task/i)
+    expect(checkboxes[0]).toHaveAccessibleName('Task item checkbox for Parent task')
+    expect(checkboxes[1]).toHaveAccessibleName('Task item checkbox for Child task')
 
     checkboxes[0]?.focus()
     expect(checkboxes[0]).toHaveFocus()
