@@ -716,6 +716,64 @@ body::before {
   font-size: 1em;
   font-weight: 400;
 }
+.prose pre[data-markdown-code] {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+}
+.prose pre[data-markdown-code] > code {
+  display: block;
+  min-width: max-content;
+  white-space: inherit;
+}
+.prose pre[data-markdown-code]:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+.prose [data-markdown-task-item] > label {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+}
+.prose [data-markdown-task-item] > label > input[type="checkbox"] {
+  flex: 0 0 auto;
+  accent-color: var(--color-primary);
+}
+.prose [data-markdown-task-item] > label > input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+.prose .hljs-comment,
+.prose .hljs-quote {
+  color: var(--color-foreground-muted);
+}
+.prose .hljs-keyword,
+.prose .hljs-selector-tag,
+.prose .hljs-literal,
+.prose .hljs-name {
+  color: var(--color-cat-1);
+}
+.prose .hljs-string,
+.prose .hljs-attr,
+.prose .hljs-attribute {
+  color: var(--color-cat-3);
+}
+.prose .hljs-number,
+.prose .hljs-symbol,
+.prose .hljs-bullet {
+  color: var(--color-cat-4);
+}
+.prose .hljs-title,
+.prose .hljs-section,
+.prose .hljs-built_in {
+  color: var(--color-cat-2);
+}
+.prose .hljs-variable,
+.prose .hljs-template-variable,
+.prose .hljs-type {
+  color: var(--color-cat-5);
+}
 .prose blockquote {
   border-left: 2px solid var(--color-border);
   color: var(--color-foreground-muted);

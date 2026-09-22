@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.0
+
+- Add one shared Markdown block renderer for editor and viewer surfaces, with
+  nested task-item semantics and common-language code highlighting.
+- Keep supported and unsupported code fences readable without changing their
+  canonical language, content, or serialized Markdown.
+- Expose `MarkdownCodeOptions` so products can provide accessible code-region
+  copy while the shared surface owns keyboard-focusable scrolling semantics.
+
 ## 0.12.0
 
 - Parse and serialize the existing `@username`, `@{unsafe username}`, and plain

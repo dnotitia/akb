@@ -9,14 +9,19 @@ import { Link } from '@tiptap/extension-link'
 import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
+import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
+import type { CodeBlockLowlightOptions } from '@tiptap/extension-code-block-lowlight'
 import { Table } from '@tiptap/extension-table'
 import TableCell from '@tiptap/extension-table-cell'
 import TableHeader from '@tiptap/extension-table-header'
 import TableRow from '@tiptap/extension-table-row'
 import TaskItem from '@tiptap/extension-task-item'
 import TaskList from '@tiptap/extension-task-list'
+import { common, createLowlight } from 'lowlight'
 
 import type {
+  MarkdownCodeLabels,
+  MarkdownCodeOptions,
   MarkdownInlineReferenceKind,
   MarkdownProfile,
   MarkdownReferenceToken,
@@ -35,6 +40,57 @@ interface MarkdownImageToken extends MarkdownToken {
 }
 
 const MARKDOWN_REFERENCE_MARK = 'markdownReference'
+
+export const DEFAULT_MARKDOWN_CODE_LABELS: MarkdownCodeLabels = {
+  region: (language?: string) =>
+    language ? `Scrollable ${language} code block` : 'Scrollable code block',
+}
+
+// Keep one registry for every editor instance. CodeBlockLowlight decorates the
+// rendered code without changing the ProseMirror document or its Markdown.
+const markdownLowlight = createLowlight(common)
+
+interface MarkdownCodeBlockOptions extends Partial<CodeBlockLowlightOptions> {
+  labels: MarkdownCodeLabels
+}
+
+const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
+  addOptions() {
+    return {
+      ...this.parent?.(),
+      labels: DEFAULT_MARKDOWN_CODE_LABELS,
+    }
+  },
+
+  renderHTML({ node, HTMLAttributes }) {
+    const parent = this.parent?.({ node, HTMLAttributes })
+    if (!parent || !Array.isArray(parent) || typeof parent[0] !== 'string') {
+      return ['pre', HTMLAttributes, ['code', {}, 0]]
+    }
+
+    const attributes = parent[1] && typeof parent[1] === 'object' && !Array.isArray(parent[1])
+      ? parent[1]
+      : {}
+    const children = Array.isArray(parent[1]) || typeof parent[1] === 'string'
+      ? parent.slice(1)
+      : parent.slice(2)
+    const language = typeof node.attrs.language === 'string' && node.attrs.language
+      ? node.attrs.language
+      : undefined
+
+    return [
+      parent[0],
+      mergeAttributes(attributes, {
+        'data-markdown-code': 'true',
+        'data-markdown-code-language': language,
+        role: 'region',
+        tabindex: '0',
+        'aria-label': this.options.labels.region(language),
+      }),
+      ...children,
+    ]
+  },
+})
 
 const RUNTIME_REFERENCE_ATTRIBUTES = new Set([
   'aria-disabled',
@@ -594,10 +650,12 @@ const RawMarkdownInline = Node.create({
 
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
+  code?: MarkdownCodeOptions
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
+  code,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -605,6 +663,11 @@ export function createMarkdownExtensions({
       // URL after parsing. `akb` is only accepted as a data scheme here; no
       // adapter or network behavior belongs in the shared schema.
       link: false,
+      codeBlock: false,
+    }),
+    MarkdownCodeBlock.configure({
+      lowlight: markdownLowlight,
+      labels: { ...DEFAULT_MARKDOWN_CODE_LABELS, ...code?.labels },
     }),
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
@@ -614,7 +677,10 @@ export function createMarkdownExtensions({
     TableHeader,
     TableCell,
     TaskList,
-    TaskItem.configure({ nested: true }),
+    TaskItem.configure({
+      nested: true,
+      HTMLAttributes: { 'data-markdown-task-item': 'true' },
+    }),
     Mathematics.configure({
       katexOptions: { throwOnError: false },
     }),

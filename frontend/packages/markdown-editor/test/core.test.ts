@@ -79,6 +79,18 @@ describe('Markdown conformance core', () => {
     expect(serialized).toContain('<div data-kind="raw">')
   })
 
+  it('keeps code fence language and content canonical when highlighting is unavailable', () => {
+    const markdown = ['```not-a-registered-language', '<value>&raw</value>', '```'].join('\n')
+    const editor = createMarkdownEditor({ initialMarkdown: markdown })
+    editors.push(editor)
+
+    const codeBlock = editor.state.doc.firstChild
+    expect(codeBlock?.type.name).toBe('codeBlock')
+    expect(codeBlock?.attrs.language).toBe('not-a-registered-language')
+    expect(codeBlock?.textContent).toBe('<value>&raw</value>')
+    expect(editor.getMarkdown().trim()).toBe(markdown)
+  })
+
   it('has canonical idempotence for the full conformance fixture', () => {
     const canonical = canonicalizeMarkdown(fixture)
 
