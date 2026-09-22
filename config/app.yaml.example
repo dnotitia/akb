@@ -346,7 +346,14 @@ vector_store_schema: vector_index
 #              Default and recommended.
 #   arrays   — sparse_terms BIGINT[] + sparse_weights REAL[] columns
 #              on the chunks row. Compact; slower at >100k rows.
+#   vchord   — raw TF in bm25vector, scored using VectorChord-BM25 index stats.
+#              Requires the extension and a validated index/backfill transition.
 vector_store_sparse_shape: posting
+# Preserve external statistics for serving, mixed deployments and posting rollback.
+# Only set vchord_only_verified after verifying ALL API/worker readers and writers
+# use pgvector/vchord, with no external-statistics consumer or posting rollback.
+# This does not disable stable bm25_vocab term ID registration.
+bm25_external_stats_mode: required
 
 # Qdrant-driver settings (ignored when driver is pgvector).
 # Set vector_url to your Qdrant endpoint (e.g. http://qdrant:6333)

@@ -6,21 +6,24 @@
 - Vocab: each unique term gets a stable integer id in `bm25_vocab`. Ids are
   NEVER reassigned — vector-store sparse vectors reference them, so a mutation
   would corrupt every already-indexed chunk.
-- Corpus stats (`bm25_stats`): N, avgdl, tokenizer version. Can lag reality;
-  quality degrades slightly until `recompute_stats()` runs.
+- External corpus stats (`bm25_stats`): N, avgdl, tokenizer version, plus
+  document frequencies in `bm25_vocab`. Posting/arrays and other pre-baked
+  consumers use these weights; Seahorse DB receives them at search time.
+  VectorChord uses its own index statistics and does not read them for scoring.
 - Query encoding goes through the same tokenizer + vocab; OOV terms are
   dropped silently.
 
 Two doc/query weight conventions live behind the same public API,
-selected by ``settings.vector_store_driver``:
+selected by the driver and, for pgvector, the sparse shape:
 
-  - **pre-baked** (pgvector, qdrant, seahorse-cloud): doc weight =
+  - **pre-baked** (pgvector posting/arrays, qdrant, seahorse-cloud): doc weight =
     saturated TF, query weight = IDF. The dot product yields BM25
     directly — the vector store doesn't need to know about BM25 at
     all, and pgvector's posting table just sums products.
-  - **raw** (seahorse-db): doc weight = raw TF (token count), query
-    weight = 1.0. The vector store applies the BM25 formula itself
-    from (N, avgdl, df-per-query-term) metadata passed at search time.
+  - **raw** (pgvector vchord, seahorse-db, seahorse-db-grpc): doc weight =
+    raw TF (token count), query weight = 1.0. VectorChord computes BM25 from
+    its index statistics. Seahorse DB computes BM25 from external
+    (N, avgdl, df-per-query-term) metadata passed at search time.
     Sending pre-baked weights here causes double-saturation on the
     doc side AND double-IDF on the query side; the BM25 ranking
     becomes proportional to IDF² × saturated_TF instead of
@@ -502,7 +505,7 @@ async def encode_document(
 ) -> tuple[list[int], list[float]]:
     """Encode a document chunk to a sparse (indices, values) tuple.
 
-    Weight convention depends on the active driver (see module
+    Weight convention depends on the active driver and sparse shape (see module
     docstring). Both branches share tokenization + vocab insertion.
     """
     tokens = await tokenize(text)
@@ -513,11 +516,10 @@ async def encode_document(
     vocab = await get_or_create_term_ids(term_counts.keys())
 
     if _use_raw_weights(sparse_shape):
-        # Raw TF. The downstream driver (seahorse-db) feeds these
-        # into Coral's inverted index as raw term frequencies; the
-        # BM25 saturation/normalization is applied by the index at
-        # search time using the (k, b, avgdl) parameters the driver
-        # passes in `hybrid_search`.
+        # Raw positive integer TF, represented as floats by the shared API.
+        # VectorChord owns saturation, document length and index statistics.
+        # Seahorse DB applies BM25 using metadata supplied by its driver.
+        # Neither branch may pre-saturate TF or load external stats here.
         raw_indices: list[int] = []
         raw_values: list[float] = []
         for term, tf in term_counts.items():
@@ -543,8 +545,7 @@ async def encode_document(
     dl = sum(term_counts.values())
     dl_norm = 1 - b + b * (dl / avgdl)
 
-    # df for the doc's terms is looked up against CURRENT vocab df (fine for
-    # indexing — not used at doc encoding time since we separate weights).
+    # Document encoding does not read df; IDF belongs to the query side.
     indices: list[int] = []
     values: list[float] = []
     for term, tf in term_counts.items():
@@ -564,7 +565,7 @@ async def encode_query(
     """Encode a query to a sparse (indices, values) tuple. OOV terms
     are dropped; no new terms are registered.
 
-    Weight convention depends on the active driver (see module
+    Weight convention depends on the active driver and sparse shape (see module
     docstring).
     """
     tokens = await tokenize(text)
@@ -576,11 +577,10 @@ async def encode_query(
         return [], []
 
     if _use_raw_weights(sparse_shape):
-        # Driver-side BM25: query weight = 1.0; the inverted index
-        # multiplies by IDF derived from the per-term-df metadata
-        # `hybrid_search` ships. OOV-but-in-vocab terms still pass
-        # through with weight 1.0 — the index will compute their IDF
-        # from the df we send.
+        # One weight per known term, regardless of query repetition.
+        # VectorChord computes IDF from its index; Seahorse DB obtains the
+        # external df metadata in its search driver, not in this encoder.
+        # Known terms absent from the current index still pass through.
         indices = list(vocab.values())
         values = [1.0] * len(indices)
         return indices, values
@@ -919,13 +919,10 @@ async def vocab_size() -> int:
 
 # ── Stats refresher background task ───────────────────────────────
 #
-# `recompute_stats()` rebuilds bm25_stats(total_docs, avgdl) and
-# bm25_vocab.df from the live chunks corpus. Without it the encoder
-# falls back to total_docs=0 (encode_query returns uniform 1.0 weights),
-# which degrades the sparse leg of hybrid search — silently. The
-# refresher runs the recompute on startup so a fresh install isn't
-# stuck at zero, then on a fixed cadence so a long-running deploy
-# stays in sync as docs are added/removed/updated.
+# `recompute_stats()` rebuilds external N/avgdl/df for consumers named by
+# settings.bm25_external_stats_consumers. VChord owns its own index statistics;
+# its vocab term-ID registration remains in the encoding path even when the
+# external refresher is disabled. Keep this refresher for posting rollback.
 
 # Skip a tick until this many source-corpus mutations have accumulated since
 # the last recompute.  The mutation sequence tracks inserts, deletes, and
@@ -1042,6 +1039,8 @@ async def _refresh_tick(retry_secs: float = _SKIPPED_RETRY_SECS) -> int:
     shortly", and `configure_idle_secs` refuses while the runner is live, so
     the wait belongs here.
     """
+    if not settings.bm25_external_stats_consumers:
+        return 0
     if not await _should_recompute():
         return 0
     last_skip_reason = bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD
@@ -1073,6 +1072,9 @@ def start_stats_refresher(interval_secs: int = 1800) -> None:
     periodic tick.  A fresh or tokenizer-changed database recomputes promptly,
     while restarting a stable 960k-chunk deployment performs no corpus scan.
     """
+    if not settings.bm25_external_stats_consumers:
+        logger.info("External BM25 stats refresher disabled: verified VChord-only deployment")
+        return
     if _refresher.is_running():
         return
     _refresher.configure_idle_secs(interval_secs)
@@ -1110,6 +1112,17 @@ async def _run_progress(conn) -> dict | None:
     }
 
 
+def external_stats_policy_snapshot() -> dict:
+    """Process policy, separate from shared DB success/progress observations."""
+    consumers = settings.bm25_external_stats_consumers
+    return {
+        "mode": settings.bm25_external_stats_mode,
+        "required": bool(consumers),
+        "consumers": consumers,
+        "refresher_running_in_this_process": _refresher.is_running(),
+    }
+
+
 async def stats_snapshot() -> dict:
     """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
     so a stuck refresher (total_docs=0 while chunks exist) is visible."""
@@ -1128,6 +1141,7 @@ async def stats_snapshot() -> dict:
         recompute_active = await bm25_maintenance.active_bm25_recompute(conn)
     if not row:
         return {
+            "external_stats": external_stats_policy_snapshot(),
             "total_docs": 0, "avgdl": 0.0,
             "tokenizer": "kiwi@0",
             "vocab_size": int(vocab or 0),
@@ -1141,6 +1155,7 @@ async def stats_snapshot() -> dict:
         }
     source_revision = int(row["source_revision"] or 0)
     return {
+        "external_stats": external_stats_policy_snapshot(),
         "total_docs": int(row["total_docs"] or 0),
         "avgdl": float(row["avgdl"] or 0.0),
         "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
