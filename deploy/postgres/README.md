@@ -83,18 +83,30 @@ materialized ranking checks its vault/source scope. Planner estimates alone do
 not authorize exact work. Operator-configured `-1` and oversized top-k requests
 use the same guard.
 
-The selectivity read and ranking transaction share a five-second wall-clock
-deadline. The transaction has a local statement timeout that never relaxes a stricter caller timeout. Size refusal or
-timeout produces an explicit search failure/degradation, not a successful empty
-or truncated result. Budget, plan, timeout and search-path settings are restored
-on commit, error and cancellation. These are conservative resource safeguards,
-not latency or relevance acceptance targets for a deployment. For example, a
-broad rare/unknown-term query that underfills on a corpus above 10,000 vectors
-can now degrade instead of scanning everything. Under the existing hybrid
-search failure contract, a failed sparse leg can also discard dense results.
-Validate this availability tradeoff before enabling VChord for a deployment.
+Finite index queries, selectivity lookup and exact queries retain the existing
+caller and database-pool timeouts. This path does not install a shorter wall
+clock or statement timeout: a query that takes longer than five seconds can
+still finish within the caller's budget. Caller cancellation and server timeout
+still roll back local plan, candidate-budget and search-path settings.
+
+When the exact row cap refuses completion, the driver retains already fetched,
+scoped finite sparse candidates and waits for the independent dense leg. It
+fuses and fetches the surviving hits, then carries them in `VectorSearchDegraded`
+with reason `sparse_search_budget_exceeded`. The search service passes these hits
+through its normal hydration/filtering and returns `degraded: true` with that
+reason. A sparse-only request can retain finite hits too; if neither leg has
+usable hits, the response is explicitly degraded and empty. Size refusal does
+not masquerade as a complete result or discard a successful dense leg. Genuine
+store/payload failures and caller cancellation keep their existing behavior.
+
+The 10,000-row threshold is a conservative exact-work safeguard, not a relevance
+or latency acceptance target. A broad underfilled query can still be incomplete;
+validate that tradeoff before deploying VChord. Preserving hits does not prove
+exact top-k completeness for that request.
 
 Run `test_vchord_candidate_budget_postgres.py` against the pinned extension to
 exercise candidate widening, scoped exact ranking, global fallback refusal and
-connection recovery. The test DSN must identify an isolated PostgreSQL instance;
+connection recovery. Hybrid/service regressions cover retained dense and sparse
+hits, both leg completion orders, ACL filters, and explicit degradation accounting.
+The test DSN must identify an isolated PostgreSQL instance;
 the tests create disposable databases.

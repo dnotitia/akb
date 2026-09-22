@@ -65,7 +65,21 @@ class VectorHit:
 class VectorStoreUnavailable(Exception):
     """Driver-side transient failure. Worker paths catch and back off;
     read paths let it propagate so `search` returns empty instead of
-    serving stale or partial results."""
+    serving stale results. VectorSearchDegraded explicitly carries usable
+    partial read results instead."""
+
+
+class VectorSearchDegraded(VectorStoreUnavailable):
+    """A read completed only partially, with usable ACL-filtered driver hits.
+
+    Callers must preserve the degradation reason through normal hydration and
+    response accounting; these hits are not a claim of complete retrieval.
+    """
+
+    def __init__(self, *, hits: list[VectorHit], reason: str) -> None:
+        super().__init__(reason)
+        self.hits = hits
+        self.reason = reason
 
 
 def has_dense(dense: list[float] | None) -> TypeGuard[list[float]]:

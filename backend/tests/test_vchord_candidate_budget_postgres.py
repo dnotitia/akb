@@ -612,7 +612,7 @@ async def test_exact_probe_timeout_restores_connection_and_stricter_server_budge
 
 
 @pytest.mark.parametrize("phase", ["estimate", "ranking"])
-async def test_wall_deadline_cancels_and_restores_connection(phase):
+async def test_caller_deadline_cancels_and_restores_connection(phase):
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             vault, _, _ = await _seed(store, conn)
@@ -633,17 +633,17 @@ async def test_wall_deadline_cancels_and_restores_connection(phase):
                 return False
 
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(pgvector_module, "_VCHORD_SEARCH_SECONDS", 0.05)
                 if phase == "estimate":
                     mp.setattr(type(store), "_filter_is_selective", slow_estimate)
                 else:
                     mp.setattr(type(conn), "fetchval", delayed)
                 with pytest.raises(TimeoutError):
-                    await store._search_sparse(
-                        conn, terms=[_UNKNOWN_TERM], weights=[1.0],
-                        filter_uuids=[vault] if phase == "estimate" else None,
-                        filter_col="vault_id", limit=65_536,
-                    )
+                    async with asyncio.timeout(0.05):
+                        await store._search_sparse(
+                            conn, terms=[_UNKNOWN_TERM], weights=[1.0],
+                            filter_uuids=[vault] if phase == "estimate" else None,
+                            filter_col="vault_id", limit=65_536,
+                        )
             assert await conn.fetchval("SELECT 1") == 1
             for key, value in before.items():
                 assert await conn.fetchval(f"SHOW {key}") == value
@@ -676,3 +676,116 @@ async def test_real_large_corpus_keeps_finite_index_search_but_refuses_exact():
                         )
                 assert -1 not in budgets
                 assert int(await conn.fetchval("SHOW bm25_catalog.bm25_limit")) == 5
+
+
+async def test_finite_index_search_can_exceed_five_seconds_under_caller_budget():
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            await _seed(store, conn)
+            original = type(conn).fetch
+            seen = []
+
+            async def slow_index(self, query, *args, **kwargs):
+                if "SELECT chunk_id FROM (" in query and "sparse_bm25" in query:
+                    seen.append(await self.fetchval("SHOW statement_timeout"))
+                    await self.execute("SELECT pg_sleep(5.1)")
+                return await original(self, query, *args, **kwargs)
+
+            await conn.execute("SET statement_timeout = '10s'")
+            try:
+                with pytest.MonkeyPatch.context() as mp:
+                    mp.setattr(type(conn), "fetch", slow_index)
+                    async with _candidate_budget(conn, budget=5):
+                        hits = await store._search_sparse(
+                            conn, terms=[_QUERY_TERM], weights=[1.0],
+                            filter_uuids=None, filter_col="vault_id", limit=1,
+                        )
+                assert len(hits) == 1
+                assert seen == ["10s"]
+                assert await conn.fetchval("SHOW statement_timeout") == "10s"
+            finally:
+                await conn.execute("RESET statement_timeout")
+
+
+@pytest.mark.parametrize("dense_first", [True, False])
+async def test_exact_refusal_keeps_dense_and_scoped_sparse_hits(dense_first):
+    from app.services.vector_store.base import VectorSearchDegraded
+
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            vault, scoped, distractors = await _seed(store, conn)
+            dense_id = str(uuid.UUID(int=50))
+            await store.upsert_one(
+                conn=conn, chunk_id=dense_id, source_type="document", source_id=dense_id,
+                vault_id=str(vault), section_path="", content="dense-only match", chunk_index=50,
+                dense=[1.0, 0.0, 0.0, 0.0], sparse_indices=[_RARE_TERM], sparse_values=[1.0],
+            )
+            # Out-of-scope vectors must not leak into retained dense results.
+            await conn.execute("UPDATE vector_index.chunks SET dense='[1,0,0,0]'::vector "
+                               "WHERE vault_id=$1", uuid.UUID(int=2))
+
+        dense_done, sparse_done = asyncio.Event(), asyncio.Event()
+        real_dense, real_sparse = store._search_dense, store._search_sparse
+
+        async def dense(*args, **kwargs):
+            if not dense_first:
+                await sparse_done.wait()
+            try:
+                return await real_dense(*args, **kwargs)
+            finally:
+                dense_done.set()
+
+        async def sparse(*args, **kwargs):
+            if dense_first:
+                await dense_done.wait()
+            try:
+                return await real_sparse(*args, **kwargs)
+            finally:
+                sparse_done.set()
+
+        async def get_pool():
+            return pool
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(store, "_pool", get_pool)
+            mp.setattr(store, "_search_dense", dense)
+            mp.setattr(store, "_search_sparse", sparse)
+            mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
+            with pytest.raises(VectorSearchDegraded) as caught:
+                await store.hybrid_search(
+                    query_text="term", query_dense=[1.0, 0.0, 0.0, 0.0],
+                    query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
+                    source_ids=None, vault_ids=[str(vault)], source_types=["document"],
+                    limit=20, prefetch_per_leg=50,
+                )
+        result = caught.value
+        assert result.reason == "sparse_search_budget_exceeded"
+        assert {hit.chunk_id for hit in result.hits} == scoped | {dense_id}
+        assert not ({hit.chunk_id for hit in result.hits} & distractors)
+        assert dense_done.is_set() and sparse_done.is_set()
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT 1") == 1
+
+
+async def test_exact_refusal_without_dense_keeps_finite_scoped_candidates():
+    from app.services.vector_store.base import VectorSearchDegraded
+
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            vault, scoped, _ = await _seed(store, conn)
+
+        async def get_pool():
+            return pool
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(store, "_pool", get_pool)
+            mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
+            with pytest.raises(VectorSearchDegraded) as caught:
+                await store.hybrid_search(
+                    query_text="term", query_dense=None,
+                    query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
+                    source_ids=None, vault_ids=[str(vault)], source_types=["document"],
+                    limit=20, prefetch_per_leg=50,
+                )
+        assert caught.value.reason == "sparse_search_budget_exceeded"
+        assert {hit.chunk_id for hit in caught.value.hits} == scoped

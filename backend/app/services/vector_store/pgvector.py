@@ -41,7 +41,7 @@ import asyncpg
 
 from app.services.sparse_shapes import SparseShape
 
-from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorSearchDegraded, VectorStoreUnavailable, has_dense
 
 
 def _advisory_lock_key(schema: str) -> int:
@@ -65,11 +65,17 @@ logger = logging.getLogger("akb.vector_store.pgvector")
 RRF_K = 60
 
 _VCHORD_MAX_CANDIDATES = 65_535
-# Exact ranking is reserved for small corpora/scopes. Even the bounded
-# cardinality probe can inspect a large heap, so ranking SQL also has a
-# server deadline and the complete sparse search has a wall-clock deadline.
+# Exact ranking is reserved for small corpora/scopes. All SQL retains the
+# existing caller/pool budgets; finite index retrieval has no shorter timer.
 _VCHORD_MAX_EXACT_ROWS = 10_000
-_VCHORD_SEARCH_SECONDS = 5.0
+
+
+class _VChordExactBudgetExceeded(VectorStoreUnavailable):
+    """Exact completion was refused; already scoped finite candidates survive."""
+
+    def __init__(self, candidate_ids: list[str] | None = None) -> None:
+        super().__init__("VChord exact search exceeds the bounded row budget")
+        self.candidate_ids = candidate_ids or []
 
 
 async def _set_vchord_candidate_budget(
@@ -874,7 +880,10 @@ class PgvectorStore:
             finally:
                 timings["dense"] = time.perf_counter() - begin
 
+        sparse_budget_exceeded = False
+
         async def _sparse_leg() -> list[str]:
+            nonlocal sparse_budget_exceeded
             begin = time.perf_counter()
             try:
                 async with pool.acquire() as c:
@@ -887,6 +896,11 @@ class PgvectorStore:
                         source_type_values=source_type_values,
                         limit=prefetch_per_leg,
                     )
+            except _VChordExactBudgetExceeded as exc:
+                # An exact-work refusal is not a store outage. Wait for the
+                # independent dense leg and retain scoped finite sparse hits.
+                sparse_budget_exceeded = True
+                return exc.candidate_ids
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
@@ -930,9 +944,11 @@ class PgvectorStore:
                 for cid, score in scoring
                 if cid in by_id
             ]
+            if sparse_budget_exceeded:
+                raise VectorSearchDegraded(hits=hits, reason="sparse_search_budget_exceeded")
             succeeded = True
             return hits
-        except (asyncpg.PostgresError, TimeoutError) as e:
+        except asyncpg.PostgresError as e:
             raise VectorStoreUnavailable(f"search failed: {e}") from e
         finally:
             # No query text, source IDs, content, or credentials in diagnostics.
@@ -1276,21 +1292,11 @@ class PgvectorStore:
             # which `hybrid_search` turns into VectorStoreUnavailable and takes
             # the dense leg down with it. "A statistics read that throws must
             # not take a search with it" is only true out here.
-            deadline = asyncio.get_running_loop().time() + _VCHORD_SEARCH_SECONDS
-            async with asyncio.timeout_at(deadline):
-                selective = (
-                    await self._filter_is_selective(conn, filter_col, filter_uuids)
-                    if filter_uuids
-                    else False
-                )
-            async with asyncio.timeout_at(deadline), conn.transaction():
-                current_timeout = int(await conn.fetchval(
-                    "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'"
-                ))
-                timeout_ms = int(_VCHORD_SEARCH_SECONDS * 1000)
-                if current_timeout > 0:
-                    timeout_ms = min(timeout_ms, current_timeout)
-                await conn.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+            selective = (
+                await self._filter_is_selective(conn, filter_col, filter_uuids)
+                if filter_uuids else False
+            )
+            async with conn.transaction():
                 await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
                 # Every name below is schema-qualified, yet the extension's
                 # own `to_bm25query` resolves `bm25vector` unqualified inside
@@ -1390,7 +1396,9 @@ class PgvectorStore:
                         candidate_budget != -1
                         and len(rows) < requested_limit
                     ):
-                        await self._check_vchord_exact_scope(conn)
+                        await self._check_vchord_exact_scope(
+                            conn, candidate_ids=[row["chunk_id"] for row in rows],
+                        )
                         await _set_vchord_candidate_budget(conn, -1)
                         rows = await conn.fetch(
                             sql, query_terms, requested_limit,
@@ -1466,6 +1474,7 @@ class PgvectorStore:
         self,
         conn: asyncpg.Connection,
         *,
+        candidate_ids: list[str] | None = None,
         filter_col: str = "vault_id",
         filter_uuids: list[uuid.UUID] | None = None,
         source_type_values: list[str] | None = None,
@@ -1492,9 +1501,7 @@ class PgvectorStore:
             ) bounded_exact_scope""", *args,
         )
         if count > _VCHORD_MAX_EXACT_ROWS:
-            raise VectorStoreUnavailable(
-                "VChord exact search exceeds the bounded row budget"
-            )
+            raise _VChordExactBudgetExceeded(candidate_ids)
 
     async def _search_vchord_index_led_filtered(
         self,
@@ -1623,7 +1630,9 @@ class PgvectorStore:
                 candidate_count < candidate_budget
                 or candidate_budget == _VCHORD_MAX_CANDIDATES
             ):
-                await self._check_vchord_exact_scope(conn)
+                await self._check_vchord_exact_scope(
+                    conn, candidate_ids=candidate_ids or hits,
+                )
                 await _set_vchord_candidate_budget(conn, -1)
                 return await filtered_hits()
 
