@@ -1,22 +1,29 @@
 import {
+  getRenderedAttributes,
   Mark,
   Node,
   mergeAttributes,
   type AnyExtension,
   type MarkdownToken,
 } from '@tiptap/core'
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model'
 import { Link } from '@tiptap/extension-link'
 import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
+import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
+import type { CodeBlockLowlightOptions } from '@tiptap/extension-code-block-lowlight'
 import { Table } from '@tiptap/extension-table'
 import TableCell from '@tiptap/extension-table-cell'
 import TableHeader from '@tiptap/extension-table-header'
 import TableRow from '@tiptap/extension-table-row'
 import TaskItem from '@tiptap/extension-task-item'
 import TaskList from '@tiptap/extension-task-list'
+import { common, createLowlight } from 'lowlight'
 
 import type {
+  MarkdownCodeLabels,
+  MarkdownCodeOptions,
   MarkdownInlineReferenceKind,
   MarkdownProfile,
   MarkdownReferenceToken,
@@ -35,6 +42,173 @@ interface MarkdownImageToken extends MarkdownToken {
 }
 
 const MARKDOWN_REFERENCE_MARK = 'markdownReference'
+
+export const DEFAULT_MARKDOWN_CODE_LABELS: MarkdownCodeLabels = {
+  region: (language?: string) =>
+    language ? `Scrollable ${language} code block` : 'Scrollable code block',
+}
+
+// Keep one registry for every editor instance. CodeBlockLowlight decorates the
+// rendered code without changing the ProseMirror document or its Markdown.
+const markdownLowlight = createLowlight(common)
+
+interface MarkdownCodeBlockOptions extends Partial<CodeBlockLowlightOptions> {
+  labels: MarkdownCodeLabels
+}
+
+const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
+  addOptions() {
+    return {
+      ...this.parent?.(),
+      labels: DEFAULT_MARKDOWN_CODE_LABELS,
+    }
+  },
+
+  renderHTML({ node, HTMLAttributes }) {
+    const parent = this.parent?.({ node, HTMLAttributes })
+    if (!parent || !Array.isArray(parent) || typeof parent[0] !== 'string') {
+      return ['pre', HTMLAttributes, ['code', {}, 0]]
+    }
+
+    const attributes = parent[1] && typeof parent[1] === 'object' && !Array.isArray(parent[1])
+      ? parent[1]
+      : {}
+    const children = Array.isArray(parent[1]) || typeof parent[1] === 'string'
+      ? parent.slice(1)
+      : parent.slice(2)
+    const language = typeof node.attrs.language === 'string' && node.attrs.language
+      ? node.attrs.language
+      : undefined
+
+    return [
+      parent[0],
+      mergeAttributes(attributes, {
+        'data-markdown-code': 'true',
+        'data-markdown-code-language': language,
+        role: 'region',
+        tabindex: '0',
+        'aria-label': this.options.labels.region(language),
+      }),
+      ...children,
+    ]
+  },
+})
+
+const MarkdownTaskItem = TaskItem.extend({
+  addNodeView() {
+    return ({ node, HTMLAttributes, getPos, editor }) => {
+      const listItem = document.createElement('li')
+      const checkboxWrapper = document.createElement('label')
+      const checkboxStyler = document.createElement('span')
+      const checkbox = document.createElement('input')
+      const content = document.createElement('div')
+
+      checkboxStyler.style.cssText =
+        'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0'
+
+      const updateA11y = (currentNode: ProseMirrorNode) => {
+        const label = this.options.a11y?.checkboxLabel?.(
+          currentNode,
+          currentNode.attrs.checked,
+        ) || `Task item checkbox for ${currentNode.textContent || 'empty task item'}`
+
+        checkbox.setAttribute('aria-label', label)
+        checkboxStyler.textContent = label
+      }
+
+      updateA11y(node)
+
+      checkboxWrapper.contentEditable = 'false'
+      checkbox.type = 'checkbox'
+      checkbox.addEventListener('mousedown', event => event.preventDefault())
+      const handleCheckboxChange = (event: Event) => {
+        event.stopImmediatePropagation()
+
+        const position = getPos()
+        if (typeof position !== 'number') return
+
+        const currentNode = editor.state.doc.nodeAt(position)
+        if (!editor.isEditable) {
+          checkbox.checked = Boolean(currentNode?.attrs.checked)
+          return
+        }
+
+        if (!currentNode) return
+
+        editor.view.dispatch(
+          editor.state.tr.setNodeMarkup(position, undefined, {
+            ...currentNode.attrs,
+            checked: checkbox.checked,
+          }),
+        )
+
+        const focusUpdatedCheckbox = () => {
+          const nextDom = editor.view.nodeDOM(position)
+          const nextCheckbox = nextDom instanceof HTMLElement
+            ? nextDom.querySelector<HTMLInputElement>('input[type="checkbox"]')
+            : null
+          if (nextCheckbox && !nextCheckbox.disabled) nextCheckbox.focus()
+        }
+        const defaultView = editor.view.dom.ownerDocument.defaultView
+        if (defaultView) defaultView.setTimeout(focusUpdatedCheckbox, 0)
+        else focusUpdatedCheckbox()
+      }
+      checkbox.addEventListener('change', handleCheckboxChange, true)
+
+      Object.entries(this.options.HTMLAttributes).forEach(([key, value]) => {
+        listItem.setAttribute(key, value)
+      })
+
+      listItem.dataset.checked = node.attrs.checked
+      checkbox.checked = node.attrs.checked
+
+      checkboxWrapper.append(checkbox, checkboxStyler)
+      listItem.append(checkboxWrapper, content)
+
+      Object.entries(HTMLAttributes).forEach(([key, value]) => {
+        listItem.setAttribute(key, value)
+      })
+
+      let previousHTMLAttributeKeys = new Set(Object.keys(HTMLAttributes))
+
+      return {
+        dom: listItem,
+        contentDOM: content,
+        update: updatedNode => {
+          if (updatedNode.type !== this.type) return false
+
+          listItem.dataset.checked = updatedNode.attrs.checked
+          checkbox.checked = updatedNode.attrs.checked
+          updateA11y(updatedNode)
+
+          const nextHTMLAttributes = getRenderedAttributes(
+            updatedNode,
+            editor.extensionManager.attributes,
+          )
+          const nextKeys = new Set(Object.keys(nextHTMLAttributes))
+          previousHTMLAttributeKeys.forEach(key => {
+            if (nextKeys.has(key) || key in this.options.HTMLAttributes) return
+            listItem.removeAttribute(key)
+          })
+          Object.entries(nextHTMLAttributes).forEach(([key, value]) => {
+            if (value === null || value === undefined) {
+              if (key in this.options.HTMLAttributes) listItem.setAttribute(key, this.options.HTMLAttributes[key])
+              else listItem.removeAttribute(key)
+            } else {
+              listItem.setAttribute(key, value)
+            }
+          })
+          previousHTMLAttributeKeys = nextKeys
+
+          return true
+        },
+        destroy() {
+          checkbox.removeEventListener('change', handleCheckboxChange, true)
+        },
+      }
+    }
+  },
+})
 
 const RUNTIME_REFERENCE_ATTRIBUTES = new Set([
   'aria-disabled',
@@ -594,10 +768,12 @@ const RawMarkdownInline = Node.create({
 
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
+  code?: MarkdownCodeOptions
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
+  code,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -605,6 +781,11 @@ export function createMarkdownExtensions({
       // URL after parsing. `akb` is only accepted as a data scheme here; no
       // adapter or network behavior belongs in the shared schema.
       link: false,
+      codeBlock: false,
+    }),
+    MarkdownCodeBlock.configure({
+      lowlight: markdownLowlight,
+      labels: { ...DEFAULT_MARKDOWN_CODE_LABELS, ...code?.labels },
     }),
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
@@ -614,7 +795,14 @@ export function createMarkdownExtensions({
     TableHeader,
     TableCell,
     TaskList,
-    TaskItem.configure({ nested: true }),
+    MarkdownTaskItem.configure({
+      nested: true,
+      HTMLAttributes: { 'data-markdown-task-item': 'true' },
+      a11y: {
+        checkboxLabel: node =>
+          `Task item checkbox for ${node.firstChild?.textContent || 'empty task item'}`,
+      },
+    }),
     Mathematics.configure({
       katexOptions: { throwOnError: false },
     }),

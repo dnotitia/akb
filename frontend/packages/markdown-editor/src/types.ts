@@ -72,6 +72,15 @@ export interface MarkdownImageOptions {
   classNames?: MarkdownImageClassNames
 }
 
+export interface MarkdownCodeLabels {
+  /** Accessible name for the keyboard-focusable code scroll region. */
+  region: (language?: string) => string
+}
+
+export interface MarkdownCodeOptions {
+  labels?: Partial<MarkdownCodeLabels>
+}
+
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile
   markedOptions?: MarkdownExtensionOptions['markedOptions']

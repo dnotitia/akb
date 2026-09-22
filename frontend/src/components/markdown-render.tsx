@@ -76,11 +76,6 @@ function useViewerLayout(
         table.replaceWith(wrapper);
         wrapper.append(table);
       });
-      root.querySelectorAll<HTMLElement>("pre").forEach((block) => {
-        block.tabIndex = 0;
-        block.setAttribute("role", "region");
-        block.setAttribute("aria-label", "Scrollable code block");
-      });
     };
 
     apply();

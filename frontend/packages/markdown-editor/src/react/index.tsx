@@ -104,6 +104,7 @@ export {
 import { markdownTableState } from '../table.js'
 import type {
   MarkdownAdapters,
+  MarkdownCodeOptions,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
@@ -123,7 +124,13 @@ import type {
   MarkdownTargetResolverContext,
 } from '../types.js'
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
-export type { MarkdownImageClassNames, MarkdownImageLabels, MarkdownImageOptions } from '../types.js'
+export type {
+  MarkdownCodeLabels,
+  MarkdownCodeOptions,
+  MarkdownImageClassNames,
+  MarkdownImageLabels,
+  MarkdownImageOptions,
+} from '../types.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 const EMPTY_REFERENCE_RESOLUTIONS: ReadonlyMap<string, MarkdownReferenceResolution> = new Map()
@@ -186,6 +193,7 @@ export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
+  code?: MarkdownCodeOptions
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
   reference?: MarkdownReferenceOptions | false
@@ -195,6 +203,7 @@ export function useMarkdownEditor({
   initialMarkdown = '',
   profile = 'preserve',
   editable = true,
+  code,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
@@ -213,11 +222,11 @@ export function useMarkdownEditor({
   )
   const extensions = useMemo(
     () => [
-      ...createMarkdownExtensions({ profile }),
+      ...createMarkdownExtensions({ profile, code }),
       ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
       referenceExtension,
     ],
-    [profile, referenceExtension, slash],
+    [code, profile, referenceExtension, slash],
   )
 
   return useEditor({
@@ -502,6 +511,14 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
   }
 }
 
+function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+    ),
+  )
+}
+
 export function MarkdownSurface({
   editor,
   editable,
@@ -737,6 +754,151 @@ export function MarkdownSurface({
       for (const resolution of imageOverrides.values()) releaseMarkdownResolution(resolution)
     }
   }, [editor, image, resolvingTargets, resolutions])
+
+  useEffect(() => {
+    const root = editor?.view.dom
+    if (!root) return
+
+    const applyTaskSemantics = () => {
+      root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(taskItem => {
+        const checkbox = taskItem.querySelector<HTMLInputElement>('input[type="checkbox"]')
+        if (!checkbox) return
+
+        checkbox.disabled = !editable
+        checkbox.tabIndex = editable ? 0 : -1
+      })
+    }
+
+    let delayedApply: ReturnType<typeof setTimeout> | undefined
+    const applyAfterRender = () => {
+      if (delayedApply !== undefined) clearTimeout(delayedApply)
+      delayedApply = setTimeout(() => {
+        delayedApply = undefined
+        applyTaskSemantics()
+      }, 0)
+    }
+    const handleTransaction = () => {
+      applyTaskSemantics()
+      applyAfterRender()
+    }
+
+    applyTaskSemantics()
+    applyAfterRender()
+    editor.on('transaction', handleTransaction)
+
+    return () => {
+      editor.off('transaction', handleTransaction)
+      if (delayedApply !== undefined) clearTimeout(delayedApply)
+    }
+  }, [editable, editor])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root || !editable) return
+
+    let pendingTabFocus: { kind: 'control'; index: number } | { kind: 'editor' } | null = null
+
+    const focusAfterTab = (index: number) => {
+      pendingTabFocus = { kind: 'control', index }
+      const control = markdownKeyboardControls(root)[index]
+      control?.focus()
+    }
+
+    const focusEditorAfterTab = () => {
+      pendingTabFocus = { kind: 'editor' }
+      editor.commands.focus()
+    }
+
+    const handleKeyboardNavigation = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      const editorTarget = target && root.contains(target)
+        ? target
+        : activeElement && root.contains(activeElement)
+          ? activeElement
+          : null
+      if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) {
+        return
+      }
+
+      const controls = markdownKeyboardControls(root)
+      if (!controls.length) return
+
+      const controlTarget = editorTarget?.closest<HTMLElement>(
+        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      )
+      const currentIndex = controlTarget ? controls.indexOf(controlTarget) : -1
+      if (currentIndex >= 0) {
+        const nextIndex = currentIndex + (event.shiftKey ? -1 : 1)
+        if (nextIndex >= 0 && nextIndex < controls.length) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+          focusAfterTab(nextIndex)
+        } else if (event.shiftKey) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+          focusEditorAfterTab()
+        } else {
+          // Keep the native browser exit from the final embedded control, but
+          // prevent Tiptap's list keymap from turning Tab into indentation.
+          pendingTabFocus = null
+          event.stopImmediatePropagation()
+        }
+        return
+      }
+
+      if (!editorTarget) return
+
+      const focusIndex = event.shiftKey ? controls.length - 1 : 0
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      focusAfterTab(focusIndex)
+    }
+
+    const keepEmbeddedControlFocus = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) {
+        return
+      }
+
+      if (pendingTabFocus) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        const pendingFocus = pendingTabFocus
+        pendingTabFocus = null
+        const restoreFocus = () => {
+          if (pendingFocus.kind === 'editor') editor.commands.focus()
+          else markdownKeyboardControls(root)[pendingFocus.index]?.focus()
+        }
+        restoreFocus()
+        // Chromium applies native Tab traversal after keyup. One macrotask is
+        // enough to restore the intended embedded control after that traversal.
+        root.ownerDocument.defaultView?.setTimeout(restoreFocus, 0)
+        return
+      }
+
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const controlTarget = target?.closest<HTMLElement>(
+        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      )
+      if (!controlTarget) return
+
+      const controls = markdownKeyboardControls(root)
+      const currentIndex = controls.indexOf(controlTarget)
+      const isFinalForward = !event.shiftKey && currentIndex === controls.length - 1
+      if (currentIndex >= 0 && !isFinalForward) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyboardNavigation, true)
+    document.addEventListener('keyup', keepEmbeddedControlFocus, true)
+    return () => {
+      document.removeEventListener('keydown', handleKeyboardNavigation, true)
+      document.removeEventListener('keyup', keepEmbeddedControlFocus, true)
+    }
+  }, [editable, editor])
 
   useEffect(() => {
     const root = editor?.view.dom
@@ -1146,6 +1308,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   markdown: string
   profile?: MarkdownProfile
   readOnly?: boolean
+  code?: MarkdownCodeOptions
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
   reference?: MarkdownReferenceOptions | false
@@ -1159,6 +1322,7 @@ export function MarkdownEditor({
   markdown,
   profile = 'preserve',
   readOnly = false,
+  code,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
@@ -1172,6 +1336,7 @@ export function MarkdownEditor({
     initialMarkdown: markdown,
     profile,
     editable: !readOnly,
+    code,
     onChange,
     slash,
     reference,
@@ -1216,6 +1381,7 @@ export function MarkdownEditor({
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
+  code?: MarkdownCodeOptions
   adapters?: MarkdownAdapters
   reference?: MarkdownReferenceOptions | false
   resolverContext?: MarkdownTargetResolverContext
@@ -1224,6 +1390,7 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
 export function MarkdownViewer({
   markdown,
   profile = 'preserve',
+  code,
   adapters,
   reference,
   resolverContext,
@@ -1233,6 +1400,7 @@ export function MarkdownViewer({
     initialMarkdown: markdown,
     profile,
     editable: false,
+    code,
     slash: false,
   })
   const resolutions = useMarkdownTargetResolutions(

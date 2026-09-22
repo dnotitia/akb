@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MarkdownEditor } from "@/components/markdown-editor";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
@@ -138,7 +138,44 @@ describe("MarkdownEditor formatting toolbar", () => {
     const editor = screen.getByRole("textbox", { name: "Document content" });
     const codeBlock = editor.querySelector("pre");
     expect(codeBlock).not.toBeNull();
+    expect(codeBlock).toHaveAttribute("data-markdown-code", "true");
+    expect(codeBlock).toHaveAttribute("role", "region");
+    expect(codeBlock).toHaveAttribute("tabindex", "0");
     expect(codeBlock).toHaveTextContent(/line one\s+line two/);
+  });
+
+  it("keeps nested task checkboxes independently editable through the shared surface", async () => {
+    let latest = "";
+    const onChange = vi.fn((markdown: string) => {
+      latest = markdown;
+    });
+    render(
+      <MarkdownEditor
+        value={[
+          "- [ ] Parent task",
+          "  - [x] Child task",
+        ].join("\n")}
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    const editor = await screen.findByRole("textbox", { name: "Document content" });
+    const checkboxes = within(editor).getAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(2);
+    expect(checkboxes[0]).toHaveAccessibleName("Task item checkbox for Parent task");
+    expect(checkboxes[1]).toHaveAccessibleName("Task item checkbox for Child task");
+    expect(checkboxes[0]).not.toBeChecked();
+    expect(checkboxes[1]).toBeChecked();
+
+    editor.focus();
+    fireEvent.keyDown(editor, { key: "Tab", code: "Tab", keyCode: 9 });
+    fireEvent.keyUp(editor, { key: "Tab", code: "Tab", keyCode: 9 });
+    expect(checkboxes[0]).toHaveFocus();
+    fireEvent.click(checkboxes[0]);
+    await waitFor(() => expect(latest).toContain("- [x] Parent task"));
+    expect(latest).toContain("- [x] Child task");
   });
 
   it("shows recoverable validation for unsafe link destinations", async () => {

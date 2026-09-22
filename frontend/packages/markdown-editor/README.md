@@ -20,6 +20,7 @@ import {
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   type MarkdownTableOptions,
   type MarkdownSlashCommandMessages,
+  type MarkdownCodeOptions,
   type MarkdownImageOptions,
   canonicalizeMarkdown,
   parseMarkdown,
@@ -270,6 +271,32 @@ they participate in the same toolbar navigation.
 </MarkdownToolbar>
 ```
 
+The shared surfaces render the same headings, paragraphs, blockquotes, ordinary
+and nested lists, task lists, and fenced code. Common languages are highlighted
+with `lowlight`; an unknown language remains readable as plain code while its
+fence language and content stay in the canonical Markdown model. Code blocks
+are bounded scrolling regions with a keyboard-focusable `pre` and a product
+provided accessible name:
+
+```tsx
+const code: MarkdownCodeOptions = {
+  labels: {
+    region: language =>
+      language ? `Scrollable ${language} code block` : 'Scrollable code block',
+  },
+}
+
+<MarkdownEditor markdown={markdown} code={code} />
+<MarkdownViewer markdown={markdown} code={code} />
+```
+
+Nested task checkboxes are independently editable, preserve their checked
+state through save/reopen, and are disabled on read-only surfaces. The
+checkbox labels and code-region semantics are presentation-only; toggling a
+task updates the editor Markdown through the existing `onChange` contract,
+while highlighting and accessibility attributes never become serialized
+Markdown.
+
 `MarkdownCommands` exposes `insertTable`, `addTableRowAfter`,
 `addTableColumnAfter`, `deleteTableRow`, `deleteTableColumn`, `deleteTable`, and
 `continueBelowTable`, alongside the Markdown and link commands. Each table
@@ -420,6 +447,17 @@ directory outside this package. The scripted composition check is not a substitu
 with a physical OS IME.
 
 ## Versioning
+
+The `0.13.0` public contract adds shared block rendering for editor/viewer
+surfaces, common-language code highlighting, keyboard-focusable code scroll
+regions, nested task checkbox behavior, and `MarkdownCodeOptions` for product
+accessible copy. Code decoration and accessibility attributes are
+presentation-only; canonical Markdown content, fence languages, and checked
+states remain unchanged.
+
+The `0.12.0` public contract adds shared stored-reference resolution for
+`MarkdownEditor` and `MarkdownViewer`, preserving canonical Markdown while
+products supply display names, runtime routes, and access policy.
 
 The `0.11.0` public contract adds the common image rendering surface and
 resource lifecycle hooks. `MarkdownSurface`, `MarkdownEditor`, and
