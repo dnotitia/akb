@@ -70,6 +70,23 @@ describe("VaultNewPage template selection", () => {
     expect(labels.join("|")).toMatch(/QA/);
   });
 
+  it("offers only empty creation when no templates are available", async () => {
+    vi.mocked(api.listVaultTemplates).mockResolvedValue([]);
+    renderPage();
+    const user = await openTemplateMenu();
+    const items = screen.getAllByRole("menuitemradio");
+    expect(items).toHaveLength(1);
+    expect(items[0].textContent).toMatch(/empty vault/i);
+    expect(screen.queryByText(/available via MCP/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/connect external git/i)).not.toBeInTheDocument();
+    await user.click(items[0]);
+    await user.type(screen.getByLabelText(/^name/i), "native-vault");
+    await user.click(screen.getByRole("button", { name: /create vault/i }));
+    await waitFor(() =>
+      expect(api.createVault).toHaveBeenCalledWith("native-vault", undefined, undefined),
+    );
+  });
+
   it("shows preview when a template is selected", async () => {
     (api.listVaultTemplates as any).mockResolvedValue(SAMPLE);
     renderPage();

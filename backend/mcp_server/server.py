@@ -74,7 +74,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import TOOLS
+from mcp_server.tools import TOOLS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -1660,14 +1660,15 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
 # ── Tool Handlers ────────────────────────────────────────────
 
 async def list_tools():
+    tools = available_tools()
     if _vault_skill_preflight_version() != 2:
-        return TOOLS
+        return tools
 
     # Capability v2 makes acknowledgement explicit.  Advertise the reserved
     # retry argument only to clients that negotiated that contract; older
     # clients keep the byte-for-byte schemas they already understand.
     decorated = []
-    for tool in TOOLS:
+    for tool in tools:
         may_write = (
             _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
             or tool.name in _ARG_WRITE_TRIGGERS

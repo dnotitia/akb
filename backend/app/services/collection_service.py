@@ -205,8 +205,8 @@ class CollectionService:
           files. Otherwise `CollectionNotEmptyError(doc_count,
           file_count, sub_collection_count)`.
         - Cascade mode (`recursive=True`): delete everything at and
-          under `P` — all sub-collection rows + all docs (one git
-          commit) + all files (s3 outbox) + the row at `P` if it
+          under `P` — all sub-collection rows + all docs (one Git
+          commit on Bare Git installations) + all files (s3 outbox) + the row at `P` if it
           exists. If the prefix contains a table, the caller must pass
           the admin-derived `allow_table_delete` capability. Returns
           `{ok, collection, deleted_docs, deleted_files,
@@ -239,6 +239,8 @@ class CollectionService:
         # Module-level import (not function-local): tests patch this symbol
         # and #525's counter module is the single authority selector.
         from app.services import document_counters as _counters
+
+        native_authority = _counters.native_documents_are_authoritative()
 
         async def _native_docs_under(
             conn, vault_uuid: uuid.UUID, prefix: str,
@@ -298,7 +300,7 @@ class CollectionService:
                 sub_rows = [dict(r) for r in sub_rows_locked]
 
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
-                if _counters.native_documents_are_authoritative():
+                if native_authority:
                     docs = docs + await _native_docs_under(conn, vault_id, norm)
                 files = await coll_repo.list_files_under(vault_id, norm, conn=conn)
                 # Tables living in this collection (FK collection_id is
@@ -363,7 +365,7 @@ class CollectionService:
                     # revision service (lifecycle + revision chain), not the
                     # legacy repository — which would find no row and report
                     # the delete as a no-op while the live document survives.
-                    if _counters.native_documents_are_authoritative() and "resource_id" in d:
+                    if native_authority and "resource_id" in d:
                         # Same delete the native document service performs
                         # (revision chain + lifecycle), minus the body-asset
                         # retention that belongs to single-document delete:
@@ -522,8 +524,10 @@ class CollectionService:
                 sub_count = len(sub_rows)
                 tables_count = len(tables)
 
-                # Snapshot for post-commit git work.
-                doc_paths_for_git = [d["path"] for d in docs]
+                # Only Bare Git installations own repository files. Native
+                # authority must not enter the Git lane, even when historical
+                # legacy catalog rows are included in the PG cleanup.
+                doc_paths_for_git = [] if native_authority else [d["path"] for d in docs]
                 if doc_paths_for_git:
                     commit_msg_for_git = (
                         f"[delete-collection] {norm}\n\n"

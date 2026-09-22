@@ -114,13 +114,14 @@ echo "▸ 4. File metadata inside same collection 'specs'"
 
 # Synthetic vault_files row + ensure the collections row exists so the
 # FK populates correctly. This skips the presigned PUT round-trip and
-# verifies the FK plumbing only.
+# verifies the FK plumbing only. Model a confirmed File explicitly: new
+# rows default to pending and must not appear in browse before confirmation.
 SPEC_COLL_ID=$(run_psql "SELECT id FROM collections WHERE vault_id = '$VAULT_ID' AND path = 'specs'")
 [ -n "$SPEC_COLL_ID" ] && pass "collections row 'specs' was auto-created by service" \
                       || fail "ensure_collection" "missing"
 
-SYN_FID=$(run_psql "INSERT INTO vault_files (vault_id, collection_id, name, s3_key, mime_type, size_bytes, description, created_by)
-                    VALUES ('$VAULT_ID', '$SPEC_COLL_ID', 'note.txt', '$VAULT/test/note.txt', 'text/plain', 5, '', '$USER')
+SYN_FID=$(run_psql "INSERT INTO vault_files (vault_id, collection_id, name, s3_key, mime_type, size_bytes, description, created_by, upload_state)
+                    VALUES ('$VAULT_ID', '$SPEC_COLL_ID', 'note.txt', '$VAULT/test/note.txt', 'text/plain', 5, '', '$USER', 'confirmed')
                     RETURNING id" | head -n 1)
 [ -n "$SYN_FID" ] && pass "synthetic file row inserted under 'specs'" || fail "file insert" "no id"
 
