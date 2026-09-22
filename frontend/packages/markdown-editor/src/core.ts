@@ -3,12 +3,14 @@ import { MarkdownManager } from '@tiptap/markdown'
 import { closeHistory } from '@tiptap/pm/history'
 
 import { createMarkdownExtensions, parseMarkdownReferenceToken } from './extensions.js'
+import { createMarkdownEditorHandle } from './react/editor-handle.js'
 import { markdownTableCommands } from './table.js'
 import type {
   MarkdownCommands,
   MarkdownDocument,
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
+  MarkdownNode,
   MarkdownParseOptions,
   MarkdownReferenceToken,
   MarkdownTarget,
@@ -20,7 +22,6 @@ export { parseMarkdownReferenceToken }
 function managerFor(options: MarkdownParseOptions = {}): MarkdownManager {
   return new MarkdownManager({
     extensions: createMarkdownExtensions({ profile: options.profile }),
-    markedOptions: options.markedOptions,
   })
 }
 
@@ -28,16 +29,16 @@ export function parseMarkdown(
   markdown: string,
   options: MarkdownParseOptions = {},
 ): MarkdownDocument {
-  const document = managerFor(options).parse(markdown) as MarkdownDocument
+  const document = managerFor(options).parse(markdown) as unknown as MarkdownDocument
   stripExcludedMarkdownReferences(document)
   return document
 }
 
 export function serializeMarkdown(
-  document: JSONContent,
+  document: MarkdownDocument,
   options: MarkdownParseOptions = {},
 ): string {
-  return managerFor(options).serialize(document)
+  return managerFor(options).serialize(document as JSONContent)
 }
 
 /**
@@ -70,7 +71,7 @@ export function canonicalizeMarkdown(
 }
 
 function stripExcludedMarkdownReferences(document: MarkdownDocument): void {
-  const visit = (node: JSONContent, excluded = false) => {
+  const visit = (node: MarkdownNode, excluded = false) => {
     const nodeExcluded =
       excluded ||
       node.type === 'codeBlock' ||
@@ -98,7 +99,7 @@ export function extractMarkdownReferences(markdown: string): MarkdownReferenceTo
   const references: MarkdownReferenceToken[] = []
   const seen = new Set<string>()
 
-  const visit = (node: JSONContent) => {
+  const visit = (node: MarkdownNode) => {
     if (node.type === 'text') {
       const referenceMark = node.marks?.find(mark => mark.type === 'markdownReference')
       if (referenceMark && referenceMark.attrs?.escaped !== true) {
@@ -146,7 +147,7 @@ export function extractMarkdownTargets(markdown: string): MarkdownTarget[] {
   const targets: MarkdownTarget[] = []
   const seen = new Set<string>()
 
-  const visit = (node: JSONContent) => {
+  const visit = (node: MarkdownNode) => {
     if (node.type === 'image') {
       const target = typeof node.attrs?.target === 'string' ? node.attrs.target : ''
       const kind = target ? inferTargetKind(target, 'image') : null
@@ -175,14 +176,13 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
   const {
     initialMarkdown = '',
     profile = 'preserve',
-    element,
     editable = true,
     image,
     onChange,
   } = options
 
   const resolvedElement =
-    element ?? (typeof document !== 'undefined' ? document.createElement('div') : undefined)
+    typeof document !== 'undefined' ? document.createElement('div') : undefined
 
   return new Editor({
     element: resolvedElement,
@@ -191,7 +191,10 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
     contentType: 'markdown',
     editable,
     onUpdate: ({ editor }) =>
-      onChange?.(serializeEditorMarkdown(editor, { profile }), editor),
+      onChange?.(
+        serializeEditorMarkdown(editor, { profile }),
+        createMarkdownEditorHandle(editor),
+      ),
   })
 }
 

@@ -2,17 +2,16 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   canonicalizeMarkdown,
-  createMarkdownEditor,
   extractMarkdownReferences,
   extractMarkdownTargets,
   markdownReferenceKey,
-  markdownCommands,
   parseMarkdownReferenceToken,
   parseMarkdown,
   resolveMarkdownReferences,
   serializeMarkdown,
   uploadMarkdownBatch,
 } from '../src/index.js'
+import { createMarkdownEditor, markdownCommands } from '../src/core.js'
 import type { MarkdownAdapters } from '../src/index.js'
 
 const fixture = `# 공통 문법

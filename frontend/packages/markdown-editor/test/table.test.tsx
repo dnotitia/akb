@@ -3,15 +3,16 @@ import { userEvent } from '@testing-library/user-event'
 import { useEffect, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Editor } from '@tiptap/core'
+import { EditorContent } from '@tiptap/react'
 
 import {
-  EditorContent,
   MarkdownEditingSurface,
   MarkdownToolbar,
-  serializeEditorMarkdown,
   useMarkdownCommands,
   useMarkdownEditor,
 } from '../src/index.js'
+import { serializeEditorMarkdown } from '../src/core.js'
+import { getMarkdownEditor } from '../src/react/editor-handle.js'
 
 const TABLE = [
   '| H1 | H2 | H3 |',
@@ -41,7 +42,7 @@ function TableHarness({ initialMarkdown, readOnly = false, onPersist, onEditor }
   const commands = useMarkdownCommands(editor)
 
   useEffect(() => {
-    onEditor?.(editor)
+    onEditor?.(getMarkdownEditor(editor))
     return () => onEditor?.(null)
   }, [editor, onEditor])
 
@@ -55,7 +56,7 @@ function TableHarness({ initialMarkdown, readOnly = false, onPersist, onEditor }
         readOnly={readOnly}
         toolbar={<MarkdownToolbar editor={editor} />}
       >
-        {editor ? <EditorContent editor={editor} /> : null}
+        {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
       </MarkdownEditingSurface>
       <div>
         <button
@@ -85,7 +86,8 @@ function TableHarness({ initialMarkdown, readOnly = false, onPersist, onEditor }
         <button
           type="button"
           onClick={() => {
-            if (editor) onPersist?.(serializeEditorMarkdown(editor))
+            const rawEditor = getMarkdownEditor(editor)
+            if (rawEditor) onPersist?.(serializeEditorMarkdown(rawEditor))
           }}
         >
           Save Markdown

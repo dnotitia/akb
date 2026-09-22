@@ -1,10 +1,19 @@
-import type { Editor, EditorOptions, FocusPosition, JSONContent } from '@tiptap/core'
-import type { MarkdownExtensionOptions } from '@tiptap/markdown'
 import type { MarkdownTableCommands, MarkdownTableState } from './table.js'
 
 export type { MarkdownTableInsertionOptions, MarkdownTableState } from './table.js'
 
 export type MarkdownProfile = 'structured' | 'preserve'
+
+declare const markdownEditorHandleBrand: unique symbol
+
+/**
+ * Opaque package-owned editor identity used to compose the shared React
+ * surfaces. The underlying editor engine is intentionally not part of this
+ * contract.
+ */
+export interface MarkdownEditorHandle {
+  readonly [markdownEditorHandleBrand]: 'MarkdownEditorHandle'
+}
 
 export type MarkdownTargetKind = 'document' | 'file' | 'attachment'
 
@@ -107,7 +116,6 @@ export interface MarkdownCodeOptions {
 
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile
-  markedOptions?: MarkdownExtensionOptions['markedOptions']
 }
 
 export interface MarkdownUploadContext {
@@ -367,13 +375,14 @@ export interface MarkdownSlashCommandOptions {
 
 export type MarkdownHeadingLevel = 1 | 2 | 3
 
+export type MarkdownFocusPosition = 'start' | 'end' | 'all' | number | boolean | null
+
 export interface MarkdownEditorConfig extends MarkdownParseOptions {
   initialMarkdown?: string
   editable?: boolean
-  element?: EditorOptions['element']
   image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
   adapters?: MarkdownAdapters
-  onChange?: (markdown: string, editor: Editor) => void
+  onChange?: (markdown: string, editor: MarkdownEditorHandle) => void
 }
 
 export interface MarkdownCommands extends MarkdownTableCommands {
@@ -403,7 +412,7 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   setHorizontalRule(): boolean
   undo(): boolean
   redo(): boolean
-  focus(position?: FocusPosition): boolean
+  focus(position?: MarkdownFocusPosition): boolean
 }
 
 export interface MarkdownActiveState {
@@ -447,5 +456,18 @@ export interface MarkdownState {
 
 export interface MarkdownDocument {
   type: 'doc'
-  content?: JSONContent[]
+  content?: MarkdownNode[]
+}
+
+export interface MarkdownNode {
+  type: string
+  attrs?: Readonly<Record<string, unknown>>
+  content?: MarkdownNode[]
+  marks?: MarkdownMark[]
+  text?: string
+}
+
+export interface MarkdownMark {
+  type: string
+  attrs?: Readonly<Record<string, unknown>>
 }

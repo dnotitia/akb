@@ -52,7 +52,6 @@ import {
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 } from './markdown-slash-command.js'
 export {
-  createMarkdownSlashCommandExtension,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 } from './markdown-slash-command.js'
 export type {
@@ -62,7 +61,6 @@ import {
   createLiveMarkdownReferenceExtension,
 } from './markdown-reference-menu.js'
 export {
-  createMarkdownReferenceExtension,
   DEFAULT_MARKDOWN_REFERENCE_LABELS,
   normalizeMarkdownReferenceCandidates,
 } from './markdown-reference-menu.js'
@@ -102,12 +100,17 @@ export {
   useMarkdownImageUploadContext,
 } from './markdown-image-upload.js'
 import { markdownTableState } from '../table.js'
+import {
+  createMarkdownEditorHandle,
+  getMarkdownEditor,
+} from './editor-handle.js'
 import type {
   MarkdownAdapters,
   MarkdownCodeOptions,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownContentAttributes,
+  MarkdownEditorHandle,
   MarkdownHeadingLevel,
   MarkdownHeadingOptions,
   MarkdownImageOptions,
@@ -128,6 +131,7 @@ import type {
 } from '../types.js'
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 export type {
+  MarkdownEditorHandle,
   MarkdownCodeLabels,
   MarkdownCodeOptions,
   MarkdownContentAttributes,
@@ -215,7 +219,7 @@ export function useMarkdownEditor({
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
-}: UseMarkdownEditorOptions = {}): Editor | null {
+}: UseMarkdownEditorOptions = {}): MarkdownEditorHandle | null {
   const [referenceSource] = useState(() => new MarkdownReferenceOptionSource(reference))
   useEffect(() => {
     referenceSource.set(reference)
@@ -237,18 +241,24 @@ export function useMarkdownEditor({
     [code, image, profile, referenceExtension, slash],
   )
 
-  return useEditor({
+  const editor = useEditor({
     extensions,
     content: initialMarkdown,
     contentType: 'markdown',
     editable,
     immediatelyRender: false,
     onUpdate: ({ editor }) =>
-      onChange?.(serializeEditorMarkdown(editor, { profile }), editor),
+      onChange?.(
+        serializeEditorMarkdown(editor, { profile }),
+        createMarkdownEditorHandle(editor),
+      ),
   })
+
+  return editor ? createMarkdownEditorHandle(editor) : null
 }
 
-export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
+export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownCommands {
+  const editor = getMarkdownEditor(handle)
   return useMemo(
     () =>
       editor
@@ -325,7 +335,8 @@ function readState(editor: Editor): MarkdownState {
   }
 }
 
-export function useMarkdownState(editor: Editor | null): MarkdownState | null {
+export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownState | null {
+  const editor = getMarkdownEditor(handle)
   const [state, setState] = useState<MarkdownState | null>(() => (editor ? readState(editor) : null))
 
   useEffect(() => {
@@ -488,7 +499,7 @@ export function useMarkdownReferenceResolutions(
 }
 
 export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   editable: boolean
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
@@ -537,7 +548,7 @@ function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
 }
 
 export function MarkdownSurface({
-  editor,
+  editor: editorHandle,
   editable,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
@@ -551,6 +562,7 @@ export function MarkdownSurface({
   children,
   ...props
 }: MarkdownSurfaceProps) {
+  const editor = getMarkdownEditor(editorHandle)
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
   }, [editor])
@@ -1261,11 +1273,11 @@ const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
 }
 
 export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   markdown: string
   profile?: MarkdownProfile
-  onSourceChange?: (markdown: string, editor: Editor) => void
-  onMarkdownApplied?: (editor: Editor) => void
+  onSourceChange?: (markdown: string, editor: MarkdownEditorHandle) => void
+  onMarkdownApplied?: (editor: MarkdownEditorHandle) => void
   readOnly?: boolean
   autoFocus?: boolean
   modeSwitchDisabled?: boolean
@@ -1291,7 +1303,7 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
  * owns mode switching, source synchronization, focus, and the shared source UI.
  */
 export function MarkdownEditingSurface({
-  editor,
+  editor: editorHandle,
   markdown,
   profile = 'preserve',
   onSourceChange,
@@ -1316,7 +1328,8 @@ export function MarkdownEditingSurface({
   className,
   ...props
 }: MarkdownEditingSurfaceProps) {
-  const imageUploadController = useMarkdownImageUpload(editor, imageUpload, readOnly)
+  const editor = getMarkdownEditor(editorHandle)
+  const imageUploadController = useMarkdownImageUpload(editorHandle, imageUpload, readOnly)
   const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
   const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
   const [source, setSource] = useState(markdown)
@@ -1385,9 +1398,9 @@ export function MarkdownEditingSurface({
         emitUpdate: false,
       })
       normalizeEditorBody(editor)
-      onMarkdownApplied?.(editor)
+      if (editorHandle) onMarkdownApplied?.(editorHandle)
     }
-  }, [editor, markdown, mode, onMarkdownApplied, profile])
+  }, [editor, editorHandle, markdown, mode, onMarkdownApplied, profile])
 
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
@@ -1432,7 +1445,7 @@ export function MarkdownEditingSurface({
           emitUpdate: false,
         })
         normalizeEditorBody(editor)
-        onMarkdownApplied?.(editor)
+        if (editorHandle) onMarkdownApplied?.(editorHandle)
       }
       sourceDirtyRef.current = false
     }
@@ -1505,7 +1518,7 @@ export function MarkdownEditingSurface({
             sourceRef.current = next
             sourceDirtyRef.current = true
             setSource(next)
-            if (editor && !readOnly) onSourceChange?.(next, editor)
+            if (editorHandle && !readOnly) onSourceChange?.(next, editorHandle)
           }}
           className={
             sourceClassName ??
@@ -1636,6 +1649,7 @@ export function MarkdownViewer({
     image,
     slash: false,
   })
+  const rawEditor = getMarkdownEditor(editor)
   const resolutions = useMarkdownTargetResolutions(
     markdown,
     adapters?.targetResolver,
@@ -1651,17 +1665,17 @@ export function MarkdownViewer({
   )
 
   useEffect(() => {
-    if (!editor || serializeEditorMarkdown(editor, { profile }) === markdown) {
+    if (!rawEditor || serializeEditorMarkdown(rawEditor, { profile }) === markdown) {
       return
     }
 
-    editor.commands.setContent(markdown, { contentType: 'markdown' })
-    normalizeEditorBody(editor)
-  }, [editor, markdown, profile])
+    rawEditor.commands.setContent(markdown, { contentType: 'markdown' })
+    normalizeEditorBody(rawEditor)
+  }, [markdown, profile, rawEditor])
 
   useEffect(() => {
-    if (editor) normalizeEditorBody(editor)
-  }, [editor])
+    if (rawEditor) normalizeEditorBody(rawEditor)
+  }, [rawEditor])
 
   return (
     <MarkdownSurface
@@ -1675,8 +1689,6 @@ export function MarkdownViewer({
     />
   )
 }
-
-export { EditorContent }
 
 function joinClasses(...classes: Array<string | undefined>): string {
   return classes.filter(Boolean).join(' ')
@@ -1714,7 +1726,7 @@ interface MarkdownLinkSelectionSnapshot {
 }
 
 export interface MarkdownLinkPopupProps {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   open: boolean
   onOpenChange: (open: boolean) => void
   /** Product-specific canonicalization and URL policy. */
@@ -1735,7 +1747,7 @@ export interface MarkdownLinkPopupProps {
  * consumers never need to assemble Tiptap commands themselves.
  */
 export function MarkdownLinkPopup({
-  editor,
+  editor: editorHandle,
   open,
   onOpenChange,
   normalizeUrl = normalizeMarkdownLinkUrl,
@@ -1746,8 +1758,9 @@ export function MarkdownLinkPopup({
   labels,
   className,
 }: MarkdownLinkPopupProps) {
+  const editor = getMarkdownEditor(editorHandle)
   const copy = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...labels }
-  const commands = useMarkdownCommands(editor)
+  const commands = useMarkdownCommands(editorHandle)
   const urlInputRef = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const snapshotRef = useRef<MarkdownLinkSelectionSnapshot | null>(null)
@@ -2037,7 +2050,7 @@ export function MarkdownToolbarGroup({
 }
 
 export interface MarkdownToolbarProps {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   children?: ReactNode
   className?: string
   'aria-label'?: string
@@ -2062,19 +2075,19 @@ export interface MarkdownToolbarLinkOptions {
  * state, selection preservation, and roving keyboard focus stay here.
  */
 export function MarkdownToolbar({
-  editor,
+  editor: editorHandle,
   children,
   className,
   'aria-label': ariaLabel = 'Text formatting',
   link,
   table,
 }: MarkdownToolbarProps) {
-  const state = useMarkdownState(editor)
-  const commands = useMarkdownCommands(editor)
+  const state = useMarkdownState(editorHandle)
+  const commands = useMarkdownCommands(editorHandle)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const [linkOpen, setLinkOpen] = useState(false)
   const imageUpload = useMarkdownImageUploadContext()
-  const editable = Boolean(editor && state?.isEditable)
+  const editable = Boolean(editorHandle && state?.isEditable)
   const active = state?.active
   const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
   const tableLabels: MarkdownTableLabels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...table?.labels }
@@ -2324,7 +2337,7 @@ export function MarkdownToolbar({
       </MarkdownToolbarGroup>
       {children}
       <MarkdownLinkPopup
-        editor={editor}
+        editor={editorHandle}
         open={linkOpen}
         onOpenChange={setLinkOpen}
         normalizeUrl={link?.normalizeUrl}

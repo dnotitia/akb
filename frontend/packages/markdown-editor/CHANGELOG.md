@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.0
+
+- Close the public editor boundary around the package-owned
+  `MarkdownEditorHandle`; raw Tiptap editors, `EditorContent`, editor
+  factories, and engine-only serialization helpers are internal.
+- Keep lower-level React composition, commands, state, source/WYSIWYG
+  synchronization, uploads, and target/reference resolution available through
+  package-owned contracts.
+
 ## 0.14.0
 
 - Make WYSIWYG updates from the core and React editor hooks return canonical

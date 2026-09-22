@@ -27,7 +27,6 @@ import {
   type MarkdownTableLayoutOptions,
   canonicalizeMarkdown,
   parseMarkdown,
-  serializeEditorMarkdown,
   serializeMarkdown,
   useMarkdownCommands,
   useMarkdownState,
@@ -50,9 +49,9 @@ draft. Source opens from the current editor body. WYSIWYG changes emit
 canonical Markdown through `onChange`; Source changes emit the exact source
 text so products can preserve authored Markdown while the shared editor stays mounted, and formatting,
 link search, and the slash command menu remain attached to the WYSIWYG surface.
-`serializeEditorMarkdown(editor, { profile: 'preserve' })` is the explicit
-serialization entry point and omits the terminal empty paragraph that Tiptap
-keeps as an editing caret after an atomic block.
+The editor instance returned by `useMarkdownEditor` is an opaque package handle;
+it can only be passed to the package-owned surfaces, commands, and state hooks.
+Products persist the Markdown delivered by `onChange` or `onSourceChange`.
 
 `MarkdownSurface` owns the editor content element and accepts
 `contentClassName` / `contentAttributes` for product styling and accessible
@@ -190,8 +189,8 @@ surface from the `/react` entry point:
 
 ```tsx
 import {
-  EditorContent,
   MarkdownEditingSurface,
+  MarkdownSurface,
   MarkdownToolbar,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   DEFAULT_MARKDOWN_REFERENCE_LABELS,
@@ -227,7 +226,7 @@ function ProductEditor({ markdown, onChange, readOnly }) {
       onSourceChange={onChange}
       modeLabels={{ group: 'Editor mode', source: 'Source' }}
     >
-      <EditorContent editor={editor} />
+      <MarkdownSurface editor={editor} editable={!readOnly} />
     </MarkdownEditingSurface>
   )
 }
@@ -382,7 +381,7 @@ policy in the adapter callbacks.
   imageMenu={{ isEditableTarget: targetPolicy }}
   toolbar={<MarkdownToolbar editor={editor} />}
 >
-  <EditorContent editor={editor} />
+  <MarkdownSurface editor={editor} editable />
 </MarkdownEditingSurface>
 ```
 
@@ -415,9 +414,9 @@ const resolver = {
 />
 ```
 
-The viewer/editor apply resolver results to their rendered DOM only. The editor model and
-`getMarkdown()` continue to contain the original canonical target, including when a resource is
-unavailable.
+The viewer/editor apply resolver results to their rendered DOM only. Change
+callbacks and `MarkdownState.markdown` continue to contain the original
+canonical target, including when a resource is unavailable.
 
 `MarkdownSurface` is the shared image renderer for products that own an editor instance. It keeps
 the canonical target, `alt`, and `title` in the Tiptap node, while a resolver supplies only the
@@ -476,6 +475,11 @@ with a physical OS IME.
 
 ## Versioning
 
+The `0.15.0` public contract closes the editor boundary around the package-owned
+`MarkdownEditorHandle`. Raw Tiptap editor values, `EditorContent`, editor
+factories, and engine serialization helpers are no longer public; lower-level
+React surfaces continue to compose through the opaque handle.
+
 The `0.14.0` public contract adds canonical WYSIWYG `onChange` serialization and moves
 editor content attributes, viewer heading/table presentation, image request
 policy, and autofocus into the shared public surface contract. These options
@@ -525,8 +529,7 @@ serialized Markdown meaning.
 The `0.6.0` public contract adds shared GFM table insertion, selection-aware
 row/column commands, table-local controls, and continuation immediately below
 the selected table. `MarkdownTableOptions` lets products provide labels and
-styling. It also includes the shared WYSIWYG / Markdown Source surface and
-`serializeEditorMarkdown`.
+styling. It also includes the shared WYSIWYG / Markdown Source surface.
 
 For a Git consumer, pin both the full commit SHA and the package subdirectory:
 
@@ -554,7 +557,7 @@ The `0.4.0` public contract adds the shared link command/state contract and
 `MarkdownLinkPopup`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
-Markdown returned by `onChange` or `serializeEditorMarkdown()` as the canonical representation, and
+Markdown returned by `onChange` or `onSourceChange` as the canonical representation, and
 choose `profile="structured"` when unknown HTML/MDX should be rejected or the default `preserve`
 profile when those constructs must survive edit/serialize cycles. Changes to the exported schema,
 Markdown profile, or serialized meaning follow semver and must include a migration note.

@@ -1,11 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
+import { EditorContent } from '@tiptap/react'
 import { useEffect, useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-  createMarkdownEditor,
-  EditorContent,
   MarkdownEditor,
   MarkdownEditingSurface,
   MarkdownSurface,
@@ -15,6 +14,8 @@ import {
   useMarkdownTargetResolutions,
   useMarkdownState,
 } from '../src/index.js'
+import { createMarkdownEditor } from '../src/core.js'
+import { getMarkdownEditor } from '../src/react/editor-handle.js'
 import type {
   MarkdownReferenceAdapter,
   MarkdownTargetResolution,
@@ -107,11 +108,11 @@ describe('React surfaces', () => {
       useEffect(() => {
         activeEditor = editor
       }, [editor])
-      return editor ? <EditorContent editor={editor} /> : null
+      return editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null
     }
 
     const { container } = render(<LinkSurface />)
-    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
     const link = container.querySelector<HTMLAnchorElement>('.ProseMirror a[href]')!
 
     await act(async () => {
@@ -124,7 +125,7 @@ describe('React surfaces', () => {
 
     expect(link).toHaveAttribute('href', '#')
     expect(link).toHaveAttribute('data-markdown-resolution', 'pending')
-    expect(activeEditor!.getMarkdown()).toBe(markdown)
+    expect(getMarkdownEditor(activeEditor)!.getMarkdown()).toBe(markdown)
     expect(onChange).not.toHaveBeenCalled()
   })
 
@@ -213,16 +214,16 @@ describe('React surfaces', () => {
           onSourceChange={next => setMarkdown(next)}
           toolbar={<button type="button">Formatting tool</button>}
         >
-          {editor ? <EditorContent editor={editor} /> : null}
+          {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
         </MarkdownEditingSurface>
       )
     }
 
     const { container } = render(<ControlledSurface />)
     const view = within(container)
-    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
 
-    const editor = activeEditor!
+    const editor = getMarkdownEditor(activeEditor)!
     await act(async () => {
       editor.commands.setTextSelection({ from: 2, to: 5 })
       editor.commands.insertContent('!')
@@ -286,7 +287,7 @@ describe('React surfaces', () => {
             sourceLabel="Markdown source"
             toolbar={<button type="button">Formatting tool</button>}
           >
-            {editor ? <EditorContent editor={editor} /> : null}
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
           </MarkdownEditingSurface>
         </>
       )
@@ -294,8 +295,8 @@ describe('React surfaces', () => {
 
     const { container } = render(<ControlledSurface />)
     const view = within(container)
-    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
-    const editor = activeEditor!
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+    const editor = getMarkdownEditor(activeEditor)!
 
     await user.click(view.getByRole('button', { name: 'Source' }))
     const source = view.getByRole('textbox', { name: 'Markdown source' })
@@ -311,12 +312,12 @@ describe('React surfaces', () => {
 
     expect(sourceChanges).toHaveBeenLastCalledWith(
       editedMarkdown,
-      editor,
+      activeEditor,
     )
     expect(view.getByTestId('markdown-value')).toHaveTextContent('<!-- keep -->')
 
     await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
-    expect(editor).toBe(activeEditor)
+    expect(editor).toBe(getMarkdownEditor(activeEditor))
     expect(container.querySelector('h2')).toHaveTextContent('Edited')
     expect(container.querySelector('img')).toHaveAttribute(
       'data-markdown-target',
@@ -479,16 +480,17 @@ describe('React surfaces', () => {
     }
 
     const { container } = render(<ImageOnlySurface />)
-    await waitFor(() => expect(activeEditor?.view).toBeTruthy())
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+    const editor = getMarkdownEditor(activeEditor)!
     expect(container.querySelector('.ProseMirror > p > [data-markdown-image-frame]')).toBeInTheDocument()
-    expect(activeEditor!.getMarkdown()).toBe(`![Only image](${target})`)
+    expect(editor.getMarkdown()).toBe(`![Only image](${target})`)
 
     await act(async () => {
-      activeEditor!.commands.focus('end')
-      activeEditor!.commands.insertContent('Continue below')
+      editor.commands.focus('end')
+      editor.commands.insertContent('Continue below')
     })
-    expect(activeEditor!.getMarkdown()).toContain(`![Only image](${target})`)
-    expect(activeEditor!.getMarkdown()).toContain('Continue below')
+    expect(editor.getMarkdown()).toContain(`![Only image](${target})`)
+    expect(editor.getMarkdown()).toContain('Continue below')
   })
 
   it('re-resolves expiring targets before expiry without changing canonical Markdown', async () => {
@@ -660,18 +662,18 @@ describe('React surfaces', () => {
           imageMenu={{}}
           onSourceChange={setMarkdown}
         >
-          {editor ? <EditorContent editor={editor} /> : null}
+          {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
         </MarkdownEditingSurface>
       )
     }
 
     const { container } = render(<ImageSurface />)
     await waitFor(() => {
-      expect(activeEditor?.view).toBeTruthy()
+      expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy()
       expect(container.querySelectorAll('[data-markdown-image-controls="true"]')).toHaveLength(3)
     })
 
-    const editor = activeEditor!
+    const editor = getMarkdownEditor(activeEditor)!
     const editSecond = screen.getByRole('button', { name: 'Edit image description: Second' })
     editSecond.focus()
     await user.keyboard('{Enter}')
