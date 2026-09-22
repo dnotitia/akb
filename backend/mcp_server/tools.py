@@ -1392,12 +1392,36 @@ TOOLS = [
 ]
 
 
-def available_tools() -> list[Tool]:
-    """Advertise only supported creation options without mutating validation.
+from mcp_server.operation_registry import (
+    FIRST_SLICE_LEGACY_NAMES,
+    OperationRegistry,
+    build_candidate_registry,
+)
 
-    TOOLS remains the accepted argument catalog for older clients, whose
-    explicit unsupported requests must reach the service's stable error.
+
+_LEGACY_TOOLS = {tool.name: tool for tool in TOOLS}
+CANDIDATE_REGISTRY: OperationRegistry = build_candidate_registry(_LEGACY_TOOLS)
+
+
+def candidate_tools() -> list[Tool]:
+    """Return the incremental candidate catalog in deterministic order.
+
+    The first-slice legacy names are replaced by registry capabilities. Later
+    slices remain at their existing public boundary until their owning issue
+    registers a replacement; this keeps one catalog without exposing a
+    duplicate address for any operation already consolidated here.
     """
+    result = [tool.model_copy(deep=True) for tool in CANDIDATE_REGISTRY.tools_by_name.values()]
+    result.extend(
+        tool.model_copy(deep=True)
+        for tool in available_tools()
+        if tool.name not in FIRST_SLICE_LEGACY_NAMES
+    )
+    return result
+
+
+def available_tools() -> list[Tool]:
+    """Return the unchanged production catalog for existing service callers."""
     capabilities = get_vault_creation_capabilities()
     if capabilities.templates and capabilities.external_git:
         return TOOLS
