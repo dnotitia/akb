@@ -40,7 +40,7 @@ from app.services.grep_replace import (
     validate_max_replacements,
 )
 from app.services.vector_store import VectorHit, get_vector_store
-from app.services.vector_store.base import VectorStoreUnavailable, supports_vault_filter
+from app.services.vector_store.base import VectorSearchDegraded, VectorStoreUnavailable, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
@@ -1204,8 +1204,8 @@ class SearchService:
             search_prefetch=settings.search_prefetch,
         )
 
-        # Hybrid (dense + BM25 sparse) via the configured driver. Returns [] on any vector-store
-        # failure — PG is the source of truth, the index is rebuildable.
+        # Hybrid (dense + BM25 sparse) via the configured driver. Explicitly
+        # degraded partial hits continue through normal dedup and hydration.
         #
         # source_types (workbench #1069): constrain the driver-side pre-filter
         # to the active Document arm (+ table/file, which have no second arm)
@@ -1998,6 +1998,9 @@ class SearchService:
             # `sparse_reason` is None on the normal path; set when the sparse leg
             # was down and we ran dense-only (degraded-but-has-results).
             return hits, sparse_reason
+        except VectorSearchDegraded as e:
+            logger.warning("vector search degraded (%s); retaining %d hits", e.reason, len(e.hits))
+            return e.hits, e.reason
         except VectorStoreUnavailable as e:
             # Transient/expected: store outage. Search degrades to empty but the
             # caller is told WHY instead of seeing a silent zero-match.

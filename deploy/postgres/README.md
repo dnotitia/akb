@@ -5,8 +5,9 @@ table the backend maintains, on the stock `pgvector/pgvector:pg16` image named
 everywhere else in this repository.
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
-which implements the same BM25 formula over a block-max index instead of a
-relational table. An operator who wants that trade can build the image here and
+which stores raw term frequencies and owns corpus statistics and BM25 scoring
+in a block-max index. Posting stores application-computed weights; identical
+rankings across the two scorers are not a compatibility guarantee. An operator who wants that trade can build the image here and
 get the same bytes we do.
 
 ## Build
@@ -70,3 +71,42 @@ Building and running this image is use. **Distributing** the built image is
 distribution of that extension and carries the corresponding obligation —
 unmodified, that is an offer of the upstream source, which the link above
 satisfies.
+
+## Bounded search and exact fallback
+
+The VChord reader widens finite candidate budgets up to 65,535. A short page is
+not proof that all matches were visited: growing segments and invisible index
+entries can consume that budget. Exact fallback remains available only when a
+bounded cardinality probe finds at most 10,000 non-NULL vectors. Index-led `-1`
+checks the global corpus, since the extension may scan it before filtering;
+materialized ranking checks its vault/source scope. Planner estimates alone do
+not authorize exact work. Operator-configured `-1` and oversized top-k requests
+use the same guard.
+
+Finite index queries, selectivity lookup and exact queries retain the existing
+caller and database-pool timeouts. This path does not install a shorter wall
+clock or statement timeout: a query that takes longer than five seconds can
+still finish within the caller's budget. Caller cancellation and server timeout
+still roll back local plan, candidate-budget and search-path settings.
+
+When the exact row cap refuses completion, the driver retains already fetched,
+scoped finite sparse candidates and waits for the independent dense leg. It
+fuses and fetches the surviving hits, then carries them in `VectorSearchDegraded`
+with reason `sparse_search_budget_exceeded`. The search service passes these hits
+through its normal hydration/filtering and returns `degraded: true` with that
+reason. A sparse-only request can retain finite hits too; if neither leg has
+usable hits, the response is explicitly degraded and empty. Size refusal does
+not masquerade as a complete result or discard a successful dense leg. Genuine
+store/payload failures and caller cancellation keep their existing behavior.
+
+The 10,000-row threshold is a conservative exact-work safeguard, not a relevance
+or latency acceptance target. A broad underfilled query can still be incomplete;
+validate that tradeoff before deploying VChord. Preserving hits does not prove
+exact top-k completeness for that request.
+
+Run `test_vchord_candidate_budget_postgres.py` against the pinned extension to
+exercise candidate widening, scoped exact ranking, global fallback refusal and
+connection recovery. Hybrid/service regressions cover retained dense and sparse
+hits, both leg completion orders, ACL filters, and explicit degradation accounting.
+The test DSN must identify an isolated PostgreSQL instance;
+the tests create disposable databases.
