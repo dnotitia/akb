@@ -31,6 +31,10 @@ Subcommands:
     repair-resource-hashes      Backfill document/file content-hash projections.
     initialize-postgres-native  Claim and initialize a never-used PostgreSQL
                                 database for the stable Native backend.
+    prepare-native-config       Prepare fresh-install Native YAML offline;
+                                database initialization is a separate step.
+    preserve-revision-config    Pin omitted legacy selection for an upgrade,
+                                preserving explicit revision configuration.
 """
 
 from __future__ import annotations
@@ -132,6 +136,42 @@ def _generate_local_session_keyset(args: list[str]) -> int:
         )
     except LocalSessionKeyConfigurationError as exc:
         print(f"local_session_keyset_failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+def _prepare_revision_config(args: list[str], *, native: bool) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    options = ("source", "secret", "output") + (("tenant-id", "namespace", "image-digest") if native else ())
+    command = "prepare-native-config" if native else "preserve-revision-config"
+    for option in options:
+        parser.add_argument(f"--{option}", required=True)
+    try:
+        parsed = parser.parse_args(args)
+    except _CLIUsageError:
+        print(
+            f"Usage: python -m app.cli {command} --source PATH --secret PATH --output PATH"
+            + (
+                " --tenant-id ID --namespace DNS1123 --image-digest sha256:<64 lowercase hex>\n"
+                "Image digest records the initial persisted receipt; retain it across workload image upgrades."
+                if native else ""
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    from app.services.revision_install_config import (
+        NativeInstallConfigError,
+        prepare_native_config,
+        preserve_revision_config,
+    )
+
+    try:
+        prepare = prepare_native_config if native else preserve_revision_config
+        report = prepare(**vars(parsed))
+    except NativeInstallConfigError as exc:
+        print(f"revision_config_preparation_failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(report, sort_keys=True))
     return 0
@@ -939,6 +979,9 @@ async def _bridge_body_backfill(args: list[str]) -> int:
                 except ValueError:
                     print(f"{arg} must be an integer", file=sys.stderr)
                     return 2
+                if value <= 0:
+                    print(f"{arg} must be positive", file=sys.stderr)
+                    return 2
                 if arg == "--limit":
                     limit = value
                 else:
@@ -955,7 +998,7 @@ async def _bridge_body_backfill(args: list[str]) -> int:
     try:
         if verify:
             checked = await verify_bridge_bodies(
-                vault=vault, limit=limit or 100_000_000, batch_size=batch_size
+                vault=vault, limit=100_000_000 if limit is None else limit, batch_size=batch_size
             )
             print(json.dumps(checked.to_dict(), sort_keys=True))
             if not checked.complete:
@@ -967,7 +1010,7 @@ async def _bridge_body_backfill(args: list[str]) -> int:
             # one result that must not be exited over quietly.
             return 0 if checked.ok else 1
         report = await backfill_bridge_bodies(
-            vault=vault, limit=limit or 1000, batch_size=batch_size, dry_run=dry_run
+            vault=vault, limit=1000 if limit is None else limit, batch_size=batch_size, dry_run=dry_run
         )
     except ValidationError as error:
         print(f"bridge_body_backfill_failed: {error}", file=sys.stderr)
@@ -1057,7 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
             "issue-recovery-admin-credential, "
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
-            "initialize-postgres-native, migrate-revision-backend, "
+            "prepare-native-config, preserve-revision-config, initialize-postgres-native, migrate-revision-backend, "
             "bridge-body-backfill, native-asset-refs-backfill, "
             "okf-validate <dir>, "
             "okf-export --from-git <worktree> --vault <name> --out <dir>",
@@ -1065,6 +1108,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     cmd = argv[0]
+    if cmd == "prepare-native-config":
+        return _prepare_revision_config(argv[1:], native=True)
+    if cmd == "preserve-revision-config":
+        return _prepare_revision_config(argv[1:], native=False)
     if cmd == "generate-local-session-keyset":
         return _generate_local_session_keyset(argv[1:])
     if cmd == "provision-recovery-admin":

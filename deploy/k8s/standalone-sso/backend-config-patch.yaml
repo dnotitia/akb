@@ -5,6 +5,8 @@ metadata:
   namespace: akb
 data:
   app.yaml: |
+    # Preserve the existing-install backend independently of future defaults.
+    document_revision_backend: bare_git
     db_host: postgres
     db_port: 5432
     db_name: akb

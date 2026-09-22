@@ -327,6 +327,8 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_encoding_contract_postgres.py
+            tests/test_vchord_external_stats_postgres.py
             tests/test_bm25_run_lock.py
           )
           # A truncated list is the failure this step has already had

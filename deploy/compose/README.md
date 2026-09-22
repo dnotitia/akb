@@ -65,3 +65,11 @@ No data is migrated or deleted automatically. Do not use `down -v`.
 The Keycloak and Qdrant overlays remain optional. Keycloak still requires the
 SSO settings and persistent session encryption key documented in its overlay;
 merely starting a Keycloak container does not enable SSO.
+
+## Opt-in PostgreSQL Native
+
+Fresh Native installations can use `docker-compose.native.yaml` with a pinned
+backend image, persistent generated identity, and a bootstrap dependency before
+API/worker startup. See [Native installation and configuration upgrades](../../docs/operations/native-installation.md).
+Existing databases still require the explicit cutover procedure; this overlay
+does not migrate them.

@@ -364,18 +364,11 @@ def start_workers(*, include_api_local: bool = True) -> None:
     # other drivers / separate-instance / fully-backfilled corpora.
     vault_backfill.start()
     queue_rescuer.start()
-    # BM25 corpus stats (total_docs, avgdl, per-term df) only become
-    # non-degenerate after `recompute_stats()` runs. The refresher fires
-    # once at startup and then on a configurable cadence so the sparse
-    # leg of hybrid search isn't silently degraded on fresh installs or
-    # after long periods without manual init.
-    # Dedicated Kiwi tokenizer process pool. Kiwi's native tokenize() holds the
-    # GIL, so asyncio.to_thread can't parallelize it and concurrent tokenization
-    # (search + this corpus-wide stats refresher + embed_worker) starves the
-    # event loop → probe timeouts → 503. Run it off-process. Start it BEFORE the
-    # stats refresher, which tokenizes the whole corpus on first tick. (Serving
-    # also depends on it — move to the always-run path if API/worker tiers split.)
-    sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
+    # External N/avgdl/df serve posting, pre-baked drivers, SeahorseDB and
+    # retained rollback paths. VChord itself owns its index statistics.
+    stats_required = bool(settings.bm25_external_stats_consumers)
+    if stats_required:
+        sparse_encoder.start_stats_refresher(settings.bm25_recompute_interval_secs)
     # Dedicated git-commit executor (write-lane, command-lane round-05).
     # Git mutations run here so blocked/slow commits can never crowd git
     # READS out of asyncio.to_thread's shared default executor.
@@ -385,10 +378,11 @@ def start_workers(*, include_api_local: bool = True) -> None:
         "embed_worker",
         "delete_worker",
         "app_rollout_worker",
-        "bm25_stats_refresher",
         "vault_backfill",
         "queue_rescuer",
     ]
+    if stats_required:
+        started.append("bm25_stats_refresher")
     if bare_git_selected and settings.external_git_enabled:
         started.append("external_git_poller")
     if m1_file_transfer_reaper.enabled():

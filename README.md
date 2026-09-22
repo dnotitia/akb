@@ -458,6 +458,9 @@ private/JWKS pair is the rollback; never overwrite key files in place.
 
 ### Vector store (driver-pluggable)
 
+See [BM25 statistics and VChord-only deployments](docs/vector-store-bm25-statistics.md)
+for weight conventions, external statistics consumers and posting rollback requirements.
+
 Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
 interface. Five drivers ship; pick at config time:
 
