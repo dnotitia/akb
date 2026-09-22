@@ -236,6 +236,7 @@ def fixture_settings(port: int, *, allow_http: bool = True, **overrides) -> Sett
     """Settings that admit the fixture host on its ephemeral port via a full
     (host, CIDR, port) allowlist pin — everything else stays fail-closed."""
     kw = dict(
+        document_revision_backend="bare_git",
         external_git_allow_http=allow_http,
         external_git_host_allowlist=[
             {

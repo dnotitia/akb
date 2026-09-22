@@ -1,3 +1,31 @@
+# Pending release: Native installation default
+
+Breaking configuration-default change (not yet released): Settings and the
+recommended Compose/Kubernetes fresh-install paths select PostgreSQL Native.
+Before upgrading, run `preserve-revision-config` against the active app/secret
+pair and install the reviewed output. It pins previously omitted selectors to
+Bare Git without touching the database. Do not copy the fresh template over
+existing configuration or attach the Native overlay to a used Git database.
+
+Fresh installations must generate and persist identity with
+`prepare-native-config`, then explicitly bootstrap a never-used database.
+Keep the initialization image receipt while changing the workload image.
+Authority/identity mismatches fail closed. Helm, all-in-one, standalone SSO
+and Git-oriented CI remain explicit legacy Bare Git paths. Historical
+migration/history/diff/activity compatibility is retained.
+
+Two smaller breaks ride along. `deploy/k8s/deploy.sh` no longer defaults to
+`AKB_PROFILE=standalone`: it exits 2 before any cluster access, so an
+invocation that relied on the implicit profile must now name it. And
+`config/app.yaml.example` is a new-install Native template whose identity
+fields are deliberately empty, so copying it is no longer a runnable
+configuration — `CONTRIBUTING.md` pins `bare_git` for a development stack, and
+`prepare-native-config` generates the identity for a real one.
+
+See [installation and upgrade order](../docs/operations/native-installation.md).
+Publish this change only with an explicitly announced default-change release;
+this entry does not bump a version, publish an artifact or authorize rollout.
+
 # AKB Backend — Changelog
 
 The AKB backend ships as a Docker image and as the HTTP layer behind

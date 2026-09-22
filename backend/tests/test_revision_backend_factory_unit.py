@@ -14,7 +14,7 @@ from app.services.document_service import DocumentService
 
 
 def _settings(tmp_path, **overrides) -> Settings:
-    return Settings(git_storage_path=str(tmp_path), **overrides)
+    return Settings(git_storage_path=str(tmp_path), **{"document_revision_backend": "bare_git", **overrides})
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +37,7 @@ def reset_revision_backend():
         mcp_package.__dict__.pop("server", None)
 
 
-def test_default_backend_is_legacy_document_service_once_per_process(monkeypatch, tmp_path):
+def test_explicit_legacy_backend_is_document_service_once_per_process(monkeypatch, tmp_path):
     from app.services import revision_backend
     from app.services import git_service
 

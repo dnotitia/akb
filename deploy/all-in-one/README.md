@@ -13,6 +13,12 @@ It deliberately does not run Keycloak inside the application container. Use
 `deploy/helm/akb` for a Kubernetes installation whose application, database,
 and optional SSO components remain isolated as separate workloads.
 
+This demo explicitly retains `document_revision_backend: bare_git`, including
+on restarts and upgrades. Its generated configuration rejects a backend switch
+through partial overrides: it does not bootstrap a PostgreSQL Native authority.
+Use the recommended Compose or generic Kubernetes installation for a new Native
+deployment.
+
 ## Quick start (pre-built image)
 
 ```bash

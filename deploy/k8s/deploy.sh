@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/../.."
 NAMESPACE="${NAMESPACE:-akb}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
-AKB_PROFILE="${AKB_PROFILE:-standalone}"
+AKB_PROFILE="${AKB_PROFILE:-}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 IMAGE_PLATFORM="${IMAGE_PLATFORM:-linux/amd64}"
 
@@ -21,7 +21,8 @@ case "${AKB_PROFILE}" in
     PROFILE_DIR="${SCRIPT_DIR}/standalone-sso"
     ;;
   *)
-    echo "AKB_PROFILE must be standalone or standalone-sso" >&2
+    echo "AKB_PROFILE must be standalone or standalone-sso for an explicit legacy Bare Git deployment." >&2
+    echo "New Native installs: prepare persistent identity and use deploy/k8s/native as documented in docs/operations/native-installation.md." >&2
     exit 2
     ;;
 esac

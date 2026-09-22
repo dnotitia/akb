@@ -87,6 +87,7 @@ def render(defaults: Path, overrides: Path, output: Path, env: dict[str, str]) -
             "db_name",
             "db_user",
             "git_storage_path",
+            "document_revision_backend",
             "auth_mode",
             "jwt_algorithm",
             "local_session_private_key_path",
@@ -110,6 +111,8 @@ def render(defaults: Path, overrides: Path, output: Path, env: dict[str, str]) -
             continue
         values = load_mapping(path)
         for key, value in values.items():
+            if key == "document_revision_backend" and value in ("bare_git", "bare_git_current"):
+                continue
             if key in fixed and value != fixed[key]:
                 raise ValueError(f"{key} is owned by the demo bootstrap")
         target.update(values)

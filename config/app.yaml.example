@@ -1,5 +1,8 @@
 # AKB application config — non-sensitive settings.
-# Copy this file to `app.yaml` and adjust as needed.
+# New installations: generate app.yaml with prepare-native-config, then run
+# explicit initialize-postgres-native bootstrap. Do not copy and start directly.
+# See docs/operations/native-installation.md. Existing installations must use
+# preserve-revision-config before upgrading; this template is not an upgrade.
 #
 # Lookup order (first hit wins): ./config/app.yaml, /etc/akb/app.yaml.
 
@@ -24,18 +27,19 @@ worker_shutdown_timeout_secs: 35
 git_storage_path: /data/vaults
 
 # === Document revision backend ===
-# The stable choices are bare_git (default) and postgres_native. The Native
-# choice is only valid after an operator runs `python -m app.cli
-# initialize-postgres-native` against a never-used AKB database. It does not
-# convert an existing Bare Git tenant. The deployment must supply a stable
-# tenant/namespace identity, a provisioned database UUID, and this image's OCI
-# digest. `bare_git_current` remains an alias. `native_ledger_m1` remains a
-# deprecated, dedicated-database measurement alias for historical receipts.
-document_revision_backend: bare_git  # bare_git | postgres_native
-# document_revision_tenant_id: tenant-example
-# document_revision_namespace: tenant-example
-# document_revision_database_id: 11111111-1111-4111-8111-111111111111
-# document_revision_runtime_image_digest: sha256:<64 lowercase hex>
+# postgres_native is the new-install default. Generate and persist identity once
+# with prepare-native-config, then bootstrap a never-used database explicitly.
+# Restart, Pod replacement, and workload image upgrades reuse that same config.
+# document_revision_runtime_image_digest is the INITIAL bootstrap image receipt;
+# it is not the currently deployed workload image digest. Never rewrite it on upgrade.
+# Existing Bare Git databases are not converted: preserve their explicit bare_git
+# selector. bare_git_current and guarded native_ledger_m1 remain legacy aliases.
+document_revision_backend: postgres_native  # postgres_native | bare_git
+# Empty placeholders are deliberate; preparation generates a unique database UUID.
+document_revision_tenant_id: ""
+document_revision_namespace: ""
+document_revision_database_id: null
+document_revision_runtime_image_digest: ""
 native_revision_m1_measurement_only: false
 # Historical M1 runs also set document_revision_backend: native_ledger_m1,
 # native_revision_m1_measurement_only: true, and db_name: akb_revision_m1_measurement.

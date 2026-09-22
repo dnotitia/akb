@@ -45,6 +45,12 @@ from app.services.external_git_validation import (
 )
 from tests.extgit_http import build_runner
 
+
+def _legacy_settings(**overrides) -> Settings:
+    """This suite exercises the explicitly selected Bare Git capability."""
+    return Settings(**{"document_revision_backend": "bare_git", **overrides})
+
+
 GIT = shutil.which("git") or "git"
 
 _COMMIT_ENV = {
@@ -105,7 +111,7 @@ def test_base_env_is_built_from_scratch_and_seals_ambient(monkeypatch):
     for k, v in ambient_vars.items():
         monkeypatch.setenv(k, v)
 
-    env = ExternalGitRunner(settings=Settings(external_git_allow_http=False))._base_env()
+    env = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))._base_env()
 
     # Forbidden vars are simply absent (built from scratch, not copied).
     for k in (
@@ -133,15 +139,15 @@ def test_base_env_is_built_from_scratch_and_seals_ambient(monkeypatch):
 
 
 def test_base_env_allows_http_only_when_opted_in():
-    on = ExternalGitRunner(settings=Settings(external_git_allow_http=True))._base_env()
-    off = ExternalGitRunner(settings=Settings(external_git_allow_http=False))._base_env()
+    on = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=True))._base_env()
+    off = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))._base_env()
     assert on["GIT_ALLOW_PROTOCOL"] == "http:https"
     assert off["GIT_ALLOW_PROTOCOL"] == "https"
 
 
 # ══ 1. Pure unit: global-arg ordering + DNS pin ══════════════════════
 def test_net_global_args_reset_precedes_credential_and_pins_dns():
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=False))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))
     url = "https://h.example/x.git"
     args = r._net_global_args(
         url, "h.example", 443, ("1.2.3.4", "2606:4700::1111"), has_cred=True
@@ -166,7 +172,7 @@ def test_net_global_args_reset_precedes_credential_and_pins_dns():
 
 
 def test_net_global_args_http_opt_in_adds_http_allow():
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=True))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=True))
     args = r._net_global_args(
         "http://h/x.git", "h", 80, ("1.2.3.4",), has_cred=False
     )
@@ -271,7 +277,7 @@ def test_ls_remote_argv_url_after_dashdash(monkeypatch):
 def test_non_https_transport_scheme_rejected(tmp_path):
     """The sealed GIT_ALLOW_PROTOCOL=https must refuse a non-https
     transport and run nothing."""
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=False))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))
     marker = tmp_path / "PWNED"
     with pytest.raises(ExternalGitCommandError) as exc:
         r._exec(
@@ -284,7 +290,7 @@ def test_non_https_transport_scheme_rejected(tmp_path):
 
 
 def test_file_scheme_rejected(tmp_path):
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=False))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))
     with pytest.raises(ExternalGitCommandError) as exc:
         r._exec(["ls-remote", "--", "file:///etc", "main"], cwd=str(tmp_path), timeout=30)
     assert "not allowed" in str(exc.value)
@@ -406,7 +412,7 @@ def test_clean_clone_has_no_structure_findings(git_http, tmp_path):
 def test_structure_flags_config_redirection(tmp_path, snippet, needle):
     bare = _init_bare(tmp_path)
     _append_config(bare, snippet)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git")
     assert any(needle.lower() in f.lower() for f in findings), findings
 
@@ -414,7 +420,7 @@ def test_structure_flags_config_redirection(tmp_path, snippet, needle):
 def test_structure_flags_origin_url_mismatch(tmp_path):
     bare = _init_bare(tmp_path)
     _append_config(bare, '\n[remote "origin"]\n\turl = https://attacker.example/x.git\n')
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git")
     assert any("origin" in f.lower() for f in findings), findings
 
@@ -422,7 +428,7 @@ def test_structure_flags_origin_url_mismatch(tmp_path):
 def test_structure_origin_url_match_is_clean(tmp_path):
     bare = _init_bare(tmp_path)
     _append_config(bare, '\n[remote "origin"]\n\turl = https://good.example/x.git\n')
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.inspect_structure(bare, "https://good.example/x.git") == []
 
 
@@ -441,7 +447,7 @@ def test_structure_flags_ondisk_redirection_files(tmp_path, rel, body, needle):
     p = bare / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare)
     assert any(needle in f.lower() for f in findings), findings
 
@@ -454,7 +460,7 @@ def test_structure_flags_replace_ref(tmp_path):
         [GIT, f"--git-dir={bare}", "replace", "-f", c1, c2],
         check=True, capture_output=True, env={**os.environ, **_COMMIT_ENV},
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert any("replace" in f.lower() for f in r.inspect_structure(bare))
 
 
@@ -477,7 +483,7 @@ def test_git_no_replace_objects_neutralizes_object_substitution(tmp_path):
     ).stdout
     assert vanilla == "EVIL\n"
     # The runner reads the ORIGINAL object — replacement is neutralized.
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.cat_blob(bare, blob_a) == b"ORIGINAL\n"
 
 
@@ -492,7 +498,7 @@ def test_blob_size_and_path_size_are_bounded_reads(tmp_path):
     nbytes = len(content.encode())
     commit = _make_commit(bare, "a.md", content)
     blob = _git_dir(bare, "rev-parse", f"{commit}:a.md")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
 
     assert r.blob_size(bare, blob) == nbytes
     assert r.path_size(bare, commit, "a.md") == nbytes  # <rev>:<path> sizing
@@ -532,7 +538,7 @@ def test_repo_local_hook_does_not_run(tmp_path):
 
     # The runner's update-ref must NOT run it.
     hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     r.update_ref(bare, "refs/heads/viarunner", commit)
     assert not marker.exists()
 
@@ -543,7 +549,7 @@ def test_update_ref_rejects_unsafe_ref_argument(tmp_path):
     merely reliant on --end-of-options."""
     bare = _init_bare(tmp_path)
     commit = _make_commit(bare, "a.md", "x\n")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     for bad in ("--upload-pack=evil", "refs/heads/x~1", "refs/heads/x y", "-d"):
         with pytest.raises(ExternalGitPolicyError):
             r.update_ref(bare, bad, commit)
@@ -556,7 +562,7 @@ def test_update_ref_rejects_unsafe_ref_argument(tmp_path):
 
 # ══ Secondary-HTTP narrowing at the git-config layer ══
 def test_net_args_reset_curlopt_and_bundleuri_before_pin():
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=False))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))
     url = "https://h.example/x.git"
     args = r._net_global_args(url, "h.example", 443, ("1.2.3.4",), has_cred=False)
     # curloptResolve is multi-valued: the empty-value RESET must precede our pin
@@ -614,7 +620,7 @@ def test_clone_and_fetch_argv_carry_no_tags(monkeypatch):
 def test_structure_default_deny_flags(tmp_path, snippet, needle):
     bare = _init_bare(tmp_path)
     _append_config(bare, snippet)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any(needle in f.lower() for f in findings), findings
 
@@ -629,7 +635,7 @@ def test_structure_findings_are_value_less(tmp_path):
         "\turl = https://evil.example/x.git\n"
         "\tproxy = http://SECRETPROXY:9\n",
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert findings  # flagged
     blob = " ".join(findings)
@@ -643,7 +649,7 @@ def test_structure_origin_fetch_refspec_mismatch_flagged(tmp_path):
         '\n[remote "origin"]\n\turl = https://good.example/x.git\n'
         "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("fetch refspec" in f.lower() for f in findings), findings
 
@@ -659,7 +665,7 @@ def test_structure_origin_fetch_refspec_exact_match_is_clean(tmp_path):
         '\n[remote "origin"]\n\turl = https://good.example/x.git\n'
         "\tfetch = +refs/heads/main:refs/heads/main\n",
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.inspect_structure(bare, "https://good.example/x.git", "main") == []
 
 
@@ -694,7 +700,7 @@ def test_structure_origin_fetch_refspec_exact_match_is_clean(tmp_path):
 def test_structure_value_and_required_structure_default_deny(tmp_path, snippet, needle):
     bare = _init_bare(tmp_path)
     _append_config(bare, snippet)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any(needle in f.lower() for f in findings), findings
 
@@ -704,7 +710,7 @@ def test_structure_flags_missing_origin(tmp_path):
     finding in its own right (Finding #2). `git init --bare` writes a
     [core] section but no remote, which is exactly that shape."""
     bare = _init_bare(tmp_path)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("missing remote.origin" in f.lower() for f in findings), findings
 
@@ -727,7 +733,7 @@ def test_structure_clean_config_with_platform_booleans_is_clean(tmp_path):
         "\turl = https://good.example/x.git\n"
         "\ttagOpt = --no-tags\n"
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.inspect_structure(bare, "https://good.example/x.git", "main") == []
 
 
@@ -741,7 +747,7 @@ def test_structure_finding_never_echoes_secret_in_config_key(tmp_path):
         "\n[http]\n\thttps://user:SECRETMARKER123@evil.example/x = 1\n"  # pragma: allowlist secret
         "\n[core]\n\tSECRETMARKER456 = /tmp/evil\n",
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert findings  # flagged
     blob = " ".join(findings).lower()
@@ -758,7 +764,7 @@ def test_structure_flags_symlink_config(tmp_path):
     target = tmp_path / "elsewhere_config"
     target.write_text(real)
     cfg.symlink_to(target)
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("symlink" in f.lower() for f in findings), findings
 
@@ -767,7 +773,7 @@ def test_structure_flags_oversized_config(tmp_path, monkeypatch):
     bare = _init_bare(tmp_path)
     monkeypatch.setattr(egr, "_MAX_CONFIG_BYTES", 64)
     _append_config(bare, "\n; " + "x" * 400 + "\n")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare)
     assert any("size cap" in f.lower() for f in findings), findings
 
@@ -780,7 +786,7 @@ def test_structure_flags_dumb_http_alternate(tmp_path):
     p = bare / "objects" / "info" / "http-alternates"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("http://169.254.169.254/latest/\n")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare)
     assert any("http-alternates" in f.lower() for f in findings), findings
 
@@ -880,7 +886,7 @@ def test_structure_flags_absent_config_file(tmp_path):
     hole — inspect_structure returned [] on a missing config file)."""
     bare = _init_bare(tmp_path)
     (bare / "config").unlink()
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("empty or absent" in f for f in findings), findings
 
@@ -888,7 +894,7 @@ def test_structure_flags_absent_config_file(tmp_path):
 def test_structure_flags_blank_config_file(tmp_path):
     bare = _init_bare(tmp_path)
     (bare / "config").write_text("")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("empty or absent" in f for f in findings), findings
 
@@ -897,7 +903,7 @@ def test_structure_absent_bare_dir_stays_clone_signal(tmp_path):
     """A wholly-absent bare dir is the caller's "clone, don't fetch" signal and
     must remain [] — the missing-config finding is scoped to a bare that exists
     but has no/blank config, not to a repo that was never cloned."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.inspect_structure(tmp_path / "never.git", "https://good.example/x.git") == []
 
 
@@ -931,7 +937,7 @@ def test_structure_absent_bare_dir_stays_clone_signal(tmp_path):
 def test_structure_flags_missing_or_duplicate_required_on_disk(tmp_path, cfg_body, needle):
     bare = _init_bare(tmp_path)
     (bare / "config").write_text(cfg_body.format(url="https://good.example/x.git"))
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any(needle in f for f in findings), findings
 
@@ -943,7 +949,7 @@ def test_structure_empirical_clone_config_on_disk_is_clean(tmp_path):
     (bare / "config").write_text(
         _EMPIRICAL_CLEAN_CLONE_CONFIG.format(url="https://good.example/x.git")
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.inspect_structure(bare, "https://good.example/x.git", "main") == []
 
 
@@ -957,7 +963,7 @@ def test_missing_and_duplicate_findings_are_value_less(tmp_path):
         "\turl = https://good.example/x.git\n"
         "\turl = https://x-access-token:SEKRIT999@evil.example/x.git\n"  # pragma: allowlist secret
     )
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     findings = r.inspect_structure(bare, "https://good.example/x.git", "main")
     assert any("duplicate remote.origin.url" in f for f in findings), findings
     blob = " ".join(findings)
@@ -1046,7 +1052,7 @@ def test_sanitize_strips_real_userinfo_but_keeps_query_at():
 def test_git_allow_protocol_is_authoritative_over_config(tmp_path):
     """A `-c protocol.ext.allow=always` (or a GIT_CONFIG_* override) must NOT
     re-enable ext:: — the sealed env GIT_ALLOW_PROTOCOL=https wins over config."""
-    r = ExternalGitRunner(settings=Settings(external_git_allow_http=False))
+    r = ExternalGitRunner(settings=_legacy_settings(external_git_allow_http=False))
     marker = tmp_path / "PWNED"
     with pytest.raises(ExternalGitCommandError) as exc:
         r._exec(
@@ -1213,7 +1219,7 @@ def test_path_size_propagates_non_missing_error(tmp_path, monkeypatch):
     oversized, proceed to materialize'."""
     bare = _init_bare(tmp_path)
     commit = _make_commit(bare, "a.md", "hi\n")
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     assert r.path_size(bare, commit, "nope.md") is None  # missing path → None
 
     def _boom(*a, **k):
@@ -1229,7 +1235,7 @@ def test_timeout_kills_process_group_and_reaps(tmp_path):
     """A wedged child + its BACKGROUND descendant are both killed by killpg on
     timeout (start_new_session groups them); the descendant never runs to its
     delayed side effect, and _exec returns promptly (no 30s hang)."""
-    r = ExternalGitRunner(settings=Settings(), git_binary="/bin/sh")
+    r = ExternalGitRunner(settings=_legacy_settings(), git_binary="/bin/sh")
     desc_marker = tmp_path / "DESCENDANT_RAN"
     # Backgrounded descendant would touch the marker at +2s; parent waits 30s.
     script = f"(sleep 2; touch '{desc_marker}') & sleep 30"
@@ -1250,7 +1256,7 @@ def test_resolve_blob_oid_typed_ls_tree_classification(tmp_path, monkeypatch):
     (surfaced as ``_local`` raising) → PROPAGATE, never masked as 'missing' —
     which ``path_size`` and its diff caller would misread as 'not oversized,
     proceed to materialize'."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     bare = _init_bare(tmp_path)
     commit = "c" * 40
     blob = "a" * 40
@@ -1289,7 +1295,7 @@ def test_resolve_blob_oid_propagates_commit_resolution_failure(tmp_path, monkeyp
     """Step 1 (``rev-parse <rev>^{commit}``) is fail-closed: a missing / corrupt /
     unknown commit fails HERE and PROPAGATES rather than being mistaken for an
     absent path (MAJOR, fix-4)."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     bare = _init_bare(tmp_path)
 
     def _boom(b, rev):
@@ -1322,7 +1328,7 @@ def test_path_size_propagates_resolve_step_failure(tmp_path, monkeypatch):
     """``path_size`` propagates a real failure at the RESOLVE step too (not only
     the size step that ``test_path_size_propagates_non_missing_error`` covers): a
     commit that fails to resolve is not masked as 'absent' (MAJOR, fix-4)."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     bare = _init_bare(tmp_path)
 
     def _boom(b, rev):
@@ -1369,7 +1375,7 @@ def test_resolve_blob_oid_fails_closed_on_corrupt_object_store(tmp_path):
     path' (None) — otherwise the oversized diff gate reads it as 'image absent'
     and could bypass the per-image blob cap on I/O recovery. A genuinely-absent
     path at a healthy commit still returns None. Never touches a real repo/.git."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
 
     # Baseline: a healthy loose-object bare — present path → oid, absent → None.
     healthy = _init_bare(tmp_path, "healthy.git")
@@ -1415,7 +1421,7 @@ def test_capped_reader_single_deadline_after_eof(tmp_path):
     """After stdout+stderr reach EOF, a child that lingers before exiting cannot
     stretch the wall clock past the ORIGINAL timeout: the capped reader waits for
     exit under ONE deadline, not the old fixed +5s post-EOF wait."""
-    r = ExternalGitRunner(settings=Settings(), git_binary="/bin/sh")
+    r = ExternalGitRunner(settings=_legacy_settings(), git_binary="/bin/sh")
     # Emit a little stdout, CLOSE both std streams, then sleep well past the
     # deadline. The reader must abort at ~0.5s, not the old ~5s post-EOF overshoot.
     script = "printf hi; exec 1>&- 2>&-; sleep 30"
@@ -1432,7 +1438,7 @@ def test_capped_reader_cap_abort_kills_process_group(tmp_path):
     """Exceeding ``max_output_bytes`` SIGKILLs the whole process GROUP (not just
     the direct child) and reaps it: a backgrounded descendant never runs to its
     delayed side effect, so no orphan/zombie survives the cap abort."""
-    r = ExternalGitRunner(settings=Settings(), git_binary="/bin/sh")
+    r = ExternalGitRunner(settings=_legacy_settings(), git_binary="/bin/sh")
     marker = tmp_path / "DESC_RAN"
     # Descendant touches the marker at +2s; the parent floods stdout so the 4 KiB
     # cap trips at once and must killpg the group before the descendant's touch.
@@ -1448,7 +1454,7 @@ def test_capped_reader_selector_failure_kills_reaps_and_closes(tmp_path, monkeyp
     OSError from ``select``), the capped reader's whole-body ``try/finally`` still
     SIGKILLs the process group, reaps the child, and CLOSES both pipe FDs — no
     orphan / zombie / leaked descriptor survives a selector fault."""
-    r = ExternalGitRunner(settings=Settings())
+    r = ExternalGitRunner(settings=_legacy_settings())
     proc = subprocess.Popen(
         ["/bin/sh", "-c", "sleep 30"],
         stdin=subprocess.DEVNULL,

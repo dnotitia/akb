@@ -12,13 +12,11 @@
 #   (vector_store_driver: seahorse, plus tenant_uuid/table) and
 #   config/secret.yaml (seahorse_token).
 #
-# Usage:
-#   1. cp config/app.yaml.example config/app.yaml
-#   2. cp config/secret.yaml.example config/secret.yaml
-#      (replace system_hmac_secret; embeddings are optional)
-#   3. Generate config/local-session keys as described in README.md.
-#   4. docker compose up
-#   5. Provision the administrator and open http://localhost:3000.
+# Fresh Native installs: follow README.md to generate persistent identity,
+# then use -f docker-compose.yaml -f docker-compose.native.yaml.
+# This base remains reusable by explicit Bare Git installations. Preserve
+# the active revision selector before upgrades; never replace existing config
+# with a fresh template or attach the Native overlay to a used Git database.
 #
 # The Postgres password is hard-coded to `akb` here for local-dev
 # convenience and must match `db_password` in config/secret.yaml.

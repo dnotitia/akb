@@ -37,10 +37,17 @@ Dnotitia, Inc. and are not covered by the software license. See
 
 ## Development Setup
 
+`config/app.yaml.example` is a **new-install Native template**: its identity
+fields are deliberately empty, so a straight copy does not start — Settings
+refuses it before the API boots. The endpoint and shell E2E suites exercise the
+Bare Git contract (see `backend/tests/conftest.py` and
+`scripts/ci/e2e_runtime.py`), so a development stack pins the same selector:
+
 ```bash
 # 1. Configure
 cp config/app.yaml.example   config/app.yaml
 cp config/secret.yaml.example config/secret.yaml
+sed -i 's/^document_revision_backend: .*/document_revision_backend: bare_git/' config/app.yaml
 $EDITOR config/secret.yaml   # at minimum, set embed_api_key
 
 # 2. Run the stack
@@ -49,6 +56,11 @@ docker compose up -d
 # 3. Tail backend logs
 docker compose logs -f backend
 ```
+
+To develop against PostgreSQL Native instead, follow the
+[root README quickstart](./README.md#quick-start): prepare persistent identity
+with `prepare-native-config` and layer `docker-compose.native.yaml`. Never point
+that overlay at a Compose project whose database already holds Bare Git data.
 
 Backend code lives in `backend/app/`; the MCP server in `backend/mcp_server/`;
 the frontend in `frontend/`. The stdio MCP proxy that ships on npm lives

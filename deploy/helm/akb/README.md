@@ -12,6 +12,11 @@ install a cluster-scoped synchronization controller. It consumes existing
 Kubernetes Secrets described in the
 [`Kubernetes deployment guide`](../../k8s/README.md).
 
+Both profiles explicitly use `document_revision_backend: bare_git` and retain
+the persistent Git volume. They are legacy compatibility paths; this chart does
+not initialize a PostgreSQL Native authority. Use the recommended Compose or
+generic Kubernetes installation for a new Native deployment.
+
 ## Prerequisites
 
 - Kubernetes 1.29 or later

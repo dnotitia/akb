@@ -56,7 +56,7 @@ def test_the_setting_does_not_restate_the_members():
 
 def test_the_settings_model_refuses_an_unknown_shape():
     with pytest.raises(Exception):
-        Settings(vector_store_sparse_shape="no-such-shape")  # type: ignore[arg-type]
+        Settings(document_revision_backend="bare_git", vector_store_sparse_shape="no-such-shape")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("site", ["_do_ensure", "upsert_one", "_search_sparse"])

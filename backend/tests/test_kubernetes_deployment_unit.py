@@ -171,3 +171,17 @@ esac
     )
     assert result.returncode == 2
     assert "Secret/akb-secret is required" in result.stderr
+
+
+def test_deployer_requires_explicit_legacy_profile_before_any_cluster_access(tmp_path: Path):
+    marker = tmp_path / "cluster-access"
+    _write_executable(tmp_path / "kubectl", f"#!/bin/sh\ntouch '{marker}'\nexit 99\n")
+    env = {**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin"}
+    env.pop("AKB_PROFILE", None)
+    result = subprocess.run(
+        ["bash", str(_K8S / "deploy.sh")], capture_output=True, text=True,
+        env=env, timeout=10, check=False,
+    )
+    assert result.returncode == 2
+    assert "New Native installs" in result.stderr
+    assert not marker.exists()

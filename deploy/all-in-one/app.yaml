@@ -8,7 +8,8 @@ db_port: 5432
 db_name: akb
 db_user: akb
 
-# === Git storage ===
+# === Legacy Bare Git storage (demo compatibility) ===
+document_revision_backend: bare_git
 git_storage_path: /data/vaults
 tokenizer_processes: 2
 worker_shutdown_timeout_secs: 35

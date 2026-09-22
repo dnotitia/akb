@@ -100,6 +100,8 @@ def test_profiles_render_one_coherent_application_stack(
 
     config = _one(resources, "ConfigMap", "akb-app-config")
     app = yaml.safe_load(config["data"]["app.yaml"])
+    assert app["document_revision_backend"] == "bare_git"
+    assert app["git_storage_path"] == "/data/vaults"
     assert app["auth_mode"] == ("sso" if wants_sso else "local")
     if wants_sso:
         assert app["keycloak_internal_url"] == "http://keycloak:8080"

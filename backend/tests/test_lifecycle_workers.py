@@ -116,7 +116,7 @@ def test_native_cloud_storage_starts_cleanup_without_custom_endpoint(monkeypatch
     started = []
     _stub_workers(monkeypatch, lifecycle, started)
     configured = _settings(external_git_enabled=False)
-    cloud = Settings(s3_auth_mode="default_chain")
+    cloud = Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain")
     configured.object_storage_enabled = cloud.object_storage_enabled
     monkeypatch.setattr(lifecycle, "settings", configured)
     monkeypatch.setattr(lifecycle.s3_delete_worker, "start", lambda: started.append("s3_delete"))
