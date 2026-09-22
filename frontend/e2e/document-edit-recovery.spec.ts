@@ -126,6 +126,58 @@ test.describe("document edit recovery mock contract", () => {
     expect(state.document.content).toBe(editedMarkdown);
   });
 
+  test("tabs through editable task checkboxes and code regions without changing list structure", async ({
+    page,
+    request,
+  }) => {
+    const recovery = await fixture(request);
+    const markdown = [
+      "# Keyboard controls",
+      "",
+      "- [ ] TASK_PARENT_AKB330",
+      "  - [x] TASK_NESTED_AKB330",
+      "- [ ] TASK_POINTER_AKB330",
+      "",
+      "```text",
+      "keyboard_code_AKB330_".repeat(12),
+      "```",
+    ].join("\n");
+
+    await page.goto(recovery.identity!.start_url!);
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await source.fill(markdown);
+    await expect(page.getByText("Draft saved locally")).toBeVisible();
+    await page.getByRole("button", { name: "WYSIWYG", exact: true }).click();
+
+    const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
+    const parent = editor.getByRole("checkbox", { name: "Task item checkbox for TASK_PARENT_AKB330", exact: true });
+    const nested = editor.getByRole("checkbox", { name: "Task item checkbox for TASK_NESTED_AKB330", exact: true });
+    const pointer = editor.getByRole("checkbox", { name: "Task item checkbox for TASK_POINTER_AKB330", exact: true });
+    const code = editor.getByRole("region", { name: "Scrollable text code block", exact: true });
+
+    await expect(parent).toBeVisible();
+    await expect(code).toBeVisible();
+    await editor.focus();
+    await expect(editor).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(parent).toBeFocused();
+    await page.keyboard.press(" ");
+    await expect(parent).toBeChecked();
+    await expect(parent).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(nested).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(pointer).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(code).toBeFocused();
+
+    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await expect(source).toHaveValue(/- \[x\] TASK(?:\\)?_PARENT(?:\\)?_AKB330/);
+    await expect(source).toHaveValue(/- \[x\] TASK(?:\\)?_NESTED(?:\\)?_AKB330/);
+    await expect(source).toHaveValue(/- \[ \] TASK(?:\\)?_POINTER(?:\\)?_AKB330/);
+  });
+
   test("creates a Source draft and reopens the saved document", async ({ page, request }) => {
     const recovery = await fixture(request);
     const title = "Source created note";

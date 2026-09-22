@@ -145,7 +145,6 @@ describe("MarkdownEditor formatting toolbar", () => {
   });
 
   it("keeps nested task checkboxes independently editable through the shared surface", async () => {
-    const user = userEvent.setup();
     let latest = "";
     const onChange = vi.fn((markdown: string) => {
       latest = markdown;
@@ -170,8 +169,11 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(checkboxes[0]).not.toBeChecked();
     expect(checkboxes[1]).toBeChecked();
 
-    checkboxes[0].focus();
-    await user.keyboard(" ");
+    editor.focus();
+    fireEvent.keyDown(editor, { key: "Tab", code: "Tab", keyCode: 9 });
+    fireEvent.keyUp(editor, { key: "Tab", code: "Tab", keyCode: 9 });
+    expect(checkboxes[0]).toHaveFocus();
+    fireEvent.click(checkboxes[0]);
     await waitFor(() => expect(latest).toContain("- [x] Parent task"));
     expect(latest).toContain("- [x] Child task");
   });

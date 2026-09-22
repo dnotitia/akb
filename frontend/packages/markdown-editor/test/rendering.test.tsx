@@ -1,4 +1,4 @@
-import { cleanup, render, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -88,6 +88,25 @@ describe('Markdown block rendering', () => {
     await view.findByRole('checkbox', { name: /Parent task/i })
     expect(view.getAllByRole('checkbox')[0]).toBeChecked()
     expect(view.getAllByRole('checkbox')[1]).toBeChecked()
+  })
+
+  it('reaches embedded task and code controls through the editor Tab order', async () => {
+    const { container } = render(<MarkdownEditor markdown={MIXED_MARKDOWN} />)
+    const editor = await within(container).findByRole('textbox')
+    const parent = within(editor).getByRole('checkbox', { name: 'Task item checkbox for Parent task' })
+    const child = within(editor).getByRole('checkbox', { name: 'Task item checkbox for Child task' })
+    const code = within(editor).getByRole('region', { name: 'Scrollable typescript code block' })
+
+    editor.focus()
+    fireEvent.keyDown(editor, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    fireEvent.keyUp(editor, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    expect(parent).toHaveFocus()
+    fireEvent.keyDown(parent, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    fireEvent.keyUp(parent, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    expect(child).toHaveFocus()
+    fireEvent.keyDown(child, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    fireEvent.keyUp(child, { key: 'Tab', code: 'Tab', keyCode: 9 })
+    expect(code).toHaveFocus()
   })
 
   it('keeps task state unchanged in read-only mode', async () => {

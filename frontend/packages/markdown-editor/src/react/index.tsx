@@ -511,6 +511,14 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
   }
 }
 
+function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+    ),
+  )
+}
+
 export function MarkdownSurface({
   editor,
   editable,
@@ -757,6 +765,7 @@ export function MarkdownSurface({
         if (!checkbox) return
 
         checkbox.disabled = !editable
+        checkbox.tabIndex = editable ? 0 : -1
       })
     }
 
@@ -780,6 +789,114 @@ export function MarkdownSurface({
     return () => {
       editor.off('transaction', handleTransaction)
       if (delayedApply !== undefined) clearTimeout(delayedApply)
+    }
+  }, [editable, editor])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root || !editable) return
+
+    let pendingTabFocus: { kind: 'control'; index: number } | { kind: 'editor' } | null = null
+
+    const focusAfterTab = (index: number) => {
+      pendingTabFocus = { kind: 'control', index }
+      const control = markdownKeyboardControls(root)[index]
+      control?.focus()
+    }
+
+    const focusEditorAfterTab = () => {
+      pendingTabFocus = { kind: 'editor' }
+      editor.commands.focus()
+    }
+
+    const handleKeyboardNavigation = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      const editorTarget = target && root.contains(target)
+        ? target
+        : activeElement && root.contains(activeElement)
+          ? activeElement
+          : null
+      if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) {
+        return
+      }
+
+      const controls = markdownKeyboardControls(root)
+      if (!controls.length) return
+
+      const controlTarget = editorTarget?.closest<HTMLElement>(
+        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      )
+      const currentIndex = controlTarget ? controls.indexOf(controlTarget) : -1
+      if (currentIndex >= 0) {
+        const nextIndex = currentIndex + (event.shiftKey ? -1 : 1)
+        if (nextIndex >= 0 && nextIndex < controls.length) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+          focusAfterTab(nextIndex)
+        } else if (event.shiftKey) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+          focusEditorAfterTab()
+        } else {
+          // Keep the native browser exit from the final embedded control, but
+          // prevent Tiptap's list keymap from turning Tab into indentation.
+          pendingTabFocus = null
+          event.stopImmediatePropagation()
+        }
+        return
+      }
+
+      if (!editorTarget) return
+
+      const focusIndex = event.shiftKey ? controls.length - 1 : 0
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      focusAfterTab(focusIndex)
+    }
+
+    const keepEmbeddedControlFocus = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) {
+        return
+      }
+
+      if (pendingTabFocus) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        const pendingFocus = pendingTabFocus
+        pendingTabFocus = null
+        const restoreFocus = () => {
+          if (pendingFocus.kind === 'editor') editor.commands.focus()
+          else markdownKeyboardControls(root)[pendingFocus.index]?.focus()
+        }
+        restoreFocus()
+        // Chromium applies native Tab traversal after keyup. One macrotask is
+        // enough to restore the intended embedded control after that traversal.
+        root.ownerDocument.defaultView?.setTimeout(restoreFocus, 0)
+        return
+      }
+
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const controlTarget = target?.closest<HTMLElement>(
+        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      )
+      if (!controlTarget) return
+
+      const controls = markdownKeyboardControls(root)
+      const currentIndex = controls.indexOf(controlTarget)
+      const isFinalForward = !event.shiftKey && currentIndex === controls.length - 1
+      if (currentIndex >= 0 && !isFinalForward) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyboardNavigation, true)
+    document.addEventListener('keyup', keepEmbeddedControlFocus, true)
+    return () => {
+      document.removeEventListener('keydown', handleKeyboardNavigation, true)
+      document.removeEventListener('keyup', keepEmbeddedControlFocus, true)
     }
   }, [editable, editor])
 

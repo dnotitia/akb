@@ -1,10 +1,12 @@
 import {
+  getRenderedAttributes,
   Mark,
   Node,
   mergeAttributes,
   type AnyExtension,
   type MarkdownToken,
 } from '@tiptap/core'
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model'
 import { Link } from '@tiptap/extension-link'
 import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
@@ -89,6 +91,122 @@ const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
       }),
       ...children,
     ]
+  },
+})
+
+const MarkdownTaskItem = TaskItem.extend({
+  addNodeView() {
+    return ({ node, HTMLAttributes, getPos, editor }) => {
+      const listItem = document.createElement('li')
+      const checkboxWrapper = document.createElement('label')
+      const checkboxStyler = document.createElement('span')
+      const checkbox = document.createElement('input')
+      const content = document.createElement('div')
+
+      checkboxStyler.style.cssText =
+        'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0'
+
+      const updateA11y = (currentNode: ProseMirrorNode) => {
+        const label = this.options.a11y?.checkboxLabel?.(
+          currentNode,
+          currentNode.attrs.checked,
+        ) || `Task item checkbox for ${currentNode.textContent || 'empty task item'}`
+
+        checkbox.setAttribute('aria-label', label)
+        checkboxStyler.textContent = label
+      }
+
+      updateA11y(node)
+
+      checkboxWrapper.contentEditable = 'false'
+      checkbox.type = 'checkbox'
+      checkbox.addEventListener('mousedown', event => event.preventDefault())
+      const handleCheckboxChange = (event: Event) => {
+        event.stopImmediatePropagation()
+
+        const position = getPos()
+        if (typeof position !== 'number') return
+
+        const currentNode = editor.state.doc.nodeAt(position)
+        if (!editor.isEditable) {
+          checkbox.checked = Boolean(currentNode?.attrs.checked)
+          return
+        }
+
+        if (!currentNode) return
+
+        editor.view.dispatch(
+          editor.state.tr.setNodeMarkup(position, undefined, {
+            ...currentNode.attrs,
+            checked: checkbox.checked,
+          }),
+        )
+
+        const focusUpdatedCheckbox = () => {
+          const nextDom = editor.view.nodeDOM(position)
+          const nextCheckbox = nextDom instanceof HTMLElement
+            ? nextDom.querySelector<HTMLInputElement>('input[type="checkbox"]')
+            : null
+          if (nextCheckbox && !nextCheckbox.disabled) nextCheckbox.focus()
+        }
+        const defaultView = editor.view.dom.ownerDocument.defaultView
+        if (defaultView) defaultView.setTimeout(focusUpdatedCheckbox, 0)
+        else focusUpdatedCheckbox()
+      }
+      checkbox.addEventListener('change', handleCheckboxChange, true)
+
+      Object.entries(this.options.HTMLAttributes).forEach(([key, value]) => {
+        listItem.setAttribute(key, value)
+      })
+
+      listItem.dataset.checked = node.attrs.checked
+      checkbox.checked = node.attrs.checked
+
+      checkboxWrapper.append(checkbox, checkboxStyler)
+      listItem.append(checkboxWrapper, content)
+
+      Object.entries(HTMLAttributes).forEach(([key, value]) => {
+        listItem.setAttribute(key, value)
+      })
+
+      let previousHTMLAttributeKeys = new Set(Object.keys(HTMLAttributes))
+
+      return {
+        dom: listItem,
+        contentDOM: content,
+        update: updatedNode => {
+          if (updatedNode.type !== this.type) return false
+
+          listItem.dataset.checked = updatedNode.attrs.checked
+          checkbox.checked = updatedNode.attrs.checked
+          updateA11y(updatedNode)
+
+          const nextHTMLAttributes = getRenderedAttributes(
+            updatedNode,
+            editor.extensionManager.attributes,
+          )
+          const nextKeys = new Set(Object.keys(nextHTMLAttributes))
+          previousHTMLAttributeKeys.forEach(key => {
+            if (nextKeys.has(key) || key in this.options.HTMLAttributes) return
+            listItem.removeAttribute(key)
+          })
+          Object.entries(nextHTMLAttributes).forEach(([key, value]) => {
+            if (value === null || value === undefined) {
+              if (key in this.options.HTMLAttributes) listItem.setAttribute(key, this.options.HTMLAttributes[key])
+              else listItem.removeAttribute(key)
+            } else {
+              listItem.setAttribute(key, value)
+            }
+          })
+          previousHTMLAttributeKeys = nextKeys
+
+          return true
+        },
+        destroy() {
+          checkbox.removeEventListener('change', handleCheckboxChange, true)
+        },
+      }
+    }
   },
 })
 
@@ -677,7 +795,7 @@ export function createMarkdownExtensions({
     TableHeader,
     TableCell,
     TaskList,
-    TaskItem.configure({
+    MarkdownTaskItem.configure({
       nested: true,
       HTMLAttributes: { 'data-markdown-task-item': 'true' },
       a11y: {
