@@ -1394,6 +1394,10 @@ class Settings(BaseModel):
     # refresher batches that drift. 6 h matches the slow drift of avgdl/df on
     # a steady-state corpus.
     bm25_recompute_interval_secs: int = 21600
+    # Keep external N/avgdl/df for serving and rollback by default. Opt out
+    # only after verifying every reader/writer uses pgvector/vchord and no
+    # posting/arrays rollback or other external-stats consumer remains.
+    bm25_external_stats_mode: Literal["required", "vchord_only_verified"] = "required"
 
     # Periodic PG-RBAC reconcile cadence. Lifecycle hooks emit role
     # DDL online; this timer is the belt-and-suspenders that catches
@@ -1433,6 +1437,28 @@ class Settings(BaseModel):
     # Tenant `/stats` snapshot listener. Off unless `stats.port` (or
     # AKB_STATS_PORT) is set. See StatsSettings above.
     stats: StatsSettings = Field(default_factory=StatsSettings)
+
+    @property
+    def bm25_external_stats_consumers(self) -> list[str]:
+        """Active consumers plus the conservatively retained rollback contract."""
+        if self.vector_store_driver == "pgvector":
+            if self.vector_store_sparse_shape != "vchord":
+                return [f"pgvector/{self.vector_store_sparse_shape}"]
+            if self.bm25_external_stats_mode == "vchord_only_verified":
+                return []
+            return ["posting_rollback_or_mixed_deployment"]
+        # SeahorseDB consumes external stats at search time even though it
+        # receives raw TF; Qdrant/Cloud bake stats into document/query weights.
+        return [self.vector_store_driver]
+
+    @model_validator(mode="after")
+    def validate_bm25_external_stats_mode(self) -> "Settings":
+        if self.bm25_external_stats_mode == "vchord_only_verified" and (
+            self.vector_store_driver != "pgvector"
+            or self.vector_store_sparse_shape != "vchord"
+        ):
+            raise ValueError("vchord_only_verified requires pgvector/vchord")
+        return self
 
     @model_validator(mode="after")
     def validate_authoritative_email_domains(self) -> "Settings":
