@@ -44,6 +44,26 @@ def test_omitted_selector_without_identity_fails_closed():
         Settings()
 
 
+def test_the_refusal_names_the_remedy_for_the_configuration_it_refused():
+    """The missing field alone does not say which of the two remedies applies.
+
+    An installation that predates the default change and one that copied the
+    template both land on the same validator, and they need opposite commands.
+    """
+    with pytest.raises(ValueError) as omitted:
+        Settings()
+    assert "preserve-revision-config" in str(omitted.value)
+    assert "prepare-native-config" not in str(omitted.value)
+
+    with pytest.raises(ValueError) as declared:
+        Settings(document_revision_backend="postgres_native")
+    assert "prepare-native-config" in str(declared.value)
+    assert "preserve-revision-config" not in str(declared.value)
+
+    for raised in (omitted, declared):
+        assert "docs/operations/native-installation.md" in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("selector", "canonical"),
     [
