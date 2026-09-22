@@ -80,6 +80,7 @@ from app.services.native_revision_service import (
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
+from app.util.errors import NATIVE_REVISION_SURFACE_UNSUPPORTED
 from app.util.text import (
     doc_path,
     like_escape,
@@ -95,13 +96,13 @@ logger = logging.getLogger("akb.native_documents")
 
 
 class NativeRevisionUnsupportedSurfaceError(AKBError):
-    """A non-revision surface was reached in the isolated measurement arm."""
+    """A surface is not supported by the PostgreSQL Native backend."""
 
     def __init__(self, surface: str):
         super().__init__(
-            f"{surface} is unavailable in the native-ledger M1 measurement arm",
+            f"{surface} is not supported by the PostgreSQL Native revision backend",
             status_code=501,
-            code="native_revision_surface_unsupported",
+            code=NATIVE_REVISION_SURFACE_UNSUPPORTED,
         )
 
 

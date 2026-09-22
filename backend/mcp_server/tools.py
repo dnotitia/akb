@@ -35,6 +35,7 @@ URI-addressable.
 from mcp.types import Tool
 
 from app.services import template_registry
+from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
 
@@ -1389,3 +1390,34 @@ TOOLS = [
         },
     ),
 ]
+
+
+def available_tools() -> list[Tool]:
+    """Advertise only supported creation options without mutating validation.
+
+    TOOLS remains the accepted argument catalog for older clients, whose
+    explicit unsupported requests must reach the service's stable error.
+    """
+    capabilities = get_vault_creation_capabilities()
+    if capabilities.templates and capabilities.external_git:
+        return TOOLS
+    result = []
+    for tool in TOOLS:
+        if tool.name != "akb_create_vault":
+            result.append(tool)
+            continue
+        tool = tool.model_copy(deep=True)
+        properties = tool.input_schema["properties"]
+        if not capabilities.templates:
+            properties.pop("template", None)
+        if not capabilities.external_git:
+            properties.pop("external_git", None)
+        tool.description = (
+            "Create a new knowledge base vault. Its name is unique across the "
+            "AKB installation and becomes part of the canonical akb:// URI. "
+            "This deployment supports empty vault creation; vault templates "
+            "and external Git mirrors are unavailable. Add collections and "
+            "documents after creation."
+        )
+        result.append(tool)
+    return result

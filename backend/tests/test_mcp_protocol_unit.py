@@ -56,8 +56,17 @@ async def _post(client: httpx.AsyncClient, body: dict, *, token: str = "token", 
 
 
 @pytest.mark.asyncio
-async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["bare_git", "postgres_native"])
+async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(monkeypatch, tmp_path, backend):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    monkeypatch.setattr(settings, "document_revision_backend", backend)
+
+    def assert_creation_catalog(response):
+        create = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "akb_create_vault")
+        properties = create["inputSchema"]["properties"]
+        assert ("template" in properties) is (backend == "bare_git")
+        assert ("external_git" in properties) is (backend == "bare_git")
+
     alice = _user("alice")
     monkeypatch.setattr(http_app, "resolve_mcp_authorization", lambda _header: _resolved(alice))
 
@@ -88,6 +97,7 @@ async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(
             assert response.status_code == 200
             assert response.headers.get("mcp-session-id") is None
             assert response.json()["result"]["resultType"] == "complete"
+            assert_creation_catalog(response)
 
             for index, revision in enumerate(LEGACY_VERSIONS, start=10):
                 response = await _post(
@@ -116,6 +126,7 @@ async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(
                 assert response.status_code == 200
                 assert response.json()["result"].get("resultType") is None
                 assert response.json()["result"].get("_meta") is None
+                assert_creation_catalog(response)
 
 
 @pytest.mark.asyncio
