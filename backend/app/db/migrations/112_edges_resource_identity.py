@@ -84,12 +84,20 @@ async def migrate(conn) -> None:
         # native ledger exists). MATCH SIMPLE leaves a NULL identity
         # unchecked, which is exactly the legacy-endpoint case.
         #
-        # NOT VALID on purpose: adding a validated foreign key scans and locks
-        # `edges`, and at this instant every value in both columns is NULL, so
-        # the scan can only confirm what the ALTER already knows. It still
-        # enforces every row inserted or updated from here on — including the
-        # backfill below. The scan is paid once, after this transaction
-        # commits, under a lock that does not block reads or writes.
+        # NOT VALID on purpose: adding a validated foreign key scans `edges`,
+        # and at this instant every value in both columns is NULL, so the scan
+        # can only confirm what the ALTER already knows. It still enforces
+        # every row inserted or updated from here on — including the backfill
+        # below.
+        #
+        # It does NOT buy a gentler lock here, and planning a production window
+        # on the assumption that it does would be wrong. `_run_one_migration` runs every
+        # migration inside its own transaction so the effects and the ledger
+        # receipt commit as one unit, which makes the `conn.transaction()` above
+        # a savepoint rather than a top-level transaction. The VALIDATE below is
+        # therefore still inside that outer transaction and inherits the ALTER's
+        # ACCESS EXCLUSIVE lock. Budget for `edges` being held under ACCESS
+        # EXCLUSIVE for this whole migration, backfill included.
         native_present = await conn.fetchval(
             "SELECT to_regclass('public.native_resources') IS NOT NULL"
         )
@@ -117,8 +125,9 @@ async def migrate(conn) -> None:
             stamped = await _backfill(conn)
 
     for constraint in added:
-        # Outside the transaction above so VALIDATE takes SHARE UPDATE
-        # EXCLUSIVE rather than inheriting the ALTER's stronger lock.
+        # Outside the savepoint, not outside a transaction — see above. Kept
+        # separate so this becomes the cheap SHARE UPDATE EXCLUSIVE validate the
+        # moment a migration can opt out of the runner's transaction.
         await conn.execute(f"ALTER TABLE edges VALIDATE CONSTRAINT {constraint}")
 
     logger.info(
