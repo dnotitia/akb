@@ -36,9 +36,9 @@ from app.services import delete_worker
 from app.services._backfill import MAX_RETRIES, next_attempt_delay
 from app.services.document_service import _parse_markdown
 from app.services.kg_service import (
-    delete_document_relations,
-    delete_implicit_document_relations,
+    delete_native_document_edges,
     store_document_relations,
+    sync_native_document_edge_uris,
 )
 from app.services.index_service import (
     Chunk,
@@ -577,8 +577,17 @@ class NativeDerivedWorker:
                 if resource["surface"] == "document":
                     # A deleted document is not a graph endpoint any more, in
                     # either direction — the legacy delete clears the same rows.
-                    await delete_document_relations(
-                        conn, resource["vault_name"], resource["current_path"],
+                    #
+                    # Keyed on the resource, not on the path it used to hold.
+                    # This intent can be applied long after the commit that
+                    # raised it, and by then a DIFFERENT document may own that
+                    # path; clearing by URI erased ITS links (akb#654).
+                    await delete_native_document_edges(
+                        conn,
+                        intent["namespace_id"],
+                        resource["vault_name"],
+                        intent["resource_id"],
+                        resource["current_path"],
                     )
                 await conn.execute(
                     "DELETE FROM native_derived_heads WHERE resource_id = $1",
@@ -649,19 +658,29 @@ class NativeDerivedWorker:
                     return 0
                 await self._drop_chunks(conn, intent["resource_id"], source_type)
                 if relations is not None:
-                    # The graph half of the same rewrite. `store_document_relations`
-                    # clears the implicit rows under the path it is about to write,
-                    # so only a path change needs the previous one cleared too — a
-                    # move otherwise leaves the old URI's body links behind. Explicit
-                    # `akb_link` rows are never touched here; the move carries them.
-                    previous_path = await conn.fetchval(
-                        "SELECT path FROM native_derived_heads WHERE resource_id = $1",
+                    # Durable recovery for the endpoints. The facade's move hook
+                    # runs after the authoritative commit and outside it, so it
+                    # can be lost entirely — a crash between commit and hook
+                    # leaves the explicit `akb_link` rows naming a path nothing
+                    # writes to, and nothing retries. This does retry: the
+                    # intent is durable, and the sync writes the head path this
+                    # transaction already locked, so running it here is
+                    # convergent with the hook rather than a second opinion.
+                    await sync_native_document_edge_uris(
+                        conn,
+                        intent["namespace_id"],
+                        head["vault_name"],
                         intent["resource_id"],
+                        resource["current_path"],
                     )
-                    if previous_path and previous_path != resource["current_path"]:
-                        await delete_implicit_document_relations(
-                            conn, head["vault_name"], previous_path,
-                        )
+                    # The graph half of the same rewrite. Passing the resource
+                    # identity scopes the implicit clear to THIS document's
+                    # rows, wherever they currently point — which subsumes the
+                    # separate previous-path sweep this used to do. That sweep
+                    # deleted by URI, so a delayed move rewrite erased the
+                    # implicit edges of whichever document had since taken the
+                    # freed path. Explicit `akb_link` rows are never touched
+                    # here; the move carries them.
                     await store_document_relations(
                         conn,
                         intent["namespace_id"],
@@ -671,6 +690,7 @@ class NativeDerivedWorker:
                         relations.related_to,
                         relations.implements,
                         relations.body,
+                        intent["resource_id"],
                     )
                 await conn.execute(
                     """
