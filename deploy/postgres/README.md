@@ -5,8 +5,9 @@ table the backend maintains, on the stock `pgvector/pgvector:pg16` image named
 everywhere else in this repository.
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
-which implements the same BM25 formula over a block-max index instead of a
-relational table. An operator who wants that trade can build the image here and
+which stores raw term frequencies and owns corpus statistics and BM25 scoring
+in a block-max index. Posting stores application-computed weights; identical
+rankings across the two scorers are not a compatibility guarantee. An operator who wants that trade can build the image here and
 get the same bytes we do.
 
 ## Build
@@ -70,3 +71,30 @@ Building and running this image is use. **Distributing** the built image is
 distribution of that extension and carries the corresponding obligation —
 unmodified, that is an offer of the upstream source, which the link above
 satisfies.
+
+## Bounded search and exact fallback
+
+The VChord reader widens finite candidate budgets up to 65,535. A short page is
+not proof that all matches were visited: growing segments and invisible index
+entries can consume that budget. Exact fallback remains available only when a
+bounded cardinality probe finds at most 10,000 non-NULL vectors. Index-led `-1`
+checks the global corpus, since the extension may scan it before filtering;
+materialized ranking checks its vault/source scope. Planner estimates alone do
+not authorize exact work. Operator-configured `-1` and oversized top-k requests
+use the same guard.
+
+The selectivity read and ranking transaction share a five-second wall-clock
+deadline. The transaction has a local statement timeout that never relaxes a stricter caller timeout. Size refusal or
+timeout produces an explicit search failure/degradation, not a successful empty
+or truncated result. Budget, plan, timeout and search-path settings are restored
+on commit, error and cancellation. These are conservative resource safeguards,
+not latency or relevance acceptance targets for a deployment. For example, a
+broad rare/unknown-term query that underfills on a corpus above 10,000 vectors
+can now degrade instead of scanning everything. Under the existing hybrid
+search failure contract, a failed sparse leg can also discard dense results.
+Validate this availability tradeoff before enabling VChord for a deployment.
+
+Run `test_vchord_candidate_budget_postgres.py` against the pinned extension to
+exercise candidate widening, scoped exact ranking, global fallback refusal and
+connection recovery. The test DSN must identify an isolated PostgreSQL instance;
+the tests create disposable databases.
