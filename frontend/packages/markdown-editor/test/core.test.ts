@@ -287,6 +287,18 @@ describe('Markdown conformance core', () => {
     expect(editor.getMarkdown()).toBe('초안')
   })
 
+  it('reports the canonical Markdown without the editor continuation paragraph', () => {
+    const changes: string[] = []
+    const target = 'https://example.com/image.png'
+    const editor = createMarkdownEditor({
+      onChange: markdown => changes.push(markdown),
+    })
+    editors.push(editor)
+
+    expect(markdownCommands(editor).insertImage(target, 'Image')).toBe(true)
+    expect(changes.at(-1)).toBe(`![Image](${target})`)
+  })
+
   it('edits and deletes one image occurrence by document position with undo', () => {
     const target = 'https://example.com/shared.png'
     const editor = createMarkdownEditor({ initialMarkdown: '' })

@@ -13,7 +13,6 @@ import {
 } from "@akb/markdown-editor/react";
 import {
   extractMarkdownTargets,
-  serializeEditorMarkdown,
 } from "@akb/markdown-editor";
 import type {
   MarkdownAsset,
@@ -61,35 +60,6 @@ const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace
   isEditableTarget: (target) => canonicalAkbMarkdownTarget(target) !== null,
 };
 
-function imageAssetIds(editor: MarkdownEditorInstance): string[] {
-  const ids = new Set<string>();
-
-  const visit = (node: {
-    type?: string;
-    attrs?: { target?: unknown };
-    content?: unknown[];
-  }) => {
-    if (node.type === "image" && typeof node.attrs?.target === "string") {
-      const id = assetIdFromUrl(node.attrs.target);
-      if (id) ids.add(id);
-    }
-    for (const child of node.content ?? []) {
-      if (child && typeof child === "object") {
-        visit(
-          child as {
-            type?: string;
-            attrs?: { target?: unknown };
-            content?: unknown[];
-          },
-        );
-      }
-    }
-  };
-
-  visit(editor.getJSON());
-  return [...ids];
-}
-
 function imageAssetIdsFromMarkdown(markdown: string): string[] {
   const ids = new Set<string>();
   for (const target of extractMarkdownTargets(markdown)) {
@@ -98,10 +68,6 @@ function imageAssetIdsFromMarkdown(markdown: string): string[] {
     if (id) ids.add(id);
   }
   return [...ids];
-}
-
-function editorContentElement(root: HTMLDivElement | null): HTMLElement | null {
-  return root?.querySelector<HTMLElement>(".ProseMirror") ?? null;
 }
 
 interface EditorToolbarProps {
@@ -231,7 +197,6 @@ export function MarkdownEditor({
   onAssetExpirationsChange,
   onUnclaimedAssetIdsChange,
 }: MarkdownEditorProps) {
-  const rootRef = React.useRef<HTMLDivElement>(null);
   const [resolutionMarkdown, setResolutionMarkdown] = React.useState(value);
   const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
   const unclaimedAssetExpirationsRef = React.useRef(
@@ -260,10 +225,9 @@ export function MarkdownEditor({
     setResolutionMarkdown(value);
   }, [value]);
   const handleChange = React.useCallback(
-    (_: string, editor: MarkdownEditorInstance) => {
-      const next = serializeEditorMarkdown(editor, { profile: "preserve" });
+    (next: string) => {
       setResolutionMarkdown(next);
-      onChange?.(next, imageAssetIds(editor));
+      onChange?.(next, imageAssetIdsFromMarkdown(next));
     },
     [onChange],
   );
@@ -403,11 +367,6 @@ export function MarkdownEditor({
     reportUnclaimedAssetIds,
   ]);
 
-  React.useEffect(() => {
-    if (!editor) return;
-    if (autoFocus && !readOnly)
-      requestAnimationFrame(() => editor.commands.focus());
-  }, [autoFocus, editor, readOnly]);
   const editorClassName = cn(
     "akb-markdown-content prose dark:prose-invert !max-w-none !min-h-96 w-full cursor-text outline-none font-sans text-[15px] leading-7 text-foreground",
     appearance === "canvas"
@@ -425,37 +384,29 @@ export function MarkdownEditor({
         ? "border-0 bg-transparent px-4 py-4"
         : "border border-border bg-surface px-5 py-4 transition-colors",
   );
-  React.useLayoutEffect(() => {
-    const content = editorContentElement(rootRef.current);
-    if (!content) return;
-    content.className = editorClassName;
-    content.setAttribute("role", "textbox");
-    content.setAttribute("aria-multiline", "true");
-    if (ariaLabel) content.setAttribute("aria-label", ariaLabel);
-    else content.removeAttribute("aria-label");
-    if (ariaLabelledby) content.setAttribute("aria-labelledby", ariaLabelledby);
-    else content.removeAttribute("aria-labelledby");
-    if (required) content.setAttribute("aria-required", "true");
-    else content.removeAttribute("aria-required");
-    content.dataset.placeholder = placeholder;
-  }, [
+  const contentAttributes = React.useMemo(() => ({
+    role: "textbox",
+    "aria-multiline": "true",
+    "aria-label": ariaLabel,
+    "aria-labelledby": ariaLabelledby,
+    "aria-required": required ? "true" : undefined,
+    "data-placeholder": placeholder,
+  }), [
     ariaLabel,
     ariaLabelledby,
-    editor,
-    editorClassName,
     placeholder,
     required,
   ]);
 
   return (
     <div
-      ref={rootRef}
       data-testid="markdown-editor"
       className="relative min-w-0"
     >
       <MarkdownEditingSurface
         editor={editor}
         markdown={value}
+        autoFocus={autoFocus}
         onSourceChange={handleSourceChange}
         readOnly={readOnly}
         table={AKB_MARKDOWN_TABLE_OPTIONS}
@@ -479,6 +430,8 @@ export function MarkdownEditor({
         <MarkdownSurface
           editor={editor}
           editable={!readOnly}
+          contentClassName={editorClassName}
+          contentAttributes={contentAttributes}
           resolutions={targetResolutions}
           resolvingTargets={Boolean(adapters.targetResolver)}
           referenceResolutions={referenceResolutions}

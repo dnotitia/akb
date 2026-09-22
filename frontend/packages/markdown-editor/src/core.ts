@@ -177,6 +177,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
     profile = 'preserve',
     element,
     editable = true,
+    image,
     onChange,
   } = options
 
@@ -185,11 +186,12 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
 
   return new Editor({
     element: resolvedElement,
-    extensions: createMarkdownExtensions({ profile }),
+    extensions: createMarkdownExtensions({ profile, image }),
     content: initialMarkdown,
     contentType: 'markdown',
     editable,
-    onUpdate: ({ editor }) => onChange?.(editor.getMarkdown(), editor),
+    onUpdate: ({ editor }) =>
+      onChange?.(serializeEditorMarkdown(editor, { profile }), editor),
   })
 }
 

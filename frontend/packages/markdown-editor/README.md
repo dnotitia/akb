@@ -21,7 +21,10 @@ import {
   type MarkdownTableOptions,
   type MarkdownSlashCommandMessages,
   type MarkdownCodeOptions,
+  type MarkdownContentAttributes,
+  type MarkdownHeadingOptions,
   type MarkdownImageOptions,
+  type MarkdownTableLayoutOptions,
   canonicalizeMarkdown,
   parseMarkdown,
   serializeEditorMarkdown,
@@ -43,12 +46,35 @@ function Document({ markdown, onChange }) {
 ```
 
 `MarkdownEditor` includes a `WYSIWYG` / `Source` switch for the same Markdown
-draft. Source opens from the current editor body, and Source edits emit raw
-Markdown through `onChange`; the shared editor stays mounted, and formatting,
+draft. Source opens from the current editor body. WYSIWYG changes emit
+canonical Markdown through `onChange`; Source changes emit the exact source
+text so products can preserve authored Markdown while the shared editor stays mounted, and formatting,
 link search, and the slash command menu remain attached to the WYSIWYG surface.
-`serializeEditorMarkdown(editor, { profile: 'preserve' })` reads the current
-editor body and omits the terminal empty paragraph that Tiptap keeps as an
-editing caret after an atomic block.
+`serializeEditorMarkdown(editor, { profile: 'preserve' })` is the explicit
+serialization entry point and omits the terminal empty paragraph that Tiptap
+keeps as an editing caret after an atomic block.
+
+`MarkdownSurface` owns the editor content element and accepts
+`contentClassName` / `contentAttributes` for product styling and accessible
+semantics. `MarkdownViewer` additionally accepts presentation-only
+`headings`, `tableLayout`, and `image.referrerPolicy` options. Heading offsets
+and ids, table scroll wrappers, runtime image attributes, and content DOM
+updates are applied by the package and never become serialized Markdown:
+
+```tsx
+<MarkdownViewer
+  markdown={markdown}
+  contentClassName="document-content"
+  contentAttributes={{ 'aria-label': 'Document body' }}
+  headings={{ levelOffset: 1, ids: ['introduction'] }}
+  image={{ referrerPolicy: 'no-referrer' }}
+  tableLayout={{
+    className: 'w-max min-w-full',
+    wrapperClassName: 'overflow-x-auto',
+    ariaLabel: 'Scrollable table',
+  }}
+/>
+```
 
 The WYSIWYG editor enables one common slash menu by default. It owns these ten
 commands: Heading 1–3, Quote, Bullet list, Numbered list, Task list, Table,
@@ -212,6 +238,8 @@ synchronization, and focus handoff. Its `toolbar` slot appears only in
 WYSIWYG mode; `modeLabels`, `sourceClassName`, and the source label props adapt
 copy, theme, and accessible names. `modeSwitchDisabled` can lock mode changes
 during an active product operation such as an upload. The optional
+`autoFocus` focuses the WYSIWYG editor after it mounts when the surface is
+editable. The optional
 `onWysiwygDragOverCapture` / `onWysiwygDropCapture` handlers attach product
 drag-and-drop behavior to the visual editor and its toolbar without affecting
 Source input. `onMarkdownApplied` is an optional product hook for schema-specific
@@ -448,6 +476,11 @@ with a physical OS IME.
 
 ## Versioning
 
+The `0.14.0` public contract adds canonical WYSIWYG `onChange` serialization and moves
+editor content attributes, viewer heading/table presentation, image request
+policy, and autofocus into the shared public surface contract. These options
+are presentation-only and do not change canonical Markdown.
+
 The `0.13.0` public contract adds shared block rendering for editor/viewer
 surfaces, common-language code highlighting, keyboard-focusable code scroll
 regions, nested task checkbox behavior, and `MarkdownCodeOptions` for product
@@ -521,7 +554,7 @@ The `0.4.0` public contract adds the shared link command/state contract and
 `MarkdownLinkPopup`.
 
 The `0.2.0` public contract adds canonical resource targets. Consumers should pin one exact package version, store the
-Markdown returned by `onChange` or `editor.getMarkdown()` as the canonical representation, and
+Markdown returned by `onChange` or `serializeEditorMarkdown()` as the canonical representation, and
 choose `profile="structured"` when unknown HTML/MDX should be rejected or the default `preserve`
 profile when those constructs must survive edit/serialize cycles. Changes to the exported schema,
 Markdown profile, or serialized meaning follow semver and must include a migration note.

@@ -24,6 +24,7 @@ import { common, createLowlight } from 'lowlight'
 import type {
   MarkdownCodeLabels,
   MarkdownCodeOptions,
+  MarkdownImageOptions,
   MarkdownInlineReferenceKind,
   MarkdownProfile,
   MarkdownReferenceToken,
@@ -492,13 +493,19 @@ function imageDestination(target: string): string {
  * renderer. Its `target` attribute is the canonical Markdown value; runtime
  * adapters may change only the rendered DOM `src` and never this attribute.
  */
-export const MarkdownImage = Node.create({
+export const MarkdownImage = Node.create<{ referrerPolicy?: string }>({
   name: 'image',
   inline: true,
   group: 'inline',
   atom: true,
   selectable: true,
   draggable: true,
+
+  addOptions() {
+    return {
+      referrerPolicy: undefined,
+    }
+  },
 
   addAttributes() {
     return {
@@ -524,6 +531,9 @@ export const MarkdownImage = Node.create({
         'img',
         {
           src: target,
+          ...(this.options.referrerPolicy
+            ? { referrerpolicy: this.options.referrerPolicy }
+            : {}),
           alt: String(node.attrs.alt ?? ''),
           ...(node.attrs.title ? { title: String(node.attrs.title) } : {}),
           'data-markdown-image': 'true',
@@ -769,11 +779,13 @@ const RawMarkdownInline = Node.create({
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
   code?: MarkdownCodeOptions
+  image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
   code,
+  image,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -789,7 +801,7 @@ export function createMarkdownExtensions({
     }),
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
-    MarkdownImage,
+    MarkdownImage.configure({ referrerPolicy: image?.referrerPolicy }),
     Table.configure({ resizable: false }),
     TableRow,
     TableHeader,

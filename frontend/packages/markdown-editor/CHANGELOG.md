@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.0
+
+- Make WYSIWYG updates from the core and React editor hooks return canonical
+  Markdown without Tiptap's terminal continuation paragraph while keeping
+  Source edits raw for authoring-preservation workflows.
+- Add public content attributes/classes, viewer heading ids and level offsets,
+  table scroll layout, image referrer policy, and editing-surface autofocus
+  options so products do not need editor-engine DOM manipulation.
+- Move AKB editor and viewer integrations onto the shared public rendering and
+  synchronization contract, preserving target resolution and draft behavior.
+
 ## 0.13.0
 
 - Add one shared Markdown block renderer for editor and viewer surfaces, with
