@@ -21,10 +21,12 @@ import { uploadMarkdownBatch } from '../adapters.js'
 import { markdownCommands } from '../core.js'
 import type {
   MarkdownAsset,
+  MarkdownEditorHandle,
   MarkdownUploadAdapter,
   MarkdownUploadContext,
   MarkdownUploadItem,
 } from '../types.js'
+import { getMarkdownEditor } from './editor-handle.js'
 
 export interface MarkdownImageUploadLabels {
   group: string
@@ -199,10 +201,11 @@ function errorForPlacement(message: string) {
 }
 
 export function useMarkdownImageUpload(
-  editor: Editor | null,
+  editorHandle: MarkdownEditorHandle | null,
   options: MarkdownImageUploadOptions | undefined,
   readOnly = false,
 ): MarkdownImageUploadController | null {
+  const editor = getMarkdownEditor(editorHandle)
   const inputRef = useRef<HTMLInputElement>(null)
   const optionsRef = useRef(options)
   const readOnlyRef = useRef(readOnly)

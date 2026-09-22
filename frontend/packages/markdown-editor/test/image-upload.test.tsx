@@ -1,13 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useEffect, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { Editor } from '@tiptap/core'
+import { EditorContent } from '@tiptap/react'
 
 import {
-  EditorContent,
   MarkdownEditingSurface,
   MarkdownToolbar,
   useMarkdownEditor,
 } from '../src/react/index.js'
+import { getMarkdownEditor } from '../src/react/editor-handle.js'
 import type { MarkdownAsset, MarkdownUploadAdapter } from '../src/types.js'
 
 afterEach(() => {
@@ -24,7 +26,7 @@ function UploadSurface({
   adapter: MarkdownUploadAdapter
   initialMarkdown?: string
   readOnly?: boolean
-  onEditor?: (editor: ReturnType<typeof useMarkdownEditor>) => void
+  onEditor?: (editor: Editor | null) => void
 }) {
   const [markdown, setMarkdown] = useState(initialMarkdown)
   const editor = useMarkdownEditor({
@@ -33,7 +35,7 @@ function UploadSurface({
     onChange: next => setMarkdown(next),
   })
 
-  useEffect(() => onEditor?.(editor), [editor, onEditor])
+  useEffect(() => onEditor?.(getMarkdownEditor(editor)), [editor, onEditor])
 
   return (
     <MarkdownEditingSurface
@@ -45,7 +47,7 @@ function UploadSurface({
       toolbar={<MarkdownToolbar editor={editor} />}
       onSourceChange={next => setMarkdown(next)}
     >
-      {editor ? <EditorContent editor={editor} /> : null}
+      {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
     </MarkdownEditingSurface>
   )
 }
@@ -56,7 +58,7 @@ describe('shared image upload surface', () => {
     const adapter: MarkdownUploadAdapter = {
       upload: vi.fn(() => new Promise<MarkdownAsset>(resolve => { resolveUpload = resolve })),
     }
-    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    let activeEditor: Editor | null = null
     render(<UploadSurface adapter={adapter} onEditor={editor => { activeEditor = editor }} />)
 
     await waitFor(() => expect(activeEditor?.view).toBeTruthy())
@@ -86,7 +88,7 @@ describe('shared image upload surface', () => {
       upload: vi.fn(() => new Promise<MarkdownAsset>(resolve => { resolveUpload = resolve })),
     }
     const oldTarget = '/api/assets/old'
-    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    let activeEditor: Editor | null = null
     render(
       <UploadSurface
         adapter={adapter}

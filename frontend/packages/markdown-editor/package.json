@@ -1,6 +1,6 @@
 {
   "name": "@akb/markdown-editor",
-  "version": "0.13.0",
+  "version": "0.15.0",
   "description": "Product-neutral Tiptap Markdown editor, viewer, and conformance contract for AKB and Reef.",
   "type": "module",
   "sideEffects": false,
@@ -25,7 +25,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/check-public-api.mjs",
     "clean": "rm -rf dist coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src test",

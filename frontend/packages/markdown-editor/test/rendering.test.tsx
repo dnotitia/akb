@@ -57,6 +57,100 @@ describe('Markdown block rendering', () => {
     expect(code?.querySelector('.hljs-keyword')).toHaveTextContent('const')
   })
 
+  it('applies the public content and read-only layout contract', async () => {
+    const markdown = [
+      '# Heading',
+      '',
+      '| Name | Value |',
+      '| --- | --- |',
+      '| A | B |',
+      '',
+      '![Diagram](https://example.com/diagram.png)',
+    ].join('\n')
+    const { container } = render(
+      <MarkdownViewer
+        markdown={markdown}
+        contentClassName="viewer-content"
+        contentAttributes={{ 'aria-label': 'Document body' }}
+        headings={{ levelOffset: 1, ids: ['heading'] }}
+        image={{ referrerPolicy: 'no-referrer' }}
+        tableLayout={{
+          className: 'w-max',
+          wrapperClassName: 'table-scroll',
+          ariaLabel: 'Scrollable document table',
+        }}
+      />,
+    )
+
+    const content = await within(container).findByRole('textbox', { name: 'Document body' })
+    await waitFor(() => expect(content.querySelector('h2')).toHaveAttribute('id', 'heading'))
+    expect(content).toHaveClass('viewer-content')
+    expect(content.querySelector('h1')).not.toBeInTheDocument()
+    expect(content.querySelector('table')).toHaveClass('w-max')
+    expect(content.querySelector('[data-markdown-table-wrapper="true"]')).toHaveClass('table-scroll')
+    expect(content.querySelector('[data-markdown-table-wrapper="true"]')).toHaveAttribute(
+      'aria-label',
+      'Scrollable document table',
+    )
+    expect(content.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
+  })
+
+  it('removes presentation-only viewer decorations when options change', async () => {
+    const markdown = [
+      '# Heading',
+      '',
+      '| Name | Value |',
+      '| --- | --- |',
+      '| A | B |',
+      '',
+      '![Diagram](https://example.com/diagram.png)',
+    ].join('\n')
+    const { container, rerender } = render(
+      <MarkdownViewer
+        markdown={markdown}
+        headings={{ levelOffset: 1, ids: ['heading'] }}
+        image={{ referrerPolicy: 'no-referrer' }}
+        tableLayout={{ className: 'w-max', wrapperClassName: 'table-scroll' }}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(container.querySelector('h2')).toHaveAttribute('id', 'heading')
+      expect(container.querySelector('[data-markdown-table-wrapper="true"]')).toBeInTheDocument()
+    })
+    rerender(<MarkdownViewer markdown={markdown} />)
+
+    await waitFor(() => {
+      expect(container.querySelector('h1')).toBeInTheDocument()
+      expect(container.querySelector('h2')).not.toBeInTheDocument()
+      expect(container.querySelector('[data-markdown-table-wrapper="true"]')).not.toBeInTheDocument()
+      expect(container.querySelector('img')).not.toHaveAttribute('referrerpolicy')
+    })
+  })
+
+  it('does not mutate editable ProseMirror DOM for viewer-only layout options', async () => {
+    const markdown = [
+      '# Heading',
+      '',
+      '| Name | Value |',
+      '| --- | --- |',
+      '| A | B |',
+    ].join('\n')
+    const { container } = render(
+      <MarkdownEditor
+        markdown={markdown}
+        headings={{ levelOffset: 1, ids: ['heading'] }}
+        tableLayout={{ className: 'w-max', wrapperClassName: 'table-scroll' }}
+      />,
+    )
+
+    const content = await within(container).findByRole('textbox')
+    await waitFor(() => expect(content.querySelector('h1')).toHaveTextContent('Heading'))
+    expect(content.querySelector('h2')).not.toBeInTheDocument()
+    expect(content.querySelector('[data-markdown-table-wrapper="true"]')).not.toBeInTheDocument()
+    expect(content.querySelector('table')).not.toHaveClass('w-max')
+  })
+
   it('exposes independent, keyboard-operable task checkboxes and preserves their Markdown state', async () => {
     const user = userEvent.setup()
     let saved = MIXED_MARKDOWN

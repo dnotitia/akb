@@ -1,10 +1,19 @@
-import type { Editor, EditorOptions, FocusPosition, JSONContent } from '@tiptap/core'
-import type { MarkdownExtensionOptions } from '@tiptap/markdown'
 import type { MarkdownTableCommands, MarkdownTableState } from './table.js'
 
 export type { MarkdownTableInsertionOptions, MarkdownTableState } from './table.js'
 
 export type MarkdownProfile = 'structured' | 'preserve'
+
+declare const markdownEditorHandleBrand: unique symbol
+
+/**
+ * Opaque package-owned editor identity used to compose the shared React
+ * surfaces. The underlying editor engine is intentionally not part of this
+ * contract.
+ */
+export interface MarkdownEditorHandle {
+  readonly [markdownEditorHandleBrand]: 'MarkdownEditorHandle'
+}
 
 export type MarkdownTargetKind = 'document' | 'file' | 'attachment'
 
@@ -70,7 +79,31 @@ export interface MarkdownImageClassNames {
 export interface MarkdownImageOptions {
   labels?: Partial<MarkdownImageLabels>
   classNames?: MarkdownImageClassNames
+  /** Presentation-only policy applied to rendered image requests. */
+  referrerPolicy?: string
 }
+
+export interface MarkdownHeadingOptions {
+  /** Presentation-only offset applied to rendered heading levels. */
+  levelOffset?: number
+  /** Presentation-only ids, matched to rendered headings in document order. */
+  ids?: readonly string[]
+}
+
+export interface MarkdownTableLayoutOptions {
+  /** Classes added to rendered tables. */
+  className?: string
+  /** Classes added to the keyboard-focusable table scroll wrapper. */
+  wrapperClassName?: string
+  /** Accessible name for the table scroll wrapper. */
+  ariaLabel?: string
+}
+
+export type MarkdownContentAttributeValue = string | number | boolean | null | undefined
+
+export type MarkdownContentAttributes = Readonly<
+  Record<string, MarkdownContentAttributeValue>
+>
 
 export interface MarkdownCodeLabels {
   /** Accessible name for the keyboard-focusable code scroll region. */
@@ -83,7 +116,6 @@ export interface MarkdownCodeOptions {
 
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile
-  markedOptions?: MarkdownExtensionOptions['markedOptions']
 }
 
 export interface MarkdownUploadContext {
@@ -343,12 +375,14 @@ export interface MarkdownSlashCommandOptions {
 
 export type MarkdownHeadingLevel = 1 | 2 | 3
 
+export type MarkdownFocusPosition = 'start' | 'end' | 'all' | number | boolean | null
+
 export interface MarkdownEditorConfig extends MarkdownParseOptions {
   initialMarkdown?: string
   editable?: boolean
-  element?: EditorOptions['element']
+  image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
   adapters?: MarkdownAdapters
-  onChange?: (markdown: string, editor: Editor) => void
+  onChange?: (markdown: string, editor: MarkdownEditorHandle) => void
 }
 
 export interface MarkdownCommands extends MarkdownTableCommands {
@@ -378,7 +412,7 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   setHorizontalRule(): boolean
   undo(): boolean
   redo(): boolean
-  focus(position?: FocusPosition): boolean
+  focus(position?: MarkdownFocusPosition): boolean
 }
 
 export interface MarkdownActiveState {
@@ -422,5 +456,18 @@ export interface MarkdownState {
 
 export interface MarkdownDocument {
   type: 'doc'
-  content?: JSONContent[]
+  content?: MarkdownNode[]
+}
+
+export interface MarkdownNode {
+  type: string
+  attrs?: Readonly<Record<string, unknown>>
+  content?: MarkdownNode[]
+  marks?: MarkdownMark[]
+  text?: string
+}
+
+export interface MarkdownMark {
+  type: string
+  attrs?: Readonly<Record<string, unknown>>
 }

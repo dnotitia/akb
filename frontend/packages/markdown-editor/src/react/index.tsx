@@ -52,7 +52,6 @@ import {
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 } from './markdown-slash-command.js'
 export {
-  createMarkdownSlashCommandExtension,
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 } from './markdown-slash-command.js'
 export type {
@@ -62,7 +61,6 @@ import {
   createLiveMarkdownReferenceExtension,
 } from './markdown-reference-menu.js'
 export {
-  createMarkdownReferenceExtension,
   DEFAULT_MARKDOWN_REFERENCE_LABELS,
   normalizeMarkdownReferenceCandidates,
 } from './markdown-reference-menu.js'
@@ -102,12 +100,19 @@ export {
   useMarkdownImageUploadContext,
 } from './markdown-image-upload.js'
 import { markdownTableState } from '../table.js'
+import {
+  createMarkdownEditorHandle,
+  getMarkdownEditor,
+} from './editor-handle.js'
 import type {
   MarkdownAdapters,
   MarkdownCodeOptions,
   MarkdownCommands,
   MarkdownEditorConfig,
+  MarkdownContentAttributes,
+  MarkdownEditorHandle,
   MarkdownHeadingLevel,
+  MarkdownHeadingOptions,
   MarkdownImageOptions,
   MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
@@ -120,16 +125,21 @@ import type {
   MarkdownReferenceResolution,
   MarkdownSlashCommandOptions,
   MarkdownState,
+  MarkdownTableLayoutOptions,
   MarkdownTargetResolution,
   MarkdownTargetResolverContext,
 } from '../types.js'
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 export type {
+  MarkdownEditorHandle,
   MarkdownCodeLabels,
   MarkdownCodeOptions,
+  MarkdownContentAttributes,
   MarkdownImageClassNames,
   MarkdownImageLabels,
   MarkdownImageOptions,
+  MarkdownHeadingOptions,
+  MarkdownTableLayoutOptions,
 } from '../types.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
@@ -194,6 +204,7 @@ export interface UseMarkdownEditorOptions {
   profile?: MarkdownProfile
   editable?: boolean
   code?: MarkdownCodeOptions
+  image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
   reference?: MarkdownReferenceOptions | false
@@ -204,10 +215,11 @@ export function useMarkdownEditor({
   profile = 'preserve',
   editable = true,
   code,
+  image,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
-}: UseMarkdownEditorOptions = {}): Editor | null {
+}: UseMarkdownEditorOptions = {}): MarkdownEditorHandle | null {
   const [referenceSource] = useState(() => new MarkdownReferenceOptionSource(reference))
   useEffect(() => {
     referenceSource.set(reference)
@@ -222,24 +234,31 @@ export function useMarkdownEditor({
   )
   const extensions = useMemo(
     () => [
-      ...createMarkdownExtensions({ profile, code }),
+      ...createMarkdownExtensions({ profile, code, image }),
       ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
       referenceExtension,
     ],
-    [code, profile, referenceExtension, slash],
+    [code, image, profile, referenceExtension, slash],
   )
 
-  return useEditor({
+  const editor = useEditor({
     extensions,
     content: initialMarkdown,
     contentType: 'markdown',
     editable,
     immediatelyRender: false,
-    onUpdate: ({ editor }) => onChange?.(editor.getMarkdown(), editor),
+    onUpdate: ({ editor }) =>
+      onChange?.(
+        serializeEditorMarkdown(editor, { profile }),
+        createMarkdownEditorHandle(editor),
+      ),
   })
+
+  return editor ? createMarkdownEditorHandle(editor) : null
 }
 
-export function useMarkdownCommands(editor: Editor | null): MarkdownCommands {
+export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownCommands {
+  const editor = getMarkdownEditor(handle)
   return useMemo(
     () =>
       editor
@@ -316,7 +335,8 @@ function readState(editor: Editor): MarkdownState {
   }
 }
 
-export function useMarkdownState(editor: Editor | null): MarkdownState | null {
+export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownState | null {
+  const editor = getMarkdownEditor(handle)
   const [state, setState] = useState<MarkdownState | null>(() => (editor ? readState(editor) : null))
 
   useEffect(() => {
@@ -479,13 +499,21 @@ export function useMarkdownReferenceResolutions(
 }
 
 export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   editable: boolean
   resolutions?: ReadonlyMap<string, MarkdownTargetResolution>
   resolvingTargets?: boolean
   referenceResolutions?: ReadonlyMap<string, MarkdownReferenceResolution>
   resolvingReferences?: boolean
   image?: MarkdownImageOptions
+  /** Classes applied to the package-owned editor content element. */
+  contentClassName?: string
+  /** Attributes applied to the package-owned editor content element. */
+  contentAttributes?: MarkdownContentAttributes
+  /** Presentation-only heading normalization for viewer integrations. */
+  headings?: MarkdownHeadingOptions
+  /** Presentation-only table sizing and scroll behavior for viewer integrations. */
+  tableLayout?: MarkdownTableLayoutOptions
   children?: ReactNode
 }
 
@@ -520,19 +548,208 @@ function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
 }
 
 export function MarkdownSurface({
-  editor,
+  editor: editorHandle,
   editable,
   resolutions = EMPTY_RESOLUTIONS,
   resolvingTargets = false,
   referenceResolutions = EMPTY_REFERENCE_RESOLUTIONS,
   resolvingReferences = false,
   image,
+  contentClassName,
+  contentAttributes,
+  headings,
+  tableLayout,
   children,
   ...props
 }: MarkdownSurfaceProps) {
+  const editor = getMarkdownEditor(editorHandle)
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
   }, [editor])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root) return
+
+    const addedClasses = (contentClassName ?? '').split(/\s+/).filter(Boolean).filter(
+      className => !root.classList.contains(className),
+    )
+    root.classList.add(...addedClasses)
+
+    const previousAttributes = new Map<string, string | null>()
+    for (const [name, value] of Object.entries(contentAttributes ?? {})) {
+      previousAttributes.set(name, root.getAttribute(name))
+      if (value === null || value === undefined) root.removeAttribute(name)
+      else root.setAttribute(name, String(value))
+    }
+
+    return () => {
+      root.classList.remove(...addedClasses)
+      for (const [name, value] of previousAttributes) {
+        if (value === null) root.removeAttribute(name)
+        else root.setAttribute(name, value)
+      }
+    }
+  }, [contentAttributes, contentClassName, editor])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root || editable || !headings) return
+
+    const managed = new Map<HTMLElement, { tagName: string; id: string | null }>()
+    const apply = () => {
+      const offset = Math.trunc(headings.levelOffset ?? 0)
+      root.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6').forEach((heading, index) => {
+        const original = managed.get(heading) ?? {
+          tagName: heading.tagName.toLowerCase(),
+          id: heading.getAttribute('id'),
+        }
+        managed.set(heading, original)
+        const sourceLevel = Number(original.tagName.slice(1))
+        const nextLevel = Math.max(1, Math.min(6, sourceLevel + offset))
+        let target = heading
+        const tagName = `h${nextLevel}`
+        if (heading.tagName.toLowerCase() !== tagName) {
+          const replacement = root.ownerDocument.createElement(tagName)
+          for (const attribute of Array.from(heading.attributes)) {
+            replacement.setAttribute(attribute.name, attribute.value)
+          }
+          replacement.innerHTML = heading.innerHTML
+          heading.replaceWith(replacement)
+          managed.delete(heading)
+          managed.set(replacement, original)
+          target = replacement
+        }
+        const id = headings.ids?.[index]
+        if (id) target.id = id
+        else if (original.id === null) target.removeAttribute('id')
+        else target.id = original.id
+      })
+    }
+
+    const restore = () => {
+      for (const [heading, original] of managed) {
+        if (!heading.isConnected) continue
+        let target = heading
+        if (heading.tagName.toLowerCase() !== original.tagName) {
+          const replacement = root.ownerDocument.createElement(original.tagName)
+          for (const attribute of Array.from(heading.attributes)) {
+            replacement.setAttribute(attribute.name, attribute.value)
+          }
+          replacement.innerHTML = heading.innerHTML
+          heading.replaceWith(replacement)
+          target = replacement
+        }
+        if (original.id === null) target.removeAttribute('id')
+        else target.id = original.id
+      }
+    }
+
+    apply()
+    editor.on('transaction', apply)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(apply)
+    observer?.observe(root, { childList: true, subtree: true })
+
+    return () => {
+      editor.off('transaction', apply)
+      observer?.disconnect()
+      restore()
+    }
+  }, [editable, editor, headings])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root || editable || !tableLayout) return
+
+    const tableClasses = (tableLayout.className ?? '').split(/\s+/).filter(Boolean)
+    const wrapperClasses = (tableLayout.wrapperClassName ?? '').split(/\s+/).filter(Boolean)
+    const addedTableClasses = new Map<HTMLTableElement, string[]>()
+    const managedWrappers = new Map<
+      HTMLDivElement,
+      {
+        table: HTMLTableElement
+        created: boolean
+        addedClasses: string[]
+        attributes: Record<'tabindex' | 'role' | 'aria-label', string | null>
+      }
+    >()
+    const apply = () => {
+      for (const table of root.querySelectorAll<HTMLTableElement>('table')) {
+        const addedClasses = addedTableClasses.get(table) ?? tableClasses.filter(
+          className => !table.classList.contains(className),
+        )
+        table.classList.add(...addedClasses)
+        addedTableClasses.set(table, addedClasses)
+        let wrapper = table.parentElement?.dataset.markdownTableWrapper === 'true'
+          ? table.parentElement as HTMLDivElement
+          : null
+        let created = false
+        if (!wrapper) {
+          wrapper = root.ownerDocument.createElement('div')
+          wrapper.dataset.markdownTableWrapper = 'true'
+          table.replaceWith(wrapper)
+          wrapper.append(table)
+          created = true
+        }
+        if (!managedWrappers.has(wrapper)) {
+          managedWrappers.set(wrapper, {
+            table,
+            created,
+            addedClasses: wrapperClasses.filter(className => !wrapper.classList.contains(className)),
+            attributes: {
+              tabindex: wrapper.getAttribute('tabindex'),
+              role: wrapper.getAttribute('role'),
+              'aria-label': wrapper.getAttribute('aria-label'),
+            },
+          })
+        }
+        const managed = managedWrappers.get(wrapper)!
+        wrapper.classList.add(...managed.addedClasses)
+        wrapper.tabIndex = 0
+        wrapper.setAttribute('role', 'region')
+        wrapper.setAttribute('aria-label', tableLayout.ariaLabel ?? 'Scrollable table')
+      }
+    }
+
+    apply()
+    editor.on('transaction', apply)
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(apply)
+    observer?.observe(root, { childList: true, subtree: true })
+
+    return () => {
+      editor.off('transaction', apply)
+      observer?.disconnect()
+      for (const [table, classes] of addedTableClasses) {
+        table.classList.remove(...classes)
+      }
+      for (const [wrapper, managed] of managedWrappers) {
+        wrapper.classList.remove(...managed.addedClasses)
+        for (const [name, value] of Object.entries(managed.attributes)) {
+          if (value === null) wrapper.removeAttribute(name)
+          else wrapper.setAttribute(name, value)
+        }
+        if (managed.created && wrapper.dataset.markdownTableWrapper === 'true') {
+          wrapper.replaceWith(managed.table)
+        }
+      }
+    }
+  }, [editable, editor, tableLayout])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
+    if (!root) return
+
+    root.querySelectorAll<HTMLImageElement>('img[data-markdown-image], img[data-markdown-target]').forEach(
+      element => {
+        if (image?.referrerPolicy) element.setAttribute('referrerpolicy', image.referrerPolicy)
+        else element.removeAttribute('referrerpolicy')
+      },
+    )
+  }, [editor, image?.referrerPolicy])
 
   useEffect(() => {
     const root = editor?.view.dom
@@ -584,6 +801,8 @@ export function MarkdownSurface({
       element.style.display = 'block'
       element.style.maxWidth = '100%'
       element.style.height = 'auto'
+      if (image?.referrerPolicy) element.setAttribute('referrerpolicy', image.referrerPolicy)
+      else element.removeAttribute('referrerpolicy')
       frame.dataset.markdownImageState = state
       frame.dataset.markdownTarget = target
       element.dataset.markdownTarget = target
@@ -1054,12 +1273,13 @@ const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
 }
 
 export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   markdown: string
   profile?: MarkdownProfile
-  onSourceChange?: (markdown: string, editor: Editor) => void
-  onMarkdownApplied?: (editor: Editor) => void
+  onSourceChange?: (markdown: string, editor: MarkdownEditorHandle) => void
+  onMarkdownApplied?: (editor: MarkdownEditorHandle) => void
   readOnly?: boolean
+  autoFocus?: boolean
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
   table?: MarkdownTableOptions
@@ -1083,12 +1303,13 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
  * owns mode switching, source synchronization, focus, and the shared source UI.
  */
 export function MarkdownEditingSurface({
-  editor,
+  editor: editorHandle,
   markdown,
   profile = 'preserve',
   onSourceChange,
   onMarkdownApplied,
   readOnly = false,
+  autoFocus = false,
   modeSwitchDisabled = false,
   toolbar,
   table,
@@ -1107,7 +1328,8 @@ export function MarkdownEditingSurface({
   className,
   ...props
 }: MarkdownEditingSurfaceProps) {
-  const imageUploadController = useMarkdownImageUpload(editor, imageUpload, readOnly)
+  const editor = getMarkdownEditor(editorHandle)
+  const imageUploadController = useMarkdownImageUpload(editorHandle, imageUpload, readOnly)
   const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
   const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
   const [source, setSource] = useState(markdown)
@@ -1170,15 +1392,15 @@ export function MarkdownEditingSurface({
     lastMarkdownRef.current = markdown
     if (!editor || (mode === 'source' && sourceDirtyRef.current)) return
 
-    if (externalValueChanged && editor.getMarkdown() !== markdown) {
+    if (externalValueChanged && serializeEditorMarkdown(editor, { profile }) !== markdown) {
       editor.commands.setContent(markdown, {
         contentType: 'markdown',
         emitUpdate: false,
       })
       normalizeEditorBody(editor)
-      onMarkdownApplied?.(editor)
+      if (editorHandle) onMarkdownApplied?.(editorHandle)
     }
-  }, [editor, markdown, mode, onMarkdownApplied])
+  }, [editor, editorHandle, markdown, mode, onMarkdownApplied, profile])
 
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
@@ -1187,6 +1409,14 @@ export function MarkdownEditingSurface({
   useEffect(() => {
     if (editor && editor.isEditable !== !readOnly) editor.setEditable(!readOnly, false)
   }, [editor, readOnly])
+
+  useEffect(() => {
+    if (!autoFocus || !editor || readOnly) return
+    const frame = requestAnimationFrame(() => {
+      if (!editor.isDestroyed) editor.commands.focus()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [autoFocus, editor, readOnly])
 
   useEffect(() => {
     if (previousModeRef.current === mode) return
@@ -1206,13 +1436,16 @@ export function MarkdownEditingSurface({
       setSource(editorMarkdown)
     } else {
       const sourceMarkdown = sourceRef.current
-      if (sourceDirtyRef.current && editor.getMarkdown() !== sourceMarkdown) {
+      if (
+        sourceDirtyRef.current &&
+        serializeEditorMarkdown(editor, { profile }) !== sourceMarkdown
+      ) {
         editor.commands.setContent(sourceMarkdown, {
           contentType: 'markdown',
           emitUpdate: false,
         })
         normalizeEditorBody(editor)
-        onMarkdownApplied?.(editor)
+        if (editorHandle) onMarkdownApplied?.(editorHandle)
       }
       sourceDirtyRef.current = false
     }
@@ -1285,7 +1518,7 @@ export function MarkdownEditingSurface({
             sourceRef.current = next
             sourceDirtyRef.current = true
             setSource(next)
-            if (editor && !readOnly) onSourceChange?.(next, editor)
+            if (editorHandle && !readOnly) onSourceChange?.(next, editorHandle)
           }}
           className={
             sourceClassName ??
@@ -1330,6 +1563,11 @@ export function MarkdownEditor({
   resolverContext,
   imageMenu,
   imageUpload,
+  image,
+  contentClassName,
+  contentAttributes,
+  headings,
+  tableLayout,
   ...props
 }: MarkdownEditorProps) {
   const editor = useMarkdownEditor({
@@ -1337,6 +1575,7 @@ export function MarkdownEditor({
     profile,
     editable: !readOnly,
     code,
+    image,
     onChange,
     slash,
     reference,
@@ -1369,6 +1608,11 @@ export function MarkdownEditor({
       <MarkdownSurface
         editor={editor}
         editable={!readOnly}
+        image={image}
+        contentClassName={contentClassName}
+        contentAttributes={contentAttributes}
+        headings={headings}
+        tableLayout={tableLayout}
         resolutions={resolutions}
         resolvingTargets={Boolean(adapters?.targetResolver)}
         referenceResolutions={referenceResolutions}
@@ -1396,13 +1640,16 @@ export function MarkdownViewer({
   resolverContext,
   ...props
 }: MarkdownViewerProps) {
+  const image = props.image
   const editor = useMarkdownEditor({
     initialMarkdown: markdown,
     profile,
     editable: false,
     code,
+    image,
     slash: false,
   })
+  const rawEditor = getMarkdownEditor(editor)
   const resolutions = useMarkdownTargetResolutions(
     markdown,
     adapters?.targetResolver,
@@ -1418,17 +1665,17 @@ export function MarkdownViewer({
   )
 
   useEffect(() => {
-    if (!editor || editor.getMarkdown() === markdown) {
+    if (!rawEditor || serializeEditorMarkdown(rawEditor, { profile }) === markdown) {
       return
     }
 
-    editor.commands.setContent(markdown, { contentType: 'markdown' })
-    normalizeEditorBody(editor)
-  }, [editor, markdown])
+    rawEditor.commands.setContent(markdown, { contentType: 'markdown' })
+    normalizeEditorBody(rawEditor)
+  }, [markdown, profile, rawEditor])
 
   useEffect(() => {
-    if (editor) normalizeEditorBody(editor)
-  }, [editor])
+    if (rawEditor) normalizeEditorBody(rawEditor)
+  }, [rawEditor])
 
   return (
     <MarkdownSurface
@@ -1442,8 +1689,6 @@ export function MarkdownViewer({
     />
   )
 }
-
-export { EditorContent }
 
 function joinClasses(...classes: Array<string | undefined>): string {
   return classes.filter(Boolean).join(' ')
@@ -1481,7 +1726,7 @@ interface MarkdownLinkSelectionSnapshot {
 }
 
 export interface MarkdownLinkPopupProps {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   open: boolean
   onOpenChange: (open: boolean) => void
   /** Product-specific canonicalization and URL policy. */
@@ -1502,7 +1747,7 @@ export interface MarkdownLinkPopupProps {
  * consumers never need to assemble Tiptap commands themselves.
  */
 export function MarkdownLinkPopup({
-  editor,
+  editor: editorHandle,
   open,
   onOpenChange,
   normalizeUrl = normalizeMarkdownLinkUrl,
@@ -1513,8 +1758,9 @@ export function MarkdownLinkPopup({
   labels,
   className,
 }: MarkdownLinkPopupProps) {
+  const editor = getMarkdownEditor(editorHandle)
   const copy = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...labels }
-  const commands = useMarkdownCommands(editor)
+  const commands = useMarkdownCommands(editorHandle)
   const urlInputRef = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const snapshotRef = useRef<MarkdownLinkSelectionSnapshot | null>(null)
@@ -1804,7 +2050,7 @@ export function MarkdownToolbarGroup({
 }
 
 export interface MarkdownToolbarProps {
-  editor: Editor | null
+  editor: MarkdownEditorHandle | null
   children?: ReactNode
   className?: string
   'aria-label'?: string
@@ -1829,19 +2075,19 @@ export interface MarkdownToolbarLinkOptions {
  * state, selection preservation, and roving keyboard focus stay here.
  */
 export function MarkdownToolbar({
-  editor,
+  editor: editorHandle,
   children,
   className,
   'aria-label': ariaLabel = 'Text formatting',
   link,
   table,
 }: MarkdownToolbarProps) {
-  const state = useMarkdownState(editor)
-  const commands = useMarkdownCommands(editor)
+  const state = useMarkdownState(editorHandle)
+  const commands = useMarkdownCommands(editorHandle)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const [linkOpen, setLinkOpen] = useState(false)
   const imageUpload = useMarkdownImageUploadContext()
-  const editable = Boolean(editor && state?.isEditable)
+  const editable = Boolean(editorHandle && state?.isEditable)
   const active = state?.active
   const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
   const tableLabels: MarkdownTableLabels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...table?.labels }
@@ -2091,7 +2337,7 @@ export function MarkdownToolbar({
       </MarkdownToolbarGroup>
       {children}
       <MarkdownLinkPopup
-        editor={editor}
+        editor={editorHandle}
         open={linkOpen}
         onOpenChange={setLinkOpen}
         normalizeUrl={link?.normalizeUrl}

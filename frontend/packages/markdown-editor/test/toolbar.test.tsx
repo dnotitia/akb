@@ -1,15 +1,16 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
+import { EditorContent } from '@tiptap/react'
 import { useEffect, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  EditorContent,
   MarkdownToolbar,
   useMarkdownEditor,
   type MarkdownSearchAdapter,
   type MarkdownSearchResult,
 } from '../src/index.js'
+import { getMarkdownEditor } from '../src/react/editor-handle.js'
 
 afterEach(() => cleanup())
 
@@ -22,7 +23,7 @@ function ToolbarHarness({ editable = true }: { editable?: boolean }) {
   return (
     <>
       <MarkdownToolbar editor={editor} />
-      {editor && <EditorContent editor={editor} />}
+      {editor && <EditorContent editor={getMarkdownEditor(editor)} />}
     </>
   )
 }
@@ -35,13 +36,13 @@ function SelectionHarness() {
   })
 
   useEffect(() => {
-    if (editor) editor.commands.setTextSelection({ from: 1, to: 5 })
+    getMarkdownEditor(editor)?.commands.setTextSelection({ from: 1, to: 5 })
   }, [editor])
 
   return (
     <>
       <MarkdownToolbar editor={editor} />
-      {editor && <EditorContent editor={editor} />}
+      {editor && <EditorContent editor={getMarkdownEditor(editor)} />}
       <output data-testid="markdown">{markdown}</output>
     </>
   )
@@ -58,7 +59,7 @@ function SearchHarness({ searchAdapter, vault = 'team', selectText = false }: Se
   const editor = useMarkdownEditor({ initialMarkdown: 'text', onChange: setMarkdown })
 
   useEffect(() => {
-    if (editor) editor.commands.setTextSelection(selectText ? { from: 1, to: 5 } : { from: 1, to: 1 })
+    getMarkdownEditor(editor)?.commands.setTextSelection(selectText ? { from: 1, to: 5 } : { from: 1, to: 1 })
   }, [editor, selectText])
 
   return (
@@ -71,7 +72,7 @@ function SearchHarness({ searchAdapter, vault = 'team', selectText = false }: Se
           searchLabels: { inputLabel: 'Search Vault resources' },
         }}
       />
-      {editor && <EditorContent editor={editor} />}
+      {editor && <EditorContent editor={getMarkdownEditor(editor)} />}
       <output data-testid="markdown">{markdown}</output>
     </>
   )
@@ -172,13 +173,13 @@ describe('MarkdownToolbar', () => {
       const editor = useMarkdownEditor({ initialMarkdown: markdown, onChange: setMarkdown })
 
       useEffect(() => {
-        if (editor) editor.commands.setTextSelection({ from: 1, to: 5 })
+        getMarkdownEditor(editor)?.commands.setTextSelection({ from: 1, to: 5 })
       }, [editor])
 
       return (
         <>
           <MarkdownToolbar editor={editor} />
-          {editor && <EditorContent editor={editor} />}
+          {editor && <EditorContent editor={getMarkdownEditor(editor)} />}
           <output data-testid="markdown">{markdown}</output>
         </>
       )

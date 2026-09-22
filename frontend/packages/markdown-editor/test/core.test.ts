@@ -2,17 +2,16 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   canonicalizeMarkdown,
-  createMarkdownEditor,
   extractMarkdownReferences,
   extractMarkdownTargets,
   markdownReferenceKey,
-  markdownCommands,
   parseMarkdownReferenceToken,
   parseMarkdown,
   resolveMarkdownReferences,
   serializeMarkdown,
   uploadMarkdownBatch,
 } from '../src/index.js'
+import { createMarkdownEditor, markdownCommands } from '../src/core.js'
 import type { MarkdownAdapters } from '../src/index.js'
 
 const fixture = `# 공통 문법
@@ -285,6 +284,18 @@ describe('Markdown conformance core', () => {
     expect(commands.insertMarkdown(' 추가')).toBe(true)
     expect(commands.undo()).toBe(true)
     expect(editor.getMarkdown()).toBe('초안')
+  })
+
+  it('reports the canonical Markdown without the editor continuation paragraph', () => {
+    const changes: string[] = []
+    const target = 'https://example.com/image.png'
+    const editor = createMarkdownEditor({
+      onChange: markdown => changes.push(markdown),
+    })
+    editors.push(editor)
+
+    expect(markdownCommands(editor).insertImage(target, 'Image')).toBe(true)
+    expect(changes.at(-1)).toBe(`![Image](${target})`)
   })
 
   it('edits and deletes one image occurrence by document position with undo', () => {
