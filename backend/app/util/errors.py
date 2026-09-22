@@ -38,6 +38,8 @@ from app.exceptions import (
     ForbiddenError,
     InvalidColumnTypeError,
     NotFoundError,
+    RESERVED_SYSTEM_PATH_CODE,
+    ReservedSystemPathError,
     VAULT_NAME_UNAVAILABLE,
     ValidationError,
     WriteBusyError,
@@ -170,6 +172,8 @@ def exception_envelope(e: Exception) -> dict:
     internal error. Lives here (no import-time side effects) so it stays unit-
     testable without importing the MCP server. See dnotitia/akb#221.
     """
+    if isinstance(e, ReservedSystemPathError):
+        return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
         return err(str(e), code=PERMISSION_DENIED)
     if isinstance(e, NotFoundError):

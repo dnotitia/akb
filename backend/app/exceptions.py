@@ -129,8 +129,31 @@ class AuthenticationError(AKBError):
 
 
 class ForbiddenError(AKBError):
-    def __init__(self, message: str = "Insufficient permissions"):
-        super().__init__(message, status_code=403)
+    def __init__(
+        self,
+        message: str = "Insufficient permissions",
+        *,
+        code: str | None = None,
+        hint: str | None = None,
+        details: dict | None = None,
+    ):
+        super().__init__(
+            message,
+            status_code=403,
+            code=code,
+            hint=hint,
+            details=details,
+        )
+
+
+RESERVED_SYSTEM_PATH_CODE = "reserved_system_path"
+
+
+class ReservedSystemPathError(ForbiddenError):
+    """A write targets AKB's reserved vault-skill system namespace."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code=RESERVED_SYSTEM_PATH_CODE)
 
 
 class LocalAuthDisabledError(AKBError):
