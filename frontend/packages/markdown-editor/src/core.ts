@@ -2,7 +2,7 @@ import { Editor, type JSONContent } from '@tiptap/core'
 import { MarkdownManager } from '@tiptap/markdown'
 import { closeHistory } from '@tiptap/pm/history'
 
-import { createMarkdownExtensions } from './extensions.js'
+import { createMarkdownExtensions, parseMarkdownReferenceToken } from './extensions.js'
 import { markdownTableCommands } from './table.js'
 import type {
   MarkdownCommands,
@@ -10,9 +10,12 @@ import type {
   MarkdownEditorConfig,
   MarkdownHeadingLevel,
   MarkdownParseOptions,
+  MarkdownReferenceToken,
   MarkdownTarget,
   MarkdownTargetKind,
 } from './types.js'
+
+export { parseMarkdownReferenceToken }
 
 function managerFor(options: MarkdownParseOptions = {}): MarkdownManager {
   return new MarkdownManager({
@@ -25,7 +28,9 @@ export function parseMarkdown(
   markdown: string,
   options: MarkdownParseOptions = {},
 ): MarkdownDocument {
-  return managerFor(options).parse(markdown) as MarkdownDocument
+  const document = managerFor(options).parse(markdown) as MarkdownDocument
+  stripExcludedMarkdownReferences(document)
+  return document
 }
 
 export function serializeMarkdown(
@@ -62,6 +67,61 @@ export function canonicalizeMarkdown(
   options: MarkdownParseOptions = {},
 ): string {
   return serializeMarkdown(parseMarkdown(markdown, options), options)
+}
+
+function stripExcludedMarkdownReferences(document: MarkdownDocument): void {
+  const visit = (node: JSONContent, excluded = false) => {
+    const nodeExcluded =
+      excluded ||
+      node.type === 'codeBlock' ||
+      node.type === 'rawMarkdownBlock' ||
+      node.marks?.some(mark => mark.type === 'link' || mark.type === 'code') === true
+
+    if (nodeExcluded && node.marks) {
+      node.marks = node.marks.filter(
+        mark => mark.type !== 'markdownReference' || mark.attrs?.escaped === true,
+      )
+    }
+    for (const child of node.content ?? []) visit(child, nodeExcluded)
+  }
+
+  for (const node of document.content ?? []) visit(node)
+}
+
+/**
+ * Find the distinct person and issue tokens represented by the shared schema.
+ * Excluded Markdown regions are removed during parsing, so this function never
+ * asks a product adapter to resolve a link label or code sample.
+ */
+export function extractMarkdownReferences(markdown: string): MarkdownReferenceToken[] {
+  const document = parseMarkdown(markdown)
+  const references: MarkdownReferenceToken[] = []
+  const seen = new Set<string>()
+
+  const visit = (node: JSONContent) => {
+    if (node.type === 'text') {
+      const referenceMark = node.marks?.find(mark => mark.type === 'markdownReference')
+      if (referenceMark && referenceMark.attrs?.escaped !== true) {
+        const value = typeof node.text === 'string' ? node.text : ''
+        const reference = parseMarkdownReferenceToken(value)
+        if (reference) {
+          const key = markdownReferenceKey(reference)
+          if (!seen.has(key)) {
+            seen.add(key)
+            references.push(reference)
+          }
+        }
+      }
+    }
+    for (const child of node.content ?? []) visit(child)
+  }
+
+  for (const node of document.content ?? []) visit(node)
+  return references
+}
+
+export function markdownReferenceKey(reference: Pick<MarkdownReferenceToken, 'kind' | 'value'>): string {
+  return `${reference.kind}\u0000${reference.value}`
 }
 
 function inferTargetKind(target: string, nodeType: string): MarkdownTargetKind | null {

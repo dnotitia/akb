@@ -1,9 +1,13 @@
 import {
   MarkdownSurface,
   useMarkdownEditor,
+  useMarkdownReferenceResolutions,
   useMarkdownTargetResolutions,
 } from "@akb/markdown-editor/react";
-import type { MarkdownTargetResolver } from "@akb/markdown-editor";
+import type {
+  MarkdownReferenceAdapter,
+  MarkdownTargetResolver,
+} from "@akb/markdown-editor";
 import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import "katex/dist/katex.min.css";
 import {
@@ -100,11 +104,13 @@ function CommonMarkdownViewer({
   className,
   resolver,
   resolverContext,
+  referenceAdapter,
 }: {
   markdown: string;
   className?: string;
   resolver?: MarkdownTargetResolver;
   resolverContext?: { vault?: string; document?: string; commit?: string };
+  referenceAdapter?: MarkdownReferenceAdapter;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const editor = useMarkdownEditor({
@@ -115,6 +121,11 @@ function CommonMarkdownViewer({
   const resolutions = useMarkdownTargetResolutions(
     markdown,
     resolver,
+    resolverContext,
+  );
+  const referenceResolutions = useMarkdownReferenceResolutions(
+    markdown,
+    referenceAdapter,
     resolverContext,
   );
 
@@ -138,6 +149,8 @@ function CommonMarkdownViewer({
         editable={false}
         resolutions={resolutions}
         resolvingTargets={Boolean(resolver)}
+        referenceResolutions={referenceResolutions}
+        resolvingReferences={Boolean(referenceAdapter?.resolve)}
       />
     </div>
   );
@@ -181,6 +194,7 @@ export function MarkdownRender({
       markdown={body}
       className={className}
       resolver={resolver}
+      referenceAdapter={adapters?.reference}
       resolverContext={
         authenticated
           ? {

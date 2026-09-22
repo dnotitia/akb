@@ -16,6 +16,7 @@ import {
   useMarkdownState,
 } from '../src/index.js'
 import type {
+  MarkdownReferenceAdapter,
   MarkdownTargetResolution,
   MarkdownTargetResolver,
   MarkdownTargetResolverContext,
@@ -124,6 +125,49 @@ describe('React surfaces', () => {
     expect(link).toHaveAttribute('href', '#')
     expect(link).toHaveAttribute('data-markdown-resolution', 'pending')
     expect(activeEditor!.getMarkdown()).toBe(markdown)
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('shares reference display between editor and viewer without serializing runtime data', async () => {
+    const markdown = '@alice REEF-123'
+    const adapter: MarkdownReferenceAdapter = {
+      search: async () => [],
+      resolve: vi.fn(async reference => ({
+        ...reference,
+        status: 'available' as const,
+        title: reference.kind === 'person' ? 'Ada Lovelace' : 'Reference issue',
+        runtimeUrl:
+          reference.kind === 'person' ? '/people/alice' : '/issues/REEF-123',
+      })),
+    }
+    const onChange = vi.fn()
+    const { container } = render(
+      <>
+        <MarkdownEditor
+          markdown={markdown}
+          onChange={onChange}
+          reference={{ adapter }}
+        />
+        <MarkdownViewer markdown={markdown} reference={{ adapter }} />
+      </>,
+    )
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]')).toHaveLength(4)
+    })
+
+    const editorReferences = container.querySelectorAll<HTMLElement>(
+      '.ProseMirror[data-placeholder] [data-markdown-reference], .ProseMirror [data-markdown-reference]',
+    )
+    expect(editorReferences).toHaveLength(4)
+    expect(editorReferences[0]).toHaveAttribute('href', '/people/alice')
+    expect(editorReferences[0]).toHaveAttribute('data-markdown-reference-title', 'Ada Lovelace')
+    expect(editorReferences[0]).toHaveTextContent('@aliceAda Lovelace')
+    expect(editorReferences[1]).toHaveAttribute('href', '/issues/REEF-123')
+    expect(editorReferences[1]).toHaveTextContent('REEF-123Reference issue')
+    const editorClick = new MouseEvent('click', { bubbles: true, cancelable: true })
+    editorReferences[0]?.dispatchEvent(editorClick)
+    expect(editorClick.defaultPrevented).toBe(true)
     expect(onChange).not.toHaveBeenCalled()
   })
 

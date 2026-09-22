@@ -9,6 +9,10 @@ import type {
   MarkdownUploadBatchResult,
   MarkdownUploadContext,
   MarkdownUploadItem,
+  MarkdownReferenceAdapter,
+  MarkdownReferenceContext,
+  MarkdownReferenceResolution,
+  MarkdownReferenceToken,
 } from './types.js'
 
 function adapterError(error: unknown): MarkdownAdapterError {
@@ -163,6 +167,58 @@ export async function resolveMarkdownTargets(
             status: 'unavailable',
             reason: 'unknown',
           } satisfies MarkdownTargetResolution,
+        ] as const
+      }
+    }),
+  )
+
+  return new Map(entries)
+}
+
+function referenceKey(reference: Pick<MarkdownReferenceToken, 'kind' | 'value'>): string {
+  return `${reference.kind}\u0000${reference.value}`
+}
+
+/**
+ * Resolve each distinct stored inline reference once. Runtime display data is
+ * returned in a separate map and never enters the Markdown document.
+ */
+export async function resolveMarkdownReferences(
+  adapter: MarkdownReferenceAdapter,
+  references: readonly MarkdownReferenceToken[],
+  context: MarkdownReferenceContext = {},
+): Promise<ReadonlyMap<string, MarkdownReferenceResolution>> {
+  const resolve = adapter.resolve?.bind(adapter)
+  if (!resolve) return new Map()
+
+  const unique = new Map<string, MarkdownReferenceToken>()
+  for (const reference of references) {
+    const key = referenceKey(reference)
+    if (!unique.has(key)) unique.set(key, reference)
+  }
+
+  const entries = await Promise.all(
+    [...unique.entries()].map(async ([key, reference]) => {
+      try {
+        return [
+          key,
+          await resolve(reference, {
+            vault: context.vault,
+            document: context.document,
+            commit: context.commit,
+            signal: context.signal,
+          }),
+        ] as const
+      } catch {
+        return [
+          key,
+          {
+            kind: reference.kind,
+            id: reference.id,
+            value: reference.value,
+            status: 'unavailable',
+            reason: 'unknown',
+          } satisfies MarkdownReferenceResolution,
         ] as const
       }
     }),

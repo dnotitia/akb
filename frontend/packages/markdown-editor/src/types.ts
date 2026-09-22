@@ -146,6 +146,45 @@ export interface MarkdownSearchContext {
 
 export type MarkdownReferenceKind = 'person' | 'issue' | 'document' | 'file'
 
+export type MarkdownInlineReferenceKind = Extract<MarkdownReferenceKind, 'person' | 'issue'>
+
+export interface MarkdownReferenceToken {
+  /** The product-owned entity kind represented by the stored token. */
+  kind: MarkdownInlineReferenceKind
+  /** Product identity used for adapter lookup, never a runtime URL. */
+  id: string
+  /** Exact canonical Markdown token as authored. */
+  value: string
+}
+
+export type MarkdownReferenceUnavailableReason =
+  | 'inaccessible'
+  | 'deleted'
+  | 'unsupported'
+  | 'unknown'
+
+export type MarkdownReferenceResolution =
+  | {
+      kind: MarkdownInlineReferenceKind
+      id: string
+      value: string
+      status: 'available'
+      /** Product display name; it is never serialized into Markdown. */
+      title: string
+      subtitle?: string
+      /** Short-lived product route; it is never serialized into Markdown. */
+      runtimeUrl?: string
+    }
+  | {
+      kind: MarkdownInlineReferenceKind
+      id: string
+      value: string
+      status: 'unavailable'
+      reason: MarkdownReferenceUnavailableReason
+      /** Optional product-provided explanation for accessible UI. */
+      title?: string
+    }
+
 /**
  * A candidate returned by the product's common `@` reference search.
  *
@@ -173,6 +212,11 @@ export interface MarkdownReferenceAdapter {
     query: string,
     context?: MarkdownReferenceContext,
   ): Promise<readonly MarkdownReferenceCandidate[]>
+  /** Resolve one stored token without changing its canonical value. */
+  resolve?(
+    reference: MarkdownReferenceToken,
+    context?: MarkdownReferenceContext,
+  ): Promise<MarkdownReferenceResolution>
 }
 
 export interface MarkdownReferenceLabels {
@@ -245,6 +289,7 @@ export interface MarkdownTargetResolverContext {
 export interface MarkdownAdapters {
   upload?: MarkdownUploadAdapter
   search?: MarkdownSearchAdapter
+  reference?: MarkdownReferenceAdapter
   targetResolver?: MarkdownTargetResolver
 }
 

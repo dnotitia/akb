@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0
+
+- Parse and serialize the existing `@username`, `@{unsafe username}`, and plain
+  issue-ID reference syntax through the shared Markdown schema.
+- Add product-owned stored-reference resolution for display names and runtime
+  routes without changing canonical Markdown or editor history.
+- Connect the same reference presentation to `MarkdownEditor` and
+  `MarkdownViewer`, preserving unresolved, escaped, link-label, and code text.
+
 ## 0.11.0
 
 - Add the public `MarkdownSurface` image renderer shared by editor and viewer
