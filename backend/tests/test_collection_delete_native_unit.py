@@ -50,7 +50,12 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     monkeypatch.setattr(
         "app.services.document_counters.native_documents_are_authoritative", lambda: native,
     )
-    for name in ("delete_document_chunks", "delete_document_relations", "emit_event"):
+    for name in (
+        "delete_document_chunks",
+        "delete_document_relations",
+        "delete_native_document_edges",
+        "emit_event",
+    ):
         monkeypatch.setattr(collection_service, name, AsyncMock())
     legacy_delete = AsyncMock(return_value=True)
     monkeypatch.setattr(collection_service.DocumentRepository, "delete_with_publications", legacy_delete)

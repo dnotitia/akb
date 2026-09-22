@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from itertools import zip_longest
-from typing import Literal, get_args
+from typing import Literal, NamedTuple, get_args
 
 from markdown_it import MarkdownIt
 
@@ -222,8 +222,15 @@ async def store_document_relations(
     related_to: list[str],
     implements: list[str],
     body_content: str,
+    source_resource_id: uuid.UUID | None = None,
 ) -> int:
     """Store all edges from a document: frontmatter fields + markdown body links.
+
+    ``source_resource_id`` is the native ledger's identity for the writing
+    document, when the native arm owns it. Passing it scopes the implicit
+    clear below to THIS resource instead of to whatever currently answers at
+    ``doc_path`` — a moved resource's rewrite would otherwise erase the
+    implicit edges of the resource that has since taken the freed path.
 
     Returns total number of edges stored.
     """
@@ -232,29 +239,45 @@ async def store_document_relations(
     # Delete only IMPLICIT edges — frontmatter+body links are the source
     # of truth for those, but explicit (akb_link) edges must survive a
     # rewrite. Without the kind filter every akb_update destroys them.
-    await conn.execute(
-        "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
-        source,
-    )
+    #
+    # Scoped by identity when we have one: that also covers the rows this
+    # resource still owns under a PREVIOUS path, so a move needs no separate
+    # old-path sweep. The URI arm stays for rows that predate identity
+    # stamping, and is restricted to rows no resource has claimed.
+    if source_resource_id is not None:
+        await conn.execute(
+            """
+            DELETE FROM edges
+             WHERE vault_id = $1 AND kind = 'implicit'
+               AND (source_resource_id = $2
+                    OR (source_resource_id IS NULL AND source_uri = $3))
+            """,
+            vault_id, source_resource_id, source,
+        )
+    else:
+        await conn.execute(
+            "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
+            source,
+        )
 
     count = 0
 
     for target_ref in depends_on:
-        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "depends_on"):
+        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "depends_on", source_resource_id):
             count += 1
 
     for target_ref in related_to:
-        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "related_to"):
+        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "related_to", source_resource_id):
             count += 1
 
     for target_ref in implements:
-        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "implements"):
+        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "implements", source_resource_id):
             count += 1
 
     # Body markdown links
     body_links = extract_markdown_links(body_content)
     for target_ref in body_links:
-        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "links_to"):
+        if await _store_edge(conn, vault_id, vault_name, source, "doc", target_ref, "links_to", source_resource_id):
             count += 1
 
     if count > 0:
@@ -275,21 +298,6 @@ async def delete_document_relations(conn, vault_name: str, doc_path: str) -> Non
     """Remove all edges involving a document (by vault name and path)."""
     uri = doc_uri(vault_name, doc_path)
     await delete_resource_edges(conn, uri)
-
-
-async def delete_implicit_document_relations(conn, vault_name: str, doc_path: str) -> None:
-    """Drop only the body/frontmatter-derived edges a document owns at ``doc_path``.
-
-    `store_document_relations` clears the implicit rows under the URI it is
-    about to rewrite, which leaves the rows the document owned under a PREVIOUS
-    path when it moves. The derived rewrite calls this for the path it is
-    replacing; explicit `akb_link` rows are never touched — they are carried to
-    the new URI by :func:`relink_resource_edges`, not deleted.
-    """
-    await conn.execute(
-        "DELETE FROM edges WHERE source_uri = $1 AND kind = 'implicit'",
-        doc_uri(vault_name, doc_path),
-    )
 
 
 async def _relink_edge_column(conn, vault_id, column: str, old_uri: str, new_uri: str) -> None:
@@ -332,6 +340,172 @@ async def relink_resource_edges(conn, vault_id, old_uri: str, new_uri: str) -> N
     """
     await _relink_edge_column(conn, vault_id, "source_uri", old_uri, new_uri)
     await _relink_edge_column(conn, vault_id, "target_uri", old_uri, new_uri)
+
+
+# ── Identity-anchored maintenance (native arm) ────────────────
+#
+# The helpers above find a resource's edges by the URI its path spells. That
+# holds on the bare-Git arm, where the `documents` row and the path it owns are
+# deleted in one transaction. It does not hold on `postgres_native`: identity is
+# `native_resources.resource_id`, `current_path` is mutable, a freed path can be
+# taken over by a DIFFERENT resource, and the graph work runs after the
+# authoritative commit — so "the edges at this URI" and "this resource's edges"
+# are two different sets exactly when it matters (akb#654, akb#655).
+#
+# These find rows by identity instead, and write the resource's CURRENT path
+# rather than replaying an old→new transition. That is what makes them safe to
+# run late, twice, or out of order.
+
+
+async def _repoint_edge_column(
+    conn, vault_id, column: str, id_column: str,
+    resource_id: uuid.UUID, new_uri: str,
+) -> None:
+    """Set ``column`` to ``new_uri`` on every edge owned by ``resource_id``.
+
+    Same duplicate handling as :func:`_relink_edge_column`: a row that would
+    collide with an edge already present at ``new_uri`` is skipped by the
+    UNIQUE guard and then dropped, because it IS that duplicate. ``column`` and
+    ``id_column`` come from a fixed internal set, so the f-string interpolation
+    is not an injection surface.
+    """
+    other = "target_uri" if column == "source_uri" else "source_uri"
+    await conn.execute(
+        f"""
+        UPDATE edges e SET {column} = $1
+         WHERE e.vault_id = $2 AND e.{id_column} = $3 AND e.{column} <> $1
+           AND NOT EXISTS (
+             SELECT 1 FROM edges x
+              WHERE x.vault_id = $2 AND x.{column} = $1
+                AND x.{other} = e.{other}
+                AND x.relation_type = e.relation_type)
+        """,
+        new_uri, vault_id, resource_id,
+    )
+    await conn.execute(
+        f"DELETE FROM edges WHERE vault_id = $1 AND {id_column} = $2 AND {column} <> $3",
+        vault_id, resource_id, new_uri,
+    )
+
+
+async def adopt_native_document_edges(
+    conn, vault_id, vault_name: str, resource_id: uuid.UUID, path: str,
+) -> None:
+    """Claim the unstamped edges at ``path`` for ``resource_id``.
+
+    Every edge written since identity stamping carries its endpoint's id, but
+    rows older than migration 112 — and rows whose path the backfill could not
+    attribute — carry none, and identity-keyed maintenance would walk straight
+    past them. A move knows one path this resource certainly used to hold, so
+    it can adopt what is sitting there.
+
+    Refused when anyone else could own those rows: a live native resource at
+    that path means they are ITS rows (that is the akb#654 shape), and a legacy
+    catalog row there means the bare-Git arm is the owner. Adoption is a repair
+    for rows nobody claims, never a transfer.
+    """
+    live = await conn.fetchval(
+        "SELECT 1 FROM native_resources WHERE namespace_id = $1 "
+        "AND surface = 'document' AND lifecycle = 'live' AND current_path = $2",
+        vault_id, path,
+    )
+    if live:
+        return
+    legacy = await conn.fetchval(_DOC_EXISTS_LEGACY, vault_id, path)
+    if legacy:
+        return
+    uri = doc_uri(vault_name, path)
+    await conn.execute(
+        "UPDATE edges SET source_resource_id = $1 WHERE vault_id = $2 "
+        "AND source_uri = $3 AND source_type = 'doc' AND source_resource_id IS NULL",
+        resource_id, vault_id, uri,
+    )
+    await conn.execute(
+        "UPDATE edges SET target_resource_id = $1 WHERE vault_id = $2 "
+        "AND target_uri = $3 AND target_type = 'doc' AND target_resource_id IS NULL",
+        resource_id, vault_id, uri,
+    )
+
+
+async def sync_native_document_edge_uris(
+    conn, vault_id, vault_name: str, resource_id: uuid.UUID, path: str,
+    *, adopt_path: str | None = None,
+) -> None:
+    """Point every edge this native document owns at its current ``path``.
+
+    Convergent, not transitional. `relink_resource_edges` replays one
+    old→new step, so two moves whose post-commit hooks finish in the opposite
+    order leave the edge on the intermediate path: the delayed A→B hook
+    rewrites an endpoint the B→C hook had already carried to C (akb#655).
+    The transition is not replayed here — the caller reads the resource's head
+    path under its row lock and passes that, so a late or repeated run writes
+    the same value the timely one did.
+
+    ``adopt_path`` is a path this resource is known to have held; unclaimed
+    rows there are adopted first, so an edge older than identity stamping still
+    moves. See :func:`adopt_native_document_edges` for when that is refused.
+    """
+    if adopt_path is not None and adopt_path != path:
+        await adopt_native_document_edges(
+            conn, vault_id, vault_name, resource_id, adopt_path,
+        )
+    new_uri = doc_uri(vault_name, path)
+    await _repoint_edge_column(
+        conn, vault_id, "source_uri", "source_resource_id", resource_id, new_uri,
+    )
+    await _repoint_edge_column(
+        conn, vault_id, "target_uri", "target_resource_id", resource_id, new_uri,
+    )
+
+
+async def delete_native_document_edges(
+    conn, vault_id, vault_name: str, resource_id: uuid.UUID, path: str,
+) -> None:
+    """Remove every edge a deleted native document was an endpoint of.
+
+    Two passes, and both are needed:
+
+    1. By identity — the rows this resource owns, whatever path they name.
+       This is the whole set for anything written since identity stamping,
+       and it is why a delayed delete no longer reaches a replacement
+       document's links (akb#654).
+    2. By URI, but only for rows carrying no identity AND only while NOBODY
+       owns the path. Those are the rows that predate stamping; leaving them
+       behind when the path is genuinely gone would be the opposite defect —
+       a deleted document keeping its edges. "Nobody" means neither a live
+       native replacement (the akb#654 shape) nor a legacy catalog row: a
+       cutover leaves pre-cutover documents in `documents`, and
+       `_resolve_document_endpoint` answers with the legacy row first, so an
+       edge at that URI is the legacy document's. The unconditional
+       `delete_document_relations` this replaces erased those too.
+    """
+    await conn.execute(
+        """
+        DELETE FROM edges
+         WHERE vault_id = $1
+           AND (source_resource_id = $2 OR target_resource_id = $2)
+        """,
+        vault_id, resource_id,
+    )
+    replacement = await conn.fetchval(
+        "SELECT 1 FROM native_resources WHERE namespace_id = $1 "
+        "AND surface = 'document' AND lifecycle = 'live' AND current_path = $2",
+        vault_id, path,
+    )
+    if replacement:
+        return
+    if await conn.fetchval(_DOC_EXISTS_LEGACY, vault_id, path):
+        return
+    uri = doc_uri(vault_name, path)
+    await conn.execute(
+        """
+        DELETE FROM edges
+         WHERE vault_id = $1
+           AND ((source_uri = $2 AND source_resource_id IS NULL)
+                OR (target_uri = $2 AND target_resource_id IS NULL))
+        """,
+        vault_id, uri,
+    )
 
 
 # ── Explicit link/unlink (agent-driven) ───────────────────────
@@ -449,25 +623,40 @@ async def link_resources(
             ):
                 await acquire_path_lock(conn, vid, ident)
 
-            if not await _resource_exists(
-                conn, vault_id, source_type, source_id,
-            ):
+            # Doc endpoints resolve rather than merely exist: the resolution
+            # carries the native ledger's identity, and an explicit link is
+            # precisely the edge that must survive the target being moved.
+            source_resource_id: uuid.UUID | None = None
+            target_resource_id: uuid.UUID | None = None
+            if source_type == "doc":
+                endpoint = await _resolve_document_endpoint(conn, vault_id, source_id)
+                if endpoint is None:
+                    return err(f"Source resource not found: {source_uri}", code=NOT_FOUND)
+                source_resource_id = endpoint.resource_id
+            elif not await _resource_exists(conn, vault_id, source_type, source_id):
                 return err(f"Source resource not found: {source_uri}", code=NOT_FOUND)
-            if not await _resource_exists(
-                conn, vault_id, target_type, target_id,
-            ):
+            if target_type == "doc":
+                endpoint = await _resolve_document_endpoint(conn, vault_id, target_id)
+                if endpoint is None:
+                    return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
+                target_resource_id = endpoint.resource_id
+            elif not await _resource_exists(conn, vault_id, target_type, target_id):
                 return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
 
             await conn.execute(
                 """
                 INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
-                                   source_type, target_type, metadata, created_by, kind)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'explicit')
+                                   source_type, target_type, metadata, created_by, kind,
+                                   source_resource_id, target_resource_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'explicit', $10, $11)
                 ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
-                SET metadata = $8, created_by = $9, kind = 'explicit'
+                SET metadata = $8, created_by = $9, kind = 'explicit',
+                    source_resource_id = EXCLUDED.source_resource_id,
+                    target_resource_id = EXCLUDED.target_resource_id
                 """,
                 uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
                 source_type, target_type, json.dumps(metadata or {}), created_by,
+                source_resource_id, target_resource_id,
             )
 
     logger.info("Linked %s → %s (%s)", source_uri, target_uri, relation_type)
@@ -1233,14 +1422,38 @@ async def _batch_resolve_names(
 # ── Helpers ───────────────────────────────────────────────────
 
 _DOC_EXISTS_LEGACY = "SELECT 1 FROM documents WHERE vault_id = $1 AND path = $2"
-_DOC_EXISTS_NATIVE = (
-    "SELECT 1 FROM native_resources WHERE namespace_id = $1 "
-    "AND surface = 'document' AND lifecycle = 'live' AND current_path = $2"
+_NATIVE_DOC_SELECT = (
+    "SELECT resource_id, current_path FROM native_resources "
+    "WHERE namespace_id = $1 AND surface = 'document' AND lifecycle = 'live' "
+)
+_NATIVE_DOC_BY_PATH = _NATIVE_DOC_SELECT + "AND current_path = $2"
+# Same two arms as `DocumentRepository.match_clause`, so a reference the legacy
+# catalog would accept is accepted here too — and the substring-match ban is
+# inherited rather than restated.
+_NATIVE_DOC_BY_REF = _NATIVE_DOC_SELECT + "AND (resource_id::text = $2 OR current_path = $2)"
+_NATIVE_DOC_BY_SUFFIX = (
+    _NATIVE_DOC_SELECT + "AND current_path LIKE '%/' || $2 ESCAPE '\\' LIMIT 2"
 )
 
 
-async def _document_exists(conn, vault_id: uuid.UUID, path: str) -> bool:
-    """True when either authority serves a document at ``path``.
+class DocumentEndpoint(NamedTuple):
+    """A resolved document endpoint.
+
+    ``path`` is the canonical vault-relative path the edge URI is built from.
+    ``resource_id`` is the native ledger's stable identity for it, or None when
+    the endpoint is a legacy `documents` row — the legacy arm needs no anchor,
+    because there the catalog row and the path it owns are deleted in the same
+    transaction.
+    """
+
+    path: str
+    resource_id: uuid.UUID | None
+
+
+async def _resolve_document_endpoint(
+    conn, vault_id: uuid.UUID, path: str,
+) -> DocumentEndpoint | None:
+    """The endpoint a document at ``path`` contributes, or None.
 
     The legacy `documents` catalog is written only by the bare-Git path; on
     `postgres_native` the native arm writes `native_resources` and never
@@ -1258,12 +1471,77 @@ async def _document_exists(conn, vault_id: uuid.UUID, path: str) -> bool:
     not an endpoint; an archived one is still live here.
     """
     if await conn.fetchval(_DOC_EXISTS_LEGACY, vault_id, path):
-        return True
+        return DocumentEndpoint(path=path, resource_id=None)
     from app.services.document_counters import native_documents_are_authoritative
 
     if not native_documents_are_authoritative():
-        return False
-    return bool(await conn.fetchval(_DOC_EXISTS_NATIVE, vault_id, path))
+        return None
+    row = await conn.fetchrow(_NATIVE_DOC_BY_PATH, vault_id, path)
+    if row is None:
+        return None
+    return DocumentEndpoint(path=row["current_path"], resource_id=row["resource_id"])
+
+
+async def _resolve_document_reference(
+    conn, vault_id: uuid.UUID, ref: str,
+) -> DocumentEndpoint | None:
+    """Resolve a NON-URI document reference through the active authority.
+
+    A body's `[B](a.md)` / `[[a.md]]` and a frontmatter `depends_on: [a.md]`
+    all arrive here. Before this, they were resolved against `documents`
+    alone — so on a native installation every such reference to a
+    post-cutover document produced no edge at all, silently, while the same
+    target written as `akb://V/doc/a.md` linked fine (akb#656).
+
+    The legacy arm is asked first and is untouched: a legacy installation
+    never reaches the native lookup, and a native installation still resolves
+    its pre-cutover documents exactly as before.
+    """
+    ref = normalize_document_link_ref(ref)
+    legacy_id = await _resolve_doc_ref(conn, vault_id, ref)
+    if legacy_id is not None:
+        path = await conn.fetchval(
+            "SELECT path FROM documents WHERE id = $1", legacy_id,
+        )
+        if path:
+            return DocumentEndpoint(path=path, resource_id=None)
+
+    from app.services.document_counters import native_documents_are_authoritative
+
+    if not native_documents_are_authoritative():
+        return None
+
+    row = await conn.fetchrow(_NATIVE_DOC_BY_REF, vault_id, ref)
+    if row is not None:
+        return DocumentEndpoint(
+            path=row["current_path"], resource_id=row["resource_id"],
+        )
+
+    # Trailing-segment match, anchored at `/` exactly as the legacy arm is.
+    # Unlike the legacy arm this one REFUSES an ambiguous reference instead of
+    # returning whichever row came back first: the legacy behaviour is kept
+    # because callers depend on it, but it is a wrong-doc magnet its own
+    # docstring admits to, and a new arm should not inherit that.
+    rows = await conn.fetch(_NATIVE_DOC_BY_SUFFIX, vault_id, like_escape(ref))
+    if len(rows) == 1:
+        return DocumentEndpoint(
+            path=rows[0]["current_path"], resource_id=rows[0]["resource_id"],
+        )
+    if len(rows) > 1:
+        logger.debug(
+            "Ambiguous native document reference %r — no edge stored", ref,
+        )
+    return None
+
+
+async def _document_exists(conn, vault_id: uuid.UUID, path: str) -> bool:
+    """True when either authority serves a document at ``path``.
+
+    One population definition, shared with `_resolve_document_endpoint`, so
+    the existence check and the edge the extraction writes cannot disagree
+    about which documents are endpoints.
+    """
+    return await _resolve_document_endpoint(conn, vault_id, path) is not None
 
 
 async def _resource_exists(conn, vault_id: uuid.UUID, rtype: str, identifier: str) -> bool:
@@ -1288,6 +1566,7 @@ async def _store_edge(
     conn, vault_id: uuid.UUID, vault_name: str,
     source_uri: str, source_type: str,
     target_ref: str, relation_type: str,
+    source_resource_id: uuid.UUID | None = None,
 ) -> bool:
     """Resolve target reference and insert edge. Returns True if stored.
 
@@ -1323,38 +1602,48 @@ async def _store_edge(
             return False
         target_type = parsed.kind
         ident = parsed.identifier or ""
-        # Validate the target EXISTS before storing — via the SAME
-        # `_resource_exists` primitive the explicit akb_link path uses, so
-        # the two link paths validate identically (they differ only in
-        # policy: akb_link returns NOT_FOUND, extraction silently skips).
+        target_resource_id: uuid.UUID | None = None
+        # Validate the target EXISTS before storing — through the SAME
+        # resolution primitive the explicit akb_link path uses, so the two
+        # link paths validate identically (they differ only in policy:
+        # akb_link returns NOT_FOUND, extraction silently skips).
         # An implicit edge to a non-existent resource can never be drawn and
         # only pollutes the graph — e.g. a wikilink whose alias leaked into
         # the path (`…/x.md|Label`), or a forward reference to a doc never
         # created. The extraction path used to skip this check, which is how
         # the malformed targets got persisted.
-        if not await _resource_exists(conn, vault_id, parsed.kind, ident):
-            logger.debug(
-                "Skipping edge to nonexistent %s %r", parsed.kind, target_ref,
-            )
-            return False
-        # Rebuild from parsed parts so surface variants collapse under the
-        # edges uniqueness convention — otherwise ON CONFLICT can't dedupe.
         if parsed.kind == "doc":
-            target_uri = doc_uri(parsed.vault, ident)
-        elif parsed.kind == "table":
-            target_uri = table_uri(parsed.vault, ident, parsed.coll_path)
+            endpoint = await _resolve_document_endpoint(conn, vault_id, ident)
+            if endpoint is None:
+                logger.debug(
+                    "Skipping edge to nonexistent %s %r", parsed.kind, target_ref,
+                )
+                return False
+            # Rebuild from the resolved path so surface variants collapse under
+            # the edges uniqueness convention — otherwise ON CONFLICT can't
+            # dedupe.
+            target_uri = doc_uri(parsed.vault, endpoint.path)
+            target_resource_id = endpoint.resource_id
         else:
-            target_uri = file_uri(parsed.vault, ident, parsed.coll_path)
+            if not await _resource_exists(conn, vault_id, parsed.kind, ident):
+                logger.debug(
+                    "Skipping edge to nonexistent %s %r", parsed.kind, target_ref,
+                )
+                return False
+            if parsed.kind == "table":
+                target_uri = table_uri(parsed.vault, ident, parsed.coll_path)
+            else:
+                target_uri = file_uri(parsed.vault, ident, parsed.coll_path)
     else:
-        # Legacy: resolve as doc ref within the same vault
-        target_id = await _resolve_doc_ref(conn, vault_id, target_ref)
-        if not target_id:
+        # Non-URI reference: a body path, a wiki link, or a bare frontmatter
+        # ref. Resolved through the ACTIVE AUTHORITY — asking `documents`
+        # alone is what left every native-only target unlinked (akb#656).
+        endpoint = await _resolve_document_reference(conn, vault_id, target_ref)
+        if endpoint is None:
             return False
-        target_path = await conn.fetchval("SELECT path FROM documents WHERE id = $1", target_id)
-        if not target_path:
-            return False
-        target_uri = doc_uri(vault_name, target_path)
+        target_uri = doc_uri(vault_name, endpoint.path)
         target_type = "doc"
+        target_resource_id = endpoint.resource_id
 
     if source_uri == target_uri:
         return False
@@ -1362,12 +1651,15 @@ async def _store_edge(
     await conn.execute(
         """
         INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
-                           source_type, target_type)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT DO NOTHING
+                           source_type, target_type,
+                           source_resource_id, target_resource_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
+        SET source_resource_id = EXCLUDED.source_resource_id,
+            target_resource_id = EXCLUDED.target_resource_id
         """,
         uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
-        source_type, target_type,
+        source_type, target_type, source_resource_id, target_resource_id,
     )
     return True
 

@@ -268,8 +268,16 @@ async def test_overview_and_health_scope_counts_to_both_uri_authorities(monkeypa
 # endpoint check that only reads the legacy catalog rejects it.
 
 
+NATIVE_RESOURCE_ID = uuid.uuid4()
+
+
 class _DocCatalogConnection:
-    """Answers the two document-existence queries, tracking which ran."""
+    """Answers the two document-existence queries, tracking which ran.
+
+    The native arm returns a ROW now, not a bare 1: the endpoint check and the
+    edge write share one resolution, and the edge needs the resource identity
+    the path alone cannot carry.
+    """
 
     def __init__(self, *, legacy: bool, native: bool) -> None:
         self.legacy = legacy
@@ -280,8 +288,12 @@ class _DocCatalogConnection:
         self.queries.append(query)
         if "FROM documents" in query:
             return 1 if self.legacy else None
-        if "FROM native_resources" in query:
-            return 1 if self.native else None
+        return None
+
+    async def fetchrow(self, query: str, *args):
+        self.queries.append(query)
+        if "FROM native_resources" in query and self.native:
+            return {"resource_id": NATIVE_RESOURCE_ID, "current_path": args[1]}
         return None
 
 
@@ -295,6 +307,40 @@ async def test_native_only_document_is_a_valid_endpoint(monkeypatch):
 
     assert await kg_service._resource_exists(conn, VAULT_ID, "doc", "specs/a.md") is True
     assert any("native_resources" in q for q in conn.queries)
+
+
+@pytest.mark.asyncio
+async def test_a_native_endpoint_resolves_with_its_stable_identity(monkeypatch):
+    """The resolution the edge write uses carries the id, not just a boolean.
+
+    Lifecycle maintenance keys on that id; a resolution that returned only
+    "yes, something is there" is what left the graph keyed on a path another
+    resource can take over (akb#654 / akb#655).
+    """
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: True,
+    )
+    conn = _DocCatalogConnection(legacy=False, native=True)
+
+    endpoint = await kg_service._resolve_document_endpoint(conn, VAULT_ID, "specs/a.md")
+    assert endpoint is not None
+    assert endpoint.path == "specs/a.md"
+    assert endpoint.resource_id == NATIVE_RESOURCE_ID
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_endpoint_resolves_without_a_native_identity(monkeypatch):
+    """The bare-Git arm needs no anchor: its catalog row dies with its path."""
+    monkeypatch.setattr(
+        "app.services.document_counters.native_documents_are_authoritative",
+        lambda: True,
+    )
+    conn = _DocCatalogConnection(legacy=True, native=False)
+
+    endpoint = await kg_service._resolve_document_endpoint(conn, VAULT_ID, "specs/a.md")
+    assert endpoint is not None
+    assert endpoint.resource_id is None
 
 
 @pytest.mark.asyncio

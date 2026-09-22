@@ -640,6 +640,16 @@ CREATE TABLE IF NOT EXISTS edges (
     -- store_document_relations' DELETE-then-reinsert pattern silently destroys
     -- every akb_link-created edge on the next akb_update of the source doc.
     kind TEXT NOT NULL DEFAULT 'implicit' CHECK(kind IN ('implicit', 'explicit')),
+    -- Stable endpoint identity for the postgres_native arm, where the path in
+    -- the URI is a MUTABLE attribute another resource can take over. Lifecycle
+    -- maintenance (delete cleanup, move relink, implicit rewrite) finds rows by
+    -- this id and repoints their URI at the resource's current head path; the
+    -- URI alone would find whoever owns the path now. Holds a
+    -- native_resources.resource_id and never a legacy documents.id, and is NULL
+    -- for every endpoint the native ledger does not own. The foreign keys are
+    -- added by migration 112 — native_resources does not exist yet here.
+    source_resource_id UUID,
+    target_resource_id UUID,
     UNIQUE(source_uri, target_uri, relation_type)
 );
 
@@ -654,6 +664,11 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target_type);
 -- degree rollups). See migration 039.
 CREATE INDEX IF NOT EXISTS idx_edges_vault_source ON edges(vault_id, source_uri);
 CREATE INDEX IF NOT EXISTS idx_edges_vault_target ON edges(vault_id, target_uri);
+-- The identity columns' indexes are NOT here. This file re-runs on every boot,
+-- including against a database whose `edges` predates those columns, and
+-- `CREATE TABLE IF NOT EXISTS` does not add a column to a table that exists —
+-- so an index naming one fails the boot schema before migration 112 gets the
+-- chance to add it. Column additions and their indexes belong to the migration.
 
 -- ============================================================
 -- Resource aliases (rename/move redirects)

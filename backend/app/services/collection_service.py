@@ -24,7 +24,10 @@ from app.services.git_service import GitService
 from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
 )
-from app.services.kg_service import delete_document_relations
+from app.services.kg_service import (
+    delete_document_relations,
+    delete_native_document_edges,
+)
 from app.services.m1_file_measurement import _tombstone_native_text_file
 from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
@@ -391,7 +394,18 @@ class CollectionService:
                             subject=f"[delete-collection] {norm}",
                         )
                         await delete_document_chunks(conn, str(d["resource_id"]))
-                        await delete_document_relations(conn, vault, d["path"])
+                        # Keyed on the resource, and on the path the native
+                        # service just resolved under its own lock — NOT on
+                        # `d["path"]`, which came from the unlocked
+                        # `list_docs_under` snapshot. The publication cleanup a
+                        # few lines below already refuses that snapshot for the
+                        # same reason; the edge cleanup did not, so a document
+                        # moved since the snapshot took whichever resource now
+                        # owns that path down with it (same shape as akb#654).
+                        await delete_native_document_edges(
+                            conn, vault_id_resolved, vault,
+                            current.resource_id, current.path,
+                        )
                         continue
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])

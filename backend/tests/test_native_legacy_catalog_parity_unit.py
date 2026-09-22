@@ -21,8 +21,9 @@ VAULT_ID = uuid.uuid4()
 
 
 class _Connection:
-    def __init__(self) -> None:
+    def __init__(self, *, head_path: str | None = None) -> None:
         self.executed: list[tuple[str, tuple]] = []
+        self.head_path = head_path
 
     def transaction(self):
         @asynccontextmanager
@@ -34,6 +35,9 @@ class _Connection:
     async def execute(self, query, *args):
         self.executed.append((query, args))
         return "OK"
+
+    async def fetchval(self, _query, *_args):
+        return self.head_path
 
 
 def _pool(conn):
@@ -104,36 +108,63 @@ async def test_a_catalog_failure_does_not_fail_the_committed_write(monkeypatch, 
 
 
 @pytest.fixture
-def _recorded_relink(monkeypatch):
-    relinked: list[tuple[str, str]] = []
+def _recorded_sync(monkeypatch):
+    synced: list[tuple[uuid.UUID, str, str | None]] = []
 
-    async def _relink(_conn, _vault_id, old_uri, new_uri):
-        relinked.append((old_uri, new_uri))
+    async def _sync(_conn, _vault_id, _vault_name, resource_id, path, *, adopt_path=None):
+        synced.append((resource_id, path, adopt_path))
 
-    monkeypatch.setattr(native_documents, "relink_resource_edges", _relink)
-    return relinked
+    monkeypatch.setattr(native_documents, "sync_native_document_edge_uris", _sync)
+    return synced
 
 
-async def test_a_native_move_carries_the_documents_edges(_recorded_relink):
-    service = NativeDocumentService(pool=_pool(_Connection()))
+async def test_a_native_move_carries_the_documents_edges(_recorded_sync):
+    resource_id = uuid.uuid4()
+    service = NativeDocumentService(pool=_pool(_Connection(head_path="direction/skh/a.md")))
 
     await service._relink_moved_edges(
         VAULT_ID, VAULT, old_path="direction/pipeline/a.md", new_path="direction/skh/a.md",
+        resource_id=resource_id,
     )
 
-    assert _recorded_relink == [
-        (
-            f"akb://{VAULT}/coll/direction/pipeline/doc/a.md",
-            f"akb://{VAULT}/coll/direction/skh/doc/a.md",
-        )
-    ]
+    assert _recorded_sync == [(resource_id, "direction/skh/a.md", "direction/pipeline/a.md")]
 
 
-async def test_a_move_that_changes_nothing_touches_no_edge(_recorded_relink):
-    service = NativeDocumentService(pool=_pool(_Connection()))
+async def test_a_move_hook_writes_the_head_path_not_the_one_it_was_handed(_recorded_sync):
+    """A hook that finished late must not undo a later move (akb#655).
+
+    The endpoint written is the resource's CURRENT head path, read under its
+    row lock — never the ``new_path`` of the transition this hook belongs to.
+    Here that transition ended at `b.md` while the head has already moved on
+    to `c.md`, and `c.md` is what the graph gets.
+    """
+    resource_id = uuid.uuid4()
+    service = NativeDocumentService(pool=_pool(_Connection(head_path="c.md")))
+
+    await service._relink_moved_edges(
+        VAULT_ID, VAULT, old_path="a.md", new_path="b.md", resource_id=resource_id,
+    )
+
+    assert _recorded_sync == [(resource_id, "c.md", "a.md")]
+
+
+async def test_a_move_hook_for_a_deleted_resource_touches_no_edge(_recorded_sync):
+    """Deletion owns its own cleanup; repointing would recreate what it drops."""
+    service = NativeDocumentService(pool=_pool(_Connection(head_path=None)))
+
+    await service._relink_moved_edges(
+        VAULT_ID, VAULT, old_path="a.md", new_path="b.md", resource_id=uuid.uuid4(),
+    )
+
+    assert _recorded_sync == []
+
+
+async def test_a_move_that_changes_nothing_touches_no_edge(_recorded_sync):
+    service = NativeDocumentService(pool=_pool(_Connection(head_path="specs/a.md")))
 
     await service._relink_moved_edges(
         VAULT_ID, VAULT, old_path="specs/a.md", new_path="specs/a.md",
+        resource_id=uuid.uuid4(),
     )
 
-    assert _recorded_relink == []
+    assert _recorded_sync == []
