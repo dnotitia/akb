@@ -15,13 +15,26 @@ in, ahead of the flip, while `posting` is still serving.
     python -m scripts.backfill_bm25_vector --since '2026-09-18T12:00:00+00:00'
     python -m scripts.backfill_bm25_vector --index
 
-WHY IT NEEDS NO CURSOR AND NO DUAL WRITE
-----------------------------------------
+NULL-ONLY WORK AND CHECKPOINTED FULL SWEEPS
+-------------------------------------------
 `NULL` means "nothing has encoded this row", and the encoder writes `'{}'` for a
 document with no content-bearing terms rather than leaving it NULL — so
 `sparse_bm25 IS NULL` *is* the queue, and an interrupted run resumes by asking
-the same question again. There is no progress table to keep consistent, and
-nothing to clean up.
+the same question again. A `--since` full sweep is different: it deliberately
+revisits already-filled rows and, without a cursor, repeats that prefix after
+every interruption. Operators can opt into a database-owned checkpoint using
+`--sweep-id`, a new `--attempt-id` for each attempt, `--protect-since`, and an
+immutable `--source-revision`. A resume adds `--resume-sweep` with the same
+sweep ID and windows. The checkpoint lives beside the chunks and records only
+writer waves whose transactions all committed. A lost checkpoint reply can
+replay a bounded wave; it must never skip uncommitted rows. A FAILED attempt's
+operational ownership must be reconciled separately before any new attempt.
+
+The checkpoint records a visited prefix, not freshness. After end-of-keyspace,
+old posting writers must drain and a cursor-zero pass from the ORIGINAL
+protected timestamp must catch up rewrites, late commits and inserts behind
+the cursor. A selective table restore or independently restored main/vector
+databases needs separate recovery proof before a checkpoint can be trusted.
 
 The window is covered without teaching the write path to write both columns.
 The `posting` branch of `upsert_one` stamps `indexed_at = NOW()` on every write
@@ -95,8 +108,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import math
 import random
+import re
 import sys
 import time
 import uuid
@@ -108,6 +123,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncpg
 
 from scripts.bm25_run_lock import run_bulk_exclusive, run_exclusive
+from scripts.bm25_sweep_checkpoint import SweepCheckpoint, open_checkpoint
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
@@ -401,6 +417,7 @@ async def _pass(
     writers: int = _WRITERS,
     write_batch_size: int = _BATCH,
     write_pause_secs: float = 0.0,
+    checkpoint: SweepCheckpoint | None = None,
 ) -> int:
     """One forward sweep over the primary key.
 
@@ -414,8 +431,9 @@ async def _pass(
     sweep just filled STILL satisfies the window it was read under. Only the
     cursor moving past it stops the query from handing it back forever.
 
-    It is still not a resume cursor: nothing is persisted, and an interrupted
-    run simply sweeps again and skips whatever is already filled.
+    Without a checkpoint, the cursor is in memory only. In `--since` mode an
+    interrupted run re-reads filled rows too; it does not skip them. An
+    optional database checkpoint acknowledges only completed writer waves.
     """
     sql = f"""
         SELECT chunk_id, content, indexed_at
@@ -424,7 +442,7 @@ async def _pass(
          ORDER BY chunk_id
          LIMIT {_BATCH}
     """
-    cursor = uuid.UUID(int=0)
+    cursor = checkpoint.cursor if checkpoint is not None else uuid.UUID(int=0)
     written = 0
     seen = 0
     started = time.monotonic()
@@ -435,7 +453,7 @@ async def _pass(
             rows = await c.fetch(sql, *args)
         if not rows:
             break
-        cursor = rows[-1]["chunk_id"]
+        page_end = rows[-1]["chunk_id"]
         seen += len(rows)
         # Fixed-size write batches make the load knob independent from the
         # reader page and writer count. Run only one writer-bounded wave at a
@@ -455,16 +473,42 @@ async def _pass(
             if completed_wave and write_pause_secs:
                 await asyncio.sleep(write_pause_secs)
             wave = parts[i:i + writers]
-            written += sum(await _gather_drained(
+            wave_written = sum(await _gather_drained(
                 *(_apply(pool, schema, part) for part in wave)
             ))
+            if checkpoint is not None:
+                # _gather_drained returns only after every writer's transaction
+                # has committed. If this receipt fails, replay the wave: never
+                # infer durable progress from a partial or ambiguous write.
+                await checkpoint.advance(
+                    wave[-1][-1]["chunk_id"],
+                    sum(len(part) for part in wave),
+                    wave_written,
+                )
+            written += wave_written
             completed_wave = True
+        cursor = page_end
         elapsed = time.monotonic() - started
         print(f"\r  {seen} read · {written} written · "
               f"{seen / elapsed:.0f}/s", end="", flush=True)
     if seen:
         print()
+    if checkpoint is not None:
+        await checkpoint.mark_exhausted()
     return written
+
+
+def _encoding_contract() -> str:
+    """Fail closed on a changed backfill, tokenizer or vector-store contract."""
+    digest = hashlib.sha256()
+    for module in (sys.modules[__name__], sparse_encoder,
+                   sys.modules[PgvectorStore.__module__]):
+        if not module.__file__:
+            raise RuntimeError("BM25 encoding source file is unavailable")
+        path = Path(module.__file__)
+        digest.update(path.name.encode())
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _positive_int(value: str) -> int:
@@ -502,6 +546,16 @@ async def main() -> None:
     ap.add_argument("--since", metavar="TIMESTAMP",
                     help="re-encode rows rewritten after this instant "
                          "(ISO 8601); use the start of the previous pass")
+    ap.add_argument("--sweep-id", type=uuid.UUID,
+                    help="stable logical full-sweep UUID for database progress")
+    ap.add_argument("--attempt-id", type=uuid.UUID,
+                    help="new UUID for each checkpointed execution attempt")
+    ap.add_argument("--protect-since", metavar="TIMESTAMP",
+                    help="unchanged old-writer catch-up boundary for this sweep")
+    ap.add_argument("--source-revision", metavar="SHA",
+                    help="immutable source revision bound to the sweep")
+    ap.add_argument("--resume-sweep", action="store_true",
+                    help="claim an existing sweep with a new attempt UUID")
     ap.add_argument("--tokenizer-processes", type=int, default=None,
                     help="Kiwi process pool size (default: the app setting)")
     ap.add_argument("--writers", type=_positive_int, default=_WRITERS,
@@ -525,6 +579,23 @@ async def main() -> None:
     since = datetime.fromisoformat(args.since) if args.since else None
     if since is not None and since.tzinfo is None:
         raise SystemExit("--since needs a timezone, e.g. ...T12:00:00+00:00")
+    checkpoint_requested = any((
+        args.sweep_id, args.attempt_id, args.protect_since,
+        args.source_revision, args.resume_sweep,
+    ))
+    protect_since = None
+    if checkpoint_requested:
+        if not all((args.sweep_id, args.attempt_id, args.protect_since,
+                    args.source_revision, since)) or args.check or args.prepare or args.index:
+            raise SystemExit(
+                "checkpointed sweep requires --since, --sweep-id, --attempt-id, "
+                "--protect-since and --source-revision; it cannot use a mode flag"
+            )
+        protect_since = datetime.fromisoformat(args.protect_since)
+        if protect_since.tzinfo is None:
+            raise SystemExit("--protect-since needs a timezone")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+            raise SystemExit("--source-revision must be a full lowercase commit SHA")
 
     await init_db()
     schema = settings.vector_store_schema
@@ -563,6 +634,26 @@ async def main() -> None:
             # before this instant but commit after this sweep visits their row.
             async with pool.acquire() as c:
                 started_at = await c.fetchval("SELECT now()")
+            if protect_since is not None and protect_since >= started_at:
+                raise SystemExit("--protect-since must predate this DB run")
+
+            checkpoint = None
+            if checkpoint_requested:
+                checkpoint = await open_checkpoint(
+                    pool, schema,
+                    sweep_id=args.sweep_id,
+                    attempt_id=args.attempt_id,
+                    since=since,
+                    protect_since=protect_since,
+                    source_revision=args.source_revision,
+                    encoding_contract=_encoding_contract(),
+                    resume=args.resume_sweep,
+                )
+                print(
+                    f"  sweep {args.sweep_id} · attempt {args.attempt_id} · "
+                    f"resume after {checkpoint.cursor} · "
+                    f"{checkpoint.seen} visited, {checkpoint.written} written"
+                )
 
             sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
             try:
@@ -573,6 +664,7 @@ async def main() -> None:
                     args.writers,
                     args.write_batch_size,
                     args.write_pause_secs,
+                    checkpoint,
                 )
             finally:
                 sparse_encoder.stop_tokenizer_pool()
@@ -581,15 +673,23 @@ async def main() -> None:
             print(f"wrote {written} · {nulls} never encoded")
 
             # Re-counting the SAME --since window includes rows just written.
-            # Zero writes is a progress signal only; concurrent identity-guard
-            # skips and late commits still require final freshness verification.
-            if written == 0 and nulls == 0:
+            # End-of-keyspace is not freshness: posting writers can change a
+            # chunk behind the cursor, including a late commit from an older
+            # transaction. Never advance the protected boundary to this run's
+            # start just because a checkpointed sweep exhausted its cursor.
+            if checkpoint is not None:
+                print("  sweep exhausted, not converged; drain old-shape writers "
+                      "and verify protected-window catch-up before a shape flip.")
+                next_since = protect_since
+            elif written == 0 and nulls == 0:
                 print("  no writes or NULLs observed in this pass; final writer-drain "
                       "and freshness verification are still required before a shape flip.")
+                next_since = started_at
             else:
                 print("  not converged yet; run again with:")
+                next_since = started_at
             print(f"  python -m scripts.backfill_bm25_vector "
-                  f"--since '{started_at.isoformat()}'")
+                  f"--since '{next_since.isoformat()}'")
         if args.check:
             await execute()
         else:
