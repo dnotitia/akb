@@ -113,6 +113,22 @@ async def _intent(pool, revision_id):
     return intent
 
 
+async def _apply_migration(pool, number: int) -> None:
+    """Apply one numbered migration onto an already-built test database."""
+    import importlib.util
+
+    path = next(
+        (pathlib.Path(__file__).resolve().parents[1] / "app" / "db" / "migrations")
+        .glob(f"{number:03d}_*.py")
+    )
+    spec = importlib.util.spec_from_file_location(f"extra_migration_{number}", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    async with pool.acquire() as conn:
+        await module.migrate(conn=conn)
+
+
 async def _apply(worker, pool, revision_id):
     """Apply one resource's derived rewrite out of band, as a delayed worker would."""
     intent = await _intent(pool, revision_id)
@@ -554,6 +570,64 @@ async def test_a_legacy_catalog_reference_still_resolves_on_a_native_installatio
                 _doc("legacy.md"),
             )
         assert identity is None, "a legacy endpoint must not be stamped with a native id"
+
+
+# ── collection delete, native branch ───────────────────────────────
+
+
+async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(monkeypatch):
+    """The native branch of collection delete follows the resource, not the URI.
+
+    It used to clear by `d["path"]` — a value read from `native_resources`
+    WITHOUT a row lock, in a snapshot taken before the per-document delete
+    re-resolves the head. The publication cleanup a few lines below already
+    refuses that snapshot for exactly this reason; the edge cleanup did not.
+
+    A concurrent move is what makes the two paths differ, and that is not
+    reproducible single-threaded. What IS reproducible is the other half of
+    the same change: an edge carrying this resource's identity is cleared
+    whatever URI it names, which the path-keyed cleanup could not see.
+    """
+    from app.repositories.document_repo import CollectionRepository
+    from app.services import collection_service as coll_mod
+    from app.services import document_service as doc_mod
+    from app.services import native_document_service as native_mod
+    from app.services.collection_service import CollectionService
+
+    async with _fresh_database() as pool:
+        vault_id, native, _, source = await _setup(pool, monkeypatch)
+        # `_fresh_database` applies a hand-picked migration list; the delete
+        # emits an event, and the outbox is not on it.
+        await _apply_migration(pool, 15)
+
+        async def _get_pool():
+            return pool
+
+        for module in (coll_mod, doc_mod, native_mod):
+            monkeypatch.setattr(module, "get_pool", _get_pool)
+
+        doomed = await native.create_text(**_args(vault_id, "specs/a.md"), payload="body")
+        await CollectionRepository(pool).get_or_create(vault_id, "specs")
+
+        # One edge at the document's current URI, and one still naming a URI it
+        # has since left — both carry its identity.
+        await _explicit_edge(
+            pool, vault_id,
+            source=_doc("source.md"), target=f"akb://{VAULT}/coll/specs/doc/a.md",
+            resource_ids=(source.resource_id, doomed.resource_id),
+        )
+        await _explicit_edge(
+            pool, vault_id,
+            source=_doc("source.md"), target=f"akb://{VAULT}/coll/specs/doc/stale.md",
+            resource_ids=(source.resource_id, doomed.resource_id),
+        )
+
+        result = await CollectionService(git=object()).delete(
+            vault=VAULT, path="specs", recursive=True, agent_id="review",
+        )
+        assert result["deleted_docs"] == 1, result
+
+        assert await _edges(pool) == []
 
 
 # ── migration 112 ──────────────────────────────────────────────────
