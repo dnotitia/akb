@@ -954,6 +954,8 @@ def test_runtime_configures_local_auth_mode_keys_and_distinct_app_token_secret(t
     secret_config = yaml.safe_load(
         (runtime.config.config_dir / "secret.yaml").read_text(encoding="utf-8")
     )
+    assert app_config["document_revision_backend"] == "bare_git"
+    assert app_config["git_storage_path"] == str(runtime.config.vault_dir)
     assert app_config["auth_mode"] == "local"
     assert app_config["jwt_algorithm"] == "RS256"
     assert Path(app_config["local_session_private_key_path"]).is_file()

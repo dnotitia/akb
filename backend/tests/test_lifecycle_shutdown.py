@@ -11,14 +11,14 @@ from app.config import Settings
 
 
 def test_runtime_safety_defaults_are_explicit_and_bounded():
-    configured = Settings()
+    configured = Settings(document_revision_backend="bare_git")
 
     assert configured.tokenizer_processes == 2
     assert configured.worker_shutdown_timeout_secs == 35.0
     with pytest.raises(ValueError):
-        Settings(tokenizer_processes=0)
+        Settings(document_revision_backend="bare_git", tokenizer_processes=0)
     with pytest.raises(ValueError):
-        Settings(tokenizer_processes=5)
+        Settings(document_revision_backend="bare_git", tokenizer_processes=5)
 
 
 def test_kiwi_uses_one_native_worker_inside_each_process(monkeypatch):

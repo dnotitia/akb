@@ -1485,6 +1485,8 @@ class E2ERuntime:
             "db_name": "akb",
             "db_user": "akb",
             "public_base_url": self.config.app_origin,
+            # Existing endpoint suites exercise the legacy Bare Git contract.
+            "document_revision_backend": "bare_git",
             "git_storage_path": str(self.config.vault_dir),
             "vector_store_driver": "pgvector",
             "embed_base_url": f"http://{self.config.embed_host}:{self.config.embed_port}/v1",

@@ -1,14 +1,18 @@
 # New PostgreSQL Native installations and safe configuration upgrades
 
-The standard Compose and Kubernetes configurations continue to use Bare Git.
-Use the opt-in surfaces below for a **never-used AKB database**. Merely changing
+Settings and the recommended Compose/Kubernetes new-install paths now default
+to PostgreSQL Native. Use the prepared surfaces below for a **never-used AKB
+database**. The reusable Kubernetes base, Helm, all-in-one, standalone SSO and
+the Git-oriented CI runtime explicitly retain Bare Git. Merely changing
 `document_revision_backend` does not convert an existing database. Existing
 installations that need Native must follow the
 [explicit cutover procedure](native-revision-existing-database-cutover.md).
 
 ## Prepare and preserve installation identity
 
-Choose a prebuilt backend image pinned by digest. The following offline command
+Choose a prebuilt backend image pinned by registry digest, or build from source
+and resolve its local image ID as shown in the root quickstart. Record which
+kind of identity you used; a local image ID is not a registry digest. The following offline command
 reads an application template and its companion secret configuration, creates a
 new database UUID, and writes a **new** application configuration:
 
@@ -63,8 +67,10 @@ docker compose -p my-native-install \
   up -d --no-build postgres minio minio-bootstrap native-bootstrap backend worker
 ```
 
-The explicit service list starts the backend stack; build/start the frontend
-separately using the root README when needed. Bootstrap waits for PostgreSQL,
+The explicit service list starts the backend stack. For the complete local
+stack, first run `docker compose -p my-native-install build frontend`, then
+omit the service list in the command above. The root quickstart shows the
+complete source-build flow, File bucket initialization and recovery admin. Bootstrap waits for PostgreSQL,
 then the API waits for successful bootstrap, and the worker waits for API
 readiness. All three application processes use the same pinned image and
 read-only configuration. Their Git paths are empty, read-only tmpfs mounts;
@@ -87,7 +93,7 @@ volumes; never use `down -v` as a repair step.
 
 ## Kubernetes
 
-`deploy/k8s/native/` is an opt-in **new-install** overlay. Generate its ignored
+`deploy/k8s/native/` is the recommended **new-install** overlay. Generate its ignored
 `app.yaml` with the command above, using the Kubernetes base application's
 settings as the template and the actual companion `secret.yaml`. The base
 application YAML is the `data.app.yaml` value in `deploy/k8s/backend.yaml`.
@@ -141,7 +147,10 @@ python -m app.cli preserve-revision-config \
   --output /path/to/reviewed/app.yaml
 ```
 
-An omitted backend becomes explicit `bare_git`, matching current behavior.
+An omitted backend becomes explicit `bare_git`, matching the behavior before
+this default change. Run this step before starting the new runtime; the new
+Settings default cannot determine whether an omitted selector belonged to an
+old installation.
 Explicit selectors (including accepted historical aliases), Native identity,
 and other app values remain unchanged. Revision controls in secrets are
 rejected; move those non-secret controls into the app configuration explicitly
@@ -156,5 +165,40 @@ pair rather than editing an inactive example file.
 
 Managed deployments must persist identity and bootstrap state in their owning
 controller. A generated standalone file does not override a controller that
-reconciles its own ConfigMap. These opt-in surfaces do not change the global
-Settings default or automatically migrate managed/Legacy installations.
+reconciles its own ConfigMap. The new Settings default does not automatically migrate managed or legacy
+installations. Managed provisioning belongs to the owning controller.
+
+## Release and upgrade order
+
+This is a **breaking configuration-default change** for configurations that
+omit `document_revision_backend`. It belongs in a release that explicitly
+announces this compatibility boundary, not an unannounced patch rollout.
+The source change alone does not publish a release or deploy an environment.
+
+1. Before replacing an existing runtime, back up the active app/secret pair,
+   database (including roles/grants and authority), local-session keys, object
+   storage and retained Git data. Record the running image and actual volume names.
+2. Run `preserve-revision-config` from a version containing that command (or
+   run the new image offline with only the configuration mounted). Review its
+   output and install it as the active `app.yaml` while retaining the old copy.
+   Keep explicit Native identities, aliases and initial image receipts intact.
+3. Replace API and worker with the same candidate image. For existing Bare Git,
+   keep the base Compose files and Git volume; do not add the Native overlay.
+   For existing Native, replay bootstrap only with the persisted identity and
+   receipt. Verify readiness, existing document/history reads and a new write.
+4. If validation fails, stop the replacement processes and restore the known
+   configuration/image under the release's schema compatibility policy. Restore
+   a backup only through the documented restore procedure; never clear Native
+   authority, regenerate an identity or force Git fallback to make startup pass.
+
+Copying `app.yaml.example` directly is no longer a runnable installation: its
+Native identity fields are deliberately empty. Without preparation, Settings
+validation fails before startup. A prepared identity pointed at an old schema
+is independently rejected by bootstrap. These are protective failures, not a
+request to initialize or convert the old database.
+
+Legacy history, diff and activity compatibility remain available after an
+explicit cutover. This default change does not migrate historical Git metadata
+or authorize deleting the retained Git archive. Native template/external-Git
+capabilities remain unsupported. Helm/all-in-one/SSO are explicit legacy paths,
+not evidence that every installer now provisions Native.

@@ -40,6 +40,11 @@ from app.services.external_git_capability import (
 )
 
 
+def _legacy_settings(**overrides) -> Settings:
+    """This suite exercises the explicitly selected Bare Git capability."""
+    return Settings(**{"document_revision_backend": "bare_git", **overrides})
+
+
 # ── version parsing + config floor ───────────────────────────────────
 @pytest.mark.parametrize(
     "text, expected",
@@ -56,22 +61,22 @@ def test_parse_git_version(text, expected) -> None:
 
 def test_config_rejects_min_below_floor() -> None:
     with pytest.raises(pydantic.ValidationError) as ei:
-        Settings(external_git_min_git_version="2.30")
+        _legacy_settings(external_git_min_git_version="2.30")
     assert "2.37" in str(ei.value)
 
 
 def test_config_rejects_unparseable_min() -> None:
     with pytest.raises(pydantic.ValidationError):
-        Settings(external_git_min_git_version="latest")
+        _legacy_settings(external_git_min_git_version="latest")
 
 
 def test_config_accepts_higher_min() -> None:
-    s = Settings(external_git_min_git_version="2.40")
+    s = _legacy_settings(external_git_min_git_version="2.40")
     assert _effective_min_version(s) == (2, 40, 0)
 
 
 def test_effective_min_defaults_to_floor() -> None:
-    s = Settings()
+    s = _legacy_settings()
     assert _effective_min_version(s) == (*EXTERNAL_GIT_MIN_GIT_VERSION_FLOOR, 0)
 
 
@@ -89,7 +94,7 @@ def test_installed_git_version_missing_binary_raises() -> None:
 def test_version_gate_fast_fails_below_floor(monkeypatch) -> None:
     monkeypatch.setattr(cap, "_installed_git_version", lambda *a, **k: (2, 36, 0))
     with pytest.raises(ExternalGitCapabilityError) as ei:
-        check_external_git_capability(Settings(external_git_enabled=True))
+        check_external_git_capability(_legacy_settings(external_git_enabled=True))
     assert "below the required minimum" in str(ei.value)
 
 
@@ -170,12 +175,12 @@ def test_disabled_is_noop(monkeypatch) -> None:
     monkeypatch.setattr(cap, "_installed_git_version", _boom)
     monkeypatch.setattr(cap, "_probe_config_env", _boom)
     monkeypatch.setattr(cap, "_probe_curlopt_resolve", _boom)
-    check_external_git_capability(Settings(external_git_enabled=False))  # no raise
+    check_external_git_capability(_legacy_settings(external_git_enabled=False))  # no raise
 
 
 def test_enabled_capable_git_passes() -> None:
     # End-to-end on the real host git (>= 2.37 with a working curloptResolve).
-    check_external_git_capability(Settings(external_git_enabled=True))
+    check_external_git_capability(_legacy_settings(external_git_enabled=True))
 
 
 def test_config_env_probe_failure_fast_fails(monkeypatch) -> None:
@@ -184,11 +189,11 @@ def test_config_env_probe_failure_fast_fails(monkeypatch) -> None:
 
     monkeypatch.setattr(cap, "_probe_config_env", _raise)
     with pytest.raises(ExternalGitCapabilityError):
-        check_external_git_capability(Settings(external_git_enabled=True))
+        check_external_git_capability(_legacy_settings(external_git_enabled=True))
 
 
 def test_curlopt_resolve_failure_fast_fails(monkeypatch) -> None:
     monkeypatch.setattr(cap, "_probe_curlopt_resolve", lambda *a, **k: False)
     with pytest.raises(ExternalGitCapabilityError) as ei:
-        check_external_git_capability(Settings(external_git_enabled=True))
+        check_external_git_capability(_legacy_settings(external_git_enabled=True))
     assert "curloptResolve" in str(ei.value)

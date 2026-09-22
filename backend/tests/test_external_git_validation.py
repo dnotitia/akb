@@ -28,7 +28,7 @@ _PUBLIC_V6 = "2606:4700:4700::1111"
 
 
 def _settings(**overrides) -> Settings:
-    return Settings(**overrides)
+    return Settings(**{"document_revision_backend": "bare_git", **overrides})
 
 
 class _FakeResolver:
@@ -600,6 +600,7 @@ def test_url_path_with_equals_is_rejected():
 def test_host_rule_requires_at_least_one_port():
     with pytest.raises(Exception):
         Settings(
+            document_revision_backend="bare_git",
             external_git_host_allowlist=[
                 {"host": "h.internal", "cidrs": ["10.0.0.0/8"], "ports": []}
             ]
@@ -608,7 +609,7 @@ def test_host_rule_requires_at_least_one_port():
 
 def test_invalid_deny_cidr_rejected_at_config_load():
     with pytest.raises(Exception):
-        Settings(external_git_deny_cidrs=["not-a-cidr"])
+        Settings(document_revision_backend="bare_git", external_git_deny_cidrs=["not-a-cidr"])
 
 
 # ══ Bounded resolver — concurrency cap + no caller hang ═════

@@ -28,13 +28,40 @@ def _native_settings(tmp_path, **overrides) -> Settings:
     return Settings(**values)
 
 
-def test_omitted_selector_defaults_to_stable_bare_git(tmp_path):
+def test_omitted_selector_defaults_to_native_with_persisted_identity(tmp_path):
     from app.services.revision_backend import canonical_document_revision_backend
 
-    configured = Settings(git_storage_path=str(tmp_path))
+    values = _native_settings(tmp_path).model_dump()
+    values.pop("document_revision_backend")
+    configured = Settings(**values)
 
-    assert configured.document_revision_backend == "bare_git"
-    assert canonical_document_revision_backend(configured.document_revision_backend) == "bare_git"
+    assert configured.document_revision_backend == "postgres_native"
+    assert canonical_document_revision_backend(configured.document_revision_backend) == "postgres_native"
+
+
+def test_omitted_selector_without_identity_fails_closed():
+    with pytest.raises(ValueError, match="postgres_native requires document_revision_tenant_id"):
+        Settings()
+
+
+def test_the_refusal_names_the_remedy_for_the_configuration_it_refused():
+    """The missing field alone does not say which of the two remedies applies.
+
+    An installation that predates the default change and one that copied the
+    template both land on the same validator, and they need opposite commands.
+    """
+    with pytest.raises(ValueError) as omitted:
+        Settings()
+    assert "preserve-revision-config" in str(omitted.value)
+    assert "prepare-native-config" not in str(omitted.value)
+
+    with pytest.raises(ValueError) as declared:
+        Settings(document_revision_backend="postgres_native")
+    assert "prepare-native-config" in str(declared.value)
+    assert "preserve-revision-config" not in str(declared.value)
+
+    for raised in (omitted, declared):
+        assert "docs/operations/native-installation.md" in str(raised.value)
 
 
 @pytest.mark.parametrize(

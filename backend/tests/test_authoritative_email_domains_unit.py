@@ -15,7 +15,13 @@ from app.config import AuthModeConfigurationError, Settings
 
 
 def _settings(**overrides) -> Settings:
-    values = {"auth_mode": "sso", "keycloak_enabled": True, **overrides}
+    # Standalone SSO remains an explicit legacy installation fixture.
+    values = {
+        "document_revision_backend": "bare_git",
+        "auth_mode": "sso",
+        "keycloak_enabled": True,
+        **overrides,
+    }
     return Settings.model_validate(values)
 
 

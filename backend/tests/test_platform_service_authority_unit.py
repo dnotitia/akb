@@ -654,6 +654,7 @@ def test_the_service_authority_client_may_not_be_a_human_or_admin_client():
 
     def build(**overrides):
         values = {
+            "document_revision_backend": "bare_git",
             "auth_mode": "sso",
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth-workspace.example.com",
@@ -682,6 +683,7 @@ def test_a_service_authority_client_requires_a_configured_keycloak_authority():
 
     with pytest.raises(AuthModeConfigurationError):
         Settings(
+            document_revision_backend="bare_git",
             auth_mode="local",
             keycloak_enabled=False,
             keycloak_service_admin_client_id=SERVICE_ADMIN_CLIENT_ID,

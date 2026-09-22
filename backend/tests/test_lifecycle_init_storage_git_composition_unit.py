@@ -34,7 +34,7 @@ async def test_managed_missing_bucket_prevents_startup(monkeypatch, tmp_path):
 
 
 def _settings(tmp_path, backend: str | None = None) -> Settings:
-    values = {"git_storage_path": str(tmp_path / "vaults")}
+    values = {"git_storage_path": str(tmp_path / "vaults"), "document_revision_backend": "bare_git"}
     if backend is not None:
         values["document_revision_backend"] = backend
     if backend == "postgres_native":
@@ -116,7 +116,7 @@ def _stub_init_storage_dependencies(monkeypatch, lifecycle, settings, events: li
 
 
 @pytest.mark.parametrize("configured_backend", [None, "bare_git"])
-async def test_init_storage_default_and_explicit_bare_git_clean_stale_locks(
+async def test_init_storage_legacy_fixture_and_explicit_bare_git_clean_stale_locks(
     monkeypatch, tmp_path, configured_backend
 ):
     from app.services import lifecycle

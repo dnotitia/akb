@@ -10,6 +10,8 @@ data:
     db_port: 5432
     db_name: {{ .Values.postgres.database }}
     db_user: {{ .Values.postgres.username }}
+    # Helm profiles retain the legacy Bare Git installation contract.
+    document_revision_backend: bare_git
     git_storage_path: /data/vaults
     tokenizer_processes: {{ .Values.app.tokenizerProcesses }}
     worker_shutdown_timeout_secs: {{ .Values.app.workerShutdownTimeoutSeconds }}
