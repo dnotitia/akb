@@ -131,6 +131,14 @@ _FIRST_SLICE: tuple[tuple[str, str, str, TargetRule, str], ...] = (
 )
 
 FIRST_SLICE_LEGACY_NAMES = frozenset(item[2] for item in _FIRST_SLICE)
+FIRST_SLICE_REPLACED_NAMES = frozenset(
+    FIRST_SLICE_LEGACY_NAMES - {"akb_grep"}
+)
+
+# `akb_grep(replace=...)` is an existing mutation operation, not a read alias.
+# Its flat public name remains available only with the write-only contract built
+# by `candidate_tools`; the read half is owned by `akb_discover/grep` above.
+DEFERRED_MUTATION_NAMES = frozenset({"akb_grep"})
 
 # Coverage deliberately names what the next candidate slices own.  This is
 # data for tests/review, not a second dispatch catalog.

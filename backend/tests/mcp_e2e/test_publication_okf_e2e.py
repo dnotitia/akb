@@ -522,8 +522,13 @@ async def test_okf_sdk_round_trip_and_import_acl(
     browsed = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_browse",
-        {"vault": target_vault, "depth": -1, "content_type": "documents"},
+        "akb_discover",
+        {
+            "action": "browse",
+            "vault": target_vault,
+            "depth": -1,
+            "content_type": "documents",
+        },
     )
     imported_items = {item.get("path"): item for item in browsed.get("items", []) if item.get("type") == "document"}
     assert "specs/api-v2.md" in imported_items
@@ -531,8 +536,8 @@ async def test_okf_sdk_round_trip_and_import_acl(
     imported_spec = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_get",
-        {"uri": imported_items["specs/api-v2.md"]["uri"]},
+        "akb_document_read",
+        {"action": "get", "uri": imported_items["specs/api-v2.md"]["uri"]},
     )
     assert imported_spec.get("type") == "spec"
     assert "OKF_SPEC_MARKER" in imported_spec.get("content", "")

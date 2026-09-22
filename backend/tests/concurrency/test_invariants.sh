@@ -234,10 +234,10 @@ fi
 
 # ── INV-8: MCP version hex validation ─────────────────────────────────
 if run_inv "INV-8"; then
-  echo "▸ INV-8: MCP akb_get version=HEAD~1 rejected"
+  echo "▸ INV-8: MCP akb_document_read/get version=HEAD~1 rejected"
   R=$(mcp_call "$SID" "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"inv8\",\"title\":\"v\",\"content\":\"# a\",\"type\":\"note\"}" | mcp_result_text)
   URI8=$(echo "$R" | python3 -c 'import sys,json;print(json.load(sys.stdin)["uri"])')
-  RAW=$(mcp_call "$SID" "akb_get" "{\"uri\":\"$URI8\",\"version\":\"HEAD~1\"}")
+  RAW=$(mcp_call "$SID" "akb_document_read" "{\"action\":\"get\",\"uri\":\"$URI8\",\"version\":\"HEAD~1\"}")
   if echo "$RAW" | grep -qE '7-64.*hex|version must be'; then
     pass "INV-8 HEAD~1 rejected with hex error"
   else

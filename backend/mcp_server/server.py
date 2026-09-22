@@ -75,7 +75,8 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.operation_registry import (
-    FIRST_SLICE_LEGACY_NAMES,
+    DEFERRED_MUTATION_NAMES,
+    FIRST_SLICE_REPLACED_NAMES,
     OperationValidationError,
 )
 from mcp_server.tools import (
@@ -1774,7 +1775,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         )
         result: dict | None = (
             err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
-            if name in FIRST_SLICE_LEGACY_NAMES
+            if name in FIRST_SLICE_REPLACED_NAMES
             else None
         )
 
@@ -1993,7 +1994,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         # discriminator is consumed at the registry boundary.
         dispatch_args = {key: value for key, value in args.items() if key != "action"}
         required = candidate_spec.required_scope
-    elif name in FIRST_SLICE_LEGACY_NAMES:
+    elif name in FIRST_SLICE_REPLACED_NAMES:
         # Keep the implementation registry callable for existing internal
         # unit seams. Public call_tool dispatch rejects this replaced name
         # before reaching here, so this is not a candidate compatibility alias.
@@ -2006,6 +2007,12 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         if not handler:
             return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
         required = _required_scope(name, args)
+
+    if name in DEFERRED_MUTATION_NAMES and not isinstance(args.get("replace"), str):
+        return err(
+            "akb_grep requires a string 'replace' argument; use akb_discover/grep for read-only search",
+            code=INVALID_ARGUMENT,
+        )
 
     # OAuth scope enforcement — only when the caller's session is
     # authenticated via a Keycloak access token (oauth_scopes is a

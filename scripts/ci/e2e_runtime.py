@@ -767,7 +767,7 @@ class E2ERuntime:
             "transport": ["http", "stdio"] if self.profile.needs_stdio else ["http"],
             "selected_capabilities": list(self.selected_capabilities),
             "tool_cases": {
-                "read": "akb_list_vaults",
+                "read": "akb_discover/list_vaults",
                 "write": "akb_put",
                 "destructive": "akb_delete",
                 "comparison": "same candidate, fixture, origin and credential",
@@ -2330,14 +2330,14 @@ class E2ERuntime:
             for item in result["tools"]
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
-        required = {"akb_list_vaults", "akb_put", "akb_delete_vault"}
+        required = {"akb_discover", "akb_put", "akb_delete_vault"}
         if not required.issubset(names):
             raise ProductAssertionFailure("stdio tools/list omitted a required tool")
         self._stdio_tools_list_observed = True
 
         read_response = await self._stdio_request(
             "tools/call",
-            {"name": "akb_list_vaults", "arguments": {}},
+            {"name": "akb_discover", "arguments": {"action": "list_vaults"}},
         )
         read_result = read_response.get("result")
         if not isinstance(read_result, dict) or "error" in read_response:

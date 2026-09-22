@@ -14,7 +14,9 @@ from app.services import audit_log
 from app.services.auth_service import AuthenticatedUser
 from mcp_server.operation_registry import (
     DEFERRED_OPERATION_NAMES,
+    DEFERRED_MUTATION_NAMES,
     FIRST_SLICE_LEGACY_NAMES,
+    FIRST_SLICE_REPLACED_NAMES,
     OperationRegistry,
     OperationValidationError,
     READ_SCOPE,
@@ -34,12 +36,18 @@ def _candidate_tools() -> dict:
     return {tool.name: tool for tool in candidate_tools()}
 
 
-def test_candidate_catalog_is_registry_owned_and_read_only() -> None:
+def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
     tools = _candidate_tools()
 
     later_tools = {tool.name for tool in available_tools()} - FIRST_SLICE_LEGACY_NAMES
-    assert set(tools) == {"akb_discover", "akb_document_read", *later_tools}
-    assert FIRST_SLICE_LEGACY_NAMES.isdisjoint(tools)
+    assert set(tools) == {"akb_discover", "akb_document_read", "akb_grep", *later_tools}
+    assert FIRST_SLICE_REPLACED_NAMES.isdisjoint(tools)
+    assert DEFERRED_MUTATION_NAMES == {"akb_grep"}
+    assert "akb_grep" in tools
+    assert "replace" in tools["akb_grep"].input_schema["required"]
+    assert tools["akb_grep"].annotations is not None
+    assert tools["akb_grep"].annotations.read_only_hint is False
+    assert tools["akb_grep"].annotations.destructive_hint is True
     legacy_names = {tool.name for tool in TOOLS}
     assert FIRST_SLICE_LEGACY_NAMES.isdisjoint(DEFERRED_OPERATION_NAMES)
     assert DEFERRED_OPERATION_NAMES <= legacy_names
@@ -267,9 +275,21 @@ async def test_candidate_http_catalog_and_action_validation(
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}},
             )
             assert listed.status_code == 200
-            names = {tool["name"] for tool in listed.json()["result"]["tools"]}
+            listed_tools = listed.json()["result"]["tools"]
+            names = {tool["name"] for tool in listed_tools}
             assert {"akb_discover", "akb_document_read", "akb_help", "akb_sql"} <= names
-            assert FIRST_SLICE_LEGACY_NAMES.isdisjoint(names)
+            assert FIRST_SLICE_REPLACED_NAMES.isdisjoint(names)
+            grep = next(tool for tool in listed_tools if tool["name"] == "akb_grep")
+            assert "replace" in grep["inputSchema"]["required"]
+            discover_grep = next(
+                branch
+                for branch in next(
+                    tool for tool in listed_tools if tool["name"] == "akb_discover"
+                )["inputSchema"]["oneOf"]
+                if branch["properties"]["action"].get("const") == "grep"
+            )
+            assert "replace" not in discover_grep["properties"]
+            assert "max_replacements" not in discover_grep["properties"]
 
             legacy_rejected = await client.post(
                 "/mcp/",
@@ -287,6 +307,48 @@ async def test_candidate_http_catalog_and_action_validation(
             )
             legacy_body = json.loads(legacy_rejected.json()["result"]["content"][0]["text"])
             assert legacy_body["code"] == "unknown_tool"
+
+            deferred_rejected = await client.post(
+                "/mcp/",
+                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_grep"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_grep",
+                        "arguments": {"pattern": "needle"},
+                        "_meta": meta,
+                    },
+                },
+            )
+            deferred_body = json.loads(
+                deferred_rejected.json()["result"]["content"][0]["text"]
+            )
+            assert deferred_body["code"] == "invalid_argument"
+
+            read_mutation_rejected = await client.post(
+                "/mcp/",
+                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_discover"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_discover",
+                        "arguments": {
+                            "action": "grep",
+                            "pattern": "needle",
+                            "max_replacements": 1,
+                        },
+                        "_meta": meta,
+                    },
+                },
+            )
+            read_mutation_body = json.loads(
+                read_mutation_rejected.json()["result"]["content"][0]["text"]
+            )
+            assert read_mutation_body["code"] == "unknown_argument"
 
             call_headers = {**headers, "mcp-method": "tools/call", "mcp-name": "akb_document_read"}
             rejected = await client.post(

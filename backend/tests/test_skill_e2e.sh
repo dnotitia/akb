@@ -94,7 +94,7 @@ echo "▸ 1. Vault create seeds overview/vault-skill.md"
 
 mcp akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"e2e\"}" >/dev/null
 
-GET_RESP=$(mcp akb_get "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+GET_RESP=$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 
 echo "$GET_RESP" | grep -q '"type": *"skill"' \
   && pass "Seeded doc has type=skill" \
@@ -184,7 +184,7 @@ echo "$R4C" | grep -q "$FORBIDDEN" \
   || fail "T4c" "expected permission_denied; got: $(echo $R4C | head -c 200)"
 
 # The guard must refuse before any write — the doc is still there afterwards.
-SURVIVED=$(mcp akb_get "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+SURVIVED=$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 echo "$SURVIVED" | grep -q '"type": *"skill"' \
   && pass "Canonical doc survives the rejected delete" \
   || fail "T4c.2" "doc gone or unreadable after a rejected delete"
@@ -222,7 +222,7 @@ echo "$H4" | grep -q "My custom rules" \
   && pass "Edited body is returned" \
   || fail "T5.1" "edit did not propagate to akb_help"
 
-GET2=$(mcp akb_get "{\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+GET2=$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"akb://$VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 echo "$GET2" | grep -q '"type": *"skill"' \
   && pass "type=skill preserved across edit" \
   || fail "T5.2" "type changed after update"
@@ -237,14 +237,14 @@ mcp akb_create_vault "{\"name\":\"$SEARCH_VAULT\",\"description\":\"e2e search\"
 # Wait a moment for async indexing to complete
 sleep 2
 
-# akb_grep should find the seeded body (chunks indexed)
-GREP_RESP=$(mcp akb_grep "{\"vault\":\"$SEARCH_VAULT\",\"pattern\":\"Document types\"}" | mcp_text_noskill)
+# akb_discover/grep should find the seeded body (chunks indexed)
+GREP_RESP=$(mcp akb_discover "{\"action\":\"grep\",\"vault\":\"$SEARCH_VAULT\",\"pattern\":\"Document types\"}" | mcp_text_noskill)
 echo "$GREP_RESP" | grep -q "overview/vault-skill.md" \
   && pass "Seeded doc is grep-findable without prior edit" \
   || fail "T5b.1" "seeded doc not in chunk index"
 
-# Also verify frontmatter is present in git (akb_get returns parsed body, not raw)
-GET_FM=$(mcp akb_get "{\"uri\":\"akb://$SEARCH_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+# Also verify frontmatter is present in git (document_read/get returns parsed body, not raw)
+GET_FM=$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"akb://$SEARCH_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 echo "$GET_FM" | grep -q '"type": *"skill"' && pass "Seeded doc has frontmatter (type=skill visible)" \
   || fail "T5b.2" "no frontmatter on seeded doc (type missing)"
 
@@ -252,11 +252,11 @@ echo "$GET_FM" | grep -q '"type": *"skill"' && pass "Seeded doc has frontmatter 
 mcp akb_delete_vault "{\"vault\":\"$SEARCH_VAULT\"}" >/dev/null 2>&1
 
 # ── 6. doc_type='skill' is queryable ────────────────────────
-echo "▸ 6. akb_search supports type='skill'"
+echo "▸ 6. akb_discover/search supports type='skill'"
 
 # Wait for async chunk + BM25/vector indexing to settle on the edited vault-skill.
 sleep 8
-S1=$(mcp akb_search "{\"vault\":\"$VAULT\",\"query\":\"Document types\",\"type\":\"skill\"}" | mcp_text_noskill)
+S1=$(mcp akb_discover "{\"action\":\"search\",\"vault\":\"$VAULT\",\"query\":\"Document types\",\"type\":\"skill\"}" | mcp_text_noskill)
 echo "$S1" | grep -q "overview/vault-skill.md" \
   && pass "type=skill filter accepts and matches" \
   || fail "T6.1" "search with type=skill did not return the skill doc"
@@ -274,7 +274,7 @@ mcp akb_create_vault "{\"name\":\"$INJECT_VAULT\",\"description\":\"e2e inject\"
 
 # akb_create_vault takes `name`, not `vault`, so tool_usage.vault_of_call
 # attributes it to no vault — this browse is the session's first touch.
-INJ1=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+INJ1=$(mcp akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 [ "$(echo "$INJ1" | skill_field reason)" = "first_touch" ] \
   && pass "First touch carries vault_skill reason=first_touch" \
   || fail "T7.1" "no first_touch payload on the first call naming the vault"
@@ -291,7 +291,7 @@ echo "$INJ1" | skill_field body | grep -q "Document types" \
   && pass "Seed body is under the injection ceiling (truncated=false)" \
   || fail "T7.4" "seed template reported as truncated"
 
-INJ2=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+INJ2=$(mcp akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 [ -z "$(echo "$INJ2" | skill_field reason)" ] \
   && pass "Second touch in the same session injects nothing" \
   || fail "T7.5" "payload re-attached without a skill change"
@@ -308,7 +308,7 @@ echo "$INJ3" | skill_field body | grep -q "Injection re-arm probe" \
   && pass "Re-armed payload carries the new body" \
   || fail "T7.7" "updated payload still holds the old body"
 
-INJ4=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+INJ4=$(mcp akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 [ -z "$(echo "$INJ4" | skill_field reason)" ] \
   && pass "Injection goes quiet again once the new version is delivered" \
   || fail "T7.8" "payload re-attached after the update was already delivered"
@@ -390,9 +390,9 @@ echo "$N2" | grep -q "$MARKER" \
 
 # 8.5 A denied vault call carries nothing either (belt and braces: the error
 # path already skips injection, but this is the shape an attacker would probe).
-N3=$(mcp2 akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+N3=$(mcp2 akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 echo "$N3" | grep -q '"code": *"permission_denied"' \
-  && pass "Non-member akb_browse → permission_denied" \
+  && pass "Non-member akb_discover/browse → permission_denied" \
   || fail "T8.5" "expected permission_denied; got: $(echo $N3 | head -c 200)"
 
 [ -z "$(echo "$N3" | skill_field vault)" ] \
@@ -405,7 +405,7 @@ echo "$N3" | grep -q '"code": *"permission_denied"' \
 # so it would consume the first touch if it ran first.
 mcp akb_grant "{\"vault\":\"$INJECT_VAULT\",\"user\":\"$E2E_USER2\",\"role\":\"reader\"}" >/dev/null 2>&1
 
-N4=$(mcp2 akb_browse "{\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
+N4=$(mcp2 akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\"}" | mcp_text)
 [ "$(echo "$N4" | skill_field reason)" = "first_touch" ] \
   && pass "Granted reader's first touch carries the payload" \
   || fail "T8.7" "authorized member lost injection: $(echo $N4 | head -c 200)"
@@ -474,7 +474,7 @@ ACK=$(echo "$W1" | skill_field ack_token)
   && pass "Strict preflight returns an acknowledgement token" \
   || fail "T8.10" "v2 challenge omitted ack_token"
 
-BEFORE_RETRY=$(mcp akb_browse "{\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\"}" | mcp_text_noskill)
+BEFORE_RETRY=$(mcp akb_discover "{\"action\":\"browse\",\"vault\":\"$INJECT_VAULT\",\"collection\":\"notes\"}" | mcp_text_noskill)
 if echo "$BEFORE_RETRY" | grep -q 'parallel-preflight-'; then
   fail "T8.11" "parallel preflight cohort mutated a document"
 else
@@ -493,7 +493,7 @@ echo "$W3" | grep -q '"code": *"permission_denied"' \
   && pass "Generic writer cannot alter owner-authored vault instructions" \
   || fail "T8.13" "writer skill update was not denied: $(echo $W3 | head -c 200)"
 
-OWNER_READ=$(mcp akb_get "{\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
+OWNER_READ=$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"akb://$INJECT_VAULT/doc/overview/vault-skill.md\"}" | mcp_text_noskill)
 echo "$OWNER_READ" | grep -q "$MARKER" \
   && pass "Denied writer update leaves the guide unchanged" \
   || fail "T8.14" "guide changed after the denied writer update"

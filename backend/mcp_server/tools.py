@@ -32,7 +32,9 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
-from mcp.types import Tool
+from copy import deepcopy
+
+from mcp.types import Tool, ToolAnnotations
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
@@ -1393,6 +1395,7 @@ TOOLS = [
 
 
 from mcp_server.operation_registry import (
+    DEFERRED_MUTATION_NAMES,
     FIRST_SLICE_LEGACY_NAMES,
     OperationRegistry,
     build_candidate_registry,
@@ -1401,6 +1404,31 @@ from mcp_server.operation_registry import (
 
 _LEGACY_TOOLS = {tool.name: tool for tool in TOOLS}
 CANDIDATE_REGISTRY: OperationRegistry = build_candidate_registry(_LEGACY_TOOLS)
+
+
+def _candidate_grep_replace_tool() -> Tool:
+    """Expose the deferred grep mutation without reviving its read mode."""
+    legacy = _LEGACY_TOOLS["akb_grep"]
+    schema = deepcopy(legacy.input_schema)
+    schema["required"] = [*schema.get("required", []), "replace"]
+    schema["additionalProperties"] = False
+    return legacy.model_copy(
+        deep=True,
+        update={
+            "description": (
+                "Deferred write-only grep replacement. The `replace` argument is "
+                "required; read-only exact or regex search is `akb_discover` "
+                "with `action=grep`. Requires writer access to every target vault."
+            ),
+            "input_schema": schema,
+            "annotations": ToolAnnotations(
+                read_only_hint=False,
+                destructive_hint=True,
+                idempotent_hint=False,
+                open_world_hint=False,
+            ),
+        },
+    )
 
 
 def candidate_tools() -> list[Tool]:
@@ -1412,10 +1440,14 @@ def candidate_tools() -> list[Tool]:
     duplicate address for any operation already consolidated here.
     """
     result = [tool.model_copy(deep=True) for tool in CANDIDATE_REGISTRY.tools_by_name.values()]
+    result.append(_candidate_grep_replace_tool())
     result.extend(
         tool.model_copy(deep=True)
         for tool in available_tools()
-        if tool.name not in FIRST_SLICE_LEGACY_NAMES
+        if (
+            tool.name not in FIRST_SLICE_LEGACY_NAMES
+            and tool.name not in DEFERRED_MUTATION_NAMES
+        )
     )
     return result
 

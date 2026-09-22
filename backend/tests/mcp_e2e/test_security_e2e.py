@@ -134,7 +134,12 @@ async def test_table_constraints_and_permission_contract(
     events_uri = events["uri"]
     assert events["unique_keys"] and events["indexes"]
 
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     events_info = _table(info, "events")
     assert events_info["unique_keys"][0]["columns"] == ["principal_id", "session_id", "seq"]
     assert events_info["indexes"]
@@ -219,7 +224,12 @@ async def test_table_constraints_and_permission_contract(
         expect_error=True,
     )
     assert duplicate_alter.get("code") == "invalid_argument"
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     assert _table(info, "dups").get("unique_keys") == []
     await _call_json(
         mcp_client,
@@ -270,8 +280,8 @@ async def test_table_constraints_and_permission_contract(
     missing_vault = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_vault_info",
-        {"vault": f"missing-{_new_vault_name('vault')}"},
+        "akb_discover",
+        {"action": "vault_info", "vault": f"missing-{_new_vault_name('vault')}"},
         expect_error=True,
     )
     assert missing_vault.get("code") == "not_found"
@@ -390,7 +400,12 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {"uri": renamed["uri"], "rename_columns": {"old_c": "new_c"}},
     )
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     renamed_key = _table(info, "rn")["unique_keys"]
     assert renamed_key[0]["columns"] == ["new_c"]
 
@@ -411,7 +426,12 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {"uri": dropped_column["uri"], "drop_columns": ["gone"]},
     )
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     assert _table(info, "dpc")["unique_keys"] == []
 
     atomic = await _call_json(
@@ -439,7 +459,12 @@ async def test_table_constraints_and_permission_contract(
         expect_error=True,
     )
     assert atomic_error.get("code") == "invalid_argument"
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     atom_info = _table(info, "atom")
     assert atom_info["indexes"] == [] and atom_info["unique_keys"] == []
 
@@ -524,31 +549,34 @@ async def test_security_access_and_sql_failure_state(
     denied_grep = await _call_json(
         other,
         runtime_session,
-        "akb_grep",
-        {"pattern": "SECURITY_MARKER_ALPHA", "vault": vault},
+        "akb_discover",
+        {"action": "grep", "pattern": "SECURITY_MARKER_ALPHA", "vault": vault},
         expect_error=True,
     )
     _assert_permission_denied(denied_grep)
     denied_search = await _call_json(
         other,
         runtime_session,
-        "akb_search",
-        {"query": "SECURITY_MARKER_ALPHA", "vault": vault},
+        "akb_discover",
+        {"action": "search", "query": "SECURITY_MARKER_ALPHA", "vault": vault},
         expect_error=True,
     )
     _assert_permission_denied(denied_search)
     unscoped_search = await _call_json(
         other,
         runtime_session,
-        "akb_search",
-        {"query": "SECURITY_MARKER_ALPHA"},
+        "akb_discover",
+        {"action": "search", "query": "SECURITY_MARKER_ALPHA"},
     )
     assert not any(item.get("vault") == vault for item in unscoped_search.get("results", []))
 
     for tool, arguments in (
         ("akb_relations", {"uri": document["uri"]}),
         ("akb_graph", {"vault": vault}),
-        ("akb_provenance", {"uri": document["uri"]}),
+        (
+            "akb_document_read",
+            {"action": "provenance", "uri": document["uri"]},
+        ),
     ):
         denied = await _call_json(other, runtime_session, tool, arguments, expect_error=True)
         _assert_permission_denied(denied)
@@ -556,8 +584,8 @@ async def test_security_access_and_sql_failure_state(
     owner_grep = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
-        {"pattern": "SECURITY_MARKER_ALPHA", "vault": vault},
+        "akb_discover",
+        {"action": "grep", "pattern": "SECURITY_MARKER_ALPHA", "vault": vault},
     )
     assert owner_grep.get("total_matches", 0) >= 1
     owner_search = await _search_until_found(
@@ -573,16 +601,21 @@ async def test_security_access_and_sql_failure_state(
     invalid_regex = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
-        {"pattern": "(invalid[[", "regex": True, "vault": vault},
+        "akb_discover",
+        {"action": "grep", "pattern": "(invalid[[", "regex": True, "vault": vault},
         expect_error=True,
     )
     assert "regex" in _json_text(invalid_regex)
     valid_regex = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
-        {"pattern": "SECURITY_MARKER.*ALPHA", "regex": True, "vault": vault},
+        "akb_discover",
+        {
+            "action": "grep",
+            "pattern": "SECURITY_MARKER.*ALPHA",
+            "regex": True,
+            "vault": vault,
+        },
     )
     assert valid_regex.get("total_matches", 0) >= 1
 
@@ -675,8 +708,8 @@ async def test_security_access_and_sql_failure_state(
     unknown = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_activity",
-        {"vault": vault, "user": "nobody"},
+        "akb_document_read",
+        {"action": "activity", "vault": vault, "user": "nobody"},
         expect_error=True,
     )
     assert "unknown argument 'user'" in _json_text(unknown)
@@ -684,8 +717,8 @@ async def test_security_access_and_sql_failure_state(
     valid_activity = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_activity",
-        {"vault": vault, "author": "nobody"},
+        "akb_document_read",
+        {"action": "activity", "vault": vault, "author": "nobody"},
     )
     assert "returned" in valid_activity
 
@@ -749,7 +782,12 @@ async def test_pat_vault_scope_write_boundary(
             expect_error=True,
         )
         _assert_scope_denied(denied)
-        readable = await _call_json(scoped, runtime_session, "akb_browse", {"vault": other_name})
+        readable = await _call_json(
+            scoped,
+            runtime_session,
+            "akb_discover",
+            {"action": "browse", "vault": other_name},
+        )
         assert "items" in readable
         assert not any(item.get("title") == "Out" for item in readable["items"])
 

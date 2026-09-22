@@ -285,7 +285,7 @@ async def test_protocol_conflicts_fail_before_dispatch_or_session_creation(monke
             response = await _post(
                 client,
                 modern_call,
-                **{**base_headers, "mcp-name": "akb_search"},
+                **{**base_headers, "mcp-name": "akb_discover"},
             )
             assert response.status_code == 400
             assert response.json()["error"]["code"] == -32020
