@@ -168,6 +168,80 @@ async def test_a_written_chunk_comes_back_from_a_search():
         assert str(uuid.UUID(int=1)) in hits, "쓴 청크가 검색에 안 나온다"
 
 
+# Past int4 and inside the u32 range the index stores. Term ids are `bigint`
+# where they are minted; the query path bound them as `int4`.
+_PAST_INT4 = 3_000_000_000
+# The first id the index cannot hold: its text input takes u32.
+_PAST_U32 = 4_294_967_296
+
+
+@pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
+async def test_a_term_id_past_int4_is_found_by_every_query_shape(shape):
+    """Written through the text input, never found through `int4` (akb#665).
+
+    Documents reach the index as a `{id:tf}` literal, which takes any id up to
+    4,294,967,295. Queries were bound as `int[]`, and asyncpg refuses anything
+    past 2,147,483,647 before the query is sent. The index-led case asks for
+    more rows than its scope holds, so the global-candidate probe runs as well.
+    """
+    async with _store() as (store, pool):
+        vault = uuid.uuid4()
+        async with pool.acquire() as conn:
+            for i, terms in enumerate([[20, _PAST_INT4], [20, 30]], start=1):
+                await store.upsert_one(
+                    chunk_id=str(uuid.UUID(int=i)), source_type="document",
+                    source_id=str(uuid.uuid4()), vault_id=str(vault),
+                    section_path="", content=f"doc{i}", chunk_index=i,
+                    dense=None, sparse_indices=terms,
+                    sparse_values=[1.0] * len(terms), conn=conn,
+                )
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(type(store), "_filter_is_selective",
+                           lambda *a, **k: _const(shape == "materialised"))
+                hits = await store._search_sparse(
+                    conn, terms=[_PAST_INT4], weights=[1.0],
+                    filter_uuids=None if shape == "unfiltered" else [vault],
+                    filter_col="vault_id", limit=5,
+                )
+        assert hits == [str(uuid.UUID(int=1))]
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+def test_the_vector_literal_names_the_bound_the_index_holds():
+    """One bound, stated where every vector is built (akb#665).
+
+    The index's text input answers an id past u32, or a negative one, with
+    "Bad parsing at position N". A document holding one is refused with the
+    bound named, rather than indexed under a subset of its terms."""
+    with pytest.raises(ValueError, match="0 to 4,294,967,295"):
+        _bm25vector_literal([20, _PAST_U32], [1.0, 1.0])
+    with pytest.raises(ValueError, match="0 to 4,294,967,295"):
+        _bm25vector_literal([-1], [1.0])
+    assert _bm25vector_literal([4_294_967_295], [1.0]) == "{4294967295:1}"
+
+
+async def test_a_query_term_the_index_cannot_hold_matches_nothing():
+    """No document can hold such a term, so it cannot fail the search (akb#665)."""
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            await store.upsert_one(
+                chunk_id=str(uuid.UUID(int=1)), source_type="document",
+                source_id=str(uuid.uuid4()), vault_id=str(uuid.uuid4()),
+                section_path="", content="doc", chunk_index=1,
+                dense=None, sparse_indices=[20], sparse_values=[1.0], conn=conn,
+            )
+            alone = await store._search_sparse(
+                conn, terms=[_PAST_U32], weights=[1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            )
+            mixed = await store._search_sparse(
+                conn, terms=[_PAST_U32, 20], weights=[1.0, 1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            )
+    assert alone == []
+    assert mixed == [str(uuid.UUID(int=1))]
+
+
 async def test_both_query_shapes_return_the_same_rows():
     """The selectivity branch chooses for speed. If it also changed the answer,
     the threshold would be a correctness knob rather than a performance one.
