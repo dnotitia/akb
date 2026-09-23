@@ -116,8 +116,9 @@ def _validate_column_name(name) -> str:
     Shared by create_table and alter_table so the two paths stay
     consistent. Refused: a non-string or blank name; any control
     character, NUL included (NUL separates the physical-name digest
-    input); more than 255 characters; and the auto-added bookkeeping
-    names, in any case (`column_key`).
+    input); a lone surrogate, which has no UTF-8 form to digest or store;
+    more than 255 characters; and the auto-added bookkeeping names, in any
+    case (`column_key`).
 
     Raises ValidationError (which IS-A ValueError) so a bad column name is a
     clean 422 on REST and invalid_argument on MCP — never an internal 500.
@@ -133,6 +134,11 @@ def _validate_column_name(name) -> str:
     if any(unicodedata.category(ch) == "Cc" for ch in logical):
         raise ValidationError(
             f"Invalid column name {logical!r}: control characters are not allowed."
+        )
+    # `!r` escapes the surrogate, so the message itself stays encodable.
+    if any(unicodedata.category(ch) == "Cs" for ch in logical):
+        raise ValidationError(
+            f"Invalid column name {logical!r}: unpaired surrogates are not allowed."
         )
     if len(logical) > _MAX_COLUMN_NAME_CHARS:
         raise ValidationError(
