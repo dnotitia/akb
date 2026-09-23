@@ -23,7 +23,7 @@ from app.services.row_query_base import (
     _unknown_column,
 )
 from app.services.row_query_shape import _shape_result
-from app.services.row_query_string import _compile_filters
+from app.services.row_query_string import _compile_filters, _is_filter_value
 from app.services.user_sql_executor import (
     PermissionDeniedError,
     UniqueViolationError,
@@ -435,7 +435,9 @@ def compile_update_rows(
     projections: list[Any] = []
     returning_sql = ""
     if fetch:
-        returning_or_error = _compile_returning(_last_value(query_params, "select"), column_meta, params)
+        returning_or_error = _compile_returning(
+            _control_value(query_params, column_meta, "select"), column_meta, params,
+        )
         if isinstance(returning_or_error, dict):
             return returning_or_error
         returning_sql, projections = returning_or_error
@@ -529,7 +531,9 @@ def compile_delete_rows(
     projections: list[Any] = []
     returning_sql = ""
     if fetch:
-        returning_or_error = _compile_returning(_last_value(query_params, "select"), column_meta, params)
+        returning_or_error = _compile_returning(
+            _control_value(query_params, column_meta, "select"), column_meta, params,
+        )
         if isinstance(returning_or_error, dict):
             return returning_or_error
         returning_sql, projections = returning_or_error
@@ -778,20 +782,54 @@ def _extract_expected_row_commit(
     return token
 
 
+# The values `all` takes as a control; `_all_rows_enabled` reads the first three.
+_ALL_ROWS_VALUES = {"1", "true", "yes", "0", "false", "no"}
+
+
+def _mutation_filter_key(key: str, value: str, column_meta: _ColumnMeta) -> bool:
+    """Whether a PATCH/DELETE query-string key is a filter.
+
+    A column can share a name with a control param (a `count` or `Order`
+    column, a `Select` header — #433 resolves names case-insensitively). An
+    UPDATE/DELETE that looks filtered must never quietly become broader than
+    the caller intended (8d04a2aa), so a key naming a column is a filter
+    unless it is a control this mutation reads AND its value is one that
+    control takes: `select` a column list (anything but `<op>.<value>`),
+    `all` a yes/no, `expected_row_commit` any token — it is always the CAS
+    token. Everything else a mutation never reads, so on a column it can
+    only be a filter, and a malformed one is refused, not ignored.
+    """
+    if key not in WRITE_CONTROL_PARAMS:
+        return True
+    if key == EXPECTED_ROW_COMMIT_PARAM or key not in column_meta:
+        return False
+    if key == "select":
+        return _is_filter_value(value)
+    if key == "all":
+        return value.lower() not in _ALL_ROWS_VALUES
+    return True
+
+
+def _control_value(
+    query_params: Sequence[tuple[str, str]], column_meta: _ColumnMeta, key: str,
+) -> str | None:
+    """The last value of control `key` that is not a filter on a column."""
+    values = [
+        v for k, v in query_params
+        if k == key and not _mutation_filter_key(k, v, column_meta)
+    ]
+    return values[-1] if values else None
+
+
 def _compile_mutation_where(
     query_params: Sequence[tuple[str, str]],
     column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
-    # A real column can share a name with a reserved control param (e.g. a
-    # table with a "count" or "order" column) — column identity wins so the
-    # caller's filter is never silently dropped from the WHERE clause. An
-    # UPDATE/DELETE that looks filtered must never quietly become broader
-    # than the caller intended.
     filter_params = [
         (key, value)
         for key, value in query_params
-        if key not in WRITE_CONTROL_PARAMS or key in column_meta
+        if _mutation_filter_key(key, value, column_meta)
     ]
     if not filter_params and not _all_rows_enabled(query_params):
         return err(

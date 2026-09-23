@@ -52,20 +52,24 @@ def compile_row_query(
     column_meta = _column_meta(columns)
     params: list[Any] = []
 
-    page_or_error = _parse_page(query_params, range_header)
+    # Each key is a filter or a control, never both (see `_read_filter_key`).
+    filters = [(k, v) for k, v in query_params if _read_filter_key(k, v, column_meta)]
+    controls = [(k, v) for k, v in query_params if not _read_filter_key(k, v, column_meta)]
+
+    page_or_error = _parse_page(controls, range_header)
     if isinstance(page_or_error, dict):
         return page_or_error
     page = page_or_error
 
-    projections_or_error = _compile_select(_last_value(query_params, "select"), column_meta, params)
+    projections_or_error = _compile_select(_last_value(controls, "select"), column_meta, params)
     if isinstance(projections_or_error, dict):
         return projections_or_error
     projections = projections_or_error
 
-    where_or_error = _compile_filters(query_params, column_meta, params)
+    where_or_error = _compile_filters(filters, column_meta, params)
     if isinstance(where_or_error, dict):
         return where_or_error
-    order_or_error = _compile_order(_last_value(query_params, "order"), column_meta, params)
+    order_or_error = _compile_order(_last_value(controls, "order"), column_meta, params)
     if isinstance(order_or_error, dict):
         return order_or_error
 
@@ -81,19 +85,37 @@ def compile_row_query(
     )
 
 
+#: Query-string keys a row read takes as controls rather than filters.
+READ_CONTROL_PARAMS = frozenset({"select", "order", "limit", "offset"})
+
+
+def _read_filter_key(key: str, value: str, column_meta: _ColumnMeta) -> bool:
+    """Whether a row read's query-string key is a filter.
+
+    A column can share a name with a control — a `Limit` or `Order` header,
+    or a lowercase `order` (#433). Its key is a filter when it names the
+    column (by `column_key`, like every other name) AND the value is a
+    filter (`<op>.<value>`); otherwise it is the control. So the web UI's
+    `limit=50&order=created_at.desc` still pages and sorts such a table, and a
+    filter on the column is never dropped from the WHERE clause (8d04a2aa).
+    Every read control validates its own value, so a malformed filter is
+    still an error, not a silent no-op.
+    """
+    if key not in READ_CONTROL_PARAMS:
+        return True
+    return key in column_meta and _is_filter_value(value)
+
+
 def _compile_filters(
     query_params: Sequence[tuple[str, str]],
     column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
+    """AND every key in `query_params` as a filter. The caller has already
+    set the control parameters aside: `_read_filter_key` for a read,
+    `table_row_write._mutation_filter_key` for a PATCH/DELETE."""
     clauses: list[str] = []
     for key, value in query_params:
-        # A real column can share a name with a reserved query-control param
-        # (e.g. a table with a "select"/"order"/"limit"/"offset" column) —
-        # column identity wins so the filter is never silently dropped from
-        # the WHERE clause. Shared by both row-read and row-write callers.
-        if key in {"select", "order", "limit", "offset"} and key not in column_meta:
-            continue
         if key in {"or", "and"}:
             clause_or_error = _compile_bool_group(key, value, column_meta, params, depth=1)
         else:
@@ -157,6 +179,19 @@ def _compile_condition(
     if operator is None:
         return err(f"Invalid filter value for {field}: expected op.value", code=INVALID_FILTER)
     return _compile_operator(operand, operator, value, params)
+
+
+#: Every operator `_compile_operator` knows: the first segment of a value
+#: that is a filter (`eq.x`, `not.in.(a,b)`) and of no control's value.
+FILTER_OPERATORS = frozenset({
+    "not", "is", "eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike", "in", "cs",
+})
+
+
+def _is_filter_value(value: str) -> bool:
+    """True when `value` has the `<op>.<value>` shape only a filter has."""
+    operator, _ = _split_operator(value)
+    return operator in FILTER_OPERATORS
 
 
 def _compile_operator(
