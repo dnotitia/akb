@@ -370,6 +370,11 @@ def test_gate4_long_korean_header_is_accepted_within_the_physical_bound():
     assert _PHYSICAL_RE.fullmatch(cols[0]["pg_name"])
     assert len(cols[0]["pg_name"].encode()) <= table_data_repo.PG_IDENT_MAX_LEN
 
+    # Longer than the bound even one byte per character — the case a
+    # character-mapping fallback (safe_ident) could not fit.
+    longer, _, _ = _spec([{"name": "가" * 70, "type": "text"}])
+    assert len(longer[0]["pg_name"].encode()) <= table_data_repo.PG_IDENT_MAX_LEN
+
     # The logical bound is characters, not bytes: 255 is the ceiling.
     widest, _, _ = _spec([{"name": "가" * 255, "type": "text"}])
     assert widest[0]["name"] == "가" * 255

@@ -389,20 +389,28 @@ async def test_gate4_long_korean_header_round_trips_within_the_physical_bound(li
     vault_id, vault, owner = await live.vault("gate4")
     header = "가나다라마바사아자차카타파하거너더러머버서어"
     assert len(header) == 22 and len(header.encode()) > table_data_repo.PG_IDENT_MAX_LEN
+    # Past the bound even at one byte per character: PostgreSQL would
+    # silently truncate an identifier this long.
+    longer = "가" * 70
 
     created = await table_service.create_table(
-        vault_id, "wide", [{"name": header, "type": "text"}], actor_id="owner",
+        vault_id, "wide",
+        [{"name": header, "type": "text"}, {"name": longer, "type": "text"}],
+        actor_id="owner",
     )
-    pg = created["columns"][0]["pg_name"]
-    assert len(pg.encode()) <= table_data_repo.PG_IDENT_MAX_LEN
-    assert pg in await live.attnames(table_data_repo.pg_table_name(vault, "wide"))
+    attnames = await live.attnames(table_data_repo.pg_table_name(vault, "wide"))
+    for col in created["columns"]:
+        assert len(col["pg_name"].encode()) <= table_data_repo.PG_IDENT_MAX_LEN
+        assert col["pg_name"] in attnames
 
     await table_row_write.insert_rows(
         vault_name=vault, vault_id=vault_id, table_name="wide",
-        user_id=owner, actor_id="owner", is_admin=True, body={header: "값"},
+        user_id=owner, actor_id="owner", is_admin=True, body={header: "값", longer: "긴 값"},
     )
-    read = await _read(vault, vault_id, "wide", owner, query_params=[("select", header)])
-    assert _items(read) == [{header: "값"}]
+    read = await _read(
+        vault, vault_id, "wide", owner, query_params=[("select", f"{header},{longer}")],
+    )
+    assert _items(read) == [{header: "값", longer: "긴 값"}]
 
 
 # ── Gate 5: every enforcement surface agrees on the physical name ────────────
