@@ -160,3 +160,45 @@ async def test_vault_info_shows_each_columns_description(monkeypatch):
     assert columns["category"]["description"] == "분류"
     assert "description" not in columns["score"]
     assert "description" not in columns["id"]
+
+
+# ── Names that fit the grammar but that PostgreSQL will not take ─────
+#
+# `user`, `order` and `group` match `^[a-z][a-z0-9_]*$`, so the rule let them
+# through to DDL, where `CREATE TABLE … (user TEXT)` is a syntax error and the
+# caller got a 500. `xmin` and the other system column names fail the same way
+# with 42701 (a 422 on create, a 500 on add). Both are refusals the rule can
+# make up front, with the reason and the way out like any other.
+
+
+def test_a_word_postgres_reserves_is_refused_with_the_way_out():
+    message = _refusal([
+        {"name": "user", "type": "text"},
+        {"name": "order", "type": "int"},
+        {"name": "group", "type": "text"},
+        {"name": "fine_column", "type": "text"},
+    ])
+
+    assert message.startswith("3 column names cannot be used")
+    for word in ("user", "order", "group"):
+        assert f"{word!r} is a word PostgreSQL reserves" in message
+    assert "fine_column" not in message
+    assert "description" in message
+
+
+def test_a_system_column_name_is_refused_with_the_way_out():
+    names = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"]
+    message = _refusal([{"name": name, "type": "text"} for name in names])
+
+    assert message.startswith("6 column names cannot be used")
+    for name in names:
+        assert f"{name!r} is a PostgreSQL system column" in message
+
+
+def test_keywords_postgres_takes_as_column_names_stay_usable():
+    # Unreserved and column-name keywords work unquoted as columns; refusing
+    # them would take away names people use (`name`, `type`, `value`).
+    specs = [{"name": word, "type": "text"} for word in
+             ("name", "type", "value", "data", "key", "count", "text", "date", "year", "position")]
+    assert [spec["name"] for spec in table_service._normalize_column_specs(specs)] == \
+        [spec["name"] for spec in specs]
