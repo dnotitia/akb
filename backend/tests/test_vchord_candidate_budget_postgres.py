@@ -582,6 +582,70 @@ async def test_small_materialized_scope_survives_large_global_corpus():
             assert set(hits) == scoped
 
 
+async def test_selective_scope_over_the_exact_cap_is_answered_index_led():
+    """Which shape runs decides latency, never the rows (akb#626).
+
+    A scope the estimator calls selective is materialised, and materialising is
+    exact work, so the cap bounds it. A scope over the cap used to raise, and
+    with no finite candidates to keep, the whole sparse leg came back empty —
+    while the index-led shape answers the same scope. In production that is
+    every scope over 10,000 rows and under 1% of the corpus.
+
+    The estimator is the real one: 30 scoped rows among 6,000 is 0.5%, so
+    `_filter_is_selective` says yes from `pg_stats` unpatched. Only the cap is
+    scaled down, to 20, to put the scope over it.
+    """
+    scoped_rows = 30
+    target = uuid.UUID(int=0xA)
+    other = uuid.UUID(int=0xB)
+    scoped_ids: set[str] = set()
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            # Distinct lengths give distinct scores, so the top-k is one answer
+            # rather than a choice among ties.
+            for ordinal in range(1, scoped_rows + 1):
+                chunk_id = uuid.UUID(int=0x1000 + ordinal)
+                scoped_ids.add(str(chunk_id))
+                await _put(
+                    store,
+                    conn,
+                    chunk_id=chunk_id,
+                    vault_id=target,
+                    source_type="document",
+                    terms=[_QUERY_TERM] + list(range(1000, 1000 + ordinal)),
+                    chunk_index=ordinal,
+                )
+            await conn.execute("""
+                INSERT INTO vector_index.chunks
+                    (chunk_id, source_type, source_id, vault_id,
+                     section_path, content, chunk_index, sparse_bm25)
+                SELECT md5(i::text)::uuid, 'document', md5(i::text)::uuid,
+                       $1, '', 'other', i, '{20:1}'::bm25_catalog.bm25vector
+                FROM generate_series(1, $2::int) i
+            """, other, 6_000 - scoped_rows)
+            await conn.execute("REINDEX INDEX vector_index.idx_vi_chunks_bm25")
+            await conn.execute("ANALYZE vector_index.chunks")
+            assert await store._filter_is_selective(conn, "vault_id", [target]) is True
+
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 20)
+                async with _candidate_budget(conn, budget=100):
+                    chosen = await store._search_sparse(
+                        conn, terms=[_QUERY_TERM], weights=[1.0],
+                        filter_uuids=[target], filter_col="vault_id", limit=10,
+                    )
+                    mp.setattr(type(store), "_filter_is_selective",
+                               lambda *a, **k: _constant(False))
+                    index_led = await store._search_sparse(
+                        conn, terms=[_QUERY_TERM], weights=[1.0],
+                        filter_uuids=[target], filter_col="vault_id", limit=10,
+                    )
+
+    assert len(chosen) == 10
+    assert set(chosen) <= scoped_ids
+    assert chosen == index_led
+
+
 async def test_exact_probe_timeout_restores_connection_and_stricter_server_budget():
     async with _store() as (store, pool):
         async with pool.acquire() as conn:

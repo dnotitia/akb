@@ -117,6 +117,12 @@ silently retries against the legacy endpoint after dropping restrictions.
   `plan_cache_mode` is pinned to a custom plan for the duration: asyncpg always
   prepares, and a generic plan built without the filter's values took the same
   statement from 0.8ms to 1501ms on the eleventh execution.
+- The choice stays a latency decision. Materialising scores every row in scope,
+  so it stays under the exact-work cap, and a selective scope over the cap is
+  now searched index-led instead of refused. Refusing returned no sparse hits
+  for every scope between 10,000 rows and 1% of the corpus — reproduced on a
+  1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
+  shape answered it in 15ms (akb#626).
 - The result is filtered on the sign of the score. `<&>` orders the whole table
   rather than filtering it — a document holding no query term scores exactly
   `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
