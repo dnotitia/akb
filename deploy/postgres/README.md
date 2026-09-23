@@ -33,6 +33,14 @@ The extension installs into its own `bm25_catalog` schema and needs no
 `shared_preload_libraries` entry. A database that never runs `CREATE EXTENSION`
 behaves exactly like the base image.
 
+Without a preload the library loads the first time a session calls into it, and
+its settings (`bm25_catalog.bm25_limit`) exist only from then on. The backend
+reads that setting on connections that may not have loaded the library yet, so
+it loads it first; a value set in the server configuration is read as is.
+Tests must run against a server started the same way: the upstream image
+preloads the library from its CMD, which hides exactly this, so CI starts it
+with a plain `postgres` command.
+
 Note that installing the extension is not by itself enough for AKB to use it —
 the sparse leg selects its implementation separately. This image only makes the
 option available.

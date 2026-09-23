@@ -646,6 +646,45 @@ async def test_selective_scope_over_the_exact_cap_is_answered_index_led():
     assert chosen == index_led
 
 
+@pytest.mark.parametrize("filtered", [True, False], ids=["index-led", "unfiltered"])
+async def test_first_search_on_a_fresh_connection_reads_the_budget(filtered):
+    """A connection's first search must not depend on an earlier one (akb#615).
+
+    `vchord_bm25` defines `bm25_catalog.*` when its library loads, and the image
+    `deploy/postgres/Dockerfile` builds does not preload it. On a session that
+    had not called into the extension yet, reading `bm25_limit` raised
+    `unrecognized configuration parameter`, which `hybrid_search` reports as a
+    store failure — both legs lost, on every new pooled connection. The two
+    branches that read the setting before their first extension call each run
+    here on a connection that has never touched the extension.
+    """
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            vault, scoped, distractors = await _seed(store, conn)
+        fresh = await asyncpg.connect(store._dsn)
+        try:
+            assert await fresh.fetchval(
+                "SELECT current_setting('bm25_catalog.bm25_limit', true)"
+            ) is None, (
+                "this server preloads vchord_bm25, and the image operators build "
+                "does not; run it with a plain `postgres` command, as CI does"
+            )
+            hits = await store._search_sparse(
+                fresh, terms=[_QUERY_TERM], weights=[1.0],
+                filter_uuids=[vault] if filtered else None,
+                filter_col="vault_id", limit=5,
+            )
+        finally:
+            await fresh.close()
+
+    assert len(hits) == 5
+    if filtered:
+        assert set(hits) == scoped
+    else:
+        # The distractors outrank every target, so an unfiltered page is theirs.
+        assert set(hits) <= distractors
+
+
 async def test_exact_probe_timeout_restores_connection_and_stricter_server_budget():
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
