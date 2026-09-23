@@ -1041,17 +1041,21 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
 
 
 async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
-    """Return [{name, row_count, columns: [{name, type, example?}]}, …]
+    """Return [{name, row_count, columns: [{name, type, description?, example?}]}, …]
     for every table in `vault_id`.
 
     Pre-loads schema + sample so agents don't have to run mid-flow
     `information_schema.columns` lookups (issue #34 KISA RAG PoC pattern —
     122 such calls observed across 107 queries).
+
+    A column's `description` comes from the registry: it is where a header
+    that cannot be an SQL identifier is kept (akb#433), and this is where an
+    agent reads the schema before writing SQL with the column's name.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         registry = await conn.fetch(
-            "SELECT id, name, unique_keys, indexes FROM vault_tables "
+            "SELECT id, name, columns, unique_keys, indexes FROM vault_tables "
             "WHERE vault_id = $1 ORDER BY name",
             vault_id,
         )
@@ -1093,6 +1097,17 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
             # validation, so direct interpolation is safe.
             row_count = await conn.fetchval(f'SELECT COUNT(*) FROM "{pg_name}"')
             columns = by_table.get(pg_name, [])
+            described = {
+                spec["name"]: spec["description"]
+                for spec in table_registry_repo.parse_json_list(r["columns"])
+                if isinstance(spec, dict)
+                and isinstance(spec.get("name"), str)
+                and isinstance(spec.get("description"), str)
+                and spec["description"]
+            }
+            for col in columns:
+                if col["name"] in described:
+                    col["description"] = described[col["name"]]
             if row_count and columns:
                 sample = await conn.fetchrow(f'SELECT * FROM "{pg_name}" LIMIT 1')
                 example_map = dict(sample) if sample else {}

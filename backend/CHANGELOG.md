@@ -35,6 +35,30 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### A refused column name says why, all at once, and where the header goes
+
+Column names stay SQL identifiers — `akb_sql` runs against the physical table
+and uses them as written — so a header taken from a document often cannot be
+one. What changed is everything around that rule (akb#433):
+
+- A create or alter lists every refused column in one error, each with its
+  reason (not ASCII, reserved, uppercase, not starting with a letter, other
+  characters, longer than 63 bytes), and says where the header goes: the
+  column's `description`. It used to stop at the first column and quote a
+  regex, so a document's table taught the rule one call at a time.
+- A name longer than 63 bytes is refused. PostgreSQL keeps 63 bytes of an
+  identifier and silently drops the rest, which left the registry and the
+  physical column naming different things.
+- `akb_create_table` and `akb_alter_table` advertise `description` and state
+  the name rule, so an agent can get it right before a refusal.
+- `akb_vault_info` returns each column's `description` from the registry. It
+  is where an agent reads a schema before writing SQL, and it only listed
+  `pg_attribute` names, so a header kept in `description` was searchable but
+  invisible to the agent writing the query.
+
+The logical/physical name proposal for the same issue is recorded as denied
+(`docs/design/denied/2026-09-17-column-logical-physical-names/`).
+
 ### Changed
 
 - Reserved vault-skill system-path policy denials now expose the stable

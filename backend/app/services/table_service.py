@@ -107,29 +107,69 @@ async def _transaction_if_needed(conn: Any, enabled: bool) -> AsyncIterator[None
     yield
 
 
-def _validate_column_name(name) -> None:
-    """Reject reserved + malformed column names (raises ValidationError → 422).
+# PostgreSQL keeps 63 bytes of an identifier (NAMEDATALEN - 1) and silently
+# drops the rest, so a longer name would leave the registry and the physical
+# column naming different things.
+_MAX_COLUMN_NAME_BYTES = 63
 
-    Shared by create_table and alter_table so the two paths stay
-    consistent: reserved names collide with the auto-added bookkeeping
-    columns (id/created_at/updated_at/created_by), and the shape check
-    keeps the registry name identical to its `safe_ident` PG identity.
+# What a refusal tells the caller — the rule, and the way out. A table taken
+# from a document usually has headers the rule refuses (akb#433); the header is
+# not lost, it belongs in the column's `description`, which akb_vault_info
+# shows and search indexes.
+_COLUMN_NAME_RULE = (
+    "Column names are SQL identifiers and akb_sql uses them as written: a "
+    "lowercase ASCII letter, then lowercase letters, digits or underscores, "
+    f"at most {_MAX_COLUMN_NAME_BYTES} bytes. Name each column for what it "
+    "holds (for example `category`) and keep the original header in that "
+    "column's `description`, which akb_vault_info shows and search indexes."
+)
 
-    Raises ValidationError (which IS-A ValueError) so a bad column name is a
+
+def _column_name_problem(name) -> str | None:
+    """Why `name` cannot name a column, or None when it can."""
+    if not isinstance(name, str) or not name:
+        return "is not a non-empty string"
+    if name.lower() in _RESERVED:
+        return f"is reserved (AKB adds {sorted(_RESERVED)} to every table)"
+    if not name.isascii():
+        return "is not ASCII"
+    if not _COLUMN_NAME_RE.fullmatch(name):
+        if name != name.lower():
+            return "has uppercase letters"
+        if not name[0].isalpha():
+            return "does not start with a letter"
+        return "contains characters other than a-z, 0-9 and _"
+    if len(name.encode("utf-8")) > _MAX_COLUMN_NAME_BYTES:
+        return (
+            f"is longer than {_MAX_COLUMN_NAME_BYTES} bytes, where PostgreSQL "
+            "cuts identifiers"
+        )
+    return None
+
+
+def _refuse_bad_column_names(names: list) -> None:
+    """Refuse every name the rule rejects, in one ValidationError (→ 422).
+
+    Shared by create_table and alter_table so the two paths stay consistent:
+    reserved names collide with the auto-added bookkeeping columns, and the
+    shape check keeps the registry name identical to its `safe_ident` PG
+    identity. All refused names are reported at once — a document's table
+    usually has several, and naming only the first taught the rule one call
+    at a time. ValidationError (which IS-A ValueError) keeps a bad name a
     clean 422 on REST and invalid_argument on MCP — never an internal 500.
     """
-    if not isinstance(name, str) or not name:
-        raise ValidationError("Column name must be a non-empty string.")
-    if name.lower() in _RESERVED:
+    problems = [
+        (name, problem) for name in names
+        if (problem := _column_name_problem(name)) is not None
+    ]
+    if problems:
+        listed = "; ".join(f"{name!r} {problem}" for name, problem in problems)
+        plural = "s" if len(problems) != 1 else ""
         raise ValidationError(
-            f"Column name '{name}' is reserved (auto-added by AKB). "
-            f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
+            f"{len(problems)} column name{plural} cannot be used: {listed}. "
+            f"{_COLUMN_NAME_RULE}"
         )
-    if not _COLUMN_NAME_RE.fullmatch(name):
-        raise ValidationError(
-            f"Invalid column name {name!r}: must match {_COLUMN_NAME_RE.pattern} "
-            f"(lowercase letter then letters/digits/underscores)."
-        )
+
 
 
 # ── Declarative unique-key / index resolution (AKB #215) ─────────
@@ -588,8 +628,9 @@ def _normalize_column_specs(columns: list[dict]) -> list[dict]:
             raise ValidationError(
                 f"Each column must be an object with a 'name' field; got {col!r}."
             )
+    _refuse_bad_column_names([col["name"] for col in columns])
+    for col in columns:
         cname = col["name"]
-        _validate_column_name(cname)
         key = cname.lower()
         if key in seen:
             raise ValidationError(
@@ -1290,24 +1331,26 @@ async def alter_table(
             # bookkeeping columns (id/created_at/updated_at/created_by) —
             # those are exactly the _RESERVED set — so a client can no
             # longer drop the PK or shadow a reserved name.
-            normalized_add_columns: list[dict] = []
             for col in (add_columns or []):
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
                         f"Each added column must be an object with a 'name' field; got {col!r}."
                     )
-                _validate_column_name(col["name"])
-                normalized_add_columns.append(_normalize_column_spec(col))
-            add_columns = normalized_add_columns
-            normalized_alter_columns: list[dict] = []
             for col in (alter_columns or []):
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
                         f"Each altered column must be an object with a 'name' field; got {col!r}."
                     )
-                _validate_column_name(col["name"])
-                normalized_alter_columns.append(dict(col))
-            alter_columns = normalized_alter_columns
+            for old_name in (rename_columns or {}):
+                if not isinstance(old_name, str) or not old_name:
+                    raise ValidationError("Rename source column must be a non-empty string.")
+            _refuse_bad_column_names(
+                [col["name"] for col in (add_columns or [])]
+                + [col["name"] for col in (alter_columns or [])]
+                + [name for pair in (rename_columns or {}).items() for name in pair]
+            )
+            add_columns = [_normalize_column_spec(col) for col in (add_columns or [])]
+            alter_columns = [dict(col) for col in (alter_columns or [])]
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
                     raise ValidationError("Drop column name must be a non-empty string.")
@@ -1316,11 +1359,6 @@ async def alter_table(
                         f"Column '{col_name}' is a reserved bookkeeping column "
                         f"and cannot be dropped. Reserved: {sorted(_RESERVED)}."
                     )
-            for old_name, new_name in (rename_columns or {}).items():
-                if not isinstance(old_name, str) or not old_name:
-                    raise ValidationError("Rename source column must be a non-empty string.")
-                _validate_column_name(old_name)
-                _validate_column_name(new_name)
 
             added: list[str] = []
             altered: list[str] = []
