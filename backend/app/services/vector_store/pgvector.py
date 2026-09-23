@@ -87,6 +87,32 @@ async def _set_vchord_candidate_budget(
     # SET LOCAL restores the pooled connection at transaction commit.
     await conn.execute(f"SET LOCAL bm25_catalog.bm25_limit = {budget}")
 
+
+async def _vchord_configured_budget(conn: asyncpg.Connection) -> int:
+    """`bm25_catalog.bm25_limit`, on a session that may not have loaded vchord_bm25.
+
+    The extension defines its settings when its library loads, and the image
+    `deploy/postgres/Dockerfile` builds does not preload it. On a session that
+    has not called into the extension yet the setting does not exist, and a
+    plain `current_setting` raised `unrecognized configuration parameter` —
+    which reaches `hybrid_search` as a store failure, so the first unfiltered
+    or index-led search on every new pooled connection lost both legs
+    (akb#615). A CI server that preloaded the library never saw it.
+
+    Any call into the extension loads it; a literal of its type is the
+    cheapest, and a connection pays for it once. A value an operator set in
+    the server configuration already exists before the load and is read as is.
+    """
+    value = await conn.fetchval(
+        "SELECT current_setting('bm25_catalog.bm25_limit', true)"
+    )
+    if value is None:
+        await conn.fetchval("SELECT '{}'::bm25_catalog.bm25vector IS NOT NULL")
+        value = await conn.fetchval(
+            "SELECT current_setting('bm25_catalog.bm25_limit')"
+        )
+    return int(value)
+
 # Schema name lands in identifier position in DDL; validate to keep
 # operator typos and config-injection-style attacks from blowing up
 # the cluster. Plain ASCII identifier is enough — pgvector's own
@@ -1358,11 +1384,7 @@ class PgvectorStore:
                     # extension scan; growing segments score before that hook.
                     # Preserve the direct fast path, and only use unqualified
                     # global candidates to choose widening or exact fallback.
-                    configured_budget = int(
-                        await conn.fetchval(
-                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
-                        )
-                    )
+                    configured_budget = await _vchord_configured_budget(conn)
                     return await self._search_vchord_index_led_filtered(
                         conn,
                         query_terms=query_terms,
@@ -1373,11 +1395,7 @@ class PgvectorStore:
                         configured_budget=configured_budget,
                     )
                 else:
-                    configured_budget = int(
-                        await conn.fetchval(
-                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
-                        )
-                    )
+                    configured_budget = await _vchord_configured_budget(conn)
                     sql = f"""
                         SELECT chunk_id FROM (
                           SELECT chunk_id::text AS chunk_id,

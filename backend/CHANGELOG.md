@@ -123,6 +123,15 @@ silently retries against the legacy endpoint after dropping restrictions.
   for every scope between 10,000 rows and 1% of the corpus — reproduced on a
   1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
   shape answered it in 15ms (akb#626).
+- The first search on a new connection no longer fails. The extension defines
+  `bm25_catalog.bm25_limit` when its library loads, and the image
+  `deploy/postgres/Dockerfile` builds does not preload it, so reading the
+  setting on a session that had not yet called into the extension raised —
+  and that reached `hybrid_search` as a store failure, losing both legs. The
+  backend now loads the library before reading the setting, once per
+  connection. CI missed it because the upstream image preloads the library
+  from its CMD; the pgvector job now starts that image with a plain
+  `postgres` command, as operators run theirs (akb#615).
 - The result is filtered on the sign of the score. `<&>` orders the whole table
   rather than filtering it — a document holding no query term scores exactly
   `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
