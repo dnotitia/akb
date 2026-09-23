@@ -11,7 +11,9 @@ from app.services.vector_store import VectorSearchDegraded, VectorStoreUnavailab
 from tests.test_search_archive_scope_vault_path_unit import VAULT_ID, _Conn, _hit, _install
 
 pytestmark = pytest.mark.asyncio
-_REASON = "sparse_search_budget_exceeded"
+# Any partial driver result. No shipped driver raises this today: the VChord
+# shape completes a short page exactly instead of refusing it (akb#673).
+_REASON = "partial_driver_result"
 
 
 def _partial_store(monkeypatch, hits):

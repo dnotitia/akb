@@ -95,48 +95,81 @@ distribution of that extension and carries the corresponding obligation —
 unmodified, that is an offer of the upstream source, which the link above
 satisfies.
 
-## Bounded search and exact fallback
+## Bounded search and exact completion
 
-The VChord reader widens finite candidate budgets up to 65,535. A short page is
-not proof that all matches were visited: growing segments and invisible index
-entries can consume that budget. Exact fallback remains available only when a
-bounded cardinality probe finds at most 10,000 non-NULL vectors. Index-led `-1`
-checks the global corpus, since the extension may scan it before filtering;
-materialized ranking checks its vault/source scope. Planner estimates alone do
-not authorize exact work. Operator-configured `-1` and oversized top-k requests
-use the same guard.
+`bm25_catalog.bm25_limit` is the size of the extension's internal top-k. A search
+asks for one finite page first. When that page comes back full, it is the answer.
+When it comes back short, the same query runs again with `-1` and that result is
+the answer (akb#673).
 
-A scope the selectivity estimate would materialize, but that holds more than
-10,000 vectors, is not refused: it is searched index-led, like any wider
-filter. Which shape runs is a latency decision and must never change the rows —
-refusing there left every scope between 10,000 vectors and 1% of the corpus
-with no sparse results at all, while the index-led shape answered the same
-scope.
+A short finite page is not proof that nothing else matches:
 
-Finite index queries, selectivity lookup and exact queries retain the existing
-caller and database-pool timeouts. This path does not install a shorter wall
-clock or statement timeout: a query that takes longer than five seconds can
-still finish within the caller's budget. Caller cancellation and server timeout
-still roll back local plan, candidate-budget and search-path settings.
+- Growing-segment rows are scored without the query's filter, and they take top-k
+  slots. So can rows the current snapshot cannot see.
+- In `vchord_bm25` 0.3.0, an index built by `CREATE INDEX` or `REINDEX` can store a
+  best score of 0 for the first full blocks of a term's list. The build saves a
+  128-posting block's summary before its best posting is counted. A bounded scan
+  skips those blocks outright. The next section covers what this means for full
+  pages.
 
-When the exact row cap refuses completion, the driver retains already fetched,
-scoped finite sparse candidates and waits for the independent dense leg. It
-fuses and fetches the surviving hits, then carries them in `VectorSearchDegraded`
-with reason `sparse_search_budget_exceeded`. The search service passes these hits
-through its normal hydration/filtering and returns `degraded: true` with that
-reason. A sparse-only request can retain finite hits too; if neither leg has
-usable hits, the response is explicitly degraded and empty. Size refusal does
-not masquerade as a complete result or discard a successful dense leg. Genuine
-store/payload failures and caller cancellation keep their existing behavior.
+`-1` reads every posting of the query terms and leaves visibility and the
+filter to the executor, so it is the only complete scan. What it costs is those
+postings plus the growing segment, and one heap check for each candidate the
+executor reads before the page fills. The corpus size is not the measure. A page
+that came back short had already read every posting it could, because pruning
+only starts once the internal top-k holds more than twice its size. Completing it
+therefore repeats work of the same order. On a 2.1M-chunk corpus, completing took
+60 ms to 2.5 s.
 
-The 10,000-row threshold is a conservative exact-work safeguard, not a relevance
-or latency acceptance target. A broad underfilled query can still be incomplete;
-validate that tradeoff before deploying VChord. Preserving hits does not prove
-exact top-k completeness for that request.
+Before this, a short page widened the finite budget up to 65,535 and then refused
+exact work whenever the corpus held more than 10,000 rows, which is always in
+production. Each widening probe scored every candidate again in the executor.
+That path took 0.1–8 s and ended with `degraded: true` on every search whose scope
+held fewer matches than the page. In the 90 such searches measured, the final
+top-10 matched what the `posting` shape returned for the same request.
 
-Run `test_vchord_candidate_budget_postgres.py` against the pinned extension to
-exercise candidate widening, scoped exact ranking, global fallback refusal and
-connection recovery. Hybrid/service regressions cover retained dense and sparse
-hits, both leg completion orders, ACL filters, and explicit degradation accounting.
+Materialising a selective scope scores every row in the scope, so it is limited to
+scopes of at most 10,000 rows (`_VCHORD_MAX_MATERIALISED_ROWS`). A larger
+selective scope is not refused. It is searched index-led, like any wider filter.
+Which shape runs is a latency decision and must never change the rows: refusing
+there left every scope between 10,000 vectors and 1% of the corpus with no
+sparse results at all (akb#626).
+
+Finite queries, the selectivity lookup and exact queries keep the existing caller
+and database-pool timeouts. This path does not install a shorter wall clock or
+statement timeout, so a query that takes longer than five seconds can still finish
+within the caller's budget. Caller cancellation and server timeouts still roll
+back the local plan, candidate-budget and search-path settings.
+
+### Full pages from a rebuilt index
+
+The block defect above also affects a page that comes back full. The skipped
+blocks' postings never compete for the page, so a full page can be missing better
+matches.
+
+Measured on an index built with `CREATE INDEX CONCURRENTLY` over 2.1M chunks: for
+150 randomly sampled terms with 128 to 20,000 matches, plus nine query terms,
+compared one term at a time, the bounded top-90 had a strictly worse score than
+the exact top-90 at some rank for 7 of the 159 terms.
+
+- An index built empty and filled by inserts does not have the defect, because
+  inserted rows are merged in by a different path.
+- A `REINDEX` brings the defect back.
+
+Check this before rebuilding the index or moving the extension pin.
+
+Run `test_vchord_candidate_budget_postgres.py` against the pinned extension. It
+covers:
+
+- finite pages and their exact completion;
+- scoped materialised ranking;
+- every exact route, including a page shortened by a rebuilt index;
+- connection recovery.
+
+Hybrid and service regressions cover:
+
+- short sparse pages completed beside the dense leg, in both completion orders;
+- ACL filters;
+- degradation accounting for drivers that do return partial results.
 The test DSN must identify an isolated PostgreSQL instance;
 the tests create disposable databases.
