@@ -647,6 +647,21 @@ async def test_d7_a_plain_target_held_physically_by_another_column_renames_logic
     assert not any("RENAME COLUMN" in s for s in conn.sql())
 
 
+async def test_d7_renaming_a_column_to_the_name_it_already_has_is_a_no_op(monkeypatch):
+    """`AGE` resolves to `age`, so a rename can name the column it already is;
+    that must not reach RENAME COLUMN, which PostgreSQL refuses onto itself."""
+    cols, _, _ = _spec([{"name": "age", "type": "int"}])
+    conn = _alter_conn(cols)
+    _wire(monkeypatch, conn)
+
+    out = await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={"AGE": "age"},
+    )
+
+    assert [(c["name"], c["pg_name"]) for c in out["columns"]] == [("age", "age")]
+    assert not any(s.startswith("ALTER TABLE") for s in conn.sql())
+
+
 async def test_d12_if_not_exists_ignores_pg_name_on_either_side(monkeypatch):
     legacy = [{"name": "title", "type": "text"}]  # stored before the backfill
     conn = _Conn(table_row={

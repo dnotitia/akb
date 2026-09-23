@@ -1594,6 +1594,11 @@ async def alter_table(
                 )
                 for col, new_name in plans:
                     old_name = col["name"]
+                    if new_name == old_name:
+                        # A name resolves case-insensitively, so `AGE` → `age`
+                        # may name the column it already is. Nothing to do —
+                        # and RENAME COLUMN onto itself would be an error.
+                        continue
                     old_physical = table_data_repo.column_pg_name(col)
                     col["name"] = new_name
                     col["pg_name"] = old_physical
