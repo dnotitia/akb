@@ -794,17 +794,22 @@ def _mutation_filter_key(key: str, value: str, column_meta: _ColumnMeta) -> bool
     UPDATE/DELETE that looks filtered must never quietly become broader than
     the caller intended (8d04a2aa), so a key naming a column is a filter
     unless it is a control this mutation reads AND its value is one that
-    control takes: `select` a column list (anything but `<op>.<value>`),
-    `all` a yes/no, `expected_row_commit` any token — it is always the CAS
-    token. Everything else a mutation never reads, so on a column it can
-    only be a filter, and a malformed one is refused, not ignored.
+    control takes: `select` a column list that is not also a filter, `all`
+    a yes/no, `expected_row_commit` any token — it is always the CAS token.
+    Everything else a mutation never reads, so on a column it can only be a
+    filter. A value that is neither is compiled as the filter and refused,
+    never ignored: `select`'s list is compiled only under
+    `return=representation`, so taking a malformed filter for it would drop
+    the filter from every other request.
     """
     if key not in WRITE_CONTROL_PARAMS:
         return True
     if key == EXPECTED_ROW_COMMIT_PARAM or key not in column_meta:
         return False
     if key == "select":
-        return _is_filter_value(value)
+        return _is_filter_value(value) or isinstance(
+            _compile_select(value, column_meta, []), dict,
+        )
     if key == "all":
         return value.lower() not in _ALL_ROWS_VALUES
     return True
