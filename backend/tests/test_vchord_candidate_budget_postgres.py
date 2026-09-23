@@ -892,3 +892,39 @@ async def test_exact_refusal_without_dense_keeps_finite_scoped_candidates():
                 )
         assert caught.value.reason == "sparse_search_budget_exceeded"
         assert {hit.chunk_id for hit in caught.value.hits} == scoped
+
+
+async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
+    """akb#673: exact completion is sized by the query's matches, not the corpus.
+
+    Two rows of the target vault hold the rare term, and no other row does; the
+    corpus holds many more rows than the exact-row cap. The index-led page comes
+    back short, the global candidates run out at those same two rows, and exact
+    completion has exactly two rows to score. Refusing it because of how many
+    OTHER rows the corpus holds marked every such search degraded in production
+    (2.1M chunks against a 10,000-row cap) while the answer was already complete.
+    """
+    target = uuid.UUID(int=0x73)
+    scoped_ids: set[str] = set()
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            for ordinal in range(1, 3):
+                chunk_id = uuid.UUID(int=0x7300 + ordinal)
+                scoped_ids.add(str(chunk_id))
+                await _put(
+                    store, conn, chunk_id=chunk_id, vault_id=target,
+                    source_type="document",
+                    terms=[_RARE_TERM] + list(range(2_000, 2_000 + ordinal)),
+                    chunk_index=ordinal,
+                )
+            await _seed(store, conn)  # 35 more rows, none holding the rare term
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
+                async with _record_budget_calls() as budgets:
+                    async with _candidate_budget(conn):
+                        hits = await _acl_hits(
+                            store, conn, target, selective=False, terms=[_RARE_TERM],
+                        )
+
+    assert set(hits) == scoped_ids
+    assert budgets[-1] == -1
