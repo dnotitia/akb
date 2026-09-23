@@ -54,8 +54,9 @@ _COLUMN_NAME_FIELD = {
     "type": "string",
     "description": (
         "SQL identifier, used as written in akb_sql: a lowercase ASCII letter, "
-        "then lowercase letters, digits or underscores, at most 63 bytes. Name "
-        "the column for what it holds (e.g. `category`)."
+        "then lowercase letters, digits or underscores, at most 63 bytes, and "
+        "not a word PostgreSQL reserves (`user`, `order`, …) or a system column "
+        "(`xmin`, …). Name the column for what it holds (e.g. `category`)."
     ),
 }
 _COLUMN_DESCRIPTION_FIELD = {

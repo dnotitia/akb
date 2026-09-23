@@ -112,6 +112,29 @@ async def _transaction_if_needed(conn: Any, enabled: bool) -> AsyncIterator[None
 # column naming different things.
 _MAX_COLUMN_NAME_BYTES = 63
 
+# Names the grammar accepts but PostgreSQL will not take as a column: the
+# keywords `pg_get_keywords()` lists as catcode R (reserved) or T (reserved,
+# can be a function or type name) — `CREATE TABLE … (user TEXT)` is a syntax
+# error — and the system column names, which fail with 42701. Both reached DDL
+# and came back as a 500. The other keywords (`name`, `type`, `value`, …) work
+# unquoted as column names and stay allowed. Frozen from PostgreSQL 16;
+# test_table_column_reserved_words_postgres compares it with the server.
+_PG_RESERVED_COLUMN_WORDS = frozenset(
+    """
+    all analyse analyze and any array as asc asymmetric authorization binary both
+    case cast check collate collation column concurrently constraint create cross
+    current_catalog current_date current_role current_schema current_time
+    current_timestamp current_user default deferrable desc distinct do else end
+    except false fetch for foreign freeze from full grant group having ilike in
+    initially inner intersect into is isnull join lateral leading left like limit
+    localtime localtimestamp natural not notnull null offset on only or order outer
+    overlaps placing primary references returning right select session_user similar
+    some symmetric system_user table tablesample then to trailing true union unique
+    user using variadic verbose when where window with
+    """.split()
+)
+_PG_SYSTEM_COLUMNS = frozenset({"tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"})
+
 # What a refusal tells the caller — the rule, and the way out. A table taken
 # from a document usually has headers the rule refuses (akb#433); the header is
 # not lost, it belongs in the column's `description`, which akb_vault_info
@@ -119,7 +142,8 @@ _MAX_COLUMN_NAME_BYTES = 63
 _COLUMN_NAME_RULE = (
     "Column names are SQL identifiers and akb_sql uses them as written: a "
     "lowercase ASCII letter, then lowercase letters, digits or underscores, "
-    f"at most {_MAX_COLUMN_NAME_BYTES} bytes. Name each column for what it "
+    f"at most {_MAX_COLUMN_NAME_BYTES} bytes, and not a word PostgreSQL "
+    "reserves or a system column. Name each column for what it "
     "holds (for example `category`) and keep the original header in that "
     "column's `description`, which akb_vault_info shows and search indexes."
 )
@@ -144,6 +168,10 @@ def _column_name_problem(name) -> str | None:
             f"is longer than {_MAX_COLUMN_NAME_BYTES} bytes, where PostgreSQL "
             "cuts identifiers"
         )
+    if name in _PG_RESERVED_COLUMN_WORDS:
+        return "is a word PostgreSQL reserves, which SQL could only use quoted"
+    if name in _PG_SYSTEM_COLUMNS:
+        return "is a PostgreSQL system column"
     return None
 
 

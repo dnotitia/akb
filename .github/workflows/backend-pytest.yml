@@ -325,6 +325,7 @@ jobs:
             tests/test_bm25_corpus_revision_postgres.py
             tests/test_bm25_recompute_resume_postgres.py
             tests/test_bm25_vocab_term_ids_postgres.py
+            tests/test_table_column_reserved_words_postgres.py
             tests/test_notifications_postgres.py
             tests/test_notification_native_postgres.py
             tests/test_notification_unwatch_postgres.py
