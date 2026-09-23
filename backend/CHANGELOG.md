@@ -34,6 +34,22 @@ now completed, but it can also leave a full page missing better matches. On the
 measured index this was 7 of 159 sampled terms. `deploy/postgres/README.md`
 describes the defect and what avoids it.
 
+### A refused tool call sets `isError` in the MCP result
+
+MCP reports a tool execution error inside the result with `isError: true`.
+AKB's refusals travel as the `{"error", "code", ...}` envelope, and the result
+never set the flag, so a client that branches on it read every refusal as a
+success. Now it does whenever the body is that envelope, whether a handler
+returned it or the dispatch built it from an exception. The body itself is
+unchanged.
+
+For client authors:
+
+- If you read the envelope, nothing changes.
+- If you raise on `isError`, you will now raise where you used to get the
+  envelope back. Handle the envelope before you raise. The first-party
+  collector and gardener clients already do.
+
 ### A database password with a URL delimiter no longer breaks the database URL
 
 `Settings.asyncpg_dsn`, which every connection uses (the main pool, the Native
