@@ -447,6 +447,17 @@ silently retries against the legacy endpoint after dropping restrictions.
 
 ### Indexing
 
+- Encoding a chunk no longer locks the vocabulary rows of terms that already
+  exist. Term ids were resolved with `INSERT ... ON CONFLICT DO UPDATE` whose
+  update was a no-op, and a no-op update still locks each existing row until
+  its transaction ends, writes a new row version, and draws a sequence value
+  for every term. Every concurrent indexer and backfill writer shares the common
+  terms, so they queued on the same rows: on a 2.1M-chunk backfill, waiting on
+  each other's vocabulary rows was 42% of the writers' sampled wait, and a
+  long-lived vocabulary had taken 161M updates for 953k rows. Known terms are
+  now read without a lock, only unseen terms are inserted (`DO NOTHING`), and a
+  term another writer committed first is read back. Term ids do not change; the
+  sequence now advances only for new terms.
 - A NUL byte in a body no longer costs the document its place in ranked search.
   Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
   does not, so indexing raised `CharacterNotInRepertoireError` on every attempt

@@ -359,6 +359,14 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
     """Return {term: term_id} for given terms. New terms get fresh ids from
     the sequence. Existing terms are looked up. df is NOT incremented here —
     df/N/avgdl are rebuilt by `recompute_stats()`.
+
+    Almost every term an encoder sees already exists, so existing terms are
+    READ, not upserted. `ON CONFLICT DO UPDATE` with a no-op SET still locks
+    each existing row until its transaction ends, writes a new row version and
+    calls `nextval()` for every term — so encoders sharing common terms queued
+    on the same rows. On a live 2.1M-chunk sweep that queue was 42% of the
+    writers' sampled wait, and the vocabulary had taken 161M updates for 953k
+    rows. A plain read takes no row lock; only unseen terms are inserted.
     """
     uniq = list({t for t in terms if t})
     if not uniq:
@@ -366,24 +374,42 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Upsert: existing rows stay untouched (including their term_id);
-        # new rows get a fresh id from the sequence.
-        # ORDER BY enforces a deterministic row-lock acquisition order so
-        # concurrent encoders processing documents with overlapping vocab
-        # (English stopwords are the dominant case) don't deadlock on the
-        # ON CONFLICT row locks.
         rows = await conn.fetch(
-            """
-            INSERT INTO bm25_vocab (term, term_id)
-            SELECT t, nextval('bm25_term_id_seq')
-              FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
-            ON CONFLICT (term) DO UPDATE
-                SET updated_at = bm25_vocab.updated_at   -- no-op, returns existing row
-            RETURNING term, term_id
-            """,
+            "SELECT term, term_id FROM bm25_vocab WHERE term = ANY($1::text[])",
             uniq,
         )
-    return {r["term"]: int(r["term_id"]) for r in rows}
+        ids = {r["term"]: int(r["term_id"]) for r in rows}
+        missing = [t for t in uniq if t not in ids]
+        if missing:
+            # ORDER BY gives concurrent callers inserting overlapping new
+            # terms one acquisition order, so they wait instead of deadlocking.
+            # DO NOTHING waits for a conflicting uncommitted insert to finish
+            # and then skips the term; the follow-up read below collects it.
+            rows = await conn.fetch(
+                """
+                INSERT INTO bm25_vocab (term, term_id)
+                SELECT t, nextval('bm25_term_id_seq')
+                  FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
+                ON CONFLICT (term) DO NOTHING
+                RETURNING term, term_id
+                """,
+                missing,
+            )
+            ids.update((r["term"], int(r["term_id"])) for r in rows)
+            raced = [t for t in missing if t not in ids]
+            if raced:
+                rows = await conn.fetch(
+                    "SELECT term, term_id FROM bm25_vocab WHERE term = ANY($1::text[])",
+                    raced,
+                )
+                ids.update((r["term"], int(r["term_id"])) for r in rows)
+    unresolved = [t for t in uniq if t not in ids]
+    if unresolved:
+        # The vocabulary is append-only, so this cannot happen by design. If it
+        # does, refuse: `encode_document` would otherwise drop the terms and
+        # store a vector that silently misses part of the document.
+        raise RuntimeError(f"bm25 vocabulary lost {len(unresolved)} term(s) mid-call")
+    return ids
 
 
 async def lookup_term_ids(terms: Iterable[str]) -> dict[str, int]:
