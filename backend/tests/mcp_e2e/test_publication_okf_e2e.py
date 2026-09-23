@@ -246,8 +246,8 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
     all_publications = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_publications",
-        {"vault": vault},
+        "akb_publication_read",
+        {"action": "list", "vault": vault},
     )
     listed = all_publications.get("publications")
     assert isinstance(listed, list)
@@ -261,8 +261,8 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
     document_publications = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_publications",
-        {"vault": vault, "resource_type": "document"},
+        "akb_publication_read",
+        {"action": "list", "vault": vault, "resource_type": "document"},
     )
     assert document_publications.get("total") == len(document_publications["publications"])
     assert all(item.get("resource_type") == "document" for item in document_publications["publications"])
@@ -270,8 +270,8 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
     file_publications = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_publications",
-        {"vault": vault, "resource_type": "file"},
+        "akb_publication_read",
+        {"action": "list", "vault": vault, "resource_type": "file"},
     )
     assert file_publications.get("total") == 1
     assert file_publications["publications"][0]["slug"] == file_slug
@@ -279,8 +279,8 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
     query_publications = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_publications",
-        {"vault": vault, "resource_type": "table_query"},
+        "akb_publication_read",
+        {"action": "list", "vault": vault, "resource_type": "table_query"},
     )
     assert query_publications.get("total") == 1
     assert query_publications["publications"][0]["slug"] == query_slug
@@ -317,8 +317,8 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
     no_access_list = await _call_json(
         secondary_mcp_client.client,
         runtime_session,
-        "akb_publications",
-        {"vault": vault},
+        "akb_publication_read",
+        {"action": "list", "vault": vault},
         expect_error=True,
     )
     assert "error" in no_access_list
@@ -346,6 +346,28 @@ async def test_publication_sdk_lifecycle_and_rest_oracle(
         expect_error=True,
     )
     assert "error" in no_access_unpublish
+
+    await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_grant",
+        {"vault": vault, "user": secondary_mcp_client.username, "role": "reader"},
+    )
+    reader_publications = await _call_json(
+        secondary_mcp_client.client,
+        runtime_session,
+        "akb_publication_read",
+        {"action": "list", "vault": vault},
+    )
+    assert reader_publications.get("total") == len(reader_publications.get("publications", []))
+    reader_export = await _call_json(
+        secondary_mcp_client.client,
+        runtime_session,
+        "akb_export_read",
+        {"action": "export", "vault": vault, "format": "okf"},
+    )
+    assert reader_export.get("format") == "okf"
+    assert reader_export.get("file_count") == len(reader_export.get("files", {}))
 
     by_slug = await _call_json(
         mcp_client,
@@ -493,8 +515,8 @@ async def test_okf_sdk_round_trip_and_import_acl(
     exported = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_export",
-        {"vault": source_vault, "format": "okf"},
+        "akb_export_read",
+        {"action": "export", "vault": source_vault, "format": "okf"},
     )
     files = exported.get("files")
     assert isinstance(files, dict)

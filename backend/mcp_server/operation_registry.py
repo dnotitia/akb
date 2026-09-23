@@ -23,7 +23,10 @@ READ_SCOPE = "akb:vault:read"
 WRITE_SCOPE = "akb:vault:write"
 
 Risk = Literal["read", "write", "destructive"]
-TargetRule = Literal["none", "vault", "optional_vault", "many_vaults", "uri", "browse"]
+VaultRole = Literal["reader", "writer", "admin", "owner", "explain_target"]
+TargetRule = Literal[
+    "none", "vault", "optional_vault", "many_vaults", "uri", "browse", "resource_or_vault"
+]
 
 
 class OperationValidationError(ValueError):
@@ -44,14 +47,14 @@ class OperationSpec:
     input_schema: dict[str, Any]
     handler: str
     required_scope: str
-    vault_role: str | None
+    vault_role: VaultRole | None
     target: TargetRule
     risk: Risk
     logical_audit_operation: str
     description: str
 
 
-_FIRST_SLICE: tuple[tuple[str, str, str, TargetRule, str], ...] = (
+_CANDIDATE_OPERATIONS: tuple[tuple[str, str, str, TargetRule, str], ...] = (
     # public tool, action, legacy handler, target rule, action description
     (
         "akb_discover",
@@ -130,17 +133,83 @@ _FIRST_SLICE: tuple[tuple[str, str, str, TargetRule, str], ...] = (
         "uri",
         "Read document provenance and visible same-vault relations without mutation.",
     ),
+    (
+        "akb_relationships",
+        "relations",
+        "akb_relations",
+        "uri",
+        "Read the existing incoming, outgoing, or both relations for one resource URI, with the optional relation-type filter.",
+    ),
+    (
+        "akb_relationships",
+        "graph",
+        "akb_graph",
+        "resource_or_vault",
+        "Read a bounded graph around a resource URI, or the full graph for a named vault; `hops` controls URI traversal.",
+    ),
+    (
+        "akb_vault_access",
+        "members",
+        "akb_vault_members",
+        "vault",
+        "List the existing member roster and roles for one vault. Requires reader access.",
+    ),
+    (
+        "akb_vault_access",
+        "explain",
+        "akb_explain_access",
+        "vault",
+        "Explain a user's access bases for one vault. Readers may explain themselves; explaining another user requires admin access.",
+    ),
+    (
+        "akb_identity",
+        "whoami",
+        "akb_whoami",
+        "none",
+        "Read the authenticated caller's existing profile.",
+    ),
+    (
+        "akb_identity",
+        "search_users",
+        "akb_search_users",
+        "none",
+        "Search users by the existing username, display-name, or email query and limit.",
+    ),
+    (
+        "akb_publication_read",
+        "list",
+        "akb_publications",
+        "vault",
+        "List the publications for one vault, optionally filtered by resource type.",
+    ),
+    (
+        "akb_export_read",
+        "export",
+        "akb_export",
+        "vault",
+        "Export one readable vault as the existing inline OKF {path: content} bundle.",
+    ),
 )
 
-FIRST_SLICE_LEGACY_NAMES = frozenset(item[2] for item in _FIRST_SLICE)
-FIRST_SLICE_REPLACED_NAMES = frozenset(
-    FIRST_SLICE_LEGACY_NAMES - {"akb_grep"}
-)
+CANDIDATE_LEGACY_NAMES = frozenset(item[2] for item in _CANDIDATE_OPERATIONS)
 
 # `akb_grep(replace=...)` is an existing mutation operation, not a read alias.
 # Its flat public name remains available only with the write-only contract built
 # by `candidate_tools`; the read half is owned by `akb_discover/grep` above.
 DEFERRED_MUTATION_NAMES = frozenset({"akb_grep"})
+CANDIDATE_REPLACED_NAMES = frozenset(
+    CANDIDATE_LEGACY_NAMES - DEFERRED_MUTATION_NAMES
+)
+
+INDEPENDENT_OPERATION_REASONS = {
+    "akb_help": "Self-documentation remains an independent tool surface.",
+    "akb_sql": "Arbitrary SQL keeps its existing mixed read/write scope and risk boundary.",
+}
+
+DEFERRED_OPERATION_REASONS = {
+    "backend_write_manage": "Backend mutations and management actions remain in the later write slice.",
+    "stdio_local_files": "Local filesystem operations remain in the stdio proxy surface.",
+}
 
 # Coverage deliberately names what the next candidate slices own.  This is
 # data for tests/review, not a second dispatch catalog.
@@ -156,26 +225,18 @@ DEFERRED_OPERATION_NAMES = frozenset(
         "akb_delete",
         "akb_create_collection",
         "akb_delete_collection",
-        "akb_relations",
-        "akb_graph",
         "akb_link",
         "akb_unlink",
         "akb_create_table",
         "akb_alter_table",
         "akb_drop_table",
         "akb_publish",
-        "akb_publications",
         "akb_publication_snapshot",
         "akb_unpublish",
-        "akb_whoami",
-        "akb_vault_members",
-        "akb_explain_access",
-        "akb_search_users",
         "akb_grant",
         "akb_revoke",
         "akb_transfer_ownership",
         "akb_set_public",
-        "akb_export",
         "akb_import",
     }
 )
@@ -189,8 +250,8 @@ def _action_schema(legacy: Tool, action: str) -> dict[str, Any]:
     schema["properties"] = properties
     schema["required"] = list(schema.get("required") or [])
     schema["additionalProperties"] = False
-    # The legacy grep tool also performs replacement.  The first slice keeps
-    # this action read-only, so mutation-only arguments never enter its schema.
+    # The legacy grep tool also performs replacement. The read capability
+    # keeps mutation-only arguments out of its action schema.
     if legacy.name == "akb_grep":
         for name in ("replace", "max_replacements"):
             properties.pop(name, None)
@@ -198,6 +259,8 @@ def _action_schema(legacy: Tool, action: str) -> dict[str, Any]:
         # The old handler accepted either coordinate form and enforced the
         # relationship itself.  The candidate contract makes that requirement
         # explicit in the action branch without changing either accepted form.
+        schema["anyOf"] = [{"required": ["uri"]}, {"required": ["vault"]}]
+    if legacy.name == "akb_graph":
         schema["anyOf"] = [{"required": ["uri"]}, {"required": ["vault"]}]
     schema["description"] = f"Candidate action `{action}` input contract."
     return schema
@@ -231,9 +294,24 @@ class OperationRegistry:
         properties = spec.input_schema.get("properties")
         if not isinstance(properties, dict) or "action" in properties:
             raise ValueError(f"action schema has invalid properties: {spec.public_tool}/{spec.action}")
-        if spec.vault_role not in {None, "reader", "writer", "admin", "owner"}:
+        if spec.vault_role not in {
+            None,
+            "reader",
+            "writer",
+            "admin",
+            "owner",
+            "explain_target",
+        }:
             raise ValueError(f"invalid vault RBAC role: {spec.vault_role}")
-        if spec.target not in {"none", "vault", "optional_vault", "many_vaults", "uri", "browse"}:
+        if spec.target not in {
+            "none",
+            "vault",
+            "optional_vault",
+            "many_vaults",
+            "uri",
+            "browse",
+            "resource_or_vault",
+        }:
             raise ValueError(f"invalid vault target rule: {spec.target}")
         self._specs.append(spec)
         self._by_key[key] = spec
@@ -332,6 +410,11 @@ class OperationRegistry:
             return WRITE_SCOPE
         return spec.required_scope
 
+    def required_scope_for_tool(self, public_tool: str) -> str | None:
+        """Return the validated common scope for a registry-owned tool."""
+        specs = [spec for spec in self._specs if spec.public_tool == public_tool]
+        return specs[0].required_scope if specs else None
+
     def logical_audit_operation_for(
         self, public_tool: str, arguments: Mapping[str, Any]
     ) -> str | None:
@@ -366,6 +449,16 @@ class OperationRegistry:
             parsed = parse_uri(value)
             return (parsed.vault,) if parsed is not None else ()
 
+        if spec.target == "resource_or_vault":
+            uri = arguments.get("uri")
+            if isinstance(uri, str) and uri:
+                from app.services.uri_service import parse_uri
+
+                parsed = parse_uri(uri)
+                return (parsed.vault,) if parsed is not None else ()
+            value = arguments.get("vault")
+            return (value,) if isinstance(value, str) and value else ()
+
         if spec.target == "browse":
             uri = arguments.get("uri")
             if isinstance(uri, str) and uri:
@@ -381,7 +474,7 @@ class OperationRegistry:
 
         return ()
 
-    def first_slice_coverage(self) -> dict[str, tuple[str, str]]:
+    def operation_coverage(self) -> dict[str, tuple[str, str]]:
         return {
             spec.handler: (spec.public_tool, spec.action)
             for spec in self._specs
@@ -445,20 +538,45 @@ class OperationRegistry:
                 "tree, `search` for semantic retrieval, and `grep` for exact text or regex. "
                 "No action mutates AKB."
             )
-        else:
+        elif public_tool == "akb_document_read":
             prefix = (
                 "Read-only document capability. Choose exactly one `action`: use `get` "
                 "for current or historical content, `section` for headings/sections, "
                 "`activity`/`history` for change history, `diff` for a commit comparison, "
                 "and `provenance` for origin metadata and visible relations. No action mutates AKB."
             )
+        else:
+            prefixes = {
+                "akb_relationships": (
+                    "Read-only relationship capability. Choose `relations` to inspect one "
+                    "resource's edges; choose `graph` for a full vault graph or a bounded URI subgraph."
+                ),
+                "akb_vault_access": (
+                    "Read-only vault access capability. Choose `members` for the roster; "
+                    "choose `explain` for the bases behind a user's access. A caller may explain "
+                    "their own access as a reader; explaining another user requires admin access."
+                ),
+                "akb_identity": (
+                    "Read-only identity capability. Choose `whoami` for the authenticated profile "
+                    "or `search_users` to find users by the existing search fields."
+                ),
+                "akb_publication_read": (
+                    "Read-only publication capability. Choose `list` to list or filter the "
+                    "publications in one vault."
+                ),
+                "akb_export_read": (
+                    "Read-only vault export capability. Choose `export` to retrieve the existing "
+                    "inline knowledge bundle for one vault."
+                ),
+            }
+            prefix = prefixes[public_tool]
         actions = "\n".join(f"- `{spec.action}`: {spec.description}" for spec in specs)
         return f"{prefix}\n\nActions:\n{actions}"
 
 
 def build_candidate_registry(legacy_tools: Mapping[str, Tool]) -> OperationRegistry:
     registry = OperationRegistry()
-    for public_tool, action, legacy_name, target, description in _FIRST_SLICE:
+    for public_tool, action, legacy_name, target, description in _CANDIDATE_OPERATIONS:
         try:
             legacy = legacy_tools[legacy_name]
         except KeyError as exc:
@@ -470,7 +588,13 @@ def build_candidate_registry(legacy_tools: Mapping[str, Tool]) -> OperationRegis
                 input_schema=_action_schema(legacy, action),
                 handler=legacy_name,
                 required_scope=READ_SCOPE,
-                vault_role="reader" if target != "none" else None,
+                vault_role=(
+                    None
+                    if target == "none"
+                    else "explain_target"
+                    if legacy_name == "akb_explain_access"
+                    else "reader"
+                ),
                 target=target,
                 risk="read",
                 logical_audit_operation=legacy_name,

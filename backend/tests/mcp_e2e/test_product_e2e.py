@@ -465,11 +465,16 @@ async def test_relations_activity_provenance_and_document_deletion(
     relations = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_relations",
-        {"uri": second["uri"]},
+        "akb_relationships",
+        {"action": "relations", "uri": second["uri"]},
     )
     assert len(relations.get("relations", [])) >= 1
-    graph = await _call_json(mcp_client, runtime_session, "akb_graph", {"vault": vault})
+    graph = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_relationships",
+        {"action": "graph", "vault": vault},
+    )
     assert len(graph.get("nodes", [])) >= 2
     assert len(graph.get("edges", [])) >= 1
     provenance = await _call_json(
@@ -499,11 +504,18 @@ async def test_relations_activity_provenance_and_document_deletion(
     assert diff.get("type")
 
     username = os.environ[runtime_session.descriptor.username_env]
+    identity = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_identity",
+        {"action": "whoami"},
+    )
+    assert identity.get("username") == username
     users = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_search_users",
-        {"query": username},
+        "akb_identity",
+        {"action": "search_users", "query": username},
     )
     assert len(users.get("users", [])) >= 1
     info = await _call_json(
@@ -513,8 +525,21 @@ async def test_relations_activity_provenance_and_document_deletion(
         {"action": "vault_info", "vault": vault},
     )
     assert info.get("owner")
-    members = await _call_json(mcp_client, runtime_session, "akb_vault_members", {"vault": vault})
+    members = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_vault_access",
+        {"action": "members", "vault": vault},
+    )
     assert len(members.get("members", [])) >= 1
+    explanation = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_vault_access",
+        {"action": "explain", "vault": vault, "user": username},
+    )
+    assert explanation.get("user") == username
+    assert explanation.get("non_member_paths", {}).get("owner") is True
 
     deleted = await _call_json(mcp_client, runtime_session, "akb_delete", {"uri": first["uri"]})
     assert deleted.get("deleted") is True

@@ -1395,8 +1395,8 @@ TOOLS = [
 
 
 from mcp_server.operation_registry import (
+    CANDIDATE_LEGACY_NAMES,
     DEFERRED_MUTATION_NAMES,
-    FIRST_SLICE_LEGACY_NAMES,
     OperationRegistry,
     build_candidate_registry,
 )
@@ -1432,12 +1432,10 @@ def _candidate_grep_replace_tool() -> Tool:
 
 
 def candidate_tools() -> list[Tool]:
-    """Return the incremental candidate catalog in deterministic order.
+    """Return the candidate catalog in deterministic order.
 
-    The first-slice legacy names are replaced by registry capabilities. Later
-    slices remain at their existing public boundary until their owning issue
-    registers a replacement; this keeps one catalog without exposing a
-    duplicate address for any operation already consolidated here.
+    Registry-owned read operations replace their legacy names. Other backend
+    operations remain at their existing boundary until a later slice owns them.
     """
     result = [tool.model_copy(deep=True) for tool in CANDIDATE_REGISTRY.tools_by_name.values()]
     result.append(_candidate_grep_replace_tool())
@@ -1445,7 +1443,7 @@ def candidate_tools() -> list[Tool]:
         tool.model_copy(deep=True)
         for tool in available_tools()
         if (
-            tool.name not in FIRST_SLICE_LEGACY_NAMES
+            tool.name not in CANDIDATE_LEGACY_NAMES
             and tool.name not in DEFERRED_MUTATION_NAMES
         )
     )
