@@ -1311,3 +1311,160 @@ async def test_older_code_needs_plain_names_and_no_stored_pg_name(monkeypatch):
     assert "while every column name is plain and no column stores pg_name" in text, text
     assert "whether or not it stores pg_name" in text, text
     assert "exactly when no column stores pg_name" not in text, text
+
+
+# ── A `select` on PATCH/DELETE is a column list or a filter, never ignored ───
+
+
+@pytest.mark.parametrize("prefer", [None, "return=representation"])
+@pytest.mark.parametrize("method", ["delete", "patch"])
+@pytest.mark.parametrize("value", ["eg.5", "5", "eq5", "isdistinct.5", "x"])
+def test_a_select_that_is_neither_a_column_list_nor_a_filter_is_refused(method, prefer, value):
+    """On a `Select` header, `select=eg.5` is a mistyped filter. Taking it as
+    the RETURNING list — compiled only under return=representation — turned
+    `DELETE …?select=eg.5&source=eq.test` into `DELETE … WHERE source = 'test'`."""
+    cols = _declared({"name": "Select", "type": "int"}, "source")
+    params = [("select", value), ("source", "eq.test")]
+    if method == "delete":
+        out = compile_delete_rows(
+            vault_name=_VAULT, table_name=_TABLE, columns=cols,
+            query_params=params, prefer_header=prefer,
+        )
+    else:
+        out = compile_update_rows(
+            vault_name=_VAULT, table_name=_TABLE, columns=cols, body={"source": "x"},
+            query_params=params, prefer_header=prefer,
+        )
+
+    assert isinstance(out, dict), out.sql
+    assert out["code"] in {"invalid_operator", "invalid_filter"}, out
+
+
+# ── Rollout installs a reference as it did before #433 ───────────────────────
+
+# Captured from de2e1ac9's `_create_table_owned` for the same manifests: what
+# an app installed before #433. Only the referenced column's physical name
+# may come from a new place; nothing else may be refused or changed.
+_PEOPLE = {
+    "id": uuid.UUID(int=7), "name": "people",
+    "columns": [{"name": "code", "type": "numeric"}],
+    "unique_keys": [{"name": "uk", "columns": ["code"]}], "indexes": [],
+    "collection": None, "description": "",
+}
+_ITEMS_BOOKKEEPING = (
+    "created_by TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+    "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+    "row_commit TEXT NOT NULL DEFAULT gen_random_uuid()::TEXT)"
+)
+_ROLLOUT_REFERENCES_BEFORE_433 = {
+    # A self-reference: the target is the table being created.
+    "self-reference": (
+        {"name": "parent", "type": "uuid",
+         "references": {"table": "items", "column": "id"}, "on_delete": "cascade"},
+        "CREATE TABLE vt_papers__items (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), "
+        "parent UUID, CONSTRAINT vt_papers__items__parent_d274c388__fkey FOREIGN KEY (parent) "
+        "REFERENCES vt_papers__items (id) ON DELETE CASCADE, " + _ITEMS_BOOKKEEPING,
+    ),
+    # PostgreSQL accepts the constraint; the table service would not.
+    "required-set-null": (
+        {"name": "owner", "type": "uuid", "required": True,
+         "references": {"table": "people", "column": "id"}, "on_delete": "set null"},
+        "CREATE TABLE vt_papers__items (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), "
+        "owner UUID NOT NULL, CONSTRAINT vt_papers__items__owner_4e419916__fkey FOREIGN KEY "
+        "(owner) REFERENCES vt_papers__people (id) ON DELETE SET NULL, " + _ITEMS_BOOKKEEPING,
+    ),
+    "int-to-numeric": (
+        {"name": "pcode", "type": "int",
+         "references": {"table": "people", "column": "code"}, "on_delete": "restrict"},
+        "CREATE TABLE vt_papers__items (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), "
+        "pcode BIGINT, CONSTRAINT vt_papers__items__pcode_6d486f52__fkey FOREIGN KEY (pcode) "
+        "REFERENCES vt_papers__people (code) ON DELETE RESTRICT, " + _ITEMS_BOOKKEEPING,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ROLLOUT_REFERENCES_BEFORE_433))
+async def test_rollout_create_installs_a_reference_as_it_did_before_433(monkeypatch, case):
+    spec, ddl_before = _ROLLOUT_REFERENCES_BEFORE_433[case]
+    conn = _RegistryConn({"people": _PEOPLE})
+    _no_grants(monkeypatch)
+    column = app_rollout_service._normalize_column(dict(spec))
+
+    await app_rollout_worker._create_table_owned(conn, _rollout_target(), {
+        "table": "items", "columns": [column], "unique_keys": [], "indexes": [],
+    })
+
+    assert next(s for s in conn.sql() if s.startswith("CREATE TABLE")) == ddl_before
+    assert _registry_insert(conn) == [column]
+
+
+async def test_rollout_create_resolves_a_self_reference_from_its_own_columns(monkeypatch):
+    """A self-reference's target is in the manifest, not the registry: a
+    reserved word there has a derived physical name the FK must use."""
+    conn = _RegistryConn({})
+    _no_grants(monkeypatch)
+    columns = [
+        app_rollout_service._normalize_column({"name": "order", "type": "text", "unique": True}),
+        app_rollout_service._normalize_column({
+            "name": "prev", "type": "text",
+            "references": {"table": "items", "column": "order"},
+        }),
+    ]
+
+    await app_rollout_worker._create_table_owned(conn, _rollout_target(), {
+        "table": "items", "columns": columns, "unique_keys": [], "indexes": [],
+    })
+
+    order_pg = table_data_repo.derive_column_pg_name("vt_papers__items", "order", 1)
+    ddl = next(s for s in conn.sql() if s.startswith("CREATE TABLE"))
+    assert f"FOREIGN KEY (prev) REFERENCES vt_papers__items ({order_pg})" in ddl, ddl
+
+
+# ── A read control whose value is valid for it stays the control ─────────────
+
+
+def test_an_order_value_that_sorts_is_a_sort_even_on_a_header_named_order():
+    """With headers `Order` and `eq`, `order=eq.desc` sorts by `eq`: the value
+    is a sort, so the key is the control. A value that is no sort is still a
+    filter on the header."""
+    cols = _declared("Order", "eq")
+    phys = _physical(cols)
+
+    sort = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, query_params=[("order", "eq.desc")],
+    )
+    assert sort.get("sql") == (
+        f"SELECT * FROM {_TABLE_PG} ORDER BY {phys['eq']} DESC LIMIT 100 OFFSET 0"
+    ), sort
+    filtered = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, query_params=[("order", "eq.5")],
+    )
+    assert filtered.get("sql") == (
+        f"SELECT * FROM {_TABLE_PG} WHERE ({phys['Order']} = $1) LIMIT 100 OFFSET 0"
+    ), filtered
+
+
+# ── System column names ──────────────────────────────────────────────────────
+
+_SYSTEM_COLUMNS = ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"]
+
+
+@pytest.mark.parametrize("word", _SYSTEM_COLUMNS)
+async def test_a_system_column_name_gets_a_derived_physical_name(monkeypatch, word):
+    """PostgreSQL refuses a user column named like a system column (42701),
+    so no existing column has one; like a reserved word it is not plain."""
+    conn = _Conn()
+    _wire(monkeypatch, conn)
+    created = await table_service.create_table(
+        uuid.uuid4(), _TABLE, [{"name": word, "type": "text"}], actor_id="tester",
+    )
+    assert created["columns"][0]["pg_name"].startswith("c_1_")
+
+    conn = _alter_conn_for([{"name": "status", "type": "text"}])
+    _wire(monkeypatch, conn)
+    altered = await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", add_columns=[{"name": word, "type": "text"}],
+    )
+    added = altered["columns"][1]
+    assert added["name"] == word and added["pg_name"].startswith("c_2_")
+    assert not any(f"ADD COLUMN {word} " in s for s in conn.sql())

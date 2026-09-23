@@ -845,3 +845,32 @@ async def test_reserved_words_are_headers_like_any_other(live):
     assert {
         r["word"] for r in keywords if not table_data_repo.is_plain_column_name(r["word"])
     } == refused
+
+
+async def test_system_column_names_are_headers_like_any_other(live):
+    """PostgreSQL refuses `xmin` as a user column (42701): on create that was a
+    422, on add a 500. Such a name gets a derived physical name instead."""
+    vault_id, vault, owner = await live.vault("syscols")
+    created = await table_service.create_table(
+        vault_id, "sheet",
+        [{"name": "xmin", "type": "text"}, {"name": "ctid", "type": "text"}],
+        actor_id="owner",
+    )
+    altered = await table_service.alter_table(
+        vault_id, "sheet", actor_id="owner", add_columns=[{"name": "tableoid", "type": "text"}],
+    )
+    phys = {c["name"]: c["pg_name"] for c in altered["columns"]}
+    assert [c["name"] for c in created["columns"]] == ["xmin", "ctid"]
+    assert set(phys.values()) <= set(
+        await live.attnames(table_data_repo.pg_table_name(vault, "sheet"))
+    )
+
+    await table_row_write.insert_rows(
+        vault_name=vault, vault_id=vault_id, table_name="sheet",
+        user_id=owner, actor_id="owner", is_admin=True,
+        body={"xmin": "a", "ctid": "b", "tableoid": "c"},
+    )
+    read = await _read(
+        vault, vault_id, "sheet", owner, query_params=[("select", "xmin,ctid,tableoid")],
+    )
+    assert _items(read) == [{"xmin": "a", "ctid": "b", "tableoid": "c"}]
