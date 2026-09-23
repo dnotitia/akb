@@ -49,7 +49,7 @@ from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
     authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
     revoke_access, list_vault_members, list_accessible_vaults, get_vault_info,
-    explain_vault_access,
+    explain_vault_access, required_explain_access_role,
     reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
@@ -75,8 +75,8 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.operation_registry import (
+    CANDIDATE_REPLACED_NAMES,
     DEFERRED_MUTATION_NAMES,
-    FIRST_SLICE_REPLACED_NAMES,
     OperationValidationError,
 )
 from mcp_server.tools import (
@@ -1669,7 +1669,7 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
     return await set_public_access(uid, args["vault"], level)
 
 
-# All first-slice operations are bound only after every legacy handler has
+# All candidate operations are bound only after every legacy handler has
 # registered.  Candidate dispatch below resolves through this binding; the
 # legacy public names are not candidate aliases.
 CANDIDATE_REGISTRY.bind_handlers(_HANDLERS)
@@ -1687,8 +1687,9 @@ async def list_tools():
     # clients keep the byte-for-byte schemas they already understand.
     decorated = []
     for tool in tools:
+        registry_scope = CANDIDATE_REGISTRY.required_scope_for_tool(tool.name)
         may_write = (
-            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
+            (registry_scope or _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE)) == _WRITE_SCOPE
             or tool.name in _ARG_WRITE_TRIGGERS
         )
         if not may_write:
@@ -1775,7 +1776,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         )
         result: dict | None = (
             err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
-            if name in FIRST_SLICE_REPLACED_NAMES
+            if name in CANDIDATE_REPLACED_NAMES
             else None
         )
 
@@ -1994,7 +1995,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         # discriminator is consumed at the registry boundary.
         dispatch_args = {key: value for key, value in args.items() if key != "action"}
         required = candidate_spec.required_scope
-    elif name in FIRST_SLICE_REPLACED_NAMES:
+    elif name in CANDIDATE_REPLACED_NAMES:
         # Keep the implementation registry callable for existing internal
         # unit seams. Public call_tool dispatch rejects this replaced name
         # before reaching here, so this is not a candidate compatibility alias.
@@ -2048,10 +2049,16 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # Registry-owned vault RBAC runs before the implementation handler. The
     # handlers retain their established checks as defense in depth, while a
     # denied candidate call never enters the protected operation at all.
-    if candidate_spec is not None and candidate_spec.vault_role is not None:
+    if candidate_spec is not None:
+        required_vault_role: str | None = candidate_spec.vault_role
+        if required_vault_role == "explain_target":
+            required_vault_role = await required_explain_access_role(uid, args["user"])
+    else:
+        required_vault_role = None
+    if candidate_spec is not None and required_vault_role is not None:
         for vault in CANDIDATE_REGISTRY.vaults_for(candidate_spec, args):
             try:
-                await check_vault_access(uid, vault, required_role=candidate_spec.vault_role)
+                await check_vault_access(uid, vault, required_role=required_vault_role)
             except Exception as exc:  # noqa: BLE001 — map the existing guard envelope
                 return exception_envelope(exc)
 

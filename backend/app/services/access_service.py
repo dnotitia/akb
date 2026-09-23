@@ -784,6 +784,25 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
 
 # ── User-accessible vaults ──────────────────────────────────
 
+async def required_explain_access_role(
+    actor_id: str, target_username: str,
+) -> str | None:
+    """Return the role needed to explain a known user, or None if absent.
+
+    The candidate registry uses this preflight to preserve the existing
+    not-found response for an unknown username while enforcing the self/admin
+    rule before dispatching the protected read handler.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        target_id = await conn.fetchval(
+            "SELECT id FROM users WHERE username = $1", target_username,
+        )
+    if target_id is None:
+        return None
+    return "reader" if str(target_id) == str(actor_id) else "admin"
+
+
 async def explain_vault_access(
     actor_id: str, vault_name: str, target_username: str,
 ) -> dict:

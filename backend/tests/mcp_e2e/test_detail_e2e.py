@@ -676,15 +676,15 @@ async def test_unicode_graph_grep_and_ownership(
     relations = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_relations",
-        {"uri": first["uri"]},
+        "akb_relationships",
+        {"action": "relations", "uri": first["uri"]},
     )
     assert _relation_count(relations) >= 1
     graph = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_graph",
-        {"uri": first["uri"], "hops": 1},
+        "akb_relationships",
+        {"action": "graph", "uri": first["uri"], "hops": 1},
     )
     assert len(graph.get("nodes", [])) >= 2
     assert len(graph.get("edges", [])) >= 1
@@ -698,8 +698,8 @@ async def test_unicode_graph_grep_and_ownership(
     relations_after = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_relations",
-        {"uri": first["uri"]},
+        "akb_relationships",
+        {"action": "relations", "uri": first["uri"]},
     )
     assert _relation_count(relations_after) == 0
 

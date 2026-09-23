@@ -1,4 +1,4 @@
-"""Focused proof for the first candidate MCP operation slice."""
+"""Focused proof for the candidate MCP operation registry."""
 
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from app.exceptions import ForbiddenError
 from app.services import audit_log
 from app.services.auth_service import AuthenticatedUser
 from mcp_server.operation_registry import (
+    CANDIDATE_LEGACY_NAMES,
+    CANDIDATE_REPLACED_NAMES,
+    DEFERRED_OPERATION_REASONS,
     DEFERRED_OPERATION_NAMES,
     DEFERRED_MUTATION_NAMES,
-    FIRST_SLICE_LEGACY_NAMES,
-    FIRST_SLICE_REPLACED_NAMES,
+    INDEPENDENT_OPERATION_REASONS,
     OperationRegistry,
     OperationValidationError,
     READ_SCOPE,
@@ -39,9 +41,20 @@ def _candidate_tools() -> dict:
 def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
     tools = _candidate_tools()
 
-    later_tools = {tool.name for tool in available_tools()} - FIRST_SLICE_LEGACY_NAMES
-    assert set(tools) == {"akb_discover", "akb_document_read", "akb_grep", *later_tools}
-    assert FIRST_SLICE_REPLACED_NAMES.isdisjoint(tools)
+    later_tools = {tool.name for tool in available_tools()} - CANDIDATE_LEGACY_NAMES
+    candidate_tools = {
+        "akb_discover",
+        "akb_document_read",
+        "akb_relationships",
+        "akb_vault_access",
+        "akb_identity",
+        "akb_publication_read",
+        "akb_export_read",
+        "akb_grep",
+        *later_tools,
+    }
+    assert set(tools) == candidate_tools
+    assert CANDIDATE_REPLACED_NAMES.isdisjoint(tools)
     assert DEFERRED_MUTATION_NAMES == {"akb_grep"}
     assert "akb_grep" in tools
     assert "replace" in tools["akb_grep"].input_schema["required"]
@@ -49,9 +62,9 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
     assert tools["akb_grep"].annotations.read_only_hint is False
     assert tools["akb_grep"].annotations.destructive_hint is True
     legacy_names = {tool.name for tool in TOOLS}
-    assert FIRST_SLICE_LEGACY_NAMES.isdisjoint(DEFERRED_OPERATION_NAMES)
+    assert CANDIDATE_LEGACY_NAMES.isdisjoint(DEFERRED_OPERATION_NAMES)
     assert DEFERRED_OPERATION_NAMES <= legacy_names
-    assert CANDIDATE_REGISTRY.first_slice_coverage() == {
+    assert CANDIDATE_REGISTRY.operation_coverage() == {
         "akb_list_vaults": ("akb_discover", "list_vaults"),
         "akb_vault_info": ("akb_discover", "vault_info"),
         "akb_browse": ("akb_discover", "browse"),
@@ -63,9 +76,28 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
         "akb_history": ("akb_document_read", "history"),
         "akb_diff": ("akb_document_read", "diff"),
         "akb_provenance": ("akb_document_read", "provenance"),
+        "akb_relations": ("akb_relationships", "relations"),
+        "akb_graph": ("akb_relationships", "graph"),
+        "akb_vault_members": ("akb_vault_access", "members"),
+        "akb_explain_access": ("akb_vault_access", "explain"),
+        "akb_whoami": ("akb_identity", "whoami"),
+        "akb_search_users": ("akb_identity", "search_users"),
+        "akb_publications": ("akb_publication_read", "list"),
+        "akb_export": ("akb_export_read", "export"),
     }
 
-    for name in ("akb_discover", "akb_document_read"):
+    assert set(INDEPENDENT_OPERATION_REASONS) == {"akb_help", "akb_sql"}
+    assert set(DEFERRED_OPERATION_REASONS) == {"backend_write_manage", "stdio_local_files"}
+
+    for name in {
+        "akb_discover",
+        "akb_document_read",
+        "akb_relationships",
+        "akb_vault_access",
+        "akb_identity",
+        "akb_publication_read",
+        "akb_export_read",
+    }:
         tool = tools[name]
         assert tool.annotations is not None
         assert tool.annotations.read_only_hint is True
@@ -75,6 +107,42 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
             assert branch["additionalProperties"] is False
             assert "action" in branch["required"]
             assert branch["properties"]["action"]["const"] in CANDIDATE_REGISTRY.actions_for(name)
+
+
+def test_remaining_backend_read_operations_are_candidate_actions() -> None:
+    tools = _candidate_tools()
+    expected_tools = {
+        "akb_relationships",
+        "akb_vault_access",
+        "akb_identity",
+        "akb_publication_read",
+        "akb_export_read",
+    }
+    assert expected_tools <= set(tools)
+
+    expected_coverage = {
+        "akb_relations": ("akb_relationships", "relations"),
+        "akb_graph": ("akb_relationships", "graph"),
+        "akb_vault_members": ("akb_vault_access", "members"),
+        "akb_explain_access": ("akb_vault_access", "explain"),
+        "akb_whoami": ("akb_identity", "whoami"),
+        "akb_search_users": ("akb_identity", "search_users"),
+        "akb_publications": ("akb_publication_read", "list"),
+        "akb_export": ("akb_export_read", "export"),
+    }
+    assert {
+        name: CANDIDATE_REGISTRY.operation_coverage().get(name)
+        for name in expected_coverage
+    } == expected_coverage
+    assert set(expected_coverage).isdisjoint(set(tools))
+    for operation, (public_tool, action) in expected_coverage.items():
+        spec = CANDIDATE_REGISTRY.spec_for(public_tool, action)
+        assert spec is not None
+        assert spec.handler == operation
+        assert spec.required_scope == READ_SCOPE
+        assert spec.risk == "read"
+        assert spec.logical_audit_operation == operation
+        assert spec.vault_role is not None or spec.target == "none"
 
 
 def test_registry_rejects_duplicate_and_incomplete_contracts() -> None:
@@ -98,16 +166,33 @@ def test_registry_rejects_duplicate_and_incomplete_contracts() -> None:
 
 def test_registry_validation_rejects_bad_action_shapes() -> None:
     invalid_calls = (
-        {"action": "unknown"},
-        {"action": "get"},
-        {"action": "get", "uri": 42},
-        {"action": "get", "uri": "akb://v/doc/n.md", "section": "other-action"},
-        {"action": "grep", "pattern": "needle", "replace": "mutation"},
+        ("akb_document_read", {"action": "unknown"}),
+        ("akb_document_read", {"action": "get"}),
+        ("akb_document_read", {"action": "get", "uri": 42}),
+        (
+            "akb_document_read",
+            {"action": "get", "uri": "akb://v/doc/n.md", "section": "other-action"},
+        ),
+        ("akb_discover", {"action": "grep", "pattern": "needle", "replace": "mutation"}),
+        ("akb_relationships", {"action": "graph"}),
+        ("akb_relationships", {"action": "relations", "uri": "akb://v/doc/n.md", "vault": "v"}),
+        ("akb_vault_access", {"action": "explain", "vault": "v"}),
+        ("akb_identity", {"action": "search_users", "query": 42}),
+        ("akb_publication_read", {"action": "list", "vault": "v", "resource_type": "user"}),
+        ("akb_export_read", {"action": "export", "vault": "v", "format": "zip"}),
     )
-    for arguments in invalid_calls:
-        public_tool = "akb_document_read" if arguments.get("action") in {"get", "unknown"} else "akb_discover"
+    for public_tool, arguments in invalid_calls:
         with pytest.raises(OperationValidationError):
             CANDIDATE_REGISTRY.validate(public_tool, arguments)
+
+
+def test_graph_target_resolution_keeps_uri_and_vault_forms() -> None:
+    graph = CANDIDATE_REGISTRY.spec_for("akb_relationships", "graph")
+    assert graph is not None
+    assert CANDIDATE_REGISTRY.vaults_for(
+        graph, {"uri": "akb://vault-a/doc/spec.md"}
+    ) == ("vault-a",)
+    assert CANDIDATE_REGISTRY.vaults_for(graph, {"vault": "vault-b"}) == ("vault-b",)
 
 
 @pytest.mark.asyncio
@@ -136,6 +221,86 @@ async def test_scope_denial_happens_before_candidate_handler(
         CANDIDATE_REGISTRY._handlers[key] = original
 
     assert result["code"] == "insufficient_scope"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_all_new_read_actions_require_read_scope_before_handler(
+    server_module,
+) -> None:
+    cases = (
+        ("akb_relationships", "relations", {"uri": "akb://v/doc/n.md"}),
+        ("akb_relationships", "graph", {"vault": "v"}),
+        ("akb_vault_access", "members", {"vault": "v"}),
+        ("akb_vault_access", "explain", {"vault": "v", "user": "reader"}),
+        ("akb_identity", "whoami", {}),
+        ("akb_identity", "search_users", {"query": "reader"}),
+        ("akb_publication_read", "list", {"vault": "v"}),
+        ("akb_export_read", "export", {"vault": "v"}),
+    )
+    called: list[tuple[str, str]] = []
+    originals = {}
+
+    for public_tool, action, _args in cases:
+        spec = CANDIDATE_REGISTRY.spec_for(public_tool, action)
+        assert spec is not None
+        key = (public_tool, action)
+        originals[key] = CANDIDATE_REGISTRY._handlers[key]
+
+        async def handler(_args, _uid, _user, *, _key=key):
+            called.append(_key)
+            return {"ok": True}
+
+        CANDIDATE_REGISTRY._handlers[key] = handler
+
+    user = server_module._MCPUser(user_id="u-1", username="reader", oauth_scopes=[])
+    try:
+        for public_tool, action, args in cases:
+            result = await server_module._dispatch(
+                public_tool, {"action": action, **args}, user
+            )
+            assert result["code"] == "insufficient_scope"
+    finally:
+        CANDIDATE_REGISTRY._handlers.update(originals)
+
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_explain_access_role_is_checked_before_handler(
+    monkeypatch: pytest.MonkeyPatch, server_module
+) -> None:
+    called = False
+    checked: list[tuple[str, str]] = []
+
+    async def role_for(_uid, username):
+        return "reader" if username == "reader" else "admin"
+
+    async def deny(_uid, vault, *, required_role):
+        checked.append((vault, required_role))
+        raise ForbiddenError("denied")
+
+    async def handler(_args, _uid, _user):
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    key = ("akb_vault_access", "explain")
+    original = CANDIDATE_REGISTRY._handlers[key]
+    CANDIDATE_REGISTRY._handlers[key] = handler
+    monkeypatch.setattr(server_module, "required_explain_access_role", role_for)
+    monkeypatch.setattr(server_module, "check_vault_access", deny)
+    try:
+        result = await server_module._dispatch(
+            "akb_vault_access",
+            {"action": "explain", "vault": "private", "user": "owner"},
+            server_module._MCPUser(user_id="reader-id", username="reader"),
+        )
+    finally:
+        CANDIDATE_REGISTRY._handlers[key] = original
+
+    assert result["code"] == "permission_denied"
+    assert checked == [("private", "admin")]
     assert called is False
 
 
@@ -251,13 +416,20 @@ async def test_candidate_http_catalog_and_action_validation(
 
     monkeypatch.setattr(http_app, "resolve_mcp_authorization", resolve)
     activity_calls: list[dict] = []
+    identity_calls: list[dict] = []
     activity_key = ("akb_document_read", "activity")
+    identity_key = ("akb_identity", "whoami")
 
     async def activity_stub(args, _uid, _user):
         activity_calls.append(args)
         return {"unexpected": True}
 
+    async def identity_stub(args, _uid, _user):
+        identity_calls.append(args)
+        return {"unexpected": True}
+
     monkeypatch.setitem(CANDIDATE_REGISTRY._handlers, activity_key, activity_stub)
+    monkeypatch.setitem(CANDIDATE_REGISTRY._handlers, identity_key, identity_stub)
 
     headers = {
         "authorization": "Bearer test-token",
@@ -285,8 +457,31 @@ async def test_candidate_http_catalog_and_action_validation(
             assert listed.status_code == 200
             listed_tools = listed.json()["result"]["tools"]
             names = {tool["name"] for tool in listed_tools}
-            assert {"akb_discover", "akb_document_read", "akb_help", "akb_sql"} <= names
-            assert FIRST_SLICE_REPLACED_NAMES.isdisjoint(names)
+            expected_capabilities = {
+                "akb_discover",
+                "akb_document_read",
+                "akb_relationships",
+                "akb_vault_access",
+                "akb_identity",
+                "akb_publication_read",
+                "akb_export_read",
+                "akb_help",
+                "akb_sql",
+            }
+            assert expected_capabilities <= names
+            assert CANDIDATE_REPLACED_NAMES.isdisjoint(names)
+            for name in expected_capabilities - {"akb_help", "akb_sql"}:
+                listed_tool = next(tool for tool in listed_tools if tool["name"] == name)
+                branches = listed_tool["inputSchema"]["oneOf"]
+                assert branches
+                assert "action" in listed_tool["description"].lower()
+                assert all(branch["additionalProperties"] is False for branch in branches)
+                assert all("action" in branch["required"] for branch in branches)
+                assert all(
+                    branch["properties"]["action"].get("const")
+                    in CANDIDATE_REGISTRY.actions_for(name)
+                    for branch in branches
+                )
             grep = next(tool for tool in listed_tools if tool["name"] == "akb_grep")
             assert "replace" in grep["inputSchema"]["required"]
             discover_grep = next(
@@ -315,6 +510,65 @@ async def test_candidate_http_catalog_and_action_validation(
             )
             legacy_body = json.loads(legacy_rejected.json()["result"]["content"][0]["text"])
             assert legacy_body["code"] == "unknown_tool"
+
+            graph_alias_rejected = await client.post(
+                "/mcp/",
+                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_graph"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_graph",
+                        "arguments": {"vault": "v"},
+                        "_meta": meta,
+                    },
+                },
+            )
+            graph_alias_body = json.loads(
+                graph_alias_rejected.json()["result"]["content"][0]["text"]
+            )
+            assert graph_alias_body["code"] == "unknown_tool"
+
+            identity_read = await client.post(
+                "/mcp/",
+                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_identity"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_identity",
+                        "arguments": {"action": "whoami"},
+                        "_meta": meta,
+                    },
+                },
+            )
+            identity_body = json.loads(
+                identity_read.json()["result"]["content"][0]["text"]
+            )
+            assert identity_body == {"unexpected": True}
+            assert identity_calls == [{}]
+
+            invalid_identity = await client.post(
+                "/mcp/",
+                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_identity"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "akb_identity",
+                        "arguments": {"action": "search_users", "query": 42},
+                        "_meta": meta,
+                    },
+                },
+            )
+            invalid_identity_body = json.loads(
+                invalid_identity.json()["result"]["content"][0]["text"]
+            )
+            assert invalid_identity_body["code"] == "invalid_argument"
+            assert identity_calls == [{}]
 
             deferred_rejected = await client.post(
                 "/mcp/",

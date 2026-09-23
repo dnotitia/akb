@@ -571,8 +571,12 @@ async def test_security_access_and_sql_failure_state(
     assert not any(item.get("vault") == vault for item in unscoped_search.get("results", []))
 
     for tool, arguments in (
-        ("akb_relations", {"uri": document["uri"]}),
-        ("akb_graph", {"vault": vault}),
+        (
+            "akb_relationships",
+            {"action": "relations", "uri": document["uri"]},
+        ),
+        ("akb_relationships", {"action": "graph", "vault": vault}),
+        ("akb_vault_access", {"action": "members", "vault": vault}),
         (
             "akb_document_read",
             {"action": "provenance", "uri": document["uri"]},
@@ -595,7 +599,12 @@ async def test_security_access_and_sql_failure_state(
         vault=vault,
     )
     assert int(owner_search.get("total", 0)) >= 1 or owner_search.get("results")
-    owner_graph = await _call_json(mcp_client, runtime_session, "akb_graph", {"vault": vault})
+    owner_graph = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_relationships",
+        {"action": "graph", "vault": vault},
+    )
     assert "nodes" in owner_graph and "edges" in owner_graph
 
     invalid_regex = await _call_json(
@@ -652,6 +661,49 @@ async def test_security_access_and_sql_failure_state(
         "akb_grant",
         {"vault": vault, "user": secondary_mcp_client.username, "role": "reader"},
     )
+    reader_relations = await _call_json(
+        other,
+        runtime_session,
+        "akb_relationships",
+        {"action": "relations", "uri": document["uri"]},
+    )
+    assert reader_relations.get("uri") == document["uri"]
+    reader_graph = await _call_json(
+        other,
+        runtime_session,
+        "akb_relationships",
+        {"action": "graph", "vault": vault},
+    )
+    assert "nodes" in reader_graph and "edges" in reader_graph
+    reader_members = await _call_json(
+        other,
+        runtime_session,
+        "akb_vault_access",
+        {"action": "members", "vault": vault},
+    )
+    assert any(
+        member.get("username") == secondary_mcp_client.username
+        for member in reader_members.get("members", [])
+    )
+    reader_explanation = await _call_json(
+        other,
+        runtime_session,
+        "akb_vault_access",
+        {
+            "action": "explain",
+            "vault": vault,
+            "user": secondary_mcp_client.username,
+        },
+    )
+    assert reader_explanation.get("effective_role") == "reader"
+    other_explanation = await _call_json(
+        other,
+        runtime_session,
+        "akb_vault_access",
+        {"action": "explain", "vault": vault, "user": os.environ[runtime_session.descriptor.username_env]},
+        expect_error=True,
+    )
+    _assert_permission_denied(other_explanation)
     readable = await _call_json(other, runtime_session, "akb_sql", {"vault": vault, "sql": "SELECT * FROM finances"})
     assert len(readable["items"]) == 2
     for sql in (
