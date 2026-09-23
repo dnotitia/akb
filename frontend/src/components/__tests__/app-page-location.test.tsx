@@ -28,8 +28,17 @@ describe("App page location", () => {
   ])("keeps named Vault section %s in the top location trail", (tail, label) => {
     render(<MemoryRouter initialEntries={[`/vault/%ED%8C%80%20Vault${tail}`]}><AppPageLocation /></MemoryRouter>);
     const location = screen.getByRole("navigation", { name: "Current page" });
-    expect(within(location).getByRole("link", { name: "팀 Vault" })).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
-    expect(within(location).getByText(label)).toHaveAttribute("aria-current", "page");
+    const vault = within(location).getByRole("link", { name: "팀 Vault" });
+    expect(vault).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
+    expect(vault.querySelector(".lucide-box")).toHaveAttribute("aria-hidden", "true");
+    const current = within(location).getByText(label);
+    expect(current).toHaveAttribute("aria-current", "page");
+    const resourceGlyph = ({ Document: ".lucide-file-text", File: ".lucide-file", Table: ".lucide-table-2" } as Record<string, string>)[label];
+    expect(location.querySelectorAll("svg")).toHaveLength(resourceGlyph ? 2 : 1);
+    if (resourceGlyph) {
+      expect(current.compareDocumentPosition(location.querySelector(resourceGlyph)!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    }
+    expect(location.querySelector("ol")).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
   });
 });

@@ -10,7 +10,6 @@ import { VaultRail } from "@/components/vault-rail";
 import { TitleBar } from "@/components/title-bar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
-import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
 import { VaultCreateDialogProvider } from "@/contexts/vault-create-dialog-context";
 import {
   DocumentCreateDialogProvider,
@@ -296,7 +295,6 @@ export function VaultShell() {
     : "calc(100vw - 10rem)";
 
   return (
-    <ResourceNavigationProvider>
     <VaultCreateDialogProvider openCreateVault={openCreateVault}>
       <DocumentCreateDialogProvider openCreateDocument={openCreateDocument}>
         <VaultRefreshProvider
@@ -423,7 +421,7 @@ export function VaultShell() {
                 data-slot="vault-route-viewport"
                 className={cn(
                   "min-h-0 min-w-0 flex-1 bg-background",
-                  isSettings || isMembers
+                  isSettings
                     ? "overflow-y-auto xl:overflow-hidden"
                     : "overflow-y-auto",
                 )}
@@ -431,11 +429,11 @@ export function VaultShell() {
                 <div
                   className={cn(
                     "w-full",
-                    isSettings || isMembers
+                    isSettings
                       ? "min-h-full xl:h-full xl:min-h-0"
                       : isOverview
                         ? "min-h-full px-2 py-3 lg:p-0"
-                        : isActivity || isPublications
+                        : isActivity || isPublications || isMembers
                           ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
                           : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
                   )}
@@ -473,6 +471,5 @@ export function VaultShell() {
         </VaultRefreshProvider>
       </DocumentCreateDialogProvider>
     </VaultCreateDialogProvider>
-    </ResourceNavigationProvider>
   );
 }

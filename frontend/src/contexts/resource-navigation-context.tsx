@@ -7,12 +7,13 @@ import {
   useRef,
   type ReactNode,
 } from "react";
+import type { NavigateOptions } from "react-router-dom";
 
-type ResourceNavigationGuard = (href: string) => boolean;
+type ResourceNavigationGuard = (href: string, options?: NavigateOptions) => boolean;
 
 interface ResourceNavigationContextValue {
   /** False means the resource is handling confirmation; prevent the Link's default navigation. */
-  requestNavigation: (href: string) => boolean;
+  requestNavigation: (href: string, options?: NavigateOptions) => boolean;
   registerGuard: (guard: ResourceNavigationGuard) => () => void;
 }
 
@@ -24,7 +25,11 @@ const ResourceNavigationContext = createContext<ResourceNavigationContextValue>(
 /** Explicitly participating resource links consult the current editor only. */
 export function ResourceNavigationProvider({ children }: { children: ReactNode }) {
   const guardRef = useRef<{ owner: symbol; guard: ResourceNavigationGuard } | null>(null);
-  const requestNavigation = useCallback((href: string) => guardRef.current?.guard(href) ?? true, []);
+  const requestNavigation = useCallback((href: string, options?: NavigateOptions) => {
+    const guard = guardRef.current?.guard;
+    if (!guard) return true;
+    return options ? guard(href, options) : guard(href);
+  }, []);
   const registerGuard = useCallback((guard: ResourceNavigationGuard) => {
     const owner = Symbol("resource-navigation");
     guardRef.current = { owner, guard };

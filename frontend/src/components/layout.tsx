@@ -1,4 +1,4 @@
-import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
+import { Link, Outlet, Navigate, matchPath, useLocation } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Boxes, House, PanelLeftOpen, PanelLeftClose, type LucideIcon } from "lucide-react";
@@ -22,11 +22,13 @@ import { Button } from "@/components/ui/button";
 import type { VaultNavigationControl } from "@/components/vault-shell";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { ResourceLocationProvider } from "@/contexts/resource-location-context";
+import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
 import { SearchStatusProvider } from "@/hooks/use-search-status";
 import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 
 const APP_SIDEBAR_COMPACT_KEY = "akb_app_sidebar_compact";
+type AppSurface = "paper" | "workspace";
 
 function identityFingerprint(user: CurrentUser): string {
   return JSON.stringify([
@@ -152,10 +154,12 @@ export function Layout() {
   }, [activeFingerprint, activeUser, queryClient]);
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
-  const isSearchWorkspace = location.pathname === "/search";
+  const isSearchWorkspace = Boolean(matchPath("/search", location.pathname));
+  const isSearchRoute = isSearchWorkspace || Boolean(matchPath("/vault/:name/search", location.pathname));
   const isSettingsWorkspace = location.pathname === "/settings";
   const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
   const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
+  const surface: AppSurface = location.pathname === "/" || isSearchRoute ? "paper" : "workspace";
 
   useLayoutEffect(() => {
     const search = searchControlsRef.current;
@@ -194,7 +198,7 @@ export function Layout() {
   }, [viewportLocked]);
 
   if (session.status === "checking") {
-    return <AppShellLoading compact={sidebarCompact} />;
+    return <AppShellLoading compact={sidebarCompact} surface={surface} />;
   }
 
   if (session.status === "unauthenticated") {
@@ -209,7 +213,7 @@ export function Layout() {
   // scroll. Document-flow routes keep natural page scroll and the footer.
   const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
-    : location.pathname === "/"
+    : surface === "paper"
       ? "min-h-screen flex flex-col bg-surface text-foreground"
       : "min-h-screen flex flex-col bg-background text-foreground";
 
@@ -217,6 +221,7 @@ export function Layout() {
     <SearchStatusProvider identity={activeFingerprint!} enabled={!revalidating}>
     <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
     <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
+    <ResourceNavigationProvider>
     <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
         <InlineLoadingState
@@ -233,8 +238,8 @@ export function Layout() {
       >
         Skip to content
       </a>
-      {/* ── Glass app header ───────────────────────────────────────── */}
-      <header className={`app-header sticky top-0 z-40 h-14 shrink-0 lg:ml-[var(--vault-navigation-width)] ${wide ? "vault-app-header" : ""}`}>
+      {/* Global location and tools; Vault section links share its quiet surface. */}
+      <header data-surface={surface} className={`app-header sticky top-0 z-40 h-14 shrink-0 lg:ml-[var(--vault-navigation-width)] ${wide ? "vault-app-header" : ""}`}>
         <div className="flex h-full w-full items-center">
           {/* Desktop identity belongs to the full-height navigation rail. */}
           <div className="flex shrink-0 items-center px-3 lg:hidden">
@@ -251,7 +256,7 @@ export function Layout() {
             </Link>
           </div>
 
-          <div className="flex h-full min-w-0 flex-1 items-center pr-3 lg:pl-5">
+          <div className="flex h-full min-w-0 flex-1 items-center pr-3 lg:px-5">
             {wide && vaultNavigationControl && <Button id="vault-navigation-trigger" variant="ghost" size="icon"
               className="mr-2 hidden h-9 w-9 shrink-0 lg:inline-flex"
               aria-label={vaultNavigationControl.open ? "Close vault navigation" : "Open vault navigation"}
@@ -262,8 +267,8 @@ export function Layout() {
             <AppPageLocation isAdmin={session.user.is_admin} />
             <div ref={searchControlsRef} className="ml-auto flex min-w-0 flex-1 items-center gap-2 lg:flex-none lg:pl-3">
               <HeaderIndexingStatus />
-              {/* This is a real global-search surface, not a shortcut to /search.
-                  Advanced mode and vault/type filters remain on the full page. */}
+              {/* Quick search stays available on every route. The full Search
+                  page owns its separate, URL-backed query below this header. */}
               <CurrentUserProvider user={session.user}>
                 <GlobalSearchDialog />
               </CurrentUserProvider>
@@ -358,18 +363,19 @@ export function Layout() {
         </div>
       </div>
     </div>
+    </ResourceNavigationProvider>
     </ResourceLocationProvider>
     </CurrentUserProvider>
     </SearchStatusProvider>
   );
 }
 
-function AppShellLoading({ compact }: { compact: boolean }) {
+function AppShellLoading({ compact, surface }: { compact: boolean; surface: AppSurface }) {
   return (
-    <LoadingState label="Verifying session" className="min-h-screen bg-background text-foreground">
+    <LoadingState label="Verifying session" className={`min-h-screen text-foreground ${surface === "paper" ? "bg-surface" : "bg-background"}`}>
       <div className={`flex min-h-screen flex-col ${compact ? "lg:pl-14" : "lg:pl-52"}`}>
-        <header className="app-header shrink-0">
-          <div className="flex h-14 w-full items-center">
+        <header data-surface={surface} className="app-header h-14 shrink-0">
+          <div className="flex h-full w-full items-center">
             <div className="flex shrink-0 items-center px-3 lg:hidden">
               <Logo size={28} wordmark variant="header" />
             </div>

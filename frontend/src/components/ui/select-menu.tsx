@@ -21,6 +21,7 @@ interface SelectMenuProps {
   placeholder?: string;
   id?: string;
   className?: string;
+  contentClassName?: string;
   /** Navigation identity controls should not resemble form fields. */
   variant?: "field" | "navigation";
   leadingIcon?: ReactNode;
@@ -53,6 +54,7 @@ export function SelectMenu({
   placeholder = "Select…",
   id,
   className,
+  contentClassName,
   variant = "field",
   leadingIcon,
   disabled,
@@ -110,7 +112,7 @@ export function SelectMenu({
           align="start"
           sideOffset={6}
           onCloseAutoFocus={showFilter ? () => setFilter("") : undefined}
-          className="z-[var(--z-popover)] max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+          className={cn("z-[var(--z-popover)] max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md", contentClassName)}
         >
           {showFilter && (
             <div className="sticky -top-1 z-10 -mx-1 -mt-1 mb-0.5 border-b border-border bg-surface px-1 pt-1">
