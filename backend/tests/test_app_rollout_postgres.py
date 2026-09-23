@@ -307,9 +307,10 @@ async def test_fresh_plan_creates_complete_descriptor_and_postflight_fingerprint
             if isinstance(indexes, str):
                 indexes = json.loads(indexes)
             assert {column["name"] for column in columns} == {"email", "amount"}
-            # Manifest names are plain, so each is its own physical name — and
-            # the registry says so, as it does for any created table (#433).
-            assert all(column["pg_name"] == column["name"] for column in columns)
+            # Manifest names are plain, so each is its own physical name, and
+            # the registry records `pg_name` only where it is not (#433): the
+            # row is exactly what a rollout wrote before.
+            assert all("pg_name" not in column for column in columns)
             assert next(column for column in columns if column["name"] == "email")["required"] is True
             assert len(unique_keys) == 1
             assert unique_keys[0]["columns"] == ["email"]

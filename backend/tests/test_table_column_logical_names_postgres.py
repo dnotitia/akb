@@ -7,13 +7,14 @@ Design: docs/design/proposal/2026-09-17-column-logical-physical-names/
 Live PostgreSQL, because every claim here is about what the database holds:
 the physical columns `pg_attribute` reports, the columns a UNIQUE constraint
 and an index are really built on, what a reader's own role may SELECT through
-`akb_sql` before and after its grants are torn down and reconciled, and a
-registry backfill that must not rewrite a byte of DDL. A fake connection
-would be asserting the test's own model.
+`akb_sql` before and after its grants are torn down and reconciled, and an
+existing table whose registry row must not change by a byte when this code
+boots over it and uses it. A fake connection would be asserting the test's own
+model.
 
 Written before the implementation and red against 2ed799bf, where every gate
-is refused by `_COLUMN_NAME_RE` or needs the backfill migration that does not
-exist yet.
+is refused by `_COLUMN_NAME_RE`. Gate 6 was rewritten for sparse `pg_name`
+storage and was red against the eager implementation that preceded it.
 
 Skips when PostgreSQL is unreachable unless REQUIRE_REAL_PG=1, which the
 live-PG CI lane sets — a gate that green-skips there is not a gate.
@@ -21,9 +22,9 @@ live-PG CI lane sets — a gate that green-skips there is not a gate.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,7 +34,7 @@ import pytest
 
 from app.db import postgres
 from app.exceptions import ValidationError
-from app.repositories import table_data_repo, table_registry_repo
+from app.repositories import table_data_repo
 from app.services import (
     access_service,
     table_row_query,
@@ -49,7 +50,9 @@ pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
-_BACKFILL = _BACKEND / "app" / "db" / "migrations" / "113_table_column_pg_names.py"
+# The last migration the registry held before #433. A database booted through
+# it is one this code has never touched.
+_BEFORE_433 = "112_edges_resource_identity.py"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -70,12 +73,28 @@ def _database_dsn(name: str) -> str:
     return f"{base}/{name}"
 
 
-def _load_backfill():
-    spec = importlib.util.spec_from_file_location(_BACKFILL.stem, _BACKFILL)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _registered_migrations() -> list[str]:
+    """Every migration, in the order `postgres.py` registers them."""
+    registry = (_BACKEND / "app" / "db" / "postgres.py").read_text()
+    ordered: list[str] = []
+    for name in re.findall(r'"(\d{3}_[a-z0-9_]+\.py)"', registry):
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
+async def _boot_through(conn, last: str) -> None:
+    """Shape the database as a release whose migration registry ended at
+    `last` left it: init.sql, then each migration through `last`, recorded in
+    the ledger so a later boot applies only what came after."""
+    await conn.execute(_INIT_SQL)
+    for filename in _registered_migrations():
+        module = postgres._load_migration(filename)
+        if module is not None:
+            await postgres._run_one_migration(conn, filename, module)
+        if filename == last:
+            return
+    raise AssertionError(f"{last} is not in the migration registry")
 
 
 async def _can_connect() -> bool:
@@ -88,7 +107,7 @@ async def _can_connect() -> bool:
 
 
 @asynccontextmanager
-async def _fresh_database():
+async def _fresh_database(*, through: str | None = None):
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
@@ -102,7 +121,10 @@ async def _fresh_database():
         # The boot path itself — init.sql, then every registered migration
         # through the ledger — so this database is shaped like a real one.
         async with pool.acquire() as conn:
-            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
+            if through is None:
+                await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
+            else:
+                await _boot_through(conn, through)
         yield pool, roles
     finally:
         await pool.close()
@@ -172,17 +194,30 @@ class _Live:
         )
         return [r["attname"] for r in rows]
 
-    async def registry_columns(self, vault_id: uuid.UUID, table: str) -> list[dict]:
-        raw = await self.pool.fetchval(
-            "SELECT columns FROM vault_tables WHERE vault_id = $1 AND name = $2",
+    async def stored_columns(self, vault_id: uuid.UUID, table: str) -> str:
+        """The registry's `columns` exactly as stored: the jsonb text."""
+        return await self.pool.fetchval(
+            "SELECT columns::text FROM vault_tables WHERE vault_id = $1 AND name = $2",
             vault_id, table,
         )
-        return table_registry_repo.parse_columns(json.loads(raw) if isinstance(raw, str) else raw)
+
+    async def stored_entries(self, vault_id: uuid.UUID, table: str) -> list[str]:
+        """Each stored column entry's jsonb text, in order."""
+        rows = await self.pool.fetch(
+            """
+            SELECT e.value::text AS entry
+              FROM vault_tables t, jsonb_array_elements(t.columns) WITH ORDINALITY AS e(value, n)
+             WHERE t.vault_id = $1 AND t.name = $2
+             ORDER BY e.n
+            """,
+            vault_id, table,
+        )
+        return [r["entry"] for r in rows]
 
 
-@pytest.fixture
-async def live(monkeypatch):
-    async with _fresh_database() as (pool, roles):
+@asynccontextmanager
+async def _live(monkeypatch, **fresh):
+    async with _fresh_database(**fresh) as (pool, roles):
         role_sync = RoleSync(pool)
         # Every service reaches the database through `get_pool()`; pinning the
         # module pool points all of them — table, row, schema, access, browse —
@@ -193,6 +228,19 @@ async def live(monkeypatch):
             user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool),
         )
         yield _Live(pool, role_sync, roles)
+
+
+@pytest.fixture
+async def live(monkeypatch):
+    async with _live(monkeypatch) as env:
+        yield env
+
+
+@pytest.fixture
+async def live_before_433(monkeypatch):
+    """A database as the last release before #433 left it."""
+    async with _live(monkeypatch, through=_BEFORE_433) as env:
+        yield env
 
 
 def _items(result) -> list[dict]:
@@ -366,7 +414,7 @@ async def test_gate3_recreating_the_same_table_yields_the_same_registry_row(live
     await table_service.create_table(
         vault_id, "results", [dict(c) for c in _HEADERS], actor_id="owner",
     )
-    first = await live.registry_columns(vault_id, "results")
+    first = await live.stored_columns(vault_id, "results")
 
     again = await table_service.create_table(
         vault_id, "results", [dict(c) for c in _HEADERS], actor_id="owner",
@@ -379,7 +427,7 @@ async def test_gate3_recreating_the_same_table_yields_the_same_registry_row(live
     await table_service.create_table(
         vault_id, "results", [dict(c) for c in _HEADERS], actor_id="owner",
     )
-    assert await live.registry_columns(vault_id, "results") == first
+    assert await live.stored_columns(vault_id, "results") == first
 
 
 # ── Gate 4: a 21+ character Korean header ────────────────────────────────────
@@ -556,7 +604,13 @@ async def _physical_snapshot(conn, table_pg: str):
     }
 
 
-async def test_gate6_backfill_adds_pg_name_and_rewrites_no_ddl(live):
+async def test_gate6_an_existing_table_is_byte_identical_under_this_code(live_before_433):
+    """A table created before #433 carries no `pg_name`, and must not gain one:
+    booting this code over it and using it through every surface leaves its
+    registry row byte-identical, its physical table untouched, and every
+    column's physical name the one it always had (`column_pg_name`'s fallback,
+    which is the contract, not a shim)."""
+    live = live_before_433
     vault_id, vault, owner = await live.vault("gate6")
     table_pg = table_data_repo.pg_table_name(vault, "legacy")
     uk_name = table_data_repo.generate_constraint_name(table_pg, ["title"], kind="uk")
@@ -585,55 +639,68 @@ async def test_gate6_backfill_adds_pg_name_and_rewrites_no_ddl(live):
                 f"INSERT INTO {table_pg} (title, status, qty, legacy_col) "
                 "VALUES ('a', 'active', 2, 'old'), ('b', 'draft', 0, NULL)"
             )
-        before = await _physical_snapshot(conn, table_pg)
-        registry_updated_at = await conn.fetchval(
-            "SELECT updated_at FROM vault_tables WHERE vault_id = $1", vault_id,
-        )
-    read_before = await _read(
-        vault, vault_id, "legacy", owner, query_params=[("order", "title.asc")],
-    )
+        physical_before = await _physical_snapshot(conn, table_pg)
+    stored_before = await live.stored_columns(vault_id, "legacy")
+    entries_before = await live.stored_entries(vault_id, "legacy")
+    assert "pg_name" not in stored_before
+    read_before = await _read(vault, vault_id, "legacy", owner, query_params=[("order", "title.asc")])
+    sql = "SELECT * FROM legacy ORDER BY title"
     sql_before = await table_service.execute_sql(
-        vault_names=[vault], user_id=str(owner), actor_id="owner",
-        sql="SELECT * FROM legacy ORDER BY title", is_admin=True,
+        vault_names=[vault], user_id=str(owner), actor_id="owner", sql=sql, is_admin=True,
     )
 
-    backfill = _load_backfill()
+    # Deploy this code: its boot applies every migration registered after
+    # the last release before #433.
     async with live.pool.acquire() as conn:
-        await backfill.migrate(conn=conn)
+        await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
 
-    registry = await live.registry_columns(vault_id, "legacy")
-    assert registry == [
-        {**c, "pg_name": "legacy_col" if c["name"] == "Legacy-Col" else c["name"]}
-        for c in _LEGACY_COLUMNS
-    ]
-    async with live.pool.acquire() as conn:
-        assert await _physical_snapshot(conn, table_pg) == before
-    read_after = await _read(
-        vault, vault_id, "legacy", owner, query_params=[("order", "title.asc")],
-    )
+    # ...and use the table through every surface.
+    read_after = await _read(vault, vault_id, "legacy", owner, query_params=[("order", "title.asc")])
     assert read_after.body == read_before.body
     assert await table_service.execute_sql(
-        vault_names=[vault], user_id=str(owner), actor_id="owner",
-        sql="SELECT * FROM legacy ORDER BY title", is_admin=True,
+        vault_names=[vault], user_id=str(owner), actor_id="owner", sql=sql, is_admin=True,
     ) == sql_before
-
-    # Idempotent: a second run changes nothing, not even the timestamp.
-    async with live.pool.acquire() as conn:
-        await backfill.migrate(conn=conn)
-        assert await conn.fetchval(
-            "SELECT updated_at FROM vault_tables WHERE vault_id = $1", vault_id,
-        ) == registry_updated_at
-    assert await live.registry_columns(vault_id, "legacy") == registry
-
-    # The pre-grammar column resolves through the row API by its registry
-    # name, and drift detection now agrees with pg_attribute about it.
     legacy_read = await _read(
         vault, vault_id, "legacy", owner,
         query_params=[("select", "title,Legacy-Col"), ("Legacy-Col", "eq.old")],
     )
     assert _items(legacy_read) == [{"title": "a", "Legacy-Col": "old"}]
+    await table_row_write.insert_rows(
+        vault_name=vault, vault_id=vault_id, table_name="legacy",
+        user_id=owner, actor_id="owner", is_admin=True, body={"title": "c", "qty": 1},
+    )
     schema = await table_schema_service.get_table_schema(vault_id, "legacy")
     assert schema["drift"]["has_drift"] is False, schema["drift"]
+    # Readers report both names, computing the physical one.
+    expected = {c["name"]: c["name"] for c in _LEGACY_COLUMNS} | {"Legacy-Col": "legacy_col"}
+    assert {c["name"]: c["pg_name"] for c in schema["columns"]} == expected
+    listed = await table_service.list_tables(vault_id)
+    assert {c["name"]: c["pg_name"] for c in listed[0]["columns"]} == expected
+    browse = await DocumentService.__new__(DocumentService)._browse_tables_by_depth(
+        vault, vault_id, prefix="", max_depth=-1,
+    )
+    assert {c["name"]: c["pg_name"] for c in browse[0].columns} == expected
+
+    # Nothing of that wrote a byte into the registry or touched the table.
+    assert await live.stored_columns(vault_id, "legacy") == stored_before
+    async with live.pool.acquire() as conn:
+        assert await _physical_snapshot(conn, table_pg) == physical_before
+    stored = json.loads(stored_before)
+    assert [table_data_repo.column_pg_name(c) for c in stored] == [
+        "title", "status", "qty", "legacy_col",
+    ]
+    assert [c["name"] for c in stored[:3]] == ["title", "status", "qty"]
+    assert set(expected.values()) <= set(await live.attnames(table_pg))
+
+    # An alter that does not touch those columns leaves their stored entries
+    # as they were, and a plain column it adds stores no `pg_name` either.
+    await table_service.alter_table(
+        vault_id, "legacy", actor_id="owner", add_columns=[{"name": "note", "type": "text"}],
+    )
+    entries_after = await live.stored_entries(vault_id, "legacy")
+    assert entries_after[:4] == entries_before
+    assert json.loads(entries_after[4]) == {"name": "note", "type": "text"}
+    assert "pg_name" not in await live.stored_columns(vault_id, "legacy")
 
     # Generated constraint names still derive exactly as they did: widening the
     # enum drops the CHECK it created and nothing is left behind.
@@ -642,7 +709,7 @@ async def test_gate6_backfill_adds_pg_name_and_rewrites_no_ddl(live):
         alter_columns=[{"name": "status", "set_enum": ["draft", "active", "archived"]}],
     )
     async with live.pool.acquire() as conn:
-        await conn.execute(f"INSERT INTO {table_pg} (title, status) VALUES ('c', 'archived')")
+        await conn.execute(f"INSERT INTO {table_pg} (title, status) VALUES ('d', 'archived')")
         status_checks = await conn.fetchval(
             """
             SELECT count(*) FROM pg_constraint c
@@ -652,3 +719,46 @@ async def test_gate6_backfill_adds_pg_name_and_rewrites_no_ddl(live):
             f"public.{table_pg}",
         )
     assert status_checks == 1
+    assert "pg_name" not in await live.stored_columns(vault_id, "legacy")
+
+
+async def test_gate6_pg_name_is_stored_only_while_a_name_needs_it(live):
+    """A plain column created now stores exactly what one created before #433
+    did. A rename that leaves a column's physical name behind its logical one
+    records `pg_name`; a rename back to the name that physical name is drops
+    it again."""
+    vault_id, vault, owner = await live.vault("gate6b")
+    created = await table_service.create_table(
+        vault_id, "states",
+        [{"name": "status", "type": "text"}, {"name": "분류", "type": "text"}],
+        actor_id="owner",
+    )
+    header_pg = created["columns"][1]["pg_name"]
+    # Both names are reported, whether or not they are stored.
+    assert [c["pg_name"] for c in created["columns"]] == ["status", header_pg]
+    entries = [json.loads(e) for e in await live.stored_entries(vault_id, "states")]
+    assert entries == [
+        {"name": "status", "type": "text"},
+        {"name": "분류", "type": "text", "pg_name": header_pg},
+    ]
+    await table_row_write.insert_rows(
+        vault_name=vault, vault_id=vault_id, table_name="states",
+        user_id=owner, actor_id="owner", is_admin=True, body={"status": "open", "분류": "A"},
+    )
+
+    await table_service.alter_table(
+        vault_id, "states", actor_id="owner", rename_columns={"status": "상태"},
+    )
+    entries = [json.loads(e) for e in await live.stored_entries(vault_id, "states")]
+    assert entries[0] == {"name": "상태", "type": "text", "pg_name": "status"}
+    assert "status" in await live.attnames(table_data_repo.pg_table_name(vault, "states"))
+    read = await _read(vault, vault_id, "states", owner, query_params=[("select", "상태")])
+    assert _items(read) == [{"상태": "open"}]
+
+    await table_service.alter_table(
+        vault_id, "states", actor_id="owner", rename_columns={"상태": "status"},
+    )
+    entries = [json.loads(e) for e in await live.stored_entries(vault_id, "states")]
+    assert entries[0] == {"name": "status", "type": "text"}
+    read = await _read(vault, vault_id, "states", owner, query_params=[("select", "status")])
+    assert _items(read) == [{"status": "open"}]

@@ -20,7 +20,7 @@ import uuid
 
 import pytest
 
-from app.repositories import table_data_repo
+from app.repositories import table_data_repo, table_registry_repo
 from app.services import table_schema_service, table_service
 from app.services.row_query_shape import _shape_result
 from app.services.table_row_query import compile_ast_row_query, compile_row_query
@@ -496,6 +496,94 @@ def test_gate6_a_registry_row_written_before_the_backfill_resolves_as_before():
     assert table_data_repo.column_pg_name({"name": "MyCol"}) == "mycol"
     assert table_data_repo.column_pg_name({"name": "my-col"}) == "my_col"
     assert table_data_repo.column_pg_name({"name": "분류", "pg_name": "c_1_0badf00d"}) == "c_1_0badf00d"
+
+
+# The registry stores `pg_name` sparsely: only where it differs from the
+# identifier the legacy rule (`safe_ident(name).lower()`) gives, which is what
+# `column_pg_name` falls back to. So every table that exists keeps a registry
+# row byte-identical to what it had, and older code can still use it.
+
+
+def _alter_conn_for(columns):
+    return _Conn(table_row={
+        "id": uuid.uuid4(), "name": _TABLE, "columns": columns,
+        "unique_keys": [], "indexes": [], "collection": None, "description": "",
+    })
+
+
+@pytest.mark.parametrize("if_not_exists", [False, True])
+async def test_gate6_a_plain_column_created_now_stores_no_pg_name(monkeypatch, if_not_exists):
+    conn = _Conn()
+    _wire(monkeypatch, conn)
+
+    out = await table_service.create_table(
+        uuid.uuid4(), _TABLE,
+        [{"name": "status", "type": "text"}, {"name": "분류", "type": "text"}],
+        actor_id="tester", if_not_exists=if_not_exists,
+    )
+
+    header_pg = out["columns"][1]["pg_name"]
+    assert _registry_insert(conn) == [
+        {"name": "status", "type": "text"},
+        {"name": "분류", "type": "text", "pg_name": header_pg},
+    ]
+    # Readers report both names regardless.
+    assert out["columns"][0]["pg_name"] == "status"
+
+
+async def test_gate6_an_alter_leaves_the_entries_it_does_not_touch_as_they_were(monkeypatch):
+    legacy = [
+        {"name": "status", "type": "text"},
+        # Predates the column grammar: its identifier is `legacy_col`.
+        {"name": "Legacy-Col", "type": "text"},
+    ]
+    conn = _alter_conn_for([dict(c) for c in legacy])
+    _wire(monkeypatch, conn)
+
+    await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester",
+        add_columns=[{"name": "note", "type": "text"}],
+    )
+
+    assert _registry_update(conn) == [*legacy, {"name": "note", "type": "text"}]
+
+
+async def test_gate6_pg_name_is_stored_only_while_a_name_needs_it(monkeypatch):
+    conn = _alter_conn_for([{"name": "status", "type": "text"}])
+    _wire(monkeypatch, conn)
+    await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={"status": "상태"},
+    )
+    renamed = _registry_update(conn)
+    # A logical rename: the column stays `status`, which the name no longer says.
+    assert renamed == [{"name": "상태", "type": "text", "pg_name": "status"}]
+    assert not any("RENAME COLUMN" in sql for sql in conn.sql())
+
+    conn = _alter_conn_for(renamed)
+    _wire(monkeypatch, conn)
+    await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={"상태": "status"},
+    )
+    # Back to the name its physical name is: nothing left to record.
+    assert _registry_update(conn) == [{"name": "status", "type": "text"}]
+
+
+def test_gate6_readers_report_the_physical_name_a_sparse_row_implies():
+    stored = json.dumps([
+        {"name": "status", "type": "text"},
+        {"name": "Legacy-Col", "type": "text"},
+        {"name": "분류", "type": "text", "pg_name": "c_3_0badf00d"},
+    ])
+    physical = ["status", "legacy_col", "c_3_0badf00d"]
+
+    assert [c["pg_name"] for c in table_registry_repo.parse_columns(stored)] == physical
+    schema = table_schema_service._build_table_schema(
+        _VAULT,
+        {"name": _TABLE, "columns": stored, "unique_keys": [], "indexes": []},
+        {"id": "uuid", **{pg: "text" for pg in physical}},
+    )
+    assert [c["pg_name"] for c in schema["columns"]] == physical
+    assert schema["drift"]["has_drift"] is False
 
 
 # ── The decisions the gates rest on ──────────────────────────────────────────
