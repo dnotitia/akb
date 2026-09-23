@@ -183,8 +183,15 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
     vault = await conn.fetchrow("SELECT name FROM vaults WHERE id=$1", target["vault_id"])
     if vault is None:
         raise ConflictError("Rollout vault is unavailable")
-    columns = list(payload["columns"])
     pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+    # Physical names derived as the table service derives them (#433): a
+    # plain manifest name keeps itself, so the registry row is the one this
+    # step always wrote; a word PostgreSQL reserves (`order`) gets `c_…`.
+    columns = [
+        {**col, "pg_name": table_data_repo.derive_column_pg_name(pg_name, col["name"], ordinal)}
+        for ordinal, col in enumerate(payload["columns"], start=1)
+    ]
+    table_service._check_physical_names(columns)
     _, unique_keys, indexes = table_service._canonical_create_spec(
         vault_name=vault["name"],
         name=table_name,

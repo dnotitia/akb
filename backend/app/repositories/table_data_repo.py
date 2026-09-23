@@ -234,8 +234,33 @@ def safe_ident(name: str) -> str:
 # so a table whose names are all plain is stored exactly as before #433.
 
 # A logical name matching this, within PG_IDENT_MAX_LEN, is its own physical
-# name — so every table created before the split keeps its identifiers.
+# name — so every table created before the split keeps its identifiers —
+# unless PostgreSQL reserves it (below).
 _PLAIN_COLUMN_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+# The keywords PostgreSQL refuses as a column name: `pg_get_keywords()`
+# catcode R (reserved) and T (reserved, can be a function or type name).
+# `CREATE TABLE t (user TEXT)` is a syntax error, so these fit the plain
+# grammar but cannot be bare identifiers, and get a derived physical name.
+# The other keywords (`name`, `type`, `value`, …) are accepted unquoted as
+# column names in the DDL and row SQL the table code emits (measured on
+# PostgreSQL 16) and stay plain. Frozen from PostgreSQL 16, like
+# `_PG_KEYWORDS`, of which this is a subset;
+# test_table_column_logical_names_postgres checks it against the server.
+_PG_RESERVED_COLUMN_WORDS = frozenset(
+    """
+    all analyse analyze and any array as asc asymmetric authorization binary both
+    case cast check collate collation column concurrently constraint create cross
+    current_catalog current_date current_role current_schema current_time
+    current_timestamp current_user default deferrable desc distinct do else end
+    except false fetch for foreign freeze from full grant group having ilike in
+    initially inner intersect into is isnull join lateral leading left like limit
+    localtime localtimestamp natural not notnull null offset on only or order outer
+    overlaps placing primary references returning right select session_user similar
+    some symmetric system_user table tablesample then to trailing true union unique
+    user using variadic verbose when where window with
+    """.split()
+)
 
 
 def column_key(name: str) -> str:
@@ -249,7 +274,11 @@ def column_key(name: str) -> str:
 
 def is_plain_column_name(name: str) -> bool:
     """True when ``name`` can be its own physical name."""
-    return bool(_PLAIN_COLUMN_RE.fullmatch(name)) and len(name.encode()) <= PG_IDENT_MAX_LEN
+    return (
+        bool(_PLAIN_COLUMN_RE.fullmatch(name))
+        and len(name.encode()) <= PG_IDENT_MAX_LEN
+        and name not in _PG_RESERVED_COLUMN_WORDS
+    )
 
 
 def derive_column_pg_name(table_pg_name: str, logical_name: str, ordinal: int) -> str:
