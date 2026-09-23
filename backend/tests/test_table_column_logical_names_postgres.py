@@ -44,6 +44,7 @@ from app.services import (
     user_sql_executor,
 )
 from app.services.document_service import DocumentService
+from app.services.native_document_service import NativeDocumentService
 from app.services.role_sync import RoleSync, user_role_name, vault_group_role_name
 
 pytestmark = pytest.mark.asyncio
@@ -680,6 +681,10 @@ async def test_gate6_an_existing_table_is_byte_identical_under_this_code(live_be
         vault, vault_id, prefix="", max_depth=-1,
     )
     assert {c["name"]: c["pg_name"] for c in browse[0].columns} == expected
+    native = await NativeDocumentService(pool=live.pool)._browse_legacy_tables(
+        vault, vault_id, prefix="", max_depth=-1,
+    )
+    assert {c["name"]: c.get("pg_name") for c in native[0].columns} == expected
 
     # Nothing of that wrote a byte into the registry or touched the table.
     assert await live.stored_columns(vault_id, "legacy") == stored_before
@@ -762,3 +767,81 @@ async def test_gate6_pg_name_is_stored_only_while_a_name_needs_it(live):
     assert entries[0] == {"name": "status", "type": "text"}
     read = await _read(vault, vault_id, "states", owner, query_params=[("select", "status")])
     assert _items(read) == [{"status": "open"}]
+
+
+# ── A drop names a declared column; reserved words are headers too ───────────
+
+
+async def test_a_drop_never_reaches_a_column_by_its_physical_name(live):
+    """A plain name can be another column's physical name: the `c_1_…` a
+    header was given, or `age` after a logical rename to `나이`. Dropping by
+    it is refused, and the column and its data stay."""
+    vault_id, vault, owner = await live.vault("dropguard")
+    created = await table_service.create_table(
+        vault_id, "results",
+        [{"name": "분류", "type": "text"}, {"name": "age", "type": "int"}],
+        actor_id="owner",
+    )
+    await table_service.alter_table(
+        vault_id, "results", actor_id="owner", rename_columns={"age": "나이"},
+    )
+    await table_row_write.insert_rows(
+        vault_name=vault, vault_id=vault_id, table_name="results",
+        user_id=owner, actor_id="owner", is_admin=True, body={"분류": "A", "나이": 7},
+    )
+    table_pg = table_data_repo.pg_table_name(vault, "results")
+    before = await live.attnames(table_pg)
+    stored = await live.stored_columns(vault_id, "results")
+
+    for name in (created["columns"][0]["pg_name"], "age"):
+        with pytest.raises(ValidationError, match="Cannot drop missing column"):
+            await table_service.alter_table(
+                vault_id, "results", actor_id="owner", drop_columns=[name],
+            )
+
+    assert await live.attnames(table_pg) == before
+    assert await live.stored_columns(vault_id, "results") == stored
+    read = await _read(vault, vault_id, "results", owner, query_params=[("select", "분류,나이")])
+    assert _items(read) == [{"분류": "A", "나이": 7}]
+
+
+async def test_reserved_words_are_headers_like_any_other(live):
+    """`CREATE TABLE … (user TEXT)` is a syntax error, so a reserved word gets
+    a derived physical name; the row API still speaks the word, including
+    one spelled like a query control the web UI sends on every listing."""
+    vault_id, vault, owner = await live.vault("reserved")
+    words = ["user", "order", "group", "limit", "select"]
+    created = await table_service.create_table(
+        vault_id, "sheet",
+        [{"name": w, "type": "text"} for w in words] + [{"name": "name", "type": "text"}],
+        actor_id="owner",
+    )
+    phys = {c["name"]: c["pg_name"] for c in created["columns"]}
+    assert phys["name"] == "name"
+    assert set(phys[w] for w in words) <= set(
+        await live.attnames(table_data_repo.pg_table_name(vault, "sheet"))
+    )
+
+    await table_row_write.insert_rows(
+        vault_name=vault, vault_id=vault_id, table_name="sheet",
+        user_id=owner, actor_id="owner", is_admin=True,
+        body=[{w: f"{w}-{n}" for w in [*words, "name"]} for n in (1, 2)],
+    )
+    listing = await _read(
+        vault, vault_id, "sheet", owner,
+        query_params=[("limit", "50"), ("offset", "0"), ("order", "created_at.desc,id.desc")],
+    )
+    assert len(_items(listing)) == 2
+    picked = await _read(
+        vault, vault_id, "sheet", owner,
+        query_params=[("select", "user,order"), ("group", "eq.group-2"), ("order", "user.asc")],
+    )
+    assert _items(picked) == [{"user": "user-2", "order": "order-2"}]
+
+    # Among PostgreSQL's keywords, exactly those it refuses as a column name
+    # are not plain; the ones it accepts (`name`, `type`, …) keep themselves.
+    keywords = await live.pool.fetch("SELECT word, catcode::text AS catcode FROM pg_get_keywords()")
+    refused = {r["word"] for r in keywords if r["catcode"] in ("R", "T")}
+    assert {
+        r["word"] for r in keywords if not table_data_repo.is_plain_column_name(r["word"])
+    } == refused

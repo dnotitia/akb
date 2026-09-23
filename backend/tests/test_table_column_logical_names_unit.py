@@ -18,14 +18,26 @@ import json
 import re
 import unicodedata
 import uuid
+from pathlib import Path
 
 import pytest
 
 from app.repositories import table_data_repo, table_registry_repo
-from app.services import table_schema_service, table_service
+from app.services import (
+    app_resource_service,
+    app_rollout_service,
+    app_rollout_worker,
+    table_schema_service,
+    table_service,
+)
+from app.services.native_document_service import NativeDocumentService
 from app.services.row_query_shape import _shape_result
 from app.services.table_row_query import compile_ast_row_query, compile_row_query
-from app.services.table_row_write import compile_insert_rows, compile_update_rows
+from app.services.table_row_write import (
+    compile_delete_rows,
+    compile_insert_rows,
+    compile_update_rows,
+)
 
 _VAULT = "papers"
 _TABLE = "results"
@@ -598,6 +610,7 @@ def test_gate6_readers_report_the_physical_name_a_sparse_row_implies():
     "line\nbreak",       # C0 control
     "del\x7f",           # DEL
     "nel\x85",           # C1 control
+    "\ud800x",           # lone surrogate: no UTF-8 form, so no digest input
     "가" * 256,
     "ID", "Created_At", "ROW_COMMIT",  # bookkeeping, in any case form
 ])
@@ -690,6 +703,8 @@ def _alter_conn(columns):
     ("status", "상태", False),
     # A column whose physical name was derived: renaming it never moves it.
     ("상태", "status", False),
+    # ...to a word PostgreSQL reserves, which cannot be a bare identifier.
+    ("status", "order", False),
 ])
 async def test_d7_rename_is_physical_only_for_a_plain_to_plain_column(monkeypatch, start, new, physical):
     cols, _, _ = _spec([
@@ -888,3 +903,411 @@ def test_d4_a_header_with_edge_spaces_is_addressable_as_written():
         query_params=[("select", "비고"), ("비고", "eq.x")],
     )
     assert read["sql"].startswith(f"SELECT {plain} FROM"), read
+
+
+# ── Drops and renames resolve a logical name, and only once ──────────────────
+
+
+@pytest.mark.parametrize("scenario", ["derived", "renamed", "unregistered"])
+async def test_a_drop_never_reaches_a_column_by_its_physical_name(monkeypatch, scenario):
+    """A plain name can be another column's PHYSICAL name — the `c_1_…` a
+    header was given, or `age` after `age` was renamed to `나이`. A drop by
+    that name must not destroy the column while the registry keeps it, so a
+    drop names a declared column or is refused, as rename and alter are."""
+    cols, _, _ = _spec([{"name": "분류", "type": "text"}, {"name": "age", "type": "int"}])
+    if scenario == "renamed":
+        cols[1]["name"] = "나이"  # renamed logically: the column is still `age`
+    name = {"derived": cols[0]["pg_name"], "renamed": "age", "unregistered": "ghost"}[scenario]
+    conn = _alter_conn(cols)
+    _wire(monkeypatch, conn)
+
+    with pytest.raises(table_service.ValidationError, match="Cannot drop missing column"):
+        await table_service.alter_table(
+            uuid.uuid4(), _TABLE, actor_id="tester", drop_columns=[name],
+        )
+
+    assert not any("DROP COLUMN" in s for s in conn.sql())
+    assert not any(s.startswith("UPDATE vault_tables") for s in conn.sql())
+
+
+@pytest.mark.parametrize("renames", [
+    {"age": "x", "AGE": "y"},
+    {"분류": "a", unicodedata.normalize("NFD", "분류"): "b"},
+])
+async def test_a_rename_map_naming_one_column_twice_is_refused(monkeypatch, renames):
+    """Two keys that resolve to one column would rename it twice and leave its
+    unique key and index at the intermediate name — or, once NFC makes them
+    one key, silently drop one of the two requests."""
+    cols, uks, idxs = _spec(
+        [{"name": "age", "type": "int", "unique": True}, {"name": "분류", "type": "text"}],
+        indexes=[{"columns": ["age"]}],
+    )
+    conn = _Conn(table_row={
+        "id": uuid.uuid4(), "name": _TABLE, "columns": cols,
+        "unique_keys": uks, "indexes": idxs, "collection": None, "description": "",
+    })
+    _wire(monkeypatch, conn)
+
+    with pytest.raises(table_service.ValidationError, match="more than once"):
+        await table_service.alter_table(
+            uuid.uuid4(), _TABLE, actor_id="tester", rename_columns=renames,
+        )
+
+    assert not any(s.startswith("ALTER TABLE") for s in conn.sql())
+    assert not any(s.startswith("UPDATE vault_tables") for s in conn.sql())
+
+
+# ── A header spelled like a control parameter ────────────────────────────────
+
+# What the web UI sends for every table it lists.
+_LISTING = [("limit", "50"), ("offset", "0"), ("order", "created_at.desc,id.desc")]
+_ROW = "00000000-0000-0000-0000-000000000001"
+
+
+def _declared(*columns) -> list[dict]:
+    """Registry entries, each with a physical name its logical name is not."""
+    out = []
+    for ordinal, col in enumerate(columns, start=1):
+        col = {"type": "text", **col} if isinstance(col, dict) else {"name": col, "type": "text"}
+        digest = hashlib.sha1(col["name"].encode()).hexdigest()[:8]
+        out.append({**col, "pg_name": f"c_{ordinal}_{digest}"})
+    return out
+
+
+@pytest.mark.parametrize("headers", [
+    ["Order", "Limit", "Offset", "Select"],
+    # Lowercase too: PostgreSQL reserves all four, and they are headers.
+    ["order", "limit", "offset", "select"],
+])
+def test_a_header_spelled_like_a_read_control_leaves_the_control_working(headers):
+    order, limit, _offset, select = headers
+    cols = _declared(*headers)
+    phys = _physical(cols)
+
+    listing = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, query_params=_LISTING,
+    )
+    assert listing.get("sql") == (
+        f"SELECT * FROM {_TABLE_PG} ORDER BY created_at DESC, id DESC LIMIT 50 OFFSET 0"
+    ), listing
+    picked = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("select", select), ("order", f"{order}.desc"), ("limit", "5")],
+    )
+    assert picked.get("sql") == (
+        f"SELECT {phys[select]} FROM {_TABLE_PG} ORDER BY {phys[order]} DESC LIMIT 5 OFFSET 0"
+    ), picked
+    # A filter on the header is a filter, however it is spelled — and only a
+    # filter: the control keeps its default.
+    for key in (limit, limit.lower(), limit.upper()):
+        filtered = compile_row_query(
+            vault_name=_VAULT, table_name=_TABLE, columns=cols, query_params=[(key, "eq.x")],
+        )
+        assert filtered.get("sql") == (
+            f"SELECT * FROM {_TABLE_PG} WHERE ({phys[limit]} = $1) LIMIT 100 OFFSET 0"
+        ), (key, filtered)
+
+
+@pytest.mark.parametrize("headers", [
+    ["Select", "All", "Expected_Row_Commit"],
+    ["select", "all", "expected_row_commit"],
+])
+def test_a_header_spelled_like_a_write_control_leaves_the_control_working(headers):
+    cols = _declared(*headers, "분류")
+    phys = _physical(cols)
+
+    update = compile_update_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, body={"분류": "y"},
+        query_params=[("id", f"eq.{_ROW}"), ("select", "*"), ("expected_row_commit", "tok")],
+        prefer_header="return=representation",
+    )
+    assert not isinstance(update, dict), update
+    assert update.sql == (
+        f"UPDATE {_TABLE_PG} SET {phys['분류']} = $1, updated_at = NOW() "
+        f"WHERE ((id = $2)) AND row_commit = $3 RETURNING *"
+    )
+    everything = compile_delete_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, query_params=[("all", "true")],
+    )
+    assert not isinstance(everything, dict), everything
+    assert everything.sql == f"DELETE FROM {_TABLE_PG} WHERE TRUE"
+
+
+def test_a_filter_on_a_header_spelled_like_a_control_is_never_dropped():
+    """8d04a2aa: an UPDATE/DELETE that looks filtered must never quietly
+    become broader. Names resolve case-insensitively (decision 4), so
+    `count=eq.0` is a filter on a `Count` header — reading only an exact
+    spelling as the column would drop it and delete every `source=test` row."""
+    cols = _declared({"name": "Count", "type": "int"}, "Order", "source")
+    phys = _physical(cols)
+
+    delete = compile_delete_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("count", "eq.0"), ("source", "eq.test")],
+    )
+    assert not isinstance(delete, dict), delete
+    assert delete.sql == (
+        f"DELETE FROM {_TABLE_PG} WHERE ({phys['Count']} = $1) AND ({phys['source']} = $2)"
+    )
+    assert delete.params == [0, "test"]
+    update = compile_update_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, body={"source": "x"},
+        query_params=[("order", "eq.first")],
+    )
+    assert not isinstance(update, dict), update
+    assert update.sql.endswith(f"WHERE ({phys['Order']} = $2)")
+    # A mutation reads no `count`: a key naming a column is a filter, and a
+    # malformed one is refused rather than ignored.
+    refused = compile_delete_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("count", "exact"), ("source", "eq.test")],
+    )
+    assert isinstance(refused, dict) and refused["code"] == "invalid_filter", refused
+
+
+# ── Words PostgreSQL reserves ────────────────────────────────────────────────
+
+
+async def test_a_reserved_word_gets_a_derived_physical_name(monkeypatch):
+    """`user`, `order` and `group` fit the plain grammar, but PostgreSQL
+    refuses them as bare identifiers — `CREATE TABLE … (user TEXT)` is a
+    syntax error — so they are not plain. Keywords it accepts as column
+    names (`name`, `type`, `value`) still are."""
+    conn = _Conn()
+    _wire(monkeypatch, conn)
+    words = ["user", "order", "group", "name", "type", "value"]
+
+    out = await table_service.create_table(
+        uuid.uuid4(), _TABLE, [{"name": w, "type": "text"} for w in words], actor_id="tester",
+    )
+
+    phys = _physical(out["columns"])
+    assert [w for w in words if phys[w] != w] == ["user", "order", "group"]
+    ddl = next(s for s in conn.sql() if s.startswith("CREATE TABLE"))
+    for word in ("user", "order", "group"):
+        assert phys[word].startswith("c_") and f" {word} " not in ddl, ddl
+    assert _registry_insert(conn) == [
+        {"name": w, "type": "text", "pg_name": phys[w]} for w in ("user", "order", "group")
+    ] + [{"name": w, "type": "text"} for w in ("name", "type", "value")]
+
+
+# ── App rollout addresses what the registry says ─────────────────────────────
+
+
+class _RegistryConn(_Conn):
+    """A connection the rollout worker and the Native browse can run against:
+    `tables` is the registry by table name; `null_ids` the rows a backfill
+    batch finds."""
+
+    def __init__(self, tables, *, null_ids=()):
+        super().__init__()
+        self.tables = tables
+        self.null_ids = list(null_ids)
+
+    async def fetchrow(self, sql, *params):
+        self.sent.append((sql, params))
+        if "FROM vault_tables" in sql:
+            return self.tables.get(params[1])
+        if "FROM vaults" in sql:
+            return {"name": _VAULT}
+        return None
+
+    async def fetchval(self, sql, *params):
+        self.sent.append((sql, params))
+        if "FROM vaults" in sql:
+            return _VAULT
+        if "app_owned_resources" in sql:
+            return True
+        return 0
+
+    async def fetch(self, sql, *params):
+        self.sent.append((sql, params))
+        if "ORDER BY id LIMIT" in sql:
+            rows, self.null_ids = [{"id": i} for i in self.null_ids], []
+            return rows
+        return []
+
+
+def _registry_row(name, columns):
+    return {
+        "id": uuid.uuid4(), "name": name, "columns": columns,
+        "unique_keys": [], "indexes": [], "collection": None, "description": "",
+    }
+
+
+def _rollout_target():
+    return {"vault_id": uuid.uuid4(), "installation_id": uuid.uuid4(), "app_id": uuid.uuid4()}
+
+
+def _no_grants(monkeypatch):
+    class _RoleSync:
+        async def grant_table_in_conn(self, *_a, **_k):
+            return None
+
+    monkeypatch.setattr(app_rollout_worker, "get_role_sync", lambda: _RoleSync())
+
+
+async def test_rollout_steps_address_the_physical_name_the_registry_holds(monkeypatch):
+    """Logical renames before adoption can leave each column's physical name
+    another column's name — `z` on column `a`, `a` on `c_2_…` — and the
+    fingerprint, which ignores `pg_name`, still matches a plain {a, z}
+    manifest. A step's SQL must reach `a` through the registry."""
+    shuffled = [
+        {"name": "z", "type": "text", "pg_name": "a"},
+        {"name": "a", "type": "text", "pg_name": "c_2_6530ef71"},
+    ]
+    orders_pg = table_data_repo.pg_table_name(_VAULT, "orders")
+    conn = _RegistryConn({"orders": _registry_row("orders", shuffled)}, null_ids=[uuid.UUID(int=1)])
+    target = _rollout_target()
+    step = {"id": uuid.uuid4(), "step_id": "backfill_a", "checkpoint": {}}
+
+    await app_rollout_worker._run_backfill(conn, target, step, {
+        "table": "orders", "column": "a", "primary_key": "id",
+        "batch_size": 10, "where_null": True, "value": "ready",
+    })
+
+    touched = [s for s in conn.sql() if orders_pg in s]
+    assert len(touched) == 2 and all("c_2_6530ef71 IS NULL" in s for s in touched), touched
+    assert touched[1].startswith(f"UPDATE {orders_pg} SET c_2_6530ef71=$1"), touched
+
+    altered: list[dict] = []
+
+    async def _alter_table(*_args, **kwargs):
+        altered.append(kwargs)
+
+    monkeypatch.setattr(app_rollout_worker, "alter_table", _alter_table)
+    conn.sent.clear()
+    await app_rollout_worker._execute_step(conn, target, step, {
+        "operation": "set_not_null", "payload": {"table": "orders", "column": "a"},
+    })
+
+    assert [s for s in conn.sql() if orders_pg in s] == [
+        f"SELECT COUNT(*) FROM {orders_pg} WHERE c_2_6530ef71 IS NULL",
+    ]
+    assert altered[0]["alter_columns"] == [{"name": "a", "set_not_null": True}]
+
+
+def test_manifest_references_keep_the_plain_column_grammar():
+    """Decision 13: a manifest names columns in the plain grammar, and a
+    reference's `column` is a column name like any other."""
+    column = {
+        "name": "parent", "type": "text",
+        "references": {"table": "parents", "column": "코드"},
+    }
+    with pytest.raises(table_service.ValidationError):
+        app_rollout_service._normalize_column(dict(column))
+    with pytest.raises(table_service.ValidationError):
+        app_resource_service.canonical_table_descriptor(
+            {"name": "children", "columns": [column], "unique_keys": [], "indexes": []},
+        )
+    plain = {**column, "references": {"table": "parents", "column": "code"}}
+    assert app_rollout_service._normalize_column(plain)["references"]["column"] == "code"
+
+
+async def test_rollout_create_references_the_physical_column_the_registry_holds(monkeypatch):
+    """A referenced column's physical name is known only to its table's
+    registry row — `code`, renamed from a header, is still `c_1_…`."""
+    parents = [{"name": "code", "type": "text", "unique": True, "pg_name": "c_1_0badf00d"}]
+    conn = _RegistryConn({"parents": _registry_row("parents", parents)})
+    _no_grants(monkeypatch)
+    column = app_rollout_service._normalize_column({
+        "name": "parent", "type": "text",
+        "references": {"table": "parents", "column": "code"},
+    })
+
+    await app_rollout_worker._create_table_owned(conn, _rollout_target(), {
+        "table": "children", "columns": [column], "unique_keys": [], "indexes": [],
+    })
+
+    ddl = next(s for s in conn.sql() if s.startswith("CREATE TABLE"))
+    parents_pg = table_data_repo.pg_table_name(_VAULT, "parents")
+    assert f"REFERENCES {parents_pg} (c_1_0badf00d)" in ddl, ddl
+    assert _registry_insert(conn)[0]["references"] == {"table": "parents", "column": "code"}
+
+
+async def test_rollout_create_gives_a_reserved_word_a_derived_physical_name(monkeypatch):
+    conn = _RegistryConn({})
+    _no_grants(monkeypatch)
+    columns = [
+        app_rollout_service._normalize_column({"name": "order", "type": "text"}),
+        app_rollout_service._normalize_column({"name": "flag", "type": "text"}),
+    ]
+
+    await app_rollout_worker._create_table_owned(conn, _rollout_target(), {
+        "table": "orders", "columns": columns, "unique_keys": [], "indexes": [],
+    })
+
+    order_pg = table_data_repo.derive_column_pg_name(
+        table_data_repo.pg_table_name(_VAULT, "orders"), "order", 1,
+    )
+    assert order_pg.startswith("c_1_")
+    ddl = next(s for s in conn.sql() if s.startswith("CREATE TABLE"))
+    assert f" {order_pg} TEXT" in ddl and " order " not in ddl, ddl
+    assert _registry_insert(conn) == [
+        {"name": "order", "type": "text", "pg_name": order_pg},
+        {"name": "flag", "type": "text"},
+    ]
+
+
+# ── Every read surface reports both names ────────────────────────────────────
+
+
+async def test_native_browse_reports_the_physical_name_a_sparse_row_implies(monkeypatch):
+    stored = [
+        {"name": "status", "type": "text"},
+        {"name": "분류", "type": "text", "pg_name": "c_2_0badf00d"},
+    ]
+
+    async def _list_for_vault(_conn, _vault_id, **_kwargs):
+        return [{
+            "name": _TABLE, "columns": json.dumps(stored), "description": "",
+            "collection": None, "created_at": None,
+        }]
+
+    monkeypatch.setattr(table_registry_repo, "list_for_vault", _list_for_vault)
+    service = NativeDocumentService(pool=_Pool(_RegistryConn({})))
+
+    items = await service._browse_legacy_tables(_VAULT, uuid.uuid4(), prefix="", max_depth=-1)
+
+    assert [(c["name"], c.get("pg_name")) for c in items[0].columns] == [
+        ("status", "status"), ("분류", "c_2_0badf00d"),
+    ]
+
+
+# ── Which tables code from before #433 can use ───────────────────────────────
+
+
+async def test_older_code_needs_plain_names_and_no_stored_pg_name(monkeypatch):
+    """Code from before #433 addresses a column as `safe_ident(name)` and
+    accepts only plain names. Neither half of that implies the other."""
+    # A header whose legacy identifier IS its physical name stores nothing...
+    for old, new in (("age", "Age"), ("a_b", "A B")):
+        conn = _alter_conn_for([{"name": old, "type": "text"}])
+        _wire(monkeypatch, conn)
+        await table_service.alter_table(
+            uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={old: new},
+        )
+        assert _registry_update(conn) == [{"name": new, "type": "text"}]
+        assert not table_data_repo.is_plain_column_name(new)
+
+    # ...and plain names store one once logical renames move them.
+    columns, _, _ = _spec([{"name": "a", "type": "text"}, {"name": "비고", "type": "text"}])
+    for renames in ({"a": "에이"}, {"에이": "z"}, {"비고": "a"}):
+        conn = _alter_conn_for(table_registry_repo.storable_columns(columns))
+        _wire(monkeypatch, conn)
+        await table_service.alter_table(
+            uuid.uuid4(), _TABLE, actor_id="tester", rename_columns=renames,
+        )
+        columns = _registry_update(conn)
+    assert [c["name"] for c in columns] == ["z", "a"]
+    assert all(table_data_repo.is_plain_column_name(c["name"]) and "pg_name" in c for c in columns)
+
+    readme = (
+        Path(__file__).resolve().parents[2] / "docs" / "design" / "proposal"
+        / "2026-09-17-column-logical-physical-names" / "README.md"
+    ).read_text()
+    section = readme.split("### Rolling deploy and rollback", 1)[1].split("\n### ", 1)[0]
+    text = " ".join(section.replace("`", "").split())
+    assert "while every column name is plain and no column stores pg_name" in text, text
+    assert "whether or not it stores pg_name" in text, text
+    assert "exactly when no column stores pg_name" not in text, text
