@@ -49,6 +49,14 @@ one. What changed is everything around that rule (akb#433):
 - A name longer than 63 bytes is refused. PostgreSQL keeps 63 bytes of an
   identifier and silently drops the rest, which left the registry and the
   physical column naming different things.
+- A name PostgreSQL will not take as a column is refused the same way, with
+  the reason, instead of failing in DDL as a 500: the 101 keywords
+  PostgreSQL 16 reserves for column positions (`user`, `order`, `group`,
+  `select`, …; `CREATE TABLE … (user TEXT)` is a syntax error) and the system
+  column names (`xmin`, `ctid`, `tableoid`, …; 42701, which the add path did
+  not catch). Keywords it does accept (`name`, `type`, `value`, …) stay
+  allowed. A live test compares the list with the server's
+  `pg_get_keywords()`.
 - `akb_create_table` and `akb_alter_table` advertise `description` and state
   the name rule, so an agent can get it right before a refusal.
 - `akb_vault_info` returns each column's `description` from the registry. It
