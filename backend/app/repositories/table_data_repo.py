@@ -262,6 +262,11 @@ _PG_RESERVED_COLUMN_WORDS = frozenset(
     """.split()
 )
 
+# PostgreSQL's system columns. A user column may not take one of these names
+# (42701), so no existing column has one, and like a reserved word such a
+# name gets a derived physical name.
+_PG_SYSTEM_COLUMNS = frozenset({"tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"})
+
 
 def column_key(name: str) -> str:
     """The key every column-name lookup compares: NFC, then casefold.
@@ -278,6 +283,7 @@ def is_plain_column_name(name: str) -> bool:
         bool(_PLAIN_COLUMN_RE.fullmatch(name))
         and len(name.encode()) <= PG_IDENT_MAX_LEN
         and name not in _PG_RESERVED_COLUMN_WORDS
+        and name not in _PG_SYSTEM_COLUMNS
     )
 
 
