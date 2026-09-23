@@ -7,6 +7,33 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The `vchord` sparse shape completes a short page instead of calling it degraded (akb#673)
+
+When the index-led page for a scope came back short, the driver widened its
+candidate budget up to 65,535. It then refused exact work whenever the corpus
+held more than 10,000 rows, because it measured the whole corpus rather than
+the query. At production size that refused every time. Every search whose scope
+held fewer matches than the page ended with `degraded: true` and
+`sparse_search_budget_exceeded`, after 0.1–8 s of widening probes. Examples
+were a rare term, or a term common elsewhere and absent from this scope. On a
+2.1M-chunk corpus the flag followed that rule in 96 of 96 measured cases.
+
+A short page is now completed with the exact scan (`bm25_limit = -1`), which is
+the only scan that reads every posting of the query terms. Its cost is those
+postings, the growing segment, and the executor's check of each candidate; the
+corpus size does not enter into it. The short page had already read every
+posting it could. Measured on the same corpus, completion took 60 ms to 2.5 s,
+including queries of several common terms that are absent from the scope. The
+widening probes are gone, and this shape no longer raises
+`sparse_search_budget_exceeded`.
+
+A short page is not the only thing the exact scan corrects. `vchord_bm25`
+0.3.0 builds some block summaries wrongly under `CREATE INDEX` and `REINDEX`,
+and a bounded scan then skips whole blocks. That can shorten a page, which is
+now completed, but it can also leave a full page missing better matches. On the
+measured index this was 7 of 159 sampled terms. `deploy/postgres/README.md`
+describes the defect and what avoids it.
+
 ### A refused tool call sets `isError` in the MCP result
 
 MCP reports a tool execution error inside the result with `isError: true`.
