@@ -41,6 +41,42 @@ specifically; the proxy has its own log in
   `reserved_system_path` error code while retaining the existing HTTP 403
   envelope.
 
+### Table columns keep the headers they were given (#433)
+
+A column's `name` is now its logical name: the header as written — `분류`,
+`TriviaQA(비과학 문헌)`, `w Embedding` — NFC-normalized and otherwise verbatim,
+up to 255 characters. `^[a-z][a-z0-9_]*$` no longer gates it, so tables whose
+headers come from documents can be created. Still refused (422): blank names,
+control characters (NUL included), the bookkeeping names in any case, and two
+names equal under NFC + casefold.
+
+Each column also carries `pg_name`, its physical name, derived by the server and
+the only spelling that reaches PostgreSQL: a plain lowercase name keeps itself,
+anything else becomes `c_<position>_<8 hex>`, deterministic for the same table
+and header. `pg_name` appears on every schema read (create/alter responses,
+table lists, `akb_browse`, the schema endpoints, vault info) and is rejected on
+input. DDL, constraint/index definitions and generated constraint/index names
+use it; the registry records unique-key and index columns by logical name.
+
+- The row API (query string, JSON AST, reads and writes) takes logical names,
+  matched case-insensitively after NFC, and answers with rows keyed by them.
+  A JSON-AST `select`/`returning` array is no longer re-split on commas, so a
+  header containing one is selectable there.
+- `akb_sql` spells columns by `pg_name`; no column rewriting. Naming a column by
+  its logical name gets `undefined_column` with a hint naming the `pg_name`.
+- Renames: a column whose `pg_name` equals its name, renamed to another plain
+  name, is renamed physically as before; any other rename changes only the
+  logical name.
+
+**Compatibility:** every existing table's columns already have plain names, so
+nothing about them changes — same physical columns, same constraint and index
+names. Migration 113 writes `pg_name` into the registry for every column that
+lacks it (`safe_ident(name)` folded to lowercase, the identifier the old DDL
+produced) and issues no DDL. App manifests keep the plain grammar. Known limits:
+the web UI's create-table dialog and sort/filter URL state still accept only
+plain column names, and a header containing a comma cannot be named in a
+query-string `select`, `order` or `on_conflict`.
+
 ### Personal access token issuance options
 
 Add versioned PAT capability discovery and strict issuance with permission

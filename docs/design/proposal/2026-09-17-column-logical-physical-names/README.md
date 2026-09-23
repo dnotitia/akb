@@ -1,8 +1,8 @@
 ---
-status: proposal
-stage: planning
+status: accepted
+stage: implementation
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-23
 issue: dnotitia/akb#433
 baseline: d25d6ee
 ---
@@ -131,3 +131,65 @@ What this explicitly does **not** do:
   change, at the cost of searchable headers. Each ingest caller currently
   pays that cost independently and differently; unifying the documented
   form is worthwhile even before this proposal lands.
+
+## Implementation (2026-09-23)
+
+Implemented on `feat/akb-433-column-logical-names` (base `2ed799bf`); the six
+gates above were committed red first and are green on the branch. Where the
+build had to be more specific than this proposal, these decisions hold:
+
+1. **Logical name.** `columns[].name` is NFC-normalized and otherwise verbatim.
+   Refused (422): non-string, empty or whitespace-only; any control character,
+   NUL included (NUL is the digest separator); more than 255 characters; the
+   bookkeeping names `id`/`created_at`/`updated_at`/`created_by`/`row_commit`
+   compared by casefold.
+2. **Physical name.** `columns[].pg_name` is server-derived and a caller-supplied
+   one is a 422. A logical name matching `^[a-z][a-z0-9_]*$` within 63 bytes is
+   its own physical name; anything else is `c_<ordinal>_<digest8>`, ordinal =
+   1-based position among user columns when added, digest = first 8 hex of
+   `sha1(table_pg_name NUL logical_name)`. The digest is over the table's
+   physical `vt_…` name rather than `table_id` (as first proposed) so that
+   re-creating a table from the same document yields the same registry row
+   (gate 3).
+3. **Uniqueness.** Logical names are unique by `casefold(NFC(name))`; physical
+   names are unique and never a bookkeeping name, 422 otherwise (a clash needs a
+   caller's plain name to equal a derived one).
+4. **Resolution.** Every name a caller gives — unique keys, indexes, alter
+   operations, row API select/filter/order/insert/update keys and the AST,
+   `on_conflict`, `references.column` — resolves by `casefold(NFC(input))`
+   against logical names through one helper (`table_data_repo.column_key`).
+5. **SQL.** Only `pg_name` is interpolated: DDL, CHECK/enum/FK/UNIQUE/INDEX
+   definitions, the duplicate preflight, `pg_attribute` comparison.
+   `table_data_repo.column_pg_name(col)` falls back to `safe_ident(name).lower()`
+   only for a registry row written before the backfill. RoleSync grants tables
+   and never names a column.
+6. **Generated names** (unique keys, indexes, check/enum/FK constraints) derive
+   from physical column names — identical to before for every existing table.
+7. **Rename.** Physical `RENAME COLUMN` only when the column's `pg_name` equals
+   its logical name and the new name is plain; otherwise the rename is logical
+   and `pg_name` and constraint names stay. A plain target another column
+   already holds physically also renames logically, since `RENAME COLUMN`
+   would fail.
+8. **Row API.** Callers use logical names; response rows and `columns` are keyed
+   by logical names, remapped from physical in Python — no quoted-identifier
+   aliases in SQL. A JSON-AST `select`/`returning` array is no longer re-joined
+   on commas.
+9. **`akb_sql` and read surfaces.** `akb_sql` spells columns physically, with no
+   column rewriting; a logical name in SQL gets a hint naming the `pg_name`.
+   Schema reads return `name` and `pg_name` per column; MCP tool text explains
+   both.
+10. **Search.** The table metadata chunk keeps logical names.
+11. **Backfill.** Migration 113 writes `pg_name = safe_ident(name).lower()` onto
+    every registry column lacking one. Registry only, no DDL, idempotent,
+    `updated_at` untouched.
+12. **`if_not_exists`.** The spec comparison ignores `pg_name`.
+
+Gate 2 is exercised with `분류`/`모델`, which `safe_ident` really does send to
+the same `__` (`중요도` becomes `___`, so the pair in the gate's text does not
+quite fuse).
+
+Table and vault names, the app-manifest column grammar, `akb_sql`'s
+Unicode-escape and `pg_settings` defenses, row-level policy and column ACLs are
+unchanged. The web UI's create-table dialog and its sort/filter URL state still
+accept only plain column names (rendering rows keyed by logical names works);
+that is the next slice if headers are to be authored or sorted in the UI.
