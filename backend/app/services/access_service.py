@@ -1041,17 +1041,21 @@ async def get_vault_info(user_id: str, vault_name: str) -> dict:
 
 
 async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
-    """Return [{name, row_count, columns: [{name, type, example?}]}, …]
+    """Return [{name, row_count, columns: [{name, pg_name, type, example?}]}, …]
     for every table in `vault_id`.
 
     Pre-loads schema + sample so agents don't have to run mid-flow
     `information_schema.columns` lookups (issue #34 KISA RAG PoC pattern —
     122 such calls observed across 107 queries).
+
+    Columns are read from `pg_attribute`, so each is reported under the
+    registry's logical `name` with the physical `pg_name` that `akb_sql`
+    (and `search_hint`) spell (#433); bookkeeping columns have one name.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         registry = await conn.fetch(
-            "SELECT id, name, unique_keys, indexes FROM vault_tables "
+            "SELECT id, name, columns, unique_keys, indexes FROM vault_tables "
             "WHERE vault_id = $1 ORDER BY name",
             vault_id,
         )
@@ -1061,9 +1065,17 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
         # All columns for the vault's vt_* tables in one query — use the
         # canonical sanitizer so hyphenated vault names map to the actual
         # `vt_<sanitised>__<sanitised>` PG identifiers.
-        from app.repositories.table_data_repo import pg_table_name
+        from app.repositories.table_data_repo import column_pg_name, pg_table_name
         from app.repositories import table_registry_repo
         pg_names = [pg_table_name(vault_name, r["name"]) for r in registry]
+        logical_by_table = {
+            pg_table_name(vault_name, r["name"]): {
+                column_pg_name(c): c["name"]
+                for c in table_registry_repo.parse_columns(r["columns"])
+                if isinstance(c, dict) and isinstance(c.get("name"), str)
+            }
+            for r in registry
+        }
         col_rows = await conn.fetch(
             """
             SELECT c.relname AS table_name, a.attname AS name,
@@ -1079,7 +1091,8 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
         )
         by_table: dict[str, list[dict]] = {}
         for row in col_rows:
-            col: dict = {"name": row["name"], "type": row["type"]}
+            logical = logical_by_table.get(row["table_name"], {}).get(row["name"], row["name"])
+            col: dict = {"name": logical, "pg_name": row["name"], "type": row["type"]}
             if row["type"] == "jsonb":
                 col["search_hint"] = f"{row['name']}::text ILIKE '%X%'"
             by_table.setdefault(row["table_name"], []).append(col)
@@ -1097,7 +1110,7 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
                 sample = await conn.fetchrow(f'SELECT * FROM "{pg_name}" LIMIT 1')
                 example_map = dict(sample) if sample else {}
                 for col in columns:
-                    val = example_map.get(col["name"])
+                    val = example_map.get(col["pg_name"])
                     if val is not None:
                         col["example"] = _coerce_example(val)
             out.append({

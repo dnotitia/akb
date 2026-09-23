@@ -977,6 +977,19 @@ akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections c
 ## Column Types
 `text`, `number`, `boolean`, `date`, `json`
 
+## Column names — logical and physical
+A column's `name` is its logical name: any text up to 255 characters, kept
+verbatim (NFC) — a document's own header such as `분류` or
+`TriviaQA(비과학 문헌)` is fine. Names are unique case-insensitively, and the
+bookkeeping names (id/created_at/updated_at/created_by/row_commit) are
+reserved in any case.
+
+AKB derives each column's physical `pg_name`, the only spelling `akb_sql`
+uses. A plain lowercase name (`^[a-z][a-z0-9_]*$`) keeps itself; any other
+gets `c_<position>_<8 hex>`, stable for the same table and header. Never send
+`pg_name` — it is rejected. `akb_browse`, the schema reads and this tool's
+response list both names.
+
 ## if_not_exists — "ensure this table exists"
 
 Default (`false`) is unchanged: creating a table that already exists is a
@@ -1436,6 +1449,13 @@ The `confirm` parameter must match the vault name. Owner only.""",
 | add_indexes | | Lookup indexes to add: [{name?, columns}] |
 | drop_indexes | | Index names to drop: ["idx_name"] |
 
+## Column names
+Columns are named by their logical `name` (matched case-insensitively). A
+rename is physical — `ALTER TABLE … RENAME COLUMN` — only when the column's
+`pg_name` equals its name and the new name is plain lowercase ASCII. Any
+other rename changes the logical name only; `pg_name`, and so the `akb_sql`
+spelling, stays.
+
 ## Unique keys & indexes
 - `add_unique_keys` / `add_indexes` mirror the `akb_create_table` shape.
 - Adding a UNIQUE key on a table that already has data PREFLIGHTS for
@@ -1545,6 +1565,13 @@ Cross-vault (use vault prefix):
 ```
 akb_sql(vaults=["sales","external-projects"],
   sql="SELECT * FROM sales__pipeline p JOIN sales__partners c ON ...")
+```
+
+Columns are spelled by their physical `pg_name`. It equals the column
+`name` for plain lowercase names; a header such as `분류` has one like
+`c_1_1a2b3c4d` — see `akb_browse`. Alias it back if you want the header:
+```
+akb_sql(vault="papers", sql='SELECT c_1_1a2b3c4d AS "분류" FROM results')
 ```
 
 Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",

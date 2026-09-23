@@ -1,7 +1,10 @@
 """Merged registry/live schema introspection for vault tables.
 
 Reports the declared registry shape for each table alongside the live
-PostgreSQL column types, flagging drift between the two. Extracted from
+PostgreSQL column types, flagging drift between the two. Each column is
+reported under its logical `name` with the physical `pg_name` it has in
+PostgreSQL, and it is `pg_name` that is compared with `pg_attribute`
+(#433). Extracted from
 `table_service`; the canonical-type helper (`_canonical_pg_type`), the
 reserved-column set (`_RESERVED`), and the live column-meta reader
 (`_fetch_column_meta`) stay in `table_service` because they are shared
@@ -24,6 +27,7 @@ from app.services.uri_service import table_uri
 
 
 def _indexed_column_names(indexes: list[dict]) -> set[str]:
+    """`column_key`s of every column some index covers."""
     names: set[str] = set()
     for idx in indexes:
         for col in idx.get("columns", []):
@@ -32,16 +36,17 @@ def _indexed_column_names(indexes: list[dict]) -> set[str]:
             else:
                 name = col
             if isinstance(name, str):
-                names.add(name)
+                names.add(table_data_repo.column_key(name))
     return names
 
 
 def _unique_column_names(unique_keys: list[dict]) -> set[str]:
+    """`column_key`s of the columns a single-column unique key covers."""
     names: set[str] = set()
     for key in unique_keys:
         cols = key.get("columns", [])
         if len(cols) == 1 and isinstance(cols[0], str):
-            names.add(cols[0])
+            names.add(table_data_repo.column_key(cols[0]))
     return names
 
 
@@ -55,8 +60,8 @@ def _build_table_schema(vault_name: str, table: dict, pg_types: dict[str, str]) 
     column_items: list[dict] = []
     missing_columns: list[str] = []
     type_mismatches: list[dict] = []
-    registry_names = {
-        c["name"]
+    registry_physical = {
+        table_data_repo.column_pg_name(c)
         for c in columns
         if isinstance(c, dict) and isinstance(c.get("name"), str)
     }
@@ -64,14 +69,16 @@ def _build_table_schema(vault_name: str, table: dict, pg_types: dict[str, str]) 
     extra_columns = sorted(
         name
         for name in pg_types
-        if name not in registry_names and name.lower() not in _RESERVED
+        if name not in registry_physical and name.lower() not in _RESERVED
     )
 
     for col in columns:
         name = col["name"]
+        physical = table_data_repo.column_pg_name(col)
+        key = table_data_repo.column_key(name)
         logical_type = col.get("type", "text")
         expected_pg_type = _canonical_pg_type(logical_type)
-        actual_pg_type = pg_types.get(name)
+        actual_pg_type = pg_types.get(physical)
         drift: dict[str, object] = {
             "missing": actual_pg_type is None,
             "type_mismatch": False,
@@ -84,6 +91,7 @@ def _build_table_schema(vault_name: str, table: dict, pg_types: dict[str, str]) 
             if drift["type_mismatch"]:
                 type_mismatches.append({
                     "column": name,
+                    "pg_name": physical,
                     "registry_type": logical_type,
                     "expected_pg_type": expected_pg_type,
                     "pg_type": actual_pg_type,
@@ -91,13 +99,14 @@ def _build_table_schema(vault_name: str, table: dict, pg_types: dict[str, str]) 
 
         column_items.append({
             "name": name,
+            "pg_name": physical,
             "type": logical_type,
             "required": bool(col.get("required", False)),
             "default": col.get("default"),
             "check": col.get("check"),
             "enum": col.get("enum"),
-            "unique": bool(col.get("unique", False) or name in unique),
-            "index": bool(col.get("index", False) or name in indexed),
+            "unique": bool(col.get("unique", False) or key in unique),
+            "index": bool(col.get("index", False) or key in indexed),
             "references": col.get("references"),
             "on_delete": col.get("on_delete"),
             "pg_type": actual_pg_type,

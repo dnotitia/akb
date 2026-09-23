@@ -55,6 +55,7 @@ def test_build_table_schema_serializes_rich_constraints_and_drift() -> None:
     status, score, missing = schema["columns"]
     assert status == {
         "name": "status",
+        "pg_name": "status",
         "type": "text",
         "required": True,
         "default": "draft",
@@ -81,6 +82,7 @@ def test_build_table_schema_serializes_rich_constraints_and_drift() -> None:
         "type_mismatches": [
             {
                 "column": "score",
+                "pg_name": "score",
                 "registry_type": "number",
                 "expected_pg_type": "numeric",
                 "pg_type": "text",
