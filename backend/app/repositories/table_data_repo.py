@@ -231,7 +231,7 @@ def safe_ident(name: str) -> str:
 #
 # The registry records `pg_name` only where it differs from
 # `legacy_column_pg_name(name)` (see `table_registry_repo.storable_columns`),
-# so a table whose names are all plain is stored exactly as before #433.
+# so a table created with plain names is stored exactly as before #433.
 
 # A logical name matching this, within PG_IDENT_MAX_LEN, is its own physical
 # name — so every table created before the split keeps its identifiers —

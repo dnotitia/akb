@@ -47,16 +47,20 @@ A column's `name` is now its logical name: the header as written — `분류`,
 `TriviaQA(비과학 문헌)`, `w Embedding` — NFC-normalized and otherwise verbatim,
 up to 255 characters. `^[a-z][a-z0-9_]*$` no longer gates it, so tables whose
 headers come from documents can be created. Still refused (422): blank names,
-control characters (NUL included), the bookkeeping names in any case, and two
-names equal under NFC + casefold.
+control characters (NUL included), lone surrogates, the bookkeeping names in
+any case, and two names equal under NFC + casefold.
 
 Each column also has `pg_name`, its physical name, derived by the server and
 the only spelling that reaches PostgreSQL: a plain lowercase name keeps itself,
 anything else becomes `c_<position>_<8 hex>`, deterministic for the same table
-and header. `pg_name` appears on every schema read (create/alter responses,
-table lists, `akb_browse`, the schema endpoints, vault info) and is rejected on
-input. DDL, constraint/index definitions and generated constraint/index names
-use it; the registry records unique-key and index columns by logical name.
+and header. A word PostgreSQL reserves (`user`, `order`, `group`: the 101
+keywords it refuses as a column name) is not plain, so a header like that
+creates instead of failing with a syntax error; keywords PostgreSQL accepts
+(`name`, `type`, `value`) stay plain. `pg_name` appears on every schema read
+(create/alter responses, table lists, `akb_browse` on both arms, the schema
+endpoints, vault info) and is rejected on input. DDL, constraint/index
+definitions and generated constraint/index names use it; the registry records
+unique-key and index columns by logical name.
 The registry stores `pg_name` only where it differs from `safe_ident(name)`
 folded to lowercase — the identifier the old DDL produced — so a plain column
 stores none.
@@ -65,22 +69,42 @@ stores none.
   matched case-insensitively after NFC, and answers with rows keyed by them.
   A JSON-AST `select`/`returning` array is no longer re-split on commas, so a
   header containing one is selectable there.
+- A header may be spelled like a query control (`Limit`, `Order`, `Select`,
+  `All`, or a lowercase `order`). A query-string key is a filter or a
+  control, never both: on a read, `select`/`order`/`limit`/`offset` is a
+  filter only when it names a column and its value is a filter
+  (`<op>.<value>`), so default paging and sorting keep working; on
+  PATCH/DELETE, a control naming a column is a filter unless the mutation
+  reads it with a value it takes (`select` a column list, `all` a yes/no,
+  `expected_row_commit` always the CAS token), so a filter on such a column
+  is never dropped, in any spelling.
 - `akb_sql` spells columns by `pg_name`; no column rewriting. Naming a column by
   its logical name gets `undefined_column` with a hint naming the `pg_name`.
 - Renames: a column whose `pg_name` equals its name, renamed to another plain
   name, is renamed physically as before; any other rename changes only the
-  logical name.
+  logical name. A rename map naming one column twice (`age` and `AGE`) is a
+  422.
+- Drops name a declared column: a name that is not one is a 422 ("Cannot drop
+  missing column") where it used to run `DROP COLUMN IF EXISTS` and succeed.
+  A plain name can now be another column's physical name, so it must never
+  reach `DROP COLUMN` on its own.
+- App manifests keep the plain grammar, `references.column` included. The
+  rollout derives physical names like the table service, and resolves FK
+  targets and the `backfill_column`/`set_not_null` column through the
+  registry.
 
 **Compatibility:** no migration runs and nothing is backfilled. Every existing
-table's columns already have plain names, so its registry row, physical
-columns and constraint and index names stay byte-for-byte as they were.
-Rolling deploy and rollback: a table whose columns all have plain names —
-every existing table, and any created with plain names — stays fully readable
-and writable by code from before this change. A column stores `pg_name` only
-when its physical name is not the one its name gives (a header, or a column
-this code renamed logically); older code could produce neither, and a table
-holding one is not usable by older code. App manifests keep the plain grammar. Known
-limits: a NUL in a column name is stripped by the REST request models but is a
+table's registry row, physical columns and constraint and index names stay
+byte-for-byte as they were: none of its columns stores `pg_name`, and each
+keeps the identifier `safe_ident` gave it. Rolling deploy and rollback:
+existing tables stay as usable by code from before this change as they were,
+and a table this code creates or alters stays fully readable and writable by
+it while every column name is plain and no column stores `pg_name` — created
+with plain names and renamed only physically. Any other name is new-code-only,
+whether or not it stores `pg_name`: a logical rename of `age` to `Age` stores
+none, yet older code refuses the name; a reserved word, or plain names moved
+onto one another's physical columns by logical renames, store one, and older
+code addresses the wrong column. Known limits: a NUL in a column name is stripped by the REST request models but is a
 422 over MCP; a header containing a comma cannot be named in a query-string
 `select`, `order` or `on_conflict` (the JSON AST can); a rename onto a plain
 name another column holds physically changes only the logical name; and the

@@ -233,10 +233,15 @@ def storable_columns(columns: list[dict]) -> list[dict]:
     """The registry form of a column list: `pg_name` only where it differs
     from what `legacy_column_pg_name` gives for the name.
 
-    A plain name is its own physical name, so a table whose names are all
-    plain stores exactly what it stored before #433 — no key appears, no
-    row changes, and older code reads it as it always did. A rename that
-    brings a name back to its physical name drops the key again."""
+    So a table created before #433 keeps its row byte for byte, and one
+    created with plain names stores what it would have then. A rename that
+    brings a name back to its physical name drops the key again.
+
+    The absence of the key does not mean older code can use the table: that
+    takes every name plain AND no key stored. `Age`, renamed logically from
+    `age`, stores none, and older code refuses the name; plain names moved
+    onto one another's physical columns store one. (The proposal's "Rolling
+    deploy and rollback".)"""
     stored: list[dict] = []
     for col in columns:
         if _is_column(col) and "pg_name" in col and (
