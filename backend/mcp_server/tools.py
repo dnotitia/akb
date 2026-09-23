@@ -710,7 +710,8 @@ TOOLS = [
             "boolean, date, json). A column `name` is its logical name and may be "
             "any text — a document's own header ('분류', 'TriviaQA(비과학 문헌)') is "
             "fine. AKB derives each column's ASCII `pg_name` (the name itself when it "
-            "is already lowercase letters/digits/underscores); akb_sql spells columns "
+            "is already lowercase letters/digits/underscores and not a reserved SQL "
+            "word such as `order`); akb_sql spells columns "
             "by `pg_name`, every other surface by `name`, and responses carry both. "
             "Optional `collection` (e.g. 'sessions/learnings') "
             "groups the table under that collection so it appears beside the documents "
@@ -835,8 +836,8 @@ TOOLS = [
             "Prefix table names with vault name for cross-vault: sales__pipeline, external_projects__partners. "
             "SELECT requires reader role. INSERT/UPDATE/DELETE requires writer role. "
             "Columns are spelled by their physical `pg_name`, which differs from the "
-            "column `name` when that name is not plain lowercase ASCII (e.g. '분류' → "
-            "c_1_…); akb_browse lists both. "
+            "column `name` when that name is not plain lowercase ASCII or is a reserved "
+            "SQL word (e.g. '분류' → c_1_…); akb_browse lists both. "
             "Add a LIMIT to SELECTs unless you truly need every row — the full result set is "
             "returned (nothing is silently truncated), so an unbounded SELECT on a large table "
             "can send back a very large response."
@@ -872,8 +873,9 @@ TOOLS = [
             "Modify a table's schema — add, remove, or rename columns via ALTER TABLE DDL. "
             "Columns are named by their logical `name`, matched case-insensitively. A rename "
             "moves the physical column only when its `pg_name` equals its name and the new "
-            "name is plain lowercase ASCII; otherwise only the logical name changes and "
-            "`pg_name` (the akb_sql spelling) stays. Requires admin role."
+            "name is plain lowercase ASCII and not a reserved SQL word; otherwise only the "
+            "logical name changes and `pg_name` (the akb_sql spelling) stays. A drop must "
+            "name a declared column. Requires admin role."
         ),
         input_schema={
             "type": "object",

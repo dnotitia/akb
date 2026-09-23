@@ -985,10 +985,10 @@ bookkeeping names (id/created_at/updated_at/created_by/row_commit) are
 reserved in any case.
 
 AKB derives each column's physical `pg_name`, the only spelling `akb_sql`
-uses. A plain lowercase name (`^[a-z][a-z0-9_]*$`) keeps itself; any other
-gets `c_<position>_<8 hex>`, stable for the same table and header. Never send
-`pg_name` — it is rejected. `akb_browse`, the schema reads and this tool's
-response list both names.
+uses. A plain lowercase name (`^[a-z][a-z0-9_]*$`) keeps itself unless SQL
+reserves it (`order`, `user`, `group`); any other gets `c_<position>_<8 hex>`,
+stable for the same table and header. Never send `pg_name` — it is rejected.
+`akb_browse`, the schema reads and this tool's response list both names.
 
 ## if_not_exists — "ensure this table exists"
 
@@ -1452,9 +1452,10 @@ The `confirm` parameter must match the vault name. Owner only.""",
 ## Column names
 Columns are named by their logical `name` (matched case-insensitively). A
 rename is physical — `ALTER TABLE … RENAME COLUMN` — only when the column's
-`pg_name` equals its name and the new name is plain lowercase ASCII. Any
-other rename changes the logical name only; `pg_name`, and so the `akb_sql`
-spelling, stays.
+`pg_name` equals its name and the new name is plain lowercase ASCII and not a
+reserved SQL word. Any other rename changes the logical name only; `pg_name`,
+and so the `akb_sql` spelling, stays. `drop_columns` names declared columns:
+a `pg_name` that is not also a column's `name` is refused, never dropped.
 
 ## Unique keys & indexes
 - `add_unique_keys` / `add_indexes` mirror the `akb_create_table` shape.
@@ -1568,8 +1569,9 @@ akb_sql(vaults=["sales","external-projects"],
 ```
 
 Columns are spelled by their physical `pg_name`. It equals the column
-`name` for plain lowercase names; a header such as `분류` has one like
-`c_1_1a2b3c4d` — see `akb_browse`. Alias it back if you want the header:
+`name` for plain lowercase names SQL does not reserve; a header such as
+`분류`, or a reserved word such as `order`, has one like `c_1_1a2b3c4d` —
+see `akb_browse`. Alias it back if you want the header:
 ```
 akb_sql(vault="papers", sql='SELECT c_1_1a2b3c4d AS "분류" FROM results')
 ```
