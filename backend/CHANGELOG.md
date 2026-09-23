@@ -158,7 +158,12 @@ silently retries against the legacy endpoint after dropping restrictions.
   pass ran. Convergence is the run that writes zero.
 - The index is built `CONCURRENTLY`, outside `_do_ensure`. That method runs its
   DDL in one transaction, and a build over a corpus this size holds a
-  `ShareLock` against every INSERT for its duration.
+  `ShareLock` against every INSERT for its duration. `_do_ensure` now builds
+  it only for an empty table (a fresh install) and refuses a populated one
+  that lacks it. Before, selecting the shape ahead of `--index` built the
+  index at startup, in that transaction, over whatever part of the column was
+  filled — bypassing `--index`'s own refusal and serving a partial column
+  with no sign of it (akb#615).
 - Writes are conditioned on the row still holding the content that was encoded,
   so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
   than being stamped with tokens from text it no longer has.
