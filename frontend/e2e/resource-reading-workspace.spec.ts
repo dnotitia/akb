@@ -1100,8 +1100,11 @@ test("preview owns local location, restores Search, and promotes Raw to the Vaul
   await expect(result).toBeFocused();
   await result.click();
   await reader.getByRole("tab", { name: "Raw", exact: true }).click();
+  await expect(reader.getByRole("tab", { name: "Raw", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(reader.getByTestId("doc-raw")).toBeVisible();
   await reader.getByRole("button", { name: "Open document in vault" }).click();
   await expect(reader).toHaveCount(0);
+  await expect(page).toHaveURL(/view=raw/);
   await expect(page.getByTestId("doc-raw")).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Resource location", exact: true })).toContainText(title);
   await expectVaultDestinationsReachable(page);

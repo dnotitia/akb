@@ -153,6 +153,8 @@ for (const viewport of [
         .click();
       // Document metadata filters exclude Files; clear the semantic report filter.
       await page.getByRole("button", { name: "Toggle report" }).click();
+      await expect(page.getByRole("button", { name: "Toggle report" })).toHaveAttribute("aria-pressed", "false");
+      await expect(page).not.toHaveURL(/doc_type=report/);
       // URL navigation is a React transition; wait for its controlled state.
       for (const label of [
         "Include text Files",

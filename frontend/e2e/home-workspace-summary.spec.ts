@@ -201,8 +201,8 @@ test("Transparent notifications and global search suspend floating chrome", asyn
   await expect(invitation).toBeHidden();
   await page.keyboard.press("Escape");
   await expect(invitation).toBeVisible();
-  await page.getByRole("button", { name: /Search all vaults/ }).click();
-  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  await expect(page.getByTestId("global-search-dialog")).toBeVisible();
   await expect(invitation).toBeHidden();
   await page.keyboard.press("Escape");
   await expect(invitation).toBeVisible();
