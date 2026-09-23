@@ -397,10 +397,6 @@ h1, h2, h3, h4, h5, h6 {
 .app-header[data-surface="paper"] {
   background-color: var(--color-surface);
 }
-@media (min-width: 64rem) {
-  /* Preserve the 56px rail alignment without dividing one header into bands. */
-  .vault-app-header { border-bottom-color: transparent; }
-}
 
 /* Gradient brand wordmark */
 .brand-gradient {

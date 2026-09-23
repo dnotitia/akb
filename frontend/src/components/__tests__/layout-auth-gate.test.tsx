@@ -124,6 +124,16 @@ describe("Layout — auth gate", () => {
     expect(screen.queryByTestId("auth-page")).toBeNull();
   });
 
+  it.each(["/search?q=x", "/search/?q=x"])("preserves page identity and quick search on %s", async (path) => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt(path);
+    await screen.findByTestId("search-page");
+    expect(screen.getByRole("banner")).toHaveAttribute("data-surface", "paper");
+    expect(screen.getByRole("button", { name: "Search knowledge" })).toBeInTheDocument();
+    expect(within(screen.getByRole("navigation", { name: "Current page" })).getByText("Search")).toHaveAttribute("aria-current", "page");
+    expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+  });
+
   it("keeps the global header full-width without page-level responsive gutters", async () => {
     vi.mocked(api.getToken).mockReturnValue("fake-jwt");
     renderAt("/");
@@ -142,7 +152,7 @@ describe("Layout — auth gate", () => {
 
     expect(await screen.findByTestId("home")).toBeTruthy();
     const status = screen.getByTestId("header-indexing-status");
-    const search = screen.getByRole("button", { name: "Search all vaults" });
+    const search = screen.getByRole("button", { name: "Search knowledge" });
     expect(status).toHaveAttribute("role", "status");
     expect(within(status).queryByRole("button")).toBeNull();
     expect(status).toBeEmptyDOMElement();

@@ -60,9 +60,24 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 const openFilters = async (user: ReturnType<typeof userEvent.setup>) =>
-  user.click(screen.getByRole("button", { name: "Filter by document type" }));
+  user.click(screen.getByRole("button", { name: "More filters" }));
 
 describe("server search filters", () => {
+  it("removes a visible filter without opening the tray or losing query and Vault scope", async () => {
+    search.mockResolvedValue(response([hit("Guide")]));
+    renderAt("/search?q=x&v=eng&collection=guides&doc_type=report");
+    const user = userEvent.setup();
+    await screen.findByText("Guide");
+    expect(screen.queryByRole("complementary", { name: "Search filters" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Remove filter Collection: guides" }));
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[3]?.collection).toBeUndefined());
+    expect(search.mock.calls.at(-1)?.slice(0, 3)).toEqual(["x", ["eng"], 25]);
+    expect(screen.getByTestId("url")).toHaveTextContent("doc_type=report");
+    await user.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => expect(screen.getByTestId("url")).not.toHaveTextContent("doc_type"));
+    expect(screen.getByTestId("url")).toHaveTextContent("v=eng");
+  });
+
   it("requests archived documents on the server, displays status, and preserves scope across modes and Back", async () => {
     search.mockImplementation(async (_q, _v, _l, options) => ({
       ...response(options?.archive_scope === "archived" ? [{ ...hit("Old guide"), status: "archived" }] : []),

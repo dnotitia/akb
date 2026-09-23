@@ -95,10 +95,17 @@ export function recordRecentSearch(
   }
 }
 
-export function clearRecentSearches(userId: string): void {
+export function clearRecentSearches(userId: string, scope?: Pick<RecentSearch, "surface" | "vaults">): void {
   if (!userId || typeof window === "undefined") return;
   try {
-    window.localStorage.removeItem(storageKey(userId));
+    if (!scope) window.localStorage.removeItem(storageKey(userId));
+    else {
+      const vaults = JSON.stringify([...scope.vaults].sort());
+      const remaining = readRecentSearches(userId).filter(item =>
+        item.surface !== scope.surface || JSON.stringify([...item.vaults].sort()) !== vaults,
+      );
+      window.localStorage.setItem(storageKey(userId), JSON.stringify(remaining));
+    }
   } catch {
     // A denied storage write should not affect the search workspace.
   }

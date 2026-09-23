@@ -276,13 +276,19 @@ an `sr-only` summary, never the only signal.
   navigation, without the long product subtitle. Between `sm` and `lg`, Search
   can shrink within the remaining header width; the account control must remain
   fully inside the viewport. Desktop Search keeps its 256px width and the
-  explicit `Search all vaults…` label; its accessible name retains that scope
-  when narrow layouts show only the search glyph. The global row and Vault
+  neutral `Search knowledge…` label on every route, with `Search knowledge` as
+  its accessible name when narrow layouts show only the search glyph. Show the
+  current Vault and scope selector only inside the opened search modal; named
+  Vault routes still default to searching that Vault. The global row and Vault
   section navigation in Vault workspaces share an opaque `background` surface, separated from the
-  `surface` reading area by one bottom hairline. On desktop, omit the visual
-  divider between those two rows without changing their 56px/40px geometry or
-  the full-height navigation rails. Home instead uses the common header's `paper`
-  variant to continue its `surface` canvas; other workspace routes retain their
+  `surface` reading area by one bottom hairline. Keep the global header's bottom
+  hairline visible on every Vault route, including the unselected Vault index;
+  preserve the 56px/40px row geometry and full-height navigation rail alignment.
+  Home instead uses the common header's `paper`
+  variant to continue its `surface` canvas. Full Search routes also use `paper`
+  (including their Vault section row). They retain the common page identity,
+  global quick-search trigger and profile; their editable query belongs to the
+  page command row below. Other workspace routes retain their
   existing treatment. Global tools share 36px controls and small
   token radii. The account trigger is a quiet avatar/name/chevron disclosure,
   not a raised outlined card; keep the name from `sm`, with full identity in the
@@ -459,11 +465,31 @@ an `sr-only` summary, never the only signal.
   resource command row remains below it; desktop reading controls remain `h-8`.
   Overview, Search, Graph, Public links, Members, Settings, Activity and full resource readers share one
   flat section-navigation row above their working content and outside its scroll
-  region. Its real links begin with Overview / Search / Graph / Public links.
+  region. Its real links begin with Overview / Graph / Public links.
   Members / Settings immediately follow the content destinations, with a short
   neutral divider before Members rather than a large gap across the workspace.
-  The Search destination visibly says `Search`; its enclosing Vault navigation
-  supplies the scope, while the global field explicitly says `Search all vaults…`.
+  The global header owns the only quick-search entry point; do not duplicate
+  it as a field, button, or Search destination in this section row. Named Vault
+  routes default to that Vault each time the dialog opens; Home, account Settings,
+  the Vault index and the creation route default to all accessible Vaults.
+  A visible scope selector sits beside the modal input on every route, using a
+  Vault/globe glyph and selected-surface tokens. Its anchored selection panel
+  offers All vaults and any individual accessible Vault from `/my/vaults`, with
+  a dedicated name filter, selected checkmark and Current vault context label.
+  Changing scope never navigates away from the launching workspace. Keep quick
+  search single-scope; multiple-Vault selection belongs to the full Search page.
+  Fetch the directory when opening search, share that proof with recent-document
+  history, and keep loading, empty, filtered-empty and retry states distinct.
+  Directory failures must not discard the query or silently broaden its scope.
+  It stacks above the input on narrow screens, keeping the query usable and the
+  complete name accessible. Manual scope changes preserve the query and content
+  filter, invalidate old results, and update recent history to match the scope.
+  Never broaden a search automatically: an empty scoped result offers an explicit
+  `Search all vaults instead` action. Changes to the account or route Vault reset
+  transient search state. `Continue in search page` carries the selected scope,
+  query and resource kind to the existing full search route. Document results keep
+  the preview-and-return flow; the app-level resource navigation guard protects
+  unsaved edits for both scoped and all-Vault results.
   All links and More follow the same left-to-right flow.
   The divider's padding participates in overflow measurements, not unmeasured margins.
   When links no longer fit, measure the actual label/icon widths and move the
@@ -1032,24 +1058,33 @@ The full route owns up to 50 results and tells users when the visible log is
 capped; empty, loading, filtered-empty, and retry states retain the same panel
 boundary so the workspace does not jump between states.
 
-Search is an advanced, single-ledger workbench rather than a hero or a permanent
-two-pane inspector. It uses the Graph explorer's full-bleed, viewport-locked
-workspace grammar instead of sitting inside a second route card or page inset.
-A connected two-row command bar leads the page: the first row owns the strongly
-bounded query field, Semantic / Literal mode, on-demand Filters, and Search
-action; the thinner second row owns Vault scope plus honest loading/result
-status. The remaining height belongs to one independently scrolling,
-full-working-width results ledger. Source-kind and document-type filters stay
-behind the labelled Filters control and remain available before searching and
-after zero results; active filters remain visible through the control's count badge. This
-keeps refinement close to the query without allowing a fixed rail to tax every
-result row or compete with the independent Collections rail. On narrow screens,
-the first row wraps controls below the query without separating mode from its
-label; Vault scope and status stack within the second row rather than truncating
-between adjacent controls. Before a query runs, the results canvas uses a quiet
-`surface-2` field and centers recent/suggested re-entry content in one bounded
-ledger, preserving clear side gutters and separation from the command bar. Once
-results exist, that inner cap disappears and rows use the full working width.
+Search combines a quick-search modal with a dedicated refinement workspace.
+On every route, the global trigger opens the existing modal for quick
+lookup and document previews; its scope/query/kind carry into the full page.
+On `/search` and `/vault/:name/search`, the common global title, location icon,
+quick-search trigger and profile remain intact. A dedicated command row below
+owns the wide, URL-backed query form and explicit Search action. The compact
+global trigger opens an independent quick lookup; opening or dismissing it must
+not change the page's query or filters. The header and working canvas use `surface` (white in light mode and
+the corresponding slate token in dark mode), not a grey title band.
+
+The full page takes its information hierarchy from GitHub search: a 256px
+refinement rail, an honest result-count/scope row, and separate bordered results.
+Semantic/Literal and content kinds are immediately visible; More filters reveals
+document types, tags, collection, state and literal options. Search mode uses
+underlined selections; content kinds use compact navigation rows with a leading
+selection marker and check, labelled All / Documents / Tables / Files. More
+filters is a neutral chevron disclosure, not another competing selected tab.
+Active filter chips
+remain removable above the results even when the advanced controls are closed.
+The rail appears only when the *available workspace* is at least 56rem wide;
+below that, controls reflow above results and use capped, independent scroll.
+This avoids squeezing results alongside the existing Vault/Collection rails.
+Search owns its viewport and results scroll. Result cards have 16px/24px outer
+gutters and a 76rem reading cap; initial re-entry content is narrower, with
+recent queries, recent documents and suggested searches separated from the input.
+No illustrative sidebar, invented facet totals, unsupported sort, or query
+qualifier parser is added. Server contracts and saved URL state remain authoritative.
 The results canvas owns all empty, loading,
 no-result, degraded, filtered-empty, retry, and
 ranked-list states inside the same stable boundary. Its empty state reuses the
@@ -1058,9 +1093,10 @@ available: user-scoped browser search history and recently viewed documents are
 shown as connected ledgers, with inaccessible Vault history removed through the
 existing Vault list. The history stores query/scope/mode and document identity
 only—never result bodies—and silently disappears when browser storage is not
-available. Each semantic or literal row uses a stable,
-non-zero-padded rank followed by source identity, compact location, one focused
-match context, and a calibrated label or literal match count. Optional backend
+available. Semantic cards lead with location, a resource icon and linked title,
+one focused excerpt, then source type/tags. Literal cards retain exact snippets,
+body-relative line numbers and match counts. Stable result IDs and accessible
+ranks preserve preview return focus. Optional backend
 tags progressively add compact result badges and optional tag suggestions.
 Tag entry remains available independently of loaded results. Indexed chunk headers and
 markdown list markers are presentation metadata and are cleaned from semantic
@@ -1089,9 +1125,19 @@ matches ledgers. Results expose source, Vault, path, and one line of context,
 but never present raw semantic ranking inputs as percentages. The labelled
 combobox auto-focuses, announces loading/result states, supports arrow-key
 selection and Enter, closes with Escape, and returns focus to its trigger.
-Before typing, a compact `Search in` row exposes All / Documents / Tables /
-Files so people can set intent before entering a query. The panel then shows
-user-scoped recent global queries beside recently viewed documents, followed by
+Only the result ledger scrolls on short viewports, leaving the query, filters,
+close control and advanced-search action reachable. Arrow-key selection keeps
+the active result in that ledger's viewport without scrolling the workspace.
+The query field visibly includes the current search scope on every route: a
+Vault-name or All vaults selector. Its name-filterable list offers any accessible
+Vault without discarding the query or kind. The current route's Vault is labelled
+separately from the selected search scope. The list is bounded and scrollable;
+keyboard users can type a filter, use arrows and Enter to choose, or Escape back
+to the scope trigger without closing search. Loading failures offer local retry,
+and unavailable directory entries are never synthesized from browser history.
+A compact row below exposes All / Documents / Tables / Files so people can set
+intent before entering a query. The panel then shows recent queries for the
+selected scope beside recently viewed documents in that scope, followed by
 the shared suggestions. Recent document history is browser-local and must be
 filtered through the current accessible Vault list before rendering; either
 history block disappears cleanly when no valid entries exist. The source choice
@@ -1101,7 +1147,18 @@ into the advanced-search URL. If the selected kind has no matches, the stable em
 Selecting a document opens the same route-backed preview over the launching
 page; tables and files go directly to their native resource. The full Search route remains
 an explicit advanced-search destination for Literal mode, Vault scope, and type
-filters; opening the global panel by itself never changes browser history.
+filters; opening the search panel by itself never changes browser history.
+Only the app header launches quick search; the Vault section row has no duplicate
+search control. Each opening defaults to the route's Vault, or all accessible
+Vaults outside a named Vault route. A manual scope change remains in effect while
+the panel is open and immediately invalidates old results; empty results never
+silently expand the scope. An explicit `Search all vaults instead` action does.
+Clearing recent queries affects only that user's matching search scope.
+Account or route Vault changes reset the panel's query and results.
+`Continue in search page` carries the query and content kind to the selected
+scope's existing Search route. Both search scopes respect the app-level
+unsaved-resource navigation guard before opening results or the search page;
+document preview dismissal returns focus to the stable app-header trigger.
 
 _Roadmap primitives_ (high-drift inline patterns being extracted): `IndexRow`
 (numbered list row), `ToggleGroup`/`ToggleChip` (segmented selection),

@@ -34,7 +34,7 @@ const linkLayout = "inline-flex h-11 items-center gap-1.5 whitespace-nowrap px-2
 const managementStartLayout = "pl-5 before:absolute before:left-1 before:top-1/2 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border-strong";
 
 function VaultNavigationLinks({ vault, route }: { vault: string; route: string }) {
-  const actions = getVaultPageActions(vault);
+  const actions = getVaultPageActions(vault).filter(action => action.key !== "search");
   const { requestNavigation } = useResourceNavigation();
   const navRef = useRef<HTMLElement>(null);
   const measureRef = useRef<HTMLDivElement>(null);
@@ -121,13 +121,14 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
   };
 
   return (
+    <div className={cn("@container/vault-navigation relative flex h-11 min-w-0 shrink-0 items-center gap-2 px-3 lg:h-10", route === sectionPaths.search ? "bg-surface" : "bg-background")}>
+    <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 border-b border-border" />
     <nav
       ref={navRef}
       aria-label="Vault sections"
       data-slot="vault-section-navigation"
-      className="relative flex h-11 min-w-0 shrink-0 items-center gap-1 bg-background px-3 lg:h-10"
+      className="relative flex h-full min-w-0 flex-1 items-center gap-1"
     >
-      <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 border-b border-border" />
       {actions.filter((_, index) => visible.includes(index)).map(action => renderLink(action))}
       {!!overflow.length && <DropdownMenu.Root modal={false} open={open} onOpenChange={value => { if (value) followedLinkRef.current = false; setOpen(value); }}>
         <DropdownMenu.Trigger asChild>
@@ -153,5 +154,6 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
       </div>
       </div>
     </nav>
+    </div>
   );
 }

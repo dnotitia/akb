@@ -10,7 +10,6 @@ import { VaultRail } from "@/components/vault-rail";
 import { TitleBar } from "@/components/title-bar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
-import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
 import { VaultCreateDialogProvider } from "@/contexts/vault-create-dialog-context";
 import {
   DocumentCreateDialogProvider,
@@ -296,7 +295,6 @@ export function VaultShell() {
     : "calc(100vw - 10rem)";
 
   return (
-    <ResourceNavigationProvider>
     <VaultCreateDialogProvider openCreateVault={openCreateVault}>
       <DocumentCreateDialogProvider openCreateDocument={openCreateDocument}>
         <VaultRefreshProvider
@@ -473,6 +471,5 @@ export function VaultShell() {
         </VaultRefreshProvider>
       </DocumentCreateDialogProvider>
     </VaultCreateDialogProvider>
-    </ResourceNavigationProvider>
   );
 }

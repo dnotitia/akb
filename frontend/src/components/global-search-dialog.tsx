@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { matchRoutes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
   Clock3,
@@ -23,9 +23,12 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SearchVaultPicker } from "@/components/search-vault-picker";
+import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
 import { useCurrentUser } from "@/contexts/current-user-context";
+import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import {
   clearRecentSearches,
   readRecentSearches,
@@ -82,6 +85,11 @@ const SUGGESTIONS = [
   "onboarding checklist",
 ] as const;
 
+function matchesSearchScope(search: RecentSearch, vault?: string) {
+  return search.surface === "global"
+    && (vault ? search.vaults.length === 1 && search.vaults[0] === vault : search.vaults.length === 0);
+}
+
 function resultHref(result: GlobalSearchResult): string {
   const source = result.source_type || "document";
   if (source === "table") {
@@ -94,12 +102,30 @@ function resultHref(result: GlobalSearchResult): string {
   return `/vault/${result.vault}/doc/${encodeURIComponent(parsed?.id ?? result.path)}`;
 }
 
+/** One stable entry point; named Vault routes supply the initial search scope. */
 export function GlobalSearchDialog() {
+  const currentUser = useCurrentUser();
+  const { pathname } = useLocation();
+  const match = matchRoutes([...appRouteContract], pathname)?.at(-1);
+  const vault = match?.route.boundary === "vault-shell" ? match.params.name : undefined;
+  return <KnowledgeSearchDialog key={JSON.stringify([currentUser?.user_id, vault])} contextVault={vault} />;
+}
+
+function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const currentUser = useCurrentUser();
   const currentUserId = currentUser?.user_id;
   const navigate = useNavigate();
   const location = useLocation();
+  const { requestNavigation } = useResourceNavigation();
+  const [vault, setVault] = useState<string | undefined>(contextVault);
+  const [availableVaults, setAvailableVaults] = useState<string[] | null>(null);
+  const [vaultsError, setVaultsError] = useState(false);
+  const [vaultsRetry, setVaultsRetry] = useState(0);
+  const id = "global";
+  const triggerId = `${id}-search-trigger`;
+  const scopeLabel = vault ? `Search in ${vault}` : "Search all accessible vaults";
   const inputRef = useRef<HTMLInputElement>(null);
+  const resultsScrollRef = useRef<HTMLDivElement>(null);
   const requestId = useRef(0);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -124,6 +150,37 @@ export function GlobalSearchDialog() {
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
 
+  function changeScope(next?: string) {
+    if (vault === next) return;
+    // Invalidate immediately: an old response must never be actionable under a
+    // newly selected scope, including before the request effect is re-run.
+    ++requestId.current;
+    setVault(next);
+    setResults([]);
+    setError(null);
+    setActiveIndex(-1);
+    setLoading(Boolean(normalizedQuery));
+    setRecentSearches([]);
+    setRecentDocuments([]);
+    if (resultsScrollRef.current) resultsScrollRef.current.scrollTop = 0;
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setAvailableVaults(null);
+    setVaultsError(false);
+    void listVaults().then(response => {
+      if (cancelled) return;
+      setAvailableVaults([...new Set((response.vaults || [])
+        .map((item: { name?: unknown }) => item.name)
+        .filter((name): name is string => typeof name === "string" && name.length > 0))]);
+    }).catch(() => {
+      if (!cancelled) setVaultsError(true);
+    });
+    return () => { cancelled = true; };
+  }, [open, vaultsRetry]);
+
   useEffect(() => {
     if (!open || !currentUserId) {
       if (!currentUserId) {
@@ -132,38 +189,16 @@ export function GlobalSearchDialog() {
       }
       return;
     }
-    let cancelled = false;
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter((search) => search.surface === "global")
+        .filter(search => matchesSearchScope(search, vault))
         .slice(0, 6),
     );
-    const storedDocuments = readRecentDocumentViews(currentUserId, 8);
-    setRecentDocuments([]);
-    if (storedDocuments.length === 0) {
-      return () => {
-        cancelled = true;
-      };
-    }
-    void listVaults()
-      .then((response) => {
-        if (cancelled) return;
-        const accessibleVaults = new Set(
-          (response.vaults || []).map((vault) => String(vault.name)),
-        );
-        setRecentDocuments(
-          storedDocuments
-            .filter((document) => accessibleVaults.has(document.vault))
-            .slice(0, 4),
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setRecentDocuments([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [currentUserId, open]);
+    const accessible = new Set(availableVaults || []);
+    setRecentDocuments(readRecentDocumentViews(currentUserId)
+      .filter(document => (!vault || document.vault === vault) && accessible.has(document.vault))
+      .slice(0, 4));
+  }, [currentUserId, open, vault, availableVaults]);
 
   useEffect(() => {
     const currentRequest = ++requestId.current;
@@ -180,7 +215,7 @@ export function GlobalSearchDialog() {
     setActiveIndex(-1);
     setLoading(true);
     const timer = window.setTimeout(() => {
-      void searchDocs(normalizedQuery, [], 12, { source_type: activeSource === "all" ? undefined : activeSource })
+      void searchDocs(normalizedQuery, vault ? [vault] : [], 12, { source_type: activeSource === "all" ? undefined : activeSource })
         .then((response) => {
           if (currentRequest !== requestId.current) return;
           const nextResults = (response.results || []) as GlobalSearchResult[];
@@ -199,20 +234,20 @@ export function GlobalSearchDialog() {
         });
     }, 220);
 
-    return () => window.clearTimeout(timer);
-  }, [normalizedQuery, open, retryKey, activeSource]);
+    return () => { window.clearTimeout(timer); ++requestId.current; };
+  }, [normalizedQuery, open, retryKey, activeSource, vault]);
 
   function rememberGlobalSearch() {
     if (!currentUserId || !normalizedQuery) return;
     recordRecentSearch(currentUserId, {
       query: normalizedQuery,
       mode: "semantic",
-      vaults: [],
+      vaults: vault ? [vault] : [],
       surface: "global",
     });
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter((search) => search.surface === "global")
+        .filter(search => matchesSearchScope(search, vault))
         .slice(0, 6),
     );
   }
@@ -220,35 +255,48 @@ export function GlobalSearchDialog() {
   function openResult(result: GlobalSearchResult) {
     rememberGlobalSearch();
     setOpen(false);
+    const href = resultHref(result);
     const source = result.source_type || "document";
-    navigate(resultHref(result), {
+    const options = {
       state:
         source === "document"
-          ? documentPreviewState(location, "global-search-trigger")
+          ? documentPreviewState(location, triggerId)
           : undefined,
-    });
+    };
+    if (requestNavigation(href, options)) navigate(href, options);
   }
 
   function openRecentDocument(document: RecentDocumentView) {
     setOpen(false);
-    navigate(
-      `/vault/${encodeURIComponent(document.vault)}/doc/${encodeURIComponent(document.path)}`,
-      { state: documentPreviewState(location, "global-search-trigger") },
-    );
+    const href = `/vault/${encodeURIComponent(document.vault)}/doc/${encodeURIComponent(document.path)}`;
+    const options = { state: documentPreviewState(location, triggerId) };
+    if (requestNavigation(href, options)) navigate(href, options);
+  }
+
+  function selectResultWithKeyboard(index: number) {
+    setActiveIndex(index);
+    const container = resultsScrollRef.current;
+    const option = document.getElementById(`${id}-search-result-${index}`);
+    if (!container || !option) return;
+    // Scroll only the result ledger, never the launching workspace or dialog.
+    const viewport = container.getBoundingClientRect();
+    const bounds = option.getBoundingClientRect();
+    if (bounds.top < viewport.top) container.scrollTop += bounds.top - viewport.top;
+    else if (bounds.bottom > viewport.bottom) {
+      container.scrollTop += Math.min(bounds.bottom - viewport.bottom, bounds.top - viewport.top);
+    }
   }
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.nativeEvent.isComposing || visibleResults.length === 0) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      setActiveIndex((current) => (current + 1) % visibleResults.length);
+      selectResultWithKeyboard((activeIndex + 1) % visibleResults.length);
       return;
     }
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      setActiveIndex((current) =>
-        current <= 0 ? visibleResults.length - 1 : current - 1,
-      );
+      selectResultWithKeyboard(activeIndex <= 0 ? visibleResults.length - 1 : activeIndex - 1);
       return;
     }
     if (event.key === "Enter" && activeIndex >= 0) {
@@ -266,52 +314,62 @@ export function GlobalSearchDialog() {
         : "";
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={next => {
+      if (next) {
+        changeScope(contextVault);
+        setAvailableVaults(null);
+        setVaultsError(false);
+      }
+      setOpen(next);
+    }}>
       <DialogTrigger asChild>
         <button
-          id="global-search-trigger"
+          id={triggerId}
           type="button"
-          aria-label="Search all vaults"
-          title="Search all vaults you can access"
+          aria-label="Search knowledge"
+          title="Search documents, tables, and files"
           className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-border-strong bg-surface text-left text-sm text-foreground-muted transition-token hover:border-primary hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-64 sm:min-w-9 sm:shrink sm:justify-start sm:px-3 lg:shrink-0"
         >
           <Search className="h-4 w-4 shrink-0" aria-hidden />
-          <span className="hidden truncate sm:inline">Search all vaults…</span>
+          <span className="hidden truncate sm:inline">Search knowledge…</span>
         </button>
       </DialogTrigger>
 
       <DialogContent
         hideClose
-        data-testid="global-search-dialog"
-        className="top-16 max-h-[calc(100dvh-5rem)] w-[calc(100%-1rem)] max-w-[96rem] -translate-y-0 gap-0 overflow-hidden rounded-[var(--radius-lg)] border-border-strong p-0 shadow-xl sm:w-[calc(100%-2rem)]"
+        data-testid={`${id}-search-dialog`}
+        className="top-16 flex max-h-[calc(100dvh-5rem)] w-[calc(100%-1rem)] max-w-[96rem] -translate-y-0 flex-col gap-0 overflow-hidden rounded-[var(--radius-lg)] border-border-strong p-0 shadow-xl sm:w-[calc(100%-2rem)]"
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           inputRef.current?.focus();
         }}
       >
-        <DialogTitle className="sr-only">Search knowledge</DialogTitle>
+        <DialogTitle className="sr-only">{vault ? scopeLabel : "Search knowledge"}</DialogTitle>
         <DialogDescription className="sr-only">
-          Search documents, tables, and files across every accessible vault.
+          {vault ? `Search documents, tables, and files in ${vault}.` : "Search documents, tables, and files across every accessible vault."}
         </DialogDescription>
 
-        <div className="flex items-center gap-2 border-b border-border-strong bg-surface p-2.5 sm:p-3">
-          <div className="flex h-10 min-w-0 flex-1 items-center gap-2.5 rounded-[var(--radius-md)] border border-border-strong bg-background px-3 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring">
+        <div className="flex shrink-0 items-start gap-2 border-b border-border-strong bg-surface p-2.5 sm:items-center sm:p-3">
+          <div className="flex min-w-0 flex-1 flex-col items-start gap-1 rounded-[var(--radius-md)] border border-border-strong bg-background p-1.5 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring sm:flex-row sm:items-center sm:gap-2.5">
+            <SearchVaultPicker value={vault} contextVault={contextVault} vaults={availableVaults}
+              error={vaultsError} onRetry={() => setVaultsRetry(key => key + 1)} onChange={changeScope} />
+            <div className="flex h-9 w-full min-w-0 flex-1 items-center gap-2.5 px-1.5 sm:w-auto">
             <Search className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
-            <label htmlFor="global-search-input" className="sr-only">
-              Search all accessible vaults
+            <label htmlFor={`${id}-search-input`} className="sr-only">
+              {scopeLabel}
             </label>
             <input
               ref={inputRef}
-              id="global-search-input"
+              id={`${id}-search-input`}
               type="search"
               role="combobox"
               aria-autocomplete="list"
               aria-expanded={visibleResults.length > 0}
               aria-controls={
-                visibleResults.length > 0 ? "global-search-results" : undefined
+                visibleResults.length > 0 ? `${id}-search-results` : undefined
               }
               aria-activedescendant={
-                activeIndex >= 0 && activeIndex < visibleResults.length ? `global-search-result-${activeIndex}` : undefined
+                activeIndex >= 0 && activeIndex < visibleResults.length ? `${id}-search-result-${activeIndex}` : undefined
               }
               autoComplete="off"
               spellCheck={false}
@@ -327,13 +385,14 @@ export function GlobalSearchDialog() {
             {query && !loading && (
               <button
                 type="button"
-                aria-label="Clear global search"
+                aria-label={vault ? "Clear vault search" : "Clear global search"}
                 onClick={() => setQuery("")}
                 className="inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 Clear
               </button>
             )}
+            </div>
           </div>
           <DialogClose asChild>
             <button
@@ -350,13 +409,10 @@ export function GlobalSearchDialog() {
           {resultStatus}
         </p>
 
-        <div className="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
-          <span className="shrink-0 text-xs font-medium text-foreground-muted">
-            Search in
-          </span>
+        <div className="flex min-h-11 shrink-0 items-center border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
           <div
             role="group"
-            aria-label="Limit global search by content kind"
+            aria-label={`Limit ${id} search by content kind`}
             className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5"
           >
             {SOURCE_FILTERS.map(({ key, label, icon: FilterIcon }) => {
@@ -402,12 +458,9 @@ export function GlobalSearchDialog() {
               );
             })}
           </div>
-          <span className="hidden shrink-0 text-xs text-foreground-muted md:block">
-            All accessible vaults
-          </span>
         </div>
 
-        <div className="rail-scroll max-h-[min(34rem,calc(100dvh-10rem))] overflow-y-auto bg-surface">
+        <div ref={resultsScrollRef} className="rail-scroll min-h-0 max-h-[min(34rem,calc(100dvh-10rem))] flex-1 overflow-y-auto bg-surface">
           {!normalizedQuery && (
             <>
               {(hasRecentSearches || hasRecentDocuments) && (
@@ -419,7 +472,7 @@ export function GlobalSearchDialog() {
                 >
                   {hasRecentSearches && (
                     <section
-                      aria-labelledby="global-recent-searches-heading"
+                      aria-labelledby={`${id}-recent-searches-heading`}
                       className={cn(
                         hasRecentDocuments && "lg:border-r lg:border-border",
                       )}
@@ -428,7 +481,7 @@ export function GlobalSearchDialog() {
                     <div className="flex min-w-0 items-center gap-2">
                       <Clock3 className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
                       <h2
-                        id="global-recent-searches-heading"
+                        id={`${id}-recent-searches-heading`}
                         className="text-xs font-semibold text-foreground"
                       >
                         Recent searches
@@ -438,7 +491,7 @@ export function GlobalSearchDialog() {
                       type="button"
                       onClick={() => {
                         if (!currentUserId) return;
-                        clearRecentSearches(currentUserId);
+                        clearRecentSearches(currentUserId, { surface: "global", vaults: vault ? [vault] : [] });
                         setRecentSearches([]);
                       }}
                       className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -446,7 +499,7 @@ export function GlobalSearchDialog() {
                       Clear
                     </button>
                   </div>
-                  <div className="divide-y divide-border" aria-label="Recent global searches">
+                  <div className="divide-y divide-border" aria-label={`Recent ${id} searches`}>
                     {recentSearches.slice(0, 4).map((search) => (
                       <button
                         key={`${search.mode}:${search.query}`}
@@ -470,12 +523,12 @@ export function GlobalSearchDialog() {
                   )}
 
                   {hasRecentDocuments && (
-                    <section aria-labelledby="global-recent-documents-heading">
+                    <section aria-labelledby={`${id}-recent-documents-heading`}>
                   <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
                     <div className="flex min-w-0 items-center gap-2">
                       <FileText className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
                       <h2
-                        id="global-recent-documents-heading"
+                        id={`${id}-recent-documents-heading`}
                         className="text-xs font-semibold text-foreground"
                       >
                         Recently viewed
@@ -517,10 +570,10 @@ export function GlobalSearchDialog() {
                 </div>
               )}
 
-              <section aria-labelledby="global-search-suggestions-heading">
+              <section aria-labelledby={`${id}-search-suggestions-heading`}>
                 <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
                   <h2
-                    id="global-search-suggestions-heading"
+                    id={`${id}-search-suggestions-heading`}
                     className="text-xs font-semibold text-foreground"
                   >
                     Suggested searches
@@ -530,7 +583,7 @@ export function GlobalSearchDialog() {
                   </span>
                 </div>
                 <div
-                  aria-label="Suggested global searches"
+                  aria-label={`Suggested ${id} searches`}
                   className="grid divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0"
                 >
                   {SUGGESTIONS.map((suggestion) => (
@@ -589,17 +642,18 @@ export function GlobalSearchDialog() {
                 No results for “{normalizedQuery}”
               </p>
               <p className="mt-1 text-xs text-foreground-muted">
-                Try fewer words or open advanced search for exact matching.
+                {vault ? `No matches in ${vault}. Try fewer words or expand your search.` : "Try fewer words or continue in the search page for exact matching."}
               </p>
+              {vault && <Button type="button" variant="outline" className="mt-3" onClick={() => { changeScope(undefined); inputRef.current?.focus(); }}>Search all vaults instead</Button>}
               {activeSource !== "all" && <Button type="button" variant="outline" className="mt-3" onClick={() => setActiveSource("all")}>Show all results</Button>}
             </div>
           )}
 
           {visibleResults.length > 0 && !loading && !error && (
-            <section aria-labelledby="global-search-results-heading">
+            <section aria-labelledby={`${id}-search-results-heading`}>
               <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
                 <h2
-                  id="global-search-results-heading"
+                  id={`${id}-search-results-heading`}
                   className="text-xs font-semibold text-foreground"
                 >
                   Top matches
@@ -610,7 +664,7 @@ export function GlobalSearchDialog() {
                     : `${visibleResults.length} of ${results.length}`}
                 </span>
               </div>
-              <ul id="global-search-results" role="listbox" aria-label="Knowledge search results">
+              <ul id={`${id}-search-results`} role="listbox" aria-label="Knowledge search results">
                 {visibleResults.map((result, index) => {
                   const source =
                     result.source_type && result.source_type in SOURCE_META
@@ -625,7 +679,7 @@ export function GlobalSearchDialog() {
                     <li key={result.uri} role="presentation">
                       <button
                         type="button"
-                        id={`global-search-result-${index}`}
+                        id={`${id}-search-result-${index}`}
                         role="option"
                         aria-selected={index === activeIndex}
                         tabIndex={-1}
@@ -677,8 +731,8 @@ export function GlobalSearchDialog() {
           )}
         </div>
 
-        <div className="flex min-h-11 items-center justify-between gap-3 border-t border-border bg-surface-2/60 px-3 py-2 sm:px-4">
-          <span className="text-xs text-foreground-muted">Semantic search · All vaults</span>
+        <div className="flex min-h-11 shrink-0 items-center justify-between gap-3 border-t border-border bg-surface-2/60 px-3 py-2 sm:px-4">
+          <span className="min-w-0 truncate text-xs text-foreground-muted">Select a result to open it</span>
           <button
             type="button"
             onClick={() => {
@@ -687,11 +741,12 @@ export function GlobalSearchDialog() {
               const params = new URLSearchParams();
               if (normalizedQuery) params.set("q", normalizedQuery);
               if (activeSource !== "all") params.set("source", activeSource);
-              navigate(`/search?${params}`);
+              const href = `${vault ? `/vault/${encodeURIComponent(vault)}/search` : "/search"}?${params}`;
+              if (requestNavigation(href)) navigate(href);
             }}
-            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            Advanced search
+            Continue in search page
             <ArrowRight className="h-3.5 w-3.5" aria-hidden />
           </button>
         </div>

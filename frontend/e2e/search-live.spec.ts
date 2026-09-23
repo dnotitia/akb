@@ -68,7 +68,7 @@ test("real login, search filters, reload and exact-search options", async ({
     await expect(
       page.getByText("Live archived report", { exact: true }),
     ).toHaveCount(0);
-    await page.getByRole("button", { name: "Filter by document type" }).click();
+    await page.getByRole("button", { name: "More filters" }).click();
     await page.getByRole("button", { name: "Toggle report" }).click();
     await expect(
       page.getByText("Live active report", { exact: true }),
@@ -88,7 +88,7 @@ test("real login, search filters, reload and exact-search options", async ({
     await expect(
       page.getByText("Live active report", { exact: true }),
     ).toHaveCount(0);
-    await page.getByRole("button", { name: "Filter by document type" }).click();
+    await page.getByRole("button", { name: "More filters" }).click();
     await page.getByLabel("Regular expression").click();
     await expect(
       page.getByText("Live active report", { exact: true }),

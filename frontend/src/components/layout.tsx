@@ -1,4 +1,4 @@
-import { Link, Outlet, Navigate, useLocation } from "react-router-dom";
+import { Link, Outlet, Navigate, matchPath, useLocation } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Boxes, House, PanelLeftOpen, PanelLeftClose, type LucideIcon } from "lucide-react";
@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import type { VaultNavigationControl } from "@/components/vault-shell";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { ResourceLocationProvider } from "@/contexts/resource-location-context";
+import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
 import { SearchStatusProvider } from "@/hooks/use-search-status";
 import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -153,11 +154,12 @@ export function Layout() {
   }, [activeFingerprint, activeUser, queryClient]);
 
   const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
-  const isSearchWorkspace = location.pathname === "/search";
+  const isSearchWorkspace = Boolean(matchPath("/search", location.pathname));
+  const isSearchRoute = isSearchWorkspace || Boolean(matchPath("/vault/:name/search", location.pathname));
   const isSettingsWorkspace = location.pathname === "/settings";
   const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
   const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
-  const surface: AppSurface = location.pathname === "/" ? "paper" : "workspace";
+  const surface: AppSurface = location.pathname === "/" || isSearchRoute ? "paper" : "workspace";
 
   useLayoutEffect(() => {
     const search = searchControlsRef.current;
@@ -219,6 +221,7 @@ export function Layout() {
     <SearchStatusProvider identity={activeFingerprint!} enabled={!revalidating}>
     <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
     <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
+    <ResourceNavigationProvider>
     <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
         <InlineLoadingState
@@ -264,8 +267,8 @@ export function Layout() {
             <AppPageLocation isAdmin={session.user.is_admin} />
             <div ref={searchControlsRef} className="ml-auto flex min-w-0 flex-1 items-center gap-2 lg:flex-none lg:pl-3">
               <HeaderIndexingStatus />
-              {/* This is a real global-search surface, not a shortcut to /search.
-                  Advanced mode and vault/type filters remain on the full page. */}
+              {/* Quick search stays available on every route. The full Search
+                  page owns its separate, URL-backed query below this header. */}
               <CurrentUserProvider user={session.user}>
                 <GlobalSearchDialog />
               </CurrentUserProvider>
@@ -360,6 +363,7 @@ export function Layout() {
         </div>
       </div>
     </div>
+    </ResourceNavigationProvider>
     </ResourceLocationProvider>
     </CurrentUserProvider>
     </SearchStatusProvider>

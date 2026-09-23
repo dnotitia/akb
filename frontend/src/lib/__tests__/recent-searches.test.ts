@@ -62,4 +62,12 @@ describe("recent search history", () => {
     expect(readRecentSearches("user-a")).toEqual([]);
     expect(readRecentSearches("user-b")).toHaveLength(1);
   });
+
+  it("clears only the selected surface and Vault scope", () => {
+    recordRecentSearch("user-a", { query: "all vaults", mode: "semantic", surface: "global" });
+    recordRecentSearch("user-a", { query: "alpha quick", mode: "semantic", surface: "global", vaults: ["alpha"] });
+    recordRecentSearch("user-a", { query: "alpha advanced", mode: "literal", surface: "advanced", vaults: ["alpha"] });
+    clearRecentSearches("user-a", { surface: "global", vaults: ["alpha"] });
+    expect(readRecentSearches("user-a").map(item => item.query).sort()).toEqual(["all vaults", "alpha advanced"]);
+  });
 });

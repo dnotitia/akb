@@ -8,6 +8,7 @@ import {
   useNavigate,
   useParams,
   useSearchParams,
+  type NavigateOptions,
 } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -182,7 +183,7 @@ function DocumentPageContent({
   const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [pendingView, setPendingView] = useState<DocView | null>(null);
-  const [pendingNavigation, setPendingNavigation] = useState<string | null>(null);
+  const [pendingNavigation, setPendingNavigation] = useState<{ href: string; options?: NavigateOptions } | null>(null);
   const navigationFocusRef = useRef<HTMLElement | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
   const [override, setOverride] = useState<{ scope: string; value: any } | null>(null);
@@ -266,8 +267,8 @@ function DocumentPageContent({
   const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
   const isDirty = contentChanged || titleChanged;
   const hasUnsavedWork = isDirty || uploadingImage || unclaimedAssetIds.length > 0;
-  const confirmResourceNavigation = useCallback((href: string) => {
-    setPendingNavigation(href);
+  const confirmResourceNavigation = useCallback((href: string, options?: NavigateOptions) => {
+    setPendingNavigation({ href, options });
     return false;
   }, []);
   useResourceNavigationGuard(
@@ -1291,7 +1292,7 @@ function DocumentPageContent({
         setPendingNavigation(null);
         // The existing unmount handler attempts draft persistence. Leaving is
         // not a discard: do not clear local drafts or delete uploaded assets.
-        if (destination) navigate(destination);
+        if (destination) navigate(destination.href, destination.options);
       }}
     />
   );
