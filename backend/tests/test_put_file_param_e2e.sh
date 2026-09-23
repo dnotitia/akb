@@ -114,16 +114,18 @@ for t in d["result"]["tools"]:
 ' 2>/dev/null)
 [ "$UPDATE_HAS_FILE" = "True" ] && pass "akb_update has file param" || fail "akb_update schema" "file param missing"
 
-# Check akb_search does NOT have file param (control)
+# Check akb_discover/search does NOT have file param (control)
 SEARCH_HAS_FILE=$(echo "$TOOLS" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 for t in d["result"]["tools"]:
-    if t["name"] == "akb_search":
-        print("file" in t["inputSchema"].get("properties",{}))
+    if t["name"] == "akb_discover":
+        branches = t["inputSchema"].get("oneOf", [])
+        search = next((b for b in branches if b.get("properties", {}).get("action", {}).get("const") == "search"), {})
+        print("file" in search.get("properties", {}))
         break
 ' 2>/dev/null)
-[ "$SEARCH_HAS_FILE" = "False" ] && pass "akb_search has no file param (control)" || fail "akb_search schema" "unexpected file param"
+[ "$SEARCH_HAS_FILE" = "False" ] && pass "akb_discover/search has no file param (control)" || fail "akb_discover/search schema" "unexpected file param"
 
 # ── 3. Create vault ──────────────────────────────────────────
 echo ""
@@ -158,7 +160,7 @@ DOC_URI=$(tool_result "$PUT_RESP" | python3 -c 'import sys,json; print(json.load
 [ -n "$DOC_URI" ] && pass "akb_put with file: uri=$DOC_URI" || fail "akb_put file" "no uri — $(tool_result "$PUT_RESP")"
 
 # Verify content matches
-GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
+GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_document_read\",\"arguments\":{\"action\":\"get\",\"uri\":\"$DOC_URI\"}}")
 GOT_TITLE=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
 GOT_CONTENT=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content","")[:50])' 2>/dev/null)
 [ "$GOT_TITLE" = "File Param Test" ] && pass "Title matches" || fail "Title" "expected 'File Param Test', got '$GOT_TITLE'"
@@ -184,7 +186,7 @@ UPDATE_COMMIT=$(tool_result "$UPDATE_RESP" | python3 -c 'import sys,json; print(
 [ -n "$UPDATE_COMMIT" ] && pass "akb_update with file: commit=$UPDATE_COMMIT" || fail "akb_update file" "no commit — $(tool_result "$UPDATE_RESP")"
 
 # Verify updated content
-GET_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
+GET_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_document_read\",\"arguments\":{\"action\":\"get\",\"uri\":\"$DOC_URI\"}}")
 GOT_CONTENT2=$(tool_result "$GET_RESP2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content","")[:60])' 2>/dev/null)
 echo "$GOT_CONTENT2" | grep -q "Updated Document from File" && pass "Updated content from file verified" || fail "Update content" "mismatch: $GOT_CONTENT2"
 

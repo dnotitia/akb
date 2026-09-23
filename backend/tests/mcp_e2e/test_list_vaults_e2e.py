@@ -14,7 +14,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSI
 from .runtime import RuntimeContext, redact_error
 
 
-SCENARIO = "akb_list_vaults"
+SCENARIO = "akb_discover/list_vaults"
 SUPPORTED_PROTOCOLS = set(HANDSHAKE_PROTOCOL_VERSIONS) | set(MODERN_PROTOCOL_VERSIONS)
 
 
@@ -33,22 +33,31 @@ def _assert_connection(
 
 
 def _assert_tool_catalog(tools: mcp_types.ListToolsResult) -> None:
-    list_vaults = next((tool for tool in tools.tools if tool.name == "akb_list_vaults"), None)
-    if list_vaults is None or not isinstance(list_vaults.input_schema, Mapping):
-        _fail("tools/list", "akb_list_vaults is missing from the typed tool catalog")
+    discover = next((tool for tool in tools.tools if tool.name == "akb_discover"), None)
+    if discover is None or not isinstance(discover.input_schema, Mapping):
+        _fail("tools/list", "akb_discover is missing from the typed tool catalog")
+    branches = discover.input_schema.get("oneOf")
+    if not isinstance(branches, list) or not any(
+        isinstance(branch, Mapping)
+        and isinstance(branch.get("properties"), Mapping)
+        and isinstance(branch["properties"].get("action"), Mapping)
+        and branch["properties"]["action"].get("const") == "list_vaults"
+        for branch in branches
+    ):
+        _fail("tools/list", "akb_discover/list_vaults is missing from the typed tool catalog")
 
 
 def _list_vaults_payload(result: mcp_types.CallToolResult) -> Mapping[str, object]:
     if result.is_error is not False:
-        _fail("tools/call akb_list_vaults", "tool returned an error")
+        _fail("tools/call akb_discover/list_vaults", "tool returned an error")
     if not result.content or not isinstance(result.content[0], mcp_types.TextContent):
-        _fail("tools/call akb_list_vaults", "tool returned no public JSON text")
+        _fail("tools/call akb_discover/list_vaults", "tool returned no public JSON text")
     try:
         public = json.loads(result.content[0].text)
     except (TypeError, ValueError):
-        _fail("tools/call akb_list_vaults", "tool returned invalid public JSON")
+        _fail("tools/call akb_discover/list_vaults", "tool returned invalid public JSON")
     if not isinstance(public, Mapping):
-        _fail("tools/call akb_list_vaults", "public result is not an object")
+        _fail("tools/call akb_discover/list_vaults", "public result is not an object")
     return public
 
 
@@ -57,13 +66,13 @@ def _assert_list_vaults_shape(public: Mapping[str, object]) -> None:
     total = public.get("total")
     returned = public.get("returned")
     if not isinstance(vaults, list):
-        _fail("tools/call akb_list_vaults", "vaults is not an array")
+        _fail("tools/call akb_discover/list_vaults", "vaults is not an array")
     if type(total) is not int or type(returned) is not int:
-        _fail("tools/call akb_list_vaults", "total and returned must be integers")
+        _fail("tools/call akb_discover/list_vaults", "total and returned must be integers")
     if returned != len(vaults):
-        _fail("tools/call akb_list_vaults", "returned does not match vaults length")
+        _fail("tools/call akb_discover/list_vaults", "returned does not match vaults length")
     if total < returned:
-        _fail("tools/call akb_list_vaults", "total is smaller than returned")
+        _fail("tools/call akb_discover/list_vaults", "total is smaller than returned")
 
 
 async def test_akb_list_vaults_mcp_e2e(
@@ -79,7 +88,9 @@ async def test_akb_list_vaults_mcp_e2e(
     _assert_tool_catalog(tools)
 
     try:
-        result = await mcp_client.call_tool("akb_list_vaults", {})
+        result = await mcp_client.call_tool(
+            "akb_discover", {"action": "list_vaults"}
+        )
     except Exception as exc:
-        _fail("tools/call akb_list_vaults", redact_error(exc, runtime_session.secrets))
+        _fail("tools/call akb_discover/list_vaults", redact_error(exc, runtime_session.secrets))
     _assert_list_vaults_shape(_list_vaults_payload(result))

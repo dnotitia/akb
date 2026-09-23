@@ -128,7 +128,12 @@ async def test_documents_browse_search_and_versioned_reads(
     linked_uri = linked["uri"]
     assert isinstance(linked_uri, str)
 
-    fetched = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": doc_uri})
+    fetched = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": doc_uri},
+    )
     assert fetched.get("title") == "MCP Created Spec"
 
     updated = await _call_json(
@@ -139,21 +144,36 @@ async def test_documents_browse_search_and_versioned_reads(
     )
     assert isinstance(updated.get("commit_hash"), str)
 
-    root = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    root = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "browse", "vault": vault},
+    )
     assert len(root.get("items", [])) >= 2
     specs = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_browse",
-        {"vault": vault, "collection": "specs"},
+        "akb_discover",
+        {"action": "browse", "vault": vault, "collection": "specs"},
     )
     assert len(specs.get("items", [])) >= 1
 
-    search = await _call_json(mcp_client, runtime_session, "akb_search", {"query": "API spec endpoint"})
+    search = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "search", "query": "API spec endpoint"},
+    )
     assert type(search.get("total")) is int
     assert search["total"] >= 0
 
-    drilled = await _call_json(mcp_client, runtime_session, "akb_drill_down", {"uri": doc_uri})
+    drilled = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "section", "uri": doc_uri},
+    )
     sections = drilled.get("sections")
     assert isinstance(sections, list) and sections
     assert not any(
@@ -161,7 +181,12 @@ async def test_documents_browse_search_and_versioned_reads(
         for section in sections
     )
 
-    trailing = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": f"{doc_uri}/"})
+    trailing = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": f"{doc_uri}/"},
+    )
     assert trailing.get("path") == "specs/mcp-created-spec.md"
 
     first_collision = await _call_json(
@@ -179,8 +204,18 @@ async def test_documents_browse_search_and_versioned_reads(
     first_uri = first_collision["uri"]
     second_uri = second_collision["uri"]
     assert first_uri != second_uri
-    first_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": first_uri})
-    second_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": second_uri})
+    first_body = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": first_uri},
+    )
+    second_body = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": second_uri},
+    )
     assert "BODY_FIRST" in first_body["content"] and "BODY_SECOND" not in first_body["content"]
     assert "BODY_SECOND" in second_body["content"] and "BODY_FIRST" not in second_body["content"]
 
@@ -199,8 +234,8 @@ async def test_documents_browse_search_and_versioned_reads(
     exact = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_get",
-        {"uri": f"akb://{vault}/doc/specs/api.md"},
+        "akb_document_read",
+        {"action": "get", "uri": f"akb://{vault}/doc/specs/api.md"},
     )
     assert "FIRST_ONLY_TAG" in exact["content"]
     assert "SECOND_ONLY_TAG" not in exact["content"]
@@ -208,8 +243,8 @@ async def test_documents_browse_search_and_versioned_reads(
     history = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_history",
-        {"uri": doc_uri},
+        "akb_document_read",
+        {"action": "history", "uri": doc_uri},
     )
     versions = history.get("history")
     assert isinstance(versions, list) and len(versions) >= 2
@@ -218,8 +253,8 @@ async def test_documents_browse_search_and_versioned_reads(
     historical = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_get",
-        {"uri": doc_uri, "version": version},
+        "akb_document_read",
+        {"action": "get", "uri": doc_uri, "version": version},
     )
     assert not str(historical.get("content", "")).lstrip().startswith("---")
 
@@ -246,8 +281,22 @@ async def test_document_move_preserves_aliases_and_collision_rules(
     new_uri = moved["uri"]
     assert new_uri != old_uri
     assert moved.get("action") == "moved"
-    assert "MOVE_BODY_TAG" in (await _call_json(mcp_client, runtime_session, "akb_get", {"uri": new_uri}))["content"]
-    assert "MOVE_BODY_TAG" in (await _call_json(mcp_client, runtime_session, "akb_get", {"uri": old_uri}))["content"]
+    assert "MOVE_BODY_TAG" in (
+        await _call_json(
+            mcp_client,
+            runtime_session,
+            "akb_document_read",
+            {"action": "get", "uri": new_uri},
+        )
+    )["content"]
+    assert "MOVE_BODY_TAG" in (
+        await _call_json(
+            mcp_client,
+            runtime_session,
+            "akb_document_read",
+            {"action": "get", "uri": old_uri},
+        )
+    )["content"]
 
     moved_again = await _call_json(
         mcp_client,
@@ -257,8 +306,22 @@ async def test_document_move_preserves_aliases_and_collision_rules(
     )
     archive_uri = moved_again["uri"]
     assert "/archive/" in archive_uri
-    assert "MOVE_BODY_TAG" in (await _call_json(mcp_client, runtime_session, "akb_get", {"uri": old_uri}))["content"]
-    assert "MOVE_BODY_TAG" in (await _call_json(mcp_client, runtime_session, "akb_get", {"uri": new_uri}))["content"]
+    assert "MOVE_BODY_TAG" in (
+        await _call_json(
+            mcp_client,
+            runtime_session,
+            "akb_document_read",
+            {"action": "get", "uri": old_uri},
+        )
+    )["content"]
+    assert "MOVE_BODY_TAG" in (
+        await _call_json(
+            mcp_client,
+            runtime_session,
+            "akb_document_read",
+            {"action": "get", "uri": new_uri},
+        )
+    )["content"]
 
     no_op = await _call_json(mcp_client, runtime_session, "akb_move", {"uri": archive_uri}, expect_error=True)
     assert no_op.get("code") == "invalid_argument"
@@ -282,8 +345,18 @@ async def test_document_move_preserves_aliases_and_collision_rules(
         {"uri": twin_b["uri"], "collection": "dups"},
     )
     assert twin_b_moved["uri"] != twin_a["uri"]
-    twin_a_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": twin_a["uri"]})
-    twin_b_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": twin_b_moved["uri"]})
+    twin_a_body = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": twin_a["uri"]},
+    )
+    twin_b_body = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": twin_b_moved["uri"]},
+    )
     assert "TWIN_A" in twin_a_body["content"] and "TWIN_B" not in twin_a_body["content"]
     assert "TWIN_B" in twin_b_body["content"] and "TWIN_A" not in twin_b_body["content"]
 
@@ -306,7 +379,12 @@ async def test_document_move_preserves_aliases_and_collision_rules(
         "akb_put",
         {"vault": vault, "collection": "reuse", "title": "Recycle", "content": "NEW_DOC"},
     )
-    reused = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": recycled_old})
+    reused = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": recycled_old},
+    )
     assert "NEW_DOC" in reused["content"] and "ORIG_DOC" not in reused["content"]
 
     await _call_json(
@@ -397,12 +475,17 @@ async def test_relations_activity_provenance_and_document_deletion(
     provenance = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_provenance",
-        {"uri": second["uri"]},
+        "akb_document_read",
+        {"action": "provenance", "uri": second["uri"]},
     )
     assert provenance.get("title")
 
-    activity = await _call_json(mcp_client, runtime_session, "akb_activity", {"vault": vault})
+    activity = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "activity", "vault": vault},
+    )
     assert type(activity.get("returned")) is int and activity["returned"] >= 2
     assert activity["activity"] and activity["activity"][0].get("files")
     first_hash = activity["activity"][0].get("hash")
@@ -410,8 +493,8 @@ async def test_relations_activity_provenance_and_document_deletion(
     diff = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_diff",
-        {"uri": first["uri"], "commit": first_hash},
+        "akb_document_read",
+        {"action": "diff", "uri": first["uri"], "commit": first_hash},
     )
     assert diff.get("type")
 
@@ -423,14 +506,25 @@ async def test_relations_activity_provenance_and_document_deletion(
         {"query": username},
     )
     assert len(users.get("users", [])) >= 1
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     assert info.get("owner")
     members = await _call_json(mcp_client, runtime_session, "akb_vault_members", {"vault": vault})
     assert len(members.get("members", [])) >= 1
 
     deleted = await _call_json(mcp_client, runtime_session, "akb_delete", {"uri": first["uri"]})
     assert deleted.get("deleted") is True
-    missing = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": first["uri"]}, expect_error=True)
+    missing = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_document_read",
+        {"action": "get", "uri": first["uri"]},
+        expect_error=True,
+    )
     assert missing.get("code") == "not_found"
 
 async def test_tables_sql_and_ddl(
@@ -486,7 +580,12 @@ async def test_tables_sql_and_ddl(
     )
     assert str(aggregate.get("items", [{}])[0].get("total_qty")) == "150"
 
-    info = await _call_json(mcp_client, runtime_session, "akb_vault_info", {"vault": vault})
+    info = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_discover",
+        {"action": "vault_info", "vault": vault},
+    )
     tables = info.get("tables") or []
     table_info = next(item for item in tables if item.get("name") == "mcp_items")
     assert any(column.get("name") == "product" for column in table_info.get("columns", []))
@@ -513,8 +612,8 @@ async def test_tables_sql_and_ddl(
     browsed_tables = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_browse",
-        {"vault": vault, "content_type": "tables"},
+        "akb_discover",
+        {"action": "browse", "vault": vault, "content_type": "tables"},
     )
     table_items = [item for item in browsed_tables.get("items", []) if item.get("type") == "table"]
     assert table_items
@@ -540,8 +639,8 @@ async def test_tables_sql_and_ddl(
     remaining = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_browse",
-        {"vault": vault, "content_type": "tables"},
+        "akb_discover",
+        {"action": "browse", "vault": vault, "content_type": "tables"},
     )
     assert not [item for item in remaining.get("items", []) if item.get("type") == "table"]
 
@@ -624,8 +723,8 @@ async def test_publication_help_and_vault_lifecycle(
     gone = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_browse",
-        {"vault": lifecycle_vault},
+        "akb_discover",
+        {"action": "browse", "vault": lifecycle_vault},
         expect_error=True,
     )
     assert gone.get("code") == "not_found"
@@ -642,8 +741,8 @@ async def test_access_roles_and_public_levels(
     no_access = await _call_json(
         second,
         runtime_session,
-        "akb_browse",
-        {"vault": vault},
+        "akb_discover",
+        {"action": "browse", "vault": vault},
         expect_error=True,
     )
     assert no_access.get("code")
@@ -655,13 +754,18 @@ async def test_access_roles_and_public_levels(
         {"vault": vault, "user": secondary_mcp_client.username, "role": "reader"},
     )
     assert granted_reader.get("granted") is True
-    readable = await _call_json(second, runtime_session, "akb_browse", {"vault": vault})
+    readable = await _call_json(
+        second,
+        runtime_session,
+        "akb_discover",
+        {"action": "browse", "vault": vault},
+    )
     assert "items" in readable
     searchable = await _call_json(
         second,
         runtime_session,
-        "akb_search",
-        {"query": "test", "vault": vault},
+        "akb_discover",
+        {"action": "search", "query": "test", "vault": vault},
     )
     assert "total" in searchable or "results" in searchable
     reader_write = await _call_json(
@@ -695,12 +799,18 @@ async def test_access_roles_and_public_levels(
         {"vault": vault, "user": secondary_mcp_client.username},
     )
     assert revoked.get("revoked") is True
-    await _call_json(second, runtime_session, "akb_browse", {"vault": vault}, expect_error=True)
     await _call_json(
         second,
         runtime_session,
-        "akb_search",
-        {"query": "test", "vault": vault},
+        "akb_discover",
+        {"action": "browse", "vault": vault},
+        expect_error=True,
+    )
+    await _call_json(
+        second,
+        runtime_session,
+        "akb_discover",
+        {"action": "search", "query": "test", "vault": vault},
         expect_error=True,
     )
 
@@ -733,7 +843,12 @@ async def test_access_roles_and_public_levels(
         {"vault": vault, "collection": "public-test", "title": "Should Fail", "content": "#No"},
         expect_error=True,
     )
-    public_read = await _call_json(second, runtime_session, "akb_browse", {"vault": vault})
+    public_read = await _call_json(
+        second,
+        runtime_session,
+        "akb_discover",
+        {"action": "browse", "vault": vault},
+    )
     assert "items" in public_read
 
     public_none = await _call_json(
@@ -743,4 +858,10 @@ async def test_access_roles_and_public_levels(
         {"vault": vault, "level": "none"},
     )
     assert public_none.get("public_access") == "none"
-    await _call_json(second, runtime_session, "akb_browse", {"vault": vault}, expect_error=True)
+    await _call_json(
+        second,
+        runtime_session,
+        "akb_discover",
+        {"action": "browse", "vault": vault},
+        expect_error=True,
+    )

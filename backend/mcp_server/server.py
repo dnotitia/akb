@@ -74,7 +74,16 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import TOOLS, available_tools
+from mcp_server.operation_registry import (
+    DEFERRED_MUTATION_NAMES,
+    FIRST_SLICE_REPLACED_NAMES,
+    OperationValidationError,
+)
+from mcp_server.tools import (
+    CANDIDATE_REGISTRY,
+    TOOLS,
+    candidate_tools,
+)
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -306,6 +315,8 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_whoami": _READ_SCOPE,
     "akb_list_vaults": _READ_SCOPE,
     "akb_vault_info": _READ_SCOPE,
+    "akb_discover": _READ_SCOPE,
+    "akb_document_read": _READ_SCOPE,
     "akb_vault_members": _READ_SCOPE,
     # A read: it reports the reasons behind a role, and reporting a reason is
     # never authority to change one.
@@ -409,18 +420,19 @@ def _required_scope(name: str, args: dict) -> str:
     `replace=""` IS a rewrite (it deletes every match), so emptiness must
     not be mistaken for absence.
     """
+    if CANDIDATE_REGISTRY.has_tool(name):
+        return CANDIDATE_REGISTRY.required_scope_for(name, args)
     if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
         return _WRITE_SCOPE
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
 
 
-# Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
-# to reject unknown arguments with a fuzzy hint. Built once at import
-# time from the same TOOLS list returned via list_tools, so the
-# "what the agent saw" and "what we accept" can't drift.
+# Schema-derived: {tool_name: set(allowed_arg_names)}. Used by the remaining
+# legacy dispatch path to reject unknown arguments with a fuzzy hint. The
+# candidate path validates through its operation registry instead.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
     t.name: set((t.input_schema or {}).get("properties", {}).keys())
-    for t in TOOLS
+    for t in [*TOOLS, *candidate_tools()]
 }
 
 
@@ -1657,10 +1669,16 @@ async def _handle_set_public(args: dict, uid: str, user: _MCPUser) -> dict:
     return await set_public_access(uid, args["vault"], level)
 
 
+# All first-slice operations are bound only after every legacy handler has
+# registered.  Candidate dispatch below resolves through this binding; the
+# legacy public names are not candidate aliases.
+CANDIDATE_REGISTRY.bind_handlers(_HANDLERS)
+
+
 # ── Tool Handlers ────────────────────────────────────────────
 
 async def list_tools():
-    tools = available_tools()
+    tools = candidate_tools()
     if _vault_skill_preflight_version() != 2:
         return tools
 
@@ -1752,7 +1770,14 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     recorded = False
     try:
         is_write = _required_scope(name, arguments) == _WRITE_SCOPE
-        result: dict | None = None
+        logical_operation = CANDIDATE_REGISTRY.logical_audit_operation_for(
+            name, arguments
+        )
+        result: dict | None = (
+            err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+            if name in FIRST_SLICE_REPLACED_NAMES
+            else None
+        )
 
         # A guide cannot influence a write that has already committed.  For a
         # reader-authorized caller's first write (or the first write after the
@@ -1760,7 +1785,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
         preflight_version = _vault_skill_preflight_version()
-        if is_write and preflight_version is not None:
+        if result is None and is_write and preflight_version is not None:
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service
@@ -1807,7 +1832,13 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # — a stalled audit disk can't freeze the loop or starve bcrypt /
         # document reads.
         audit_log.record_tool(
-            name, arguments, user, result, is_write=is_write, protocol=protocol
+            name,
+            arguments,
+            user,
+            result,
+            is_write=is_write,
+            protocol=protocol,
+            logical_operation=logical_operation,
         )
         # Independent sink: usage analytics go to PG so they can be grouped, and
         # must NOT inherit the audit flags (audit is off by default and
@@ -1888,7 +1919,15 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         if not recorded:
             is_write = _required_scope(name, arguments) == _WRITE_SCOPE
             audit_log.record_tool(
-                name, arguments, user, envelope, is_write=is_write, protocol=protocol
+                name,
+                arguments,
+                user,
+                envelope,
+                is_write=is_write,
+                protocol=protocol,
+                logical_operation=CANDIDATE_REGISTRY.logical_audit_operation_for(
+                    name, arguments
+                ),
             )
             tool_usage.record(
                 name, arguments, user, envelope,
@@ -1941,9 +1980,39 @@ server.add_request_handler("tools/call", CallToolRequestParams, _call_tool_reque
 async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     uid = user.user_id
 
-    handler = _HANDLERS.get(name)
-    if not handler:
-        return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+    candidate_spec = None
+    dispatch_args = args
+    if CANDIDATE_REGISTRY.has_tool(name):
+        try:
+            candidate_spec = CANDIDATE_REGISTRY.validate(name, args)
+        except OperationValidationError as exc:
+            if exc.code == "unknown_argument":
+                return err(str(exc), code=UNKNOWN_ARGUMENT, **exc.details)
+            return err(str(exc), code=INVALID_ARGUMENT, **exc.details)
+        handler = CANDIDATE_REGISTRY.handler_for(candidate_spec)
+        # Legacy handlers remain implementation units only. The public action
+        # discriminator is consumed at the registry boundary.
+        dispatch_args = {key: value for key, value in args.items() if key != "action"}
+        required = candidate_spec.required_scope
+    elif name in FIRST_SLICE_REPLACED_NAMES:
+        # Keep the implementation registry callable for existing internal
+        # unit seams. Public call_tool dispatch rejects this replaced name
+        # before reaching here, so this is not a candidate compatibility alias.
+        handler = _HANDLERS.get(name)
+        if not handler:
+            return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+        required = _required_scope(name, args)
+    else:
+        handler = _HANDLERS.get(name)
+        if not handler:
+            return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+        required = _required_scope(name, args)
+
+    if name in DEFERRED_MUTATION_NAMES and not isinstance(args.get("replace"), str):
+        return err(
+            "akb_grep requires a string 'replace' argument; use akb_discover/grep for read-only search",
+            code=INVALID_ARGUMENT,
+        )
 
     # OAuth scope enforcement — only when the caller's session is
     # authenticated via a Keycloak access token (oauth_scopes is a
@@ -1959,7 +2028,6 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # A test in `test_mcp_oauth_unit` asserts every registered handler
     # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _required_scope(name, args)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -1968,7 +2036,6 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _required_scope(name, args)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(
@@ -1978,12 +2045,22 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=sorted(user.token_scopes),
             )
 
+    # Registry-owned vault RBAC runs before the implementation handler. The
+    # handlers retain their established checks as defense in depth, while a
+    # denied candidate call never enters the protected operation at all.
+    if candidate_spec is not None and candidate_spec.vault_role is not None:
+        for vault in CANDIDATE_REGISTRY.vaults_for(candidate_spec, args):
+            try:
+                await check_vault_access(uid, vault, required_role=candidate_spec.vault_role)
+            except Exception as exc:  # noqa: BLE001 — map the existing guard envelope
+                return exception_envelope(exc)
+
     # Reject unknown arguments before the handler sees them. Without
     # this, a typo like `akb_activity(user=...)` (real name: `author`)
     # would silently fall through `args.get("author")` and quietly
     # disable the filter — agent thinks the filter applied and trusts
     # an unfiltered result.
-    allowed = _TOOL_ARG_NAMES.get(name)
+    allowed = _TOOL_ARG_NAMES.get(name) if candidate_spec is None else None
     if allowed is not None:
         unknown = [k for k in args if k not in allowed]
         if unknown:
@@ -1996,7 +2073,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
             )
 
     try:
-        return await handler(args, uid, user)
+        return await handler(dispatch_args, uid, user)
     except WriteBusyError as e:
         # Write-lane admission timed out (429-class). Precise code +
         # machine-readable backoff so agents retry instead of treating

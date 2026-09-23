@@ -528,11 +528,9 @@ async def test_grep_with_replace_is_refused_for_read_only_pat():
 
 
 @pytest.mark.asyncio
-async def test_grep_without_replace_stays_readable_for_read_only_pat(monkeypatch):
-    """Non-regression: plain grep must remain available to read-only
-    tokens — promoting the whole tool to write-grade would have been the
-    blunt fix and would take literal search away from every read agent."""
-    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
+async def test_discover_grep_stays_readable_for_read_only_pat(monkeypatch):
+    """Read-only grep is exposed by the candidate action contract."""
+    from mcp_server.server import CANDIDATE_REGISTRY, _dispatch, _MCPUser
 
     called = []
 
@@ -540,11 +538,25 @@ async def test_grep_without_replace_stays_readable_for_read_only_pat(monkeypatch
         called.append(args)
         return {"ok": True}
 
-    monkeypatch.setitem(_HANDLERS, "akb_grep", _stub)
+    key = ("akb_discover", "grep")
+    original = CANDIDATE_REGISTRY._handlers[key]
+    CANDIDATE_REGISTRY._handlers[key] = _stub
+    async def allow(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("mcp_server.server.check_vault_access", allow)
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x"}, user)
+    try:
+        result = await _dispatch(
+            "akb_discover", {"action": "grep", "vault": "v", "pattern": "x"}, user
+        )
+    finally:
+        CANDIDATE_REGISTRY._handlers[key] = original
     assert result == {"ok": True}
     assert called == [{"vault": "v", "pattern": "x"}]
+
+    rejected = await _dispatch("akb_grep", {"vault": "v", "pattern": "x"}, user)
+    assert rejected["code"] == "invalid_argument"
 
 
 @pytest.mark.asyncio

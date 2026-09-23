@@ -83,12 +83,12 @@ EPH_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin
 # Verify searchable
 source "$(dirname "$0")/_wait_for_indexing.sh"
 wait_for_indexing
-R=$(m "akb_search" "{\"query\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
 SEARCH_BEFORE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$SEARCH_BEFORE" -ge 1 ] 2>/dev/null && pass "Searchable before delete ($SEARCH_BEFORE)" || fail "Search before" "$R"
 
 # Verify greppable
-R=$(m "akb_grep" "{\"pattern\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"grep\",\"pattern\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
 GREP_BEFORE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_matches',0))" 2>/dev/null)
 [ "$GREP_BEFORE" -ge 1 ] 2>/dev/null && pass "Greppable before delete ($GREP_BEFORE)" || fail "Grep before" "$R"
 
@@ -99,17 +99,17 @@ DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).ge
 
 # Verify NOT searchable after delete
 sleep 1  # brief wait for async cleanup
-R=$(m "akb_search" "{\"query\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
 SEARCH_AFTER=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$SEARCH_AFTER" = "0" ] && pass "Not searchable after delete (0 hits)" || fail "Search after delete" "still $SEARCH_AFTER hits"
 
 # Verify NOT greppable after delete
-R=$(m "akb_grep" "{\"pattern\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"grep\",\"pattern\":\"UNIQUE_MARKER_XJ7K9Q\",\"vault\":\"$VAULT\"}")
 GREP_AFTER=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_matches',0))" 2>/dev/null)
 [ "$GREP_AFTER" = "0" ] && pass "Not greppable after delete (0 matches)" || fail "Grep after delete" "still $GREP_AFTER matches"
 
 # Verify get returns not found
-R=$(m "akb_get" "{\"uri\":\"$EPH_DOC_URI\"}")
+R=$(m "akb_document_read" "{\"action\":\"get\",\"uri\":\"$EPH_DOC_URI\"}")
 GET_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$GET_ERROR" = "True" ] && pass "Get returns not found after delete" || fail "Get after delete" "$R"
 
@@ -135,7 +135,7 @@ DEL_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print
 [ "$DEL_ERR" = "True" ] && pass "Delete nonexistent doc → error/false" || fail "Delete nonexistent" "$R"
 
 # History nonexistent doc
-R=$(m "akb_history" "{\"uri\":\"$NONEXIST_URI\"}")
+R=$(m "akb_document_read" "{\"action\":\"history\",\"uri\":\"$NONEXIST_URI\"}")
 HIST_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'not found' in str(d).lower())" 2>/dev/null)
 [ "$HIST_ERR" = "True" ] && pass "History nonexistent doc → error" || fail "History nonexistent" "$R"
 
@@ -179,17 +179,17 @@ echo ""
 echo "▸ 4. Search Edge Cases"
 
 # Semantic search may return low-relevance results — verify it doesn't crash
-R=$(m "akb_search" "{\"query\":\"ZZZZZ_NONEXISTENT_QUERY_12345\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"ZZZZZ_NONEXISTENT_QUERY_12345\",\"vault\":\"$VAULT\"}")
 EMPTY_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('total' in d and 'results' in d)" 2>/dev/null)
 [ "$EMPTY_OK" = "True" ] && pass "Irrelevant search returns valid response" || fail "Empty search" "$R"
 
 # Grep empty results
-R=$(m "akb_grep" "{\"pattern\":\"ZZZZZ_NONEXISTENT_12345\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"grep\",\"pattern\":\"ZZZZZ_NONEXISTENT_12345\",\"vault\":\"$VAULT\"}")
 GREP_EMPTY=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_docs',0))" 2>/dev/null)
 [ "$GREP_EMPTY" = "0" ] && pass "Empty grep returns 0 docs" || fail "Empty grep" "docs=$GREP_EMPTY"
 
 # Search with special characters
-R=$(m "akb_search" "{\"query\":\"SELECT * FROM; DROP TABLE--\",\"vault\":\"$VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"SELECT * FROM; DROP TABLE--\",\"vault\":\"$VAULT\"}")
 SPECIAL_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d)" 2>/dev/null)
 [ "$SPECIAL_OK" = "True" ] && pass "Search with SQL-like chars doesn't crash" || fail "Special char search" "$R"
 
@@ -232,18 +232,18 @@ m "akb_create_vault" "{\"name\":\"$EMPTY_VAULT\",\"description\":\"empty\"}" >/d
 # vault is not literally empty — it carries just that seed. Assert a small
 # bounded count (catches a vault that wrongly accumulates content) rather
 # than 0.
-R=$(m "akb_browse" "{\"vault\":\"$EMPTY_VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"browse\",\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_ITEMS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null)
 [ "$EMPTY_ITEMS" -le 2 ] 2>/dev/null && pass "Browse fresh vault: $EMPTY_ITEMS items (seeded vault-skill)" || fail "Empty browse" "items=$EMPTY_ITEMS"
 
 # Search empty vault
-R=$(m "akb_search" "{\"query\":\"anything\",\"vault\":\"$EMPTY_VAULT\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"anything\",\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_SEARCH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$EMPTY_SEARCH" = "0" ] && pass "Search empty vault: 0 results" || fail "Empty vault search" "$R"
 
 # Activity on a fresh vault — the init commit plus the seeded vault-skill
 # commit (≤2).
-R=$(m "akb_activity" "{\"vault\":\"$EMPTY_VAULT\"}")
+R=$(m "akb_document_read" "{\"action\":\"activity\",\"vault\":\"$EMPTY_VAULT\"}")
 EMPTY_ACT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('activity',[])))" 2>/dev/null)
 [ "$EMPTY_ACT" -le 2 ] 2>/dev/null && pass "Activity on new vault: $EMPTY_ACT entries (init + skill seed)" || fail "Empty activity" "entries=$EMPTY_ACT"
 

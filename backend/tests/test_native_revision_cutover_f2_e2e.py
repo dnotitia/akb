@@ -885,8 +885,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 token=owner_pat,
                 session_id=native_session,
                 request_id=5,
-                tool="akb_get",
-                arguments={"uri": mcp_document["uri"]},
+                tool="akb_document_read",
+                arguments={"action": "get", "uri": mcp_document["uri"]},
             )
             assert mcp_result.get("isError") is not True
             assert "version two" in json.dumps(mcp_read)

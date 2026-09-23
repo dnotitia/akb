@@ -406,6 +406,7 @@ def record_tool(
     *,
     is_write: bool = False,
     protocol: dict[str, str] | None = None,
+    logical_operation: str | None = None,
 ) -> None:
     """Audit a canonical API operation from MCP dispatch or REST access routes.
     ``user`` is the resolved principal; ``result`` is the handler's return envelope (or the
@@ -417,38 +418,46 @@ def record_tool(
     canonical `resource_uri` built by `uri_service`) for operational Redis
     fanout; this audit stream records the *tool actually invoked* at the
     API surface (`action="akb_put"`), including reads and failures, for a
-    compliance SIEM. A canonical `resource_uri` can't be formed reliably
-    from raw dispatch args (e.g. `akb_search` has no resource), so we keep
-    an honest, lossy `target` rather than fake a URI. The divergence is
-    intentional; do not try to unify the two."""
+    compliance SIEM. Bounded candidate tools pass ``logical_operation`` so
+    the recorded action remains the underlying operation (for example,
+    ``akb_get`` rather than only ``akb_document_read``). A canonical
+    `resource_uri` can't be formed reliably from raw dispatch args (e.g.
+    `akb_search` has no resource), so we keep an honest, lossy `target` rather
+    than fake a URI. The divergence is intentional; do not try to unify the
+    two."""
     if not settings.audit.enabled:
         return
+    operation_name = logical_operation or name
     # Skip reads only when the operator opted out of read logging; unknown
     # (i.e. state-changing) tools are always kept. `is_write` overrides the
     # tool-level classification for a read tool invoked with a mutating
     # argument — see the note on `_READ_ONLY_TOOLS`.
-    if not settings.audit.log_reads and name in _READ_ONLY_TOOLS and not is_write:
+    if not settings.audit.log_reads and operation_name in _READ_ONLY_TOOLS and not is_write:
         return
     outcome, code = "ok", None
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
         outcome = "error"
         code = result.get("code")
-    if name == "akb_grep" and is_write:
+    if operation_name == "akb_grep" and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
     audit_meta: dict[str, Any] = dict(protocol or {})
-    if name in {"akb_grant", "akb_revoke"}:
+    if logical_operation and logical_operation != name:
+        audit_meta["public_tool"] = name
+        if isinstance(args, dict) and isinstance(args.get("action"), str):
+            audit_meta["action"] = args["action"]
+    if operation_name in {"akb_grant", "akb_revoke"}:
         # Bounded metadata identifies the recipient and basis, including a
         # failed attempt. A revoke with no key means all bases; a grant with no
         # key means direct. Never serialize the request or exception wholesale.
         source_key = args.get("source_key")
-        if name == "akb_grant" and source_key is None:
+        if operation_name == "akb_grant" and source_key is None:
             source_key = "direct"
         access_meta: dict[str, Any] = {
             "user": str(args.get("user", ""))[:_TARGET_MAX],
             "source_key": str(source_key)[:_TARGET_MAX] if source_key is not None else None,
             "revision": args.get("revision") if type(args.get("revision")) is int else None,
         }
-        if name == "akb_grant":
+        if operation_name == "akb_grant":
             access_meta["role"] = str(args.get("role", ""))[:_TARGET_MAX]
         if outcome == "ok" and isinstance(result, dict):
             access_meta.update({
@@ -456,10 +465,10 @@ def record_tool(
                 "applied": result.get("applied"),
             })
         audit_meta["access"] = access_meta
-    if name == "akb_grep" and is_write:
+    if operation_name == "akb_grep" and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
-        action=name,
+        action=operation_name,
         actor=getattr(user, "username", None),
         actor_id=getattr(user, "user_id", None),
         vault=(args.get("vault") if isinstance(args, dict) else None),

@@ -51,8 +51,12 @@ _SENTINEL = {
 
 
 def test_vault_of_call_public_name():
-    assert vault_of_call("akb_get", {"uri": "akb://v1/doc/notes/a.md"}) == "v1"
-    assert vault_of_call("akb_search", {"vault": "v2", "query": "x"}) == "v2"
+    assert vault_of_call(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    ) == "v1"
+    assert vault_of_call(
+        "akb_discover", {"action": "search", "vault": "v2", "query": "x"}
+    ) == "v2"
     assert vault_of_call("akb_sql", {"vaults": ["a", "b"]}) is None
 
 
@@ -112,7 +116,9 @@ def _authorizing(vault: str | None, result: dict | None = None):
 async def test_success_path_attaches_payload(wired):
     wired["dispatch"](_authorizing("v1"))
 
-    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+    body = await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    )
 
     assert body["ok"] == 1
     assert body["vault_skill"] == _SENTINEL
@@ -137,7 +143,9 @@ async def test_authorized_vault_mismatch_blocks_injection(wired):
     """Fail-closed: the args name v2, the completed check covered v1."""
     wired["dispatch"](_authorizing("v1"))
 
-    body = await _run("akb_get", {"uri": "akb://v2/doc/notes/a.md"})
+    body = await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v2/doc/notes/a.md"}
+    )
 
     assert "vault_skill" not in body
     assert wired["calls"] == []
@@ -146,7 +154,9 @@ async def test_authorized_vault_mismatch_blocks_injection(wired):
 async def test_stale_authorization_does_not_leak_into_the_next_call(wired):
     """A reused task context must not carry a previous call's authorization."""
     wired["dispatch"](_authorizing("v1"))
-    await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+    await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    )
 
     wired["dispatch"](_authorizing(None, {"help": "..."}))
     body = await _run("akb_help", {"topic": "quickstart", "vault": "v1"})
@@ -161,7 +171,9 @@ async def test_raised_exception_gets_envelope_without_injection(wired):
 
     wired["dispatch"](boom)
 
-    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+    body = await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    )
 
     assert body.get("error")
     assert "vault_skill" not in body
@@ -175,7 +187,9 @@ async def test_handler_error_dict_gets_no_injection(wired):
 
     wired["dispatch"](denied)
 
-    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+    body = await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    )
 
     assert body["code"] == "FORBIDDEN"
     assert "vault_skill" not in body
@@ -202,7 +216,9 @@ async def test_injector_failure_never_fails_the_call(monkeypatch, wired):
     wired["dispatch"](_authorizing("v1"))
     monkeypatch.setattr(vault_skill_service, "injection_payload", exploding)
 
-    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
+    body = await _run(
+        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
+    )
 
     assert body == {"ok": 1}
 
@@ -297,17 +313,20 @@ async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
     tools = await server_mod.list_tools()
     by_name = {tool.name: tool for tool in tools}
 
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_update"].input_schema["properties"]
-    )
-    # akb_grep is normally read-only but becomes a writer when `replace` is
-    # present, so its schema must carry the acknowledgement too.
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_grep"].input_schema["properties"]
-    )
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_get"].input_schema["properties"]
-    )
+    def has_ack(tool_name: str) -> bool:
+        schema = by_name[tool_name].input_schema
+        if server_mod.VAULT_SKILL_ACK_ARGUMENT in schema.get("properties", {}):
+            return True
+        return any(
+            server_mod.VAULT_SKILL_ACK_ARGUMENT in branch.get("properties", {})
+            for branch in schema.get("oneOf", [])
+        )
+
+    assert has_ack("akb_update")
+    # The candidate discovery and document-read capabilities are strictly
+    # read-only; the old grep replacement path is not part of this slice.
+    assert not has_ack("akb_discover")
+    assert not has_ack("akb_document_read")
 
 
 async def test_legacy_client_write_succeeds_and_gets_additive_guide(

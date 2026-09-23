@@ -47,6 +47,21 @@ function discovery() {
   };
 }
 
+function candidateDiscoverTool() {
+  return {
+    name: "akb_discover",
+    inputSchema: {
+      type: "object",
+      oneOf: [{
+        type: "object",
+        properties: { action: { const: "list_vaults" } },
+        required: ["action"],
+        additionalProperties: false,
+      }],
+    },
+  };
+}
+
 async function consumerRoot() {
   const root = await mkdtemp(join(tmpdir(), "akb-inspector-consumer-test-"));
   await writeFile(join(root, "package.json"), "{}\n");
@@ -105,7 +120,7 @@ test("smoke runs both transports, redacts the marker, and removes config state",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+          ? { tools: [candidateDiscoverTool()] }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
       child.emit("close", 0);
@@ -168,7 +183,7 @@ test("strict catalog errors fail while warnings remain in the operation result",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+          ? { tools: [candidateDiscoverTool()] }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       const envelope = { result };
       if (method === "tools/list") envelope.schemaFindings = schemaFindings;
@@ -231,7 +246,7 @@ test("missing credentials and read-call errors cannot pass", async () => {
         const result = method === "initialize"
           ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
           : method === "tools/list"
-            ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+            ? { tools: [candidateDiscoverTool()] }
             : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: true };
         child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
         child.emit("close", 0);
