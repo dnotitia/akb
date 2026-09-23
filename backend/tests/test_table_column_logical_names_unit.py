@@ -656,3 +656,104 @@ async def test_d12_if_not_exists_ignores_pg_name_on_either_side(monkeypatch):
         if_not_exists=True, can_read_existing=True,
     )
     assert out["matches_request"] is True, out["mismatches"]
+
+
+async def test_d4_every_boundary_resolves_by_nfc_casefold(monkeypatch):
+    decomposed = unicodedata.normalize("NFD", "분류")
+    cols, uks, idxs = _spec(
+        _HEADERS,
+        unique_keys=[{"columns": [decomposed, "W EMBEDDING"]}],
+        indexes=[{"columns": [{"name": "triviaqa(비과학 문헌)", "order": "desc"}]}],
+    )
+    assert uks[-1]["columns"] == ["분류", "w Embedding"]
+    assert idxs[-1]["columns"] == [{"name": "TriviaQA(비과학 문헌)", "order": "desc"}]
+    phys = _physical(cols)
+
+    read = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("select", f"{decomposed},W EMBEDDING"), ("W EMBEDDING", "eq.x")],
+    )
+    assert "error" not in read, read
+    assert read["sql"].startswith(f"SELECT {phys['분류']}, {phys['w Embedding']} FROM")
+    body, _ = _shape_result(
+        {"items": [{phys["분류"]: "A", phys["w Embedding"]: "x"}], "columns": []},
+        vault_name=_VAULT, table_name=_TABLE,
+        projections=read["projections"], count_exact=False, offset=0,
+    )
+    # Reported under the declared spelling, however the caller wrote it.
+    assert body["items"] == [{"분류": "A", "w Embedding": "x"}]
+
+    upsert = compile_insert_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, actor_id="alice",
+        unique_keys=uks, body={decomposed: "A", "w embedding": "x"},
+        query_params=[("on_conflict", f"{decomposed},W EMBEDDING")],
+    )
+    assert not isinstance(upsert, dict), upsert
+    assert f"ON CONFLICT ({phys['분류']}, {phys['w Embedding']})" in upsert.sql
+
+    # alter: drop/alter/rename resolve the same way.
+    conn = _Conn(table_row={
+        "id": uuid.uuid4(), "name": _TABLE, "columns": cols,
+        "unique_keys": [], "indexes": [], "collection": None, "description": "",
+    })
+    _wire(monkeypatch, conn)
+    await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester",
+        alter_columns=[{"name": "중요도".upper(), "set_default": 1}],
+        drop_columns=["W EMBEDDING"],
+        rename_columns={decomposed: "대분류"},
+    )
+    stored = _registry_update(conn)
+    assert [c["name"] for c in stored] == ["대분류", "중요도", "TriviaQA(비과학 문헌)"]
+    assert f"ALTER COLUMN {phys['중요도']} SET DEFAULT 1" in " ".join(conn.sql())
+
+
+def test_d8_one_row_naming_one_column_twice_is_refused():
+    cols, _, _ = _spec(_HEADERS)
+    decomposed = unicodedata.normalize("NFD", "분류")
+    insert = compile_insert_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols, actor_id="alice",
+        body={"분류": "A", decomposed: "B"},
+    )
+    assert isinstance(insert, dict) and insert["code"] == "invalid_argument"
+    update = compile_update_rows(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        body={"w Embedding": "a", "W EMBEDDING": "b"}, query_params=[("all", "true")],
+    )
+    assert isinstance(update, dict) and update["code"] == "invalid_argument"
+
+
+def test_d8_a_header_with_a_comma_is_selectable_through_the_ast():
+    cols, _, _ = _spec([{"name": "Revenue, 2023", "type": "numeric"}])
+    ast = compile_ast_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        ast={"select": ["Revenue, 2023"], "order": [{"col": "Revenue, 2023", "dir": "desc"}]},
+    )
+    assert "error" not in ast, ast
+    assert [p.output_key for p in ast["projections"]] == ["Revenue, 2023"]
+
+
+def test_d4_a_crafted_operand_is_refused_in_bounded_time():
+    """A logical name can contain `->>`, so no grammar can say where it ends;
+    the split is asked of the table. An operand built to make a regex
+    backtrack must cost a bounded scan, not a quadratic one: against
+    `^(.+?)(->>…)?(::…)?$` this input takes 5 s at 8,000 arrows and grows
+    with the square."""
+    import time
+
+    cols, _, _ = _spec([{"name": "메타", "type": "jsonb"}])
+    hostile = "->>a" * 60_000 + "::X"
+    started = time.monotonic()
+    out = compile_ast_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        ast={"filter": {"col": hostile, "op": "eq", "val": "x"}},
+    )
+    assert time.monotonic() - started < 2
+    assert out["code"] == "undefined_column"
+
+    fine = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("메타->>tier", "eq.gold"), ("메타->>a:b", "eq.x")],
+    )
+    assert fine["code"] == "undefined_column"
+    assert "메타->>a:b" in fine["error"]

@@ -15,6 +15,8 @@ from app.exceptions import NotFoundError
 from app.repositories import table_data_repo, table_registry_repo
 from app.services.row_query_ast import _compile_ast_filter
 from app.services.row_query_base import (
+    _ColumnMeta,
+    _ColumnRef,
     _add_param,
     _column_meta,
     _compile_select,
@@ -263,10 +265,10 @@ def compile_insert_rows(
 
     column_meta = _column_meta(columns)
     params: list[Any] = []
-    insert_columns_or_error = _insert_columns(rows, column_meta)
-    if isinstance(insert_columns_or_error, dict):
-        return insert_columns_or_error
-    insert_columns = insert_columns_or_error
+    resolved_or_error = _insert_columns(rows, column_meta)
+    if isinstance(resolved_or_error, dict):
+        return resolved_or_error
+    insert_columns, resolved_rows = resolved_or_error
     on_conflict_or_error = _compile_on_conflict(
         _last_value(query_params, "on_conflict"),
         column_meta,
@@ -277,13 +279,13 @@ def compile_insert_rows(
     conflict_columns = on_conflict_or_error
 
     values_sql: list[str] = []
-    for row in rows:
+    for row in resolved_rows:
         cells: list[str] = []
         for col in insert_columns:
-            if col == "created_by":
+            if col.name == "created_by":
                 cells.append(_add_param(params, actor_id))
-            elif col in row:
-                cells.append(_add_param(params, _normalize_value(row[col], column_meta[col])))
+            elif col.pg_name in row:
+                cells.append(_add_param(params, _normalize_value(row[col.pg_name], col.type_name)))
             else:
                 cells.append("DEFAULT")
         values_sql.append(f"({', '.join(cells)})")
@@ -307,7 +309,7 @@ def compile_insert_rows(
 
     sql = (
         f"INSERT INTO {table_data_repo.pg_table_name(vault_name, table_name)} "
-        f"({', '.join(table_data_repo.safe_ident(c) for c in insert_columns)}) "
+        f"({', '.join(c.pg_name for c in insert_columns)}) "
         f"VALUES {', '.join(values_sql)}{conflict_sql}{returning_sql}"
     )
     return _CompiledMutation(
@@ -338,7 +340,7 @@ def compile_ast_mutation(
         return returning
     ast_prefer = _ast_prefer_header(ast, prefer_header)
     if key == "insert":
-        query_params = []
+        query_params: list[tuple[str, Any]] = []
         if returning is not None:
             query_params.append(("select", returning))
         on_conflict = ast.get("on_conflict")
@@ -459,7 +461,7 @@ def _compile_update_ast(
     columns: list[dict],
     body: Any,
     ast: Mapping[str, Any],
-    returning: str | None,
+    returning: str | list[str] | None,
     prefer_header: str | None,
 ) -> _CompiledMutation | dict[str, Any]:
     if not isinstance(body, Mapping):
@@ -549,7 +551,7 @@ def _compile_delete_ast(
     table_name: str,
     columns: list[dict],
     ast: Mapping[str, Any],
-    returning: str | None,
+    returning: str | list[str] | None,
     prefer_header: str | None,
 ) -> _CompiledMutation | dict[str, Any]:
     column_meta = _column_meta(columns)
@@ -677,41 +679,66 @@ def _normalize_insert_rows(body: Any) -> list[Mapping[str, Any]] | dict[str, Any
 
 def _insert_columns(
     rows: Sequence[Mapping[str, Any]],
-    column_meta: dict[str, str],
-) -> list[str] | dict[str, Any]:
-    ordered: list[str] = []
+    column_meta: _ColumnMeta,
+) -> tuple[list[_ColumnRef], list[dict[str, Any]]] | dict[str, Any]:
+    """Resolve each row's keys (logical names) to columns.
+
+    Returns the ordered union of columns plus `created_by`, and each row
+    re-keyed by physical name. Rows may spell a column differently; two keys
+    in one row that name the same column are refused rather than letting
+    one silently win."""
+    ordered: list[_ColumnRef] = []
     seen: set[str] = set()
+    resolved_rows: list[dict[str, Any]] = []
     for row in rows:
-        for raw_col in row:
+        resolved: dict[str, Any] = {}
+        for raw_col, value in row.items():
             if not isinstance(raw_col, str) or not raw_col:
                 return err("INSERT column names must be non-empty strings.", code=INVALID_ARGUMENT)
-            if raw_col in INSERT_SERVER_CONTROLLED:
-                continue
-            if raw_col not in column_meta:
+            col = column_meta.resolve(raw_col)
+            if col is None:
                 return _unknown_column(raw_col, column_meta)
-            if raw_col not in seen:
-                ordered.append(raw_col)
-                seen.add(raw_col)
-    ordered.append("created_by")
-    return ordered
+            if col.name in INSERT_SERVER_CONTROLLED:
+                continue
+            if col.pg_name in resolved:
+                return err(
+                    f"INSERT row names column {col.name!r} more than once.",
+                    code=INVALID_ARGUMENT,
+                )
+            resolved[col.pg_name] = value
+            if col.pg_name not in seen:
+                ordered.append(col)
+                seen.add(col.pg_name)
+        resolved_rows.append(resolved)
+    ordered.append(_ColumnRef("created_by", "created_by", "text"))
+    return ordered, resolved_rows
 
 
 def _compile_update_set_parts(
     body: Mapping[str, Any],
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> list[str] | dict[str, Any]:
     set_parts: list[str] = []
+    seen: set[str] = set()
     for raw_col, value in body.items():
         if not isinstance(raw_col, str) or not raw_col:
             return err("PATCH column names must be non-empty strings.", code=INVALID_ARGUMENT)
         if raw_col in UPDATE_IMMUTABLE:
             continue
-        if raw_col not in column_meta:
+        col = column_meta.resolve(raw_col)
+        if col is None:
             return _unknown_column(raw_col, column_meta)
+        if col.name in UPDATE_IMMUTABLE:
+            continue
+        if col.pg_name in seen:
+            return err(
+                f"PATCH body names column {col.name!r} more than once.",
+                code=INVALID_ARGUMENT,
+            )
+        seen.add(col.pg_name)
         set_parts.append(
-            f"{table_data_repo.safe_ident(raw_col)} = "
-            f"{_add_param(params, _normalize_value(value, column_meta[raw_col]))}"
+            f"{col.pg_name} = {_add_param(params, _normalize_value(value, col.type_name))}"
         )
     if not set_parts:
         return err("PATCH body must include at least one mutable column.", code=INVALID_ARGUMENT)
@@ -753,7 +780,7 @@ def _extract_expected_row_commit(
 
 def _compile_mutation_where(
     query_params: Sequence[tuple[str, str]],
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     # A real column can share a name with a reserved control param (e.g. a
@@ -779,7 +806,7 @@ def _compile_mutation_where(
 
 def _compile_ast_mutation_where(
     ast: Mapping[str, Any],
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     node = None
@@ -803,8 +830,8 @@ def _compile_ast_mutation_where(
 
 
 def _compile_returning(
-    select_value: str | None,
-    column_meta: dict[str, str],
+    select_value: str | Sequence[str] | None,
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> tuple[str, list[Any]] | dict[str, Any]:
     projections_or_error = _compile_select(select_value, column_meta, params)
@@ -813,7 +840,7 @@ def _compile_returning(
     return f" RETURNING {', '.join(p.sql for p in projections_or_error)}", projections_or_error
 
 
-def _ast_returning_select(ast: Mapping[str, Any]) -> str | None | dict[str, Any]:
+def _ast_returning_select(ast: Mapping[str, Any]) -> str | list[str] | None | dict[str, Any]:
     value = ast.get("returning", ast.get("select"))
     if value is None:
         return None
@@ -829,7 +856,8 @@ def _ast_returning_select(ast: Mapping[str, Any]) -> str | None | dict[str, Any]
             if not isinstance(item, str):
                 return err("AST returning entries must be strings.", code=INVALID_ARGUMENT)
             out.append(item)
-        return ",".join(out)
+        # Kept a list: re-joining on "," would split a header containing one.
+        return out
     return err("AST returning must be a string, string array, or boolean.", code=INVALID_ARGUMENT)
 
 
@@ -847,59 +875,60 @@ def _ast_prefer_header(ast: Mapping[str, Any], prefer_header: str | None) -> str
 
 def _compile_on_conflict(
     raw: str | None,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     unique_keys: list[dict],
-) -> list[str] | dict[str, Any]:
+) -> list[_ColumnRef] | dict[str, Any]:
     if raw is None or not raw.strip():
         return []
-    columns = [part.strip() for part in raw.split(",") if part.strip()]
-    if not columns:
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    if not names:
         return err("on_conflict must name at least one column.", code=INVALID_ARGUMENT)
-    seen: set[str] = set()
-    for col in columns:
-        if col not in column_meta:
-            return _unknown_column(col, column_meta)
-        key = col.lower()
-        if key in seen:
+    columns: list[_ColumnRef] = []
+    for name in names:
+        col = column_meta.resolve(name)
+        if col is None:
+            return _unknown_column(name, column_meta)
+        if col in columns:
             return err("on_conflict columns must be distinct.", code=INVALID_ARGUMENT)
-        seen.add(key)
+        columns.append(col)
     if _is_unique_conflict_target(columns, unique_keys):
         return columns
     return err(
         "on_conflict must target an existing UNIQUE or PRIMARY KEY constraint.",
         code=NO_UNIQUE_CONSTRAINT,
-        target=columns,
+        target=[col.name for col in columns],
     )
 
 
-def _is_unique_conflict_target(columns: list[str], unique_keys: list[dict]) -> bool:
-    lowered = {col.lower() for col in columns}
-    if lowered == {"id"}:
+def _is_unique_conflict_target(columns: list[_ColumnRef], unique_keys: list[dict]) -> bool:
+    # Declared keys record logical names; compare through the same key.
+    wanted = {table_data_repo.column_key(col.name) for col in columns}
+    if wanted == {"id"}:
         return True
     for unique_key in unique_keys:
         raw_cols = unique_key.get("columns") if isinstance(unique_key, dict) else None
         if not isinstance(raw_cols, list) or len(raw_cols) != len(columns):
             continue
-        if {str(col).lower() for col in raw_cols} == lowered:
+        if {table_data_repo.column_key(str(col)) for col in raw_cols} == wanted:
             return True
     return False
 
 
 def _compile_upsert_clause(
     *,
-    conflict_columns: list[str],
-    insert_columns: list[str],
+    conflict_columns: list[_ColumnRef],
+    insert_columns: list[_ColumnRef],
     prefer_header: str | None,
 ) -> str:
-    target = ", ".join(table_data_repo.safe_ident(col) for col in conflict_columns)
+    target = ", ".join(col.pg_name for col in conflict_columns)
     if _prefer_ignore_duplicates(prefer_header):
         return f" ON CONFLICT ({target}) DO NOTHING"
-    conflict_lookup = {col.lower() for col in conflict_columns}
+    conflicting = {col.pg_name for col in conflict_columns}
     set_parts = [
-        f"{table_data_repo.safe_ident(col)} = EXCLUDED.{table_data_repo.safe_ident(col)}"
+        f"{col.pg_name} = EXCLUDED.{col.pg_name}"
         for col in insert_columns
-        if col.lower() not in conflict_lookup
-        and col not in {"created_by", *UPDATE_IMMUTABLE}
+        if col.pg_name not in conflicting
+        and col.name not in {"created_by", *UPDATE_IMMUTABLE}
     ]
     set_parts.append("updated_at = NOW()")
     return f" ON CONFLICT ({target}) DO UPDATE SET {', '.join(set_parts)}"

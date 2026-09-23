@@ -2,7 +2,9 @@
 
 Turns the raw executor rows into the `table_query` response body,
 stripping the bookkeeping columns injected for exact-count paging and
-restoring caller-facing projection keys.
+restoring caller-facing projection keys. PostgreSQL answers under each
+column's physical name; the body reports every user column under its
+logical name (#433).
 """
 
 from __future__ import annotations
@@ -46,10 +48,19 @@ def _shape_result(
     return body, f"*/{total}"
 
 
+def _star_renames(projections: Sequence[_Projection]) -> dict[str, str] | None:
+    """The physical→logical renames of the `*` projection, or None without one."""
+    for p in projections:
+        if p.output_key == "*":
+            return p.renames
+    return None
+
+
 def _shape_item(row: dict[str, Any], projections: Sequence[_Projection]) -> dict[str, Any]:
-    if any(p.output_key == "*" for p in projections):
+    renames = _star_renames(projections)
+    if renames is not None:
         out = {
-            k: v for k, v in row.items()
+            renames.get(k, k): v for k, v in row.items()
             if k not in {"__akb_total", "__akb_present"} and not k.startswith("__akb_col_")
         }
     else:
@@ -61,9 +72,10 @@ def _shape_item(row: dict[str, Any], projections: Sequence[_Projection]) -> dict
 
 
 def _output_columns(raw_columns: Iterable[str], projections: Sequence[_Projection]) -> list[str]:
-    if any(p.output_key == "*" for p in projections):
+    renames = _star_renames(projections)
+    if renames is not None:
         columns = [
-            c for c in raw_columns
+            renames.get(c, c) for c in raw_columns
             if c not in {"__akb_total", "__akb_present"} and not c.startswith("__akb_col_")
         ]
     else:

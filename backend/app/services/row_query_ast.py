@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
-from app.repositories import table_data_repo
 from app.util.errors import (
     FILTER_TOO_DEEP,
     INVALID_ARGUMENT,
@@ -25,6 +24,7 @@ from app.util.errors import (
 from app.services.row_query_base import (
     CAST_SQL,
     MAX_BOOL_DEPTH,
+    _ColumnMeta,
     _Operand,
     _add_param,
     _bind_operand_params,
@@ -112,7 +112,7 @@ def _ast_page_params(ast: Mapping[str, Any]) -> list[tuple[str, str]]:
     return params
 
 
-def _ast_select_value(value: Any) -> str | None | dict[str, Any]:
+def _ast_select_value(value: Any) -> str | list[str] | None | dict[str, Any]:
     if value is None:
         return None
     if isinstance(value, str):
@@ -123,7 +123,8 @@ def _ast_select_value(value: Any) -> str | None | dict[str, Any]:
             if not isinstance(item, str):
                 return err("AST select entries must be strings.", code=INVALID_ARGUMENT)
             out.append(item)
-        return ",".join(out)
+        # Kept a list: re-joining on "," would split a header containing one.
+        return out
     return err("AST select must be a string or string array.", code=INVALID_ARGUMENT)
 
 
@@ -138,7 +139,7 @@ def _ast_filter_root(ast: Mapping[str, Any]) -> Any | None:
 
 def _compile_ast_filter(
     node: Any,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
     *,
     depth: int,
@@ -156,7 +157,7 @@ def _compile_ast_filter(
 def _compile_ast_bool_group(
     joiner: str,
     value: Any,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
     *,
     depth: int,
@@ -180,7 +181,7 @@ def _compile_ast_bool_group(
 
 def _compile_ast_condition(
     node: Mapping[str, Any],
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     operator = node.get("op")
@@ -193,20 +194,21 @@ def _compile_ast_condition(
     return _compile_ast_operator(operand, operator.lower(), node.get("val"), params)
 
 
-def _compile_ast_operand(node: Mapping[str, Any], column_meta: dict[str, str]) -> _Operand | dict[str, Any]:
+def _compile_ast_operand(node: Mapping[str, Any], column_meta: _ColumnMeta) -> _Operand | dict[str, Any]:
     col = node.get("col")
     if isinstance(col, str):
         return _compile_operand(col, column_meta)
     jsonb = node.get("jsonb")
     if not isinstance(jsonb, Mapping):
         return err("AST condition must include col or jsonb.", code=INVALID_ARGUMENT)
-    base = jsonb.get("col")
-    if not isinstance(base, str) or not base:
+    base_name = jsonb.get("col")
+    if not isinstance(base_name, str) or not base_name:
         return err("AST jsonb operand must include a column name.", code=INVALID_ARGUMENT)
-    if base not in column_meta:
-        return _unknown_column(base, column_meta)
-    if not _is_json_type(column_meta[base]):
-        return err(f"Column {base!r} is not a JSON column.", code=UNDEFINED_COLUMN)
+    base = column_meta.resolve(base_name)
+    if base is None:
+        return _unknown_column(base_name, column_meta)
+    if not _is_json_type(base.type_name):
+        return err(f"Column {base.name!r} is not a JSON column.", code=UNDEFINED_COLUMN)
     path = jsonb.get("path")
     if not isinstance(path, Sequence) or isinstance(path, (str, bytes, bytearray)) or not path:
         return err("AST jsonb operand must include a non-empty path array.", code=INVALID_ARGUMENT)
@@ -218,7 +220,7 @@ def _compile_ast_operand(node: Mapping[str, Any], column_meta: dict[str, str]) -
     cast = jsonb.get("cast")
     if cast is not None and (not isinstance(cast, str) or cast not in CAST_SQL):
         return err(f"Invalid JSON cast {cast!r}.", code=INVALID_CAST, allowed_casts=sorted(CAST_SQL))
-    sql_base = table_data_repo.safe_ident(base)
+    sql_base = base.pg_name
     if len(path_items) == 1:
         expr = f"{sql_base} ->> ${{param}}::text"
         operand_params: list[Any] = [path_items[0]]
@@ -298,7 +300,7 @@ def _compile_ast_operator(
 
 def _compile_ast_order(
     value: Any,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     if value is None:

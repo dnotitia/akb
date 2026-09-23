@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
@@ -52,9 +52,12 @@ CAST_SQL = {
 
 def _is_json_type(type_name: str) -> bool:
     return type_name in {"json", "jsonb"}
-_JSON_PATH_RE = re.compile(
-    r"^(?P<base>[a-z][a-z0-9_]*)(?:(?P<arrow>->>|#>>)(?P<path>[^:]+))?(?:::(?P<cast>[a-z]+))?$"
-)
+# A JSON-path operand is `<column>(->>|#>>)<path>[::<cast>]`. The column is a
+# LOGICAL name and may contain anything a header can — `->>` included — so no
+# grammar can find where it ends; `_split_json_operand` asks the table instead.
+_JSON_ARROW_RE = re.compile(r"->>|#>>")
+_JSON_PATH_SUFFIX_RE = re.compile(r"(?P<path>[^:]+)(?:::(?P<cast>[a-z]+))?")
+_CAST_RE = re.compile(r"[a-z]+")
 
 
 @dataclass
@@ -63,11 +66,64 @@ class RowQueryResponse:
     content_range: str | None = None
 
 
+@dataclass(frozen=True)
+class _ColumnRef:
+    """One addressable column: the name a caller uses and the one SQL uses."""
+
+    name: str
+    pg_name: str
+    type_name: str
+
+
+class _ColumnMeta:
+    """Every column a row query may name, resolved at the API boundary (#433).
+
+    Callers name a column by its LOGICAL name; `resolve` compares with
+    `table_data_repo.column_key` (NFC, casefold), and only the resolved
+    column's physical `pg_name` is ever interpolated into SQL. Bookkeeping
+    columns keep their one name.
+    """
+
+    def __init__(self, columns: list[dict]):
+        refs = [_ColumnRef(name, name, type_name) for name, type_name in BOOKKEEPING_COLUMNS.items()]
+        for col in columns:
+            if not isinstance(col, dict):
+                continue
+            name = col.get("name")
+            if isinstance(name, str) and name:
+                refs.append(_ColumnRef(
+                    name,
+                    table_data_repo.column_pg_name(col),
+                    str(col.get("type") or "text").lower(),
+                ))
+        self._by_key = {table_data_repo.column_key(ref.name): ref for ref in refs}
+        # How long a caller's spelling of a name can be: decomposition and
+        # case folding lengthen it, but never beyond a small factor.
+        self.max_spelling = 4 * max(len(ref.name) for ref in refs) + 16
+
+    def resolve(self, raw: Any) -> _ColumnRef | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        return self._by_key.get(table_data_repo.column_key(raw))
+
+    def __contains__(self, raw: Any) -> bool:
+        return self.resolve(raw) is not None
+
+    def names(self) -> list[str]:
+        return sorted(ref.name for ref in self._by_key.values())
+
+    def logical_names(self) -> dict[str, str]:
+        """{physical: logical} for every column whose two names differ."""
+        return {ref.pg_name: ref.name for ref in self._by_key.values() if ref.pg_name != ref.name}
+
+
 @dataclass
 class _Operand:
     sql: str
     params: list[Any]
     type_name: str
+    # The column when the operand is a plain column rather than a JSON path.
+    column: _ColumnRef | None = None
 
 
 @dataclass
@@ -75,6 +131,8 @@ class _Projection:
     sql: str
     output_key: str
     result_key: str
+    # `*` only: result keys (physical names) to report under logical names.
+    renames: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -83,40 +141,61 @@ class _Page:
     offset: int
 
 
-def _column_meta(columns: list[dict]) -> dict[str, str]:
-    meta = dict(BOOKKEEPING_COLUMNS)
-    for col in columns:
-        if not isinstance(col, dict):
+def _column_meta(columns: list[dict]) -> _ColumnMeta:
+    return _ColumnMeta(columns)
+
+
+def _split_json_operand(
+    token: str, column_meta: _ColumnMeta,
+) -> tuple[_ColumnRef, str | None, str, str | None] | None:
+    """(column, arrow, path, cast) for ``<column>(->>|#>>)<path>[::<cast>]``
+    or ``<column>::<cast>``; None when no prefix names a column.
+
+    Only an arrow whose prefix resolves to a column splits the operand, and
+    only arrows within the longest spelling a name could have are tried, so
+    a crafted operand costs a bounded scan, not a backtracking regex."""
+    for arrow in _JSON_ARROW_RE.finditer(token):
+        if arrow.start() > column_meta.max_spelling:
+            break
+        column = column_meta.resolve(token[:arrow.start()])
+        if column is None:
             continue
-        name = col.get("name")
-        if isinstance(name, str) and name:
-            meta[name] = str(col.get("type") or "text").lower()
-    return meta
+        suffix = _JSON_PATH_SUFFIX_RE.fullmatch(token, arrow.end())
+        if suffix is None:
+            return None
+        return column, arrow.group(), suffix.group("path"), suffix.group("cast")
+    head, sep, cast = token.rpartition("::")
+    if sep and _CAST_RE.fullmatch(cast) and len(head) <= column_meta.max_spelling:
+        column = column_meta.resolve(head)
+        if column is not None:
+            return column, None, "", cast
+    return None
 
 
-def _compile_operand(raw: str, column_meta: dict[str, str]) -> _Operand | dict[str, Any]:
+def _compile_operand(raw: str, column_meta: _ColumnMeta) -> _Operand | dict[str, Any]:
     token = raw.strip()
-    m = _JSON_PATH_RE.fullmatch(token)
-    if not m:
-        return _unknown_column(token, column_meta)
-    base = m.group("base")
-    if base not in column_meta:
-        return _unknown_column(base, column_meta)
-    arrow = m.group("arrow")
-    cast = m.group("cast")
+    # A whole-token column wins over any JSON-path reading of it: a header
+    # may itself contain `->>` or `::`.
+    column = column_meta.resolve(token)
+    if column is not None:
+        return _Operand(sql=column.pg_name, params=[], type_name=column.type_name, column=column)
+    split = _split_json_operand(token, column_meta)
+    if split is None:
+        first_arrow = _JSON_ARROW_RE.search(token)
+        base_name = token[:first_arrow.start()] if first_arrow else token
+        # A known column with a malformed path is reported whole, as before.
+        return _unknown_column(token if column_meta.resolve(base_name) else base_name, column_meta)
+    base, arrow, raw_path, cast = split
     if cast and cast not in CAST_SQL:
         return err(f"Invalid JSON cast {cast!r}.", code=INVALID_CAST, allowed_casts=sorted(CAST_SQL))
     if not arrow:
-        if cast:
-            return err("Casts are only supported for JSON path operands.", code=INVALID_CAST)
-        ident = table_data_repo.safe_ident(base)
-        return _Operand(sql=ident, params=[], type_name=column_meta[base])
-    if not _is_json_type(column_meta[base]):
-        return err(f"Column {base!r} is not a JSON column.", code=UNDEFINED_COLUMN)
-    path = (m.group("path") or "").strip()
+        return err("Casts are only supported for JSON path operands.", code=INVALID_CAST)
+    if not _is_json_type(base.type_name):
+        return err(f"Column {base.name!r} is not a JSON column.", code=UNDEFINED_COLUMN)
+    path = raw_path.strip()
     if not path:
         return err(f"Invalid JSON path operand: {raw}", code=INVALID_FILTER)
-    sql_base = table_data_repo.safe_ident(base)
+    sql_base = base.pg_name
     if arrow == "->>":
         expr = f"{sql_base} ->> ${{param}}::text"
         operand_params: list[Any] = [path]
@@ -136,7 +215,7 @@ def _bind_operand_params(operand: _Operand, params: list[Any]) -> _Operand:
     sql = operand.sql
     for value in operand.params:
         sql = sql.replace("${param}", _add_param(params, value), 1)
-    return _Operand(sql=sql, params=[], type_name=operand.type_name)
+    return _Operand(sql=sql, params=[], type_name=operand.type_name, column=operand.column)
 
 
 def _add_param(params: list[Any], value: Any) -> str:
@@ -288,8 +367,8 @@ def _convert_value(raw: str, type_name: str) -> Any | dict[str, Any]:
     return raw
 
 
-def _unknown_column(name: str, column_meta: dict[str, str]) -> dict[str, Any]:
-    available = sorted(column_meta)
+def _unknown_column(name: str, column_meta: _ColumnMeta) -> dict[str, Any]:
+    available = column_meta.names()
     return err(
         f"Column {name!r} does not exist on this table.",
         code=UNDEFINED_COLUMN,
@@ -298,38 +377,49 @@ def _unknown_column(name: str, column_meta: dict[str, str]) -> dict[str, Any]:
     )
 
 
+def _star(column_meta: _ColumnMeta) -> _Projection:
+    return _Projection(sql="*", output_key="*", result_key="*", renames=column_meta.logical_names())
+
+
 def _compile_select(
-    select_value: str | None,
-    column_meta: dict[str, str],
+    select_value: str | Sequence[str] | None,
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> list[_Projection] | dict[str, Any]:
+    """A querystring `select=` splits on commas; a JSON-AST list does not, so
+    a header that contains one is still selectable by name."""
     if not select_value:
-        return [_Projection(sql="*", output_key="*", result_key="*")]
+        return [_star(column_meta)]
+    tokens = _split_top_level(select_value) if isinstance(select_value, str) else list(select_value)
     projections: list[_Projection] = []
-    for idx, token in enumerate(_split_top_level(select_value)):
+    for idx, token in enumerate(tokens):
         token = token.strip()
         if not token:
             continue
-        if re.search(r"(?<!:):(?!:)", token):
-            return err("Column aliases in select= are not implemented yet.", code=NOT_IMPLEMENTED)
         if token == "*":
-            projections.append(_Projection(sql="*", output_key="*", result_key="*"))
+            projections.append(_star(column_meta))
             continue
+        if column_meta.resolve(token) is None and re.search(r"(?<!:):(?!:)", token):
+            return err("Column aliases in select= are not implemented yet.", code=NOT_IMPLEMENTED)
         operand_or_error = _compile_operand(token, column_meta)
         if isinstance(operand_or_error, dict):
             return operand_or_error
         operand = _bind_operand_params(operand_or_error, params)
-        if operand.sql == token:
-            projections.append(_Projection(sql=operand.sql, output_key=token, result_key=token))
+        if operand.column is not None:
+            # Rows come back keyed by the physical name and are reported
+            # under the logical one — no quoted-identifier alias in the SQL.
+            projections.append(_Projection(
+                sql=operand.sql, output_key=operand.column.name, result_key=operand.sql,
+            ))
         else:
             result_key = f"__akb_col_{idx}"
             projections.append(_Projection(sql=f"{operand.sql} AS {result_key}", output_key=token, result_key=result_key))
-    return projections or [_Projection(sql="*", output_key="*", result_key="*")]
+    return projections or [_star(column_meta)]
 
 
 def _compile_order(
     order_value: str | None,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     if not order_value:

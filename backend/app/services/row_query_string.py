@@ -17,6 +17,7 @@ from app.util.errors import (
 )
 from app.services.row_query_base import (
     MAX_BOOL_DEPTH,
+    _ColumnMeta,
     _Operand,
     _add_param,
     _bind_operand_params,
@@ -82,7 +83,7 @@ def compile_row_query(
 
 def _compile_filters(
     query_params: Sequence[tuple[str, str]],
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     clauses: list[str] = []
@@ -107,7 +108,7 @@ def _compile_filters(
 def _compile_bool_group(
     joiner: str,
     value: str,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
     *,
     depth: int,
@@ -145,7 +146,7 @@ def _compile_bool_group(
 def _compile_condition(
     field: str,
     raw_value: str,
-    column_meta: dict[str, str],
+    column_meta: _ColumnMeta,
     params: list[Any],
 ) -> str | dict[str, Any]:
     operand_or_error = _compile_operand(field, column_meta)
