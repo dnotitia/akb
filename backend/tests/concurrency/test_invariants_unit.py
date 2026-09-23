@@ -936,7 +936,12 @@ async def test_p2_create_table_bad_columns_are_validation_errors(pool):
         [{"name": "id", "type": "text"}],                      # reserved (reef's case)
         [{"name": "created_at", "type": "text"}],              # reserved
         [{"name": "title"}, {"name": "title"}],                # duplicate → would be 42701
-        [{"name": "Title", "type": "text"}],                   # malformed (uppercase)
+        # A column name is a logical name now (#433): `Title` is a valid
+        # header. Case-insensitive duplicates, control characters and a
+        # caller-chosen physical name are what stays malformed.
+        [{"name": "Title"}, {"name": "title"}],                # duplicate by casefold
+        [{"name": "bad\x00name", "type": "text"}],            # malformed (control char)
+        [{"name": "title", "pg_name": "c_1_0badf00d"}],        # pg_name is server-derived
         [{"type": "text"}],                                    # missing "name"
     ]
     for i, cols in enumerate(bad_payloads):
