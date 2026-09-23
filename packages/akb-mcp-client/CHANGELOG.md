@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — the proxy's own refusals set `isError`
+
+The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,
+`akb_update_file`, `akb_delete_file`, `akb_put_image`, `akb_discard_image`) now
+set `isError: true` when they refuse. That covers a failed call, a local
+`vault_skill_required`, and a `file` argument that cannot be read. The backend
+does the same for its own refusals, so both kinds of refusal carry the flag. The
+`{"error", ...}` body is unchanged.
+
 ## 2.3.2 — opt-in per-call usage record
 
 Setting `AKB_MCP_USAGE_LOG=<path>` makes the proxy append one JSON line per
