@@ -50,13 +50,16 @@ headers come from documents can be created. Still refused (422): blank names,
 control characters (NUL included), the bookkeeping names in any case, and two
 names equal under NFC + casefold.
 
-Each column also carries `pg_name`, its physical name, derived by the server and
+Each column also has `pg_name`, its physical name, derived by the server and
 the only spelling that reaches PostgreSQL: a plain lowercase name keeps itself,
 anything else becomes `c_<position>_<8 hex>`, deterministic for the same table
 and header. `pg_name` appears on every schema read (create/alter responses,
 table lists, `akb_browse`, the schema endpoints, vault info) and is rejected on
 input. DDL, constraint/index definitions and generated constraint/index names
 use it; the registry records unique-key and index columns by logical name.
+The registry stores `pg_name` only where it differs from `safe_ident(name)`
+folded to lowercase — the identifier the old DDL produced — so a plain column
+stores none.
 
 - The row API (query string, JSON AST, reads and writes) takes logical names,
   matched case-insensitively after NFC, and answers with rows keyed by them.
@@ -68,14 +71,20 @@ use it; the registry records unique-key and index columns by logical name.
   name, is renamed physically as before; any other rename changes only the
   logical name.
 
-**Compatibility:** every existing table's columns already have plain names, so
-nothing about them changes — same physical columns, same constraint and index
-names. Migration 113 writes `pg_name` into the registry for every column that
-lacks it (`safe_ident(name)` folded to lowercase, the identifier the old DDL
-produced) and issues no DDL. App manifests keep the plain grammar. Known limits:
-the web UI's create-table dialog and sort/filter URL state still accept only
-plain column names, and a header containing a comma cannot be named in a
-query-string `select`, `order` or `on_conflict`.
+**Compatibility:** no migration runs and nothing is backfilled. Every existing
+table's columns already have plain names, so its registry row, physical
+columns and constraint and index names stay byte-for-byte as they were.
+Rolling deploy and rollback: a table whose columns all have plain names —
+every existing table, and any created with plain names — stays fully readable
+and writable by code from before this change. Only a column with a non-plain
+name stores `pg_name`; older code could never create one, and a table that has
+one is not usable by older code. App manifests keep the plain grammar. Known
+limits: a NUL in a column name is stripped by the REST request models but is a
+422 over MCP; a header containing a comma cannot be named in a query-string
+`select`, `order` or `on_conflict` (the JSON AST can); a rename onto a plain
+name another column holds physically changes only the logical name; and the
+web UI's create-table dialog, sort/filter URL state and table publication still
+accept only plain column names.
 
 ### Personal access token issuance options
 

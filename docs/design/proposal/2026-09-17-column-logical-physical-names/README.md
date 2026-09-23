@@ -134,9 +134,11 @@ What this explicitly does **not** do:
 
 ## Implementation (2026-09-23)
 
-Implemented on `feat/akb-433-column-logical-names` (base `2ed799bf`); the six
-gates above were committed red first and are green on the branch. Where the
-build had to be more specific than this proposal, these decisions hold:
+Implemented on `feat/akb-433-column-logical-names`. The six gates above were
+committed red first and are green on the branch; gate 6 was restated for
+sparse storage (decision 11) and was committed red again before that change.
+Where the build had to be more specific than this proposal, these decisions
+hold:
 
 1. **Logical name.** `columns[].name` is NFC-normalized and otherwise verbatim.
    Refused (422): non-string, empty or whitespace-only; any control character,
@@ -160,9 +162,10 @@ build had to be more specific than this proposal, these decisions hold:
    against logical names through one helper (`table_data_repo.column_key`).
 5. **SQL.** Only `pg_name` is interpolated: DDL, CHECK/enum/FK/UNIQUE/INDEX
    definitions, the duplicate preflight, `pg_attribute` comparison.
-   `table_data_repo.column_pg_name(col)` falls back to `safe_ident(name).lower()`
-   only for a registry row written before the backfill. RoleSync grants tables
-   and never names a column.
+   `table_data_repo.column_pg_name(col)` returns the stored `pg_name`, or, when
+   none is stored, `safe_ident(name).lower()` — the identifier DDL before the
+   split made. That fallback is the contract (decision 11), not a transition
+   shim. RoleSync grants tables and never names a column.
 6. **Generated names** (unique keys, indexes, check/enum/FK constraints) derive
    from physical column names — identical to before for every existing table.
 7. **Rename.** Physical `RENAME COLUMN` only when the column's `pg_name` equals
@@ -176,12 +179,21 @@ build had to be more specific than this proposal, these decisions hold:
    on commas.
 9. **`akb_sql` and read surfaces.** `akb_sql` spells columns physically, with no
    column rewriting; a logical name in SQL gets a hint naming the `pg_name`.
-   Schema reads return `name` and `pg_name` per column; MCP tool text explains
-   both.
+   Every read of a table's columns — schema reads, table lists, `akb_browse`,
+   vault info, create/alter responses, MCP — reports `name` and `pg_name`,
+   computed through `column_pg_name` whether or not it is stored; MCP tool text
+   explains both.
 10. **Search.** The table metadata chunk keeps logical names.
-11. **Backfill.** Migration 113 writes `pg_name = safe_ident(name).lower()` onto
-    every registry column lacking one. Registry only, no DDL, idempotent,
-    `updated_at` untouched.
+11. **Sparse storage, no backfill.** Supersedes "Compatibility and migration"
+    above. A registry column stores `pg_name` only where it differs from
+    `safe_ident(name).lower()`; otherwise the key is absent. The rule lives at
+    the one place columns are written (`table_registry_repo.storable_columns`,
+    used by `insert` and `update_columns`), so create, idempotent create, alter
+    add, rename and app rollout all store sparsely; a rename that brings a name
+    back to its physical name drops the key again. `parse_columns` fills
+    `pg_name` back in on read. No migration runs and nothing is backfilled: a
+    table whose column names are all plain — every table that exists, and any
+    created with plain names — is stored exactly as before, byte for byte.
 12. **`if_not_exists`.** The spec comparison ignores `pg_name`.
 
 Gate 2 is exercised with `분류`/`모델`, which `safe_ident` really does send to
@@ -190,6 +202,45 @@ quite fuse).
 
 Table and vault names, the app-manifest column grammar, `akb_sql`'s
 Unicode-escape and `pg_settings` defenses, row-level policy and column ACLs are
-unchanged. The web UI's create-table dialog and its sort/filter URL state still
-accept only plain column names (rendering rows keyed by logical names works);
-that is the next slice if headers are to be authored or sorted in the UI.
+unchanged.
+
+### Rolling deploy and rollback
+
+Nothing is migrated, so there is no window to protect. A table whose columns
+all have plain names — every table that exists before this change, and any
+created with plain names after it — is stored exactly as before and stays fully
+readable and writable by code from before #433, during a rolling deploy and
+after a rollback. Only a column with a non-plain name stores `pg_name`, and
+older code could never have created one; a table that has such a column is not
+usable by older code, which would address the column by `safe_ident` of its
+name — the collision this change exists to prevent.
+
+### Known limits
+
+Behaviour left as it is, on purpose:
+
+- **NUL.** A column name containing NUL is a 422 over MCP. Over REST the request
+  model (`NFCModel`) strips NUL from every string before the service sees it,
+  so `"분\x00류"` arrives as `"분류"` and is accepted. That is the pre-existing
+  REST normalization, not a column-name rule.
+- **Commas.** A header containing a comma cannot be named in a query-string
+  `select`, `order` or `on_conflict`, which split on commas. The JSON AST can:
+  a `select`/`returning` array is not re-split, and `order` objects and filters
+  take one name each. PostgREST-style double quoting is not implemented.
+- **Rename onto a name held physically.** Renaming a column to a plain name
+  that another column already uses as its physical name is a logical-only
+  rename (decision 7): `RENAME COLUMN` would fail, and the logical rename is
+  still what was asked.
+
+Follow-ups in the web UI, which renders and edits rows keyed by logical names
+but does not yet let a header be authored, sorted or published:
+
+- **URL sort/filter state.** `frontend/src/lib/table-query-state.ts`
+  (`parseSort`, `parseFilter`) accepts only `^[a-z][a-z0-9_]*$`, so sorting or
+  filtering by a header column is dropped from the URL and falls back to the
+  default sort.
+- **Create dialog.** `frontend/src/components/table-create-dialog.tsx` still
+  refuses a non-plain column name.
+- **Table publication.** `frontend/src/lib/table-publication.ts` refuses to
+  publish a non-plain column; it would need to select the `pg_name` and alias
+  it back to the header.
