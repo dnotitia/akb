@@ -4,9 +4,10 @@ The extension may stop an index-led scan after bm25_catalog.bm25_limit
 candidates. SQL predicates applied above that scan can therefore remove every
 candidate even when matching chunks exist beyond the budget. Materialising a
 small ACL set first is deliberately the control case: its ranking does not
-depend on the global BM25 candidate budget. The direct filtered query remains
-the fast path for sealed segments; a growing scan or invisible row can still
-make a finite page short, so only the -1 exact fallback proves exhaustion.
+depend on the global BM25 candidate budget. The finite page remains the fast
+path; a growing scan, an invisible row or a skipped block can still make it
+short, so a short page is completed with the -1 exact scan, which is the only
+one that proves exhaustion (akb#673).
 
 These cases require the extension-capable PostgreSQL image. They create one
 database per test and skip when AKB_VCHORD_TEST_DSN is absent.
@@ -322,7 +323,7 @@ async def _seed_rare(
     return target_vault, scoped_ids
 
 
-async def test_index_led_acl_adapts_and_restores_pooled_budget():
+async def test_index_led_acl_completes_exactly_and_restores_pooled_budget():
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
@@ -338,16 +339,18 @@ async def test_index_led_acl_adapts_and_restores_pooled_budget():
                             )
                         )
 
-            probes = [
+            ranked = [
                 query for query in queries
-                if "global_candidates AS MATERIALIZED" in query[0]
+                if "ranked WHERE score < 0" in query[0]
             ]
             assert set(hits) == scoped_ids
-            assert budgets == [5, 20, 80]
-            assert len(probes) == 3
-            await _assert_bm25_index_scan(
-                conn, *probes[-1], budget=budgets[-1],
-            )
+            # The finite page comes back short (the thirty higher-scoring
+            # distractors take its slots) and the exact scan completes it. No
+            # widening probes in between.
+            assert budgets == [5, -1]
+            assert len(ranked) == 2
+            assert not any("global_candidates" in query[0] for query in queries)
+            await _assert_bm25_index_scan(conn, *ranked[-1], budget=-1)
     assert restored == _BUDGET
 
 
@@ -368,7 +371,7 @@ async def test_source_type_filter_adapts_candidate_budget():
                     )
 
     assert set(hits) == scoped_ids
-    assert budgets == [5, 20, 80]
+    assert budgets == [5, -1]
 
 
 async def test_filtered_short_page_uses_exact_fallback_in_order():
@@ -544,9 +547,20 @@ async def test_dead_index_entries_use_exact_unfiltered_fallback():
     assert budgets == [5, -1]
 
 
-@pytest.mark.parametrize("mode", ["unfiltered", "filtered", "configured-exact", "large-k", "materialized"])
-async def test_broad_exact_search_fails_closed_without_unbounded_scan(mode):
-    """Planner selectivity and operator -1 cannot bypass the exact row cap."""
+@pytest.mark.parametrize("mode,expected_budgets", [
+    ("unfiltered", [5, -1]),
+    ("filtered", [5, -1]),
+    ("configured-exact", []),  # the operator's -1 is used as it stands
+    ("large-k", [-1]),
+    # Five scoped rows over a materialise cap of four: searched index-led.
+    ("materialized", [5, -1]),
+])
+async def test_every_exact_route_completes_and_restores_the_session(mode, expected_budgets):
+    """A short page is completed, never refused, whatever led to exact work.
+
+    The query term is in no row, so the complete answer is empty. Until akb#673
+    each of these routes refused instead, because it measured the corpus.
+    """
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             vault, _, _ = await _seed(store, conn)
@@ -554,18 +568,18 @@ async def test_broad_exact_search_fails_closed_without_unbounded_scan(mode):
             original_timeout = await conn.fetchval("SHOW statement_timeout")
             original_path = await conn.fetchval("SHOW search_path")
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
+                mp.setattr(pgvector_module, "_VCHORD_MAX_MATERIALISED_ROWS", 4)
                 mp.setattr(type(store), "_filter_is_selective",
                            lambda *a, **k: _constant(mode == "materialized"))
                 async with _record_budget_calls() as budgets:
                     async with _candidate_budget(conn, budget=-1 if mode == "configured-exact" else 2):
-                        with pytest.raises(pgvector_module.VectorStoreUnavailable, match="bounded row budget"):
-                            await store._search_sparse(
-                                conn, terms=[_UNKNOWN_TERM], weights=[1.0],
-                                filter_uuids=[vault] if mode in ("filtered", "materialized") else None,
-                                filter_col="vault_id", limit=65_536 if mode == "large-k" else 5,
-                            )
-                        assert -1 not in budgets
+                        hits = await store._search_sparse(
+                            conn, terms=[_UNKNOWN_TERM], weights=[1.0],
+                            filter_uuids=[vault] if mode in ("filtered", "materialized") else None,
+                            filter_col="vault_id", limit=65_536 if mode == "large-k" else 5,
+                        )
+                        assert hits == []
+                        assert budgets == expected_budgets
                         assert await conn.fetchval("SELECT 1") == 1
             assert await conn.fetchval("SHOW plan_cache_mode") == original_plan
             assert await conn.fetchval("SHOW statement_timeout") == original_timeout
@@ -577,12 +591,12 @@ async def test_small_materialized_scope_survives_large_global_corpus():
         async with pool.acquire() as conn:
             vault, scoped, _ = await _seed(store, conn)
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 5)
+                mp.setattr(pgvector_module, "_VCHORD_MAX_MATERIALISED_ROWS", 5)
                 hits = await _acl_hits(store, conn, vault, selective=True)
             assert set(hits) == scoped
 
 
-async def test_selective_scope_over_the_exact_cap_is_answered_index_led():
+async def test_selective_scope_over_the_materialise_cap_is_answered_index_led():
     """Which shape runs decides latency, never the rows (akb#626).
 
     A scope the estimator calls selective is materialised, and materialising is
@@ -628,7 +642,7 @@ async def test_selective_scope_over_the_exact_cap_is_answered_index_led():
             assert await store._filter_is_selective(conn, "vault_id", [target]) is True
 
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 20)
+                mp.setattr(pgvector_module, "_VCHORD_MAX_MATERIALISED_ROWS", 20)
                 async with _candidate_budget(conn, budget=100):
                     chosen = await store._search_sparse(
                         conn, terms=[_QUERY_TERM], weights=[1.0],
@@ -685,28 +699,31 @@ async def test_first_search_on_a_fresh_connection_reads_the_budget(filtered):
         assert set(hits) <= distractors
 
 
-async def test_exact_probe_timeout_restores_connection_and_stricter_server_budget():
+async def test_exact_scan_timeout_restores_connection_and_stricter_server_budget():
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
-            original = type(conn).fetchval
+            original = type(conn).fetch
             observed_timeouts = []
 
-            async def slow_probe(self, query, *args, **kwargs):
-                if "bounded_exact_scope" in query:
-                    observed_timeouts.append(await original(self, "SHOW statement_timeout"))
+            async def slow_exact(self, query, *args, **kwargs):
+                if "ranked WHERE score < 0" in query:
+                    observed_timeouts.append(await self.fetchval("SHOW statement_timeout"))
                     await self.execute("SELECT pg_sleep(1)")
                 return await original(self, query, *args, **kwargs)
 
             await conn.execute("SET statement_timeout = '20ms'")
             try:
                 with pytest.MonkeyPatch.context() as mp:
-                    mp.setattr(type(conn), "fetchval", slow_probe)
+                    mp.setattr(type(conn), "fetch", slow_exact)
                     with pytest.raises((asyncpg.QueryCanceledError, TimeoutError)):
+                        # A page larger than any finite budget goes straight to -1.
                         await store._search_sparse(
                             conn, terms=[_UNKNOWN_TERM], weights=[1.0],
                             filter_uuids=None, filter_col="vault_id", limit=65_536,
                         )
+                # The exact scan runs under the caller's own, stricter timeout:
+                # the driver installs none of its own.
                 assert observed_timeouts == ["20ms"]
                 assert await conn.fetchval("SHOW statement_timeout") == "20ms"
                 assert await conn.fetchval("SELECT 1") == 1
@@ -722,10 +739,10 @@ async def test_caller_deadline_cancels_and_restores_connection(phase):
             before = {key: await conn.fetchval(f"SHOW {key}") for key in (
                 "statement_timeout", "plan_cache_mode", "search_path", "bm25_catalog.bm25_limit",
             )}
-            original = type(conn).fetchval
+            original = type(conn).fetch
 
             async def delayed(self, query, *args, **kwargs):
-                if "bounded_exact_scope" in query:
+                if "ranked WHERE score < 0" in query:
                     # Simulate client-side delay after SET LOCAL; the wall
                     # deadline must roll back even with no server timeout.
                     await asyncio.sleep(1)
@@ -739,7 +756,7 @@ async def test_caller_deadline_cancels_and_restores_connection(phase):
                 if phase == "estimate":
                     mp.setattr(type(store), "_filter_is_selective", slow_estimate)
                 else:
-                    mp.setattr(type(conn), "fetchval", delayed)
+                    mp.setattr(type(conn), "fetch", delayed)
                 with pytest.raises(TimeoutError):
                     async with asyncio.timeout(0.05):
                         await store._search_sparse(
@@ -752,7 +769,8 @@ async def test_caller_deadline_cancels_and_restores_connection(phase):
                 assert await conn.fetchval(f"SHOW {key}") == value
 
 
-async def test_real_large_corpus_keeps_finite_index_search_but_refuses_exact():
+async def test_real_large_corpus_keeps_finite_search_and_answers_an_unknown_term_exactly():
+    """10,001 rows: more than the 10,000-row corpus cap that used to refuse this."""
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -762,22 +780,24 @@ async def test_real_large_corpus_keeps_finite_index_search_but_refuses_exact():
                 SELECT md5(i::text)::uuid, 'document', md5(i::text)::uuid,
                        $1, '', 'common term', i, '{10:1}'::bm25_catalog.bm25vector
                 FROM generate_series(1, $2::int) i
-            """, uuid.UUID(int=1), pgvector_module._VCHORD_MAX_EXACT_ROWS + 1)
+            """, uuid.UUID(int=1), 10_001)
             await conn.execute("REINDEX INDEX vector_index.idx_vi_chunks_bm25")
             await conn.execute("ANALYZE vector_index.chunks")
             async with _candidate_budget(conn, budget=5):
-                common = await store._search_sparse(
-                    conn, terms=[10], weights=[1.0], filter_uuids=None,
-                    filter_col="vault_id", limit=5,
-                )
-                assert len(common) == 5
                 async with _record_budget_calls() as budgets:
-                    with pytest.raises(pgvector_module.VectorStoreUnavailable, match="bounded row budget"):
-                        await store._search_sparse(
-                            conn, terms=[_UNKNOWN_TERM], weights=[1.0], filter_uuids=None,
-                            filter_col="vault_id", limit=5,
-                        )
-                assert -1 not in budgets
+                    common = await store._search_sparse(
+                        conn, terms=[10], weights=[1.0], filter_uuids=None,
+                        filter_col="vault_id", limit=5,
+                    )
+                assert len(common) == 5
+                assert budgets == [5]  # a full page is answered finite
+                async with _record_budget_calls() as budgets:
+                    unknown = await store._search_sparse(
+                        conn, terms=[_UNKNOWN_TERM], weights=[1.0], filter_uuids=None,
+                        filter_col="vault_id", limit=5,
+                    )
+                assert unknown == []
+                assert budgets == [5, -1]
                 assert int(await conn.fetchval("SHOW bm25_catalog.bm25_limit")) == 5
 
 
@@ -811,9 +831,13 @@ async def test_finite_index_search_can_exceed_five_seconds_under_caller_budget()
 
 
 @pytest.mark.parametrize("dense_first", [True, False])
-async def test_exact_refusal_keeps_dense_and_scoped_sparse_hits(dense_first):
-    from app.services.vector_store.base import VectorSearchDegraded
+async def test_short_sparse_page_is_completed_beside_the_dense_leg(dense_first):
+    """A short sparse page used to end the search degraded; now it is completed.
 
+    The sparse leg's finite page is short (thirty higher-scoring distractors
+    outside the scope take its slots), so it runs the exact scan and returns
+    every scoped match. Neither leg is lost, whichever finishes first.
+    """
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, distractors = await _seed(store, conn)
@@ -853,26 +877,20 @@ async def test_exact_refusal_keeps_dense_and_scoped_sparse_hits(dense_first):
             mp.setattr(store, "_pool", get_pool)
             mp.setattr(store, "_search_dense", dense)
             mp.setattr(store, "_search_sparse", sparse)
-            mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
-            with pytest.raises(VectorSearchDegraded) as caught:
-                await store.hybrid_search(
-                    query_text="term", query_dense=[1.0, 0.0, 0.0, 0.0],
-                    query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
-                    source_ids=None, vault_ids=[str(vault)], source_types=["document"],
-                    limit=20, prefetch_per_leg=50,
-                )
-        result = caught.value
-        assert result.reason == "sparse_search_budget_exceeded"
-        assert {hit.chunk_id for hit in result.hits} == scoped | {dense_id}
-        assert not ({hit.chunk_id for hit in result.hits} & distractors)
+            hits = await store.hybrid_search(
+                query_text="term", query_dense=[1.0, 0.0, 0.0, 0.0],
+                query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
+                source_ids=None, vault_ids=[str(vault)], source_types=["document"],
+                limit=20, prefetch_per_leg=50,
+            )
+        assert {hit.chunk_id for hit in hits} == scoped | {dense_id}
+        assert not ({hit.chunk_id for hit in hits} & distractors)
         assert dense_done.is_set() and sparse_done.is_set()
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT 1") == 1
 
 
-async def test_exact_refusal_without_dense_keeps_finite_scoped_candidates():
-    from app.services.vector_store.base import VectorSearchDegraded
-
+async def test_sparse_only_search_with_a_short_page_is_complete():
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, _ = await _seed(store, conn)
@@ -882,16 +900,13 @@ async def test_exact_refusal_without_dense_keeps_finite_scoped_candidates():
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(store, "_pool", get_pool)
-            mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
-            with pytest.raises(VectorSearchDegraded) as caught:
-                await store.hybrid_search(
-                    query_text="term", query_dense=None,
-                    query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
-                    source_ids=None, vault_ids=[str(vault)], source_types=["document"],
-                    limit=20, prefetch_per_leg=50,
-                )
-        assert caught.value.reason == "sparse_search_budget_exceeded"
-        assert {hit.chunk_id for hit in caught.value.hits} == scoped
+            hits = await store.hybrid_search(
+                query_text="term", query_dense=None,
+                query_sparse_indices=[_QUERY_TERM], query_sparse_values=[1.0],
+                source_ids=None, vault_ids=[str(vault)], source_types=["document"],
+                limit=20, prefetch_per_leg=50,
+            )
+        assert {hit.chunk_id for hit in hits} == scoped
 
 
 async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
@@ -917,14 +932,74 @@ async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
                     terms=[_RARE_TERM] + list(range(2_000, 2_000 + ordinal)),
                     chunk_index=ordinal,
                 )
-            await _seed(store, conn)  # 35 more rows, none holding the rare term
-            with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(pgvector_module, "_VCHORD_MAX_EXACT_ROWS", 4)
-                async with _record_budget_calls() as budgets:
-                    async with _candidate_budget(conn):
-                        hits = await _acl_hits(
-                            store, conn, target, selective=False, terms=[_RARE_TERM],
-                        )
+            # More rows than the 10,000-row corpus cap that refused this, none
+            # of them holding the rare term.
+            await conn.execute("""
+                INSERT INTO vector_index.chunks
+                    (chunk_id, source_type, source_id, vault_id,
+                     section_path, content, chunk_index, sparse_bm25)
+                SELECT md5(i::text)::uuid, 'document', md5(i::text)::uuid,
+                       $1, '', 'filler', i, '{20:1}'::bm25_catalog.bm25vector
+                FROM generate_series(1, $2::int) i
+            """, uuid.UUID(int=0x74), 10_001)
+            await conn.execute("ANALYZE vector_index.chunks")
+            async with _record_budget_calls() as budgets:
+                async with _candidate_budget(conn):
+                    hits = await _acl_hits(
+                        store, conn, target, selective=False, terms=[_RARE_TERM],
+                    )
 
     assert set(hits) == scoped_ids
-    assert budgets[-1] == -1
+    assert budgets == [5, -1]
+
+
+async def test_page_shortened_by_a_rebuilt_index_is_completed_exactly():
+    """vchord_bm25 0.3.0 can build block summaries that a bounded scan skips.
+
+    CREATE INDEX and REINDEX save a full 128-posting block's summary before the
+    block's best posting is counted, and take the last posting among ties. A
+    block whose best score falls on its last posting is recorded as scoring at
+    most 0, and a bounded scan skips it outright. With 300 identical rows that
+    is both full blocks: the bounded scan sees the 44 rows of the partial block
+    and no others. The exact scan reads every posting, so the page it completes
+    is the whole answer.
+    """
+    target = uuid.UUID(int=0x75)
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO vector_index.chunks
+                    (chunk_id, source_type, source_id, vault_id,
+                     section_path, content, chunk_index, sparse_bm25)
+                SELECT md5('same-' || i)::uuid, 'document', md5('same-' || i)::uuid,
+                       $1, '', 'same', i, '{10:1}'::bm25_catalog.bm25vector
+                FROM generate_series(1, 300) i
+            """, target)
+            await conn.execute("REINDEX INDEX vector_index.idx_vi_chunks_bm25")
+            await conn.execute("ANALYZE vector_index.chunks")
+            async with _candidate_budget(conn, budget=100):
+                async with conn.transaction():
+                    await conn.execute('SET LOCAL search_path TO "$user", public, bm25_catalog')
+                    bounded = await conn.fetchval("""
+                        SELECT count(*) FROM (
+                          SELECT c.sparse_bm25 <&> bm25_catalog.to_bm25query(
+                                   'vector_index.idx_vi_chunks_bm25'::regclass,
+                                   '{10:1}'::bm25_catalog.bm25vector) AS score
+                          FROM vector_index.chunks c
+                          WHERE c.sparse_bm25 IS NOT NULL
+                          ORDER BY score LIMIT 90) ranked WHERE score < 0
+                    """)
+                # The defect this test is about. If a new extension pin stops
+                # skipping those blocks, this is the line to revisit.
+                assert bounded == 44
+                with pytest.MonkeyPatch.context() as mp:
+                    mp.setattr(type(store), "_filter_is_selective",
+                               lambda *a, **k: _constant(False))
+                    async with _record_budget_calls() as budgets:
+                        hits = await store._search_sparse(
+                            conn, terms=[10], weights=[1.0],
+                            filter_uuids=[target], filter_col="vault_id", limit=90,
+                        )
+
+    assert len(hits) == 90
+    assert budgets == [100, -1]
