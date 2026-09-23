@@ -676,6 +676,7 @@ async def test_unicode_graph_grep_and_ownership(
             "limit": 1,
             "max_replacements": 2,
         },
+        expect_error=True,
     )
     assert budget.get("code") == "bulk_too_large"
     assert budget.get("replacement_complete") is False
