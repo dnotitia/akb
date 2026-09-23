@@ -1456,10 +1456,24 @@ async def alter_table(
                         f"and cannot be dropped. Reserved: {sorted(_RESERVED)}."
                     )
             normalized_renames: dict[str, str] = {}
+            # Two keys naming one column — `age` and `AGE`, or an NFC and an
+            # NFD spelling — would rename it twice (leaving its unique keys
+            # and indexes at the intermediate name) or, once NFC makes them
+            # one key, silently drop one request.
+            rename_sources: dict[str, str] = {}
             for old_name, new_name in (rename_columns or {}).items():
                 if not isinstance(old_name, str) or not old_name:
                     raise ValidationError("Rename source column must be a non-empty string.")
-                normalized_renames[_validate_column_name(old_name)] = _validate_column_name(new_name)
+                source = _validate_column_name(old_name)
+                source_key = table_data_repo.column_key(source)
+                if source_key in rename_sources:
+                    raise ValidationError(
+                        f"Cannot rename column {source!r} more than once in one request: "
+                        f"{rename_sources[source_key]!r} names the same column (column "
+                        f"names are compared case-insensitively)."
+                    )
+                rename_sources[source_key] = source
+                normalized_renames[source] = _validate_column_name(new_name)
             rename_columns = normalized_renames
 
             added: list[str] = []
