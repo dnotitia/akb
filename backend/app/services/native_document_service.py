@@ -1570,7 +1570,8 @@ class NativeDocumentService(DocumentService):
                     row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
                 except Exception:
                     row_count = 0
-                columns = ensure_list(row["columns"]) if isinstance(row["columns"], str) else row["columns"]
+                # Both names, as every read surface reports them (#433).
+                columns = table_registry_repo.parse_columns(row["columns"])
                 items.append(
                     BrowseItem(
                         name=row["name"],
