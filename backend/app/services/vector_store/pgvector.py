@@ -1279,6 +1279,14 @@ class PgvectorStore:
             # Below about 0.05% they converge — the planner reaches the same
             # place on its own — so the branch is harmless at the small end.
             #
+            # Materialising scores every row in scope, which is exact work, so
+            # it stays under the exact-work cap. A selective scope over the cap
+            # is not refused: the index leads, as it would for any wider
+            # filter. Refusing it lost the whole sparse leg for every scope
+            # between the cap and 1% of the corpus, while the index-led shape
+            # answered the same scope (akb#626). The choice decides latency;
+            # it must never decide the rows.
+            #
             # `plan_cache_mode` is set because asyncpg always prepares, and a
             # generic plan is built without the filter's values: the same
             # statement measured 0.8ms for ten executions and then 1500ms once
@@ -1313,11 +1321,13 @@ class PgvectorStore:
                 )
                 requested_limit = int(limit)
 
-                if filter_uuids and selective:
-                    await self._check_vchord_exact_scope(
+                materialise = bool(filter_uuids) and selective and not (
+                    await self._exceeds_exact_budget(
                         conn, filter_col=filter_col, filter_uuids=filter_uuids,
                         source_type_values=source_type_values,
                     )
+                )
+                if materialise:
                     type_pred = (
                         " AND source_type = ANY($4::text[])" if source_type_values else ""
                     )
@@ -1414,7 +1424,8 @@ class PgvectorStore:
     # under 1% (akb#626). It is one number and it will age — what keeps it
     # honest is that both sides of it were measured on a corpus shaped like a
     # real deployment, and that being wrong costs latency, never correctness:
-    # both shapes return the same rows.
+    # both shapes return the same rows. That includes a selective scope too big
+    # to materialise under the exact-work cap — it is index-led, not refused.
     _SELECTIVE_FRACTION = 0.01
 
     async def _filter_is_selective(
@@ -1475,15 +1486,30 @@ class PgvectorStore:
         conn: asyncpg.Connection,
         *,
         candidate_ids: list[str] | None = None,
+    ) -> None:
+        """Refuse exact scoring of the global corpus when it is over the cap.
+
+        An index scan with bm25_limit=-1 may examine the global corpus before
+        applying filters, so every index-led exact fallback is bounded by the
+        *global* size. Refusing keeps `candidate_ids`, the finite hits already
+        in hand.
+        """
+        if await self._exceeds_exact_budget(conn):
+            raise _VChordExactBudgetExceeded(candidate_ids)
+
+    async def _exceeds_exact_budget(
+        self,
+        conn: asyncpg.Connection,
+        *,
         filter_col: str = "vault_id",
         filter_uuids: list[uuid.UUID] | None = None,
         source_type_values: list[str] | None = None,
-    ) -> None:
-        """Bound actual rows, not planner estimates, before exact scoring.
+    ) -> bool:
+        """Would exact scoring of this scope pass the cap? Actual rows, bounded.
 
-        An index scan with bm25_limit=-1 may examine the global corpus before
-        applying filters, so its callers check the *global* size. Only the
-        materialized path can safely check the filtered scope instead.
+        Counts rows, never planner estimates, and stops at cap + 1, so asking
+        costs less than the work it guards. Only materialising scores exactly
+        the filtered rows, so only that decision asks about a filtered scope.
         """
         predicates = ["sparse_bm25 IS NOT NULL"]
         args: list[object] = []
@@ -1500,8 +1526,7 @@ class PgvectorStore:
                 LIMIT {_VCHORD_MAX_EXACT_ROWS + 1}
             ) bounded_exact_scope""", *args,
         )
-        if count > _VCHORD_MAX_EXACT_ROWS:
-            raise _VChordExactBudgetExceeded(candidate_ids)
+        return bool(count > _VCHORD_MAX_EXACT_ROWS)
 
     async def _search_vchord_index_led_filtered(
         self,

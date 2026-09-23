@@ -83,6 +83,13 @@ materialized ranking checks its vault/source scope. Planner estimates alone do
 not authorize exact work. Operator-configured `-1` and oversized top-k requests
 use the same guard.
 
+A scope the selectivity estimate would materialize, but that holds more than
+10,000 vectors, is not refused: it is searched index-led, like any wider
+filter. Which shape runs is a latency decision and must never change the rows —
+refusing there left every scope between 10,000 vectors and 1% of the corpus
+with no sparse results at all, while the index-led shape answered the same
+scope.
+
 Finite index queries, selectivity lookup and exact queries retain the existing
 caller and database-pool timeouts. This path does not install a shorter wall
 clock or statement timeout: a query that takes longer than five seconds can
