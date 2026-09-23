@@ -5,9 +5,9 @@ import { HomeConnectionInvitation } from "@/components/home-connection-invitatio
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 vi.mock("@/components/connection-setup", () => ({
-  ConnectionSetup: ({ onSecretCreated, onTokenCreated, mcpOauthEnabled }: { onSecretCreated: () => void; onTokenCreated?: () => void; mcpOauthEnabled: boolean }) => <>
+  ConnectionSetup: ({ onDirtyChange, onTokenCreated, mcpOauthEnabled }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; mcpOauthEnabled: boolean }) => <>
     <p>{mcpOauthEnabled ? "OAuth is available" : "Personal token setup"}</p>
-    <button onClick={() => { onSecretCreated(); onTokenCreated?.(); }}>Create test token</button>
+    <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); }}>Create test token</button>
     <input aria-label="Saved private configuration" defaultValue="private-example" />
   </>,
 }));

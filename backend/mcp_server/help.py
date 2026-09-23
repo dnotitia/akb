@@ -1852,25 +1852,78 @@ akb_unlink(
 
 
 
+def _help_for_backend(topic: str | None) -> str:
+    from app.services.vault_creation_capabilities import get_vault_creation_capabilities
+
+    if get_vault_creation_capabilities().templates:
+        return HELP[topic]
+    if topic == "access":
+        return HELP[topic].split("## Create a Vault with Template")[0] + """## Create a Vault
+```
+akb_create_vault(name="my-project", description="Project X knowledge base")
+```
+This deployment supports empty vault creation. Vault templates and external
+Git mirrors are unavailable; add collections and documents after creation."""
+    if topic == "onboarding":
+        return """# Workflow: Set Up a New Project Vault
+
+### Step 1: Create an empty vault
+```
+akb_create_vault(name="my-project", description="Project X knowledge base")
+```
+Vault templates and external Git mirrors are unavailable on this deployment.
+
+### Step 2: Add collections
+```
+akb_create_collection(vault="my-project", path="decisions")
+akb_create_collection(vault="my-project", path="specs")
+```
+
+### Step 3:""" + HELP[topic].split("### Step 3:", 1)[1]
+    if topic == "akb_create_vault":
+        return """# akb_create_vault — Create a Vault
+
+## Parameters
+| Param | Required | Description |
+|-------|----------|-------------|
+| name | ✓ | Unique across this AKB installation; lowercase letters and digits with single hyphens between words. Becomes part of the canonical `akb://` URI |
+| description | | What this vault is for |
+| public_access | | none (default), reader, or writer |
+
+This deployment supports empty vault creation. Vault templates and external
+Git mirrors are unavailable. Explicit requests for these options return
+`native_revision_surface_unsupported`; omit them to create an empty vault.
+
+## Example
+```
+akb_create_vault(name="project-x", description="Project X docs")
+```
+
+If the name cannot be assigned, the tool returns the stable
+`vault_name_unavailable` conflict without revealing another Vault's owner,
+visibility, or state."""
+    return HELP[topic]
+
+
 def _resolve_help(topic: str | None) -> str:
     """Resolve help topic with fuzzy matching."""
     if topic is None:
-        return HELP[None]
+        return _help_for_backend(None)
 
     t = topic.strip().lower()
 
     # Exact match
     if t in HELP:
-        return HELP[t]
+        return _help_for_backend(t)
 
     # Try with akb_ prefix
     if not t.startswith("akb_") and f"akb_{t}" in HELP:
-        return HELP[f"akb_{t}"]
+        return _help_for_backend(f"akb_{t}")
 
     # Fuzzy: find topics containing the query
     matches = [k for k in HELP if k and t in k]
     if len(matches) == 1:
-        return HELP[matches[0]]
+        return _help_for_backend(matches[0])
     if matches:
         listing = "\n".join(f"- `{m}`" for m in sorted(matches))
         return f"# Multiple matches for \"{topic}\"\n\nDid you mean one of these?\n{listing}\n\nUse `akb_help(topic=\"...\")` with the exact name."

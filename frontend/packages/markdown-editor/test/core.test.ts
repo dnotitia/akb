@@ -2,13 +2,16 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   canonicalizeMarkdown,
-  createMarkdownEditor,
+  extractMarkdownReferences,
   extractMarkdownTargets,
-  markdownCommands,
+  markdownReferenceKey,
+  parseMarkdownReferenceToken,
   parseMarkdown,
+  resolveMarkdownReferences,
   serializeMarkdown,
   uploadMarkdownBatch,
 } from '../src/index.js'
+import { createMarkdownEditor, markdownCommands } from '../src/core.js'
 import type { MarkdownAdapters } from '../src/index.js'
 
 const fixture = `# 공통 문법
@@ -75,6 +78,18 @@ describe('Markdown conformance core', () => {
     expect(serialized).toContain('<div data-kind="raw">')
   })
 
+  it('keeps code fence language and content canonical when highlighting is unavailable', () => {
+    const markdown = ['```not-a-registered-language', '<value>&raw</value>', '```'].join('\n')
+    const editor = createMarkdownEditor({ initialMarkdown: markdown })
+    editors.push(editor)
+
+    const codeBlock = editor.state.doc.firstChild
+    expect(codeBlock?.type.name).toBe('codeBlock')
+    expect(codeBlock?.attrs.language).toBe('not-a-registered-language')
+    expect(codeBlock?.textContent).toBe('<value>&raw</value>')
+    expect(editor.getMarkdown().trim()).toBe(markdown)
+  })
+
   it('has canonical idempotence for the full conformance fixture', () => {
     const canonical = canonicalizeMarkdown(fixture)
 
@@ -99,6 +114,99 @@ describe('Markdown conformance core', () => {
       { kind: 'file', target: file },
       { kind: 'attachment', target: attachment },
     ])
+  })
+
+  it('round-trips person syntax and issue IDs while excluding Markdown-owned regions', () => {
+    const markdown = [
+      '@alice @{Ada Lovelace} REEF-123 UNKNOWN-9',
+      '[label @link REEF-456](https://example.com)',
+      '`@code REEF-457`',
+      '```text',
+      '@fenced REEF-458',
+      '```',
+      '\\@escaped \\REEF-459 email@example.com',
+    ].join('\n\n')
+
+    expect(extractMarkdownReferences(markdown)).toEqual([
+      { kind: 'person', id: 'alice', value: '@alice' },
+      { kind: 'person', id: 'Ada Lovelace', value: '@{Ada Lovelace}' },
+      { kind: 'issue', id: 'REEF-123', value: 'REEF-123' },
+      { kind: 'issue', id: 'UNKNOWN-9', value: 'UNKNOWN-9' },
+    ])
+    expect(parseMarkdownReferenceToken('@alice')).toEqual({
+      kind: 'person',
+      id: 'alice',
+      value: '@alice',
+    })
+    expect(parseMarkdownReferenceToken('REEF-123')).toEqual({
+      kind: 'issue',
+      id: 'REEF-123',
+      value: 'REEF-123',
+    })
+    expect(parseMarkdownReferenceToken('@alice trailing')).toBeNull()
+
+    const canonical = canonicalizeMarkdown(markdown)
+    expect(canonicalizeMarkdown(canonical)).toBe(canonical)
+    expect(extractMarkdownReferences(canonical)).toEqual(
+      extractMarkdownReferences(markdown),
+    )
+    expect(canonical).toContain('`@code REEF-457`')
+    expect(canonical).toContain('@fenced REEF-458')
+
+    expect(extractMarkdownReferences('\\\\REEF-459')).toEqual([
+      { kind: 'issue', id: 'REEF-459', value: 'REEF-459' },
+    ])
+    expect(extractMarkdownReferences('\\REEF-459')).toEqual([])
+    expect(canonicalizeMarkdown('\\REEF-459')).toBe('\\REEF-459')
+
+    const linkLabel = parseMarkdown(markdown).content?.[1]?.content?.[0]
+    expect(linkLabel?.marks?.some(mark => mark.type === 'markdownReference')).toBe(false)
+  })
+
+  it('keeps reference runtime resolution outside canonical Markdown', async () => {
+    const references = extractMarkdownReferences('@alice REEF-123')
+    const adapter = {
+      search: async () => [],
+      resolve: async (reference: (typeof references)[number]) =>
+        reference.kind === 'person'
+          ? {
+              ...reference,
+              status: 'available' as const,
+              title: 'Ada Lovelace',
+              runtimeUrl: '/people/alice',
+            }
+          : {
+              ...reference,
+              status: 'unavailable' as const,
+              reason: 'deleted' as const,
+            },
+    }
+
+    const resolutions = await resolveMarkdownReferences(adapter, references)
+
+    expect(resolutions.get(markdownReferenceKey(references[0]!))).toMatchObject({
+      status: 'available',
+      title: 'Ada Lovelace',
+      runtimeUrl: '/people/alice',
+    })
+    expect(resolutions.get(markdownReferenceKey(references[1]!))).toMatchObject({
+      status: 'unavailable',
+      reason: 'deleted',
+    })
+    expect(canonicalizeMarkdown('@alice REEF-123')).toBe('@alice REEF-123')
+  })
+
+  it('edits a reference as ordinary text with undo and redo', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: '@alice 주변 텍스트' })
+    editors.push(editor)
+
+    editor.commands.setTextSelection({ from: 1, to: 7 })
+    expect(editor.commands.insertContent('@bob')).toBe(true)
+    expect(editor.getMarkdown()).toBe('@bob 주변 텍스트')
+    expect(editor.commands.undo()).toBe(true)
+    expect(editor.getMarkdown()).toBe('@alice 주변 텍스트')
+    expect(editor.commands.redo()).toBe(true)
+    expect(editor.getMarkdown()).toBe('@bob 주변 텍스트')
   })
 
   it('retains every per-file upload outcome for a partial batch', async () => {
@@ -176,6 +284,18 @@ describe('Markdown conformance core', () => {
     expect(commands.insertMarkdown(' 추가')).toBe(true)
     expect(commands.undo()).toBe(true)
     expect(editor.getMarkdown()).toBe('초안')
+  })
+
+  it('reports the canonical Markdown without the editor continuation paragraph', () => {
+    const changes: string[] = []
+    const target = 'https://example.com/image.png'
+    const editor = createMarkdownEditor({
+      onChange: markdown => changes.push(markdown),
+    })
+    editors.push(editor)
+
+    expect(markdownCommands(editor).insertImage(target, 'Image')).toBe(true)
+    expect(changes.at(-1)).toBe(`![Image](${target})`)
   })
 
   it('edits and deletes one image occurrence by document position with undo', () => {

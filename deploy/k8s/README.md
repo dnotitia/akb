@@ -1,11 +1,13 @@
 # AKB Kubernetes deployment
 
-The Kubernetes tree has two application shapes and no credential-service
-lifecycle:
+The recommended new-install path is `native/`, with generated persistent
+identity and explicit bootstrap. The base and standalone SSO remain explicit
+Bare Git compatibility paths. None owns a credential-service lifecycle:
 
 ```text
 deploy/k8s/
-├── kustomization.yaml       # standalone AKB + PostgreSQL
+├── kustomization.yaml       # legacy Bare Git standalone + PostgreSQL
+├── native/                  # recommended fresh Native installation
 ├── backend.yaml
 ├── frontend.yaml
 ├── postgres.yaml
@@ -16,13 +18,13 @@ deploy/k8s/
 └── redis.yaml               # optional operator-owned addition
 ```
 
-Neither shape creates Kubernetes Secrets, installs a credentials server, or
+No profile creates Kubernetes Secrets, installs a credentials server, or
 installs a cluster-scoped synchronization controller. The operator provisions
 the required Secrets before applying AKB.
 
 ## Required Secrets
 
-Both shapes consume `Secret/akb-secret`. For local authentication it contains:
+All profiles consume `Secret/akb-secret`. For local authentication it contains:
 
 | Key | Purpose |
 |---|---|
@@ -56,7 +58,13 @@ restricted backups, and their existing credential source.
 
 ## Render directly
 
-Standalone:
+For a new Native installation, first follow the
+[identity, Secret and image preparation procedure](../../docs/operations/native-installation.md#kubernetes),
+then render `deploy/k8s/native`. It must never be applied to an existing Git
+database. Before upgrading an existing installation,
+[preserve the active revision config](../../docs/operations/native-installation.md#preserve-existing-configuration-before-changing-defaults).
+
+Explicit legacy Standalone:
 
 ```bash
 kubectl kustomize --load-restrictor=LoadRestrictionsNone deploy/k8s \
@@ -76,8 +84,10 @@ operator-owned overlay before applying either render.
 
 ## Convenience deployer
 
-`deploy.sh` preserves the pre-profile build/apply workflow. It never creates
-or modifies credentials.
+`deploy.sh` requires an explicit `AKB_PROFILE=standalone|standalone-sso` for
+legacy deployments. It fails before any cluster operation if the profile is
+omitted. New Native installations use the prepared overlay render/apply flow
+above. The script never creates or modifies credentials.
 
 Standalone with existing images:
 
@@ -182,3 +192,11 @@ pinning nothing, because CI then tests a version the deployment does not run.
 
 For a chart-based installation, see [`../helm/akb`](../helm/akb/README.md).
 The Helm chart renders the same standalone and standalone-SSO shapes.
+
+## Recommended PostgreSQL Native
+
+For a never-used database, the `native/` overlay adds explicit bootstrap before
+API/worker startup and uses empty read-only Git storage. Generate and preserve
+installation identity, provision secrets, and pin all three backend images as
+specified in [Native installation and configuration upgrades](../../docs/operations/native-installation.md).
+Do not apply the new-install overlay to an existing Bare Git/cutover database.

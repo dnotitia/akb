@@ -84,6 +84,7 @@ def _settings(
         external_git_enabled=external_git_enabled,
         tokenizer_processes=2,
         bm25_recompute_interval_secs=3600,
+        bm25_external_stats_consumers=["posting_rollback_or_mixed_deployment"],
         s3_endpoint_url=None,
         object_storage_enabled=False,
         model_api_governance_mode="external_metering",
@@ -115,7 +116,7 @@ def test_native_cloud_storage_starts_cleanup_without_custom_endpoint(monkeypatch
     started = []
     _stub_workers(monkeypatch, lifecycle, started)
     configured = _settings(external_git_enabled=False)
-    cloud = Settings(s3_auth_mode="default_chain")
+    cloud = Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain")
     configured.object_storage_enabled = cloud.object_storage_enabled
     monkeypatch.setattr(lifecycle, "settings", configured)
     monkeypatch.setattr(lifecycle.s3_delete_worker, "start", lambda: started.append("s3_delete"))
@@ -272,3 +273,16 @@ def test_external_git_poller_service_is_lazy_not_constructed_at_import(monkeypat
         # Restore a clean module (real ctor, _service reset) for other tests.
         egs.ExternalGitService.__init__ = real_init
         importlib.reload(poller)
+
+
+def test_verified_vchord_only_skips_stats_but_keeps_tokenizer(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    configured = _settings(external_git_enabled=False)
+    configured.bm25_external_stats_consumers = []
+    monkeypatch.setattr(lifecycle, "settings", configured)
+    lifecycle.start_workers()
+    assert "stats_refresher" not in started
+    assert "tokenizer_pool" in started
+    assert "embed_worker" in started

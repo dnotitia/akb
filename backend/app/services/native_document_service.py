@@ -68,7 +68,10 @@ from app.services.document_service import (
 )
 from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
-from app.services.kg_service import validate_new_structured_relation_refs
+from app.services.kg_service import (
+    sync_native_document_edge_uris,
+    validate_new_structured_relation_refs,
+)
 from app.services.native_revision_service import (
     Failpoint,
     NativeRevisionService,
@@ -77,6 +80,7 @@ from app.services.native_revision_service import (
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
+from app.util.errors import NATIVE_REVISION_SURFACE_UNSUPPORTED
 from app.util.text import (
     doc_path,
     like_escape,
@@ -92,13 +96,13 @@ logger = logging.getLogger("akb.native_documents")
 
 
 class NativeRevisionUnsupportedSurfaceError(AKBError):
-    """A non-revision surface was reached in the isolated measurement arm."""
+    """A surface is not supported by the PostgreSQL Native backend."""
 
     def __init__(self, surface: str):
         super().__init__(
-            f"{surface} is unavailable in the native-ledger M1 measurement arm",
+            f"{surface} is not supported by the PostgreSQL Native revision backend",
             status_code=501,
-            code="native_revision_surface_unsupported",
+            code=NATIVE_REVISION_SURFACE_UNSUPPORTED,
         )
 
 
@@ -140,6 +144,134 @@ class NativeDocumentService(DocumentService):
         if vault_id is None:
             raise NotFoundError("Vault", vault)
         return vault_id
+
+    async def _register_collection(self, vault_id: uuid.UUID, path: str) -> None:
+        """Keep the `collections` catalog in step with a native write.
+
+        Browse renders folders from `collections` rows, which only the legacy
+        write path maintained (`document_service` calls the same
+        `get_or_create` for put and move). Without this a native document is
+        served at its path and counted in its collection's totals, while the
+        folder itself is missing from the parent listing — `akb_browse` on the
+        parent shows nothing, and deleting the "collection" reports it absent.
+
+        Mirrors the legacy arm exactly: the document's own collection, never
+        its ancestors, and nothing for a vault-root document.
+
+        Best-effort on purpose. The Revision is already committed and is the
+        authority; a catalog row that could not be written is a browse defect,
+        not a lost write, and the next document into the same collection
+        retries it. Failing the call here would report a successful write as
+        an error.
+        """
+        collection = path.rsplit("/", 1)[0] if "/" in path else ""
+        if not collection:
+            return
+        try:
+            await CollectionRepository(await self._pool()).get_or_create(vault_id, collection)
+        except Exception:
+            logger.warning(
+                "native write: collection catalog row not written for %s (vault %s)",
+                collection, vault_id, exc_info=True,
+            )
+
+    async def _relink_moved_edges(
+        self, vault_id: uuid.UUID, vault: str, *, old_path: str, new_path: str,
+        resource_id: uuid.UUID | None = None,
+    ) -> None:
+        """Point the moved document's graph edges at its CURRENT path.
+
+        Explicit `akb_link` edges name a URI, and a move changes it — without
+        this an agent's links point at a path nothing writes to, and
+        `akb_relations` on the moved document comes back empty even though the
+        old URI still resolves through the move alias. Implicit body-link edges
+        are carried here too rather than left for the derived worker, which
+        would leave the old URI's rows behind until its intent is applied.
+
+        This runs AFTER the authoritative commit and outside its transaction,
+        so two moves can commit A→B→C while their hooks finish in the opposite
+        order. Replaying the old→new step is what then left the edge on the
+        intermediate path: the delayed A→B hook rewrote an endpoint the B→C
+        hook had already carried to C (akb#655). So the transition is not
+        replayed at all. The resource's head path is read under its row lock
+        and every edge that resource owns is set to it — a late or repeated run
+        writes the same value the timely one did.
+
+        ``resource_id`` is the moved resource; the caller has it. When it is
+        absent the resource is resolved from the paths, newest first. That
+        fallback is safe by construction: a path that no live resource holds
+        resolves to nothing, and a path a DIFFERENT resource has taken over
+        resolves to that resource — whose head path is the path we just looked
+        it up by, making the sync a no-op either way.
+        """
+        if old_path == new_path:
+            return
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if resource_id is None:
+                    resource_id = await self._resource_that_held(
+                        conn, vault_id, new_path, old_path,
+                    )
+                    if resource_id is None:
+                        return
+                current_path = await conn.fetchval(
+                    """
+                    SELECT current_path FROM native_resources
+                     WHERE namespace_id = $1 AND resource_id = $2
+                       AND surface = 'document' AND lifecycle = 'live'
+                     FOR UPDATE
+                    """,
+                    vault_id, resource_id,
+                )
+                if current_path is None:
+                    # Already deleted — the delete path owns that cleanup, and
+                    # repointing a dead resource's edges would only recreate
+                    # rows it is about to drop.
+                    return
+                await sync_native_document_edge_uris(
+                    conn, vault_id, vault, resource_id, current_path,
+                    adopt_path=old_path,
+                )
+
+    @staticmethod
+    async def _resource_that_held(
+        conn, vault_id: uuid.UUID, new_path: str, old_path: str,
+    ) -> uuid.UUID | None:
+        """Best-effort identity for a caller that only knows the two paths.
+
+        Live resource at the new path, then at the old one, then the native
+        path-alias ledger — which is the only arm that still answers once the
+        resource has moved on again, and is exactly the reordered-hook case.
+        Each arm is safe: a path a DIFFERENT resource has taken over resolves
+        to that resource, whose head path is the path we looked it up by, so
+        the sync is a no-op.
+        """
+        for candidate in (new_path, old_path):
+            found = await conn.fetchval(
+                """
+                SELECT resource_id FROM native_resources
+                 WHERE namespace_id = $1 AND surface = 'document'
+                   AND lifecycle = 'live' AND current_path = $2
+                """,
+                vault_id, candidate,
+            )
+            if found is not None:
+                return found
+        return await conn.fetchval(
+            """
+            SELECT a.resource_id
+              FROM native_resource_path_aliases a
+              JOIN native_resources r
+                ON r.namespace_id = a.namespace_id AND r.resource_id = a.resource_id
+             WHERE a.namespace_id = $1 AND a.surface = 'document'
+               AND a.old_path = $2 AND a.retired_revision_id IS NULL
+               AND r.lifecycle = 'live'
+             ORDER BY a.created_at DESC
+             LIMIT 1
+            """,
+            vault_id, old_path,
+        )
 
     @staticmethod
     def _has_complete_native_frontmatter(frontmatter: dict) -> bool:
@@ -737,6 +869,7 @@ class NativeDocumentService(DocumentService):
                 asset_ids=asset_ids,
             )
         content_hash = _certified_content_hash(raw)
+        await self._register_collection(vault_id, final_path)
         return DocumentPutResponse(
             uri=doc_uri(req.vault, final_path),
             vault=req.vault,
@@ -1127,6 +1260,11 @@ class NativeDocumentService(DocumentService):
                 previous_revision=result.parent_revision_id,
                 previous_path=current.path,
             )
+        await self._relink_moved_edges(
+            vault_id, vault, old_path=current.path, new_path=result.path,
+            resource_id=result.resource_id,
+        )
+        await self._register_collection(vault_id, result.path)
         return DocumentPutResponse(
             uri=doc_uri(vault, result.path),
             vault=vault,

@@ -64,7 +64,13 @@ async def _fresh_database():
     pool = None
     try:
         await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89):
+        # 112 is here because the derived pipeline now writes `edges`, and that
+        # table's resource-identity foreign keys and partial indexes come from
+        # the migration, not from init.sql (init.sql re-runs against existing
+        # databases, where an index on a column `CREATE TABLE IF NOT EXISTS`
+        # never added would fail the boot schema). Without it this fixture
+        # builds an `edges` no deployment has.
+        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89, 112):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None

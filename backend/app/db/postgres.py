@@ -382,6 +382,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "109_users_email_lower_uniq.py",  # case-insensitive uniqueness on users.email (#551)
         "110_search_degradation_daily.py",  # daily search degradation counters + per-cause breakdown (akb#612)
         "111_bm25_recompute_resume.py",  # durable BM25 recompute cursor + term accumulator (akb#616)
+        "112_edges_resource_identity.py",  # anchor graph edges to native resource identity (akb#654/#655/#656)
     ):
         if filename in applied:
             continue

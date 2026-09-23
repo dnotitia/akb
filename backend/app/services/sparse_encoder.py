@@ -6,21 +6,24 @@
 - Vocab: each unique term gets a stable integer id in `bm25_vocab`. Ids are
   NEVER reassigned — vector-store sparse vectors reference them, so a mutation
   would corrupt every already-indexed chunk.
-- Corpus stats (`bm25_stats`): N, avgdl, tokenizer version. Can lag reality;
-  quality degrades slightly until `recompute_stats()` runs.
+- External corpus stats (`bm25_stats`): N, avgdl, tokenizer version, plus
+  document frequencies in `bm25_vocab`. Posting/arrays and other pre-baked
+  consumers use these weights; Seahorse DB receives them at search time.
+  VectorChord uses its own index statistics and does not read them for scoring.
 - Query encoding goes through the same tokenizer + vocab; OOV terms are
   dropped silently.
 
 Two doc/query weight conventions live behind the same public API,
-selected by ``settings.vector_store_driver``:
+selected by the driver and, for pgvector, the sparse shape:
 
-  - **pre-baked** (pgvector, qdrant, seahorse-cloud): doc weight =
+  - **pre-baked** (pgvector posting/arrays, qdrant, seahorse-cloud): doc weight =
     saturated TF, query weight = IDF. The dot product yields BM25
     directly — the vector store doesn't need to know about BM25 at
     all, and pgvector's posting table just sums products.
-  - **raw** (seahorse-db): doc weight = raw TF (token count), query
-    weight = 1.0. The vector store applies the BM25 formula itself
-    from (N, avgdl, df-per-query-term) metadata passed at search time.
+  - **raw** (pgvector vchord, seahorse-db, seahorse-db-grpc): doc weight =
+    raw TF (token count), query weight = 1.0. VectorChord computes BM25 from
+    its index statistics. Seahorse DB computes BM25 from external
+    (N, avgdl, df-per-query-term) metadata passed at search time.
     Sending pre-baked weights here causes double-saturation on the
     doc side AND double-IDF on the query side; the BM25 ranking
     becomes proportional to IDF² × saturated_TF instead of
@@ -53,6 +56,7 @@ from kiwipiepy import Kiwi
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.services import bm25_maintenance
 
 logger = logging.getLogger("akb.sparse_encoder")
 
@@ -355,6 +359,14 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
     """Return {term: term_id} for given terms. New terms get fresh ids from
     the sequence. Existing terms are looked up. df is NOT incremented here —
     df/N/avgdl are rebuilt by `recompute_stats()`.
+
+    Almost every term an encoder sees already exists, so existing terms are
+    READ, not upserted. `ON CONFLICT DO UPDATE` with a no-op SET still locks
+    each existing row until its transaction ends, writes a new row version and
+    calls `nextval()` for every term — so encoders sharing common terms queued
+    on the same rows. On a live 2.1M-chunk sweep that queue was 42% of the
+    writers' sampled wait, and the vocabulary had taken 161M updates for 953k
+    rows. A plain read takes no row lock; only unseen terms are inserted.
     """
     uniq = list({t for t in terms if t})
     if not uniq:
@@ -362,24 +374,42 @@ async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Upsert: existing rows stay untouched (including their term_id);
-        # new rows get a fresh id from the sequence.
-        # ORDER BY enforces a deterministic row-lock acquisition order so
-        # concurrent encoders processing documents with overlapping vocab
-        # (English stopwords are the dominant case) don't deadlock on the
-        # ON CONFLICT row locks.
         rows = await conn.fetch(
-            """
-            INSERT INTO bm25_vocab (term, term_id)
-            SELECT t, nextval('bm25_term_id_seq')
-              FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
-            ON CONFLICT (term) DO UPDATE
-                SET updated_at = bm25_vocab.updated_at   -- no-op, returns existing row
-            RETURNING term, term_id
-            """,
+            "SELECT term, term_id FROM bm25_vocab WHERE term = ANY($1::text[])",
             uniq,
         )
-    return {r["term"]: int(r["term_id"]) for r in rows}
+        ids = {r["term"]: int(r["term_id"]) for r in rows}
+        missing = [t for t in uniq if t not in ids]
+        if missing:
+            # ORDER BY gives concurrent callers inserting overlapping new
+            # terms one acquisition order, so they wait instead of deadlocking.
+            # DO NOTHING waits for a conflicting uncommitted insert to finish
+            # and then skips the term; the follow-up read below collects it.
+            rows = await conn.fetch(
+                """
+                INSERT INTO bm25_vocab (term, term_id)
+                SELECT t, nextval('bm25_term_id_seq')
+                  FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
+                ON CONFLICT (term) DO NOTHING
+                RETURNING term, term_id
+                """,
+                missing,
+            )
+            ids.update((r["term"], int(r["term_id"])) for r in rows)
+            raced = [t for t in missing if t not in ids]
+            if raced:
+                rows = await conn.fetch(
+                    "SELECT term, term_id FROM bm25_vocab WHERE term = ANY($1::text[])",
+                    raced,
+                )
+                ids.update((r["term"], int(r["term_id"])) for r in rows)
+    unresolved = [t for t in uniq if t not in ids]
+    if unresolved:
+        # The vocabulary is append-only, so this cannot happen by design. If it
+        # does, refuse: `encode_document` would otherwise drop the terms and
+        # store a vector that silently misses part of the document.
+        raise RuntimeError(f"bm25 vocabulary lost {len(unresolved)} term(s) mid-call")
+    return ids
 
 
 async def lookup_term_ids(terms: Iterable[str]) -> dict[str, int]:
@@ -501,7 +531,7 @@ async def encode_document(
 ) -> tuple[list[int], list[float]]:
     """Encode a document chunk to a sparse (indices, values) tuple.
 
-    Weight convention depends on the active driver (see module
+    Weight convention depends on the active driver and sparse shape (see module
     docstring). Both branches share tokenization + vocab insertion.
     """
     tokens = await tokenize(text)
@@ -512,11 +542,10 @@ async def encode_document(
     vocab = await get_or_create_term_ids(term_counts.keys())
 
     if _use_raw_weights(sparse_shape):
-        # Raw TF. The downstream driver (seahorse-db) feeds these
-        # into Coral's inverted index as raw term frequencies; the
-        # BM25 saturation/normalization is applied by the index at
-        # search time using the (k, b, avgdl) parameters the driver
-        # passes in `hybrid_search`.
+        # Raw positive integer TF, represented as floats by the shared API.
+        # VectorChord owns saturation, document length and index statistics.
+        # Seahorse DB applies BM25 using metadata supplied by its driver.
+        # Neither branch may pre-saturate TF or load external stats here.
         raw_indices: list[int] = []
         raw_values: list[float] = []
         for term, tf in term_counts.items():
@@ -542,8 +571,7 @@ async def encode_document(
     dl = sum(term_counts.values())
     dl_norm = 1 - b + b * (dl / avgdl)
 
-    # df for the doc's terms is looked up against CURRENT vocab df (fine for
-    # indexing — not used at doc encoding time since we separate weights).
+    # Document encoding does not read df; IDF belongs to the query side.
     indices: list[int] = []
     values: list[float] = []
     for term, tf in term_counts.items():
@@ -563,7 +591,7 @@ async def encode_query(
     """Encode a query to a sparse (indices, values) tuple. OOV terms
     are dropped; no new terms are registered.
 
-    Weight convention depends on the active driver (see module
+    Weight convention depends on the active driver and sparse shape (see module
     docstring).
     """
     tokens = await tokenize(text)
@@ -575,11 +603,10 @@ async def encode_query(
         return [], []
 
     if _use_raw_weights(sparse_shape):
-        # Driver-side BM25: query weight = 1.0; the inverted index
-        # multiplies by IDF derived from the per-term-df metadata
-        # `hybrid_search` ships. OOV-but-in-vocab terms still pass
-        # through with weight 1.0 — the index will compute their IDF
-        # from the df we send.
+        # One weight per known term, regardless of query repetition.
+        # VectorChord computes IDF from its index; Seahorse DB obtains the
+        # external df metadata in its search driver, not in this encoder.
+        # Known terms absent from the current index still pass through.
         indices = list(vocab.values())
         values = [1.0] * len(indices)
         return indices, values
@@ -605,7 +632,9 @@ async def encode_query(
 # ── Corpus stats recompute ────────────────────────────────────────
 
 
-_BM25_RECOMPUTE_LOCK_KEY = 987654321
+# Keep the private name as a rolling-compatibility alias for callers/tests
+# that still import it. The value is owned by the shared maintenance module.
+_BM25_RECOMPUTE_LOCK_KEY = bm25_maintenance.BM25_RECOMPUTE_LOCK_KEY
 
 
 async def _open_run(conn, tname: str, tver: str) -> dict:
@@ -671,7 +700,11 @@ async def _open_run(conn, tname: str, tver: str) -> dict:
     return dict(fresh)
 
 
-async def recompute_stats(batch_size: int = 500) -> dict:
+async def recompute_stats(
+    batch_size: int = 500,
+    *,
+    defer_if_vector_queue: bool = False,
+) -> dict:
     """Rebuild df (per term) and (total_docs, avgdl). Safe to run repeatedly.
 
     Streams chunks in keyset-paginated batches and accumulates document
@@ -695,6 +728,10 @@ async def recompute_stats(batch_size: int = 500) -> dict:
     waiting for the leader to finish.  With a durable cursor it does one more
     thing: the replica that takes the lock next continues the departing one's
     scan rather than starting over.
+
+    ``defer_if_vector_queue`` is enabled by the background refresher. Direct
+    callers retain the historical manual/initialization behavior and may
+    intentionally rebuild stats while chunks are waiting for vector indexing.
     """
     pool = await get_pool()
     tname, tver = tokenizer_info()
@@ -715,8 +752,30 @@ async def recompute_stats(batch_size: int = 500) -> dict:
                 "vocab_size": None,
                 "tokenizer": f"{tname}@{tver}",
                 "skipped": True,
+                "skip_reason": bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD,
             }
         try:
+            # Take the exclusive legacy lock before observing the queue. The
+            # bulk maintenance guard holds a shared lock on this same key, so
+            # this ordering keeps the queue check and the start of the scan
+            # inside the race-free bulk exclusion boundary.
+            if (
+                defer_if_vector_queue
+                and await bm25_maintenance.vector_upsert_queue_nonempty(lock_conn)
+            ):
+                logger.info(
+                    "BM25 recompute deferred: vector upsert queue is nonempty"
+                )
+                return {
+                    "total_docs": None,
+                    "avgdl": None,
+                    "vocab_size": None,
+                    "tokenizer": f"{tname}@{tver}",
+                    "skipped": True,
+                    "skip_reason": (
+                        bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_VECTOR_QUEUE
+                    ),
+                }
             # The invalidation boundary belongs to the RUN, not to this call.
             # Chunk writes that commit while we are walking the corpus advance
             # the sequence past this value, so a later tick will conservatively
@@ -886,13 +945,10 @@ async def vocab_size() -> int:
 
 # ── Stats refresher background task ───────────────────────────────
 #
-# `recompute_stats()` rebuilds bm25_stats(total_docs, avgdl) and
-# bm25_vocab.df from the live chunks corpus. Without it the encoder
-# falls back to total_docs=0 (encode_query returns uniform 1.0 weights),
-# which degrades the sparse leg of hybrid search — silently. The
-# refresher runs the recompute on startup so a fresh install isn't
-# stuck at zero, then on a fixed cadence so a long-running deploy
-# stays in sync as docs are added/removed/updated.
+# `recompute_stats()` rebuilds external N/avgdl/df for consumers named by
+# settings.bm25_external_stats_consumers. VChord owns its own index statistics;
+# its vocab term-ID registration remains in the encoding path even when the
+# external refresher is disabled. Keep this refresher for posting rollback.
 
 # Skip a tick until this many source-corpus mutations have accumulated since
 # the last recompute.  The mutation sequence tracks inserts, deletes, and
@@ -1009,15 +1065,22 @@ async def _refresh_tick(retry_secs: float = _SKIPPED_RETRY_SECS) -> int:
     shortly", and `configure_idle_secs` refuses while the runner is live, so
     the wait belongs here.
     """
+    if not settings.bm25_external_stats_consumers:
+        return 0
     if not await _should_recompute():
         return 0
+    last_skip_reason = bm25_maintenance.BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD
     for attempt in range(_SKIPPED_RETRIES + 1):
-        if not (await recompute_stats()).get("skipped"):
+        outcome = await recompute_stats(defer_if_vector_queue=True)
+        if not outcome.get("skipped"):
             return 0
+        reason = outcome.get("skip_reason")
+        if reason in bm25_maintenance.BM25_RECOMPUTE_SKIP_REASONS:
+            last_skip_reason = reason
         if attempt < _SKIPPED_RETRIES:
             await asyncio.sleep(retry_secs)
     logger.info(
-        "BM25 recompute deferred: the lock is held by a running recompute"
+        "BM25 recompute deferred after retries: %s", last_skip_reason
     )
     return 0
 
@@ -1035,6 +1098,9 @@ def start_stats_refresher(interval_secs: int = 1800) -> None:
     periodic tick.  A fresh or tokenizer-changed database recomputes promptly,
     while restarting a stable 960k-chunk deployment performs no corpus scan.
     """
+    if not settings.bm25_external_stats_consumers:
+        logger.info("External BM25 stats refresher disabled: verified VChord-only deployment")
+        return
     if _refresher.is_running():
         return
     _refresher.configure_idle_secs(interval_secs)
@@ -1072,6 +1138,17 @@ async def _run_progress(conn) -> dict | None:
     }
 
 
+def external_stats_policy_snapshot() -> dict:
+    """Process policy, separate from shared DB success/progress observations."""
+    consumers = settings.bm25_external_stats_consumers
+    return {
+        "mode": settings.bm25_external_stats_mode,
+        "required": bool(consumers),
+        "consumers": consumers,
+        "refresher_running_in_this_process": _refresher.is_running(),
+    }
+
+
 async def stats_snapshot() -> dict:
     """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
     so a stuck refresher (total_docs=0 while chunks exist) is visible."""
@@ -1087,8 +1164,10 @@ async def stats_snapshot() -> dict:
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
         current_revision = await _current_corpus_revision(conn)
         recompute = await _run_progress(conn)
+        recompute_active = await bm25_maintenance.active_bm25_recompute(conn)
     if not row:
         return {
+            "external_stats": external_stats_policy_snapshot(),
             "total_docs": 0, "avgdl": 0.0,
             "tokenizer": "kiwi@0",
             "vocab_size": int(vocab or 0),
@@ -1098,9 +1177,11 @@ async def stats_snapshot() -> dict:
             "pending_changes": current_revision,
             "last_recomputed_at": None,
             "recompute_in_flight": recompute,
+            "recompute_active": recompute_active,
         }
     source_revision = int(row["source_revision"] or 0)
     return {
+        "external_stats": external_stats_policy_snapshot(),
         "total_docs": int(row["total_docs"] or 0),
         "avgdl": float(row["avgdl"] or 0.0),
         "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
@@ -1113,4 +1194,5 @@ async def stats_snapshot() -> dict:
             row["updated_at"].isoformat() if row["updated_at"] else None
         ),
         "recompute_in_flight": recompute,
+        "recompute_active": recompute_active,
     }

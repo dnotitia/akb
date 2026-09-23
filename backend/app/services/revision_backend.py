@@ -1,7 +1,7 @@
 """Process-scoped selection of the document revision implementation.
 
-The stable bare-Git document service remains the default. Native is an
-explicit process-scoped choice, while the historical M1 selector remains a
+New installations default to PostgreSQL Native with prepared authority.
+Explicit Bare Git and the historical M1 selector remain a
 guarded compatibility path. Selection happens once at a composition root,
 never from request or vault data.
 """

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.15.0
+
+- Close the public editor boundary around the package-owned
+  `MarkdownEditorHandle`; raw Tiptap editors, `EditorContent`, editor
+  factories, and engine-only serialization helpers are internal.
+- Keep lower-level React composition, commands, state, source/WYSIWYG
+  synchronization, uploads, and target/reference resolution available through
+  package-owned contracts.
+
+## 0.14.0
+
+- Make WYSIWYG updates from the core and React editor hooks return canonical
+  Markdown without Tiptap's terminal continuation paragraph while keeping
+  Source edits raw for authoring-preservation workflows.
+- Add public content attributes/classes, viewer heading ids and level offsets,
+  table scroll layout, image referrer policy, and editing-surface autofocus
+  options so products do not need editor-engine DOM manipulation.
+- Move AKB editor and viewer integrations onto the shared public rendering and
+  synchronization contract, preserving target resolution and draft behavior.
+
+## 0.13.0
+
+- Add one shared Markdown block renderer for editor and viewer surfaces, with
+  nested task-item semantics and common-language code highlighting.
+- Keep supported and unsupported code fences readable without changing their
+  canonical language, content, or serialized Markdown.
+- Expose `MarkdownCodeOptions` so products can provide accessible code-region
+  copy while the shared surface owns keyboard-focusable scrolling semantics.
+
+## 0.12.0
+
+- Parse and serialize the existing `@username`, `@{unsafe username}`, and plain
+  issue-ID reference syntax through the shared Markdown schema.
+- Add product-owned stored-reference resolution for display names and runtime
+  routes without changing canonical Markdown or editor history.
+- Connect the same reference presentation to `MarkdownEditor` and
+  `MarkdownViewer`, preserving unresolved, escaped, link-label, and code text.
+
 ## 0.11.0
 
 - Add the public `MarkdownSurface` image renderer shared by editor and viewer

@@ -1,3 +1,31 @@
+# Pending release: Native installation default
+
+Breaking configuration-default change (not yet released): Settings and the
+recommended Compose/Kubernetes fresh-install paths select PostgreSQL Native.
+Before upgrading, run `preserve-revision-config` against the active app/secret
+pair and install the reviewed output. It pins previously omitted selectors to
+Bare Git without touching the database. Do not copy the fresh template over
+existing configuration or attach the Native overlay to a used Git database.
+
+Fresh installations must generate and persist identity with
+`prepare-native-config`, then explicitly bootstrap a never-used database.
+Keep the initialization image receipt while changing the workload image.
+Authority/identity mismatches fail closed. Helm, all-in-one, standalone SSO
+and Git-oriented CI remain explicit legacy Bare Git paths. Historical
+migration/history/diff/activity compatibility is retained.
+
+Two smaller breaks ride along. `deploy/k8s/deploy.sh` no longer defaults to
+`AKB_PROFILE=standalone`: it exits 2 before any cluster access, so an
+invocation that relied on the implicit profile must now name it. And
+`config/app.yaml.example` is a new-install Native template whose identity
+fields are deliberately empty, so copying it is no longer a runnable
+configuration — `CONTRIBUTING.md` pins `bare_git` for a development stack, and
+`prepare-native-config` generates the identity for a real one.
+
+See [installation and upgrade order](../docs/operations/native-installation.md).
+Publish this change only with an explicitly announced default-change release;
+this entry does not bump a version, publish an artifact or authorize rollout.
+
 # AKB Backend — Changelog
 
 The AKB backend ships as a Docker image and as the HTTP layer behind
@@ -6,6 +34,67 @@ specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
 ## Unreleased
+
+### Changed
+
+- Reserved vault-skill system-path policy denials now expose the stable
+  `reserved_system_path` error code while retaining the existing HTTP 403
+  envelope.
+
+### Personal access token issuance options
+
+Add versioned PAT capability discovery and strict issuance with permission
+presets, relative or absolute expiration, and Vault write restrictions. Shared
+connection setup exposes advanced options and a pre-submit authority summary;
+token metadata includes Vault scope, and replacement preserves restrictions and
+the original absolute expiration before separately revoking the old token.
+
+Ordinary document reads retain the user's readable Vault access; Vault scope
+limits writes and also confines raw SQL reads. This is not a new general-purpose
+Vault read isolation model. Token secrets remain visible only in the current
+creation session.
+
+**Compatibility:** PAT credentials can no longer mint tokens through self or
+administrator issuance routes. Machine provisioning requires an active service
+key explicitly listed in `admin_token_issuer_ids`, an administrator owner,
+unrestricted Vault scope and read/write authority. The allowlist defaults empty;
+operators must migrate control-plane callers before rollout. Legacy omitted,
+null or zero `expires_days` retains unlimited expiration, while negative,
+noncanonical and overflowing durations are rejected. Stored tokens are unchanged.
+Deploy all mint handlers before exposing v1 capabilities; advanced creation never
+silently retries against the legacy endpoint after dropping restrictions.
+
+### The graph and the collections catalog follow the active authority
+
+- A document written by the native arm has no legacy `documents` row — that is
+  the design. The graph layer resolved endpoints through that catalog alone, so
+  on a `postgres_native` installation every document created after the vault's
+  cutover was rejected as a missing `akb_link` endpoint while `akb_get` served
+  it, and the `links_to` edges extracted from a body naming it were dropped.
+  `_resource_exists` now asks the native ledger through the same selector and
+  population the counters use, and keeps asking the catalog too: a cutover
+  leaves pre-cutover documents there, and an endpoint that resolved yesterday
+  must keep resolving (#637).
+- Browse renders a folder from a `collections` row, which only the legacy write
+  path maintained. A native document was served at its path and counted in its
+  collection's totals while the folder itself was absent from the parent
+  listing — and deleting that "collection" reported it missing. Native `put`
+  and `move` now register the document's own collection exactly as the legacy
+  arm does. Best-effort: the Revision is already committed and is the
+  authority, so a row that could not be written is a browse defect, not a lost
+  write (#638).
+- A native `move` kept the edges pointing at the old URI. The rewrite the
+  legacy move has always done is now one helper both arms call, so an agent's
+  explicit links survive a move (#638).
+- Frontmatter relations and body links become edges on the native arm again.
+  They belong to the derived rewrite, beside chunking: the worker already
+  re-reads the verified Head under a lock and replaces derived state in one
+  transaction. It clears the previous path's implicit rows when the path
+  changed, and drops every edge of a deleted document (#638).
+- Known gap: `akb_relations` names a native endpoint by its path rather than
+  its title. The name is present either way; resolving the human title means
+  reading and verifying the Head payload the way search hydration does, and
+  that join is not worth copying into the graph module (#638).
 
 ### A third sparse shape, `vchord`, stores BM25 terms in an index
 
@@ -28,6 +117,21 @@ specifically; the proxy has its own log in
   `plan_cache_mode` is pinned to a custom plan for the duration: asyncpg always
   prepares, and a generic plan built without the filter's values took the same
   statement from 0.8ms to 1501ms on the eleventh execution.
+- The choice stays a latency decision. Materialising scores every row in scope,
+  so it stays under the exact-work cap, and a selective scope over the cap is
+  now searched index-led instead of refused. Refusing returned no sparse hits
+  for every scope between 10,000 rows and 1% of the corpus — reproduced on a
+  1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
+  shape answered it in 15ms (akb#626).
+- The first search on a new connection no longer fails. The extension defines
+  `bm25_catalog.bm25_limit` when its library loads, and the image
+  `deploy/postgres/Dockerfile` builds does not preload it, so reading the
+  setting on a session that had not yet called into the extension raised —
+  and that reached `hybrid_search` as a store failure, losing both legs. The
+  backend now loads the library before reading the setting, once per
+  connection. CI missed it because the upstream image preloads the library
+  from its CMD; the pgvector job now starts that image with a plain
+  `postgres` command, as operators run theirs (akb#615).
 - The result is filtered on the sign of the score. `<&>` orders the whole table
   rather than filtering it — a document holding no query term scores exactly
   `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
@@ -54,7 +158,12 @@ specifically; the proxy has its own log in
   pass ran. Convergence is the run that writes zero.
 - The index is built `CONCURRENTLY`, outside `_do_ensure`. That method runs its
   DDL in one transaction, and a build over a corpus this size holds a
-  `ShareLock` against every INSERT for its duration.
+  `ShareLock` against every INSERT for its duration. `_do_ensure` now builds
+  it only for an empty table (a fresh install) and refuses a populated one
+  that lacks it. Before, selecting the shape ahead of `--index` built the
+  index at startup, in that transaction, over whatever part of the column was
+  filled — bypassing `--index`'s own refusal and serving a partial column
+  with no sign of it (akb#615).
 - Writes are conditioned on the row still holding the content that was encoded,
   so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
   than being stamped with tokens from text it no longer has.
@@ -338,6 +447,17 @@ specifically; the proxy has its own log in
 
 ### Indexing
 
+- Encoding a chunk no longer locks the vocabulary rows of terms that already
+  exist. Term ids were resolved with `INSERT ... ON CONFLICT DO UPDATE` whose
+  update was a no-op, and a no-op update still locks each existing row until
+  its transaction ends, writes a new row version, and draws a sequence value
+  for every term. Every concurrent indexer and backfill writer shares the common
+  terms, so they queued on the same rows: on a 2.1M-chunk backfill, waiting on
+  each other's vocabulary rows was 42% of the writers' sampled wait, and a
+  long-lived vocabulary had taken 161M updates for 953k rows. Known terms are
+  now read without a lock, only unseen terms are inserted (`DO NOTHING`), and a
+  term another writer committed first is read back. Term ids do not change; the
+  sequence now advances only for new terms.
 - A NUL byte in a body no longer costs the document its place in ranked search.
   Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
   does not, so indexing raised `CharacterNotInRepertoireError` on every attempt

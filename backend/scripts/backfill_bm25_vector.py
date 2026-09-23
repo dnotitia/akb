@@ -15,13 +15,26 @@ in, ahead of the flip, while `posting` is still serving.
     python -m scripts.backfill_bm25_vector --since '2026-09-18T12:00:00+00:00'
     python -m scripts.backfill_bm25_vector --index
 
-WHY IT NEEDS NO CURSOR AND NO DUAL WRITE
-----------------------------------------
+NULL-ONLY WORK AND CHECKPOINTED FULL SWEEPS
+-------------------------------------------
 `NULL` means "nothing has encoded this row", and the encoder writes `'{}'` for a
 document with no content-bearing terms rather than leaving it NULL — so
 `sparse_bm25 IS NULL` *is* the queue, and an interrupted run resumes by asking
-the same question again. There is no progress table to keep consistent, and
-nothing to clean up.
+the same question again. A `--since` full sweep is different: it deliberately
+revisits already-filled rows and, without a cursor, repeats that prefix after
+every interruption. Operators can opt into a database-owned checkpoint using
+`--sweep-id`, a new `--attempt-id` for each attempt, `--protect-since`, and an
+immutable `--source-revision`. A resume adds `--resume-sweep` with the same
+sweep ID and windows. The checkpoint lives beside the chunks and records only
+writer waves whose transactions all committed. A lost checkpoint reply can
+replay a bounded wave; it must never skip uncommitted rows. A FAILED attempt's
+operational ownership must be reconciled separately before any new attempt.
+
+The checkpoint records a visited prefix, not freshness. After end-of-keyspace,
+old posting writers must drain and a cursor-zero pass from the ORIGINAL
+protected timestamp must catch up rewrites, late commits and inserts behind
+the cursor. A selective table restore or independently restored main/vector
+databases needs separate recovery proof before a checkpoint can be trusted.
 
 The window is covered without teaching the write path to write both columns.
 The `posting` branch of `upsert_one` stamps `indexed_at = NOW()` on every write
@@ -84,15 +97,21 @@ Two things follow, and both are in this script rather than in advice:
   that index's cost is dominated by vocabulary breadth. `--prepare` adds only
   the column; `--index` builds it CONCURRENTLY at the end, over a column that
   is already full, so the build does not hold a ShareLock against every INSERT.
-- **The writes are split.** Overlapping the disk waits is the only lever that
-  works here: one writer measured 4-16 rows/s, two 32.3 and 32.5 (two
-  orderings, 0.6% apart), four 45-62. `--writers` defaults to four.
+- **The writes can be split and paced.** Overlapping the disk waits is the only
+  throughput lever that worked here: one writer measured 4-16 rows/s, two 32.3
+  and 32.5 (two orderings, 0.6% apart), four 45-62. `--write-batch-size`
+  bounds each statement, `--writers` bounds a concurrent wave, and
+  `--write-pause-secs` yields between completed waves. Conservative canaries
+  can tune those independently without changing the 500-row read page.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import math
 import random
+import re
 import sys
 import time
 import uuid
@@ -103,7 +122,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncpg
 
-from scripts.bm25_run_lock import run_exclusive
+from scripts.bm25_run_lock import run_bulk_exclusive, run_exclusive
+from scripts.bm25_sweep_checkpoint import SweepCheckpoint, open_checkpoint
 
 from app.config import settings
 from app.db.postgres import close_pool, init_db
@@ -390,8 +410,15 @@ async def _apply_once(pool, schema: str, rows) -> int:
     return int(res.split()[-1]) if res.startswith("UPDATE") else 0
 
 
-async def _pass(pool, schema: str, since: datetime | None,
-                writers: int = _WRITERS) -> int:
+async def _pass(
+    pool,
+    schema: str,
+    since: datetime | None,
+    writers: int = _WRITERS,
+    write_batch_size: int = _BATCH,
+    write_pause_secs: float = 0.0,
+    checkpoint: SweepCheckpoint | None = None,
+) -> int:
     """One forward sweep over the primary key.
 
     Keyset pagination rather than a bare `WHERE ... LIMIT`: with the latter,
@@ -404,8 +431,9 @@ async def _pass(pool, schema: str, since: datetime | None,
     sweep just filled STILL satisfies the window it was read under. Only the
     cursor moving past it stops the query from handing it back forever.
 
-    It is still not a resume cursor: nothing is persisted, and an interrupted
-    run simply sweeps again and skips whatever is already filled.
+    Without a checkpoint, the cursor is in memory only. In `--since` mode an
+    interrupted run re-reads filled rows too; it does not skip them. An
+    optional database checkpoint acknowledges only completed writer waves.
     """
     sql = f"""
         SELECT chunk_id, content, indexed_at
@@ -414,32 +442,93 @@ async def _pass(pool, schema: str, since: datetime | None,
          ORDER BY chunk_id
          LIMIT {_BATCH}
     """
-    cursor = uuid.UUID(int=0)
+    cursor = checkpoint.cursor if checkpoint is not None else uuid.UUID(int=0)
     written = 0
     seen = 0
     started = time.monotonic()
+    completed_wave = False
     while True:
         async with pool.acquire() as c:
             args = (cursor, since) if since is not None else (cursor,)
             rows = await c.fetch(sql, *args)
         if not rows:
             break
-        cursor = rows[-1]["chunk_id"]
+        page_end = rows[-1]["chunk_id"]
         seen += len(rows)
-        # Split the batch and write the parts at once. Encoding still happens
-        # inside each part, so the tokenizer stays busy while the writes wait
-        # on disk — which is the whole reason this is split.
-        size = -(-len(rows) // writers)
-        parts = [rows[i:i + size] for i in range(0, len(rows), size)]
-        written += sum(await _gather_drained(
-            *(_apply(pool, schema, part) for part in parts)
-        ))
+        # Fixed-size write batches make the load knob independent from the
+        # reader page and writer count. Run only one writer-bounded wave at a
+        # time, and pause between completed waves only after every write task
+        # has returned (and therefore released its transaction and connection).
+        # Preserve the historical default split: one read page is balanced
+        # across the configured writers. The explicit batch size is a ceiling,
+        # so a smaller value can create additional paced waves without a larger
+        # value making the default writers ineffective.
+        balanced_size = -(-len(rows) // writers)
+        statement_size = min(write_batch_size, balanced_size)
+        parts = [
+            rows[i:i + statement_size]
+            for i in range(0, len(rows), statement_size)
+        ]
+        for i in range(0, len(parts), writers):
+            if completed_wave and write_pause_secs:
+                await asyncio.sleep(write_pause_secs)
+            wave = parts[i:i + writers]
+            wave_written = sum(await _gather_drained(
+                *(_apply(pool, schema, part) for part in wave)
+            ))
+            if checkpoint is not None:
+                # _gather_drained returns only after every writer's transaction
+                # has committed. If this receipt fails, replay the wave: never
+                # infer durable progress from a partial or ambiguous write.
+                await checkpoint.advance(
+                    wave[-1][-1]["chunk_id"],
+                    sum(len(part) for part in wave),
+                    wave_written,
+                )
+            written += wave_written
+            completed_wave = True
+        cursor = page_end
         elapsed = time.monotonic() - started
         print(f"\r  {seen} read · {written} written · "
               f"{seen / elapsed:.0f}/s", end="", flush=True)
     if seen:
         print()
+    if checkpoint is not None:
+        await checkpoint.mark_exhausted()
     return written
+
+
+def _encoding_contract() -> str:
+    """Fail closed on a changed backfill, tokenizer or vector-store contract."""
+    digest = hashlib.sha256()
+    for module in (sys.modules[__name__], sparse_encoder,
+                   sys.modules[PgvectorStore.__module__]):
+        if not module.__file__:
+            raise RuntimeError("BM25 encoding source file is unavailable")
+        path = Path(module.__file__)
+        digest.update(path.name.encode())
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _finite_nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number") from None
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return parsed
 
 
 async def main() -> None:
@@ -457,19 +546,56 @@ async def main() -> None:
     ap.add_argument("--since", metavar="TIMESTAMP",
                     help="re-encode rows rewritten after this instant "
                          "(ISO 8601); use the start of the previous pass")
+    ap.add_argument("--sweep-id", type=uuid.UUID,
+                    help="stable logical full-sweep UUID for database progress")
+    ap.add_argument("--attempt-id", type=uuid.UUID,
+                    help="new UUID for each checkpointed execution attempt")
+    ap.add_argument("--protect-since", metavar="TIMESTAMP",
+                    help="unchanged old-writer catch-up boundary for this sweep")
+    ap.add_argument("--source-revision", metavar="SHA",
+                    help="immutable source revision bound to the sweep")
+    ap.add_argument("--resume-sweep", action="store_true",
+                    help="claim an existing sweep with a new attempt UUID")
     ap.add_argument("--tokenizer-processes", type=int, default=None,
                     help="Kiwi process pool size (default: the app setting)")
-    ap.add_argument("--writers", type=int, default=_WRITERS,
+    ap.add_argument("--writers", type=_positive_int, default=_WRITERS,
                     help=f"UPDATE statements in flight at once (default {_WRITERS}); "
                          "the write is disk-latency bound, so this is the knob "
                          "that matters")
+    ap.add_argument(
+        "--write-batch-size",
+        type=_positive_int,
+        default=_BATCH,
+        help=f"maximum rows per UPDATE statement (default {_BATCH})",
+    )
+    ap.add_argument(
+        "--write-pause-secs",
+        type=_finite_nonnegative_float,
+        default=0.0,
+        help="seconds to pause between writer waves (default 0)",
+    )
     args = ap.parse_args()
-    if args.writers < 1:
-        ap.error("--writers must be positive")
 
     since = datetime.fromisoformat(args.since) if args.since else None
     if since is not None and since.tzinfo is None:
         raise SystemExit("--since needs a timezone, e.g. ...T12:00:00+00:00")
+    checkpoint_requested = any((
+        args.sweep_id, args.attempt_id, args.protect_since,
+        args.source_revision, args.resume_sweep,
+    ))
+    protect_since = None
+    if checkpoint_requested:
+        if not all((args.sweep_id, args.attempt_id, args.protect_since,
+                    args.source_revision, since)) or args.check or args.prepare or args.index:
+            raise SystemExit(
+                "checkpointed sweep requires --since, --sweep-id, --attempt-id, "
+                "--protect-since and --source-revision; it cannot use a mode flag"
+            )
+        protect_since = datetime.fromisoformat(args.protect_since)
+        if protect_since.tzinfo is None:
+            raise SystemExit("--protect-since needs a timezone")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+            raise SystemExit("--source-revision must be a full lowercase commit SHA")
 
     await init_db()
     schema = settings.vector_store_schema
@@ -508,10 +634,38 @@ async def main() -> None:
             # before this instant but commit after this sweep visits their row.
             async with pool.acquire() as c:
                 started_at = await c.fetchval("SELECT now()")
+            if protect_since is not None and protect_since >= started_at:
+                raise SystemExit("--protect-since must predate this DB run")
+
+            checkpoint = None
+            if checkpoint_requested:
+                checkpoint = await open_checkpoint(
+                    pool, schema,
+                    sweep_id=args.sweep_id,
+                    attempt_id=args.attempt_id,
+                    since=since,
+                    protect_since=protect_since,
+                    source_revision=args.source_revision,
+                    encoding_contract=_encoding_contract(),
+                    resume=args.resume_sweep,
+                )
+                print(
+                    f"  sweep {args.sweep_id} · attempt {args.attempt_id} · "
+                    f"resume after {checkpoint.cursor} · "
+                    f"{checkpoint.seen} visited, {checkpoint.written} written"
+                )
 
             sparse_encoder.start_tokenizer_pool(args.tokenizer_processes)
             try:
-                written = await _pass(pool, schema, since, args.writers)
+                written = await _pass(
+                    pool,
+                    schema,
+                    since,
+                    args.writers,
+                    args.write_batch_size,
+                    args.write_pause_secs,
+                    checkpoint,
+                )
             finally:
                 sparse_encoder.stop_tokenizer_pool()
 
@@ -519,19 +673,30 @@ async def main() -> None:
             print(f"wrote {written} · {nulls} never encoded")
 
             # Re-counting the SAME --since window includes rows just written.
-            # Zero writes is a progress signal only; concurrent identity-guard
-            # skips and late commits still require final freshness verification.
-            if written == 0 and nulls == 0:
+            # End-of-keyspace is not freshness: posting writers can change a
+            # chunk behind the cursor, including a late commit from an older
+            # transaction. Never advance the protected boundary to this run's
+            # start just because a checkpointed sweep exhausted its cursor.
+            if checkpoint is not None:
+                print("  sweep exhausted, not converged; drain old-shape writers "
+                      "and verify protected-window catch-up before a shape flip.")
+                next_since = protect_since
+            elif written == 0 and nulls == 0:
                 print("  no writes or NULLs observed in this pass; final writer-drain "
                       "and freshness verification are still required before a shape flip.")
+                next_since = started_at
             else:
                 print("  not converged yet; run again with:")
+                next_since = started_at
             print(f"  python -m scripts.backfill_bm25_vector "
-                  f"--since '{started_at.isoformat()}'")
+                  f"--since '{next_since.isoformat()}'")
         if args.check:
             await execute()
         else:
-            await run_exclusive(pool, schema, execute, announce=True)
+            async def execute_with_vector_ownership():
+                await run_exclusive(pool, schema, execute, announce=True)
+
+            await run_bulk_exclusive(execute_with_vector_ownership)
     finally:
         if pool is not None:
             await pool.close()

@@ -77,34 +77,37 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
-      # The BM25 index extension, for `tests/test_vchord_sparse_shape_postgres.py`.
-      # Without this service those tests skip — and a skip here reads exactly
-      # like a pass, which is the failure this job's file list already guards
-      # against for a different reason.
+    steps:
+      - uses: actions/checkout@v4
+
+      # The BM25 index extension, for the VChord test modules. Without this
+      # server those tests skip — and a skip here reads exactly like a pass,
+      # which is the failure this job's file list already guards against for
+      # a different reason.
       #
       # This is the SAME digest `deploy/postgres/Dockerfile` copies the
       # extension out of, so CI exercises the version an operator building
-      # that image would get. It is the upstream image rather than ours
-      # because a `services:` entry must be pullable, and this one happens to
-      # ship pgvector too (0.8.1) — enough for the `vector` column the shared
-      # DDL creates. It is NOT the production base: that is
-      # `pgvector/pgvector:pg16`, above, at a newer pgvector. Nothing in these
-      # tests reads a vector, so the difference stays inside the DDL.
-      vchord:
-        image: tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d
+      # that image would get; it happens to ship pgvector too (0.8.1), enough
+      # for the `vector` column the shared DDL creates. It is NOT the
+      # production base: that is `pgvector/pgvector:pg16`, above, at a newer
+      # pgvector. Nothing in these tests reads a vector.
+      #
+      # It is started here rather than as a `services:` entry because the
+      # image's CMD preloads the library (`-c shared_preload_libraries=...`)
+      # and a service cannot override CMD. The image operators build does not
+      # preload it, and that difference is not confined to the DDL: without a
+      # preload the extension's settings exist only once a session has called
+      # into it, and a preloaded server hid the failure of every new pooled
+      # connection's first search (akb#615). A plain `postgres` command runs
+      # the same bytes the way operators do.
+      - name: Start the BM25 extension server, without a preload
         env:
-          POSTGRES_USER: akb
-          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
-          POSTGRES_DB: akb
-        ports:
-          - 15433:5432
-        options: >-
-          --health-cmd "pg_isready -U akb"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-    steps:
-      - uses: actions/checkout@v4
+          VCHORD_PASSWORD: akb  # pragma: allowlist secret
+        run: |
+          docker run -d --name vchord -p 15433:5432 \
+            -e POSTGRES_USER=akb -e POSTGRES_PASSWORD="$VCHORD_PASSWORD" -e POSTGRES_DB=akb \
+            tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d \
+            postgres
 
       - uses: actions/setup-python@v5
         with:
@@ -142,6 +145,17 @@ jobs:
           asyncio.run(main())
           PY
 
+      # Over TCP: while the image initialises it runs a temporary server on
+      # the Unix socket only, which would answer a socket probe too early.
+      - name: Wait for the BM25 extension server
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec vchord pg_isready -h 127.0.0.1 -U akb -q && exit 0
+            sleep 1
+          done
+          docker logs vchord
+          exit 1
+
       - name: Run pgvector DB-backed e2e tests
         working-directory: backend
         env:
@@ -155,7 +169,7 @@ jobs:
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
-          # The vchord service above. The sparse-shape tests create and drop
+          # The vchord server started above. The sparse-shape tests create and drop
           # their own database on it, so it is a separate server, not a
           # separate database on the one above.
           AKB_VCHORD_TEST_DSN: postgresql://akb:akb@localhost:15433/akb  # pragma: allowlist secret
@@ -298,6 +312,7 @@ jobs:
             tests/test_account_self_lifecycle_postgres.py
             tests/test_sso_account_lifecycle_postgres.py
             tests/test_sso_account_sync_postgres.py
+            tests/test_pat_issuance_postgres.py
             tests/test_admin_auth_postgres.py
             tests/test_sso_identity_migration_postgres.py
             tests/test_pending_admission_postgres.py
@@ -308,6 +323,8 @@ jobs:
             tests/test_sso_browser_session_postgres.py
             tests/test_sso_session_epoch_upgrade_postgres.py
             tests/test_bm25_corpus_revision_postgres.py
+            tests/test_bm25_recompute_resume_postgres.py
+            tests/test_bm25_vocab_term_ids_postgres.py
             tests/test_notifications_postgres.py
             tests/test_notification_native_postgres.py
             tests/test_notification_unwatch_postgres.py
@@ -326,6 +343,8 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_encoding_contract_postgres.py
+            tests/test_vchord_external_stats_postgres.py
             tests/test_bm25_run_lock.py
           )
           # A truncated list is the failure this step has already had

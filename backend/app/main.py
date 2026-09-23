@@ -208,6 +208,13 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     details = exc.errors()
+    if request.url.path == "/api/v1/auth/tokens/issuance":
+        fields = [{"field": ".".join(str(part) for part in error["loc"] if part != "body") or "form",
+                   "code": error["type"], "message": error["msg"]} for error in details]
+        return JSONResponse(status_code=422, content=_error_payload(422, {
+            "code": "token_issuance_validation", "message": "Token issuance validation failed",
+            "details": {"fields": fields},
+        }))
     if request.url.path == "/api/v1/my/account/deletion":
         # Validation must never echo the password (including malformed request bodies).
         details = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in details]
@@ -324,6 +331,8 @@ async def _no_store_public_surfaces(request: Request, call_next):
             break
     if (
         path == "/api/v1/auth/config"
+        or path == "/api/v1/auth/tokens"
+        or path.startswith("/api/v1/auth/tokens/")
         or path.startswith("/api/v1/admin/")
         or path.startswith("/api/v1/app/installations/")
         or path.startswith("/api/v1/app/rollouts")
@@ -546,8 +555,14 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
     never be chunked or embedded; `vector_store.backfill.upsert` is the
     chunk-level one below it; `native_file_projection` is the S3-to-Native
     admission ahead of both.
+
+    `mcp_oauth` is not a queue: it reports whether the OIDC realm behind
+    `mcp_oauth_enabled` advertises the DCR endpoint and vault scopes that
+    path needs, and names the setup script when it does not. `unknown`
+    means the IdP could not be read, which is not a verdict on the realm.
     """
     from app.services import (
+        mcp_oauth_preconditions,
         native_derived_worker,
         native_file_projection,
         queue_rescuer,
@@ -602,6 +617,15 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         # decision turns on: whether a surface should show partial results
         # depends on how often they exist.
         "search": await _safe(search_degradation_stats.snapshot),
+        # Not a queue either, and the only section here about a dependency
+        # AKB does not own: whether the OIDC realm was ever given the client
+        # scopes and DCR policy the MCP OAuth path needs (akb#635). An
+        # unconfigured realm fails at the IdP with a bare 403 before any AKB
+        # code runs, so this is the one place AKB can say which script fixes
+        # it. Stays on the unauthenticated half because every input is a
+        # public discovery document; see the module docstring for why it is
+        # here rather than at startup, and for what it cannot see.
+        "mcp_oauth": await _safe(mcp_oauth_preconditions.health_section),
     }
 
     # Top-level aggregate (#538): `degraded` when any queue section holds

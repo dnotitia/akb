@@ -79,6 +79,24 @@ async def test_a_tick_with_nothing_to_do_does_not_recompute(monkeypatch, refresh
 
 
 @pytest.mark.asyncio
+async def test_refresher_enables_vector_queue_deferral(monkeypatch):
+    requested = []
+
+    async def should_recompute():
+        return True
+
+    async def recompute_stats(*args, **kwargs):
+        requested.append(kwargs)
+        return _stats(skipped=False)
+
+    monkeypatch.setattr(sparse_encoder, "_should_recompute", should_recompute)
+    monkeypatch.setattr(sparse_encoder, "recompute_stats", recompute_stats)
+
+    assert await sparse_encoder._refresh_tick(retry_secs=0) == 0
+    assert requested == [{"defer_if_vector_queue": True}]
+
+
+@pytest.mark.asyncio
 async def test_a_handover_skip_is_retried_rather_than_costing_an_interval(
     monkeypatch, refresher
 ):

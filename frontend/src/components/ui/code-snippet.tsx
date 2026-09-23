@@ -50,7 +50,7 @@ export function CodeSnippet({
           )}
         >
           {copied ? <Check className="h-3 w-3" aria-hidden /> : <Copy className="h-3 w-3" aria-hidden />}
-          {copied ? "Copied" : "Copy"}
+          <span role={copied ? "status" : undefined} aria-live="polite">{copied ? "Copied" : "Copy"}</span>
         </button>
       </div>
       <pre tabIndex={0} aria-label={filename || "Configuration snippet"} className="font-mono text-xs leading-relaxed p-3 overflow-x-auto bg-surface text-foreground whitespace-pre-wrap break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">

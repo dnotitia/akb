@@ -76,6 +76,11 @@ chmod 644 "$cert_dir/tls.key" "$cert_dir/tls.crt"
 mkdir -p "$fixture_run_dir/config"
 sso_session_epoch="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 cat >"$fixture_run_dir/config/app.yaml" <<YAML
+# This fixture writes its whole config, so it owns the revision selector
+# too: an omitted one now defaults to postgres_native and the run would
+# fail Settings validation before Keycloak is ever reached. The fixture
+# exercises the legacy Bare Git SSO path.
+document_revision_backend: bare_git
 auth_mode: sso
 auth_runtime_generation: 1
 sso_session_epoch: "$sso_session_epoch"

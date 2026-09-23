@@ -18,7 +18,7 @@ import {
 } from "@/lib/api";
 
 vi.mock("@/lib/api", async () => ({
-  ApiError: (await vi.importActual<typeof import("@/lib/api")>("@/lib/api")).ApiError,
+  ...await vi.importActual<typeof import("@/lib/api")>("@/lib/api"),
   createPAT: vi.fn(),
   createVault: vi.fn(),
   listVaultTemplates: vi.fn().mockResolvedValue([]),

@@ -38,6 +38,8 @@ from app.exceptions import (
     ForbiddenError,
     InvalidColumnTypeError,
     NotFoundError,
+    RESERVED_SYSTEM_PATH_CODE,
+    ReservedSystemPathError,
     VAULT_NAME_UNAVAILABLE,
     ValidationError,
     WriteBusyError,
@@ -80,6 +82,7 @@ UNKNOWN_ARGUMENT = "unknown_argument"  # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"  # version / expected-state mismatch
 NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
+NATIVE_REVISION_SURFACE_UNSUPPORTED = "native_revision_surface_unsupported"
 WRITE_BUSY = "write_busy"  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"  # PG 23505 — INSERT/UPDATE breaks a unique key
 EDIT_FAILED = "edit_failed"  # akb_edit: old_string match / uniqueness failure
@@ -169,6 +172,8 @@ def exception_envelope(e: Exception) -> dict:
     internal error. Lives here (no import-time side effects) so it stays unit-
     testable without importing the MCP server. See dnotitia/akb#221.
     """
+    if isinstance(e, ReservedSystemPathError):
+        return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
         return err(str(e), code=PERMISSION_DENIED)
     if isinstance(e, NotFoundError):
@@ -200,6 +205,8 @@ def exception_envelope(e: Exception) -> dict:
             hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
             retry_after_secs=e.retry_after_secs,
         )
+    if getattr(e, "code", None) == NATIVE_REVISION_SURFACE_UNSUPPORTED:
+        return err(str(e), code=NATIVE_REVISION_SURFACE_UNSUPPORTED)
     if getattr(e, "code", None) == GIT_HISTORY_FAILED:
         return err(str(e), code=GIT_HISTORY_FAILED)
     if getattr(e, "code", None) == GIT_HISTORY_TIMEOUT:

@@ -4,6 +4,7 @@ Public API:
     VectorStore              — Protocol all drivers implement
     VectorHit                — search result dataclass
     VectorStoreUnavailable   — driver-side transient failure
+    VectorSearchDegraded     — partial search hits with an explicit reason
     get_vector_store()       — factory; selects driver from settings
 
 Drivers (in sibling modules):
@@ -17,13 +18,14 @@ A full vector-store loss is recoverable by setting
 re-upsert from PG.
 """
 
-from .base import VectorHit, VectorStore, VectorStoreUnavailable
+from .base import VectorHit, VectorSearchDegraded, VectorStore, VectorStoreUnavailable
 from .factory import get_vector_store, reset_singleton_for_tests
 
 __all__ = [
     "VectorStore",
     "VectorHit",
     "VectorStoreUnavailable",
+    "VectorSearchDegraded",
     "get_vector_store",
     "reset_singleton_for_tests",
 ]

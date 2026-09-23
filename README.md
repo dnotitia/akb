@@ -4,7 +4,7 @@
 
 # AKB — Agent Knowledge Base
 
-> **Organizational memory for AI agents.** Git-backed knowledge base served
+> **Organizational memory for AI agents.** PostgreSQL-native knowledge base served
 > over the **Model Context Protocol (MCP)** — agents read and write directly
 > with hybrid semantic + keyword search, structured tables, files, and a URI
 > graph. Drop-in alternative to Confluence / Notion for Claude Code, Cursor,
@@ -88,7 +88,8 @@ Most knowledge tools are built for humans clicking through a UI. Agents need a
 different shape: structured documents, semantic + keyword search in one call,
 explicit relations, and full version history. AKB gives agents a single set of
 tools (`akb_put`, `akb_search`, `akb_browse`, `akb_relations`, …) over a
-backing store of Git bare repos and a PostgreSQL hybrid index.
+PostgreSQL-native revision store and hybrid index. Explicit Bare Git installations
+remain supported for existing deployments.
 
 ## Retrieval quality
 
@@ -132,7 +133,7 @@ read/write store; opinions about *what to do with* the knowledge live outside.
 │   Relations (graph)   │  Session  │  Publications        │
 ├──────────────────────────────────────────────────────────┤
 │                  Storage Layer                           │
-│   Git bare repos       │  PostgreSQL 16 (text + meta SoT)│
+│   Native revisions     │  PostgreSQL 16 (text + meta SoT)│
 │                        │  Vector store (driver):         │
 │                        │    pgvector        (default, PG)│
 │                        │    qdrant          (optional)   │
@@ -150,7 +151,8 @@ letting the indexing worker re-populate.
 
 ## Key Concepts
 
-- **Vault** — A Git bare repo. The unit of access control and physical isolation.
+- **Vault** — The unit of access control and knowledge organization. Native
+  revisions live in PostgreSQL; the legacy backend uses one bare Git repo per vault.
 - **Collection** — A directory inside a vault. Topical grouping of documents.
 - **Document** — Markdown + YAML frontmatter, optimised for agent read/write.
 - **Hybrid Search** — Dense (semantic) + BM25 (lexical) fused via RRF in one call.
@@ -168,7 +170,7 @@ letting the indexing worker re-populate.
 | Tool | Description |
 |------|-------------|
 | `akb_list_vaults` / `akb_create_vault` | Vault management |
-| `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (Git commit + indexing) |
+| `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (revision + indexing) |
 | `akb_put_file` / `akb_get_file` / `akb_update_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
 | `akb_put_image` / `akb_discard_image` | Validated inline Markdown images — proxy-side in `akb-mcp` 2.2+ |
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
@@ -176,7 +178,7 @@ letting the indexing worker re-populate.
 | `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
 | `akb_drill_down` | Section-level retrieval |
 | `akb_relations` / `akb_link` / `akb_unlink` / `akb_graph` | Knowledge graph |
-| `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, Git history |
+| `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, revision history |
 | `akb_grant` / `akb_revoke` / `akb_set_public` | Permission boundaries — per-user, per-org, public |
 | `akb_publish` / `akb_unpublish` | Public publication |
 
@@ -256,13 +258,14 @@ related_to: ["akb://eng/coll/meetings/doc/2026-05-01-payments.md"]
 
 ### Open Knowledge Format (OKF) compatible
 
-A vault is stored as a git tree of `.md` + YAML-frontmatter files whose
+With the explicit Bare Git backend, a vault is stored as a git tree of
+`.md` + YAML-frontmatter files whose
 identity is the path — the same model as Google Cloud's
 [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog)
 (OKF v0.1), which AKB independently arrived at before the spec existed.
-AKB-authored bundles satisfy all three OKF MUST rules, and AKB can export any
-vault as a conformant OKF bundle (documents, plus tables/files as concept docs)
-and validate any bundle:
+AKB-authored bundles satisfy all three OKF MUST rules. The Git-tree exporter
+below exports Bare Git vaults as a conformant OKF bundle (documents, plus tables/files as concept docs)
+and validates bundles. It is not a Native vault exporter:
 
 ```bash
 python -m app.cli okf-export --from-git /data/vaults/_worktrees/<vault> \
@@ -276,55 +279,76 @@ down*; AKB stores, versions, searches, governs, and serves it to agents. See
 
 ## Quick Start
 
-The default Docker Compose stack runs four long-lived services: PostgreSQL
-with pgvector, MinIO, the backend, and the frontend. A one-shot
-`minio-bootstrap` service creates the local file bucket before the backend
-starts. For semantic (dense) search you bring an OpenAI-compatible
-embedding endpoint (OpenAI, OpenRouter, self-hosted vLLM/TEI, etc.). It is
-not strictly required: with no embed endpoint (or during an outage) the
-pgvector and Qdrant drivers **degrade to BM25-only** lexical search rather
-than returning nothing — dense is genuinely optional end-to-end (the
-`seahorse-db` driver is the exception; see *Vector store* below). Prefer
-running a separate Qdrant cluster, or pointing at Seahorse? See *Vector
-store* below.
+New installations use **PostgreSQL Native** with a persisted installation identity
+and an explicit database bootstrap. Use a **new Compose project and never-used
+database**. Existing installations must follow the
+[pre-upgrade preservation procedure](docs/operations/native-installation.md#preserve-existing-configuration-before-changing-defaults)
+before using this version; changing a default does not migrate their data.
+
+The recommended stack runs PostgreSQL with pgvector, MinIO, API, a separate
+worker, and frontend. One-shot services prepare the File bucket and Native
+authority before the application starts. Docker Compose 2.24.4+ is required.
+Configure an OpenAI-compatible embedding endpoint for dense search; pgvector
+and Qdrant degrade to BM25-only lexical search when embedding is unavailable.
 
 ```bash
-# 1. Configure
-cp config/app.yaml.example   config/app.yaml
-cp config/secret.yaml.example config/secret.yaml
-$EDITOR config/secret.yaml   # set embed_api_key and replace system_hmac_secret
+# 1. Build this checkout's images. For a registry installation, use a backend
+# image pinned as registry.example.com/akb-backend@sha256:... instead.
+docker build -t akb-backend:native-local ./backend
+docker compose -p my-native-install build frontend
+export AKB_NATIVE_IMAGE="$(docker image inspect akb-backend:native-local --format '{{.Id}}')"
+export AKB_NATIVE_CONFIG_DIR="$PWD/config/native"
 
-# Generate the installation's persistent RSA-3072 local-session keyset.
-# This directory is gitignored; back it up with the other installation secrets.
-cd backend
-uv run python -m app.cli generate-local-session-keyset \
-  --output-dir ../config/local-session
-cd ..
+# 2. Prepare installation assets ONCE. Keep them and the original template.
+mkdir -p "$AKB_NATIVE_CONFIG_DIR"
+cp config/app.yaml.example "$AKB_NATIVE_CONFIG_DIR/template.yaml"
+cp config/secret.yaml.example "$AKB_NATIVE_CONFIG_DIR/secret.yaml"
+$EDITOR "$AKB_NATIVE_CONFIG_DIR/template.yaml" # provider and public URL settings
+$EDITOR "$AKB_NATIVE_CONFIG_DIR/secret.yaml"   # credentials and independent secrets
 
-# 2. Run
-docker compose up -d
+docker run --rm -v "$AKB_NATIVE_CONFIG_DIR:/installation" \
+  "$AKB_NATIVE_IMAGE" python -m app.cli generate-local-session-keyset \
+  --output-dir /installation/local-session
+docker run --rm -v "$AKB_NATIVE_CONFIG_DIR:/installation" \
+  "$AKB_NATIVE_IMAGE" python -m app.cli prepare-native-config \
+  --source /installation/template.yaml --secret /installation/secret.yaml \
+  --output /installation/app.yaml --tenant-id my-installation --namespace akb \
+  --image-digest "${AKB_NATIVE_IMAGE##*@}"
 
-# 3. Provision the designated recovery administrator (local mode)
-#    The password is read from stdin and is never printed by AKB.
-docker compose exec -T backend python -m app.cli provision-recovery-admin local \
+# 3. Use the same project, files and environment on every subsequent operation.
+docker compose -p my-native-install \
+  -f docker-compose.yaml -f docker-compose.native.yaml up -d --no-build
+
+# 4. Provision the local recovery administrator with an operator-owned password.
+docker compose -p my-native-install \
+  -f docker-compose.yaml -f docker-compose.native.yaml \
+  exec -T backend python -m app.cli provision-recovery-admin local \
   --username recovery-admin --email recovery-admin@example.com \
   --password-file - < /secure/operator/recovery-admin.password
 
-# 4. Open
 open http://localhost:3000
 ```
 
-`config/app.yaml` and `config/secret.yaml` are the **single source of
-application configuration**. Mount the `config/` directory at `/etc/akb/` in
-any deployment. Process composition is the narrow exception:
-`AKB_PROCESS_ROLE=all|api|worker` selects the entrypoint role and
-`AKB_TOKENIZER_PROCESSES=1..4` can lower the per-process tokenizer pool for a
-deployment container. The Kubernetes base owns those two operational values;
-business, auth, storage, and provider settings remain in the YAML files.
+The local image ID pins the locally built bytes; it is not a registry digest.
+For distributed installs, build/push first and use the registry digest for
+`AKB_NATIVE_IMAGE`. Keep the generated initializing image receipt unchanged
+when upgrading the workload image. Never regenerate identity or local-session
+keys on restart. On Linux, ensure the operator can read and back up assets
+created by the container (or run the preparer with the operator's UID/GID).
 
-Compose also runs the API and worker separately. See the
-[local deployment guide](deploy/compose/README.md) for existing-volume upgrades,
-configuration changes, and remote-access URLs.
+The generated `app.yaml` and companion `secret.yaml` are the single source of
+application configuration and are mounted read-only at `/etc/akb`.
+`AKB_PROCESS_ROLE=all|api|worker` only selects process composition;
+`AKB_TOKENIZER_PROCESSES=1..4` can reduce tokenizer concurrency. Revision
+selection is not an environment-variable switch.
+
+See the [Native installation guide](docs/operations/native-installation.md)
+for image upgrades, bootstrap recovery and Kubernetes. The
+[Compose guide](deploy/compose/README.md) preserves the explicit Bare Git
+upgrade path. Helm, all-in-one and standalone SSO remain **legacy Bare Git
+compatibility paths** in this release. Native does not support document
+templates or external Git imports; its discovery and API reject those
+capabilities. Existing migration/history/diff/activity compatibility remains.
 
 Ordinary registration always creates a non-admin account, including on an
 empty database. Administrator bootstrap is available only through the
@@ -457,6 +481,9 @@ then remove it in a later coordinated keyset revision. Restoring the previous
 private/JWKS pair is the rollback; never overwrite key files in place.
 
 ### Vector store (driver-pluggable)
+
+See [BM25 statistics and VChord-only deployments](docs/vector-store-bm25-statistics.md)
+for weight conventions, external statistics consumers and posting rollback requirements.
 
 Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
 interface. Five drivers ship; pick at config time:

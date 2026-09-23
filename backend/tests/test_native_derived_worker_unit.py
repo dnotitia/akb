@@ -448,3 +448,214 @@ async def test_an_unnameable_resource_still_reports_the_abandonment(caplog):
     message = next(r for r in caplog.records if r.levelno == logging.ERROR).getMessage()
     assert "ABANDONED" in message
     assert "vault=<unresolved>" in message
+
+
+# ── Graph parity: the derived rewrite owns the document's implicit edges ──
+
+
+def test_document_relations_are_read_from_frontmatter_and_body():
+    raw = """---
+title: Native title
+depends_on:
+  - akb://measure/coll/specs/doc/a.md
+related_to: not-a-list
+---
+# Body
+see [b](specs/b.md)
+"""
+
+    relations = native_derived_worker.build_native_document_relations(raw)
+
+    assert relations.depends_on == ["akb://measure/coll/specs/doc/a.md"]
+    assert relations.related_to == []          # a scalar is not a relation list
+    assert relations.implements == []
+    assert "specs/b.md" in relations.body
+    assert "title: Native title" not in relations.body
+
+
+class _RewriteConn:
+    """Records the writes one derived rewrite performs."""
+
+    def __init__(self, resource: dict, previous_path: str | None) -> None:
+        self.resource = resource
+        self.previous_path = previous_path
+        self.executed: list[str] = []
+
+    def transaction(self):
+        @asynccontextmanager
+        async def _tx():
+            yield None
+
+        return _tx()
+
+    async def fetchrow(self, _query, *_args):
+        return self.resource
+
+    async def fetchval(self, _query, *_args):
+        return self.previous_path
+
+    async def execute(self, query, *_args):
+        self.executed.append(query)
+        return "OK"
+
+
+def _rewrite_pool(conn):
+    class _Pool:
+        def acquire(self):
+            @asynccontextmanager
+            async def _acquire():
+                yield conn
+
+            return _acquire()
+
+    return _Pool()
+
+
+def _document_intent(resource_id, namespace_id, revision_id):
+    return {
+        "intent_id": uuid.uuid4(),
+        "resource_id": resource_id,
+        "namespace_id": namespace_id,
+        "revision_id": revision_id,
+        "surface": "document",
+    }
+
+
+@pytest.fixture
+def _stubbed_rewrite(monkeypatch):
+    """Isolate the graph half: real body verification and chunking are elsewhere."""
+    calls: dict[str, list] = {"stored": [], "all_deleted": []}
+
+    monkeypatch.setattr(
+        native_derived_worker, "verify_native_head_body",
+        lambda head: b"---\ntitle: T\n---\nbody [x](specs/x.md)\n",
+    )
+
+    async def _store(
+        _conn, vault_id, vault_name, path, depends_on, related_to, implements, body,
+        source_resource_id=None,
+    ):
+        calls["stored"].append(
+            (vault_id, vault_name, path, depends_on, related_to, implements, body,
+             source_resource_id)
+        )
+        return 1
+
+    async def _delete_all(_conn, vault_id, vault_name, resource_id, path):
+        calls["all_deleted"].append((vault_id, vault_name, resource_id, path))
+
+    async def _enqueue(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(native_derived_worker, "store_document_relations", _store)
+    monkeypatch.setattr(native_derived_worker, "delete_native_document_edges", _delete_all)
+    monkeypatch.setattr(native_derived_worker.delete_worker, "enqueue_source_deletes", _enqueue)
+    return calls
+
+
+async def test_a_live_document_rewrite_stores_its_body_links(_stubbed_rewrite):
+    resource_id, namespace_id, revision_id = uuid.uuid4(), uuid.uuid4(), "rev-1"
+    conn = _RewriteConn(
+        {"lifecycle": "live", "head_revision_id": revision_id, "current_path": "specs/a.md"},
+        previous_path="specs/a.md",
+    )
+    worker = NativeDerivedWorker(pool=_rewrite_pool(conn))
+
+    await worker._apply_live(
+        _document_intent(resource_id, namespace_id, revision_id),
+        {"vault_name": "measure", "current_path": "specs/a.md", "resource_id": resource_id},
+    )
+
+    assert len(_stubbed_rewrite["stored"]) == 1
+    vault_id, vault_name, path, *_rest = _stubbed_rewrite["stored"][0]
+    assert (vault_id, vault_name, path) == (namespace_id, "measure", "specs/a.md")
+    # The rewrite hands over the resource identity, which is what scopes the
+    # implicit clear to this document instead of to whatever answers at the path.
+    assert _stubbed_rewrite["stored"][0][-1] == resource_id
+
+
+async def test_a_moved_document_clears_its_old_links_by_identity_not_by_path(_stubbed_rewrite):
+    """The rewrite no longer sweeps the previous PATH.
+
+    It used to read `native_derived_heads.path` and delete the implicit rows
+    there, which erased the links of whichever document had since taken that
+    freed path. The identity handed to `store_document_relations` covers the
+    rows this resource still owns under any previous path, so the sweep is
+    both unnecessary and unsafe.
+    """
+    resource_id, namespace_id, revision_id = uuid.uuid4(), uuid.uuid4(), "rev-2"
+    conn = _RewriteConn(
+        {"lifecycle": "live", "head_revision_id": revision_id, "current_path": "new/a.md"},
+        previous_path="old/a.md",
+    )
+    worker = NativeDerivedWorker(pool=_rewrite_pool(conn))
+
+    await worker._apply_live(
+        _document_intent(resource_id, namespace_id, revision_id),
+        {"vault_name": "measure", "current_path": "new/a.md", "resource_id": resource_id},
+    )
+
+    assert _stubbed_rewrite["stored"][0][2] == "new/a.md"
+    assert _stubbed_rewrite["stored"][0][-1] == resource_id
+    assert not any("old/a.md" in q for q in conn.executed)
+
+
+async def test_a_superseded_revision_rewrites_no_relations(_stubbed_rewrite):
+    resource_id, namespace_id = uuid.uuid4(), uuid.uuid4()
+    conn = _RewriteConn(
+        {"lifecycle": "live", "head_revision_id": "rev-newer", "current_path": "specs/a.md"},
+        previous_path=None,
+    )
+    worker = NativeDerivedWorker(pool=_rewrite_pool(conn))
+
+    applied = await worker._apply_live(
+        _document_intent(resource_id, namespace_id, "rev-old"),
+        {"vault_name": "measure", "current_path": "specs/a.md", "resource_id": resource_id},
+    )
+
+    assert applied == 0
+    assert _stubbed_rewrite["stored"] == []
+
+
+async def test_a_deleted_document_stops_being_a_graph_endpoint(_stubbed_rewrite):
+    resource_id, revision_id = uuid.uuid4(), "rev-3"
+    conn = _RewriteConn(
+        {
+            "lifecycle": "deleted",
+            "head_revision_id": revision_id,
+            "current_path": "specs/a.md",
+            "surface": "document",
+            "vault_name": "measure",
+        },
+        previous_path=None,
+    )
+    worker = NativeDerivedWorker(pool=_rewrite_pool(conn))
+
+    namespace_id = uuid.uuid4()
+    await worker._apply_delete(_document_intent(resource_id, namespace_id, revision_id))
+
+    # Keyed on the resource. The path comes along only so the cleanup can tell
+    # whether it has been taken over (akb#654).
+    assert _stubbed_rewrite["all_deleted"] == [
+        (namespace_id, "measure", resource_id, "specs/a.md")
+    ]
+
+
+async def test_a_deleted_file_leaves_the_document_graph_alone(_stubbed_rewrite):
+    resource_id, revision_id = uuid.uuid4(), "rev-4"
+    conn = _RewriteConn(
+        {
+            "lifecycle": "deleted",
+            "head_revision_id": revision_id,
+            "current_path": "assets/a.txt",
+            "surface": "file",
+            "vault_name": "measure",
+        },
+        previous_path=None,
+    )
+    worker = NativeDerivedWorker(pool=_rewrite_pool(conn))
+    intent = _document_intent(resource_id, uuid.uuid4(), revision_id) | {"surface": "file"}
+
+    await worker._apply_delete(intent)
+
+    assert _stubbed_rewrite["all_deleted"] == []

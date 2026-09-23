@@ -42,3 +42,66 @@ def test_every_stage_of_the_extension_image_is_pinned_by_digest():
     assert refs, "이미지 참조를 못 찾았다"
     unpinned = [r for r in refs if "@sha256:" not in r]
     assert not unpinned, f"digest 없이 당기는 참조: {unpinned}"
+
+
+def _compose_files() -> list[Path]:
+    """Every tracked Compose file, found rather than listed.
+
+    A list would go stale the first time somebody adds an overlay, and the
+    reference this test exists to catch is exactly the one nobody remembered.
+    """
+    files = sorted(
+        p for p in REPO.rglob("*compose*.y*ml")
+        if ".git" not in p.parts and "node_modules" not in p.parts
+    )
+    assert files, "compose 파일을 하나도 못 찾았다"
+    return files
+
+
+def test_every_compose_reference_that_pulls_carries_a_digest():
+    """akb#621: `minio/minio:latest` stopped resolving and nothing was red.
+
+    A tag is a name the registry may repoint, and `:latest` is the most movable
+    of them — so two developers can get different builds from one commit, and a
+    repository that disappears is only noticed by whoever has no cache. Both
+    failures are the same missing pin.
+
+    This reads the files instead of repeating their literals, so moving a pin is
+    one edit, not two that drift apart.
+    """
+    unpinned: list[str] = []
+    for path in _compose_files():
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            match = re.match(r"^\s*image:\s*(\S+)", line)
+            if not match:
+                continue
+            ref = match.group(1)
+            # An interpolated reference is the deployment's to pin: the file
+            # names a variable, and its value is chosen where it is set.
+            if ref.startswith("${"):
+                continue
+            if "@sha256:" not in ref:
+                unpinned.append(f"{path.relative_to(REPO)}:{number} {ref}")
+    assert not unpinned, (
+        "digest 없이 당기는 compose 참조 — 레지스트리가 옮기면 조용히 바뀌거나 사라진다:\n  "
+        + "\n  ".join(unpinned)
+    )
+
+
+def test_every_stack_runs_the_same_minio():
+    """akb#621 asked for one MinIO version across development, eval and CI.
+
+    Three compose files name it, so "named once" is enforced as agreement: every
+    reference to the server is the same string, and so is every reference to the
+    client. Before the fix they had drifted into two registries, and only one of
+    them still served the image.
+    """
+    by_image: dict[str, set[str]] = {"minio/minio": set(), "minio/mc": set()}
+    for path in _compose_files():
+        for ref in re.findall(r"^\s*image:\s*(\S+)", path.read_text(), re.M):
+            for name, seen in by_image.items():
+                if re.search(rf"(^|/){re.escape(name)}[:@]", ref):
+                    seen.add(ref)
+    assert by_image["minio/minio"], "MinIO 서버 참조를 하나도 못 찾았다"
+    for name, seen in by_image.items():
+        assert len(seen) <= 1, f"{name} 참조가 스택마다 다르다: {sorted(seen)}"

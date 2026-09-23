@@ -82,11 +82,13 @@ Backend (Streamable HTTP) handles all business logic. Proxy (stdio) handles loca
 
 Two supported paths:
 
-- **Local / dev**: `docker compose up -d` from repo root. Frontend on `:3000`,
+- **Local / dev**: follow the Native prepare/bootstrap quickstart in `README.md`.
+  Use `docker-compose.yaml` with `docker-compose.native.yaml`. Frontend on `:3000`,
   backend on `:8000`. See `README.md` for the quickstart.
 - **Kubernetes**: generic manifests under `deploy/k8s/`. `deploy/k8s/deploy.sh`
-  builds + pushes images to `$REGISTRY` (override via env) and applies the
-  kustomize base. `deploy/k8s/internal/` (gitignored) is where operator-
+  requires an explicit legacy profile and builds + pushes images to `$REGISTRY`
+  (override via env). New Native installations use `deploy/k8s/native/` with
+  generated identity and pinned images; see `docs/operations/native-installation.md`. `deploy/k8s/internal/` (gitignored) is where operator-
   specific overrides live — `deploy-internal.sh` and any private overlay.
 - Both backend and frontend Deployments use `imagePullPolicy: Always`, so a
   `kubectl rollout restart deployment/backend -n <ns>` picks up a new

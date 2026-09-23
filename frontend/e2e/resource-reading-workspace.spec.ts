@@ -576,7 +576,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     // The wrapper owns a 1px border on either side.
     expect(Math.abs(innerTable!.x - measures.table.x)).toBeLessThanOrEqual(1);
     expect(Math.abs(innerTable!.width - measures.table.width)).toBeLessThanOrEqual(2);
-    const code = page.getByRole("region", { name: "Scrollable code block" });
+    const code = page.getByRole("region", { name: /^Scrollable(?: [a-z0-9-]+)? code block$/i });
     expect(await code.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
     const image = await flow.getByRole("img", { name: "Small diagram" }).boundingBox();
     expect(image!.width).toBe(80);
@@ -587,7 +587,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     }
     if (width >= 1440) expect(measures.heading.top).toBeLessThanOrEqual(220);
     await expect(page.getByRole("region", { name: "Scrollable table" })).toHaveAttribute("tabindex", "0");
-    await expect(page.getByRole("region", { name: "Scrollable code block" })).toHaveAttribute("tabindex", "0");
+    await expect(code).toHaveAttribute("tabindex", "0");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath("reader.png") });
     const currentTitle = location.locator('[aria-current="page"]');

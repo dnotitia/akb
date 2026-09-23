@@ -18,7 +18,7 @@ def _load(
     tmp_path: Path,
     values: dict[str, object],
 ) -> app_config.Settings:
-    (tmp_path / "app.yaml").write_text(yaml.safe_dump(values, sort_keys=False))
+    (tmp_path / "app.yaml").write_text(yaml.safe_dump({"document_revision_backend": "bare_git", **values}, sort_keys=False))
     monkeypatch.setattr(app_config, "_CONFIG_CANDIDATES", [tmp_path])
     return app_config._load_settings()
 
@@ -99,7 +99,7 @@ def test_runtime_generation_is_positive_and_upgrade_ack_is_versioned(
 
 
 def test_programmatic_settings_construction_does_not_require_runtime_mode() -> None:
-    configured = app_config.Settings()
+    configured = app_config.Settings(document_revision_backend="bare_git")
 
     assert configured.auth_mode is None
     assert configured.local_auth_enabled is True
@@ -615,6 +615,7 @@ def test_local_startup_requires_system_hmac_and_persistent_signing_keys(
 
 def test_api_audience_has_distinct_public_resource_default() -> None:
     loaded = app_config.Settings(
+        document_revision_backend="bare_git",
         auth_mode="sso",
         keycloak_enabled=True,
         public_base_url="https://akb.example.com",

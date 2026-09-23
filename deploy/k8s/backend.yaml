@@ -10,10 +10,14 @@ metadata:
   namespace: akb
 data:
   # Mounted at /etc/akb/app.yaml. All non-secret runtime config lives here.
-  # Defaults match config/app.yaml.example. Override per-environment via
+  # Defaults match config/app.yaml.example except document_revision_backend:
+  # the example is a new-install Native template, this base is Bare Git.
+  # Override per-environment via
   # `kubectl edit configmap akb-app-config -n akb` or a kustomize overlay
   # under deploy/k8s/internal/.
   app.yaml: |
+    # Preserve the existing-install backend independently of future defaults.
+    document_revision_backend: bare_git
     db_host: postgres
     db_port: 5432
     db_name: akb

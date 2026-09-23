@@ -1,0 +1,51 @@
+# NEW Native databases only. Existing Bare Git databases require explicit
+# cutover; an init failure must never be bypassed by removing authority checks.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: akb
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: native-bootstrap
+          image: akb-backend:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "app.cli", "initialize-postgres-native"]
+          volumeMounts:
+            - name: app-config
+              mountPath: /etc/akb/app.yaml
+              subPath: app.yaml
+              readOnly: true
+            - name: secret-config
+              mountPath: /etc/akb/secret.yaml
+              subPath: secret.yaml
+              readOnly: true
+            - name: local-session-keys
+              mountPath: /etc/akb/local-session
+              readOnly: true
+            - name: vaultdata
+              mountPath: /data/vaults
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "1Gi"
+      containers:
+        - name: backend
+          volumeMounts:
+            - name: vaultdata
+              mountPath: /data/vaults
+              readOnly: true
+        - name: worker
+          volumeMounts:
+            - name: vaultdata
+              mountPath: /data/vaults
+              readOnly: true
+      volumes:
+        - name: vaultdata
+          persistentVolumeClaim: null
+          emptyDir: {}

@@ -5,6 +5,8 @@ import { expect, test, type Page } from "@playwright/test";
 test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated authenticated HTTP fixtures.");
 
 async function fixture(page: Page, dark = false) {
+  const userId = "00000000-0000-4000-8000-000000000001";
+  const tokenId = "00000000-0000-4000-8000-000000000002";
   const state = { legacy: false, vaults: 20, tokens: 0, summaries: 0, details: 0, authGate: null as Promise<void> | null };
   await page.addInitScript(({ dark }) => {
     localStorage.setItem("akb_token", "home-summary-isolated-fixture");
@@ -15,13 +17,26 @@ async function fixture(page: Page, dark = false) {
     const url = new URL(route.request().url());
     const path = url.pathname;
     if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
-    if (path.endsWith("/auth/me")) return Promise.resolve(state.authGate).then(() => route.fulfill({ json: { user_id: "home-summary-fixture", username: "reviewer", display_name: "임근우", email: "review@example.invalid", is_admin: false, auth_method: "local" } }));
+    if (path.endsWith("/auth/me")) return Promise.resolve(state.authGate).then(() => route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "임근우", email: "review@example.invalid", is_admin: false, auth_method: "local" } }));
+    if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ json: {
+      contract_version: 1, user_id: userId, name_max_length: 255,
+      permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"],
+      vault_scope_semantics: "write_restriction_sql_read_write",
+    } });
+    if (path.endsWith("/auth/tokens/issuance") && route.request().method() === "POST") {
+      const request = route.request().postDataJSON();
+      expect(request).toEqual({ contract_version: 1, expected_user_id: userId,
+        name: "Example work laptop", scopes: ["read", "write"], vault_scope: null });
+      state.tokens++;
+      return route.fulfill({ json: {
+        contract_version: 1, user_id: userId, token_id: tokenId, name: "Example work laptop",
+        token: "akb_isolated_secret_save_before_closing", prefix: "akb_isolated", key_class: "pat",
+        scopes: ["read", "write"], vault_scope: null, expires_at: null, issued_at: new Date().toISOString(),
+      } });
+    }
     if (path.endsWith("/auth/tokens")) {
-      if (route.request().method() === "POST") {
-        state.tokens++;
-        return route.fulfill({ json: { token_id: "fixture-token", token: "akb_isolated_secret_save_before_closing" } });
-      }
-      return route.fulfill({ json: { tokens: state.tokens ? [{ token_id: "fixture-token", name: "Existing" }] : [] } });
+      expect(route.request().method()).toBe("GET");
+      return route.fulfill({ json: { tokens: state.tokens ? [{ token_id: tokenId, name: "Existing" }] : [] } });
     }
     if (path.endsWith("/my/workspace-summary")) {
       state.summaries++;

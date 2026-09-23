@@ -1,16 +1,23 @@
 # Existing-database revision cutover
 
-This runbook moves one existing standalone AKB database from the default
-`bare_git` revision backend to `postgres_native`. It requires planned downtime.
+This runbook moves one existing standalone AKB database from the `bare_git`
+revision backend to `postgres_native`. It requires planned downtime.
 It does not perform an online dual write or a reverse migration.
 
 ## Before the window
 
-1. Upgrade the AKB image while it still selects `bare_git`, so migrations and
+1. Pin the current selector before touching the image. `bare_git` is no longer
+   the Settings default, so a configuration that simply omits
+   `document_revision_backend` now resolves to `postgres_native` and refuses to
+   start. Run
+   [`preserve-revision-config`](native-installation.md#preserve-existing-configuration-before-changing-defaults)
+   on the active app/secret pair and install its reviewed output, so step 2
+   upgrades an installation whose backend is written down.
+2. Upgrade the AKB image while it still selects `bare_git`, so migrations and
    the cutover command are installed without changing authority.
-2. Take a coherent PostgreSQL and Git-storage recovery point and verify that it
+3. Take a coherent PostgreSQL and Git-storage recovery point and verify that it
    can be restored into a disposable environment.
-3. For each persisted external-Git source, have Git Collector write a **read-only
+4. For each persisted external-Git source, have Git Collector write a **read-only
    v1 adoption manifest while the source is still an AKB `external_git` mirror**.
    AKB accepts only Collector's exact
    `akb-collector.git-adoption-manifest` v1 shape: the fixed purpose,
@@ -25,7 +32,7 @@ It does not perform an online dual write or a reverse migration.
    fields as Collector proof context, and verifies **every** live active
    external-Git Document—not only documents under `path_prefix`—before it
    accepts the handoff.
-4. Record the future Native deployment identity fields in `app.yaml`:
+5. Record the future Native deployment identity fields in `app.yaml`:
    `document_revision_tenant_id`, `document_revision_namespace`,
    `document_revision_database_id`, and the immutable image digest.
 

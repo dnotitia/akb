@@ -20,6 +20,7 @@ from app.models.document import (
 )
 from app.services.auth_service import AuthenticatedUser
 from app.services.revision_backend import get_document_service
+from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.util.git_refs import HEX_COMMIT_RE
 from app.util.text import to_nfc
 
@@ -70,6 +71,8 @@ async def create_vault(name: str, description: str = "", template: str | None = 
     summary="List available vault templates",
 )
 async def list_vault_templates(user: AuthenticatedUser = Depends(get_current_user)):
+    if not get_vault_creation_capabilities().templates:
+        return []
     return [
         VaultTemplate(
             name=s.name,

@@ -17,8 +17,9 @@ Sparse storage shape is selected at construction time:
 
   posting  — chunks(...) + posting(term_id, chunk_id, weight),
              B-tree-indexed on term_id. Sparse search is a single
-             indexed lookup. Default and recommended at any scale
-             where you actually care about latency.
+             indexed lookup with application-owned BM25 weights.
+  vchord  — raw integer TF in bm25vector; the BM25 index owns scoring
+             and corpus statistics. Exact fallback is size/time bounded.
   arrays   — chunks(sparse_terms BIGINT[], sparse_weights REAL[]).
              One row per chunk. Sparse search unnest+JOIN+GROUP BY.
              RETAINED for the bench harness only — don't pick this
@@ -40,7 +41,7 @@ import asyncpg
 
 from app.services.sparse_shapes import SparseShape
 
-from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorSearchDegraded, VectorStoreUnavailable, has_dense
 
 
 def _advisory_lock_key(schema: str) -> int:
@@ -64,6 +65,17 @@ logger = logging.getLogger("akb.vector_store.pgvector")
 RRF_K = 60
 
 _VCHORD_MAX_CANDIDATES = 65_535
+# Exact ranking is reserved for small corpora/scopes. All SQL retains the
+# existing caller/pool budgets; finite index retrieval has no shorter timer.
+_VCHORD_MAX_EXACT_ROWS = 10_000
+
+
+class _VChordExactBudgetExceeded(VectorStoreUnavailable):
+    """Exact completion was refused; already scoped finite candidates survive."""
+
+    def __init__(self, candidate_ids: list[str] | None = None) -> None:
+        super().__init__("VChord exact search exceeds the bounded row budget")
+        self.candidate_ids = candidate_ids or []
 
 
 async def _set_vchord_candidate_budget(
@@ -74,6 +86,32 @@ async def _set_vchord_candidate_budget(
     # The bounded integer is safe to interpolate into the extension GUC.
     # SET LOCAL restores the pooled connection at transaction commit.
     await conn.execute(f"SET LOCAL bm25_catalog.bm25_limit = {budget}")
+
+
+async def _vchord_configured_budget(conn: asyncpg.Connection) -> int:
+    """`bm25_catalog.bm25_limit`, on a session that may not have loaded vchord_bm25.
+
+    The extension defines its settings when its library loads, and the image
+    `deploy/postgres/Dockerfile` builds does not preload it. On a session that
+    has not called into the extension yet the setting does not exist, and a
+    plain `current_setting` raised `unrecognized configuration parameter` —
+    which reaches `hybrid_search` as a store failure, so the first unfiltered
+    or index-led search on every new pooled connection lost both legs
+    (akb#615). A CI server that preloaded the library never saw it.
+
+    Any call into the extension loads it; a literal of its type is the
+    cheapest, and a connection pays for it once. A value an operator set in
+    the server configuration already exists before the load and is read as is.
+    """
+    value = await conn.fetchval(
+        "SELECT current_setting('bm25_catalog.bm25_limit', true)"
+    )
+    if value is None:
+        await conn.fetchval("SELECT '{}'::bm25_catalog.bm25vector IS NOT NULL")
+        value = await conn.fetchval(
+            "SELECT current_setting('bm25_catalog.bm25_limit')"
+        )
+    return int(value)
 
 # Schema name lands in identifier position in DDL; validate to keep
 # operator typos and config-injection-style attacks from blowing up
@@ -461,13 +499,37 @@ class PgvectorStore:
                     ADD COLUMN IF NOT EXISTS sparse_bm25 bm25_catalog.bm25vector
                 """
             )
-            await conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_vi_chunks_bm25
-                    ON "{self._schema}".chunks
-                 USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
-                """
-            )
+            # The index is built here only for an empty table — a fresh
+            # install, where it costs nothing. Over existing chunks it is the
+            # job of `scripts/backfill_bm25_vector.py --index`, which builds it
+            # CONCURRENTLY and refuses while any row still has no vector.
+            # Building it here held this transaction's ShareLock against every
+            # write for the whole build, over whatever part of the column the
+            # backfill had reached, and made each later batch of that backfill
+            # pay index maintenance per row (akb#615). A populated table with no
+            # index means the shape was selected before the runbook finished:
+            # say so, rather than serve a partial column.
+            if await conn.fetchval(
+                "SELECT to_regclass($1) IS NULL",
+                f'"{self._schema}".idx_vi_chunks_bm25',
+            ):
+                if await conn.fetchval(
+                    f'SELECT EXISTS (SELECT 1 FROM "{self._schema}".chunks)'
+                ):
+                    raise VectorStoreUnavailable(
+                        'vector_store_sparse_shape is "vchord" but '
+                        f'"{self._schema}".idx_vi_chunks_bm25 does not exist and '
+                        "the table already holds chunks. Fill sparse_bm25 and build "
+                        "the index with scripts/backfill_bm25_vector.py (--index, "
+                        "once the sweep has converged) before selecting this shape."
+                    )
+                await conn.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_vi_chunks_bm25
+                        ON "{self._schema}".chunks
+                     USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
+                    """
+                )
 
         else:
             assert_never(self._sparse_shape)
@@ -868,7 +930,10 @@ class PgvectorStore:
             finally:
                 timings["dense"] = time.perf_counter() - begin
 
+        sparse_budget_exceeded = False
+
         async def _sparse_leg() -> list[str]:
+            nonlocal sparse_budget_exceeded
             begin = time.perf_counter()
             try:
                 async with pool.acquire() as c:
@@ -881,6 +946,11 @@ class PgvectorStore:
                         source_type_values=source_type_values,
                         limit=prefetch_per_leg,
                     )
+            except _VChordExactBudgetExceeded as exc:
+                # An exact-work refusal is not a store outage. Wait for the
+                # independent dense leg and retain scoped finite sparse hits.
+                sparse_budget_exceeded = True
+                return exc.candidate_ids
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
@@ -924,6 +994,8 @@ class PgvectorStore:
                 for cid, score in scoring
                 if cid in by_id
             ]
+            if sparse_budget_exceeded:
+                raise VectorSearchDegraded(hits=hits, reason="sparse_search_budget_exceeded")
             succeeded = True
             return hits
         except asyncpg.PostgresError as e:
@@ -1257,6 +1329,14 @@ class PgvectorStore:
             # Below about 0.05% they converge — the planner reaches the same
             # place on its own — so the branch is harmless at the small end.
             #
+            # Materialising scores every row in scope, which is exact work, so
+            # it stays under the exact-work cap. A selective scope over the cap
+            # is not refused: the index leads, as it would for any wider
+            # filter. Refusing it lost the whole sparse leg for every scope
+            # between the cap and 1% of the corpus, while the index-led shape
+            # answered the same scope (akb#626). The choice decides latency;
+            # it must never decide the rows.
+            #
             # `plan_cache_mode` is set because asyncpg always prepares, and a
             # generic plan is built without the filter's values: the same
             # statement measured 0.8ms for ten executions and then 1500ms once
@@ -1272,8 +1352,7 @@ class PgvectorStore:
             # not take a search with it" is only true out here.
             selective = (
                 await self._filter_is_selective(conn, filter_col, filter_uuids)
-                if filter_uuids
-                else False
+                if filter_uuids else False
             )
             async with conn.transaction():
                 await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
@@ -1292,7 +1371,13 @@ class PgvectorStore:
                 )
                 requested_limit = int(limit)
 
-                if filter_uuids and selective:
+                materialise = bool(filter_uuids) and selective and not (
+                    await self._exceeds_exact_budget(
+                        conn, filter_col=filter_col, filter_uuids=filter_uuids,
+                        source_type_values=source_type_values,
+                    )
+                )
+                if materialise:
                     type_pred = (
                         " AND source_type = ANY($4::text[])" if source_type_values else ""
                     )
@@ -1323,11 +1408,7 @@ class PgvectorStore:
                     # extension scan; growing segments score before that hook.
                     # Preserve the direct fast path, and only use unqualified
                     # global candidates to choose widening or exact fallback.
-                    configured_budget = int(
-                        await conn.fetchval(
-                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
-                        )
-                    )
+                    configured_budget = await _vchord_configured_budget(conn)
                     return await self._search_vchord_index_led_filtered(
                         conn,
                         query_terms=query_terms,
@@ -1338,11 +1419,7 @@ class PgvectorStore:
                         configured_budget=configured_budget,
                     )
                 else:
-                    configured_budget = int(
-                        await conn.fetchval(
-                            "SELECT current_setting('bm25_catalog.bm25_limit')::integer"
-                        )
-                    )
+                    configured_budget = await _vchord_configured_budget(conn)
                     sql = f"""
                         SELECT chunk_id FROM (
                           SELECT chunk_id::text AS chunk_id,
@@ -1356,6 +1433,8 @@ class PgvectorStore:
                         ) ranked WHERE score < 0
                         ORDER BY score
                     """
+                    if configured_budget == -1 or requested_limit > _VCHORD_MAX_CANDIDATES:
+                        await self._check_vchord_exact_scope(conn)
                     candidate_budget = configured_budget
                     if configured_budget != -1:
                         candidate_budget = (
@@ -1369,6 +1448,9 @@ class PgvectorStore:
                         candidate_budget != -1
                         and len(rows) < requested_limit
                     ):
+                        await self._check_vchord_exact_scope(
+                            conn, candidate_ids=[row["chunk_id"] for row in rows],
+                        )
                         await _set_vchord_candidate_budget(conn, -1)
                         rows = await conn.fetch(
                             sql, query_terms, requested_limit,
@@ -1384,7 +1466,8 @@ class PgvectorStore:
     # under 1% (akb#626). It is one number and it will age — what keeps it
     # honest is that both sides of it were measured on a corpus shaped like a
     # real deployment, and that being wrong costs latency, never correctness:
-    # both shapes return the same rows.
+    # both shapes return the same rows. That includes a selective scope too big
+    # to materialise under the exact-work cap — it is index-led, not refused.
     _SELECTIVE_FRACTION = 0.01
 
     async def _filter_is_selective(
@@ -1439,6 +1522,53 @@ class PgvectorStore:
         others = max(1.0, distinct - len(common))
         share = sum(common.get(v, remainder / others) for v in filter_uuids)
         return share < self._SELECTIVE_FRACTION
+
+    async def _check_vchord_exact_scope(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        candidate_ids: list[str] | None = None,
+    ) -> None:
+        """Refuse exact scoring of the global corpus when it is over the cap.
+
+        An index scan with bm25_limit=-1 may examine the global corpus before
+        applying filters, so every index-led exact fallback is bounded by the
+        *global* size. Refusing keeps `candidate_ids`, the finite hits already
+        in hand.
+        """
+        if await self._exceeds_exact_budget(conn):
+            raise _VChordExactBudgetExceeded(candidate_ids)
+
+    async def _exceeds_exact_budget(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        filter_col: str = "vault_id",
+        filter_uuids: list[uuid.UUID] | None = None,
+        source_type_values: list[str] | None = None,
+    ) -> bool:
+        """Would exact scoring of this scope pass the cap? Actual rows, bounded.
+
+        Counts rows, never planner estimates, and stops at cap + 1, so asking
+        costs less than the work it guards. Only materialising scores exactly
+        the filtered rows, so only that decision asks about a filtered scope.
+        """
+        predicates = ["sparse_bm25 IS NOT NULL"]
+        args: list[object] = []
+        if filter_uuids:
+            args.append(filter_uuids)
+            predicates.append(f"{filter_col} = ANY(${len(args)}::uuid[])")
+        if source_type_values:
+            args.append(source_type_values)
+            predicates.append(f"source_type = ANY(${len(args)}::text[])")
+        count = await conn.fetchval(
+            f"""SELECT count(*) FROM (
+                SELECT 1 FROM "{self._schema}".chunks
+                WHERE {" AND ".join(predicates)}
+                LIMIT {_VCHORD_MAX_EXACT_ROWS + 1}
+            ) bounded_exact_scope""", *args,
+        )
+        return bool(count > _VCHORD_MAX_EXACT_ROWS)
 
     async def _search_vchord_index_led_filtered(
         self,
@@ -1503,8 +1633,10 @@ class PgvectorStore:
         # -1 is the extension's exact brute-force mode. A requested SQL page
         # larger than its finite maximum also needs that mode to remain exact.
         if configured_budget == -1:
+            await self._check_vchord_exact_scope(conn)
             return await filtered_hits()
         if limit > _VCHORD_MAX_CANDIDATES:
+            await self._check_vchord_exact_scope(conn)
             await _set_vchord_candidate_budget(conn, -1)
             return await filtered_hits()
 
@@ -1565,6 +1697,9 @@ class PgvectorStore:
                 candidate_count < candidate_budget
                 or candidate_budget == _VCHORD_MAX_CANDIDATES
             ):
+                await self._check_vchord_exact_scope(
+                    conn, candidate_ids=candidate_ids or hits,
+                )
                 await _set_vchord_candidate_budget(conn, -1)
                 return await filtered_hits()
 

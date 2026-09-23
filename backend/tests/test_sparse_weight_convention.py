@@ -159,6 +159,7 @@ def test_encoder_flag_matches_expected_convention(
     miss on ``seahorse-db-grpc``."""
     expected = _EXPECTED[driver]
     monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", driver)
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_sparse_shape", "posting")
     actual_raw = sparse_encoder._use_raw_weights()
     if expected == "raw_tf":
         assert actual_raw is True, (
@@ -171,3 +172,72 @@ def test_encoder_flag_matches_expected_convention(
             f"returned raw. Remove it from "
             f"sparse_encoder._RAW_WEIGHT_DRIVERS or change _EXPECTED."
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver,shape", sorted(_EXPECTED_BY_SHAPE))
+async def test_encoded_values_and_external_stats_consumption(driver, shape, monkeypatch):
+    """Assert numeric output, not only the dispatch flag that selects it."""
+    import math
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", driver)
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_sparse_shape", shape)
+    monkeypatch.setattr(
+        sparse_encoder, "tokenize", AsyncMock(return_value=["검색", "검색", "engine"])
+    )
+    vocab = {"검색": 17, "engine": 91}
+    register = AsyncMock(return_value=vocab)
+    lookup = AsyncMock(return_value=vocab)
+    monkeypatch.setattr(sparse_encoder, "get_or_create_term_ids", register)
+    monkeypatch.setattr(sparse_encoder, "lookup_term_ids", lookup)
+    raw = _EXPECTED_BY_SHAPE[(driver, shape)] == "raw_tf"
+    stats = AsyncMock(return_value={"total_docs": 100, "avgdl": 6, "k1": 1.5, "b": 0.75})
+    df = AsyncMock(return_value={17: 2, 91: 80})
+    if raw:
+        stats.side_effect = AssertionError("raw encoding must not consume external stats")
+        df.side_effect = AssertionError("raw encoding must not consume external df")
+    monkeypatch.setattr(sparse_encoder, "load_stats", stats)
+    monkeypatch.setattr(sparse_encoder, "load_df_for_terms", df)
+
+    doc = dict(zip(*(await sparse_encoder.encode_document("document"))))
+    query = dict(zip(*(await sparse_encoder.encode_query("query"))))
+    if raw:
+        assert doc == {17: 2.0, 91: 1.0}
+        assert all(weight > 0 and weight.is_integer() for weight in doc.values())
+        assert query == {17: 1.0, 91: 1.0}
+        stats.assert_not_awaited()
+        df.assert_not_awaited()
+    else:
+        norm = 1 - 0.75 + 0.75 * 3 / 6
+        assert doc == pytest.approx({17: 2 * 2.5 / (2 + 1.5 * norm), 91: 2.5 / (1 + 1.5 * norm)})
+        assert query == pytest.approx({17: math.log(1 + 98.5 / 2.5), 91: math.log(1 + 20.5 / 80.5)})
+        assert stats.await_count == 2
+        df.assert_awaited_once()
+    register.assert_awaited_once()
+    lookup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_vchord_empty_and_oov_queries_do_not_register_terms_or_read_stats(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", "pgvector")
+    monkeypatch.setattr(sparse_encoder.settings, "vector_store_sparse_shape", "vchord")
+    tokenize = AsyncMock(return_value=[])
+    register = AsyncMock(side_effect=AssertionError("empty documents/queries must not register terms"))
+    lookup = AsyncMock(return_value={})
+    stats = AsyncMock(side_effect=AssertionError("raw encoding must not load stats"))
+    df = AsyncMock(side_effect=AssertionError("raw encoding must not load df"))
+    for name, value in (("tokenize", tokenize), ("get_or_create_term_ids", register),
+                        ("lookup_term_ids", lookup), ("load_stats", stats), ("load_df_for_terms", df)):
+        monkeypatch.setattr(sparse_encoder, name, value)
+    assert await sparse_encoder.encode_document("") == ([], [])
+    assert await sparse_encoder.encode_query("") == ([], [])
+    lookup.assert_not_awaited()
+    tokenize.return_value = ["unknown", "unknown"]
+    assert await sparse_encoder.encode_query("unknown unknown") == ([], [])
+    lookup.assert_awaited_once_with(["unknown"])
+    register.assert_not_awaited()
+    stats.assert_not_awaited()
+    df.assert_not_awaited()

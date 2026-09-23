@@ -22,6 +22,7 @@ def _encoded_key(byte: int = 7) -> str:
 
 def _sso_settings(**changes: object) -> Settings:
     values: dict[str, object] = {
+        "document_revision_backend": "bare_git",  # standalone SSO compatibility
         "auth_mode": "sso",
         "keycloak_enabled": True,
         "keycloak_server_url": "https://auth.example.com",
@@ -56,6 +57,7 @@ def test_browser_session_capability_requires_complete_server_custody(monkeypatch
     assert ready.keycloak_browser_redirect_uri == ("https://akb.example.com/api/v1/auth/keycloak/callback")
 
     local = Settings(
+        document_revision_backend="bare_git",
         auth_mode="local",
         sso_browser_session_encryption_key=_encoded_key(),
     )

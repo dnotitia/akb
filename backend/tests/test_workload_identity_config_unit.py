@@ -8,6 +8,7 @@ from app.config import Settings
 
 def managed_values(**overrides):
     return {
+        "document_revision_backend": "bare_git",  # managed legacy fixture
         "model_api_governance_mode": "platform_hard",
         "platform_gateway_base_url": "https://gateway.example/v1",
         "platform_gateway_token_file": "/var/run/identity/gateway/token",
@@ -68,18 +69,18 @@ def test_projected_token_paths_are_absolute(name):
 
 
 def test_standalone_static_and_native_cloud_storage_are_explicit():
-    disabled = Settings(embed_base_url="")
+    disabled = Settings(document_revision_backend="bare_git", embed_base_url="")
     assert disabled.s3_auth_mode == "static"
     assert not disabled.object_storage_enabled
-    static = Settings(s3_endpoint_url="http://minio:9000", s3_access_key="local", s3_secret_key="fixture")
+    static = Settings(document_revision_backend="bare_git", s3_endpoint_url="http://minio:9000", s3_access_key="local", s3_secret_key="fixture")
     assert static.object_storage_enabled
-    cloud = Settings(s3_auth_mode="default_chain", s3_region="us-east-1")
+    cloud = Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain", s3_region="us-east-1")
     assert cloud.object_storage_enabled
     assert not cloud.platform_gateway_token_file
     with pytest.raises(ValidationError, match="s3_access_key"):
-        Settings(s3_auth_mode="default_chain", s3_access_key="not-selected")
+        Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain", s3_access_key="not-selected")
 
 
 def test_explicit_standalone_rgw_identity_requires_complete_tuple():
     with pytest.raises(ValidationError, match="s3_role_arn"):
-        Settings(s3_auth_mode="default_chain", s3_web_identity_token_file="/run/token")
+        Settings(document_revision_backend="bare_git", s3_auth_mode="default_chain", s3_web_identity_token_file="/run/token")

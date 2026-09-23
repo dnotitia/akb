@@ -25,6 +25,7 @@ import uuid
 import asyncpg
 import pytest
 
+from app.services.vector_store import VectorStoreUnavailable
 from app.services.vector_store.pgvector import PgvectorStore, _bm25vector_literal
 
 pytestmark = pytest.mark.asyncio  # 동기 테스트는 아래에서 개별 해제
@@ -103,6 +104,49 @@ async def test_the_ddl_creates_an_index_the_planner_can_use():
         assert kind == "bm25", (
             "DDL 이 bm25 인덱스를 안 만들었다 — 이 모양의 값어치가 통째로 사라진다"
         )
+
+
+async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill():
+    """Startup builds the BM25 index only for an empty table (akb#615).
+
+    Over existing chunks the index is `scripts/backfill_bm25_vector.py
+    --index`'s job: it builds CONCURRENTLY, and refuses while any row still has
+    no vector. `_do_ensure` runs in one transaction, so building it there held
+    a ShareLock against every write for the whole build, over whatever part of
+    the column happened to be filled, and turned the rest of the sweep into the
+    kind that measured 42x slower per batch. Selecting the shape before the
+    runbook has run must fail visibly instead, and build nothing.
+    """
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            chunk = uuid.uuid4()
+            # A row written under `posting`: no vector yet.
+            await conn.execute(
+                """
+                INSERT INTO vector_index.chunks
+                    (chunk_id, source_type, source_id, vault_id,
+                     section_path, content, chunk_index)
+                VALUES ($1, 'document', $1, $2, '', 'indexed under posting', 0)
+                """,
+                chunk, uuid.uuid4(),
+            )
+            await conn.execute("DROP INDEX vector_index.idx_vi_chunks_bm25")
+
+        restarted = PgvectorStore(
+            dsn=store._dsn, schema="vector_index",
+            dense_dim=4, sparse_shape="vchord",
+        )
+        try:
+            with pytest.raises(VectorStoreUnavailable, match="--index"):
+                await restarted.ensure_collection()
+        finally:
+            if restarted._own_pool is not None:
+                await restarted._own_pool.close()
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT to_regclass('vector_index.idx_vi_chunks_bm25')"
+            ) is None
 
 
 async def test_a_written_chunk_comes_back_from_a_search():
