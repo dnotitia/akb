@@ -176,18 +176,22 @@ _PAST_U32 = 4_294_967_296
 
 
 @pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
-async def test_a_term_id_past_int4_is_found_by_every_query_shape(shape):
-    """Written through the text input, never found through `int4` (akb#665).
+async def test_a_query_term_past_int4_reaches_every_query_shape(shape):
+    """Term ids are `bigint` where they are minted, the index holds u32, and
+    the query path bound them as `int4` (akb#665). asyncpg refused any id past
+    2,147,483,647 before the query was sent, so a query holding one failed
+    outright in every shape, and in `hybrid_search` took both legs with it.
 
-    Documents reach the index as a `{id:tf}` literal, which takes any id up to
-    4,294,967,295. Queries were bound as `int[]`, and asyncpg refuses anything
-    past 2,147,483,647 before the query is sent. The index-led case asks for
-    more rows than its scope holds, so the global-candidate probe runs as well.
+    Only the query carries the large id. Writing one into the index is left to
+    a manual check: the index keeps a structure per id up to its largest, and
+    one row at id 3,000,000,000 measured 152 s and 11 GB. The index-led case
+    asks for more rows than its scope holds, so the global-candidate probe
+    runs as well.
     """
     async with _store() as (store, pool):
         vault = uuid.uuid4()
         async with pool.acquire() as conn:
-            for i, terms in enumerate([[20, _PAST_INT4], [20, 30]], start=1):
+            for i, terms in enumerate([[20, 30], [20]], start=1):
                 await store.upsert_one(
                     chunk_id=str(uuid.UUID(int=i)), source_type="document",
                     source_id=str(uuid.uuid4()), vault_id=str(vault),
@@ -199,11 +203,11 @@ async def test_a_term_id_past_int4_is_found_by_every_query_shape(shape):
                 mp.setattr(type(store), "_filter_is_selective",
                            lambda *a, **k: _const(shape == "materialised"))
                 hits = await store._search_sparse(
-                    conn, terms=[_PAST_INT4], weights=[1.0],
+                    conn, terms=[20, _PAST_INT4], weights=[1.0, 1.0],
                     filter_uuids=None if shape == "unfiltered" else [vault],
                     filter_col="vault_id", limit=5,
                 )
-        assert hits == [str(uuid.UUID(int=1))]
+        assert set(hits) == {str(uuid.UUID(int=1)), str(uuid.UUID(int=2))}
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
@@ -616,12 +620,14 @@ async def test_the_two_shapes_really_do_produce_different_plans():
                 )
             await conn.execute("ANALYZE vector_index.chunks")
 
-            captured: list[str] = []
+            # The arguments are captured with the statement, so the EXPLAIN
+            # binds exactly what the product sent — not a guess at its types.
+            captured: list[tuple[str, tuple]] = []
             real_fetch = type(conn).fetch
 
             async def spy(self, sql, *args, **kwargs):
                 if "sparse_bm25" in sql:
-                    captured.append(sql)
+                    captured.append((sql, args))
                 return await real_fetch(self, sql, *args, **kwargs)
 
             plans = {}
@@ -637,14 +643,12 @@ async def test_the_two_shapes_really_do_produce_different_plans():
                         conn, terms=[10], weights=[1.0], filter_uuids=[vid],
                         filter_col="vault_id", limit=5,
                     )
-                sql = captured[-1]
+                sql, args = captured[-1]
                 async with conn.transaction():
                     await conn.execute(
                         'SET LOCAL search_path TO "$user", public, bm25_catalog'
                     )
-                    rows = await conn.fetch(
-                        f"EXPLAIN {sql}", [10], [vid], 5,
-                    )
+                    rows = await conn.fetch(f"EXPLAIN {sql}", *args)
                 plans[selective] = "\n".join(r[0] for r in rows)
 
         index_node = "Index Scan using idx_vi_chunks_bm25"

@@ -68,6 +68,11 @@ _VCHORD_MAX_CANDIDATES = 65_535
 # Exact ranking is reserved for small corpora/scopes. All SQL retains the
 # existing caller/pool budgets; finite index retrieval has no shorter timer.
 _VCHORD_MAX_EXACT_ROWS = 10_000
+# The largest term id a `bm25vector` holds. Its text input parses u32 and
+# answers anything larger, or negative, with "Bad parsing at position N". Term
+# ids are minted as `bigint`, so this, not the column type, is the limit the
+# vchord shape lives under (akb#665).
+_BM25VECTOR_MAX_TERM_ID = 4_294_967_295
 
 
 class _VChordExactBudgetExceeded(VectorStoreUnavailable):
@@ -162,6 +167,16 @@ def _bm25vector_literal(
         raise ValueError(
             f"sparse indices and values disagree: {len(indices)} vs {len(values)}"
         )
+    for term in indices:
+        if not 0 <= int(term) <= _BM25VECTOR_MAX_TERM_ID:
+            # The index would answer "Bad parsing at position N", naming
+            # neither the term nor the limit. Dropping the term instead would
+            # index the document under a subset of what it says, which nothing
+            # downstream could notice.
+            raise ValueError(
+                f"term id {term} is outside the range a bm25vector holds "
+                f"(0 to {_BM25VECTOR_MAX_TERM_ID:,})"
+            )
     counts: dict[int, int] = {}
     for term, weight in zip(indices, values):
         counts[int(term)] = counts.get(int(term), 0) + max(1, round(float(weight)))
@@ -180,6 +195,25 @@ def _bm25vector_literal(
     # match wanted. (An earlier version of this comment claimed the opposite
     # and returned None for it. It was wrong about the filter.)
     return "{" + ", ".join(f"{t}:{counts[t]}" for t in sorted(counts)) + "}"
+
+
+def _bm25query_literal(terms: list[int]) -> str | None:
+    """The query as the same `{id:tf}` text input documents use, or None.
+
+    Queries were bound as `int[]`, the extension's only array cast, and asyncpg
+    refuses any id past 2,147,483,647 before the query is sent — while
+    documents, written as text, hold ids up to 4,294,967,295 (akb#665). Built
+    as text, a query reaches every id a document can hold, and the two stay
+    equal: the array cast counts a repeated id the way this literal folds it.
+
+    A term past that range is in no document, because writing one is refused,
+    so it is dropped here rather than failing the whole search. None means
+    nothing is left to ask.
+    """
+    held = [int(t) for t in terms if 0 <= int(t) <= _BM25VECTOR_MAX_TERM_ID]
+    if not held:
+        return None
+    return _bm25vector_literal(held, [1.0] * len(held))
 
 
 class PgvectorStore:
@@ -1342,7 +1376,9 @@ class PgvectorStore:
             # statement measured 0.8ms for ten executions and then 1500ms once
             # PostgreSQL switched. SET LOCAL scopes it to this transaction so
             # the pooled connection is not left altered.
-            query_terms = [int(t) for t in terms]
+            query_vector = _bm25query_literal(list(terms))
+            if query_vector is None:
+                return []
             # Read the statistics BEFORE the transaction opens. Inside it, a
             # server-side error aborts the transaction, and catching the
             # exception in Python does not un-abort it — the next statement
@@ -1392,7 +1428,7 @@ class PgvectorStore:
                           SELECT chunk_id::text AS chunk_id,
                                  sparse_bm25 <&> bm25_catalog.to_bm25query(
                                     '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                                    $1::int[]::bm25_catalog.bm25vector) AS score
+                                    $1::text::bm25_catalog.bm25vector) AS score
                           FROM candidate_chunks
                           ORDER BY score
                           LIMIT $3
@@ -1400,7 +1436,7 @@ class PgvectorStore:
                         ORDER BY score
                     """
                     rows = await conn.fetch(
-                        sql, query_terms, filter_uuids, requested_limit,
+                        sql, query_vector, filter_uuids, requested_limit,
                         *([source_type_values] if source_type_values else []),
                     )
                 elif filter_uuids or source_type_values:
@@ -1411,7 +1447,7 @@ class PgvectorStore:
                     configured_budget = await _vchord_configured_budget(conn)
                     return await self._search_vchord_index_led_filtered(
                         conn,
-                        query_terms=query_terms,
+                        query_vector=query_vector,
                         filter_col=filter_col,
                         filter_uuids=filter_uuids,
                         source_type_values=source_type_values,
@@ -1425,7 +1461,7 @@ class PgvectorStore:
                           SELECT chunk_id::text AS chunk_id,
                                  sparse_bm25 <&> bm25_catalog.to_bm25query(
                                     '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                                    $1::int[]::bm25_catalog.bm25vector) AS score
+                                    $1::text::bm25_catalog.bm25vector) AS score
                           FROM "{self._schema}".chunks
                           WHERE sparse_bm25 IS NOT NULL
                           ORDER BY score
@@ -1443,7 +1479,7 @@ class PgvectorStore:
                             else max(requested_limit, configured_budget, 1)
                         )
                         await _set_vchord_candidate_budget(conn, candidate_budget)
-                    rows = await conn.fetch(sql, query_terms, requested_limit)
+                    rows = await conn.fetch(sql, query_vector, requested_limit)
                     if (
                         candidate_budget != -1
                         and len(rows) < requested_limit
@@ -1453,7 +1489,7 @@ class PgvectorStore:
                         )
                         await _set_vchord_candidate_budget(conn, -1)
                         rows = await conn.fetch(
-                            sql, query_terms, requested_limit,
+                            sql, query_vector, requested_limit,
                         )
 
         else:
@@ -1574,7 +1610,7 @@ class PgvectorStore:
         self,
         conn: asyncpg.Connection,
         *,
-        query_terms: list[int],
+        query_vector: str,
         filter_col: str,
         filter_uuids: list[uuid.UUID] | None,
         source_type_values: list[str] | None,
@@ -1616,7 +1652,7 @@ class PgvectorStore:
               SELECT c.chunk_id::text AS chunk_id,
                      c.sparse_bm25 <&> bm25_catalog.to_bm25query(
                         '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                        $1::int[]::bm25_catalog.bm25vector) AS score
+                        $1::text::bm25_catalog.bm25vector) AS score
               FROM "{self._schema}".chunks c
               WHERE {filtered_where}
               ORDER BY score
@@ -1624,7 +1660,7 @@ class PgvectorStore:
             ) ranked WHERE score < 0
             ORDER BY score
         """
-        filtered_args: list[object] = [query_terms, *filtered_scope_args, limit]
+        filtered_args: list[object] = [query_vector, *filtered_scope_args, limit]
 
         async def filtered_hits() -> list[str]:
             rows = await conn.fetch(filtered_sql, *filtered_args)
@@ -1660,7 +1696,7 @@ class PgvectorStore:
               SELECT c.chunk_id,
                      c.sparse_bm25 <&> bm25_catalog.to_bm25query(
                         '"{self._schema}".idx_vi_chunks_bm25'::regclass,
-                        $1::int[]::bm25_catalog.bm25vector) AS score
+                        $1::text::bm25_catalog.bm25vector) AS score
               FROM "{self._schema}".chunks c
               WHERE c.sparse_bm25 IS NOT NULL
               ORDER BY score
@@ -1681,7 +1717,7 @@ class PgvectorStore:
 
         while True:
             probe_args: list[object] = [
-                query_terms,
+                query_vector,
                 candidate_budget,
                 *global_scope_args,
                 limit,

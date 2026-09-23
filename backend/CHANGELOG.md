@@ -123,6 +123,15 @@ silently retries against the legacy endpoint after dropping restrictions.
   for every scope between 10,000 rows and 1% of the corpus — reproduced on a
   1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
   shape answered it in 15ms (akb#626).
+- A query term past 2,147,483,647 no longer fails the search. Query vectors
+  were bound as `int[]`, the extension's only array cast, and asyncpg refuses
+  any id past `int4` before the query is sent, while term ids are minted as
+  `bigint` and documents, written as `{id:tf}` text, already held ids up to
+  4,294,967,295. Queries now go through the same text input. That u32 limit is
+  stated once, in `_bm25vector_literal`: a document holding an id outside it
+  is refused with the bound named rather than "Bad parsing at position N",
+  and a query term outside it is dropped, since no document can hold it
+  (akb#665).
 - The first search on a new connection no longer fails. The extension defines
   `bm25_catalog.bm25_limit` when its library loads, and the image
   `deploy/postgres/Dockerfile` builds does not preload it, so reading the
