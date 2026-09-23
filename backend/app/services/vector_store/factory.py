@@ -46,6 +46,19 @@ def get_vector_store() -> VectorStore:
         )
     elif driver == "pgvector":
         from .pgvector import PgvectorStore
+
+        # `required` keeps posting's statistics fresh for a rollback; the
+        # posting rows follow them, or the way back decays from the day of
+        # the flip (akb#615).
+        posting_weights = None
+        if (
+            settings.vector_store_sparse_shape == "vchord"
+            and settings.bm25_external_stats_mode == "required"
+        ):
+            from app.services.sparse_encoder import saturate_for_posting
+
+            posting_weights = saturate_for_posting
+
         from app.db.postgres import get_pool
 
         _singleton = PgvectorStore(
@@ -54,6 +67,7 @@ def get_vector_store() -> VectorStore:
             dense_dim=settings.embed_dimensions,
             sparse_shape=settings.vector_store_sparse_shape,
             get_main_pool=get_pool,
+            posting_weights=posting_weights,
         )
     elif driver == "seahorse-cloud":
         from .seahorse_cloud import SeahorseCloudStore

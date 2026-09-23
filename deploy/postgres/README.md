@@ -52,6 +52,14 @@ would build it inside its schema transaction, blocking writes for the build,
 over a column the backfill had not finished. A fresh, empty database gets the
 index at startup as before.
 
+Switching back is kept possible for as long as it is wanted. While
+`bm25_external_stats_mode` is `required` — the default — an installation that
+came from `posting` keeps writing that table too, so setting the shape back to
+`posting` serves the rows as they are. Once the way back is no longer needed,
+set `vchord_only_verified`: the writes to `posting` and the statistics
+recompute both stop, and the table can be dropped. A fresh vchord installation
+has no `posting` to keep.
+
 ## Tokenization is not affected
 
 The extension ships no tokenizer of its own; `vchord_bm25` 0.3.0 is the index

@@ -123,6 +123,17 @@ silently retries against the legacy endpoint after dropping restrictions.
   for every scope between 10,000 rows and 1% of the corpus — reproduced on a
   1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
   shape answered it in 15ms (akb#626).
+- While the way back is retained, the vchord shape keeps `posting` current.
+  `bm25_external_stats_mode = "required"`, the default, already kept
+  posting's statistics fresh for a rollback, but after the flip nothing wrote
+  `posting` itself: new chunks never reached it and rewritten chunks kept
+  their old weights, so switching back would have served a table that had
+  been decaying since the day of the flip. An installation that came from
+  `posting` now writes both on every chunk until the operator sets
+  `vchord_only_verified`. The posting weights come from the raw frequencies
+  already encoded, through the same formula the posting shape uses, so the
+  text is not tokenized twice. A fresh vchord install has no table to keep,
+  and none is created (akb#615).
 - A query term past 2,147,483,647 no longer fails the search. Query vectors
   were bound as `int[]`, the extension's only array cast, and asyncpg refuses
   any id past `int4` before the query is sent, while term ids are minted as

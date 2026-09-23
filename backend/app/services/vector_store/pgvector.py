@@ -34,6 +34,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import assert_never
 
@@ -244,6 +245,10 @@ class PgvectorStore:
         dense_dim: int,
         sparse_shape: SparseShape,
         get_main_pool=None,  # callable returning the main PG pool, used when dsn is None
+        # Raw term frequencies -> the weights `posting` stores. Handed over
+        # only while the way back to `posting` is retained (akb#615); see
+        # `_keeps_posting` below.
+        posting_weights: Callable[[list[float]], Awaitable[list[float]]] | None = None,
     ):
         if not _SCHEMA_NAME_RE.match(schema):
             raise ValueError(
@@ -255,6 +260,10 @@ class PgvectorStore:
         self._dense_dim = dense_dim
         self._sparse_shape = sparse_shape
         self._get_main_pool = get_main_pool
+        self._posting_weights = posting_weights
+        # Decided in `_do_ensure`: the vchord shape keeps `posting` current
+        # only when it has weights for it and the table is already there.
+        self._keeps_posting = False
         self._own_pool: asyncpg.Pool | None = None
         self._ensured_collection = False
         # Serialize ensure_collection across concurrent callers. PG's
@@ -564,6 +573,17 @@ class PgvectorStore:
                      USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
                     """
                 )
+            # The way back to `posting` (akb#615). `bm25_external_stats_mode =
+            # required` keeps posting's statistics fresh for a rollback, and
+            # while it does the factory hands over `posting_weights`: an
+            # installation that came from `posting` then keeps that table
+            # current on every write, so switching back serves the rows as
+            # they are now. A fresh vchord install has nothing to go back to,
+            # and nothing is created for it.
+            self._keeps_posting = (
+                self._posting_weights is not None
+                and await self._side_table_exists(conn)
+            )
 
         else:
             assert_never(self._sparse_shape)
@@ -687,6 +707,28 @@ class PgvectorStore:
 
     # ── Upsert ────────────────────────────────────────────────────
 
+    async def _side_table_exists(self, conn) -> bool:
+        return bool(await conn.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", f'"{self._schema}".posting',
+        ))
+
+    async def _replace_postings(
+        self, c, cid: uuid.UUID, terms: list[int], weights: list[float],
+    ) -> None:
+        """Make this chunk's rows in `posting` exactly `terms` and `weights`."""
+        await c.execute(
+            f'DELETE FROM "{self._schema}".posting WHERE chunk_id = $1', cid,
+        )
+        if terms:
+            await c.executemany(
+                f"""
+                INSERT INTO "{self._schema}".posting
+                    (term_id, chunk_id, weight)
+                VALUES ($1, $2, $3)
+                """,
+                [(int(t), cid, float(w)) for t, w in zip(terms, weights)],
+            )
+
     async def upsert_one(
         self,
         *,
@@ -760,23 +802,7 @@ class PgvectorStore:
                         cid, source_type, sid, vid, section_path or "",
                         content, int(chunk_index), dense_param,
                     )
-                    # Replace posting rows for this chunk.
-                    await c.execute(
-                        f'DELETE FROM "{self._schema}".posting WHERE chunk_id = $1',
-                        cid,
-                    )
-                    if sparse_indices:
-                        await c.executemany(
-                            f"""
-                            INSERT INTO "{self._schema}".posting
-                                (term_id, chunk_id, weight)
-                            VALUES ($1, $2, $3)
-                            """,
-                            [
-                                (int(t), cid, float(w))
-                                for t, w in zip(sparse_indices, sparse_values)
-                            ],
-                        )
+                    await self._replace_postings(c, cid, sparse_indices, sparse_values)
                 elif self._sparse_shape == "vchord":
                     # One statement, not two: the terms are a column of the row
                     # being written, so there is no side table to delete from
@@ -834,6 +860,14 @@ class PgvectorStore:
                         content, int(chunk_index), dense_param,
                         _bm25vector_literal(sparse_indices, sparse_values),
                     )
+                    if self._keeps_posting:
+                        assert self._posting_weights is not None
+                        await self._replace_postings(
+                            c, cid, sparse_indices,
+                            await self._posting_weights(
+                                [float(v) for v in sparse_values]
+                            ),
+                        )
                 else:
                     assert_never(self._sparse_shape)
         except asyncpg.PostgresError as e:
