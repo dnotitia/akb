@@ -1211,8 +1211,9 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             can_read_existing=await _can_read_vault(user, uid, vault),
         )
     except (ValidationError, ValueError) as e:
-        # ValidationError: bad table name / over-long PG identifier (422).
-        # ValueError: still raised by _validate_column_name. Both are
+        # ValidationError: a bad table name, the refused column names (all
+        # of them, from _refuse_bad_column_names) or an over-long PG
+        # identifier (422); ValueError is its base class. Both are
         # caller-fixable — keep the precise invalid_argument code rather
         # than letting them fall to the dispatch catch-all as `internal`.
         return err(str(e), code=INVALID_ARGUMENT)
