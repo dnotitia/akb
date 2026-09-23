@@ -7,7 +7,6 @@ lock; a persisted checkpoint makes a retry resume rather than restart.
 
 from __future__ import annotations
 
-import copy
 import logging
 import json
 import uuid
@@ -173,6 +172,41 @@ async def _owned(conn: Any, installation_id: uuid.UUID, vault_id: uuid.UUID, tab
     )
 
 
+async def _reference_targets(
+    conn: Any, vault_id: uuid.UUID, table_name: str, columns: list[dict[str, Any]],
+) -> dict[str, str]:
+    """{referencing column's physical name: referenced column's physical name}.
+
+    Only the name. A rollout creates what its release declares, as it did
+    before #433, and PostgreSQL judges the constraint: the table service's
+    reference checks (target exists, types match, SET NULL on a nullable
+    column) would refuse releases that installed before — a self-reference
+    among them. What #433 moves is where the referenced column's physical
+    name comes from: the manifest's own columns for a self-reference, the
+    target's registry row otherwise. A column neither declares keeps the
+    name the manifest gives (`id` always does).
+    """
+    targets: dict[str, str] = {}
+    own = table_service._declared_column_lookup(columns)
+    for col in columns:
+        refs = col.get("references")
+        if not isinstance(refs, dict):
+            continue
+        key = table_data_repo.column_key(str(refs.get("column") or "id"))
+        if key == "id":
+            continue
+        if refs.get("table") == table_name:
+            declared = own.get(key)
+        else:
+            row = await table_registry_repo.find_by_name(conn, vault_id, str(refs.get("table")))
+            declared = None if row is None else table_service._declared_column_lookup(
+                table_registry_repo.parse_columns(row["columns"])
+            ).get(key)
+        if declared is not None:
+            targets[table_data_repo.column_pg_name(col)] = table_data_repo.column_pg_name(declared)
+    return targets
+
+
 async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[str, Any]) -> None:
     table_name = _safe_identifier(payload["table"])
     existing = await table_registry_repo.find_by_name(conn, target["vault_id"], table_name)
@@ -191,7 +225,6 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         {**col, "pg_name": table_data_repo.derive_column_pg_name(pg_name, col["name"], ordinal)}
         for ordinal, col in enumerate(payload["columns"], start=1)
     ]
-    table_service._check_physical_names(columns)
     _, unique_keys, indexes = table_service._canonical_create_spec(
         vault_name=vault["name"],
         name=table_name,
@@ -200,13 +233,7 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         indexes=list(payload.get("indexes") or []),
         normalize_columns=False,
     )
-    # A referenced column's physical name is known only to its table's
-    # registry row (#433), as on the table service's create. Resolved on
-    # copies: the registry keeps the manifest's spelling, which the
-    # post-rollout fingerprint compares.
-    reference_columns = await table_service._validate_column_references(
-        conn, target["vault_id"], copy.deepcopy(columns),
-    )
+    reference_columns = await _reference_targets(conn, target["vault_id"], table_name, columns)
     table_id = uuid.uuid4()
     await table_data_repo.create_dynamic_table(
         conn,
