@@ -175,8 +175,9 @@ def _split_json_operand(
 def _compile_operand(raw: str, column_meta: _ColumnMeta) -> _Operand | dict[str, Any]:
     token = raw.strip()
     # A whole-token column wins over any JSON-path reading of it: a header
-    # may itself contain `->>` or `::`.
-    column = column_meta.resolve(token)
+    # may itself contain `->>` or `::`, or begin or end with a space — so the
+    # spelling as sent is tried before the trimmed one.
+    column = column_meta.resolve(raw) or column_meta.resolve(token)
     if column is not None:
         return _Operand(sql=column.pg_name, params=[], type_name=column.type_name, column=column)
     split = _split_json_operand(token, column_meta)
@@ -392,16 +393,17 @@ def _compile_select(
         return [_star(column_meta)]
     tokens = _split_top_level(select_value) if isinstance(select_value, str) else list(select_value)
     projections: list[_Projection] = []
-    for idx, token in enumerate(tokens):
-        token = token.strip()
+    for idx, raw_token in enumerate(tokens):
+        token = raw_token.strip()
         if not token:
             continue
         if token == "*":
             projections.append(_star(column_meta))
             continue
-        if column_meta.resolve(token) is None and re.search(r"(?<!:):(?!:)", token):
+        named = column_meta.resolve(raw_token) or column_meta.resolve(token)
+        if named is None and re.search(r"(?<!:):(?!:)", token):
             return err("Column aliases in select= are not implemented yet.", code=NOT_IMPLEMENTED)
-        operand_or_error = _compile_operand(token, column_meta)
+        operand_or_error = _compile_operand(raw_token, column_meta)
         if isinstance(operand_or_error, dict):
             return operand_or_error
         operand = _bind_operand_params(operand_or_error, params)

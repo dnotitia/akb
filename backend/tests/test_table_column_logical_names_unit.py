@@ -764,6 +764,24 @@ def test_d4_a_crafted_operand_is_refused_in_bounded_time():
     assert "메타->>a:b" in fine["error"]
 
 
+def test_d4_a_header_with_edge_spaces_is_addressable_as_written():
+    """Logical names are verbatim, surrounding spaces included, so the row
+    API tries the name as sent before trimming it."""
+    cols, _, _ = _spec([{"name": " 비고 ", "type": "text"}, {"name": "비고", "type": "text"}])
+    padded, plain = cols[0]["pg_name"], cols[1]["pg_name"]
+    ast = compile_ast_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        ast={"select": [" 비고 "], "filter": {"col": " 비고 ", "op": "eq", "val": "x"}},
+    )
+    assert "error" not in ast, ast
+    assert ast["sql"].startswith(f"SELECT {padded} FROM") and f"WHERE {padded} = $1" in ast["sql"]
+    read = compile_row_query(
+        vault_name=_VAULT, table_name=_TABLE, columns=cols,
+        query_params=[("select", "비고"), ("비고", "eq.x")],
+    )
+    assert read["sql"].startswith(f"SELECT {plain} FROM"), read
+
+
 def test_d11_backfill_records_the_identifier_the_old_ddl_made():
     import importlib.util
     from pathlib import Path
