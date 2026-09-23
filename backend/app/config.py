@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -1697,11 +1697,18 @@ class Settings(BaseModel):
 
     @property
     def database_url(self) -> str:
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        return self.asyncpg_dsn
 
     @property
     def asyncpg_dsn(self) -> str:
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        # The credentials sit in the URL, where "/", "@", ":", "?" and "#" are
+        # delimiters: a password holding one was read as host, port or query.
+        # Percent-encode them; asyncpg decodes each part, so PostgreSQL
+        # receives the values unchanged.
+        user = quote(self.db_user, safe="")
+        password = quote(self.db_password, safe="")
+        database = quote(self.db_name, safe="")
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{database}"
 
 
 _CONFIG_CANDIDATES = [Path("./config"), Path("/etc/akb")]

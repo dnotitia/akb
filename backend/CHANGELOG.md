@@ -5,6 +5,27 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## Unreleased
+
+### A database password with a URL delimiter no longer breaks the database URL
+
+`Settings.asyncpg_dsn`, which every connection uses (the main pool, the Native
+bootstrap and the BM25 scripts), put the credentials into the URL verbatim. In
+a URL, `/`, `@`, `?` and `#` are delimiters, so a password containing one of
+them was misread:
+
+- With a `/`, part of the password became the host. The backend then looked up
+  a host that does not exist ("Name or service not known") and never started.
+- With a `?`, the connection failed with "bad query field".
+- A literal `%2F` was decoded into `/`, so the wrong password was sent.
+
+A base64-generated password contains `/` about half the time.
+
+The user, password and database name are now percent-encoded. asyncpg decodes
+each part, so PostgreSQL receives exactly the configured values. A password
+made only of letters, digits, `-`, `.`, `_` and `~` yields the same URL as
+before. `database_url` is now the same URL.
+
 ## 0.15.0 — 2026-09-23  *(breaking default — PostgreSQL Native for new installations)*
 
 This is the announced default-change release the Native default was held for.
