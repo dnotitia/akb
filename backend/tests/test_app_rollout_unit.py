@@ -157,8 +157,14 @@ async def test_backfill_checkpoint_is_cumulative_across_restart_resume():
             assert "SELECT name FROM vaults" in query
             return "fixture-vault"
 
+        async def fetchrow(self, query, *_args):
+            # The backfilled column's physical name comes from the registry.
+            assert "FROM vault_tables" in query
+            return {"columns": [{"name": "flag", "type": "text"}]}
+
         async def fetch(self, query, *_args):
             assert "ORDER BY id LIMIT" in query
+            assert "WHERE flag IS NULL" in query
             return self._batches.pop(0)
 
         async def execute(self, query, *_args):

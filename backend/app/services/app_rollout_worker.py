@@ -234,9 +234,29 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
     )
 
 
+async def _physical_column(conn: Any, vault_id: uuid.UUID, table_name: str, column: str) -> str:
+    """The physical name of manifest column ``column``, read from the registry.
+
+    A manifest names a column logically (#433). A table adopted after logical
+    renames can hold `z` on physical `a` and `a` on `c_2_…`, and its
+    fingerprint — which ignores `pg_name` — still matches a plain {a, z}
+    manifest, so SQL must never take the manifest name as the identifier.
+    """
+    table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+    if table is None:
+        raise ConflictError("Rollout table is unavailable")
+    declared = table_service._declared_column_lookup(
+        table_registry_repo.parse_columns(table["columns"])
+    )
+    col = declared.get(table_data_repo.column_key(column))
+    if col is None:
+        raise ConflictError("Rollout column is not declared on its table")
+    return table_data_repo.column_pg_name(col)
+
+
 async def _run_backfill(conn: Any, target: dict[str, Any], step: dict[str, Any], payload: dict[str, Any]) -> bool:
     table_name = _safe_identifier(payload["table"])
-    column = _safe_identifier(payload["column"])
+    column_name = _safe_identifier(payload["column"])
     primary_key = _safe_identifier(payload["primary_key"])
     if primary_key != "id":
         raise ValidationError("backfill cursor must use the stable id primary key")
@@ -244,6 +264,7 @@ async def _run_backfill(conn: Any, target: dict[str, Any], step: dict[str, Any],
     if not vault_name:
         raise ConflictError("Rollout vault is unavailable")
     pg_name = table_data_repo.pg_table_name(vault_name, table_name)
+    column = await _physical_column(conn, target["vault_id"], table_name, column_name)
     checkpoint = step["checkpoint"] or {}
     if isinstance(checkpoint, str):
         try:
@@ -362,11 +383,12 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             ),
         )
     elif operation == "set_not_null":
-        column = _safe_identifier(payload["column"])
+        column_name = _safe_identifier(payload["column"])
         vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id=$1", target["vault_id"])
         if not vault_name:
             raise ConflictError("Rollout vault is unavailable")
         pg_name = table_data_repo.pg_table_name(vault_name, table_name)
+        column = await _physical_column(conn, target["vault_id"], table_name, column_name)
         remaining = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name} WHERE {column} IS NULL")
         if remaining:
             raise ConflictError("Rollout not-null precondition failed")
