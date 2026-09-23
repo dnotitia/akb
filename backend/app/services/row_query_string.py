@@ -32,6 +32,7 @@ from app.services.row_query_base import (
     _nested_group,
     _parse_contains_value,
     _parse_in_values,
+    _parse_int,
     _parse_page,
     _prefer_count_exact,
     _split_bool_condition,
@@ -95,15 +96,31 @@ def _read_filter_key(key: str, value: str, column_meta: _ColumnMeta) -> bool:
     A column can share a name with a control — a `Limit` or `Order` header,
     or a lowercase `order` (#433). Its key is a filter when it names the
     column (by `column_key`, like every other name) AND the value is a
-    filter (`<op>.<value>`); otherwise it is the control. So the web UI's
-    `limit=50&order=created_at.desc` still pages and sorts such a table, and a
-    filter on the column is never dropped from the WHERE clause (8d04a2aa).
-    Every read control validates its own value, so a malformed filter is
-    still an error, not a silent no-op.
+    filter (`<op>.<value>`) that the control would not take; otherwise it
+    is the control. So the web UI's `limit=50&order=created_at.desc` still
+    pages and sorts such a table, `order=eq.desc` still sorts by a column
+    named `eq`, and a filter on the column is never dropped from the WHERE
+    clause (8d04a2aa). Every read control validates its own value, so a
+    malformed filter is still an error, not a silent no-op.
     """
     if key not in READ_CONTROL_PARAMS:
         return True
-    return key in column_meta and _is_filter_value(value)
+    return (
+        key in column_meta
+        and _is_filter_value(value)
+        and not _is_read_control_value(key, value, column_meta)
+    )
+
+
+def _is_read_control_value(key: str, value: str, column_meta: _ColumnMeta) -> bool:
+    """Whether `value` is one the read control `key` takes — a column list,
+    a sort, a number. Compiled against scratch parameters; nothing is kept."""
+    scratch: list[Any] = []
+    if key == "select":
+        return not isinstance(_compile_select(value, column_meta, scratch), dict)
+    if key == "order":
+        return not isinstance(_compile_order(value, column_meta, scratch), dict)
+    return not isinstance(_parse_int(value, default=0), dict)
 
 
 def _compile_filters(
