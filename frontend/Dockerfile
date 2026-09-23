@@ -4,9 +4,12 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/markdown-editor/package.json packages/markdown-editor/tsconfig.json packages/markdown-editor/tsconfig.build.json ./packages/markdown-editor/
 COPY packages/markdown-editor/src ./packages/markdown-editor/src
+COPY packages/markdown-editor/scripts ./packages/markdown-editor/scripts
 RUN corepack enable && corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
 # The workspace install runs the common package's prepare build before the
 # frontend bundle; the workspace allowBuilds list stays limited to esbuild/msw.
+# That build ends in scripts/check-public-api.mjs, so everything it reads must be
+# copied above this line, not left to `COPY . .`.
 RUN pnpm install --frozen-lockfile
 
 COPY . .
