@@ -210,10 +210,13 @@ Nothing is migrated, so there is no window to protect. A table whose columns
 all have plain names — every table that exists before this change, and any
 created with plain names after it — is stored exactly as before and stays fully
 readable and writable by code from before #433, during a rolling deploy and
-after a rollback. Only a column with a non-plain name stores `pg_name`, and
-older code could never have created one; a table that has such a column is not
-usable by older code, which would address the column by `safe_ident` of its
-name — the collision this change exists to prevent.
+after a rollback. A column stores `pg_name` only when its physical name is not
+the one its name gives: a column created with a non-plain name, or one this
+code renamed logically (to a header, or from one). Older code could produce
+neither, and a table holding such a column is not usable by older code, which
+would address the column by `safe_ident` of its name — the collision this
+change exists to prevent. Whether a table is safe for older code is therefore
+readable from the registry: it is exactly when no column stores `pg_name`.
 
 ### Known limits
 

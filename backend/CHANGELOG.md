@@ -76,9 +76,10 @@ table's columns already have plain names, so its registry row, physical
 columns and constraint and index names stay byte-for-byte as they were.
 Rolling deploy and rollback: a table whose columns all have plain names —
 every existing table, and any created with plain names — stays fully readable
-and writable by code from before this change. Only a column with a non-plain
-name stores `pg_name`; older code could never create one, and a table that has
-one is not usable by older code. App manifests keep the plain grammar. Known
+and writable by code from before this change. A column stores `pg_name` only
+when its physical name is not the one its name gives (a header, or a column
+this code renamed logically); older code could produce neither, and a table
+holding one is not usable by older code. App manifests keep the plain grammar. Known
 limits: a NUL in a column name is stripped by the REST request models but is a
 422 over MCP; a header containing a comma cannot be named in a query-string
 `select`, `order` or `on_conflict` (the JSON AST can); a rename onto a plain

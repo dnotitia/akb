@@ -706,6 +706,9 @@ async def test_d7_rename_is_physical_only_for_a_plain_to_plain_column(monkeypatc
 
     col = out["columns"][0]
     assert col["name"] == new
+    # Stored only while the name does not say the physical name: a logical
+    # rename to a header, or from one to a plain name, records it.
+    assert _registry_update(conn)[0].get("pg_name") == (None if physical else before)
     renames = [s for s in conn.sql() if "RENAME COLUMN" in s]
     if physical:
         assert renames == [f"ALTER TABLE {_TABLE_PG} RENAME COLUMN {before} TO {new}"]
