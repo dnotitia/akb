@@ -54,9 +54,10 @@ Each column also has `pg_name`, its physical name, derived by the server and
 the only spelling that reaches PostgreSQL: a plain lowercase name keeps itself,
 anything else becomes `c_<position>_<8 hex>`, deterministic for the same table
 and header. A word PostgreSQL reserves (`user`, `order`, `group`: the 101
-keywords it refuses as a column name) is not plain, so a header like that
-creates instead of failing with a syntax error; keywords PostgreSQL accepts
-(`name`, `type`, `value`) stay plain. `pg_name` appears on every schema read
+keywords it refuses as a column name) is not plain, and neither is a system
+column name (`xmin`, `ctid`, `tableoid`, …), so a header like that creates
+instead of failing; keywords PostgreSQL accepts (`name`, `type`, `value`)
+stay plain. `pg_name` appears on every schema read
 (create/alter responses, table lists, `akb_browse` on both arms, the schema
 endpoints, vault info) and is rejected on input. DDL, constraint/index
 definitions and generated constraint/index names use it; the registry records
@@ -73,11 +74,12 @@ stores none.
   `All`, or a lowercase `order`). A query-string key is a filter or a
   control, never both: on a read, `select`/`order`/`limit`/`offset` is a
   filter only when it names a column and its value is a filter
-  (`<op>.<value>`), so default paging and sorting keep working; on
-  PATCH/DELETE, a control naming a column is a filter unless the mutation
-  reads it with a value it takes (`select` a column list, `all` a yes/no,
+  (`<op>.<value>`) the control would not take, so default paging and
+  sorting keep working; on PATCH/DELETE, a control naming a column is a
+  filter unless the mutation reads it with a value it takes (`select` a
+  column list, checked even when no rows are returned; `all` a yes/no;
   `expected_row_commit` always the CAS token), so a filter on such a column
-  is never dropped, in any spelling.
+  is never dropped, in any spelling, and a mistyped one is refused.
 - `akb_sql` spells columns by `pg_name`; no column rewriting. Naming a column by
   its logical name gets `undefined_column` with a hint naming the `pg_name`.
 - Renames: a column whose `pg_name` equals its name, renamed to another plain
@@ -89,9 +91,11 @@ stores none.
   A plain name can now be another column's physical name, so it must never
   reach `DROP COLUMN` on its own.
 - App manifests keep the plain grammar, `references.column` included. The
-  rollout derives physical names like the table service, and resolves FK
-  targets and the `backfill_column`/`set_not_null` column through the
-  registry.
+  rollout derives physical names like the table service and resolves a
+  referenced column's physical name (from the manifest for a
+  self-reference, from the registry otherwise) and the
+  `backfill_column`/`set_not_null` column through the registry; it validates
+  nothing it did not before.
 
 **Compatibility:** no migration runs and nothing is backfilled. Every existing
 table's registry row, physical columns and constraint and index names stay

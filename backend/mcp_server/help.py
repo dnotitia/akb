@@ -986,7 +986,7 @@ reserved in any case.
 
 AKB derives each column's physical `pg_name`, the only spelling `akb_sql`
 uses. A plain lowercase name (`^[a-z][a-z0-9_]*$`) keeps itself unless SQL
-reserves it (`order`, `user`, `group`); any other gets `c_<position>_<8 hex>`,
+reserves it (`order`, `user`, `xmin`); any other gets `c_<position>_<8 hex>`,
 stable for the same table and header. Never send `pg_name` — it is rejected.
 `akb_browse`, the schema reads and this tool's response list both names.
 

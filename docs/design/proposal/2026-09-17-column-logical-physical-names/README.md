@@ -148,9 +148,11 @@ hold:
    casefold.
 2. **Physical name.** `columns[].pg_name` is server-derived and a caller-supplied
    one is a 422. A logical name is **plain** when it matches `^[a-z][a-z0-9_]*$`
-   within 63 bytes and is not one of the 101 words PostgreSQL refuses as a
+   within 63 bytes and is neither one of the 101 words PostgreSQL refuses as a
    column name (`user`, `order`, `group`, …: `pg_get_keywords()` catcode R or
-   T, frozen from PostgreSQL 16). A plain name is its own physical name;
+   T, frozen from PostgreSQL 16) nor a system column name (`xmin`, `ctid`,
+   `tableoid`, …), which no user column may take. A plain name is its own
+   physical name;
    anything else is `c_<ordinal>_<digest8>`, ordinal =
    1-based position among user columns when added, digest = first 8 hex of
    `sha1(table_pg_name NUL logical_name)`. The digest is over the table's
@@ -189,15 +191,18 @@ hold:
    on commas. A query-string key is a filter or a control, never both, and a
    header may be spelled like a control (`Limit`, `Order`, lowercase `order`):
    on a read, `select`/`order`/`limit`/`offset` is a filter only when it names
-   a column and its value is a filter (`<op>.<value>`), so the web UI's
-   `limit=50&offset=0&order=created_at.desc,id.desc` still pages and sorts. On
+   a column and its value is a filter (`<op>.<value>`) the control would not
+   take, so the web UI's `limit=50&offset=0&order=created_at.desc,id.desc`
+   still pages and sorts, and `order=eq.desc` sorts by a column named `eq`. On
    PATCH/DELETE a control naming a column is a filter unless the mutation
-   reads it and the value is one it takes — `select` a column list, `all` a
-   yes/no; `expected_row_commit` is always the CAS token — so a filter on such
-   a column is never dropped (8d04a2aa), in any spelling. Controls a mutation
-   never reads (`count`, `order`, `limit`, `offset`, `resolution`,
-   `on_conflict`) are filters on a column of that name, and a malformed one is
-   a 400, not ignored.
+   reads it and the value is one it takes — `select` a column list that
+   compiles against the table and is not a filter, checked whether or not the
+   response returns rows; `all` a yes/no; `expected_row_commit` is always the
+   CAS token — so a filter on such a column is never dropped (8d04a2aa), in
+   any spelling, and a mistyped one is refused with the filter's own error.
+   Controls a mutation never reads (`count`, `order`, `limit`, `offset`,
+   `resolution`, `on_conflict`) are filters on a column of that name, and a
+   malformed one is a 400, not ignored.
 9. **`akb_sql` and read surfaces.** `akb_sql` spells columns physically, with no
    column rewriting; a logical name in SQL gets a hint naming the `pg_name`.
    Every read of a table's columns — schema reads, table lists, `akb_browse`
@@ -220,7 +225,11 @@ hold:
     `references.column` included; the fingerprint ignores `pg_name`. The
     rollout's create step derives physical names as the table service does
     (a reserved word gets `c_…`) and resolves a referenced column's physical
-    name through its table's registry row; `backfill_column` and the
+    name — from the manifest's own columns for a self-reference, from the
+    target's registry row otherwise — and validates nothing more: it creates
+    what the release declares, as before #433, and PostgreSQL judges the
+    constraint (a self-reference, `set null` on a required column and an
+    int → numeric FK all install as they did). `backfill_column` and the
     `set_not_null` precheck resolve their column through the registry, since
     a table adopted after logical renames can hold one column's name on
     another's physical column.
