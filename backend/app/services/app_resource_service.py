@@ -102,6 +102,12 @@ def _canonical_column(value: Any) -> dict[str, Any]:
         refs, on_delete = table_data_repo.normalize_reference_spec(
             result["references"], result.get("on_delete")
         )
+        # Plain grammar, like the column names above (#433 decision 13).
+        if (
+            len(refs["column"].encode("utf-8")) > _MAX_IDENTIFIER_LENGTH
+            or not _TABLE_NAME_RE.fullmatch(refs["column"])
+        ):
+            raise ValidationError("table schema column reference is invalid")
         result["references"] = refs
         result["on_delete"] = on_delete
     return result

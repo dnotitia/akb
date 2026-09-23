@@ -159,6 +159,10 @@ def _normalize_column(value: Any, *, nullable_only: bool = False) -> dict[str, A
     if isinstance(default, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)", default.strip()):
         raise ValidationError("Manifest column defaults must not contain expressions")
     result = table_data_repo.normalize_column_spec(result)
+    if result.get("references") is not None:
+        # A manifest names every column in the plain grammar (#433 decision
+        # 13) — a referenced one too; the table service accepts headers.
+        _identifier(result["references"]["column"], label="references column")
     for flag in ("required", "unique", "index"):
         if result.get(flag) is False or result.get(flag) is None:
             result.pop(flag, None)

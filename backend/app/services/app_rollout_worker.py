@@ -7,6 +7,7 @@ lock; a persisted checkpoint makes a retry resume rather than restart.
 
 from __future__ import annotations
 
+import copy
 import logging
 import json
 import uuid
@@ -192,6 +193,13 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         indexes=list(payload.get("indexes") or []),
         normalize_columns=False,
     )
+    # A referenced column's physical name is known only to its table's
+    # registry row (#433), as on the table service's create. Resolved on
+    # copies: the registry keeps the manifest's spelling, which the
+    # post-rollout fingerprint compares.
+    reference_columns = await table_service._validate_column_references(
+        conn, target["vault_id"], copy.deepcopy(columns),
+    )
     table_id = uuid.uuid4()
     await table_data_repo.create_dynamic_table(
         conn,
@@ -200,6 +208,7 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
         vault_name=vault["name"],
         vault_id=target["vault_id"],
         resource_uri=table_uri(vault["name"], table_name),
+        reference_columns=reference_columns,
     )
     for unique_key in unique_keys:
         await table_data_repo.create_unique_constraint(
