@@ -1,0 +1,40 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs on the same ref — only the latest PR push matters.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+# Build every Dockerfile in the repository. Nothing is pushed. None of the test
+# jobs builds an image, so the frontend and all-in-one images stopped building
+# after #652 while every check stayed green (#669).
+jobs:
+  build:
+    name: Docker image (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            file: backend/Dockerfile
+            context: backend
+          - image: frontend
+            file: frontend/Dockerfile
+            context: frontend
+          - image: all-in-one
+            file: deploy/all-in-one/Dockerfile
+            context: .
+          - image: postgres
+            file: deploy/postgres/Dockerfile
+            context: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.image }}
+        run: docker build --file "${{ matrix.file }}" --tag "akb-${{ matrix.image }}:ci" "${{ matrix.context }}"

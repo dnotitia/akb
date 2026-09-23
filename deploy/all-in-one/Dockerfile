@@ -34,9 +34,12 @@ WORKDIR /src
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./frontend/
 COPY frontend/packages/markdown-editor/package.json frontend/packages/markdown-editor/tsconfig.json frontend/packages/markdown-editor/tsconfig.build.json ./frontend/packages/markdown-editor/
 COPY frontend/packages/markdown-editor/src ./frontend/packages/markdown-editor/src
+COPY frontend/packages/markdown-editor/scripts ./frontend/packages/markdown-editor/scripts
 RUN corepack enable && corepack prepare "$(node -p 'require("./frontend/package.json").packageManager')" --activate
 # The workspace install runs the common package's prepare build before Vite;
 # the workspace allowBuilds list stays limited to esbuild/msw.
+# That build ends in scripts/check-public-api.mjs, so everything it reads must be
+# copied above this line, not left to `COPY frontend/`.
 RUN cd frontend && pnpm install --frozen-lockfile
 
 COPY frontend/ ./frontend/
