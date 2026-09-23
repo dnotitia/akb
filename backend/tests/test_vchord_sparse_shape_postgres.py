@@ -39,7 +39,7 @@ def _database_dsn(name: str) -> str:
 
 
 @contextlib.asynccontextmanager
-async def _store():
+async def _store(*, posting_first: bool = False, **store_kwargs):
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN 미설정 — 확장이 있는 PostgreSQL 이 필요하다")
     admin = await asyncpg.connect(_DSN)
@@ -49,9 +49,16 @@ async def _store():
     try:
         store = PgvectorStore(
             dsn=_database_dsn(name), schema="vector_index",
-            dense_dim=4, sparse_shape="vchord",
+            dense_dim=4, sparse_shape="vchord", **store_kwargs,
         )
         async with pool.acquire() as conn:
+            if posting_first:
+                # An installation that came from `posting`: its side table is
+                # there before the shape flips.
+                await PgvectorStore(
+                    dsn=_database_dsn(name), schema="vector_index",
+                    dense_dim=4, sparse_shape="posting",
+                )._do_ensure(conn)
             await store._do_ensure(conn)
         yield store, pool
     finally:
@@ -146,6 +153,73 @@ async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill():
         async with pool.acquire() as conn:
             assert await conn.fetchval(
                 "SELECT to_regclass('vector_index.idx_vi_chunks_bm25')"
+            ) is None
+
+
+async def _ten_times(raw: list[float]) -> list[float]:
+    # A mapping a test can check without a vocabulary or corpus statistics.
+    return [w * 10.0 for w in raw]
+
+
+async def _postings(conn, chunk: uuid.UUID) -> list[tuple[int, float]]:
+    rows = await conn.fetch(
+        "SELECT term_id, weight FROM vector_index.posting "
+        "WHERE chunk_id = $1 ORDER BY term_id",
+        chunk,
+    )
+    return [(r["term_id"], r["weight"]) for r in rows]
+
+
+async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
+    """The way back is kept while it is promised (akb#615).
+
+    `bm25_external_stats_mode="required"` keeps posting's statistics fresh for
+    a rollback, but after the flip nothing wrote `posting` itself: new chunks
+    never reached it and rewritten ones kept their old weights. While the way
+    back is retained, an installation that came from `posting` writes both, so
+    switching back serves the rows as they are now.
+    """
+    async with _store(posting_first=True, posting_weights=_ten_times) as (store, pool):
+        vault, chunk = uuid.uuid4(), uuid.UUID(int=1)
+        async with pool.acquire() as conn:
+            async def write(terms: list[int], tfs: list[float]) -> None:
+                await store.upsert_one(
+                    chunk_id=str(chunk), source_type="document",
+                    source_id=str(chunk), vault_id=str(vault),
+                    section_path="", content="doc", chunk_index=0,
+                    dense=None, sparse_indices=terms, sparse_values=tfs, conn=conn,
+                )
+
+            await write([10, 20], [1.0, 2.0])
+            assert await _postings(conn, chunk) == [(10, 10.0), (20, 20.0)]
+            await write([30], [3.0])  # rewritten: the old postings must go
+            assert await _postings(conn, chunk) == [(30, 30.0)]
+
+            back = PgvectorStore(
+                dsn=store._dsn, schema="vector_index",
+                dense_dim=4, sparse_shape="posting",
+            )
+            assert await back._search_sparse(
+                conn, terms=[30], weights=[1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            ) == [str(chunk)]
+
+            await store.delete_point(str(chunk), conn=conn)
+            assert await _postings(conn, chunk) == []
+
+
+async def test_a_fresh_vchord_install_has_no_posting_to_keep():
+    """Nothing to go back to, so nothing is written or created for it."""
+    async with _store(posting_weights=_ten_times) as (store, pool):
+        async with pool.acquire() as conn:
+            await store.upsert_one(
+                chunk_id=str(uuid.UUID(int=1)), source_type="document",
+                source_id=str(uuid.uuid4()), vault_id=str(uuid.uuid4()),
+                section_path="", content="doc", chunk_index=0,
+                dense=None, sparse_indices=[10], sparse_values=[1.0], conn=conn,
+            )
+            assert await conn.fetchval(
+                "SELECT to_regclass('vector_index.posting')"
             ) is None
 
 

@@ -555,34 +555,51 @@ async def encode_document(
                 raw_values.append(float(tf))
         return raw_indices, raw_values
 
-    stats = await load_stats()
-    # total_docs is only needed for query-side IDF (see encode_query); doc
-    # encoding works on TF saturation + dl normalization only.
-    avgdl_raw = float(stats.get("avgdl") or 0)
-    avgdl = avgdl_raw if avgdl_raw > 0 else 1.0
-    k1 = float(stats.get("k1") or settings.bm25_k1)
-    b = float(stats.get("b") or settings.bm25_b)
-
-    # For documents we store TF pre-saturated with the BM25 saturation so
-    # Dot product at query time yields BM25 score. Specifically for
-    # each term t in doc d:
-    #   doc_weight[t] = TF(t,d) * (k1 + 1) / (TF(t,d) + k1 * (1 - b + b*|d|/avgdl))
-    # and query_weight[t] = IDF(t). Then dot = Σ IDF(t) * sat_TF(t,d) = BM25.
-    dl = sum(term_counts.values())
-    dl_norm = 1 - b + b * (dl / avgdl)
-
-    # Document encoding does not read df; IDF belongs to the query side.
+    # Document encoding does not read df; IDF belongs to the query side. The
+    # ids and frequencies are gathered exactly as the raw branch gathers them,
+    # so a caller holding raw frequencies can derive these same weights later
+    # (`saturate_for_posting`).
     indices: list[int] = []
-    values: list[float] = []
+    tfs: list[float] = []
     for term, tf in term_counts.items():
         tid = vocab.get(term)
         if tid is None:
             continue
-        # tf>0 (Counter), k1>0, dl_norm>0 → denom>0, sat_tf>0; no zero guard needed.
-        sat_tf = tf * (k1 + 1) / (tf + k1 * dl_norm)
         indices.append(tid)
-        values.append(float(sat_tf))
-    return indices, values
+        tfs.append(float(tf))
+    return indices, _saturate(tfs, await load_stats(), dl=sum(term_counts.values()))
+
+
+def _saturate(tfs: list[float], stats: dict, *, dl: float | None = None) -> list[float]:
+    """Raw term frequencies → the pre-saturated document weights `posting` stores.
+
+    For each term t in document d:
+      doc_weight[t] = TF(t,d) * (k1 + 1) / (TF(t,d) + k1 * (1 - b + b*|d|/avgdl))
+    and query_weight[t] = IDF(t), so the dot product at query time is BM25.
+    total_docs is only needed for query-side IDF (see encode_query).
+
+    `dl` is the document's token count. Left out, it is the sum of `tfs`, which
+    is the same number whenever every term received an id — and
+    `get_or_create_term_ids` either assigns every one or raises.
+    """
+    avgdl_raw = float(stats.get("avgdl") or 0)
+    avgdl = avgdl_raw if avgdl_raw > 0 else 1.0
+    k1 = float(stats.get("k1") or settings.bm25_k1)
+    b = float(stats.get("b") or settings.bm25_b)
+    length = sum(tfs) if dl is None else dl
+    dl_norm = 1 - b + b * (length / avgdl)
+    # tf>0, k1>0, dl_norm>0 → denom>0; no zero guard needed.
+    return [float(tf * (k1 + 1) / (tf + k1 * dl_norm)) for tf in tfs]
+
+
+async def saturate_for_posting(tfs: list[float]) -> list[float]:
+    """The weights `posting` stores for these raw frequencies, under current stats.
+
+    The vchord shape keeps `posting` current with this while the way back to it
+    is retained (akb#615), from the frequencies it already encoded rather than
+    by tokenizing the text a second time.
+    """
+    return _saturate(tfs, await load_stats())
 
 
 async def encode_query(
