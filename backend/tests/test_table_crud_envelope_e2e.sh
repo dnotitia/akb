@@ -161,10 +161,13 @@ BAD_RENAME=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/
   -d '{"rename_columns":{"missing":"new_name"}}')
 [ "$BAD_RENAME" = "422" ] && pass "alter.bad-rename: HTTP 422" || fail "alter.bad-rename" "expected 422, got $BAD_RENAME"
 
+# Column names resolve case-insensitively (#433), so a differently-cased
+# reference is not an error any more; a rename onto another column's name in
+# a different case still is.
 BAD_RENAME_CASE=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
   -H "Authorization: Bearer $PAT" \
   -H 'Content-Type: application/json' \
-  -d '{"rename_columns":{"AGE_YEARS":"age_again"}}')
+  -d '{"rename_columns":{"age_years":"EMAIL"}}')
 [ "$BAD_RENAME_CASE" = "422" ] && pass "alter.bad-rename-case: HTTP 422" || fail "alter.bad-rename-case" "expected 422, got $BAD_RENAME_CASE"
 
 BAD_RENAME_DUP=$(curl -sk -o /dev/null -w "%{http_code}" -X PATCH "$BASE_URL/api/v1/tables/$VAULT/$TABLE" \
