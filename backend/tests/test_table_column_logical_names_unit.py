@@ -757,3 +757,30 @@ def test_d4_a_crafted_operand_is_refused_in_bounded_time():
     )
     assert fine["code"] == "undefined_column"
     assert "메타->>a:b" in fine["error"]
+
+
+def test_d11_backfill_records_the_identifier_the_old_ddl_made():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "app" / "db" / "migrations" / "113_table_column_pg_names.py"
+    spec = importlib.util.spec_from_file_location("migration_113", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    legacy = [
+        {"name": "status", "type": "text"},
+        {"name": "Legacy-Col", "type": "text"},
+        {"name": "분류", "type": "text", "pg_name": "c_1_0badf00d"},
+        "not a column",
+    ]
+    assert module.backfilled_columns(legacy) == [
+        {"name": "status", "type": "text", "pg_name": "status"},
+        {"name": "Legacy-Col", "type": "text", "pg_name": "legacy_col"},
+        {"name": "분류", "type": "text", "pg_name": "c_1_0badf00d"},
+        "not a column",
+    ]
+    assert module.backfilled_columns(module.backfilled_columns(legacy)) is None
+    assert module.backfilled_columns([]) is None
+    assert json.loads(json.dumps(module.backfilled_columns(legacy))) == module.backfilled_columns(legacy)
