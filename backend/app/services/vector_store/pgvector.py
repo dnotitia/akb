@@ -499,13 +499,37 @@ class PgvectorStore:
                     ADD COLUMN IF NOT EXISTS sparse_bm25 bm25_catalog.bm25vector
                 """
             )
-            await conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_vi_chunks_bm25
-                    ON "{self._schema}".chunks
-                 USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
-                """
-            )
+            # The index is built here only for an empty table — a fresh
+            # install, where it costs nothing. Over existing chunks it is the
+            # job of `scripts/backfill_bm25_vector.py --index`, which builds it
+            # CONCURRENTLY and refuses while any row still has no vector.
+            # Building it here held this transaction's ShareLock against every
+            # write for the whole build, over whatever part of the column the
+            # backfill had reached, and made each later batch of that backfill
+            # pay index maintenance per row (akb#615). A populated table with no
+            # index means the shape was selected before the runbook finished:
+            # say so, rather than serve a partial column.
+            if await conn.fetchval(
+                "SELECT to_regclass($1) IS NULL",
+                f'"{self._schema}".idx_vi_chunks_bm25',
+            ):
+                if await conn.fetchval(
+                    f'SELECT EXISTS (SELECT 1 FROM "{self._schema}".chunks)'
+                ):
+                    raise VectorStoreUnavailable(
+                        'vector_store_sparse_shape is "vchord" but '
+                        f'"{self._schema}".idx_vi_chunks_bm25 does not exist and '
+                        "the table already holds chunks. Fill sparse_bm25 and build "
+                        "the index with scripts/backfill_bm25_vector.py (--index, "
+                        "once the sweep has converged) before selecting this shape."
+                    )
+                await conn.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_vi_chunks_bm25
+                        ON "{self._schema}".chunks
+                     USING bm25 (sparse_bm25 bm25_catalog.bm25_ops)
+                    """
+                )
 
         else:
             assert_never(self._sparse_shape)

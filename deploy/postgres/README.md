@@ -45,6 +45,13 @@ Note that installing the extension is not by itself enough for AKB to use it —
 the sparse leg selects its implementation separately. This image only makes the
 option available.
 
+On a database that already holds chunks, select `vchord` only after
+`scripts/backfill_bm25_vector.py --index` has built the index. Until then the
+backend refuses the shape rather than building the index itself: at startup it
+would build it inside its schema transaction, blocking writes for the build,
+over a column the backfill had not finished. A fresh, empty database gets the
+index at startup as before.
+
 ## Tokenization is not affected
 
 The extension ships no tokenizer of its own; `vchord_bm25` 0.3.0 is the index
