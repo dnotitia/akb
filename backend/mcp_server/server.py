@@ -1883,7 +1883,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         )
         return CallToolResult(
             content=[TextContent(type="text", text=encoded)],
-            isError=_is_error_envelope(result),
+            is_error=_is_error_envelope(result),
         )
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
@@ -1926,7 +1926,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                     text=encoded,
                 )
             ],
-            isError=True,
+            is_error=True,
         )
 
 
