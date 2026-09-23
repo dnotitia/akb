@@ -1654,9 +1654,12 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     # the two copies would fall out of step the first time someone forgot.
     postgres_image = compose["services"]["postgres"]["image"]
     assert postgres_image.startswith("pgvector/pgvector:pg16@sha256:"), postgres_image
-    assert compose["services"]["minio"]["image"] == (
-        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
-    )
+    # Same shape as the postgres assertion above, for the same reason: a dated
+    # release tag carrying a digest, not one exact string. The literal that
+    # stood here was the second copy of a pin, and akb#621 moved the pin.
+    minio_image = compose["services"]["minio"]["image"]
+    assert minio_image.startswith("quay.io/minio/minio:RELEASE."), minio_image
+    assert "@sha256:" in minio_image, minio_image
     assert compose["services"]["postgres"]["ports"] == [
         "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
     ]

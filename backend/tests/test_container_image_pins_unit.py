@@ -86,3 +86,22 @@ def test_every_compose_reference_that_pulls_carries_a_digest():
         "digest 없이 당기는 compose 참조 — 레지스트리가 옮기면 조용히 바뀌거나 사라진다:\n  "
         + "\n  ".join(unpinned)
     )
+
+
+def test_every_stack_runs_the_same_minio():
+    """akb#621 asked for one MinIO version across development, eval and CI.
+
+    Three compose files name it, so "named once" is enforced as agreement: every
+    reference to the server is the same string, and so is every reference to the
+    client. Before the fix they had drifted into two registries, and only one of
+    them still served the image.
+    """
+    by_image: dict[str, set[str]] = {"minio/minio": set(), "minio/mc": set()}
+    for path in _compose_files():
+        for ref in re.findall(r"^\s*image:\s*(\S+)", path.read_text(), re.M):
+            for name, seen in by_image.items():
+                if re.search(rf"(^|/){re.escape(name)}[:@]", ref):
+                    seen.add(ref)
+    assert by_image["minio/minio"], "MinIO 서버 참조를 하나도 못 찾았다"
+    for name, seen in by_image.items():
+        assert len(seen) <= 1, f"{name} 참조가 스택마다 다르다: {sorted(seen)}"
