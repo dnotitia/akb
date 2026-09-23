@@ -323,6 +323,8 @@ jobs:
             tests/test_sso_browser_session_postgres.py
             tests/test_sso_session_epoch_upgrade_postgres.py
             tests/test_bm25_corpus_revision_postgres.py
+            tests/test_bm25_recompute_resume_postgres.py
+            tests/test_bm25_vocab_term_ids_postgres.py
             tests/test_notifications_postgres.py
             tests/test_notification_native_postgres.py
             tests/test_notification_unwatch_postgres.py
