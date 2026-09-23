@@ -188,6 +188,19 @@ def _declared_column_lookup(columns: list[dict]) -> dict[str, dict]:
     }
 
 
+def _missing_drop_message(name: str, table_name: str, columns: list[dict]) -> str:
+    """Why `name` cannot be dropped — naming the column whose physical name
+    it is, when it is one, since that is the likeliest mistake."""
+    message = f"Cannot drop missing column {name!r} on table {table_name!r}."
+    for col in columns:
+        if isinstance(col, dict) and table_data_repo.column_pg_name(col) == name:
+            return (
+                f"{message} {name!r} is the physical name of column "
+                f"{col['name']!r}; drop it by that name."
+            )
+    return message
+
+
 def _check_key_column(col, lookup: dict[str, dict], *, ctx: str) -> dict:
     """Validate one referenced column and return its DECLARED column.
 
@@ -1528,18 +1541,18 @@ async def alter_table(
 
             if drop_columns:
                 declared = _declared_column_lookup(columns)
-                # (reported name, physical name or None when nothing can be there)
-                drops: list[tuple[str, str | None]] = []
+                # (declared name, physical name). A drop names a DECLARED
+                # column, as a rename or an alter does. A name that is not
+                # one is refused, never sent to DROP COLUMN: a plain name can
+                # be another column's physical name — the `c_1_…` a header
+                # was given, or `age` after `age` was renamed to `나이` — and
+                # dropping by it would destroy a column the registry keeps.
+                drops: list[tuple[str, str]] = []
                 for col_name in drop_columns:
                     target = declared.get(table_data_repo.column_key(col_name))
-                    if target is not None:
-                        drops.append((target["name"], table_data_repo.column_pg_name(target)))
-                    elif table_data_repo.is_plain_column_name(col_name):
-                        # Not in the registry: DROP ... IF EXISTS by that name,
-                        # exactly as before the split.
-                        drops.append((col_name, col_name))
-                    else:
-                        drops.append((col_name, None))
+                    if target is None:
+                        raise ValidationError(_missing_drop_message(col_name, table_name, columns))
+                    drops.append((target["name"], table_data_repo.column_pg_name(target)))
                 await _reject_referenced_target_columns(
                     conn,
                     vault_id,
@@ -1548,15 +1561,14 @@ async def alter_table(
                     action="drop",
                 )
                 for col_name, dropped_physical in drops:
-                    if dropped_physical is not None:
-                        try:
-                            await table_data_repo.drop_column(conn, pg_name, dropped_physical)
-                        except asyncpg.DependentObjectsStillExistError as e:
-                            raise ConflictError(
-                                f"Cannot drop column {col_name!r} on table {table_name!r}: "
-                                "other vault tables reference it. Drop dependent tables "
-                                "or columns first."
-                            ) from e
+                    try:
+                        await table_data_repo.drop_column(conn, pg_name, dropped_physical)
+                    except asyncpg.DependentObjectsStillExistError as e:
+                        raise ConflictError(
+                            f"Cannot drop column {col_name!r} on table {table_name!r}: "
+                            "other vault tables reference it. Drop dependent tables "
+                            "or columns first."
+                        ) from e
                     dropped.append(col_name)
                 dropped_keys = {table_data_repo.column_key(name) for name in dropped}
                 columns = [
