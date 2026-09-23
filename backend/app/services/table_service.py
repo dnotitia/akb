@@ -1963,15 +1963,6 @@ async def alter_table(
                     existing_idxs.append(idx)
                     idx_changed = True
 
-            # A row written before the backfill carries no pg_name; record the
-            # identifier it already has, so the registry never needs the
-            # fallback for it again.
-            columns = [
-                {**c, "pg_name": table_data_repo.column_pg_name(c)}
-                if isinstance(c, dict) and isinstance(c.get("name"), str) and not c.get("pg_name")
-                else c
-                for c in columns
-            ]
             await table_registry_repo.update_columns(conn, table["id"], columns)
             if uk_changed or idx_changed:
                 await table_registry_repo.update_schema_meta(

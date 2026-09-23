@@ -2019,7 +2019,8 @@ class DocumentService:
                     row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
                 except Exception:
                     row_count = 0
-                cols = ensure_list(r["columns"]) if isinstance(r["columns"], str) else r["columns"]
+                # Each column with its physical `pg_name` as well as its name.
+                cols = table_registry_repo.parse_columns(r["columns"])
                 items.append(BrowseItem(
                     # `path` is the table name. Pre-0.3.0 it was a
                     # synthetic `_tables/<name>` string, which made

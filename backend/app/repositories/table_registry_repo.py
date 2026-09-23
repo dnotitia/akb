@@ -12,6 +12,11 @@ referencing `collections.id` (NULL == vault root). Table names remain
 unique within a vault (NOT per-collection), so the PG-side
 `pg_table_name(vault, name)` mapping is unchanged and a table can be
 moved between collections without renaming.
+
+A column's physical `pg_name` (#433) is stored sparsely: written only where
+it differs from the identifier `table_data_repo.legacy_column_pg_name` gives
+(`storable_columns`), and filled back in on every read (`parse_columns`).
+In between, every column carries it.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from app.repositories import table_data_repo
 from app.utils import ensure_list
 
 
@@ -183,7 +189,7 @@ async def insert(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         """,
         table_id, vault_id, collection_id, name, description,
-        json.dumps(columns),
+        json.dumps(storable_columns(columns)),
         json.dumps(unique_keys or []), json.dumps(indexes or []),
         created_by, now,
     )
@@ -196,7 +202,7 @@ async def delete(conn, table_id: uuid.UUID) -> None:
 async def update_columns(conn, table_id: uuid.UUID, columns: list[dict]) -> None:
     await conn.execute(
         "UPDATE vault_tables SET columns = $1, updated_at = NOW() WHERE id = $2",
-        json.dumps(columns), table_id,
+        json.dumps(storable_columns(columns)), table_id,
     )
 
 
@@ -219,13 +225,41 @@ async def update_schema_meta(
     )
 
 
+def _is_column(col: Any) -> bool:
+    return isinstance(col, dict) and isinstance(col.get("name"), str)
+
+
+def storable_columns(columns: list[dict]) -> list[dict]:
+    """The registry form of a column list: `pg_name` only where it differs
+    from what `legacy_column_pg_name` gives for the name.
+
+    A plain name is its own physical name, so a table whose names are all
+    plain stores exactly what it stored before #433 — no key appears, no
+    row changes, and older code reads it as it always did. A rename that
+    brings a name back to its physical name drops the key again."""
+    stored: list[dict] = []
+    for col in columns:
+        if _is_column(col) and "pg_name" in col and (
+            not col["pg_name"]
+            or col["pg_name"] == table_data_repo.legacy_column_pg_name(col["name"])
+        ):
+            col = {k: v for k, v in col.items() if k != "pg_name"}
+        stored.append(col)
+    return stored
+
+
 def parse_columns(raw: Any) -> list[dict]:
-    """Normalise the `columns` jsonb to list[dict]. asyncpg returns it as
-    a pre-parsed list normally, but legacy rows inserted as JSON string
+    """Normalise the `columns` jsonb to list[dict], each column carrying its
+    physical `pg_name` (`column_pg_name` fills in the ones stored sparsely),
+    so every reader and read surface sees both names. asyncpg returns the
+    jsonb pre-parsed normally, but legacy rows inserted as JSON string
     literals come back as `str` — handle both."""
-    if isinstance(raw, str):
-        return ensure_list(raw)
-    return list(raw) if raw else []
+    columns = ensure_list(raw) if isinstance(raw, str) else (list(raw) if raw else [])
+    return [
+        {**col, "pg_name": table_data_repo.column_pg_name(col)}
+        if _is_column(col) and not col.get("pg_name") else col
+        for col in columns
+    ]
 
 
 def parse_json_list(raw: Any) -> list[dict]:

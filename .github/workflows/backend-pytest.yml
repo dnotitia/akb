@@ -337,8 +337,9 @@ jobs:
             # Column logical/physical names (#433): what pg_attribute holds,
             # which physical columns a UNIQUE key and an index are built on,
             # what a reader's own role can SELECT before and after RoleSync
-            # reconciles, and a registry backfill that must not move a byte
-            # of DDL. All PostgreSQL facts; off this list it skips in both jobs.
+            # reconciles, and an existing table whose registry row must not
+            # change by a byte when this code boots over it. All PostgreSQL
+            # facts; off this list it skips in both jobs.
             tests/test_table_column_logical_names_postgres.py
             tests/test_kg_document_ref_postgres.py
             tests/test_search_covering_indexes_e2e.py

@@ -121,6 +121,11 @@ def _stored_row(*, name="issues", columns=None, collection=None):
     }
 
 
+def _with_pg_names(specs: list[dict]) -> list[dict]:
+    """Columns as a read reports them: a plain name is its own `pg_name`."""
+    return [{**c, "pg_name": c["name"]} for c in specs]
+
+
 def _norm(specs: list[dict]) -> list[dict]:
     """Normalize like a real create would, so a comparison test isolates the
     field under test instead of tripping on `type` (json -> jsonb)."""
@@ -233,8 +238,9 @@ async def test_divergent_schema_names_the_differing_fields(monkeypatch):
 
     assert out["matches_request"] is False
     assert "columns" in out["mismatches"]
-    # the STORED schema, not the request's
-    assert out["columns"] == [{"name": "headline", "type": "text"}]
+    # the STORED schema, not the request's — reported, like every read of
+    # a table's columns, with each column's physical `pg_name` (#433)
+    assert out["columns"] == [{"name": "headline", "type": "text", "pg_name": "headline"}]
 
 
 async def test_divergent_collection_is_reported(monkeypatch):
@@ -262,7 +268,7 @@ async def test_legacy_json_string_columns_are_normalised(monkeypatch):
     out = await table_service.create_table(
         uuid.uuid4(), "issues", _COLS, actor_id="t", if_not_exists=True, can_read_existing=True)
 
-    assert out["columns"] == _COLS
+    assert out["columns"] == _with_pg_names(_COLS)
     assert out["matches_request"] is True
 
 
@@ -590,7 +596,7 @@ async def test_read_authority_grants_the_full_envelope(monkeypatch):
         uuid.uuid4(), "issues", _COLS, actor_id="t",
         if_not_exists=True, can_read_existing=True)
 
-    assert out["columns"] == _COLS
+    assert out["columns"] == _with_pg_names(_COLS)
     assert out["matches_request"] is True
     assert "uri" in out and "collection" in out
 
@@ -625,9 +631,9 @@ async def test_real_create_is_unaffected_by_the_capability(monkeypatch):
         if_not_exists=True, can_read_existing=False)
 
     assert out["created"] is True
-    # The created table reports its columns as stored: each with the
-    # server-derived physical name, its own name for a plain one (#433).
-    assert out["columns"] == [{**c, "pg_name": c["name"]} for c in _COLS]
+    # The created table reports each column with its physical name — its own
+    # name, for a plain one (#433).
+    assert out["columns"] == _with_pg_names(_COLS)
 
 
 # ── 6. the advisory lock ─────────────────────────────────────────

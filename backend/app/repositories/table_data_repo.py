@@ -228,6 +228,10 @@ def safe_ident(name: str) -> str:
 # derived by the server, ASCII-only, and the only spelling ever interpolated
 # into SQL. `safe_ident` cannot stand in for the mapping: it sends `분류` and
 # `모델` both to `__`.
+#
+# The registry records `pg_name` only where it differs from
+# `legacy_column_pg_name(name)` (see `table_registry_repo.storable_columns`),
+# so a table whose names are all plain is stored exactly as before #433.
 
 # A logical name matching this, within PG_IDENT_MAX_LEN, is its own physical
 # name — so every table created before the split keeps its identifiers.
@@ -268,9 +272,10 @@ def derive_column_pg_name(table_pg_name: str, logical_name: str, ordinal: int) -
     return f"c_{ordinal}_{digest}"
 
 
-def _legacy_pg_name(name: str) -> str:
-    # What DDL before the split produced from a registry name: `safe_ident`
-    # interpolated unquoted, which PostgreSQL folds to lowercase.
+def legacy_column_pg_name(name: str) -> str:
+    """The identifier DDL before the split made from a registry name:
+    `safe_ident` interpolated unquoted, which PostgreSQL folds to lowercase.
+    For a plain name, the name itself."""
     return safe_ident(name).lower()
 
 
@@ -278,12 +283,15 @@ def column_pg_name(col: dict) -> str:
     """The physical identifier of a registry column — the only column name
     that may reach SQL.
 
-    A registry row written before the backfill (migration 113) carries no
-    ``pg_name``; its identifier is the one the old DDL produced."""
+    A column without a stored ``pg_name`` has the identifier
+    `legacy_column_pg_name` gives. That is the contract, not a transition
+    shim: the registry stores ``pg_name`` only where it differs, so every
+    table created before #433, and every plain column created after, has
+    none."""
     pg_name = col.get("pg_name")
     if isinstance(pg_name, str) and pg_name:
         return safe_ident(pg_name)
-    return _legacy_pg_name(col["name"])
+    return legacy_column_pg_name(col["name"])
 
 
 def normalize_column_type(logical_type: Any) -> str:
@@ -589,7 +597,7 @@ def foreign_key_constraint_definition(
     )
     target_col = (
         safe_ident(target_column) if target_column is not None
-        else _legacy_pg_name(refs["column"])
+        else legacy_column_pg_name(refs["column"])
     )
     return (
         f"CONSTRAINT {name} FOREIGN KEY ({source_col}) "

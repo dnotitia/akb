@@ -3,7 +3,8 @@
 Design: docs/design/proposal/2026-09-17-column-logical-physical-names/
 ("Acceptance gates"). This is the DB-free half. The half that needs a real
 PostgreSQL — the whole lifecycle, `akb_sql`, `pg_attribute` drift, RoleSync
-and the backfill migration — is `test_table_column_logical_names_postgres.py`.
+and an existing table left byte-identical — is
+`test_table_column_logical_names_postgres.py`.
 
 Written before the implementation, and red against 2ed799bf: every gate is
 refused there by `_COLUMN_NAME_RE`, or asks for the `pg_name` the registry
@@ -437,8 +438,8 @@ def test_gate5_drift_compares_the_registry_to_pg_attribute_by_physical_name():
 
 # Captured from 2ed799bf for the spec below: the DDL and generated names a
 # table created before this change carries. Grammar-shaped names must keep
-# producing exactly these bytes, which is what lets the backfill be
-# `pg_name = name` with no DDL rewrite.
+# producing exactly these bytes, which is what lets an existing table keep
+# its physical names — `pg_name = name`, stored nowhere — with no DDL rewrite.
 _LEGACY_SPEC = [
     {"name": "status", "type": "enum", "enum": ["draft", "active"], "default": "draft"},
     {"name": "qty", "type": "int", "required": True, "default": 1, "check": {"op": "gte", "value": 0}},
@@ -489,9 +490,10 @@ async def test_gate6_grammar_shaped_names_keep_their_physical_identity():
     assert conn.sql()[0] == _LEGACY_DDL
 
 
-def test_gate6_a_registry_row_written_before_the_backfill_resolves_as_before():
-    # Unquoted identifiers fold to lowercase, and `safe_ident` mapped every
-    # other character to `_`: that pair is the identifier the old DDL made.
+def test_gate6_a_column_without_pg_name_has_the_identifier_the_legacy_rule_gives():
+    # The contract for every column that stores no `pg_name`. Unquoted
+    # identifiers fold to lowercase, and `safe_ident` mapped every other
+    # character to `_`: that pair is the identifier the old DDL made.
     assert table_data_repo.column_pg_name({"name": "status"}) == "status"
     assert table_data_repo.column_pg_name({"name": "MyCol"}) == "mycol"
     assert table_data_repo.column_pg_name({"name": "my-col"}) == "my_col"
@@ -751,7 +753,7 @@ async def test_d7_renaming_a_column_to_the_name_it_already_has_is_a_no_op(monkey
 
 
 async def test_d12_if_not_exists_ignores_pg_name_on_either_side(monkeypatch):
-    legacy = [{"name": "title", "type": "text"}]  # stored before the backfill
+    legacy = [{"name": "title", "type": "text"}]  # stored without pg_name
     conn = _Conn(table_row={
         "id": uuid.uuid4(), "vault_id": uuid.uuid4(), "collection_id": None,
         "collection": None, "name": _TABLE, "description": "",
@@ -883,30 +885,3 @@ def test_d4_a_header_with_edge_spaces_is_addressable_as_written():
         query_params=[("select", "비고"), ("비고", "eq.x")],
     )
     assert read["sql"].startswith(f"SELECT {plain} FROM"), read
-
-
-def test_d11_backfill_records_the_identifier_the_old_ddl_made():
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[1] / "app" / "db" / "migrations" / "113_table_column_pg_names.py"
-    spec = importlib.util.spec_from_file_location("migration_113", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    legacy = [
-        {"name": "status", "type": "text"},
-        {"name": "Legacy-Col", "type": "text"},
-        {"name": "분류", "type": "text", "pg_name": "c_1_0badf00d"},
-        "not a column",
-    ]
-    assert module.backfilled_columns(legacy) == [
-        {"name": "status", "type": "text", "pg_name": "status"},
-        {"name": "Legacy-Col", "type": "text", "pg_name": "legacy_col"},
-        {"name": "분류", "type": "text", "pg_name": "c_1_0badf00d"},
-        "not a column",
-    ]
-    assert module.backfilled_columns(module.backfilled_columns(legacy)) is None
-    assert module.backfilled_columns([]) is None
-    assert json.loads(json.dumps(module.backfilled_columns(legacy))) == module.backfilled_columns(legacy)

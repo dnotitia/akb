@@ -383,7 +383,6 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "110_search_degradation_daily.py",  # daily search degradation counters + per-cause breakdown (akb#612)
         "111_bm25_recompute_resume.py",  # durable BM25 recompute cursor + term accumulator (akb#616)
         "112_edges_resource_identity.py",  # anchor graph edges to native resource identity (akb#654/#655/#656)
-        "113_table_column_pg_names.py",  # record each vault-table column's physical pg_name; registry only, no DDL (akb#433)
     ):
         if filename in applied:
             continue
