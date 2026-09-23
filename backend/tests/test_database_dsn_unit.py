@@ -82,4 +82,6 @@ def test_database_url_is_the_same_url() -> None:
 def test_a_plain_password_keeps_the_url_it_always_had() -> None:
     configured = _settings(db_password="akb-secure-password-change-me")
 
-    assert configured.asyncpg_dsn == "postgresql://akbuser:akb-secure-password-change-me@postgres:5432/akb"
+    assert configured.asyncpg_dsn == (
+        "postgresql://akbuser:akb-secure-password-change-me@postgres:5432/akb"  # pragma: allowlist secret
+    )
