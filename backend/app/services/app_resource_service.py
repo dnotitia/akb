@@ -56,6 +56,10 @@ def _canonical_column(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError("table schema columns must be objects")
     result = dict(to_nfc_any(value))
+    # `pg_name` is the server-derived physical name a registry row carries
+    # (#433) — an implementation detail like the constraint names below, so
+    # it is not part of the logical schema a manifest declares.
+    result.pop("pg_name", None)
     if set(result) - {
         "name",
         "type",

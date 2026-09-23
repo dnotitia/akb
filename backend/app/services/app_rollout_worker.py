@@ -182,8 +182,14 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
     vault = await conn.fetchrow("SELECT name FROM vaults WHERE id=$1", target["vault_id"])
     if vault is None:
         raise ConflictError("Rollout vault is unavailable")
-    columns = list(payload["columns"])
     pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
+    # Manifest column names match the plain grammar, so each keeps itself as
+    # its physical name; recording it makes the registry row what a create
+    # writes (#433).
+    columns = [
+        {**column, "pg_name": table_data_repo.derive_column_pg_name(pg_name, column["name"], ordinal)}
+        for ordinal, column in enumerate(payload["columns"], start=1)
+    ]
     _, unique_keys, indexes = table_service._canonical_create_spec(
         vault_name=vault["name"],
         name=table_name,
@@ -206,14 +212,14 @@ async def _create_table_owned(conn: Any, target: dict[str, Any], payload: dict[s
             conn,
             pg_name,
             unique_key["name"],
-            unique_key["columns"],
+            table_service._physical_names(columns, unique_key["columns"]),
         )
     for index in indexes:
         await table_data_repo.create_index(
             conn,
             pg_name,
             index["name"],
-            [(column["name"], column["order"]) for column in index["columns"]],
+            table_service._physical_index_columns(columns, index["columns"]),
         )
     await table_registry_repo.insert(
         conn,

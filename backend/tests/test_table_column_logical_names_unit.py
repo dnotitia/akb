@@ -491,3 +491,168 @@ def test_gate6_a_registry_row_written_before_the_backfill_resolves_as_before():
     assert table_data_repo.column_pg_name({"name": "MyCol"}) == "mycol"
     assert table_data_repo.column_pg_name({"name": "my-col"}) == "my_col"
     assert table_data_repo.column_pg_name({"name": "분류", "pg_name": "c_1_0badf00d"}) == "c_1_0badf00d"
+
+
+# ── The decisions the gates rest on ──────────────────────────────────────────
+# (numbered as in the proposal's implementation notes)
+
+
+@pytest.mark.parametrize("bad", [
+    "", "   ", "\t", 7, None,
+    "분\x00류",          # NUL separates the digest input
+    "line\nbreak",       # C0 control
+    "del\x7f",           # DEL
+    "nel\x85",           # C1 control
+    "가" * 256,
+    "ID", "Created_At", "ROW_COMMIT",  # bookkeeping, in any case form
+])
+def test_d1_logical_names_that_are_refused(bad):
+    with pytest.raises(table_service.ValidationError):
+        _spec([{"name": bad, "type": "text"}])
+
+
+def test_d1_logical_names_are_nfc_and_otherwise_verbatim():
+    cols, _, _ = _spec([
+        {"name": unicodedata.normalize("NFD", "중요도"), "type": "text"},
+        {"name": " padded ", "type": "text"},
+        {"name": "MixedCase", "type": "text"},
+    ])
+    assert [c["name"] for c in cols] == ["중요도", " padded ", "MixedCase"]
+    # Not plain, so each gets a derived physical name.
+    assert all(c["pg_name"].startswith("c_") for c in cols)
+
+
+async def test_d2_a_caller_cannot_supply_pg_name(monkeypatch):
+    with pytest.raises(table_service.ValidationError, match="pg_name"):
+        _spec([{"name": "분류", "pg_name": "c_1_deadbeef", "type": "text"}])
+
+    cols, _, _ = _spec([{"name": "분류", "type": "text"}])
+    conn = _Conn(table_row={
+        "id": uuid.uuid4(), "name": _TABLE, "columns": cols,
+        "unique_keys": [], "indexes": [], "collection": None, "description": "",
+    })
+    _wire(monkeypatch, conn)
+    with pytest.raises(table_service.ValidationError, match="pg_name"):
+        await table_service.alter_table(
+            uuid.uuid4(), _TABLE, actor_id="tester",
+            add_columns=[{"name": "비고", "pg_name": "evil", "type": "text"}],
+        )
+    assert not any(s.startswith("ALTER TABLE") for s in conn.sql())
+
+
+@pytest.mark.parametrize("pair", [
+    ("Title", "title"),
+    ("W Embedding", "w embedding"),
+    (unicodedata.normalize("NFD", "분류"), "분류"),
+])
+def test_d3_logical_names_are_unique_by_nfc_casefold(pair):
+    with pytest.raises(table_service.ValidationError, match="Duplicate column name"):
+        _spec([{"name": pair[0], "type": "text"}, {"name": pair[1], "type": "text"}])
+
+
+def test_d3_a_plain_name_equal_to_a_derived_one_is_refused():
+    derived = table_data_repo.derive_column_pg_name(_TABLE_PG, "분류", 1)
+    with pytest.raises(table_service.ValidationError, match="physical name"):
+        _spec([{"name": "분류", "type": "text"}, {"name": derived, "type": "text"}])
+
+
+async def test_d4_references_resolve_a_logical_target_to_its_physical_column(monkeypatch):
+    target_cols, _, _ = _spec([{"name": "코드", "type": "text", "unique": True}], table="parents")
+
+    async def fake_find_by_name(conn, vault_id, name):
+        assert name == "parents"
+        return {"columns": target_cols, "unique_keys": []}
+
+    monkeypatch.setattr(table_service.table_registry_repo, "find_by_name", fake_find_by_name)
+    source, _, _ = _spec([{
+        "name": "부모 코드", "type": "text",
+        "references": {"table": "parents", "column": unicodedata.normalize("NFD", "코드")},
+    }])
+
+    targets = await table_service._validate_column_references(object(), uuid.uuid4(), source)
+
+    assert source[0]["references"] == {"table": "parents", "column": "코드"}
+    assert targets == {source[0]["pg_name"]: target_cols[0]["pg_name"]}
+    ddl = table_data_repo.foreign_key_constraint_definition(
+        _TABLE_PG, source[0], vault_name=_VAULT, target_column=targets[source[0]["pg_name"]],
+    )
+    assert ddl.isascii(), ddl
+    assert f"FOREIGN KEY ({source[0]['pg_name']}) REFERENCES vt_papers__parents ({target_cols[0]['pg_name']})" in ddl
+
+
+def _alter_conn(columns):
+    return _Conn(table_row={
+        "id": uuid.uuid4(), "name": _TABLE, "columns": columns,
+        "unique_keys": [], "indexes": [], "collection": None, "description": "",
+    })
+
+
+@pytest.mark.parametrize(("start", "new", "physical"), [
+    # A column whose physical name is its logical name, renamed to a plain
+    # name: the rename every table had before the split.
+    ("status", "state", True),
+    # ...to a header: the physical column stays.
+    ("status", "상태", False),
+    # A column whose physical name was derived: renaming it never moves it.
+    ("상태", "status", False),
+])
+async def test_d7_rename_is_physical_only_for_a_plain_to_plain_column(monkeypatch, start, new, physical):
+    cols, _, _ = _spec([
+        {"name": start, "type": "enum", "enum": ["a", "b"]},
+        {"name": "qty", "type": "int", "check": {"op": "gte", "value": 0}},
+    ])
+    before = cols[0]["pg_name"]
+    conn = _alter_conn(cols)
+    _wire(monkeypatch, conn)
+
+    out = await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={start: new},
+    )
+
+    col = out["columns"][0]
+    assert col["name"] == new
+    renames = [s for s in conn.sql() if "RENAME COLUMN" in s]
+    if physical:
+        assert renames == [f"ALTER TABLE {_TABLE_PG} RENAME COLUMN {before} TO {new}"]
+        assert col["pg_name"] == new
+        # The enum CHECK moves to the name derived from the new column.
+        assert any(
+            table_data_repo.enum_constraint_name(_TABLE_PG, new) in s for s in conn.sql()
+        )
+    else:
+        assert renames == []
+        assert col["pg_name"] == before
+        assert not any(s.startswith("ALTER TABLE") for s in conn.sql())
+
+
+async def test_d7_a_plain_target_held_physically_by_another_column_renames_logically(monkeypatch):
+    cols, _, _ = _spec([{"name": "state", "type": "text"}, {"name": "status", "type": "text"}])
+    # `state` was renamed logically earlier; its column is still `state`.
+    cols[0]["name"] = "상태"
+    conn = _alter_conn(cols)
+    _wire(monkeypatch, conn)
+
+    out = await table_service.alter_table(
+        uuid.uuid4(), _TABLE, actor_id="tester", rename_columns={"status": "state"},
+    )
+
+    assert [(c["name"], c["pg_name"]) for c in out["columns"]] == [
+        ("상태", "state"), ("state", "status"),
+    ]
+    assert not any("RENAME COLUMN" in s for s in conn.sql())
+
+
+async def test_d12_if_not_exists_ignores_pg_name_on_either_side(monkeypatch):
+    legacy = [{"name": "title", "type": "text"}]  # stored before the backfill
+    conn = _Conn(table_row={
+        "id": uuid.uuid4(), "vault_id": uuid.uuid4(), "collection_id": None,
+        "collection": None, "name": _TABLE, "description": "",
+        "columns": legacy, "unique_keys": [], "indexes": [],
+        "created_by": "someone", "created_at": None, "updated_at": None,
+    })
+    _wire(monkeypatch, conn)
+    out = await table_service.create_table(
+        uuid.uuid4(), _TABLE, [{"name": "title", "type": "text"}], actor_id="tester",
+        if_not_exists=True, can_read_existing=True,
+    )
+    assert out["matches_request"] is True, out["mismatches"]

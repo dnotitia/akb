@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import date, datetime
 from typing import Any
 from uuid import UUID
@@ -213,8 +214,76 @@ def pg_short_name(table_name: str) -> str:
 
 
 def safe_ident(name: str) -> str:
-    """Sanitise a column / table name for use as a SQL identifier."""
+    """Sanitise a caller-chosen ASCII name (constraint / index) for use as a
+    SQL identifier. Never a column's logical name: that goes through
+    ``column_pg_name``."""
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
+# ── Column names: logical vs physical (#433) ─────────────────────
+#
+# A column carries two names. `name` is the LOGICAL name — the header as its
+# author wrote it (`분류`, `TriviaQA(비과학 문헌)`), NFC-normalized — and is
+# what every API boundary resolves against. `pg_name` is the PHYSICAL name,
+# derived by the server, ASCII-only, and the only spelling ever interpolated
+# into SQL. `safe_ident` cannot stand in for the mapping: it sends `분류` and
+# `모델` both to `__`.
+
+# A logical name matching this, within PG_IDENT_MAX_LEN, is its own physical
+# name — so every table created before the split keeps its identifiers.
+_PLAIN_COLUMN_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def column_key(name: str) -> str:
+    """The key every column-name lookup compares: NFC, then casefold.
+
+    Applied once, where a caller-supplied name meets a table's declared
+    logical names, so a decomposed (macOS) `분류` and `W Embedding` for a
+    stored `w Embedding` resolve to the column they mean."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def is_plain_column_name(name: str) -> bool:
+    """True when ``name`` can be its own physical name."""
+    return bool(_PLAIN_COLUMN_RE.fullmatch(name)) and len(name.encode()) <= PG_IDENT_MAX_LEN
+
+
+def derive_column_pg_name(table_pg_name: str, logical_name: str, ordinal: int) -> str:
+    """Physical name for a column added as the ``ordinal``-th user column.
+
+    A plain logical name keeps itself. Anything else becomes
+    ``c_<ordinal>_<digest8>``: ASCII, far inside the byte bound however long
+    the header, and deterministic — the digest is over the NUL-joined
+    ``(physical table, logical name)`` pair, the shape
+    ``generate_constraint_name`` uses, so re-creating a table from the same
+    document yields the same registry row. NUL is refused in a logical name,
+    so two names can never share a digest input.
+    """
+    if is_plain_column_name(logical_name):
+        return logical_name
+    # usedforsecurity=False: a collision-avoidance tag, as in _constraint_name.
+    digest = hashlib.sha1(
+        "\x00".join([table_pg_name, logical_name]).encode(), usedforsecurity=False,
+    ).hexdigest()[:8]
+    return f"c_{ordinal}_{digest}"
+
+
+def _legacy_pg_name(name: str) -> str:
+    # What DDL before the split produced from a registry name: `safe_ident`
+    # interpolated unquoted, which PostgreSQL folds to lowercase.
+    return safe_ident(name).lower()
+
+
+def column_pg_name(col: dict) -> str:
+    """The physical identifier of a registry column — the only column name
+    that may reach SQL.
+
+    A registry row written before the backfill (migration 113) carries no
+    ``pg_name``; its identifier is the one the old DDL produced."""
+    pg_name = col.get("pg_name")
+    if isinstance(pg_name, str) and pg_name:
+        return safe_ident(pg_name)
+    return _legacy_pg_name(col["name"])
 
 
 def normalize_column_type(logical_type: Any) -> str:
@@ -269,7 +338,7 @@ def column_type_sql(logical_type: Any) -> str:
 
 def column_definition(col: dict, *, include_check: bool = True) -> str:
     """Build one validated user-column definition for CREATE/ALTER TABLE."""
-    col_name = safe_ident(col["name"])
+    col_name = column_pg_name(col)
     logical_type = normalize_column_type(col.get("type", "text"))
     parts = [col_name, TYPE_MAP[logical_type]]
     if col.get("required"):
@@ -306,7 +375,7 @@ def _column_check_sql(col: dict) -> str | None:
     if not isinstance(op, str):
         raise ValidationError("check.op must be a string.")
     op = op.lower()
-    col_name = safe_ident(col["name"])
+    col_name = column_pg_name(col)
     logical_type = normalize_column_type(col.get("type", "text"))
     if op in _CHECK_OPERATORS:
         if "value" not in spec:
@@ -431,13 +500,11 @@ def normalize_reference_spec(refs: Any, on_delete: Any = None) -> tuple[dict, st
             f"Invalid references.table {table!r}: must match {_REFERENCE_NAME_RE.pattern}."
         )
     column = refs.get("column") or refs.get("referenced_column") or "id"
-    if not isinstance(column, str) or not column:
+    # A logical column name, like any other: the service resolves it against
+    # the target table's declared columns and reaches SQL only as that
+    # column's physical name.
+    if not isinstance(column, str) or not column.strip():
         raise ValidationError("references.column must be a non-empty column name.")
-    if column != "id" and not _REFERENCE_NAME_RE.fullmatch(column):
-        raise ValidationError(
-            f"Invalid references.column {column!r}: must be 'id' or match "
-            f"{_REFERENCE_NAME_RE.pattern}."
-        )
     nested_on_delete = refs.get("on_delete")
     if nested_on_delete is not None and on_delete is not None:
         nested = normalize_on_delete(nested_on_delete)
@@ -472,7 +539,7 @@ def check_constraint_definition(pg_name: str, col: dict) -> str:
     check_sql = _column_check_sql(col)
     if not check_sql:
         raise ValidationError(f"Column {col.get('name')!r} has no check spec.")
-    name = safe_ident(check_constraint_name(pg_name, col["name"]))
+    name = safe_ident(check_constraint_name(pg_name, column_pg_name(col)))
     return f"CONSTRAINT {name} CHECK ({check_sql})"
 
 
@@ -483,7 +550,7 @@ def enum_check_sql(col: dict) -> str:
 
 
 def enum_constraint_definition(pg_name: str, col: dict) -> str:
-    name = safe_ident(enum_constraint_name(pg_name, col["name"]))
+    name = safe_ident(enum_constraint_name(pg_name, column_pg_name(col)))
     return f"CONSTRAINT {name} CHECK ({enum_check_sql(col)})"
 
 
@@ -499,20 +566,31 @@ def _same_vault_reference_pg_name(pg_name: str, table_name: str) -> str:
 
 
 def foreign_key_constraint_definition(
-    pg_name: str, col: dict, *, vault_name: str | None = None,
+    pg_name: str,
+    col: dict,
+    *,
+    vault_name: str | None = None,
+    target_column: str | None = None,
 ) -> str:
+    """``target_column`` is the referenced column's PHYSICAL name, which only
+    the target table's registry knows; the service resolves it. Without it
+    the referenced name is taken to be plain, as every reference written
+    before the logical/physical split was."""
     refs = col.get("references")
     if refs is None:
         raise ValidationError(f"Column {col.get('name')!r} has no references spec.")
     refs, on_delete = normalize_reference_spec(refs, col.get("on_delete"))
-    name = safe_ident(foreign_key_constraint_name(pg_name, col["name"]))
-    source_col = safe_ident(col["name"])
+    source_col = column_pg_name(col)
+    name = safe_ident(foreign_key_constraint_name(pg_name, source_col))
     target_table = (
         pg_table_name(vault_name, refs["table"])
         if vault_name is not None
         else _same_vault_reference_pg_name(pg_name, refs["table"])
     )
-    target_col = safe_ident(refs["column"])
+    target_col = (
+        safe_ident(target_column) if target_column is not None
+        else _legacy_pg_name(refs["column"])
+    )
     return (
         f"CONSTRAINT {name} FOREIGN KEY ({source_col}) "
         f"REFERENCES {target_table} ({target_col}) "
@@ -531,9 +609,15 @@ async def create_dynamic_table(
     vault_name: str | None = None,
     vault_id: UUID | str,
     resource_uri: str,
+    reference_columns: dict[str, str] | None = None,
 ) -> None:
     """Create the data-bearing PG table for a vault table. Caller is
-    responsible for sanitising `pg_name` (use `pg_table_name`)."""
+    responsible for sanitising `pg_name` (use `pg_table_name`).
+
+    ``reference_columns`` maps a referencing column's physical name to the
+    physical name of the column it references (see
+    ``foreign_key_constraint_definition``)."""
+    reference_columns = reference_columns or {}
     col_defs = ["id UUID PRIMARY KEY DEFAULT uuid_generate_v4()"]
     for col in columns:
         col_defs.append(column_definition(col, include_check=False))
@@ -546,7 +630,10 @@ async def create_dynamic_table(
     for col in columns:
         if col.get("references") is not None:
             col_defs.append(
-                foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)
+                foreign_key_constraint_definition(
+                    pg_name, col, vault_name=vault_name,
+                    target_column=reference_columns.get(column_pg_name(col)),
+                )
             )
     col_defs.append("created_by TEXT")
     col_defs.append("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
@@ -648,9 +735,15 @@ async def count_rows(conn, pg_name: str) -> int:
 
 
 async def add_column(
-    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+    conn,
+    pg_name: str,
+    col: dict,
+    *,
+    vault_name: str | None = None,
+    reference_column: str | None = None,
 ) -> None:
-    """Add a column to the dynamic table. Column DDL is validated here."""
+    """Add a column to the dynamic table. Column DDL is validated here.
+    ``reference_column`` is the referenced column's physical name."""
     await conn.execute(
         f"ALTER TABLE {pg_name} ADD COLUMN IF NOT EXISTS "
         f"{column_definition(col, include_check=False)}"
@@ -660,18 +753,23 @@ async def add_column(
     if normalize_column_type(col.get("type", "text")) == "enum":
         await create_enum_constraint(conn, pg_name, col)
     if col.get("references") is not None:
-        await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
+        await create_foreign_key_constraint(
+            conn, pg_name, col, vault_name=vault_name, target_column=reference_column,
+        )
+
+
+# The primitives below that take a bare column name take its PHYSICAL name.
 
 
 async def drop_column(conn, pg_name: str, col_name: str) -> None:
     await conn.execute(
-        f"ALTER TABLE {pg_name} DROP COLUMN IF EXISTS {col_name}"
+        f"ALTER TABLE {pg_name} DROP COLUMN IF EXISTS {safe_ident(col_name)}"
     )
 
 
 async def rename_column(conn, pg_name: str, old_name: str, new_name: str) -> None:
     await conn.execute(
-        f"ALTER TABLE {pg_name} RENAME COLUMN {old_name} TO {new_name}"
+        f"ALTER TABLE {pg_name} RENAME COLUMN {safe_ident(old_name)} TO {safe_ident(new_name)}"
     )
 
 
@@ -726,8 +824,9 @@ async def create_unique_constraint(
 ) -> None:
     """``ALTER TABLE {pg} ADD CONSTRAINT {name} UNIQUE ({cols})``.
 
-    Every identifier flows through ``safe_ident``; caller is expected to
-    have validated/resolved ``name`` already (see service layer)."""
+    ``columns`` are physical names. Every identifier flows through
+    ``safe_ident``; caller is expected to have validated/resolved ``name``
+    already (see service layer)."""
     safe_name = safe_ident(name)
     cols = ", ".join(safe_ident(c) for c in columns)
     await conn.execute(
@@ -782,23 +881,28 @@ async def drop_column_check_constraints(conn, pg_name: str, col_name: str) -> No
 
 
 async def replace_check_constraint(conn, pg_name: str, col: dict) -> None:
-    await drop_column_check_constraints(conn, pg_name, col["name"])
+    await drop_column_check_constraints(conn, pg_name, column_pg_name(col))
     if col.get("check") is not None:
         await create_check_constraint(conn, pg_name, col)
 
 
 async def replace_enum_constraint(conn, pg_name: str, col: dict) -> None:
-    await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, col["name"]))
+    await drop_constraint(conn, pg_name, enum_constraint_name(pg_name, column_pg_name(col)))
     await create_enum_constraint(conn, pg_name, col)
 
 
 async def create_foreign_key_constraint(
-    conn, pg_name: str, col: dict, *, vault_name: str | None = None,
+    conn,
+    pg_name: str,
+    col: dict,
+    *,
+    vault_name: str | None = None,
+    target_column: str | None = None,
 ) -> None:
-    await conn.execute(
-        f"ALTER TABLE {pg_name} ADD "
-        f"{foreign_key_constraint_definition(pg_name, col, vault_name=vault_name)}"
+    definition = foreign_key_constraint_definition(
+        pg_name, col, vault_name=vault_name, target_column=target_column,
     )
+    await conn.execute(f"ALTER TABLE {pg_name} ADD {definition}")
 
 
 async def replace_foreign_key_constraint(
@@ -808,13 +912,17 @@ async def replace_foreign_key_constraint(
     col: dict,
     *,
     vault_name: str | None = None,
+    target_column: str | None = None,
 ) -> None:
+    """``old_col_name`` is the column's physical name before a rename."""
     await drop_constraint(conn, pg_name, foreign_key_constraint_name(pg_name, old_col_name))
-    await create_foreign_key_constraint(conn, pg_name, col, vault_name=vault_name)
+    await create_foreign_key_constraint(
+        conn, pg_name, col, vault_name=vault_name, target_column=target_column,
+    )
 
 
 async def alter_column_default(conn, pg_name: str, col: dict) -> None:
-    safe_col = safe_ident(col["name"])
+    safe_col = column_pg_name(col)
     default_sql = _column_default_sql(col)
     if default_sql is None:
         await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} DROP DEFAULT")
@@ -855,8 +963,8 @@ async def create_index(
 ) -> None:
     """``CREATE INDEX {name} ON {pg} ({col [ASC|DESC], ...})``.
 
-    ``cols_with_order`` is a list of ``(column, order)`` where order is
-    ``'asc'`` / ``'desc'`` (the closed enum). Identifiers via
+    ``cols_with_order`` is a list of ``(physical column, order)`` where order
+    is ``'asc'`` / ``'desc'`` (the closed enum). Identifiers via
     ``safe_ident``; order via the ``_ORDER_SQL`` map — an unknown order
     raises ``ValidationError`` rather than reaching the DDL string."""
     safe_name = safe_ident(name)
@@ -895,8 +1003,9 @@ async def unique_key_duplicates(
     block a valid ``ADD CONSTRAINT``.
 
     ``SELECT {cols}, COUNT(*) FROM {pg} WHERE {cols all NOT NULL}
-    GROUP BY {cols} HAVING COUNT(*) > 1 LIMIT {n}`` — identifiers via
-    ``safe_ident``; ``limit`` is coerced to ``int``."""
+    GROUP BY {cols} HAVING COUNT(*) > 1 LIMIT {n}`` — ``columns`` are
+    physical names, via ``safe_ident``; ``limit`` is coerced to ``int``, and
+    the returned groups are keyed by physical name."""
     safe_cols = [safe_ident(c) for c in columns]
     col_list = ", ".join(safe_cols)
     not_null = " AND ".join(f"{c} IS NOT NULL" for c in safe_cols)

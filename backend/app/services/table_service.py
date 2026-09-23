@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -82,10 +83,12 @@ logger = logging.getLogger("akb.tables")
 # on UPDATE/DELETE via `expected_row_commit`. Never user-writable.
 _RESERVED = {"id", "created_at", "updated_at", "created_by", "row_commit"}
 
-# Column-name shape — same grammar as table names. Enforced on
-# create AND alter so the value stored in the registry cannot diverge
-# from `safe_ident(name)` (which silently maps punctuation to `_`).
-_COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# A column's `name` is its LOGICAL name (#433): the header as its author
+# wrote it, NFC-normalized and otherwise verbatim. It never reaches SQL —
+# the server derives the physical `pg_name` (see
+# `table_data_repo.derive_column_pg_name`) — so there is no identifier
+# grammar to enforce, only this bound.
+_MAX_COLUMN_NAME_CHARS = 255
 
 
 @asynccontextmanager
@@ -107,29 +110,65 @@ async def _transaction_if_needed(conn: Any, enabled: bool) -> AsyncIterator[None
     yield
 
 
-def _validate_column_name(name) -> None:
-    """Reject reserved + malformed column names (raises ValidationError → 422).
+def _validate_column_name(name) -> str:
+    """Validate a logical column name; return it NFC-normalized (→ 422).
 
     Shared by create_table and alter_table so the two paths stay
-    consistent: reserved names collide with the auto-added bookkeeping
-    columns (id/created_at/updated_at/created_by), and the shape check
-    keeps the registry name identical to its `safe_ident` PG identity.
+    consistent. Refused: a non-string or blank name; any control
+    character, NUL included (NUL separates the physical-name digest
+    input); more than 255 characters; and the auto-added bookkeeping
+    names, in any case (`column_key`).
 
     Raises ValidationError (which IS-A ValueError) so a bad column name is a
     clean 422 on REST and invalid_argument on MCP — never an internal 500.
     """
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str) or not name.strip():
         raise ValidationError("Column name must be a non-empty string.")
-    if name.lower() in _RESERVED:
+    logical = unicodedata.normalize("NFC", name)
+    if table_data_repo.column_key(logical) in _RESERVED:
         raise ValidationError(
-            f"Column name '{name}' is reserved (auto-added by AKB). "
+            f"Column name '{logical}' is reserved (auto-added by AKB). "
             f"Reserved names: {sorted(_RESERVED)}. Choose a different name."
         )
-    if not _COLUMN_NAME_RE.fullmatch(name):
+    if any(unicodedata.category(ch) == "Cc" for ch in logical):
         raise ValidationError(
-            f"Invalid column name {name!r}: must match {_COLUMN_NAME_RE.pattern} "
-            f"(lowercase letter then letters/digits/underscores)."
+            f"Invalid column name {logical!r}: control characters are not allowed."
         )
+    if len(logical) > _MAX_COLUMN_NAME_CHARS:
+        raise ValidationError(
+            f"Column name is {len(logical)} characters long; the limit is "
+            f"{_MAX_COLUMN_NAME_CHARS}."
+        )
+    return logical
+
+
+def _reject_caller_pg_name(col: dict) -> None:
+    """`pg_name` is server-derived (#433); a caller never supplies one."""
+    if "pg_name" in col:
+        raise ValidationError(
+            f"Column {col.get('name')!r}: `pg_name` is derived by the server "
+            f"and cannot be supplied. Send the column's `name` only."
+        )
+
+
+def _check_physical_names(columns: list[dict]) -> None:
+    """Physical names must be unique within the table and clear of the
+    bookkeeping columns. A clash needs a caller's plain name to equal a
+    derived `c_<ordinal>_<digest>` one; refuse it here rather than as DDL."""
+    seen: dict[str, str] = {}
+    for col in columns:
+        physical = table_data_repo.column_pg_name(col)
+        if physical in _RESERVED:
+            raise ValidationError(
+                f"Column {col['name']!r} would take the physical name "
+                f"{physical!r}, which is reserved. Choose a different name."
+            )
+        if physical in seen:
+            raise ValidationError(
+                f"Columns {seen[physical]!r} and {col['name']!r} would share the "
+                f"physical name {physical!r}. Choose a different name."
+            )
+        seen[physical] = col["name"]
 
 
 # ── Declarative unique-key / index resolution (AKB #215) ─────────
@@ -139,35 +178,53 @@ def _validate_column_name(name) -> None:
 _INDEX_ORDERS = {"asc", "desc"}
 
 
-def _declared_column_lookup(columns: list[dict]) -> dict[str, str]:
-    """Map lower(name) → declared name, for case-insensitive existence
-    checks against a table's declared columns."""
-    return {c["name"].lower(): c["name"] for c in columns if isinstance(c, dict) and "name" in c}
+def _declared_column_lookup(columns: list[dict]) -> dict[str, dict]:
+    """Map `column_key(name)` → declared column: the one lookup every
+    caller-supplied column name is resolved through (#433 decision 4)."""
+    return {
+        table_data_repo.column_key(c["name"]): c
+        for c in columns
+        if isinstance(c, dict) and isinstance(c.get("name"), str)
+    }
 
 
-def _check_key_column(col, lookup: dict[str, str], *, ctx: str) -> str:
-    """Validate one referenced column and return its CANONICAL declared name.
+def _check_key_column(col, lookup: dict[str, dict], *, ctx: str) -> dict:
+    """Validate one referenced column and return its DECLARED column.
 
     Non-empty string, not reserved, and present in the table's declared
-    columns (case-insensitive). Returning the canonical name means a
-    mixed-case reference (e.g. ``"ACTOR"`` for declared ``"actor"``) is stored
-    as the real PG identifier — so the duplicate-preflight sample
-    (``row[safe_ident(name)]``) can't KeyError on a casing mismatch, and the
-    registry never records a divergent casing.
+    columns (`column_key`). Returning the declared column means a
+    differently-spelled reference (``"ACTOR"`` for ``"actor"``, a decomposed
+    ``분류``) is stored under the canonical logical name, and its physical
+    name is at hand for DDL and generated names.
     """
     if not isinstance(col, str) or not col:
         raise ValidationError(f"{ctx}: each column must be a non-empty string; got {col!r}.")
-    if col.lower() in _RESERVED:
+    key = table_data_repo.column_key(col)
+    if key in _RESERVED:
         raise ValidationError(
             f"{ctx}: column {col!r} is a reserved bookkeeping column "
             f"(auto-added by AKB) and cannot be used. Reserved: {sorted(_RESERVED)}."
         )
-    if col.lower() not in lookup:
+    if key not in lookup:
         raise ValidationError(
             f"{ctx}: column {col!r} does not exist on this table. "
-            f"Declared columns: {sorted(lookup.values())}."
+            f"Declared columns: {sorted(c['name'] for c in lookup.values())}."
         )
-    return lookup[col.lower()]
+    return lookup[key]
+
+
+def _physical_names(columns: list[dict], names: list[str]) -> list[str]:
+    """Physical names for key/index columns the registry records logically."""
+    lookup = _declared_column_lookup(columns)
+    return [
+        table_data_repo.column_pg_name(lookup[table_data_repo.column_key(name)])
+        for name in names
+    ]
+
+
+def _physical_index_columns(columns: list[dict], index_columns: list[dict]) -> list[tuple[str, str]]:
+    physical = _physical_names(columns, [c["name"] for c in index_columns])
+    return [(pg, c["order"]) for pg, c in zip(physical, index_columns)]
 
 
 def _resolve_unique_keys(
@@ -178,9 +235,12 @@ def _resolve_unique_keys(
     name. Pure function — no DB. Raises ValidationError on bad input.
 
     - ``columns`` must be a non-empty list of existing, non-reserved
-      column names (case-insensitive vs the table's declared columns).
+      column names (``column_key`` vs the table's declared columns); they
+      are recorded under their logical names.
     - ``name`` is optional; when omitted a deterministic, schema-global
-      namespaced name is generated (see ``generate_constraint_name``).
+      namespaced name is generated from the PHYSICAL column names (see
+      ``generate_constraint_name``), so an existing table's names are
+      unchanged.
     - Names (generated or supplied) must be unique within the set.
     """
     if items is None:
@@ -200,17 +260,18 @@ def _resolve_unique_keys(
             raise ValidationError(
                 f"unique_keys.columns must be a non-empty list; got {cols!r}."
             )
-        canon_cols: list[str] = []
+        canon_cols: list[dict] = []
         seen_cols: set[str] = set()
         for col in cols:
-            cname = _check_key_column(col, lookup, ctx="unique_keys")
-            if cname.lower() in seen_cols:
+            declared = _check_key_column(col, lookup, ctx="unique_keys")
+            key = table_data_repo.column_key(declared["name"])
+            if key in seen_cols:
                 raise ValidationError(
                     f"unique_keys: column {col!r} appears more than once in a single "
                     f"key; a unique key's columns must be distinct."
                 )
-            seen_cols.add(cname.lower())
-            canon_cols.append(cname)
+            seen_cols.add(key)
+            canon_cols.append(declared)
         name = item.get("name")
         if name is not None:
             if not isinstance(name, str) or not name:
@@ -222,14 +283,16 @@ def _resolve_unique_keys(
                     f"{table_data_repo.PG_IDENT_MAX_LEN}-char PostgreSQL identifier limit."
                 )
         else:
-            name = table_data_repo.generate_constraint_name(pg_name, canon_cols, kind="uk")
+            name = table_data_repo.generate_constraint_name(
+                pg_name, [table_data_repo.column_pg_name(c) for c in canon_cols], kind="uk",
+            )
         if name in seen_names:
             raise ValidationError(
                 f"Duplicate unique-key name {name!r}. Names (generated or supplied) "
                 f"must be unique within a table."
             )
         seen_names.add(name)
-        resolved.append({"name": name, "columns": canon_cols})
+        resolved.append({"name": name, "columns": [c["name"] for c in canon_cols]})
     return resolved
 
 
@@ -261,7 +324,7 @@ def _resolve_indexes(
                 f"indexes.columns must be a non-empty list; got {cols!r}."
             )
         norm_cols: list[dict] = []
-        col_names: list[str] = []
+        physical: list[str] = []
         seen_cols: set[str] = set()
         for col in cols:
             if isinstance(col, str):
@@ -278,15 +341,16 @@ def _resolve_indexes(
                 raise ValidationError(
                     f"indexes: each column must be a string or {{name, order?}}; got {col!r}."
                 )
-            cname = _check_key_column(col_name, lookup, ctx="indexes")
-            if cname.lower() in seen_cols:
+            declared = _check_key_column(col_name, lookup, ctx="indexes")
+            key = table_data_repo.column_key(declared["name"])
+            if key in seen_cols:
                 raise ValidationError(
                     f"indexes: column {col_name!r} appears more than once in a single "
                     f"index; an index's columns must be distinct."
                 )
-            seen_cols.add(cname.lower())
-            norm_cols.append({"name": cname, "order": order})
-            col_names.append(cname)
+            seen_cols.add(key)
+            norm_cols.append({"name": declared["name"], "order": order})
+            physical.append(table_data_repo.column_pg_name(declared))
         name = item.get("name")
         if name is not None:
             if not isinstance(name, str) or not name:
@@ -298,7 +362,7 @@ def _resolve_indexes(
                     f"{table_data_repo.PG_IDENT_MAX_LEN}-char PostgreSQL identifier limit."
                 )
         else:
-            name = table_data_repo.generate_constraint_name(pg_name, col_names, kind="idx")
+            name = table_data_repo.generate_constraint_name(pg_name, physical, kind="idx")
         if name in seen_names:
             raise ValidationError(
                 f"Duplicate index name {name!r}. Names (generated or supplied) "
@@ -319,7 +383,9 @@ def _normalize_column_spec(col: dict) -> dict:
 def _inline_unique_keys(columns: list[dict], pg_name: str) -> list[dict]:
     return [
         {
-            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="uk"),
+            "name": table_data_repo.generate_constraint_name(
+                pg_name, [table_data_repo.column_pg_name(col)], kind="uk",
+            ),
             "columns": [col["name"]],
         }
         for col in columns
@@ -330,7 +396,9 @@ def _inline_unique_keys(columns: list[dict], pg_name: str) -> list[dict]:
 def _inline_indexes(columns: list[dict], pg_name: str) -> list[dict]:
     return [
         {
-            "name": table_data_repo.generate_constraint_name(pg_name, [col["name"]], kind="idx"),
+            "name": table_data_repo.generate_constraint_name(
+                pg_name, [table_data_repo.column_pg_name(col)], kind="idx",
+            ),
             "columns": [{"name": col["name"], "order": "asc"}],
         }
         for col in columns
@@ -370,11 +438,12 @@ def _normalize_enum_renames(spec: dict, old_values: list, new_values: list[str])
 
 
 def _single_column_unique_names(unique_keys: list[dict]) -> set[str]:
+    """`column_key`s of the columns a single-column unique key covers."""
     names: set[str] = set()
     for unique_key in unique_keys:
         cols = unique_key.get("columns", [])
         if len(cols) == 1 and isinstance(cols[0], str):
-            names.add(cols[0].lower())
+            names.add(table_data_repo.column_key(cols[0]))
     return names
 
 
@@ -382,8 +451,15 @@ async def _validate_column_references(
     conn,
     vault_id: uuid.UUID,
     columns: list[dict],
-) -> None:
-    """Validate same-vault FK references before any DDL reaches PostgreSQL."""
+) -> dict[str, str]:
+    """Validate same-vault FK references before any DDL reaches PostgreSQL.
+
+    `references.column` is a logical name, resolved like any other against
+    the target table and canonicalized to its declared spelling. Returns
+    {referencing column's physical name: referenced column's physical name}
+    for the DDL, which only the target's registry row can answer.
+    """
+    targets: dict[str, str] = {}
     for col in columns:
         refs = col.get("references")
         if refs is None:
@@ -406,27 +482,29 @@ async def _validate_column_references(
             )
 
         target_column = refs["column"]
-        if target_column == "id":
+        target_key = table_data_repo.column_key(target_column)
+        if target_key == "id":
+            refs["column"] = "id"
+            target_physical = "id"
             target_type = "uuid"
             target_is_unique = True
         else:
             target_columns = table_registry_repo.parse_columns(target_table["columns"])
             lookup = _declared_column_lookup(target_columns)
-            target_key = target_column.lower()
             if target_key not in lookup:
                 raise ValidationError(
                     f"Column {col['name']!r}: references target column "
                     f"{target_column!r} does not exist on table {refs['table']!r}."
                 )
-            canonical_target = lookup[target_key]
-            refs["column"] = canonical_target
-            target_meta = next(c for c in target_columns if c["name"] == canonical_target)
+            target_meta = lookup[target_key]
+            refs["column"] = target_meta["name"]
+            target_physical = table_data_repo.column_pg_name(target_meta)
             target_type = table_data_repo.normalize_column_type(target_meta.get("type", "text"))
             target_unique_names = _single_column_unique_names(
                 table_registry_repo.parse_json_list(target_table.get("unique_keys"))
             )
             target_is_unique = bool(
-                target_meta.get("unique") is True or canonical_target.lower() in target_unique_names
+                target_meta.get("unique") is True or target_key in target_unique_names
             )
         if not target_is_unique:
             raise ValidationError(
@@ -442,6 +520,8 @@ async def _validate_column_references(
                 f"{source_pg_type} cannot reference {refs['table']}.{refs['column']} "
                 f"({target_pg_type})."
             )
+        targets[table_data_repo.column_pg_name(col)] = target_physical
+    return targets
 
 
 async def _referencing_columns(
@@ -451,7 +531,7 @@ async def _referencing_columns(
     target_columns: set[str],
 ) -> list[str]:
     refs: list[str] = []
-    targets = {c.lower() for c in target_columns}
+    targets = {table_data_repo.column_key(c) for c in target_columns}
     for table in await table_registry_repo.list_for_vault(conn, vault_id):
         for col in table_registry_repo.parse_columns(table.get("columns")):
             reference = col.get("references")
@@ -463,7 +543,7 @@ async def _referencing_columns(
                 isinstance(ref_table, str)
                 and isinstance(ref_column, str)
                 and ref_table.lower() == target_table_name.lower()
-                and ref_column.lower() in targets
+                and table_data_repo.column_key(ref_column) in targets
             ):
                 refs.append(f"{table['name']}.{col.get('name')}")
     return sorted(refs)
@@ -573,8 +653,9 @@ async def delete_table_index(table_id: str) -> None:
 # ── CRUD ─────────────────────────────────────────────────────────
 
 
-def _normalize_column_specs(columns: list[dict]) -> list[dict]:
-    """Validate + normalize a caller's column list.
+def _normalize_column_specs(columns: list[dict], table_pg_name: str) -> list[dict]:
+    """Validate + normalize a caller's column list, deriving each column's
+    physical `pg_name` from its logical name and 1-based position.
 
     Extracted so the `if_not_exists` no-op can normalize the REQUEST the
     same way the stored row was normalized at its own create — comparing a
@@ -583,14 +664,14 @@ def _normalize_column_specs(columns: list[dict]) -> list[dict]:
     """
     seen: set[str] = set()
     normalized: list[dict] = []
-    for col in columns:
+    for ordinal, col in enumerate(columns, start=1):
         if not isinstance(col, dict) or "name" not in col:
             raise ValidationError(
                 f"Each column must be an object with a 'name' field; got {col!r}."
             )
-        cname = col["name"]
-        _validate_column_name(cname)
-        key = cname.lower()
+        _reject_caller_pg_name(col)
+        cname = _validate_column_name(col["name"])
+        key = table_data_repo.column_key(cname)
         if key in seen:
             raise ValidationError(
                 f"Duplicate column name {cname!r}. Column names must be "
@@ -598,7 +679,14 @@ def _normalize_column_specs(columns: list[dict]) -> list[dict]:
                 f"reserved names {sorted(_RESERVED)}."
             )
         seen.add(key)
-        normalized.append(_normalize_column_spec(col))
+        # The physical name is set before normalization compiles the
+        # column's default/check, so that SQL is built from it too.
+        normalized.append(_normalize_column_spec({
+            **col,
+            "name": cname,
+            "pg_name": table_data_repo.derive_column_pg_name(table_pg_name, cname, ordinal),
+        }))
+    _check_physical_names(normalized)
     return normalized
 
 
@@ -628,8 +716,8 @@ def _canonical_create_spec(
     column and then rejects a column that already carries one, so running it
     twice turns every enum create into a 422.
     """
-    cols = _normalize_column_specs(columns) if normalize_columns else list(columns)
     pg_name = table_data_repo.pg_table_name(vault_name, name)
+    cols = _normalize_column_specs(columns, pg_name) if normalize_columns else list(columns)
     uks = _inline_unique_keys(cols, pg_name) + _resolve_unique_keys(
         unique_keys, cols, pg_name,
     )
@@ -696,6 +784,10 @@ def _comparable(specs: list[dict]) -> list[dict]:
     per field: `False` counts as absent for the boolean flags, but for
     `default` only NULL does — `default: false` on a boolean column is a real
     `DEFAULT FALSE`. `required: true` likewise still differs from omitting it.
+
+    `pg_name` is dropped outright: it is server-derived, and a row stored
+    before the backfill has none, so it says nothing about whether the
+    caller's schema matches.
     """
     def _absent(k, v) -> bool:
         if k in _COLUMN_NOOP_WHEN_FALSE:
@@ -710,7 +802,7 @@ def _comparable(specs: list[dict]) -> list[dict]:
             out.append(_typed(spec))
             continue
         out.append(_typed(
-            {k: v for k, v in spec.items() if not _absent(k, v)}))
+            {k: v for k, v in spec.items() if k != "pg_name" and not _absent(k, v)}))
     return out
 
 
@@ -911,7 +1003,10 @@ async def create_table(
                     )
                 raise ConflictError(f"Table already exists: {name}")
 
-            columns = _normalize_column_specs(columns)
+            # Pure, and needed first: each column's physical name is derived
+            # from the table's (#433).
+            pg_name = table_data_repo.pg_table_name(vault["name"], name)
+            columns = _normalize_column_specs(columns, pg_name)
 
             collection_id = None
             if collection_path:
@@ -934,7 +1029,6 @@ async def create_table(
                     f"over the {table_data_repo.PG_IDENT_MAX_LEN}-byte PostgreSQL "
                     f"identifier limit."
                 )
-            pg_name = table_data_repo.pg_table_name(vault["name"], name)
 
             # Cross-vault physical-name fusion preflight (issue #285).
             # `_sanitize_pg_part` maps `-` → `_` and `__` is also the
@@ -970,7 +1064,7 @@ async def create_table(
                 # already normalized above; re-running would 422 every enum
                 normalize_columns=False,
             )
-            await _validate_column_references(conn, vault_id, columns)
+            reference_columns = await _validate_column_references(conn, vault_id, columns)
 
             try:
                 try:
@@ -983,6 +1077,7 @@ async def create_table(
                         resource_uri=table_uri(
                             vault["name"], name, collection=collection_path
                         ),
+                        reference_columns=reference_columns,
                     )
                 except asyncpg.DuplicateTableError as e:
                     # The CREATE TABLE itself lost a create/create race past
@@ -998,12 +1093,12 @@ async def create_table(
                     ) from e
                 for uk in resolved_uks:
                     await table_data_repo.create_unique_constraint(
-                        conn, pg_name, uk["name"], uk["columns"],
+                        conn, pg_name, uk["name"], _physical_names(columns, uk["columns"]),
                     )
                 for idx in resolved_idxs:
                     await table_data_repo.create_index(
                         conn, pg_name, idx["name"],
-                        [(c["name"], c["order"]) for c in idx["columns"]],
+                        _physical_index_columns(columns, idx["columns"]),
                     )
                 await table_registry_repo.insert(
                     conn,
@@ -1290,14 +1385,44 @@ async def alter_table(
             # bookkeeping columns (id/created_at/updated_at/created_by) —
             # those are exactly the _RESERVED set — so a client can no
             # longer drop the PK or shadow a reserved name.
+            #
+            # Every name here is LOGICAL and resolves through `column_key`
+            # (#433); an added column gets its physical name now, from its
+            # position, so its default/check compile against that name.
+            declared = _declared_column_lookup(columns)
             normalized_add_columns: list[dict] = []
+            # Validated like the rest, but a no-op: re-adding a column that is
+            # already there (or twice in one request) is skipped, as before.
+            skipped_add_columns: list[dict] = []
+            adding: dict[str, str] = {}
             for col in (add_columns or []):
                 if not isinstance(col, dict) or "name" not in col:
                     raise ValidationError(
                         f"Each added column must be an object with a 'name' field; got {col!r}."
                     )
-                _validate_column_name(col["name"])
-                normalized_add_columns.append(_normalize_column_spec(col))
+                _reject_caller_pg_name(col)
+                cname = _validate_column_name(col["name"])
+                ordinal = len(columns) + len(normalized_add_columns) + 1
+                spec = _normalize_column_spec({
+                    **col,
+                    "name": cname,
+                    "pg_name": table_data_repo.derive_column_pg_name(pg_name, cname, ordinal),
+                })
+                key = table_data_repo.column_key(cname)
+                existing = declared.get(key)
+                same = existing["name"] if existing is not None else adding.get(key)
+                if same == cname:
+                    skipped_add_columns.append(spec)
+                    continue
+                if same is not None:
+                    raise ValidationError(
+                        f"Cannot add column {cname!r} to table {table_name!r}: column "
+                        f"{same!r} already exists (column names are compared "
+                        f"case-insensitively)."
+                    )
+                adding[key] = cname
+                normalized_add_columns.append(spec)
+            _check_physical_names(columns + normalized_add_columns)
             add_columns = normalized_add_columns
             normalized_alter_columns: list[dict] = []
             for col in (alter_columns or []):
@@ -1305,38 +1430,41 @@ async def alter_table(
                     raise ValidationError(
                         f"Each altered column must be an object with a 'name' field; got {col!r}."
                     )
+                _reject_caller_pg_name(col)
                 _validate_column_name(col["name"])
                 normalized_alter_columns.append(dict(col))
             alter_columns = normalized_alter_columns
             for col_name in (drop_columns or []):
                 if not isinstance(col_name, str) or not col_name:
                     raise ValidationError("Drop column name must be a non-empty string.")
-                if col_name.lower() in _RESERVED:
+                if table_data_repo.column_key(col_name) in _RESERVED:
                     raise ValidationError(
                         f"Column '{col_name}' is a reserved bookkeeping column "
                         f"and cannot be dropped. Reserved: {sorted(_RESERVED)}."
                     )
+            normalized_renames: dict[str, str] = {}
             for old_name, new_name in (rename_columns or {}).items():
                 if not isinstance(old_name, str) or not old_name:
                     raise ValidationError("Rename source column must be a non-empty string.")
-                _validate_column_name(old_name)
-                _validate_column_name(new_name)
+                normalized_renames[_validate_column_name(old_name)] = _validate_column_name(new_name)
+            rename_columns = normalized_renames
 
             added: list[str] = []
             altered: list[str] = []
             dropped: list[str] = []
             renamed: dict[str, str] = {}
 
-            if add_columns:
-                await _validate_column_references(conn, vault_id, add_columns)
+            if add_columns or skipped_add_columns:
+                reference_columns = await _validate_column_references(
+                    conn, vault_id, add_columns + skipped_add_columns,
+                )
                 taken_uk_names = {uk["name"] for uk in existing_uks}
                 taken_idx_names = {idx["name"] for idx in existing_idxs}
                 for col in add_columns:
-                    if any(c["name"] == col["name"] for c in columns):
-                        continue
                     try:
                         await table_data_repo.add_column(
                             conn, pg_name, col, vault_name=vault["name"],
+                            reference_column=reference_columns.get(col["pg_name"]),
                         )
                     except asyncpg.NotNullViolationError as e:
                         raise ValidationError(
@@ -1361,7 +1489,7 @@ async def alter_table(
                             )
                         try:
                             await table_data_repo.create_unique_constraint(
-                                conn, pg_name, uk["name"], uk["columns"],
+                                conn, pg_name, uk["name"], [col["pg_name"]],
                             )
                         except asyncpg.UniqueViolationError as e:
                             raise ValidationError(
@@ -1386,8 +1514,7 @@ async def alter_table(
                             )
                         try:
                             await table_data_repo.create_index(
-                                conn, pg_name, idx["name"],
-                                [(c["name"], c["order"]) for c in idx["columns"]],
+                                conn, pg_name, idx["name"], [(col["pg_name"], "asc")],
                             )
                         except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
                             raise ValidationError(
@@ -1400,32 +1527,49 @@ async def alter_table(
                         idx_changed = True
 
             if drop_columns:
+                declared = _declared_column_lookup(columns)
+                # (reported name, physical name or None when nothing can be there)
+                drops: list[tuple[str, str | None]] = []
+                for col_name in drop_columns:
+                    target = declared.get(table_data_repo.column_key(col_name))
+                    if target is not None:
+                        drops.append((target["name"], table_data_repo.column_pg_name(target)))
+                    elif table_data_repo.is_plain_column_name(col_name):
+                        # Not in the registry: DROP ... IF EXISTS by that name,
+                        # exactly as before the split.
+                        drops.append((col_name, col_name))
+                    else:
+                        drops.append((col_name, None))
                 await _reject_referenced_target_columns(
                     conn,
                     vault_id,
                     table_name,
-                    {c for c in drop_columns if isinstance(c, str)},
+                    {name for name, _physical in drops},
                     action="drop",
                 )
-                for col_name in drop_columns:
-                    safe_name = table_data_repo.safe_ident(col_name)
-                    try:
-                        await table_data_repo.drop_column(conn, pg_name, safe_name)
-                    except asyncpg.DependentObjectsStillExistError as e:
-                        raise ConflictError(
-                            f"Cannot drop column {col_name!r} on table {table_name!r}: "
-                            "other vault tables reference it. Drop dependent tables "
-                            "or columns first."
-                        ) from e
+                for col_name, dropped_physical in drops:
+                    if dropped_physical is not None:
+                        try:
+                            await table_data_repo.drop_column(conn, pg_name, dropped_physical)
+                        except asyncpg.DependentObjectsStillExistError as e:
+                            raise ConflictError(
+                                f"Cannot drop column {col_name!r} on table {table_name!r}: "
+                                "other vault tables reference it. Drop dependent tables "
+                                "or columns first."
+                            ) from e
                     dropped.append(col_name)
-                columns = [c for c in columns if c["name"] not in drop_columns]
+                dropped_keys = {table_data_repo.column_key(name) for name in dropped}
+                columns = [
+                    c for c in columns if table_data_repo.column_key(c["name"]) not in dropped_keys
+                ]
 
             if rename_columns:
                 lookup = _declared_column_lookup(columns)
                 rename_targets: set[str] = set()
+                plans: list[tuple[dict, str]] = []
                 for old_name, new_name in rename_columns.items():
-                    old_key = old_name.lower()
-                    new_key = new_name.lower()
+                    old_key = table_data_repo.column_key(old_name)
+                    new_key = table_data_repo.column_key(new_name)
                     if old_key not in lookup:
                         raise ValidationError(
                             f"Cannot rename missing column {old_name!r} on table {table_name!r}."
@@ -1440,51 +1584,66 @@ async def alter_table(
                             f"Cannot rename multiple columns to {new_name!r} on table {table_name!r}."
                         )
                     rename_targets.add(new_key)
+                    plans.append((lookup[old_key], new_name))
                 await _reject_referenced_target_columns(
                     conn,
                     vault_id,
                     table_name,
-                    {old for old in rename_columns if isinstance(old, str)},
+                    {col["name"] for col, _new in plans},
                     action="rename",
                 )
-                for old_name, new_name in rename_columns.items():
-                    old_col = next((dict(c) for c in columns if c["name"] == old_name), None)
-                    old_safe = table_data_repo.safe_ident(old_name)
-                    new_safe = table_data_repo.safe_ident(new_name)
-                    old_has_scalar_check = bool(
-                        old_col
-                        and old_col.get("check") is not None
-                        and old_col.get("type") != "enum"
+                for col, new_name in plans:
+                    old_name = col["name"]
+                    old_physical = table_data_repo.column_pg_name(col)
+                    col["name"] = new_name
+                    col["pg_name"] = old_physical
+                    renamed[old_name] = new_name
+                    # A rename is physical only for a column whose physical
+                    # name IS its logical name, to a name that can be one —
+                    # the rename every table had before the split (#433
+                    # decision 7). Anything else renames the registry entry
+                    # and leaves the column, its constraints and every
+                    # generated name alone. So does a plain target another
+                    # column already holds physically: RENAME COLUMN would
+                    # fail, and the logical rename is still the request.
+                    taken = {
+                        table_data_repo.column_pg_name(c) for c in columns if c is not col
+                    }
+                    if not (
+                        old_physical == old_name
+                        and table_data_repo.is_plain_column_name(new_name)
+                        and new_name not in taken
+                    ):
+                        continue
+                    old_has_scalar_check = (
+                        col.get("check") is not None and col.get("type") != "enum"
                     )
                     try:
                         if old_has_scalar_check:
                             await table_data_repo.drop_column_check_constraints(
-                                conn, pg_name, old_name,
+                                conn, pg_name, old_physical,
                             )
-                        await table_data_repo.rename_column(conn, pg_name, old_safe, new_safe)
+                        await table_data_repo.rename_column(conn, pg_name, old_physical, new_name)
                     except asyncpg.DependentObjectsStillExistError as e:
                         raise ConflictError(
                             f"Cannot rename column {old_name!r} on table {table_name!r}: "
                             "other vault tables reference it. Drop dependent tables "
                             "or columns first."
                         ) from e
-                    updated_col = None
-                    for c in columns:
-                        if c["name"] == old_name:
-                            c["name"] = new_name
-                            updated_col = c
-                    renamed[old_name] = new_name
-                    if old_col and old_col.get("type") == "enum" and updated_col:
+                    col["pg_name"] = new_name
+                    if col.get("type") == "enum":
                         await table_data_repo.drop_constraint(
                             conn, pg_name,
-                            table_data_repo.enum_constraint_name(pg_name, old_name),
+                            table_data_repo.enum_constraint_name(pg_name, old_physical),
                         )
-                        await table_data_repo.create_enum_constraint(conn, pg_name, updated_col)
-                    if old_has_scalar_check and updated_col:
-                        await table_data_repo.create_check_constraint(conn, pg_name, updated_col)
-                    if old_col and old_col.get("references") is not None and updated_col:
+                        await table_data_repo.create_enum_constraint(conn, pg_name, col)
+                    if old_has_scalar_check:
+                        await table_data_repo.create_check_constraint(conn, pg_name, col)
+                    if col.get("references") is not None:
+                        reference = await _validate_column_references(conn, vault_id, [col])
                         await table_data_repo.replace_foreign_key_constraint(
-                            conn, pg_name, old_name, updated_col, vault_name=vault["name"],
+                            conn, pg_name, old_physical, col, vault_name=vault["name"],
+                            target_column=reference.get(new_name),
                         )
 
             # ── Declarative unique keys / indexes (AKB #215) ─────────
@@ -1495,45 +1654,60 @@ async def alter_table(
             # a PG column rename leaves the constraint/index under the old
             # column name, and DROP COLUMN auto-drops any constraint/index the
             # column was part of. Mirror both in the registry. (#220 review.)
+            # The registry records key/index columns by logical name.
             if renamed:
-                ren = {old.lower(): new for old, new in renamed.items()}
+                ren = {table_data_repo.column_key(old): new for old, new in renamed.items()}
                 for uk in existing_uks:
-                    new_cols = [ren.get(str(c).lower(), c) for c in uk.get("columns", [])]
+                    new_cols = [
+                        ren.get(table_data_repo.column_key(str(c)), c)
+                        for c in uk.get("columns", [])
+                    ]
                     if new_cols != uk.get("columns"):
                         uk["columns"] = new_cols
                         uk_changed = True
                 for idx in existing_idxs:
                     for c in idx.get("columns", []):
-                        if isinstance(c, dict) and str(c.get("name", "")).lower() in ren:
-                            c["name"] = ren[str(c["name"]).lower()]
+                        if not isinstance(c, dict):
+                            continue
+                        key = table_data_repo.column_key(str(c.get("name", "")))
+                        if key in ren:
+                            c["name"] = ren[key]
                             idx_changed = True
             if dropped:
-                dset = {d.lower() for d in dropped}
-                kept_uks = [uk for uk in existing_uks
-                            if not any(str(c).lower() in dset for c in uk.get("columns", []))]
+                dset = {table_data_repo.column_key(d) for d in dropped}
+                kept_uks = [
+                    uk for uk in existing_uks
+                    if not any(table_data_repo.column_key(str(c)) in dset for c in uk.get("columns", []))
+                ]
                 if len(kept_uks) != len(existing_uks):
                     existing_uks = kept_uks
                     uk_changed = True
-                kept_idxs = [idx for idx in existing_idxs
-                             if not any(isinstance(c, dict) and str(c.get("name", "")).lower() in dset
-                                        for c in idx.get("columns", []))]
+                kept_idxs = [
+                    idx for idx in existing_idxs
+                    if not any(
+                        isinstance(c, dict)
+                        and table_data_repo.column_key(str(c.get("name", ""))) in dset
+                        for c in idx.get("columns", [])
+                    )
+                ]
                 if len(kept_idxs) != len(existing_idxs):
                     existing_idxs = kept_idxs
                     idx_changed = True
 
             if alter_columns:
                 column_lookup: dict[str, tuple[int, dict]] = {
-                    c["name"].lower(): (column_index, c)
+                    table_data_repo.column_key(c["name"]): (column_index, c)
                     for column_index, c in enumerate(columns)
                     if isinstance(c, dict) and isinstance(c.get("name"), str)
                 }
                 for spec in alter_columns:
-                    key = spec["name"].lower()
+                    key = table_data_repo.column_key(spec["name"])
                     if key not in column_lookup:
                         raise ValidationError(
                             f"Cannot alter missing column {spec['name']!r} on table {table_name!r}."
                         )
                     column_index, current = column_lookup[key]
+                    physical = table_data_repo.column_pg_name(current)
                     logical_type = table_data_repo.normalize_column_type(
                         current.get("type", "text")
                     )
@@ -1614,11 +1788,11 @@ async def alter_table(
                         if enum_requested:
                             await table_data_repo.drop_constraint(
                                 conn, pg_name,
-                                table_data_repo.enum_constraint_name(pg_name, current["name"]),
+                                table_data_repo.enum_constraint_name(pg_name, physical),
                             )
                             if renames:
                                 await table_data_repo.rename_enum_values(
-                                    conn, pg_name, current["name"], renames,
+                                    conn, pg_name, physical, renames,
                                 )
                         if set_default or drop_default:
                             await table_data_repo.alter_column_default(conn, pg_name, next_col)
@@ -1628,7 +1802,7 @@ async def alter_table(
                             )
                         if set_not_null or drop_not_null:
                             await table_data_repo.alter_column_required(
-                                conn, pg_name, current["name"], bool(next_col.get("required")),
+                                conn, pg_name, physical, bool(next_col.get("required")),
                             )
                         if enum_requested:
                             await table_data_repo.create_enum_constraint(conn, pg_name, next_col)
@@ -1709,12 +1883,13 @@ async def alter_table(
                     # PREFLIGHT existing data BEFORE the ADD CONSTRAINT so a
                     # duplicate fails pre-DDL — the TX rolls back leaving
                     # schema + registry untouched (AC #4, #10).
+                    key_columns = _physical_names(columns, uk["columns"])
                     dups = await table_data_repo.unique_key_duplicates(
-                        conn, pg_name, uk["columns"], limit=5,
+                        conn, pg_name, key_columns, limit=5,
                     )
                     if dups:
                         sample = [
-                            {c: row[table_data_repo.safe_ident(c)] for c in uk["columns"]}
+                            {c: row[pg] for c, pg in zip(uk["columns"], key_columns)}
                             for row in dups
                         ]
                         raise ValidationError(
@@ -1726,7 +1901,7 @@ async def alter_table(
                         )
                     try:
                         await table_data_repo.create_unique_constraint(
-                            conn, pg_name, uk["name"], uk["columns"],
+                            conn, pg_name, uk["name"], key_columns,
                         )
                     except asyncpg.UniqueViolationError as e:
                         # The preflight above is best-effort: FOR UPDATE locks
@@ -1766,7 +1941,7 @@ async def alter_table(
                     try:
                         await table_data_repo.create_index(
                             conn, pg_name, idx["name"],
-                            [(c["name"], c["order"]) for c in idx["columns"]],
+                            _physical_index_columns(columns, idx["columns"]),
                         )
                     except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError) as e:
                         # Index names share PostgreSQL's schema-global namespace
@@ -1783,6 +1958,15 @@ async def alter_table(
                     existing_idxs.append(idx)
                     idx_changed = True
 
+            # A row written before the backfill carries no pg_name; record the
+            # identifier it already has, so the registry never needs the
+            # fallback for it again.
+            columns = [
+                {**c, "pg_name": table_data_repo.column_pg_name(c)}
+                if isinstance(c, dict) and isinstance(c.get("name"), str) and not c.get("pg_name")
+                else c
+                for c in columns
+            ]
             await table_registry_repo.update_columns(conn, table["id"], columns)
             if uk_changed or idx_changed:
                 await table_registry_repo.update_schema_meta(
@@ -2017,6 +2201,7 @@ async def execute_sql(
         async with pool.acquire() as conn:
             enriched = await _enrich_undefined_error(
                 conn, msg, allowed_pg_tables=set(table_map.values()),
+                vault_names=vault_names,
             )
         if enriched:
             return enriched
@@ -2032,6 +2217,7 @@ async def _enrich_undefined_error(
     err_msg: str,
     *,
     allowed_pg_tables: set[str],
+    vault_names: list[str] | tuple[str, ...] = (),
 ) -> dict | None:
     """Turn a column/table-not-exist error into an actionable hint.
 
@@ -2039,6 +2225,11 @@ async def _enrich_undefined_error(
     user-supplied SQL is sandboxed. `allowed_pg_tables` is the caller's
     rewritten table list (e.g. ``{"vt_sales__pipeline"}``) — we never
     suggest names from other vaults.
+
+    SQL spells a column by its PHYSICAL name (#433). A caller who wrote a
+    column's logical name — the header `akb_browse` shows — is told the
+    physical name to use instead of being fuzzy-matched against
+    identifiers that look nothing like it.
 
     Returns the canonical 0.5.6 error envelope (``err(...)`` with
     ``code=undefined_column`` or ``undefined_table``, ``hint``, and
@@ -2056,6 +2247,23 @@ async def _enrich_undefined_error(
         col_meta = await _fetch_column_meta(conn, allowed_pg_tables)
         if not col_meta:
             return None
+        logical = await _logical_column_matches(
+            conn, bad_col, allowed_pg_tables=allowed_pg_tables, vault_names=vault_names,
+        )
+        if logical:
+            spelled = ", ".join(
+                f"{m['pg_name']} (table {m['table']})" for m in logical
+            )
+            return err(
+                err_msg,
+                code=UNDEFINED_COLUMN,
+                hint=(
+                    f"{bad_col!r} is a column's logical name; in SQL use its "
+                    f"physical name: {spelled}. akb_browse lists both."
+                ),
+                available_columns=list(col_meta.keys()),
+                logical_matches=logical,
+            )
         hint = fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
         jsonb_cols = [c for c, t in col_meta.items() if t == "jsonb"]
         if jsonb_cols:
@@ -2093,6 +2301,44 @@ async def _enrich_undefined_error(
         )
 
     return None
+
+
+async def _logical_column_matches(
+    conn,
+    name: str,
+    *,
+    allowed_pg_tables: set[str],
+    vault_names: list[str] | tuple[str, ...],
+) -> list[dict]:
+    """Registry columns in the caller's tables whose LOGICAL name is ``name``
+    (by `column_key`) and whose physical name is not. Same boundary as the
+    fuzzy hint: only tables the rewriter gave this caller."""
+    if not vault_names:
+        return []
+    rows = await conn.fetch(
+        """
+        SELECT v.name AS vault, t.name AS table_name, t.columns
+          FROM vault_tables t
+          JOIN vaults v ON v.id = t.vault_id
+         WHERE v.name = ANY($1::text[])
+         ORDER BY v.name, t.name
+        """,
+        list(vault_names),
+    )
+    key = table_data_repo.column_key(name)
+    matches: list[dict] = []
+    for row in rows:
+        if table_data_repo.pg_table_name(row["vault"], row["table_name"]) not in allowed_pg_tables:
+            continue
+        for col in table_registry_repo.parse_columns(row["columns"]):
+            if not isinstance(col, dict) or not isinstance(col.get("name"), str):
+                continue
+            physical = table_data_repo.column_pg_name(col)
+            if table_data_repo.column_key(col["name"]) == key and physical != name:
+                matches.append(
+                    {"table": row["table_name"], "name": col["name"], "pg_name": physical}
+                )
+    return matches
 
 
 async def _fetch_column_meta(conn, table_names: set[str]) -> dict[str, str]:

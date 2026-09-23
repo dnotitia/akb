@@ -625,7 +625,9 @@ async def test_real_create_is_unaffected_by_the_capability(monkeypatch):
         if_not_exists=True, can_read_existing=False)
 
     assert out["created"] is True
-    assert out["columns"] == _COLS
+    # The created table reports its columns as stored: each with the
+    # server-derived physical name, its own name for a plain one (#433).
+    assert out["columns"] == [{**c, "pg_name": c["name"]} for c in _COLS]
 
 
 # ── 6. the advisory lock ─────────────────────────────────────────
