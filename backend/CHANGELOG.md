@@ -1,6 +1,18 @@
-# Pending release: Native installation default
+# AKB Backend — Changelog
 
-Breaking configuration-default change (not yet released): Settings and the
+The AKB backend ships as a Docker image and as the HTTP layer behind
+the `akb-mcp` stdio proxy. This changelog tracks the backend
+specifically; the proxy has its own log in
+`packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
+
+## 0.15.0 — 2026-09-23  *(breaking default — PostgreSQL Native for new installations)*
+
+This is the announced default-change release the Native default was held for.
+0.14.3 below was recorded but never tagged; its changes first ship here.
+
+### Breaking: new installations default to PostgreSQL Native
+
+Breaking configuration-default change: Settings and the
 recommended Compose/Kubernetes fresh-install paths select PostgreSQL Native.
 Before upgrading, run `preserve-revision-config` against the active app/secret
 pair and install the reviewed output. It pins previously omitted selectors to
@@ -23,17 +35,6 @@ configuration — `CONTRIBUTING.md` pins `bare_git` for a development stack, and
 `prepare-native-config` generates the identity for a real one.
 
 See [installation and upgrade order](../docs/operations/native-installation.md).
-Publish this change only with an explicitly announced default-change release;
-this entry does not bump a version, publish an artifact or authorize rollout.
-
-# AKB Backend — Changelog
-
-The AKB backend ships as a Docker image and as the HTTP layer behind
-the `akb-mcp` stdio proxy. This changelog tracks the backend
-specifically; the proxy has its own log in
-`packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
-
-## Unreleased
 
 ### A refused column name says why, all at once, and where the header goes
 
