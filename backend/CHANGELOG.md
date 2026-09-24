@@ -34,11 +34,11 @@ where they run it: the same pinned pgvector image, plus the extension's files.
 Existing installations keep the sparse shape they serve. Moving one to this
 image restarts PostgreSQL once, on the same PostgreSQL and pgvector versions.
 
-**Upgrading a Compose installation**: build `postgres` (and `frontend`, for the
-complete stack) before the first `up --no-build`. `--no-build` cannot create an
-image that only a build produces. Without that step, Compose stops the running
-containers and then fails with `No such image: <project>-postgres:latest`.
-`docker compose up -d` without `--no-build` builds it by itself.
+**Upgrading a Compose installation**: after updating the checkout, build
+`postgres` (and `frontend`, for the complete stack) before `up --no-build`,
+which never builds. Without that step, Compose stops the API (`backend`) and
+then fails with `No such image: <project>-postgres:latest`, which leaves the API
+down. `docker compose up -d --build` rebuilds every built service by itself.
 
 ### New databases use the `vchord` sparse shape where the server provides it
 

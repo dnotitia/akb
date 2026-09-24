@@ -219,32 +219,49 @@ def _native_stack_builds(tmp_path) -> set[str]:
     return {name for name, service in rendered["services"].items() if "build" in service}
 
 
+def _paragraph(text: str, anchor: str) -> str:
+    """The blank-line-separated paragraph of `text` that contains `anchor`."""
+    found = [p for p in text.split("\n\n") if anchor in p]
+    assert len(found) == 1, f"{anchor!r}: {len(found)} paragraphs"
+    return found[0]
+
+
 def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_path):
-    """`up --no-build` cannot create an image that only a build produces.
+    """`up --no-build` never builds, so an instruction that ends in it must build first.
 
     When PostgreSQL moved from a pulled image to a built one, an installation
-    that followed its own instructions (`up -d --no-build`) had Compose stop the
-    running containers and then fail with `No such image`. Each set of
-    instructions that ends in `up --no-build` must therefore build every service
-    the stack builds, found from the rendered stack rather than listed here.
+    that followed its own upgrade instructions (`up -d --no-build`) had Compose
+    stop the API and then fail with `No such image`. And once an image exists,
+    `--no-build` keeps running it after the checkout changes. So each place that
+    tells an operator to run `up --no-build`, for a new installation and for an
+    upgrade, must build every service the rendered stack builds.
     """
     import re
 
     if not shutil.which("docker"):
         pytest.skip("Docker Compose required")
     built = _native_stack_builds(tmp_path)
-    assert built == {"frontend", "postgres"}, built  # the Native overlay pulls the backend
-    quickstart = (ROOT / "README.md").read_text()
-    commands = re.findall(r"docker compose -p my-native-install build ([a-z ]+)", quickstart)
-    assert commands, "README 빠른 시작에 compose build 단계가 없다"
-    assert built <= set(" ".join(commands).split()), commands
-    for doc, services in (
-        ("docs/operations/native-installation.md", {"postgres"}),
-        ("deploy/compose/README.md", {"frontend", "postgres"}),
-    ):
-        text = (ROOT / doc).read_text()
-        for service in services:
-            assert re.search(rf"build[^.]*\b{service}\b", text, re.I), f"{doc}: {service} 빌드 안내가 없다"
+    assert "postgres" in built, built
+    readme = (ROOT / "README.md").read_text()
+    native = (ROOT / "docs/operations/native-installation.md").read_text()
+    instructions = {
+        "README step 1": _paragraph(readme, "docker compose -p my-native-install build"),
+        "README upgrade": _paragraph(readme, "To upgrade, update the checkout"),
+        "Native guide, new installation": _paragraph(native, "docker compose -p my-native-install build postgres\n"),
+        "Native guide, upgrade": _paragraph(native, "On upgrades, update `AKB_NATIVE_IMAGE`"),
+        "Compose README": _paragraph((ROOT / "deploy/compose/README.md").read_text(), "`up --no-build` for the complete stack"),
+        "Native overlay header": _paragraph((ROOT / "docker-compose.native.yaml").read_text(), "`up --no-build`"),
+    }
+    for where, text in instructions.items():
+        if where == "README upgrade":
+            assert "repeat step 1" in text, where  # step 1 is the build
+            text = instructions["README step 1"]
+        if where == "Native guide, new installation":
+            # The backend stack; the complete one builds the frontend in the next paragraph.
+            assert re.search(r"\bbuild postgres\b", text), where
+            continue
+        missing = [svc for svc in sorted(built) if not re.search(rf"\b{svc}\b", text)]
+        assert "build" in text.lower() and not missing, f"{where}: no build of {missing}"
 
 
 @pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])
