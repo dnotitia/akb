@@ -7,6 +7,31 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The BM25 statistics recompute draws term ids for new terms only (akb#687)
+
+The recompute registered the terms it counted with
+`INSERT … SELECT term, nextval('bm25_term_id_seq') … ON CONFLICT DO NOTHING`.
+That draws an id for every term, including each one the vocabulary already
+holds and the conflict then discards, so every pass advanced the sequence by
+the whole vocabulary. One long-lived installation reached 728,985,301 ids for
+955,060 terms. The `vchord` shape's index sizes its per-term arrays by the
+largest id rather than by the number of terms, and its VACUUM cleanup walks
+all of them (akb#687). Only terms missing from the vocabulary reach `nextval()`
+now; a term an encoder inserts at the same moment still costs one id.
+
+- Ids already drawn are kept; nothing is renumbered. An installation that has
+  already drawn them keeps its largest id, and with it the `vchord` cleanup
+  cost, until its ids are renumbered or the extension's cleanup no longer walks
+  every id (akb#687). This change stops the growth. The same
+  drawing used part of the u32 range a term id must fit (akb#665): 729M of
+  4.29 billion at that installation.
+- Where the recompute runs: the background refresher runs it wherever external
+  statistics are consumed, which is every non-pgvector driver (Qdrant
+  included), pgvector `arrays` and `posting`, pgvector `vchord` under
+  `required` or, under `auto`, while a `posting` table exists, and any pgvector
+  database whose shape is not decided yet. `scripts/init_bm25_vocab.py` runs it
+  anywhere.
+
 ### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
 
 `vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release
