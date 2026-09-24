@@ -7,6 +7,51 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The `vchord` shape refuses a term id of 2^30 or more instead of corrupting another term
+
+A term id reaches the BM25 index in a `bm25vector`, and AKB refused only the ids
+its text input cannot parse: negative ones and those past 4,294,967,295
+(akb#665). The index's own limit is lower. `vchord_bm25` 0.3.0 addresses its
+per-term arrays with 32-bit byte offsets at 4 bytes per id, and its release
+build does not check the multiplication. An id of 1,073,741,824 (2^30) or more
+therefore lands on the id 2^30 below it, and nothing reports an error:
+
+- **Built over existing rows** (`CREATE INDEX`, `REINDEX`, every `pg_restore`):
+  a search for the high id reads the lower id's entries, and the document that
+  holds the high id cannot be found through it.
+- **Inserted, then sealed**: the high id's posting joins the lower id's list and
+  its document the lower id's count. Searches for the lower term rank a document
+  that does not hold it, and both terms' IDF is wrong.
+
+Measured on a patched 0.3.0 build. Term ids come from `bm25_term_id_seq`. No
+installation is known to be past 2^30; one long-lived installation is at about
+68% of it.
+
+What changes:
+
+- **The `vchord` shape writes term ids up to 1,073,741,823 (2^30 - 1).** A
+  document holding a larger one is refused before anything reaches the index.
+  The term is not dropped, because that would index the document under part of
+  what it says.
+- **A query term at or above 2^30 is dropped**, as one past u32 already was. No
+  document can hold it.
+- The other sparse shapes and drivers are unchanged.
+
+**If it fires**: the indexing worker records the refusal on the chunk and
+retries it like any other per-row failure until it is abandoned; `/health`
+counts it under `vector_store.backfill.upsert`. The chunk's `vector_last_error`
+names the id, the range and the remedy, and `scripts/backfill_bm25_vector.py`
+stops with the same message:
+
+```
+term id <id> is outside the range the vchord BM25 index holds (0 to 1,073,741,823): …
+```
+
+Once `bm25_term_id_seq` passes 2^30, every document holding a new term is
+refused, and the vocabulary's ids have to be renumbered densely before such a
+document can be indexed. This change does not renumber them.
+`SELECT last_value FROM bm25_term_id_seq` shows how close an installation is.
+
 ### The BM25 index's VACUUM no longer stalls search, and its counts survive a crash (akb#687)
 
 `vchord_bm25` 0.3.0 held the index's metapage through both steps of VACUUM, and a
@@ -76,8 +121,8 @@ now; a term an encoder inserts at the same moment still costs one id.
   already drawn them keeps its largest id, and with it the `vchord` cleanup
   cost, until its ids are renumbered or the extension's cleanup no longer walks
   every id (akb#687). This change stops the growth. The same
-  drawing used part of the u32 range a term id must fit (akb#665): 729M of
-  4.29 billion at that installation.
+  drawing used part of the range a term id must fit in the `vchord` index: 729M
+  of the 1,073,741,824 ids below 2^30 at that installation.
 - Where the recompute runs: the background refresher runs it wherever external
   statistics are consumed, which is every non-pgvector driver (Qdrant
   included), pgvector `arrays` and `posting`, pgvector `vchord` under

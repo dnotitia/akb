@@ -296,6 +296,8 @@ current average.
     document the lower id's count, so searches for the lower term rank a
     document that does not hold it, and both terms' IDF is wrong.
   AKB draws term ids from `bm25_term_id_seq`, which has to stay below 2^30.
+  The backend refuses to index a document holding such an id, and the error
+  names the id and the limit.
 - **The recount blocks sealing while it runs.** It holds the seal lock from its
   first page to its last, so the growing segment, which every search reads in
   full, keeps growing until it ends.
