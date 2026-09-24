@@ -234,7 +234,8 @@ def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_p
     stop the API and then fail with `No such image`. And once an image exists,
     `--no-build` keeps running it after the checkout changes. So each place that
     tells an operator to run `up --no-build`, for a new installation and for an
-    upgrade, must build every service the rendered stack builds.
+    upgrade, must carry a `docker compose ... build` command naming every
+    service the rendered stack builds.
     """
     import re
 
@@ -242,26 +243,32 @@ def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_p
         pytest.skip("Docker Compose required")
     built = _native_stack_builds(tmp_path)
     assert "postgres" in built, built
+
+    def builds(text: str) -> set[str]:
+        """The services named by the `docker compose ... build` commands in `text`."""
+        return {name for names in re.findall(r"docker compose(?: -p \S+)? build ((?:[a-z-]+ ?)+)", text)
+                for name in names.split()}
+
     readme = (ROOT / "README.md").read_text()
     native = (ROOT / "docs/operations/native-installation.md").read_text()
+    compose = (ROOT / "deploy/compose/README.md").read_text()
+    step_1 = _paragraph(readme, "docker compose -p my-native-install build")
+    assert "repeat step 1" in _paragraph(readme, "To upgrade, update the checkout")  # step 1 is the build
+    header = (ROOT / "docker-compose.native.yaml").read_text().split("\nservices:", 1)[0]
     instructions = {
-        "README step 1": _paragraph(readme, "docker compose -p my-native-install build"),
-        "README upgrade": _paragraph(readme, "To upgrade, update the checkout"),
-        "Native guide, new installation": _paragraph(native, "docker compose -p my-native-install build postgres\n"),
+        "README step 1": step_1,
+        # The backend stack's command, and the frontend the complete stack adds.
+        "Native guide, new installation": _paragraph(native, "docker compose -p my-native-install build postgres\n")
+        + _paragraph(native, "For the complete local\nstack"),
         "Native guide, upgrade": _paragraph(native, "On upgrades, update `AKB_NATIVE_IMAGE`"),
-        "Compose README": _paragraph((ROOT / "deploy/compose/README.md").read_text(), "`up --no-build` for the complete stack"),
-        "Native overlay header": _paragraph((ROOT / "docker-compose.native.yaml").read_text(), "`up --no-build`"),
+        "Compose README": _paragraph(compose, "`up --no-build` for the complete stack"),
+        "Native overlay header": header,
     }
     for where, text in instructions.items():
-        if where == "README upgrade":
-            assert "repeat step 1" in text, where  # step 1 is the build
-            text = instructions["README step 1"]
-        if where == "Native guide, new installation":
-            # The backend stack; the complete one builds the frontend in the next paragraph.
-            assert re.search(r"\bbuild postgres\b", text), where
-            continue
-        missing = [svc for svc in sorted(built) if not re.search(rf"\b{svc}\b", text)]
-        assert "build" in text.lower() and not missing, f"{where}: no build of {missing}"
+        missing = sorted(built - builds(text))
+        assert not missing, f"{where}: no build of {missing}"
+    # The base stack's upgrade must rebuild too: a plain `up -d` keeps an old image.
+    assert "up -d --build" in _paragraph(compose, "PostgreSQL is built from `deploy/postgres`")
 
 
 @pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])

@@ -90,10 +90,9 @@ persisted configuration, including after real documents have been written.
 
 On upgrades, update `AKB_NATIVE_IMAGE`, keep the initializing receipt in
 `app.yaml`, and rebuild what the new checkout builds before any
-`up --no-build`: `docker compose -p my-native-install build postgres`, plus
-`frontend` for the complete stack. `--no-build` never builds. A missing
-PostgreSQL image makes it stop the API and then fail with `No such image`, and
-an old frontend image keeps running. A rebuilt PostgreSQL image recreates the
+`up --no-build`: `docker compose -p my-native-install build frontend postgres`.
+`--no-build` never builds. A missing PostgreSQL image makes it stop the API and
+then fail with `No such image`, and an old frontend image keeps running. A rebuilt PostgreSQL image recreates the
 PostgreSQL container once on the same data volume. Then recreate API/worker together using the same
 Compose project and files. A bootstrap replay remains safe. Confirm both processes are healthy and
 read back existing documents after replacement. Preserve database/S3/config/key
