@@ -43,7 +43,7 @@ What changes:
   which is an extension build no installation should have.
 - **`deploy/k8s/deploy.sh` tags `akb-postgres` by all of its build inputs.** A
   changed patch or lockfile therefore produces a new tag.
-- **The defect's traces are gone.** The test that pinned it (`bounded == 44`) is
+- **The akb#679 defect's traces are gone.** The test that pinned it (`bounded == 44`) is
   now its regression test, beside `test_vchord_index_build_postgres.py`. The
   docs that described it as a limit now describe the fixes.
 

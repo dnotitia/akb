@@ -130,7 +130,7 @@ else
   BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
   FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
   # Tagged by its build inputs, not the AKB version: the Dockerfile and the
-  # patch and lockfile it copies, names and contents. An AKB upgrade that leaves
+  # patches and lockfile it copies, names and contents. An AKB upgrade that leaves
   # them unchanged must not restart PostgreSQL, and one that changes any of them
   # must not reuse a tag the nodes already hold.
   POSTGRES_INPUTS="$(cd "${ROOT_DIR}/deploy/postgres" \
