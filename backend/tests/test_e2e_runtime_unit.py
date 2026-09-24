@@ -1178,7 +1178,9 @@ async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp
 
     await runtime._start_dependencies()
 
-    assert compose_calls == [(("up", "--detach", "--wait"), {})]
+    # Always --build: a reused project name must not run an image an earlier
+    # checkout built from deploy/postgres.
+    assert compose_calls == [(("up", "--build", "--detach", "--wait"), {})]
     assert identity_calls == 1
     assert runtime._dependency_identity == dependency_identity
 
