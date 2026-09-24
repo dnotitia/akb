@@ -4,8 +4,11 @@ New installations follow the [root Native quickstart](../../README.md#quick-star
 prepare persistent configuration/identity once, then layer
 `docker-compose.native.yaml` over the reusable `docker-compose.yaml` base.
 The Native overlay explicitly bootstraps a never-used database before API and
-worker start. It keeps their Git paths read-only and empty. Build the frontend
-before using `up --no-build` for the complete stack.
+worker start. It keeps their Git paths read-only and empty. Run
+`docker compose -p <project> build frontend postgres` before using
+`up --no-build` for the complete stack, and again after every update of the
+checkout: `--no-build` never builds, so a missing image fails and an old one
+keeps running.
 
 Use the same Compose project name, config directory and file list on every
 operation so database and object-store volumes are reused. API and worker run
@@ -34,7 +37,16 @@ on the active app/secret pair and install the reviewed output. Omitted old
 selectors become explicit Bare Git; explicit Native identity stays intact.
 Do not overwrite existing config with the new example or regenerate keys.
 Existing Bare Git installations continue using the base Compose without the
-Native overlay and retain their Git volume. Existing root Compose
+Native overlay and retain their Git volume.
+
+PostgreSQL is built from `deploy/postgres`: the same pinned pgvector image plus
+the BM25 index extension. After updating the checkout, run
+`docker compose -p <project> up -d --build` with the installation's project name
+and file list, which rebuilds it with the other built services. A plain `up -d`
+builds only an image that does not exist yet and keeps an old one. With
+`--no-build`, first run `docker compose -p <project> build` with the same
+project name and file list. The first start on a new image recreates the PostgreSQL container
+once on the same data volume, and a database keeps the sparse shape it serves. Existing root Compose
 volume names (`postgres_data`, `vault_data`, `minio_data`) are unchanged.
 
 The historical `deploy/docker-compose.yaml` used `pgdata` and `vaultdata`,

@@ -329,6 +329,13 @@ docker compose -p my-native-install \
 open http://localhost:3000
 ```
 
+To upgrade, update the checkout and repeat step 1 before step 3. `up --no-build`
+never builds, so it cannot pick up what the new checkout builds (`frontend`,
+`postgres`): a missing image makes it fail, and an old one keeps running. On the
+upgrade that turned PostgreSQL into a built image, skipping step 1 stops the API
+(`backend`) and then fails with `No such image: my-native-install-postgres:latest`,
+which leaves the API down.
+
 The local image ID pins the locally built bytes; it is not a registry digest.
 For distributed installs, build/push first and use the registry digest for
 `AKB_NATIVE_IMAGE`. Keep the generated initializing image receipt unchanged
