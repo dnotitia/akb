@@ -74,6 +74,11 @@ frontend:
     limits: {cpu: 500m, memory: 512Mi}
 
 postgres:
+  # Set this to the image built from deploy/postgres/Dockerfile (the README's
+  # install commands do): it adds the vchord_bm25 BM25 index, and a new database
+  # then gets the default `vchord` sparse shape. The stock pgvector image stays
+  # the default so an upgrade never switches a running database to an image
+  # nobody has built; on it a new database gets `posting`.
   image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
   pullPolicy: IfNotPresent
   database: akb

@@ -295,7 +295,7 @@ and Qdrant degrade to BM25-only lexical search when embedding is unavailable.
 # 1. Build this checkout's images. For a registry installation, use a backend
 # image pinned as registry.example.com/akb-backend@sha256:... instead.
 docker build -t akb-backend:native-local ./backend
-docker compose -p my-native-install build frontend
+docker compose -p my-native-install build frontend postgres
 export AKB_NATIVE_IMAGE="$(docker image inspect akb-backend:native-local --format '{{.Id}}')"
 export AKB_NATIVE_CONFIG_DIR="$PWD/config/native"
 
@@ -489,10 +489,12 @@ Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
 interface. Five drivers ship; pick at config time:
 
 - **`pgvector`** (default) — uses the same Postgres container that holds
-  application data. The pgvector/pgvector image pre-installs the
-  extension; the driver creates a separate `vector_index` schema, so the
-  main `chunks` table stays plain PostgreSQL. RRF fusion runs
-  application-side. No external service to operate.
+  application data. The install paths build that container's image from
+  `deploy/postgres/Dockerfile`: pgvector plus the `vchord_bm25` BM25 index,
+  which gives a new database the default `vchord` sparse shape. The driver
+  creates a separate `vector_index` schema, so the main `chunks` table stays
+  plain PostgreSQL. RRF fusion runs application-side. No external service to
+  operate.
 - **`qdrant`** — runs a separate Qdrant container; native RRF via the
   Query API. Useful when you already operate Qdrant or want to scale
   the vector store independently of Postgres.

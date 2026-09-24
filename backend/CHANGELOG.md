@@ -7,6 +7,33 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The install paths build PostgreSQL with the BM25 index extension
+
+The default sparse shape needs `vchord_bm25` in the server. AKB publishes no
+PostgreSQL image, so the install paths now build `deploy/postgres/Dockerfile`
+where they run it: the same pinned pgvector image, plus the extension's files.
+
+- **Compose** builds it as the `postgres` service, and so does the CI runtime
+  e2e. The Native quickstart builds `postgres` along with the frontend before
+  its `up --no-build`.
+- **`deploy/k8s/deploy.sh`** builds and pushes `akb-postgres` next to the
+  backend and frontend, and puts it in the rendered manifests.
+  - The tag comes from the Dockerfile's content, so an AKB upgrade that leaves
+    the image unchanged does not restart PostgreSQL.
+  - With `SKIP_BUILD=true`, `POSTGRES_IMAGE` names it.
+- **Helm** and the **Native Kubernetes overlay** get it through their install
+  commands: `postgres.image`, and an `images` entry.
+- **The chart and the Kubernetes base manifest keep the stock pgvector image as
+  their default.** Upgrading a release that never set it cannot point a running
+  database at an image nobody has built.
+- **The all-in-one image does not include it.** That image is the one AKB
+  publishes (`dnseahorse/akb`), and publishing an image with the extension in it
+  is distribution of that extension (AGPLv3 or ELv2), which this change does
+  not decide. A new all-in-one database gets `posting`.
+
+Existing installations keep the sparse shape they serve. Moving one to this
+image restarts PostgreSQL once, on the same PostgreSQL and pgvector versions.
+
 ### New databases use the `vchord` sparse shape where the server provides it
 
 `vector_store_sparse_shape` and `bm25_external_stats_mode` now default to
@@ -35,9 +62,9 @@ recompute to run.
   shape. A configuration that names a shape behaves as before, and is recorded
   too.
 - **The shipped configurations now say `auto`** (compose example, Helm, the
-  Kubernetes manifests, all-in-one). The stock `pgvector/pgvector` image they
-  run does not provide the extension, so their new databases still get
-  `posting` until they run an image that does, such as `deploy/postgres/`.
+  Kubernetes manifests, all-in-one). On the stock `pgvector/pgvector` image,
+  which does not provide the extension, a new database gets `posting`; the
+  entry above lists the install paths that now build one that does.
 - **The extension needs a superuser to create.** Where AKB's role is not one, a
   superuser runs `CREATE EXTENSION vchord_bm25` and
   `GRANT USAGE ON SCHEMA bm25_catalog TO <role>` before AKB first starts on the

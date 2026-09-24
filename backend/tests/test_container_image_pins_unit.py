@@ -1,12 +1,12 @@
-"""The optional extension image cannot become a second way to move PostgreSQL.
+"""The extension image cannot become a second way to move PostgreSQL.
 
-`deploy/postgres/Dockerfile` builds AKB's PostgreSQL with `vchord_bm25` added.
-It is optional, but it is also a second place naming a PostgreSQL image — and
-akb#619 was about exactly that failure mode: a reference that moves the
-database while every manifest still reads the same. If the extension image ever
-drifted off the pinned base, enabling BM25-on-index would quietly change the
-PostgreSQL version at the same time, and the two changes would be impossible to
-tell apart when something broke.
+`deploy/postgres/Dockerfile` builds AKB's PostgreSQL with `vchord_bm25` added,
+and the install paths build it. It is also a second place naming a PostgreSQL
+image — and akb#619 was about exactly that failure mode: a reference that moves
+the database while every manifest still reads the same. If the extension image
+ever drifted off the pinned base, enabling BM25-on-index would quietly change
+the PostgreSQL version at the same time, and the two changes would be
+impossible to tell apart when something broke.
 
 These assertions compare against the deployment manifest rather than against a
 literal digest, so moving the pin does not mean editing a test too. Two copies
@@ -105,3 +105,36 @@ def test_every_stack_runs_the_same_minio():
     assert by_image["minio/minio"], "MinIO 서버 참조를 하나도 못 찾았다"
     for name, seen in by_image.items():
         assert len(seen) <= 1, f"{name} 참조가 스택마다 다르다: {sorted(seen)}"
+
+
+def test_the_compose_install_paths_build_the_extension_image():
+    """The default sparse shape needs vchord_bm25 in the server.
+
+    AKB publishes no PostgreSQL image, so an install path that pulls the stock
+    pgvector image gives every new database `posting`. The local stack and the
+    CI runtime e2e build deploy/postgres instead, and carry no `image:` of their
+    own that could drift from its pins.
+    """
+    import yaml
+
+    for compose in ("docker-compose.yaml", "scripts/ci/dependency-compose.yaml"):
+        path = REPO / compose
+        postgres = yaml.safe_load(path.read_text())["services"]["postgres"]
+        assert "image" not in postgres, f"{compose}: postgres 가 빌드 대신 이미지를 당긴다"
+        context = (path.parent / postgres["build"]["context"]).resolve()
+        assert context == (REPO / "deploy/postgres").resolve(), f"{compose}: {context}"
+
+
+def test_the_published_all_in_one_does_not_bundle_the_extension():
+    """The all-in-one is the one AKB image that is published (`dnseahorse/akb`).
+
+    vchord_bm25 is AGPLv3 or ELv2. The install paths build deploy/postgres
+    where they run, which is use; publishing an image that carries the
+    extension is distribution of it, with the obligation the Dockerfile's
+    licensing note describes. That is a decision of its own, not a side effect
+    of making `vchord` the default, so a new all-in-one database gets `posting`.
+    """
+    dockerfile = (REPO / "deploy/all-in-one/Dockerfile").read_text()
+    entrypoint = (REPO / "deploy/all-in-one/entrypoint.sh").read_text()
+    assert "vchord" not in dockerfile.lower(), "공개 이미지가 vchord_bm25 를 싣는다"
+    assert "vchord" not in entrypoint.lower(), "공개 이미지가 vchord_bm25 를 만든다"

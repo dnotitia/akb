@@ -185,3 +185,73 @@ def test_deployer_requires_explicit_legacy_profile_before_any_cluster_access(tmp
     assert result.returncode == 2
     assert "New Native installs" in result.stderr
     assert not marker.exists()
+
+
+_PINNED_PGVECTOR = "pgvector/pgvector:pg16@sha256:" + "a" * 64
+_KEYCLOAK_POSTGRES = "postgres:16-alpine@sha256:" + "b" * 64
+
+
+def _render_capturing_kubectl(tmp_path: Path) -> Path:
+    """A kubectl that passes every precondition and keeps what gets applied."""
+    applied = tmp_path / "applied.yaml"
+    _write_executable(
+        tmp_path / "kubectl",
+        f"""#!/usr/bin/env bash
+set -eu
+case "$1" in
+  create) printf '%s\\n' 'apiVersion: v1' 'kind: Namespace' 'metadata:' '  name: akb-test' ;;
+  kustomize) printf '%s\\n' 'kind: StatefulSet' '        - image: {_PINNED_PGVECTOR}' \\
+      '        - image: {_KEYCLOAK_POSTGRES}' '        - image: akb-backend:latest' ;;
+  apply) if [ "$2" = "-f" ] && [ "$3" != "-" ]; then cp "$3" "{applied}"; else cat >/dev/null; fi ;;
+  *) exit 0 ;;
+esac
+""",
+    )
+    return applied
+
+
+def _deploy(tmp_path: Path, **extra: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update({"PATH": f"{tmp_path}:/usr/bin:/bin", "NAMESPACE": "akb-test", "AKB_PROFILE": "standalone"})
+    env.update(extra)
+    return subprocess.run(["bash", str(_K8S / "deploy.sh")], check=False, capture_output=True,
+                          text=True, timeout=30, env=env)
+
+
+def test_deployer_puts_the_postgres_image_it_is_given_into_the_render(tmp_path: Path):
+    applied = _render_capturing_kubectl(tmp_path)
+    result = _deploy(tmp_path, SKIP_BUILD="true", BACKEND_IMAGE="example/akb-backend:test",
+                     FRONTEND_IMAGE="example/akb-frontend:test", POSTGRES_IMAGE="example/akb-postgres:test")
+    assert result.returncode == 0, result.stderr
+    rendered = applied.read_text()
+    assert "image: example/akb-postgres:test" in rendered
+    assert "pgvector/pgvector" not in rendered
+    # Keycloak's own database is not AKB's and keeps its image.
+    assert f"image: {_KEYCLOAK_POSTGRES}" in rendered
+
+
+def test_deployer_without_a_postgres_image_keeps_the_base_and_says_what_follows(tmp_path: Path):
+    applied = _render_capturing_kubectl(tmp_path)
+    result = _deploy(tmp_path, SKIP_BUILD="true", BACKEND_IMAGE="example/akb-backend:test",
+                     FRONTEND_IMAGE="example/akb-frontend:test")
+    assert result.returncode == 0, result.stderr
+    assert f"image: {_PINNED_PGVECTOR}" in applied.read_text()
+    assert "POSTGRES_IMAGE is unset" in result.stderr and "posting" in result.stderr
+
+
+def test_deployer_builds_the_extension_image_and_deploys_it(tmp_path: Path):
+    """Built from deploy/postgres, tagged by the Dockerfile's content so an AKB
+    upgrade that leaves the image unchanged does not restart PostgreSQL."""
+    applied = _render_capturing_kubectl(tmp_path)
+    builds = tmp_path / "docker.log"
+    _write_executable(tmp_path / "docker", f"#!/bin/sh\necho \"$*\" >> '{builds}'\n")
+    result = _deploy(tmp_path, REGISTRY="registry.example")
+    assert result.returncode == 0, result.stderr
+    checksum = subprocess.run(["cksum"], input=(_K8S.parents[0] / "postgres/Dockerfile").read_bytes(),
+                              capture_output=True, check=True).stdout.split()[0].decode()
+    image = f"registry.example/akb-postgres:pg16-{checksum}"
+    postgres_builds = [line for line in builds.read_text().splitlines() if image in line]
+    assert len(postgres_builds) == 1, builds.read_text()
+    assert Path(postgres_builds[0].split()[-1]).resolve() == (_K8S.parents[0] / "postgres").resolve()
+    assert f"image: {image}" in applied.read_text()
+

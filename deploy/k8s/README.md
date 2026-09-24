@@ -97,6 +97,7 @@ AKB_PROFILE=standalone \
 SKIP_BUILD=true \
 BACKEND_IMAGE=ghcr.io/example/akb-backend:0.14.2 \
 FRONTEND_IMAGE=ghcr.io/example/akb-frontend:0.14.1 \
+POSTGRES_IMAGE=ghcr.io/example/akb-postgres:pg16 \
 bash deploy/k8s/deploy.sh
 ```
 
@@ -108,6 +109,7 @@ AKB_PROFILE=standalone-sso \
 SKIP_BUILD=true \
 BACKEND_IMAGE=ghcr.io/example/akb-backend:0.14.2 \
 FRONTEND_IMAGE=ghcr.io/example/akb-frontend:0.14.1 \
+POSTGRES_IMAGE=ghcr.io/example/akb-postgres:pg16 \
 SSO_AKB_PUBLIC_URL=https://akb.example.com \
 SSO_KEYCLOAK_PUBLIC_URL=https://auth.akb.example.com \
 SSO_PRODUCT_ADMIN_USERNAME=admin \
@@ -115,9 +117,15 @@ SSO_PRODUCT_ADMIN_EMAIL=admin@example.com \
 bash deploy/k8s/deploy.sh
 ```
 
-Without `SKIP_BUILD=true`, set `REGISTRY`; the script builds and pushes both
-images. `KUBE_CONTEXT`, `IMAGE_PLATFORM`, `STORAGE_CLASS`, and
-`KUSTOMIZE_DIR` remain optional operator inputs.
+Without `SKIP_BUILD=true`, set `REGISTRY`; the script builds and pushes the
+backend, the frontend and `akb-postgres`. `akb-postgres` is
+`deploy/postgres/Dockerfile`: the pinned pgvector image plus the `vchord_bm25`
+BM25 index, which gives a new database the default `vchord` sparse shape. Its
+tag comes from the Dockerfile's content, so an AKB upgrade that leaves it
+unchanged does not restart PostgreSQL. With `SKIP_BUILD=true`, `POSTGRES_IMAGE`
+names it. Leave it unset to keep the base manifest's stock pgvector image, on
+which a new database gets `posting`. `KUBE_CONTEXT`, `IMAGE_PLATFORM`,
+`STORAGE_CLASS`, and `KUSTOMIZE_DIR` remain optional operator inputs.
 
 ## Removing a legacy bundled credential service
 
