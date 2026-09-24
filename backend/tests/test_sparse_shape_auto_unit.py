@@ -167,6 +167,19 @@ def test_the_sampler_counts_nothing_for_an_undecided_shape(monkeypatch):
     assert sampler.pgvector_relations() == ("chunks", "posting")
 
 
+@pytest.mark.asyncio
+async def test_the_sampler_reports_vector_bytes_absent_for_an_undecided_shape(monkeypatch):
+    """Absent is not zero: a sum over no relations would publish 0 bytes."""
+    from app.stats import sampler
+
+    class _NeverAsked:
+        async def fetchval(self, *args):  # pragma: no cover — reaching it is the failure
+            raise AssertionError("an undecided shape has no relations to measure")
+
+    monkeypatch.setattr(sampler, "settings", _settings())
+    assert await sampler._vector_bytes(_NeverAsked()) is None
+
+
 def test_health_names_the_configured_and_the_effective_shape():
     configured = _decided(shape="posting", decided_by="existing_posting", posting=True)
     assert configured.sparse_shape_snapshot() == {

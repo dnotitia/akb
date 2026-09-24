@@ -396,8 +396,13 @@ async def _vector_bytes(conn) -> int | None:
     if settings.vector_store_dsn:
         return None
 
+    relations = pgvector_relations()
+    if not relations:
+        # `auto` not decided in this process: which relations exist is not
+        # known, and a sum over none of them would be a zero, not an absence.
+        return None
     total = 0
-    for relation in pgvector_relations():
+    for relation in relations:
         size = await conn.fetchval(
             """
             SELECT pg_total_relation_size(c.oid)
