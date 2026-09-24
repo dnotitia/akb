@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+    # The install paths' PostgreSQL (deploy/postgres/Dockerfile), so the runtime
+    # e2e runs the default route: a new database that gets the `vchord` shape.
+    build:
+      context: ../../deploy/postgres
     environment:
       POSTGRES_USER: akb
       POSTGRES_PASSWORD: akb

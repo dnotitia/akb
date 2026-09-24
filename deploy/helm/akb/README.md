@@ -32,6 +32,10 @@ generic Kubernetes installation for a new Native deployment.
 kubectl create namespace akb
 # Provision Secret/akb-secret through the operator's credential process.
 
+# PostgreSQL with the vchord_bm25 BM25 index, which gives a new database the
+# default `vchord` sparse shape. Build it next to the backend and frontend images.
+docker buildx build -t ghcr.io/example/akb-postgres:pg16 --push deploy/postgres
+
 helm upgrade --install akb deploy/helm/akb \
   --namespace akb \
   --values deploy/helm/akb/profiles/standalone.yaml \
@@ -39,6 +43,7 @@ helm upgrade --install akb deploy/helm/akb \
   --set-string images.backend.tag=0.14.2 \
   --set-string images.frontend.repository=ghcr.io/example/akb-frontend \
   --set-string images.frontend.tag=0.14.1 \
+  --set-string postgres.image=ghcr.io/example/akb-postgres:pg16 \
   --set-string global.publicUrl=https://akb.example.com \
   --set-string ingress.host=akb.example.com \
   --wait
@@ -46,6 +51,12 @@ helm upgrade --install akb deploy/helm/akb \
 
 Set `secretContract.name` when the operator-owned runtime Secret uses a
 different name.
+
+`postgres.image` defaults to the stock pgvector image, on which a new database
+gets the `posting` sparse shape. It stays the default so that upgrading a
+release never points a running database at an image nobody has built. Changing
+it on an existing release restarts PostgreSQL once on the same PostgreSQL and
+pgvector versions; a database that already serves `posting` keeps it.
 
 ## Standalone SSO
 
@@ -60,6 +71,7 @@ helm upgrade --install akb deploy/helm/akb \
   --set-string images.backend.tag=0.14.2 \
   --set-string images.frontend.repository=ghcr.io/example/akb-frontend \
   --set-string images.frontend.tag=0.14.1 \
+  --set-string postgres.image=ghcr.io/example/akb-postgres:pg16 \
   --set-string global.publicUrl=https://akb.example.com \
   --set-string ingress.host=akb.example.com \
   --set-string sso.keycloakPublicUrl=https://auth.akb.example.com \

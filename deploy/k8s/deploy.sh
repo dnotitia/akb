@@ -121,10 +121,17 @@ if [[ "${SKIP_BUILD}" == "true" ]]; then
   : "${BACKEND_IMAGE:?Set BACKEND_IMAGE when SKIP_BUILD=true}"
   : "${FRONTEND_IMAGE:?Set FRONTEND_IMAGE when SKIP_BUILD=true}"
   echo "=== Reusing caller-supplied images ==="
+  if [[ -z "${POSTGRES_IMAGE:-}" ]]; then
+    echo "POSTGRES_IMAGE is unset: PostgreSQL keeps the stock pgvector image, which" >&2
+    echo "has no vchord_bm25, so a new database gets the posting sparse shape." >&2
+  fi
 else
   : "${REGISTRY:?Set REGISTRY env (for example, ghcr.io/myorg)}"
   BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
   FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
+  # Tagged by the Dockerfile's content, not the AKB version: an AKB upgrade that
+  # leaves the database image unchanged must not restart PostgreSQL.
+  POSTGRES_IMAGE="${REGISTRY}/akb-postgres:pg16-$(cksum <"${ROOT_DIR}/deploy/postgres/Dockerfile" | cut -d' ' -f1)"
   echo "=== Building Docker images (${IMAGE_PLATFORM}) — version ${VERSION} ==="
   docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-backend:${VERSION}" -t "${BACKEND_IMAGE}" --push \
@@ -133,6 +140,12 @@ else
     -t "${REGISTRY}/akb-frontend:${VERSION}" -t "${FRONTEND_IMAGE}" --push \
     -f "${ROOT_DIR}/frontend/Dockerfile" \
     "${ROOT_DIR}/frontend"
+  # PostgreSQL with the vchord_bm25 BM25 index extension, which the default
+  # `vector_store_sparse_shape: auto` gives a new database. See
+  # deploy/postgres/README.md.
+  docker buildx build --platform "${IMAGE_PLATFORM}" \
+    -t "${POSTGRES_IMAGE}" --push \
+    "${ROOT_DIR}/deploy/postgres"
 fi
 
 echo "=== Rendering ${AKB_PROFILE} ==="
@@ -180,7 +193,12 @@ fi
 
 kubectl kustomize --load-restrictor=LoadRestrictionsNone "${RENDER_DIR}" | \
   sed "s|image: akb-backend:latest|image: ${BACKEND_IMAGE}|g" | \
-  sed "s|image: akb-frontend:latest|image: ${FRONTEND_IMAGE}|g" \
+  sed "s|image: akb-frontend:latest|image: ${FRONTEND_IMAGE}|g" | \
+  if [[ -n "${POSTGRES_IMAGE:-}" ]]; then
+    sed -E "s|image: pgvector/pgvector:[^[:space:]]+|image: ${POSTGRES_IMAGE}|g"
+  else
+    cat
+  fi \
   >"${RENDER_DIR}/rendered.yaml"
 
 if [[ "${AUTH_PROFILE}" == "sso" ]]; then

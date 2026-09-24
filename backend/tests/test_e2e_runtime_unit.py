@@ -1652,8 +1652,13 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     # which is the disagreement the pinning was meant to remove. Repeating the
     # digest instead would make this a second place to edit on every bump, and
     # the two copies would fall out of step the first time someone forgot.
-    postgres_image = compose["services"]["postgres"]["image"]
-    assert postgres_image.startswith("pgvector/pgvector:pg16@sha256:"), postgres_image
+    # The runtime builds the install paths' PostgreSQL, so the e2e runs the
+    # default route: a new database that gets the `vchord` sparse shape. Its base
+    # and extension pins live in that Dockerfile and are held by
+    # test_container_image_pins_unit.py, not repeated here.
+    postgres = compose["services"]["postgres"]
+    assert "image" not in postgres, postgres
+    assert (CI_DIR / postgres["build"]["context"]).resolve() == (CI_DIR.parents[1] / "deploy/postgres").resolve()
     # Same shape as the postgres assertion above, for the same reason: a dated
     # release tag carrying a digest, not one exact string. The literal that
     # stood here was the second copy of a pin, and akb#621 moved the pin.

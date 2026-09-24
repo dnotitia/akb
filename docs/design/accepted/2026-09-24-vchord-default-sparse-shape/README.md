@@ -70,9 +70,20 @@ the vector store is built. `/health` reports `vector_store.sparse_shape`.
   would meet the populated-table guard and return empty search, dense results
   included, while readiness stayed green. The order above is what prevents
   that.
-- **The shipped images.** The stock `pgvector/pgvector` image does not provide
-  the extension, so the shipped configurations, now `auto`, keep getting
-  `posting` on it. `deploy/postgres/` builds an image that does.
+- **Where the extension comes from.** AKB publishes no PostgreSQL image. Its
+  install paths build `deploy/postgres/Dockerfile`, the pinned pgvector image
+  plus the extension, where they run it:
+  - Compose, `deploy/k8s/deploy.sh` and the CI runtime e2e build it themselves.
+  - Helm and the Native Kubernetes overlay take it through the image value that
+    their install commands set.
+  - The all-in-one leaves it out. It is the one image AKB publishes, and
+    publishing the extension is distribution of it (AGPLv3 or ELv2), a decision
+    this record does not make. A new all-in-one database gets `posting`.
+
+  Building and running it is use, not distribution. The chart and the
+  Kubernetes base manifest keep the stock pgvector image as their literal
+  default. Upgrading a release that never set it therefore cannot point a
+  running database at an image nobody has built.
 
 ## Consequences
 

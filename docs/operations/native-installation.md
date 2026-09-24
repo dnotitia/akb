@@ -62,6 +62,9 @@ project's database volumes for this new-install flow.
 ```sh
 export AKB_NATIVE_IMAGE='registry.example.com/akb-backend@sha256:REPLACE_WITH_IMAGE_DIGEST'
 export AKB_NATIVE_CONFIG_DIR='/absolute/path/to/config/native'
+# PostgreSQL is built from deploy/postgres/Dockerfile (pgvector plus the
+# vchord_bm25 BM25 index), so it has to exist before an `up --no-build`.
+docker compose -p my-native-install build postgres
 docker compose -p my-native-install \
   -f docker-compose.yaml -f docker-compose.native.yaml \
   up -d --no-build postgres minio minio-bootstrap native-bootstrap backend worker
@@ -103,13 +106,21 @@ installation; adjust both the overlay and config together before first start.
 
 Add an `images` entry to your operator-owned copy of this overlay (or use
 `kustomize edit set image`) to replace **every** `akb-backend` image, including
-the init container, with the pinned backend image:
+the init container, with the pinned backend image, and PostgreSQL's with the
+image you built from `deploy/postgres/Dockerfile`:
 
 ```yaml
 images:
   - name: akb-backend
     newName: registry.example.com/akb-backend
     digest: sha256:REPLACE_WITH_IMAGE_DIGEST
+  # PostgreSQL built from deploy/postgres/Dockerfile: pgvector plus the
+  # vchord_bm25 BM25 index, which gives the new database the default `vchord`
+  # sparse shape. Without this entry the base's stock pgvector image gives it
+  # `posting`.
+  - name: pgvector/pgvector
+    newName: registry.example.com/akb-postgres
+    digest: sha256:REPLACE_WITH_POSTGRES_IMAGE_DIGEST
 ```
 
 Render before applying, using the same explicit Kubernetes context for all

@@ -3,12 +3,29 @@
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
 in a block-max index. With `vector_store_sparse_shape: auto`, the default, a new
-database on a server that provides it gets the `vchord` shape. On the stock
-`pgvector/pgvector:pg16` image named everywhere else in this repository, a new
-database gets `posting`, the table the backend maintains itself. Posting stores
+database on a server that provides it gets the `vchord` shape. Posting stores
 application-computed weights; identical rankings across the two scorers are not
-a compatibility guarantee. An operator can build the image here and get the same
-bytes we do.
+a compatibility guarantee.
+
+The repository's install paths build this image rather than pull a prebuilt one:
+
+| Install path | How it gets this image |
+| --- | --- |
+| Compose (`docker-compose.yaml`, the README quickstart) | builds it as the `postgres` service |
+| `deploy/k8s/deploy.sh` | builds and pushes `akb-postgres`, and puts it in the rendered manifests |
+| Helm | the README's install commands build it and set `postgres.image` |
+| `deploy/k8s/native/` | its guide adds an `images` entry for it |
+| CI runtime e2e | builds it for its dependency stack |
+| all-in-one | does not include it; a new database there gets `posting` |
+
+Building and running it is use of the extension. Publishing an image with the
+extension in it is distribution (see the Dockerfile's licensing note), which is
+why the all-in-one, the one image AKB publishes, leaves it out.
+
+A server left on the stock `pgvector/pgvector:pg16` image gives a new database
+`posting`, the table the backend maintains itself. The chart and the Kubernetes
+base manifest keep that image as their literal default, so an upgrade never
+points a running database at an image nobody has built.
 
 The shape is decided once per database, at startup, and recorded in
 `<vector_store_schema>.install_state`, so an existing installation keeps the

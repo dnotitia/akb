@@ -1,10 +1,14 @@
-# AKB's PostgreSQL, plus an optional BM25 index extension.
+# AKB's PostgreSQL: the pinned pgvector image plus the vchord_bm25 BM25 index
+# extension.
 #
-# This is not required. AKB's sparse retrieval leg works without it, against
-# the `posting` table the backend maintains itself. The extension is an
-# alternative implementation of the same BM25 formula with a different index
-# structure, and this image exists so that an operator who wants it can build
-# the exact same bytes we do.
+# The repository's install paths build this image where they run it: Compose,
+# deploy/k8s/deploy.sh, the Helm and Native Kubernetes install commands, and the
+# CI runtime e2e. Under the default `vector_store_sparse_shape: auto`, a new
+# database on it gets the `vchord` shape, where the index owns BM25 scoring. AKB
+# also works without the extension, on the `posting` table the backend maintains
+# itself, and a database that already serves `posting` keeps it on this image
+# too. The published all-in-one image does not include the extension; see the
+# licensing note below.
 #
 # The base is AKB's own PostgreSQL image, pinned by digest, so enabling the
 # extension does not silently change the database version at the same time.
