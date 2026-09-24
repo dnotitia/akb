@@ -21,14 +21,16 @@ now; a term an encoder inserts at the same moment still costs one id.
 
 - Ids already drawn are kept; nothing is renumbered. An installation that has
   already drawn them keeps its largest id, and with it the `vchord` cleanup
-  cost, until its ids are renumbered. This change stops the growth. The same
+  cost, until its ids are renumbered or the extension's cleanup no longer walks
+  every id (akb#687). This change stops the growth. The same
   drawing used part of the u32 range a term id must fit (akb#665): 729M of
   4.29 billion at that installation.
 - Where the recompute runs: the background refresher runs it wherever external
-  statistics are consumed, which is every non-pgvector driver (Qdrant, the
-  default, included), pgvector `arrays` and `posting`, and pgvector `vchord`
-  under `required` or, under `auto`, while a `posting` table exists.
-  `scripts/init_bm25_vocab.py` runs it anywhere.
+  statistics are consumed, which is every non-pgvector driver (Qdrant
+  included), pgvector `arrays` and `posting`, pgvector `vchord` under
+  `required` or, under `auto`, while a `posting` table exists, and any pgvector
+  database whose shape is not decided yet. `scripts/init_bm25_vocab.py` runs it
+  anywhere.
 
 ### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
 
