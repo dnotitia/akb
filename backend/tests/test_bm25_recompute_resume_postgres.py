@@ -333,7 +333,8 @@ async def test_a_recompute_draws_term_ids_only_for_new_terms(monkeypatch):
         vocab, sequence = await vocab_and_sequence()
         assert set(vocab) == set(_EXPECTED_DF)
 
-        await sparse_encoder.recompute_stats(batch_size=5)
+        second = await sparse_encoder.recompute_stats(batch_size=5)
+        assert second["vocab_size"] == len(_EXPECTED_DF), "the second pass must actually run"
         assert await vocab_and_sequence() == (vocab, sequence), "a pass over known terms drew term ids"
 
         async with pool.acquire() as conn:
