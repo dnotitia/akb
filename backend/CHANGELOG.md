@@ -7,21 +7,32 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
-### Index builds no longer hide matches from a bounded search (akb#679)
+### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
 
-`vchord_bm25` 0.3.0 had a defect in how it builds an index over existing rows:
-`CREATE INDEX`, `CREATE INDEX CONCURRENTLY`, `REINDEX`, and so every `pg_restore`
-and the backfill runbook's `--index`. It wrote a full block's score summary
-before it recorded the block's best posting. A bounded search then skipped such
-blocks and could miss better matches, on a full page as well as a short one. On
-a 2.1M-chunk index, 7 of 159 sampled terms had a worse top-90.
+`vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release
+after 0.3.0 fixes them.
+
+- **Index builds (akb#679).** An index built over existing rows (`CREATE INDEX`,
+  `CREATE INDEX CONCURRENTLY`, `REINDEX`, and so every `pg_restore` and the
+  backfill runbook's `--index`) flushed a full block before it recorded the
+  block's best posting. A bounded search then skipped such blocks, and a page,
+  full or short, could miss better matches. On a 2.1M-chunk index, 7 of 159
+  sampled terms had a worse top-90.
+- **VACUUM (akb#684).** It subtracted a deleted document's one-byte length code
+  instead of its length from the sum the average document length comes from.
+  The average grew with every update and delete until the index was rebuilt,
+  and length normalisation skewed with it.
+
+What changes:
 
 - **`deploy/postgres/Dockerfile` compiles the extension** from the 0.3.0 source
-  with a four-line fix, in `deploy/postgres/vchord_bm25/`, instead of copying
-  the upstream binary.
-  - Its inputs are pinned: the source tarball by sha256, Rust 1.91.1 by digest
-    (the compiler of the upstream binary), and the crates by a committed
-    `Cargo.lock`.
+  with both fixes, in `deploy/postgres/vchord_bm25/`, instead of copying the
+  upstream binary.
+  - Its inputs are pinned:
+    - the source tarball, by sha256;
+    - Rust 1.91.1, by digest (the compiler of the upstream binary);
+    - the crates, by a committed `Cargo.lock`;
+    - the PostgreSQL headers, at exactly the base's server version.
   - The first build compiles the extension. That takes under a minute on a
     many-core host and several minutes on a laptop.
 - **CI tests that image.** Its VChord test lane used to run the upstream image,
@@ -29,20 +40,20 @@ a 2.1M-chunk index, 7 of 159 sampled terms had a worse top-90.
 - **`deploy/k8s/deploy.sh` tags `akb-postgres` by all of its build inputs.** A
   changed patch or lockfile therefore produces a new tag.
 - **The defect's traces are gone.** The test that pinned it (`bounded == 44`) is
-  now its regression test, beside a 20,000-document corpus compared term by term
-  with the exact scan. The docs that described it as a limit now describe the fix.
+  now its regression test, beside `test_vchord_index_build_postgres.py`. The
+  docs that described it as a limit now describe the fixes.
 
-**Upgrading**: an index that the upstream binary built over existing rows keeps
-its summaries until it is rebuilt. After moving to the new image, run
-`REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`. An index
-built empty and filled by inserts, which every new database has, needs nothing.
+**Upgrading**: an index that the upstream binary built or vacuumed keeps its
+summaries and its inflated average until it is rebuilt. After moving to the new
+image, run `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
+A new database's index needs nothing.
 
 ### The install paths build PostgreSQL with the BM25 index extension
 
 The default sparse shape needs `vchord_bm25` in the server. AKB publishes no
 PostgreSQL image, so the install paths now build `deploy/postgres/Dockerfile`
 where they run it: the same pinned pgvector image, plus the extension compiled
-with the fix above.
+with the fixes above.
 
 - **Compose** builds it as the `postgres` service, and so does the CI runtime
   e2e. The Native quickstart builds `postgres` along with the frontend before

@@ -2,8 +2,9 @@
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
-in a block-max index. The Dockerfile compiles it from the 0.3.0 source with one
-fix, described under [Index builds](#index-builds-akb679). With `vector_store_sparse_shape: auto`, the default, a new
+in a block-max index. The Dockerfile compiles it from the 0.3.0 source with two
+fixes, described under [Index builds](#index-builds-akb679) and
+[VACUUM statistics](#vacuum-statistics-akb684). With `vector_store_sparse_shape: auto`, the default, a new
 database on a server that provides it gets the `vchord` shape. Posting stores
 application-computed weights; identical rankings across the two scorers are not
 a compatibility guarantee.
@@ -51,11 +52,12 @@ Every input that decides the bytes is pinned:
 | Rust | 1.91.1, by digest; the compiler the upstream 0.3.0 binary was built with |
 | Extension source | the upstream 0.3.0 tarball, by sha256 |
 | Crates | `vchord_bm25/Cargo.lock`, built `--locked`; 0.3.0 ships no lockfile |
-| The fix | `vchord_bm25/0001-record-block-max-before-flush.patch`, applied with `--fuzz=0` so a patch that no longer fits fails the build |
+| The fixes | `vchord_bm25/*.patch`, applied with `set -e` and `--fuzz=0` so a patch that no longer fits fails the build |
 
-The PostgreSQL headers come from the base's own PGDG repository, for the same
-major version. The SQL install and upgrade scripts and the control file come
-from the source tree and are byte-identical to the upstream release's.
+The PostgreSQL headers are those of exactly the base's server version, from the
+PGDG archive, and bindgen uses the LLVM those headers depend on. The SQL install
+and upgrade scripts and the control file come from the source tree and are
+byte-identical to the upstream release's.
 
 The base references are multi-architecture indexes, so
 `--platform linux/amd64,linux/arm64` works, but compiling a platform under
@@ -130,18 +132,19 @@ terms most queries contain.
 So when moving this pin, check that a document containing a query term still
 scores below zero at high document frequency before accepting the bump. Then
 run `test_vchord_index_build_postgres.py` against the new version with and
-without the patch; see [Index builds](#index-builds-akb679).
+without the patches; see [Tests](#tests).
 
 ## Index builds (akb#679)
 
 An index built over existing rows goes through the extension's build path:
 `CREATE INDEX`, `CREATE INDEX CONCURRENTLY`, `REINDEX`, every `pg_restore`, and the
-backfill runbook's `--index`. Upstream 0.3.0 wrote a full 128-posting block's
-score summary before it recorded the block's best posting. When that posting
-was the block's last one, and ties make it so, the block kept the previous
-block's best, or 0 for a leading run of blocks. A bounded scan skips a block by
-that summary, so a page, full or short, could miss better matches. Rows that
-arrive by insert take another path and never had this.
+backfill runbook's `--index`. Upstream 0.3.0 flushed a full 128-posting block
+before it recorded the block's best posting. A block whose best posting was its
+last one therefore kept the best recorded for an earlier block, or 0 if none
+had been. Ties make that common. A bounded scan skips a block by that summary,
+so a page, full or short, could miss better matches. Rows that arrive by insert
+reach sealed blocks through the seal path, which records the best first and
+never had this.
 
 `vchord_bm25/0001-record-block-max-before-flush.patch` records the best posting
 first. It changes no on-disk format and no SQL. Measured against the same SQL:
@@ -164,10 +167,43 @@ REINDEX INDEX CONCURRENTLY vector_index.idx_vi_chunks_bm25;
 
 Use the installation's `vector_store_schema` in place of `vector_index`.
 
-`test_vchord_index_build_postgres.py` holds the fix. It covers blocks whose last
-posting is the best, and a 20,000-document corpus compared term by term with
-the exact scan. Upstream 0.3.0 fails both. Drop the patch only when a new
-upstream pin passes this test without it.
+## VACUUM statistics (akb#684)
+
+The metapage keeps the sum of document lengths, and BM25 takes the average
+document length from it. An insert adds a document's exact length. Upstream
+0.3.0's VACUUM subtracted the document's one-byte length code instead. The code
+equals the length only up to 40: 136 to 143 is code 62, 300 is code 72. Every
+update and delete therefore left length behind, and the average grew until the
+index was rebuilt. That skews length normalisation and, with it, the exact
+ranking.
+
+`vchord_bm25/0002-vacuum-subtracts-document-length.patch` subtracts the length
+the code stands for. The index stores only the code, so a deleted document now
+leaves less than its bucket's width behind: under 7 at a length of 139, rather
+than about 77. At a length that starts a bucket, such as 64, it leaves nothing.
+A rebuild resets the sum exactly.
+
+## What a bounded scan can still differ on
+
+A block summary is the block's best posting, chosen with the average document
+length of the moment it is written. BM25 at query time uses the current average,
+so a large change in that average can make an old summary underestimate its
+block. With the VACUUM fix, the average moves only as the corpus itself changes.
+`REINDEX INDEX CONCURRENTLY` rewrites every summary with the current average.
+
+## Tests
+
+`test_vchord_index_build_postgres.py` holds both fixes. Each test compares with
+the exact scan right after the index is written:
+
+- blocks whose last posting is the best, built by `REINDEX`;
+- the same rows sealed by inserts, the path that never had the defect;
+- a VACUUM that must take back exactly the length an insert added;
+- a 20,000-document corpus, one term at a time and in queries of two or three
+  terms.
+
+Upstream 0.3.0 fails all but the sealed case. Drop a patch only when a new
+upstream pin passes its test without it.
 
 ## Licensing
 
@@ -176,11 +212,11 @@ the Elastic License v2, at the recipient's option. It is a separate program
 that runs inside the PostgreSQL server and is reached over the PostgreSQL wire
 protocol, so it does not change the licensing of AKB itself.
 
-The patch in `vchord_bm25/` is offered under the extension's own terms.
+The patches in `vchord_bm25/` are offered under the extension's own terms.
 Building and running this image is use. **Distributing** the built image is
 distribution of the modified extension and carries the corresponding
-obligation: an offer of its source, which is the upstream tarball plus that
-patch.
+obligation: an offer of its source, which is the upstream tarball plus those
+patches.
 
 ## Bounded search and exact completion
 

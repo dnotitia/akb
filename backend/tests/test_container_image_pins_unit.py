@@ -67,12 +67,17 @@ def test_the_extension_is_compiled_from_pinned_source_with_the_fix():
     assert "cargo build --locked" in dockerfile
     lockfile = REPO / "deploy/postgres/vchord_bm25/Cargo.lock"
     assert re.search(r'name = "pgrx"\nversion = "0\.16\.1"', lockfile.read_text()), lockfile
-    patches = sorted((REPO / "deploy/postgres/vchord_bm25").glob("*.patch"))
-    assert patches, "akb#679 패치가 없다"
-    assert "patch -p1 --forward --fuzz=0" in dockerfile
-    fix = patches[0].read_text()
-    assert "src/segment/posting/serializer.rs" in fix
-    assert "AGPL-3.0-only or Elastic-2.0" in fix  # offered under the extension's own terms
+    patches = {p.name: p.read_text() for p in (REPO / "deploy/postgres/vchord_bm25").glob("*.patch")}
+    fixes = {  # the file each fix changes
+        "akb#679": "src/segment/posting/serializer.rs",
+        "akb#684": "src/index/vacuum.rs",
+    }
+    for issue, path in fixes.items():
+        assert any(f"+++ b/{path}" in text for text in patches.values()), f"{issue} 패치가 없다"
+    for name, text in patches.items():
+        assert "AGPL-3.0-only or Elastic-2.0" in text, name  # offered under the extension's own terms
+    assert "set -eu" in dockerfile and "patch -p1 --forward --fuzz=0 --batch" in dockerfile
+    assert re.search(r'"postgresql-server-dev-\$\{PG_MAJOR\}=\$\{PG_VERSION\}"', dockerfile), "헤더가 서버 버전에 고정되지 않았다"
 
 
 def test_nothing_runs_the_upstream_prebuilt_extension():

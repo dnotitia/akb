@@ -7,15 +7,17 @@ over existing rows: CREATE INDEX, CREATE INDEX CONCURRENTLY, REINDEX. For each
 posting it first checks whether the posting ends the current 128-posting block
 and flushes the block with the running best (blockwand_tf and
 blockwand_fieldnorm_id). Only then does it check whether the posting is the
-block's best and record it. So when a block's best posting is its last one,
-the block is flushed with the previous block's best, or with 0 for a leading
-run of such blocks. Ties make that common: FixedBlockPartition picks the best
-with `max_by`, which returns the last of equal maxima.
+block's best and record it. So a block whose best posting is its last one is
+flushed with the best most recently recorded for an earlier block, or with 0
+if none was. Ties make that common, because FixedBlockPartition picks the best
+with `max_by`, which returns the last of equal maxima. When every block's best
+comes last, every full block is saved as scoring 0.
 
 A bounded scan (finite bm25_catalog.bm25_limit) skips a block whose summary is
-below its threshold, so it drops postings that belong in the top-k. The exact
-scan does not read the summaries. The insert and seal path (append.rs) updates
-the running best before it flushes and is unaffected.
+at or below its threshold, and the threshold starts at 0, so it drops postings
+that belong in the top-k. The exact scan does not read the summaries. The seal
+path (append.rs), which writes the blocks of rows that arrived by insert,
+updates the running best before it flushes and is unaffected.
 
 The fix records the best posting before the flush check. It changes no on-disk
 format and no SQL.

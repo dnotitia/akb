@@ -10,18 +10,22 @@
 # published all-in-one image does not include the extension; see the licensing
 # note below.
 #
-# WHY IT IS COMPILED HERE. vchord_bm25 0.3.0 has a defect in how it builds an
-# index over existing rows: CREATE INDEX, CREATE INDEX CONCURRENTLY, REINDEX,
-# and therefore every pg_restore (akb#679). The build writes a full block's
-# score summary before it records the block's best posting. A bounded scan then
-# skips blocks it should read and returns a worse top-k than the exact scan.
-# Rows that arrive by insert are written by another path and were never
-# affected. vchord_bm25/0001-*.patch records the best posting first. No release
-# after 0.3.0 carries a fix; drop the patch when one does.
+# WHY IT IS COMPILED HERE. vchord_bm25 0.3.0 has two defects that AKB's default
+# sparse shape runs into, and no release after 0.3.0 fixes them:
+#   * 0001: building an index over existing rows (CREATE INDEX, REINDEX, and so
+#     every pg_restore) saves a full block's score summary before it records the
+#     block's best posting. A bounded scan then skips blocks it should read and
+#     returns a worse top-k than the exact scan (akb#679). The insert and seal
+#     path records first and was never affected.
+#   * 0002: VACUUM subtracts a deleted document's one-byte length code instead of
+#     its length, so the index's average document length inflates with every
+#     update and delete (akb#684).
+# Drop a patch when an upstream release carries its fix; deploy/postgres/README.md
+# says how to check.
 #
 # PINNED INPUTS. Everything that decides the bytes is fixed here:
-#   * the pgvector base, the same digest as deploy/k8s/postgres.yaml. It also
-#     supplies the PostgreSQL headers, from its own PGDG repository and major;
+#   * the pgvector base, the same digest as deploy/k8s/postgres.yaml, and the
+#     PostgreSQL headers of exactly its server version;
 #   * Rust 1.91.1, the compiler the upstream 0.3.0 binary was built with (its
 #     embedded rustc commit is ed61e7d7);
 #   * the upstream source tarball, by sha256;
@@ -44,12 +48,12 @@
 # License v3 or the Elastic License v2, at the recipient's option; see
 # https://github.com/tensorchord/VectorChord-bm25. It is a separate program
 # that runs inside the PostgreSQL server and is reached over the PostgreSQL
-# wire protocol, so it does not change the licensing of AKB itself. The patch
-# in vchord_bm25/ is offered under the extension's own terms. Building and
+# wire protocol, so it does not change the licensing of AKB itself. The patches
+# in vchord_bm25/ are offered under the extension's own terms. Building and
 # running this image is use, not distribution. Distributing the built image is
 # distribution of the modified extension and carries the corresponding
 # obligation: an offer of its source, which is the upstream tarball plus the
-# patch in this directory.
+# patches in this directory.
 
 ARG PGVECTOR_IMAGE=pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
 ARG RUST_IMAGE=rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65
@@ -62,21 +66,32 @@ ARG VCHORD_BM25_SHA256=5ef4441bf3aa7a5ec735f7d865e6ead8b1c827a1b4ecfeac2c0e1c6e7
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 COPY --from=rust /usr/local/cargo /usr/local/cargo
-RUN apt-get update \
+# The headers of exactly the server this image runs. PGDG's main repository lists
+# only its newest release, so the pin also reads the archive, which keeps every
+# release: the build does not break, or drift, when a new minor version ships.
+RUN . /etc/os-release \
+ && echo "deb [ signed-by=/usr/local/share/keyrings/postgres.gpg.asc ] http://apt-archive.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg-archive main" \
+      > /etc/apt/sources.list.d/pgdg-archive.list \
+ && apt-get update \
  && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates clang curl libclang-dev patch pkg-config \
-        "postgresql-server-dev-${PG_MAJOR}" \
+        build-essential ca-certificates curl patch pkg-config \
+        "postgresql-server-dev-${PG_MAJOR}=${PG_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
+# bindgen's libclang: the LLVM the PostgreSQL headers package depends on, named
+# rather than searched for, so a second LLVM on the path cannot change the build.
+ENV LIBCLANG_PATH=/usr/lib/llvm-19/lib
 WORKDIR /src
 RUN curl -fsSL "https://github.com/tensorchord/VectorChord-bm25/archive/refs/tags/${VCHORD_BM25_VERSION}.tar.gz" -o source.tar.gz \
  && echo "${VCHORD_BM25_SHA256}  source.tar.gz" | sha256sum -c - \
  && tar -xzf source.tar.gz --strip-components=1 \
  && rm source.tar.gz
 COPY vchord_bm25/ /vchord_bm25/
-# --forward --fuzz=0: a patch that no longer applies exactly, or is already in
-# the source, fails the build instead of being skipped or bent to fit.
-RUN for p in /vchord_bm25/*.patch; do patch -p1 --forward --fuzz=0 < "$p"; done \
- && cp /vchord_bm25/Cargo.lock Cargo.lock
+# A patch that no longer applies exactly, or is already in the source, fails
+# the build instead of being skipped or bent to fit: `set -e` stops at the first
+# failure, and --forward --fuzz=0 --batch refuse to reverse, fuzz or ask.
+RUN set -eu; \
+    for p in /vchord_bm25/*.patch; do patch -p1 --forward --fuzz=0 --batch < "$p"; done; \
+    cp /vchord_bm25/Cargo.lock Cargo.lock
 RUN PGRX_PG_CONFIG_PATH="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
     cargo build --locked --lib --features "pg${PG_MAJOR}" --release
 RUN mkdir -p /out/lib /out/extension \

@@ -1,0 +1,49 @@
+Subtract a deleted document's length, not its length code, in VACUUM
+
+Applies to vchord_bm25 0.3.0 (upstream tag 0.3.0, commit c610b7ab).
+
+The metapage keeps doc_term_cnt, the sum of document lengths, and BM25 takes
+the average document length from it. An insert adds the document's exact
+length (insert.rs) and a build sums exact lengths (builder.rs), but
+ambulkdelete (vacuum.rs) subtracts field_norm_reader.read(i): the document's
+one-byte length code, not its length. The code equals the length only up to
+40; above that it compresses (136 to 143 is code 62, 300 is code 72). So every
+deleted document longer than 40 leaves most of its length behind, and the
+average document length grows with every update and delete that VACUUM cleans
+up, until the index is rebuilt.
+
+The index stores only the code, so the fix subtracts the length the code
+stands for, id_to_fieldnorm(code). The code maps a length down to the start of
+its bucket, so a deleted document now leaves behind less than its bucket's
+width (under 7 at a length of 139, instead of about 77), and nothing at a
+length that starts a bucket, such as 64. A rebuild still resets the sum
+exactly. No on-disk format or SQL changes.
+
+Measured: 1,000 rows inserted, deleted and vacuumed left doc_term_cnt at
+915,973 against 2,973 true, an average length of 3,578 against 11.61.
+
+License: this patch modifies vchord_bm25 and is offered under the same terms
+as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
+---
+diff --git a/src/index/vacuum.rs b/src/index/vacuum.rs
+index fc449a4..c107de0 100644
+--- a/src/index/vacuum.rs
++++ b/src/index/vacuum.rs
+@@ -4,7 +4,7 @@ use crate::{
+     page::{page_read, page_write, BM25_PAGE_SIZE, METAPAGE_BLKNO},
+     segment::{
+         delete::DeleteBitmapReader,
+-        field_norm::{FieldNormRead, FieldNormReader},
++        field_norm::{id_to_fieldnorm, FieldNormRead, FieldNormReader},
+         growing::GrowingSegmentReader,
+         meta::MetaPageData,
+         payload::PayloadReader,
+@@ -58,7 +58,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
+         if callback(tid) {
+             delete_bitmap_reader.delete(i);
+             meta.doc_cnt -= 1;
+-            meta.doc_term_cnt -= field_norm_reader.read(i) as u64;
++            meta.doc_term_cnt -= id_to_fieldnorm(field_norm_reader.read(i)) as u64;
+             stats.tuples_removed += 1.0;
+         } else {
+             stats.num_index_tuples += 1.0;

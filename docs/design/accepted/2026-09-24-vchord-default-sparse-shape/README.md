@@ -73,7 +73,7 @@ the vector store is built. `/health` reports `vector_store.sparse_shape`.
 - **Where the extension comes from.** AKB publishes no PostgreSQL image. Its
   install paths build `deploy/postgres/Dockerfile` where they run it: the
   pinned pgvector image plus the extension, compiled from the 0.3.0 source with
-  the fix for index builds (akb#679).
+  fixes for index builds (akb#679) and VACUUM's length statistics (akb#684).
   - Compose, `deploy/k8s/deploy.sh` and the CI jobs build it themselves.
   - Helm and the Native Kubernetes overlay take it through the image value that
     their install commands set.
@@ -99,11 +99,15 @@ the vector store is built. `/health` reports `vector_store.sparse_shape`.
 
 ## Known limits
 
-- **Indexes the upstream binary built.** Upstream 0.3.0 saved some block
-  summaries too early when it built an index over existing rows, and a bounded
-  scan then skipped those blocks (akb#679). The image compiles the extension
-  with that fixed. An index the upstream binary built keeps its summaries until
-  `REINDEX INDEX CONCURRENTLY` rebuilds it on the new image.
+- **Indexes the upstream binary built or vacuumed.** Upstream 0.3.0 saved some
+  block summaries too early when it built an index over existing rows
+  (akb#679), and its VACUUM inflated the average document length (akb#684). The
+  image compiles the extension with both fixed. An index the upstream binary
+  touched keeps what it wrote until `REINDEX INDEX CONCURRENTLY` rebuilds it on
+  the new image.
+- **Summaries and the moving average.** A block summary is chosen with the
+  average document length of the moment it is written. A large later change in
+  that average can make it underestimate its block. A rebuild rewrites them.
 - **Sealing.** Inserts accumulate in the index's growing segment until it
   reaches `bm25_catalog.segment_growing_max_page_size` pages, and every search
   reads that segment in full. The insert that seals it moves the segment into
