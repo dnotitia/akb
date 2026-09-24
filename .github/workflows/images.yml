@@ -34,7 +34,7 @@ jobs:
             context: .
           - image: postgres
             file: deploy/postgres/Dockerfile
-            # The Dockerfile copies its patch and lockfile from here.
+            # The Dockerfile copies its patches and lockfile from here.
             context: deploy/postgres
     steps:
       - uses: actions/checkout@v4

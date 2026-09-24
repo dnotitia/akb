@@ -53,11 +53,11 @@ def test_every_image_the_extension_build_pulls_is_pinned_by_digest():
     assert not unpinned, f"digest 없이 당기는 참조: {unpinned}"
 
 
-def test_the_extension_is_compiled_from_pinned_source_with_the_fix():
-    """akb#679 is fixed by compiling the extension here, so what is compiled is pinned.
+def test_the_extension_is_compiled_from_pinned_source_with_its_fixes():
+    """akb#679 and akb#684 are fixed by compiling the extension here, so what is compiled is pinned.
 
     The upstream tarball by sha256, the crates by a committed lockfile built
-    `--locked` (0.3.0 ships none), and the patch applied exactly: a patch that
+    `--locked` (0.3.0 ships none), and the patches applied exactly: a patch that
     no longer fits must fail the build rather than be skipped or bent.
     """
     dockerfile = _postgres_dockerfile()
@@ -83,7 +83,7 @@ def test_the_extension_is_compiled_from_pinned_source_with_the_fix():
 
 
 def test_nothing_runs_the_upstream_prebuilt_extension():
-    """The upstream 0.3.0 binary has the akb#679 build defect.
+    """The upstream 0.3.0 binary has the akb#679 and akb#684 defects.
 
     An install path or CI job that pulled the publisher's image would run, or
     test, an extension build no installation should have. The history in the

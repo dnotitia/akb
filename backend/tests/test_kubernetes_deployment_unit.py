@@ -243,7 +243,7 @@ def test_deployer_without_a_postgres_image_keeps_the_base_and_says_what_follows(
 def test_deployer_builds_the_extension_image_and_deploys_it(tmp_path: Path):
     """Built from deploy/postgres and tagged by every input of that build.
 
-    The tag covers the Dockerfile and the patch and lockfile it copies, so an
+    The tag covers the Dockerfile and the patches and lockfile it copies, so an
     AKB upgrade that leaves them unchanged does not restart PostgreSQL, and a
     changed patch cannot hide behind a tag the nodes already hold.
     """

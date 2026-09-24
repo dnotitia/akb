@@ -1,5 +1,5 @@
 # AKB's PostgreSQL: the pinned pgvector image plus the vchord_bm25 BM25 index
-# extension, compiled here from its source with one fix.
+# extension, compiled here from its source with two fixes.
 #
 # The repository's install paths build this image where they run it: Compose,
 # deploy/k8s/deploy.sh, the Helm and Native Kubernetes install commands, and the
