@@ -1,5 +1,5 @@
 # AKB's PostgreSQL: the pinned pgvector image plus the vchord_bm25 BM25 index
-# extension, compiled here from its source with four fixes.
+# extension, compiled here from its source with five fixes.
 #
 # The repository's install paths build this image where they run it: Compose,
 # deploy/k8s/deploy.sh, the Helm and Native Kubernetes install commands, and the
@@ -31,8 +31,13 @@
 #     indexed, holding the metapage, with a page write and a WAL record per id.
 #     At 729M term ids that stalled search for 44 minutes, wrote 35 GiB of WAL,
 #     allocated 2.7 GiB, and could not be cancelled (akb#687). It now recounts
-#     a term statistic page at a time, holds no lock from one page to the next,
-#     and writes only the pages whose counts changed.
+#     a term statistic page at a time, holds no buffer lock from one page to the
+#     next, and writes only the pages whose counts changed. A recount that a
+#     cancel or a crash cuts short stays owed until the next VACUUM finishes it.
+#   * 0005: until then a term's statistic can exceed the document count, and the
+#     IDF went negative: a search for that term alone found nothing (akb#687).
+#     The IDF now holds the statistic at the document count, and takes its
+#     ratio in f64, where in f32 it rounded to 0 past about 8.4M documents.
 # Drop a patch when an upstream release carries its fix; deploy/postgres/README.md
 # says how to check.
 #

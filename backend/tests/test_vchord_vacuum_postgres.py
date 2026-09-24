@@ -13,7 +13,15 @@ both, and a search reads the metapage for its whole scan (akb#687):
 
 The image deploy/postgres builds carries patches 0003 and 0004, which take the
 metapage one page at a time and log each page's marks with the counts they
-take off. Without them every test here fails.
+take off. Without them the first three tests fail.
+
+A VACUUM stopped between the two steps, or during the recount, leaves some
+statistics counting deleted documents. 0004 also records that a recount is
+owed until one reaches its last page, so the next VACUUM of any kind finishes
+it; upstream recounted only when that VACUUM removed documents itself. Until
+then a statistic can exceed the document count, and 0005 keeps the IDF
+positive, so a search for that term alone still finds its documents. Without
+those two the fourth test fails.
 
 Requires the extension-capable server (AKB_VCHORD_TEST_DSN, the image
 deploy/postgres builds). Each test creates and drops its own database.
@@ -89,12 +97,22 @@ async def _metapage(conn: asyncpg.Connection) -> dict[str, int]:
     return {key: int(re.search(rf"\b{key}: (\d+)", text).group(1)) for key in keys}
 
 
-async def _data_pages(conn: asyncpg.Connection, first_blkno: int) -> list[str]:
+async def _data_pages(conn: asyncpg.Connection, first_blkno: int, limit: int | None = None) -> list[str]:
     """The data pages of one of the index's arrays, through its first inode page."""
     inode = await _inspect(conn, first_blkno)
     assert inode.startswith("Virtual Inode Page"), inode[:80]
     blknos = [int(b) for b in re.search(r"\[(.*)\]", inode, re.S).group(1).split(",")]
-    return [await _inspect(conn, blkno) for blkno in blknos]
+    return [await _inspect(conn, blkno) for blkno in blknos[:limit]]
+
+
+async def _term_statistics(conn: asyncpg.Connection) -> list[int]:
+    """Every term's stored statistic, indexed by term id."""
+    meta = await _metapage(conn)
+    stored: list[int] = []
+    for page in await _data_pages(conn, meta["term_stat_blkno"]):
+        body = re.search(r"\[(.*)\]", page, re.S).group(1).strip()
+        stored.extend(int(n) for n in body.split(",") if body)
+    return stored[: meta["term_id_cnt"]]
 
 
 async def _deleted(conn: asyncpg.Connection) -> int:
@@ -135,7 +153,7 @@ async def _vacuum_while_searching(dsn: str, *, cost_delay_ms: int) -> tuple[floa
         longest: dict[str, float] = {}
         while not task.done():
             phase = await _phase(watch, pid)
-            took = await _search(probe, "{1:1,3:1}")
+            took = await _search(probe, "{3:1}")  # 200 documents, quick by itself
             if phase:
                 longest[phase] = max(longest.get(phase, 0.0), took)
         await task
@@ -226,7 +244,7 @@ async def test_the_cleanup_over_a_sparse_term_id_space_is_quick_and_exact():
         await conn.execute("DELETE FROM vacuum_probe WHERE id % 4 = 1")
         took, longest = await _vacuum_while_searching(dsn, cost_delay_ms=0)
         meta = await _metapage(conn)
-        first_page = (await _data_pages(conn, meta["term_stat_blkno"]))[0]
+        first_page = (await _data_pages(conn, meta["term_stat_blkno"], limit=1))[0]
 
     live = [terms for i, terms in rows.items() if i % 4 != 1]
     truth: dict[int, int] = {}
@@ -241,3 +259,99 @@ async def test_the_cleanup_over_a_sparse_term_id_space_is_quick_and_exact():
     assert max(longest.values()) < 1.0, f"a search waited for VACUUM: {longest}"
     assert meta["doc_cnt"] == len(live)
     assert wrong == {}, f"{len(wrong)} term statistics differ from the rows: {dict(list(wrong.items())[:10])}"
+
+
+async def _vacuum_cancelled_in(dsn: str, phase: str) -> str:
+    """Run VACUUM slowed by a cost delay, and cancel it once it is in `phase`.
+
+    Returns the phase the cancel landed in, or "finished" when VACUUM ended
+    before the cancel reached it.
+    """
+    vac, watch = await asyncpg.connect(dsn), await asyncpg.connect(dsn)
+    try:
+        pid = await vac.fetchval("SELECT pg_backend_pid()")
+        await vac.execute("SET vacuum_cost_delay = '2ms'")
+        await vac.execute("SET vacuum_cost_limit = 10")
+        task = asyncio.create_task(vac.execute("VACUUM vacuum_probe"))
+        while not task.done() and await _phase(watch, pid) != phase:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.05)
+        landed = await _phase(watch, pid)
+        await watch.execute("SELECT pg_cancel_backend($1)", pid)
+        try:
+            await task
+        except asyncpg.QueryCanceledError:
+            return landed or "finished"
+        return "finished"
+    finally:
+        await vac.close()
+        await watch.close()
+
+
+async def _rows_found(conn: asyncpg.Connection, query: str) -> int:
+    async with conn.transaction():
+        await conn.execute('SET LOCAL search_path TO "$user", public, bm25_catalog')
+        await conn.execute("SET LOCAL bm25_catalog.bm25_limit = 10")
+        return len(await conn.fetch(_SEARCH, query))
+
+
+async def test_a_vacuum_that_removes_nothing_finishes_a_recount_an_interrupted_one_owed():
+    """Statistics left counting deleted documents are recounted by the next VACUUM, whatever it removes.
+
+    Term 1 is in every document, terms 2 to 5,001 in one document of every
+    5,000, and each document has a rare term of its own, so the recount has
+    hundreds of statistic pages to write. 40,000 of the 100,000 documents are
+    deleted, and three VACUUMs follow:
+
+    - the first is cancelled after its bulk delete, while it vacuums the heap.
+      Every statistic still counts the deleted documents, and term 1's is
+      100,000 against 60,000 documents. Without 0005 its IDF is negative and a
+      search for term 1 alone finds nothing;
+    - the second finds every dead document already marked, so it removes
+      nothing from the index. Upstream therefore skipped the recount; with
+      0004 it runs, and is cancelled part way;
+    - the third has nothing left to remove at all. With 0004 it finishes the
+      recount, and every statistic matches the rows.
+    """
+    rare = 600_000
+    async with _database() as (conn, dsn):
+        await conn.execute("ALTER TABLE vacuum_probe SET (autovacuum_enabled = off)")
+        await conn.execute(
+            "INSERT INTO vacuum_probe SELECT i, ('{1:1,' || (i % 5000 + 2) || ':1,'"
+            f" || (5002 + (i::bigint * 7919) % {rare}) || ':1}}')::bm25_catalog.bm25vector"
+            " FROM generate_series(0, 99999) i")
+        await _index(conn)
+        await conn.execute("DELETE FROM vacuum_probe WHERE id % 10 < 4")
+
+        first = await _vacuum_cancelled_in(dsn, "vacuuming heap")
+        stale = await _term_statistics(conn)
+        found = await _rows_found(conn, "{1:1}")
+        second = await _vacuum_cancelled_in(dsn, "cleaning up indexes")
+        stale_after_second = await _term_statistics(conn)
+        await conn.execute("VACUUM vacuum_probe")
+        stored = await _term_statistics(conn)
+        meta = await _metapage(conn)
+
+    truth: dict[int, int] = {}
+    for i in range(100_000):
+        if i % 10 >= 4:
+            for term in (1, i % 5000 + 2, 5002 + (i * 7919) % rare):
+                truth[term] = truth.get(term, 0) + 1
+
+    def wrong(statistics: list[int]) -> int:
+        return sum(count != truth.get(term, 0) for term, count in enumerate(statistics))
+
+    assert first == "vacuuming heap", first
+    assert stale[1] == 100_000 and meta["doc_cnt"] == 60_000, (stale[1], meta)
+    observed = {
+        "rows found for term 1 alone": found,
+        "second VACUUM cancelled in": second,
+        "recount stopped part way": 0 < wrong(stale_after_second) < wrong(stale),
+        "statistics wrong after the third": wrong(stored),
+    }
+    assert observed == {
+        "rows found for term 1 alone": 10,
+        "second VACUUM cancelled in": "cleaning up indexes",
+        "recount stopped part way": True,
+        "statistics wrong after the third": 0,
+    }, (observed, {"wrong after the first": wrong(stale), "after the second": wrong(stale_after_second)})

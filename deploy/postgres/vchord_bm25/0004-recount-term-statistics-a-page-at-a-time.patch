@@ -30,8 +30,23 @@ time:
 - It then writes the page, if a count on it changed, under one WAL record,
   moving each count by the difference it measured. An insert that ran after
   the metapage was released keeps its addition.
-- It holds no lock from one page to the next, and applies the cost-based delay
-  and checks for interrupts between pages.
+- It holds no buffer lock from one page to the next, and applies the
+  cost-based delay and checks for interrupts between pages. The seal lock
+  stays held throughout, so no insert seals the growing segment until the
+  recount ends.
+
+A recount that stops part way leaves the statistics it has not reached still
+counting deleted documents. Upstream recounted only when the same VACUUM had
+removed documents, so the next VACUUM repaired them only if it removed some
+too; one whose bulk delete found every document already marked, after a cancel
+or a crash, never did. The bulk delete now notes, in the WAL record that takes
+documents off the counts, that a recount is owed, and only a recount that
+reaches its last page clears the note. amvacuumcleanup recounts whenever the
+note is set, so the next VACUUM of any kind, including one that removes
+nothing, finishes what an interrupted one owed. ANALYZE never recounts. The
+note is the high bit of the metapage's version word, which nothing reads, and
+an index built before this patch reads as owing nothing.
+
 Memory is the delete bitmap, the growing segment's terms and one page of
 counts. No on-disk format or SQL changes.
 
@@ -55,12 +70,18 @@ Also measured:
   40,000 deleted, under autovacuum's cost delay: the cleanup took 162 s, no
   search waited more than 0.07 s, and the WAL was 2.75 GiB, a full-page image
   of each changed statistic page.
+- 100,000 documents, 40,000 deleted, the VACUUM backend killed during the
+  recount, then a VACUUM with nothing to remove: recounting only when that
+  VACUUM removed documents, as upstream did, left all 42,001 affected
+  statistics too high; recounting what is owed left none. A cancel between the
+  bulk delete and the cleanup, followed by a cancel during the recount, gave
+  the same.
 
 License: this patch modifies vchord_bm25 and is offered under the same terms
 as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
 ---
 diff --git a/src/index/vacuum.rs b/src/index/vacuum.rs
-index 69c6b50..adb8e37 100644
+index 69c6b50..f918173 100644
 --- a/src/index/vacuum.rs
 +++ b/src/index/vacuum.rs
 @@ -1,15 +1,15 @@
@@ -70,7 +91,7 @@ index 69c6b50..adb8e37 100644
  use crate::{
 -    page::{page_read, page_write_pair, BM25_PAGE_SIZE, METAPAGE_BLKNO},
 +    datatype::Bm25VectorBorrowed,
-+    page::{page_read, page_write_pair, VirtualPageReader, BM25_PAGE_SIZE, METAPAGE_BLKNO},
++    page::{page_read, page_write, page_write_pair, VirtualPageReader, BM25_PAGE_SIZE, METAPAGE_BLKNO},
      segment::{
          delete::{mark_deleted, DeleteBitmapReader, DELETE_BITMAP_PAGE_DOCS},
          field_norm::{id_to_fieldnorm, FieldNormRead, FieldNormReader},
@@ -84,40 +105,95 @@ index 69c6b50..adb8e37 100644
      },
  };
  
-@@ -119,57 +119,145 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
+@@ -57,7 +57,8 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
+ 
+     // One delete bitmap page at a time: find its dead documents with no lock
+     // held, then set their bits and take them off the counts in one WAL record,
+-    // so a crash keeps both or neither. A document whose bit is already set was
++    // so a crash keeps both or neither. The same record notes that the term
++    // statistics now owe a recount. A document whose bit is already set was
+     // counted out when it was set, by this pass or by an earlier one that did
+     // not finish, and is not counted again.
+     let mut dead: Vec<(u32, u8)> = Vec::new();
+@@ -90,6 +91,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
+             if mark_deleted(bitmap_page, i) {
+                 meta.doc_cnt -= 1;
+                 meta.doc_term_cnt -= id_to_fieldnorm(field_norm) as u64;
++                meta.set_recount_owed(true);
+                 stats.tuples_removed += 1.0;
+             }
+         }
+@@ -105,71 +107,184 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
+     info: *mut pgrx::pg_sys::IndexVacuumInfo,
+     stats: *mut pgrx::pg_sys::IndexBulkDeleteResult,
+ ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
++    // ANALYZE calls this too, and has to stay cheap.
++    if (*info).analyze_only {
++        return stats;
++    }
++    let index = (*info).index;
++    // The term statistics are recounted whenever a bulk delete took documents
++    // off the counts and no recount has finished since: in this VACUUM, or in
++    // an earlier one that was cancelled or crashed once its marks had landed.
++    // A VACUUM that removes nothing, or whose bulk delete finds every document
++    // already marked, still pays what the earlier one owed.
++    let owed = {
++        let metapage = page_read(index, METAPAGE_BLKNO);
++        let meta: &MetaPageData = metapage.as_ref();
++        meta.recount_owed()
++    };
++    let stats = if owed && stats.is_null() {
++        pgrx::pg_sys::palloc0(size_of::<pgrx::pg_sys::IndexBulkDeleteResult>()).cast()
++    } else {
++        stats
++    };
+     if stats.is_null() {
+-        return std::ptr::null_mut();
++        return stats;
+     }
+-
+     (*stats).num_pages = pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
+-        (*info).index,
++        index,
+         pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
+     );
+-
+-    if (*stats).tuples_removed == 0.0 {
++    if !owed {
+         return stats;
      }
  
-     let index = (*info).index;
+-    let index = (*info).index;
 +    // Sealing moves growing documents into the sealed segment and frees their
 +    // pages. An insert seals only if it gets this lock without waiting, so
 +    // holding it keeps both segments where the recount reads them, while
 +    // inserts go on.
 +    pgrx::pg_sys::LockPage(index, METAPAGE_BLKNO, pgrx::pg_sys::ExclusiveLock as _);
 +    recount_term_stats(index);
++    // Only a recount that reached its last page settles what was owed. A cancel
++    // or a crash before this line leaves it owed, for the next VACUUM.
++    {
++        let mut metapage = page_write(index, METAPAGE_BLKNO);
++        let meta: &mut MetaPageData = metapage.as_mut();
++        meta.set_recount_owed(false);
++    }
 +    pgrx::pg_sys::UnlockPage(index, METAPAGE_BLKNO, pgrx::pg_sys::ExclusiveLock as _);
++
++    stats
++}
++
++const TERMS_PER_PAGE: u32 = (BM25_PAGE_SIZE / std::mem::size_of::<u32>()) as u32;
  
 -    let metapage = page_read(index, METAPAGE_BLKNO);
 -    let meta: &MetaPageData = metapage.as_ref();
 -    let term_id_cnt = meta.term_id_cnt;
 -    let mut term_stats = (0..term_id_cnt).map(|_| 0u32).collect::<Vec<_>>();
 -    let delete_bitmap_reader = DeleteBitmapReader::new(index, meta.delete_bitmap_blkno);
-+    stats
-+}
-+
-+const TERMS_PER_PAGE: u32 = (BM25_PAGE_SIZE / std::mem::size_of::<u32>()) as u32;
- 
--    if let Some(growing) = meta.growing_segment.as_ref() {
--        let reader = GrowingSegmentReader::new(index, growing);
--        let mut doc_id = meta.sealed_doc_id;
--        let mut iter = reader.into_lending_iter(usize::MAX);
--        while let Some(vector) = iter.next() {
--            if !delete_bitmap_reader.is_delete(doc_id) {
--                for &idx in vector.indexes() {
--                    term_stats[idx as usize] += 1;
 +// Sets each term's statistic to the number of live documents that hold it, one
-+// term statistic page at a time. No lock is held from one page to the next, so
-+// searches and inserts go on and the recount can be cancelled between pages.
-+// A page is written only if a count on it changed.
++// term statistic page at a time. No buffer lock is held from one page to the
++// next, so searches and inserts go on and the recount can be cancelled between
++// pages; the caller holds the seal lock throughout, so no insert seals until it
++// ends. A page is written only if a count on it changed.
 +unsafe fn recount_term_stats(index: pgrx::pg_sys::Relation) {
 +    let (doc_id_end, sealed_doc_id, growing, sealed, term_id_cnt, term_stat_blkno, bitmap_blkno) = {
 +        let metapage = page_read(index, METAPAGE_BLKNO);
@@ -150,7 +226,15 @@ index 69c6b50..adb8e37 100644
 +    tail.read_until(index, growing.as_ref(), doc_id_end, |doc_id, vector| {
 +        add_terms(&mut growing_terms, doc_id, vector)
 +    });
-+
+ 
+-    if let Some(growing) = meta.growing_segment.as_ref() {
+-        let reader = GrowingSegmentReader::new(index, growing);
+-        let mut doc_id = meta.sealed_doc_id;
+-        let mut iter = reader.into_lending_iter(usize::MAX);
+-        while let Some(vector) = iter.next() {
+-            if !delete_bitmap_reader.is_delete(doc_id) {
+-                for &idx in vector.indexes() {
+-                    term_stats[idx as usize] += 1;
 +    let term_info_reader =
 +        (sealed.term_id_cnt > 0).then(|| VirtualPageReader::new(index, sealed.term_info_blkno));
 +    let term_stat_reader = VirtualPageReader::new(index, term_stat_blkno);
@@ -369,4 +453,37 @@ index eef6f42..a398da2 100644
 +
  pub struct SealingTask {
      pub page_count: u32,
+ }
+diff --git a/src/segment/meta.rs b/src/segment/meta.rs
+index f7e5382..7fb3375 100644
+--- a/src/segment/meta.rs
++++ b/src/segment/meta.rs
+@@ -1,6 +1,11 @@
+ use super::{growing::GrowingSegmentData, sealed::SealedSegmentData};
+ 
+ pub const META_VERSION: u32 = 1;
++// The high bit of `version` records that a bulk delete took documents off the
++// counts and no recount of the term statistics has finished since. Nothing
++// reads the version, so the flag leaves the page format as it is, and an index
++// built before it reads as owing nothing.
++const RECOUNT_OWED: u32 = 1 << 31;
+ 
+ #[derive(Debug)]
+ pub struct MetaPageData {
+@@ -44,4 +49,16 @@ impl MetaPageData {
+     pub fn avgdl(&self) -> f32 {
+         self.doc_term_cnt as f32 / self.doc_cnt as f32
+     }
++
++    pub fn recount_owed(&self) -> bool {
++        self.version & RECOUNT_OWED != 0
++    }
++
++    pub fn set_recount_owed(&mut self, owed: bool) {
++        if owed {
++            self.version |= RECOUNT_OWED;
++        } else {
++            self.version &= !RECOUNT_OWED;
++        }
++    }
  }

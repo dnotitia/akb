@@ -73,9 +73,10 @@ def test_the_extension_is_compiled_from_pinned_source_with_its_fixes():
         # The length sum is counted the same way on every side: build, insert, VACUUM.
         "akb#684": ["src/segment/builder.rs", "src/index/insert.rs", "src/index/vacuum.rs"],
         # VACUUM takes the metapage a page at a time: marks and counts in one record,
-        # term statistics recounted page by page.
+        # term statistics recounted page by page, a recount owed until one finishes,
+        # and the IDF held positive meanwhile.
         "akb#687": ["src/index/vacuum.rs", "src/page/postgres.rs", "src/segment/delete.rs",
-                    "src/segment/growing.rs"],
+                    "src/segment/growing.rs", "src/segment/meta.rs", "src/weight.rs"],
     }
     for issue, paths in fixes.items():
         for path in paths:

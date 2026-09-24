@@ -25,20 +25,28 @@ search reads the metapage for its whole scan.
 
 What changes:
 
-- **Two more patches in `deploy/postgres/vchord_bm25/`.**
+- **Three more patches in `deploy/postgres/vchord_bm25/`.**
   - `0003` marks one delete bitmap page at a time. Each page's marks and the
     counts they take off go into one WAL record, so a crash keeps both or
     neither, and a VACUUM that runs again takes no document off twice.
-  - `0004` recounts one term statistic page at a time. It holds no lock from one
-    page to the next, writes only pages whose counts changed, and stops at the
-    next page when cancelled. While it runs, inserts skip sealing the growing
-    segment.
+  - `0004` recounts one term statistic page at a time. It holds no buffer lock
+    from one page to the next, writes only pages whose counts changed, and stops
+    at the next page when cancelled. While it runs, inserts skip sealing the
+    growing segment. A recount that a cancel or a crash cuts short stays owed,
+    and the next VACUUM finishes it whatever it removes; upstream recounted only
+    when that VACUUM removed documents itself, so the statistics could stay too
+    high: 42,001 of them in one reproduction.
+  - `0005` keeps the IDF positive while a term's statistic still counts deleted
+    documents. It went negative, and a search for that term alone found
+    nothing.
   - Measured on the same shapes: a search during the bulk delete took 0.001 s
     instead of 2.86 s. The cleanup at 728,984,818 term ids took 2.7 s, with no
     search waiting more than 0.002 s, 0.3 MiB of WAL and 3.4 MiB of memory.
 - **`test_vchord_vacuum_postgres.py`, in the VChord lane**, cancels a bulk
-  delete, searches through one, and runs a cleanup over 20,000,001 term ids.
-  The image without the two patches fails all three.
+  delete, searches through one, runs a cleanup over 20,000,001 term ids, and
+  interrupts two VACUUMs before a third with nothing to remove. The image
+  without 0003 and 0004 fails the first three; without the owed recount or
+  without 0005, the fourth fails.
 - **The docs describe the fixes** where they listed VACUUM as a known limit, and
   name a limit the extension still has: a term id at or above 2^30 reads
   another term's entries.
