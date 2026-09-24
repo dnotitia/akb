@@ -245,8 +245,12 @@ def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_p
     assert "postgres" in built, built
 
     def builds(text: str) -> set[str]:
-        """The services named by the `docker compose ... build` commands in `text`."""
-        return {name for names in re.findall(r"docker compose(?: -p \S+)? build ((?:[a-z-]+ ?)+)", text)
+        """The services named by `docker compose -p <project> build` commands in `text`.
+
+        The project is required: built under another project name, an image
+        does not answer that project's `up --no-build`.
+        """
+        return {name for names in re.findall(r"docker compose -p \S+ build ((?:[a-z-]+ ?)+)", text)
                 for name in names.split()}
 
     readme = (ROOT / "README.md").read_text()
