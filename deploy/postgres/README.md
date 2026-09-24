@@ -234,9 +234,10 @@ reached still counting the deleted documents. Upstream recounted only when the
 same VACUUM removed documents, so a VACUUM that found every dead document
 already marked, or had none, never repaired them. The bulk delete now records,
 in the WAL record that takes documents off the counts, that a recount is owed,
-and only a recount that reaches its last page clears it. The next VACUUM of any
-kind, autovacuum included, finishes the recount whatever it removes; ANALYZE
-never runs it. Measured on 100,000 documents with 40,000 deleted, the VACUUM
+and only a recount that reaches its last page clears it. The next VACUUM that
+cleans up the index, autovacuum included, finishes the recount whatever it
+removes; one run with `INDEX_CLEANUP OFF`, or stopped by the wraparound
+failsafe, leaves it for the one after, and ANALYZE never runs it. Measured on 100,000 documents with 40,000 deleted, the VACUUM
 backend killed during the recount and then a VACUUM with nothing to remove:
 42,001 statistics stayed too high under the upstream condition, none with this.
 
@@ -246,7 +247,12 @@ show more documents than remain, and its IDF went negative: a search for that
 term alone found nothing, 0 rows where 10 were due in the same shape. The IDF
 now holds the statistic at the document count, and takes its ratio in f64. On
 a settled index nothing moves beyond f32 rounding: 58 queries kept their top 20
-in the same order, and no score moved by more than 1.4e-7 of itself.
+in the same order, and no score in them moved by more than 1.4e-7 of itself. A
+term in nearly every document moves by up to about 0.2%, the same for every
+document that holds it, so no order changes. The seal path uses the same IDF
+for block summaries, and a seal while a statistic ran ahead recorded summaries
+that bounded scans then skipped for good: the best document was missing from a
+bounded top 10 even after the recount. 0005 prevents that.
 
 | | 0.3.0 with 0001 and 0002 | This image |
 | --- | --- | --- |
@@ -263,9 +269,10 @@ default cost delay. A statistic page it writes carries a full-page image after
 each checkpoint, so over a sparse id space, where most terms sit alone on their
 page, one VACUUM of 40,000 documents wrote 2.75 GiB.
 
-On this image, the fix itself needs no rebuild. An index whose counts a crash
-damaged under the upstream binary keeps them until `REINDEX INDEX
-CONCURRENTLY`.
+On this image, the fix itself needs no rebuild. Two kinds of damage an older
+build left keep until `REINDEX INDEX CONCURRENTLY`: counts a crash damaged
+under the upstream binary, and block summaries sealed while a term's statistic
+ran ahead of the document count.
 
 ## What a bounded scan can still differ on
 

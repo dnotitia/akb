@@ -292,6 +292,7 @@ async def _rows_found(conn: asyncpg.Connection, query: str) -> int:
     async with conn.transaction():
         await conn.execute('SET LOCAL search_path TO "$user", public, bm25_catalog')
         await conn.execute("SET LOCAL bm25_catalog.bm25_limit = 10")
+        await conn.execute("SET LOCAL enable_seqscan = off")  # the index's scan, not a sort
         return len(await conn.fetch(_SEARCH, query))
 
 

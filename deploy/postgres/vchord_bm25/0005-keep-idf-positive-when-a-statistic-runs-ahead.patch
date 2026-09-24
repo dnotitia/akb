@@ -19,12 +19,20 @@ none of them: a search for that term alone finds nothing.
   once N passes about 8.4 million, so a term in every document already scored
   0 in a settled index of that size.
 
+The seal path computes each block's summary with the same IDF (append.rs). A
+seal while n ran ahead of N recorded summaries from a negative IDF, and a
+bounded scan then skipped those blocks for good, even once the statistics were
+recounted. This patch prevents that; an index an older build sealed in that
+state keeps it until REINDEX.
+
 Measured on 100,000 documents with a term in every one, 40,000 deleted, after a
 VACUUM cancelled between the bulk delete and the cleanup: a search for that
 term alone returned no rows, and 10 with this patch (bm25_limit 10). On a
 settled index of 45,000 documents, 58 queries returned the same top 20 in the
-same order with and without it, and no score moved by more than 1.4e-7 of
-itself.
+same order with and without it, and no score in them moved by more than 1.4e-7
+of itself. A term held by nearly every document moves more, by up to about
+0.2% at 45,000 to 2.1 million documents: f32 rounded its ratio. The move is the
+same for every document holding the term, so no order changes.
 
 License: this patch modifies vchord_bm25 and is offered under the same terms
 as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.

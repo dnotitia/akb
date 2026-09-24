@@ -33,7 +33,8 @@ What changes:
     from one page to the next, writes only pages whose counts changed, and stops
     at the next page when cancelled. While it runs, inserts skip sealing the
     growing segment. A recount that a cancel or a crash cuts short stays owed,
-    and the next VACUUM finishes it whatever it removes; upstream recounted only
+    and the next VACUUM that cleans up the index finishes it whatever it
+    removes; upstream recounted only
     when that VACUUM removed documents itself, so the statistics could stay too
     high: 42,001 of them in one reproduction.
   - `0005` keeps the IDF positive while a term's statistic still counts deleted
@@ -54,8 +55,10 @@ What changes:
   inputs changed.
 
 **Upgrading**: rebuild the PostgreSQL image. The fix itself needs no index
-rebuild. An index whose counts a crash damaged under the upstream binary keeps
-them until `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
+rebuild. Two kinds of damage an older build left keep until `REINDEX INDEX
+CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`: counts a crash damaged
+under the upstream binary, and block summaries sealed while a term's statistic
+ran ahead of the document count, which hide their blocks from bounded searches.
 
 ### The BM25 statistics recompute draws term ids for new terms only (akb#687)
 

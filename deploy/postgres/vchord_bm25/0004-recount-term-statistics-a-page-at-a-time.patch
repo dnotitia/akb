@@ -42,10 +42,14 @@ too; one whose bulk delete found every document already marked, after a cancel
 or a crash, never did. The bulk delete now notes, in the WAL record that takes
 documents off the counts, that a recount is owed, and only a recount that
 reaches its last page clears the note. amvacuumcleanup recounts whenever the
-note is set, so the next VACUUM of any kind, including one that removes
-nothing, finishes what an interrupted one owed. ANALYZE never recounts. The
-note is the high bit of the metapage's version word, which nothing reads, and
-an index built before this patch reads as owing nothing.
+note is set, so the next VACUUM that cleans up the index, including one that
+removes nothing, finishes what an interrupted one owed. A VACUUM run with
+INDEX_CLEANUP OFF, or stopped by the wraparound failsafe, skips the cleanup and
+leaves the note for the one after. ANALYZE never recounts. When that VACUUM
+removed nothing, no bulk delete counted the index's tuples, so the cleanup
+reports the metapage's document count instead of leaving pg_class.reltuples at
+0. The note is the high bit of the metapage's version word, which nothing
+reads, and an index built before this patch reads as owing nothing.
 
 Memory is the delete bitmap, the growing segment's terms and one page of
 counts. No on-disk format or SQL changes.
@@ -81,7 +85,7 @@ License: this patch modifies vchord_bm25 and is offered under the same terms
 as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
 ---
 diff --git a/src/index/vacuum.rs b/src/index/vacuum.rs
-index 69c6b50..f918173 100644
+index 69c6b50..457f992 100644
 --- a/src/index/vacuum.rs
 +++ b/src/index/vacuum.rs
 @@ -1,15 +1,15 @@
@@ -123,7 +127,7 @@ index 69c6b50..f918173 100644
                  stats.tuples_removed += 1.0;
              }
          }
-@@ -105,71 +107,184 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
+@@ -105,71 +107,189 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
      info: *mut pgrx::pg_sys::IndexVacuumInfo,
      stats: *mut pgrx::pg_sys::IndexBulkDeleteResult,
  ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
@@ -137,13 +141,18 @@ index 69c6b50..f918173 100644
 +    // an earlier one that was cancelled or crashed once its marks had landed.
 +    // A VACUUM that removes nothing, or whose bulk delete finds every document
 +    // already marked, still pays what the earlier one owed.
-+    let owed = {
++    let (owed, doc_cnt) = {
 +        let metapage = page_read(index, METAPAGE_BLKNO);
 +        let meta: &MetaPageData = metapage.as_ref();
-+        meta.recount_owed()
++        (meta.recount_owed(), meta.doc_cnt)
 +    };
 +    let stats = if owed && stats.is_null() {
-+        pgrx::pg_sys::palloc0(size_of::<pgrx::pg_sys::IndexBulkDeleteResult>()).cast()
++        // No bulk delete ran, so nothing counted the index's tuples, and
++        // PostgreSQL writes whatever is returned into pg_class.reltuples.
++        let stats: *mut pgrx::pg_sys::IndexBulkDeleteResult =
++            pgrx::pg_sys::palloc0(size_of::<pgrx::pg_sys::IndexBulkDeleteResult>()).cast();
++        (*stats).num_index_tuples = f64::from(doc_cnt);
++        stats
 +    } else {
 +        stats
 +    };
