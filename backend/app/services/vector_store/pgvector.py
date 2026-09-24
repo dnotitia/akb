@@ -186,7 +186,8 @@ def _bm25vector_literal(
             raise ValueError(
                 f"term id {term} is outside the range the vchord BM25 index "
                 f"holds (0 to {_BM25VECTOR_MAX_TERM_ID:,}): an id at or above "
-                f"2^30 would corrupt another term's statistics in that index. "
+                f"2^30 would land on another term's entries in that index and "
+                f"corrupt its postings, statistics and search results. "
                 f"The BM25 vocabulary's term ids have to be renumbered densely "
                 f"before a document holding it can be indexed."
             )
