@@ -329,6 +329,12 @@ docker compose -p my-native-install \
 open http://localhost:3000
 ```
 
+To upgrade, update the checkout and repeat step 1 before step 3:
+`up --no-build` cannot create an image that only a build produces, so a service
+the new checkout builds (`frontend`, `postgres`) is rebuilt first. Skipping it
+does not fail cleanly: Compose stops the running containers and then stops with
+`No such image: my-native-install-postgres:latest`.
+
 The local image ID pins the locally built bytes; it is not a registry digest.
 For distributed installs, build/push first and use the registry digest for
 `AKB_NATIVE_IMAGE`. Keep the generated initializing image receipt unchanged

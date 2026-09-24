@@ -34,6 +34,12 @@ where they run it: the same pinned pgvector image, plus the extension's files.
 Existing installations keep the sparse shape they serve. Moving one to this
 image restarts PostgreSQL once, on the same PostgreSQL and pgvector versions.
 
+**Upgrading a Compose installation**: build `postgres` (and `frontend`, for the
+complete stack) before the first `up --no-build`. `--no-build` cannot create an
+image that only a build produces. Without that step, Compose stops the running
+containers and then fails with `No such image: <project>-postgres:latest`.
+`docker compose up -d` without `--no-build` builds it by itself.
+
 ### New databases use the `vchord` sparse shape where the server provides it
 
 `vector_store_sparse_shape` and `bm25_external_stats_mode` now default to

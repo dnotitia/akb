@@ -200,6 +200,53 @@ def test_demo_yaml_preserves_values_and_mounted_overrides(tmp_path, demo_env):
     assert app["rerank_enabled"] is False
 
 
+def _native_stack_builds(tmp_path) -> set[str]:
+    """The services the Native Compose stack builds rather than pulls."""
+    import json
+    import os
+
+    env = {
+        **os.environ,
+        "AKB_NATIVE_IMAGE": "registry.example.com/akb-backend@sha256:" + "0" * 64,
+        "AKB_NATIVE_CONFIG_DIR": str(tmp_path),
+    }
+    rendered = json.loads(subprocess.check_output(
+        ["docker", "compose", "-p", "akb-contract",
+         "-f", str(ROOT / "docker-compose.yaml"), "-f", str(ROOT / "docker-compose.native.yaml"),
+         "config", "--format", "json"],
+        text=True, env=env,
+    ))
+    return {name for name, service in rendered["services"].items() if "build" in service}
+
+
+def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_path):
+    """`up --no-build` cannot create an image that only a build produces.
+
+    When PostgreSQL moved from a pulled image to a built one, an installation
+    that followed its own instructions (`up -d --no-build`) had Compose stop the
+    running containers and then fail with `No such image`. Each set of
+    instructions that ends in `up --no-build` must therefore build every service
+    the stack builds, found from the rendered stack rather than listed here.
+    """
+    import re
+
+    if not shutil.which("docker"):
+        pytest.skip("Docker Compose required")
+    built = _native_stack_builds(tmp_path)
+    assert built == {"frontend", "postgres"}, built  # the Native overlay pulls the backend
+    quickstart = (ROOT / "README.md").read_text()
+    commands = re.findall(r"docker compose -p my-native-install build ([a-z ]+)", quickstart)
+    assert commands, "README 빠른 시작에 compose build 단계가 없다"
+    assert built <= set(" ".join(commands).split()), commands
+    for doc, services in (
+        ("docs/operations/native-installation.md", {"postgres"}),
+        ("deploy/compose/README.md", {"frontend", "postgres"}),
+    ):
+        text = (ROOT / doc).read_text()
+        for service in services:
+            assert re.search(rf"build[^.]*\b{service}\b", text, re.I), f"{doc}: {service} 빌드 안내가 없다"
+
+
 @pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])
 def test_demo_rejects_infrastructure_override_without_exposing_value(tmp_path, demo_env, filename):
     (tmp_path / filename).write_text("db_password: do-not-print-this\n")

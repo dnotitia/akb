@@ -4,8 +4,10 @@ New installations follow the [root Native quickstart](../../README.md#quick-star
 prepare persistent configuration/identity once, then layer
 `docker-compose.native.yaml` over the reusable `docker-compose.yaml` base.
 The Native overlay explicitly bootstraps a never-used database before API and
-worker start. It keeps their Git paths read-only and empty. Build the frontend
-before using `up --no-build` for the complete stack.
+worker start. It keeps their Git paths read-only and empty. Build `frontend` and
+`postgres` before using `up --no-build` for the complete stack, and again after
+every update of the checkout: `--no-build` cannot create an image that only a
+build produces.
 
 Use the same Compose project name, config directory and file list on every
 operation so database and object-store volumes are reused. API and worker run
@@ -34,7 +36,13 @@ on the active app/secret pair and install the reviewed output. Omitted old
 selectors become explicit Bare Git; explicit Native identity stays intact.
 Do not overwrite existing config with the new example or regenerate keys.
 Existing Bare Git installations continue using the base Compose without the
-Native overlay and retain their Git volume. Existing root Compose
+Native overlay and retain their Git volume.
+
+PostgreSQL is built from `deploy/postgres`: the same pinned pgvector image plus
+the BM25 index extension. `docker compose up -d` builds it. With `--no-build`,
+run `docker compose build postgres` first. The first start recreates the
+PostgreSQL container once on the same data volume, and a database keeps the
+sparse shape it serves. Existing root Compose
 volume names (`postgres_data`, `vault_data`, `minio_data`) are unchanged.
 
 The historical `deploy/docker-compose.yaml` used `pgdata` and `vaultdata`,

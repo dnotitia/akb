@@ -89,8 +89,13 @@ After successful initialization, bootstrap can be replayed with the same
 persisted configuration, including after real documents have been written.
 
 On upgrades, update `AKB_NATIVE_IMAGE`, keep the initializing receipt in
-`app.yaml`, and recreate API/worker together using the same Compose project and
-files. A bootstrap replay remains safe. Confirm both processes are healthy and
+`app.yaml`, and rebuild what the new checkout builds before any
+`up --no-build`: `docker compose -p my-native-install build postgres`, plus
+`frontend` for the complete stack. `--no-build` cannot create those images, and
+without them Compose stops the running containers before it fails with
+`No such image`. A rebuilt PostgreSQL image recreates the PostgreSQL container
+once on the same data volume. Then recreate API/worker together using the same
+Compose project and files. A bootstrap replay remains safe. Confirm both processes are healthy and
 read back existing documents after replacement. Preserve database/S3/config/key
 volumes; never use `down -v` as a repair step.
 
