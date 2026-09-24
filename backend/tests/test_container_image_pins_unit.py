@@ -68,12 +68,14 @@ def test_the_extension_is_compiled_from_pinned_source_with_the_fix():
     lockfile = REPO / "deploy/postgres/vchord_bm25/Cargo.lock"
     assert re.search(r'name = "pgrx"\nversion = "0\.16\.1"', lockfile.read_text()), lockfile
     patches = {p.name: p.read_text() for p in (REPO / "deploy/postgres/vchord_bm25").glob("*.patch")}
-    fixes = {  # the file each fix changes
-        "akb#679": "src/segment/posting/serializer.rs",
-        "akb#684": "src/index/vacuum.rs",
+    fixes = {  # the files each fix changes
+        "akb#679": ["src/segment/posting/serializer.rs"],
+        # The length sum is counted the same way on every side: build, insert, VACUUM.
+        "akb#684": ["src/segment/builder.rs", "src/index/insert.rs", "src/index/vacuum.rs"],
     }
-    for issue, path in fixes.items():
-        assert any(f"+++ b/{path}" in text for text in patches.values()), f"{issue} 패치가 없다"
+    for issue, paths in fixes.items():
+        for path in paths:
+            assert any(f"+++ b/{path}" in text for text in patches.values()), f"{issue}: {path} 패치가 없다"
     for name, text in patches.items():
         assert "AGPL-3.0-only or Elastic-2.0" in text, name  # offered under the extension's own terms
     assert "set -eu" in dockerfile and "patch -p1 --forward --fuzz=0 --batch" in dockerfile

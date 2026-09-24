@@ -135,7 +135,8 @@ else
   # must not reuse a tag the nodes already hold.
   POSTGRES_INPUTS="$(cd "${ROOT_DIR}/deploy/postgres" \
     && find Dockerfile vchord_bm25 -type f | LC_ALL=C sort \
-    | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done | cksum | cut -d' ' -f1)"
+    | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done \
+    | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
   POSTGRES_IMAGE="${REGISTRY}/akb-postgres:pg16-${POSTGRES_INPUTS}"
   echo "=== Building Docker images (${IMAGE_PLATFORM}) — version ${VERSION} ==="
   docker buildx build --platform "${IMAGE_PLATFORM}" \

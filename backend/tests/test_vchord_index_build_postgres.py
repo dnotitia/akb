@@ -9,10 +9,11 @@ Its VACUUM also subtracted a length code instead of a length from the sum the
 average document length comes from (akb#684). The image deploy/postgres builds
 carries both fixes.
 
-The exact scan (`bm25_limit = -1`) reads every posting and is the reference.
-A block summary is exact when it is written. A later large change in the
-average document length can still make one underestimate, so these compare
-right after the index is written.
+The ranking tests compare with the exact scan (`bm25_limit = -1`), which reads
+every posting. A block summary is exact when it is written, and a later large
+change in the average document length can still make one underestimate, so
+they compare right after the index is written. The VACUUM test compares the
+metapage's length sum.
 
 Requires the extension-capable server (AKB_VCHORD_TEST_DSN, the image
 deploy/postgres builds). Each test creates and drops its own database.
@@ -114,9 +115,11 @@ def _worse_ranks(bounded: list[float], exact: list[float]) -> int:
 
     Scores are negative and ascending, so worse is greater. Comparing scores
     rather than row ids ignores ties, which either scan may order differently.
+    The tolerance is relative: scores are small, and one document scores the
+    same bits in both scans.
     """
     padded = bounded + [0.0] * (len(exact) - len(bounded))
-    return sum(1 for b, e in zip(padded, exact) if b > e + 1e-6)
+    return sum(1 for b, e in zip(padded, exact) if b > e + abs(e) * 1e-5)
 
 
 async def test_blocks_whose_best_posting_comes_last_stay_reachable():
@@ -171,20 +174,24 @@ async def test_blocks_the_seal_writes_keep_their_best_posting():
 
 
 async def test_vacuum_takes_back_the_length_an_insert_added():
-    """VACUUM leaves the sum of document lengths as the remaining rows have it (akb#684).
+    """VACUUM subtracts exactly what the build and the insert added (akb#684).
 
-    The metapage's doc_term_cnt is that sum, and BM25 takes the average document
-    length from it. An insert adds the exact length. Upstream 0.3.0's VACUUM
-    subtracted the document's one-byte length code instead: at a length of 64
-    that code is 50, so 14 of every deleted document's 64 stayed. The index
-    stores only the code, so the fix subtracts the length the code stands for,
-    which at a bucket start such as 64 is all of it.
+    The metapage's doc_term_cnt is the sum of document lengths, and BM25 takes
+    the average document length from it. The index stores a one-byte length
+    code per document, which keeps lengths up to 40 and rounds longer ones down
+    to their bucket's start: 139 is stored as 136, 300 as 280. Upstream 0.3.0
+    added exact lengths and VACUUM subtracted the code itself (62 for 139), so
+    every update left length behind. Every side now counts the stored length,
+    so a sum survives any number of replacements unchanged.
     """
     async with _database() as conn:
-        await _load(conn, ["{10:1,%d:9}" % (100_000 + i) for i in range(200)])
+        await _load(conn, ["{10:1,%d:138}" % (100_000 + i) for i in range(200)])  # length 139
         before = await _metapage(conn)
-        await _insert(conn, ["{20:64}"] * 500, first=1_000)
-        assert (await _metapage(conn))["doc_term_cnt"] == before["doc_term_cnt"] + 500 * 64
+        assert before["doc_term_cnt"] == 200 * 136  # the build counts stored lengths
+        lengths = {64: 64, 139: 136, 300: 280}  # length: stored length
+        await _insert(conn, ["{20:%d}" % n for n in lengths for _ in range(100)], first=1_000)
+        added = (await _metapage(conn))["doc_term_cnt"] - before["doc_term_cnt"]
+        assert added == 100 * sum(lengths.values())  # and so does the insert
         await conn.execute("DELETE FROM vector_index.chunks WHERE chunk_index >= 1000")
         await conn.execute("VACUUM vector_index.chunks")
         after = await _metapage(conn)
@@ -193,7 +200,7 @@ async def test_vacuum_takes_back_the_length_an_insert_added():
     assert after["doc_term_cnt"] == before["doc_term_cnt"], after["doc_term_cnt"] - before["doc_term_cnt"]
 
 
-async def test_a_corpus_built_by_create_index_ranks_like_the_exact_scan():
+async def test_a_corpus_built_over_existing_rows_ranks_like_the_exact_scan():
     """A skewed random corpus, compared with the exact scan query by query.
 
     The same shape as the measurement on a production-sized index. With this

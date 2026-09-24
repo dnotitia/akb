@@ -18,21 +18,25 @@ after 0.3.0 fixes them.
   block's best posting. A bounded search then skipped such blocks, and a page,
   full or short, could miss better matches. On a 2.1M-chunk index, 7 of 159
   sampled terms had a worse top-90.
-- **VACUUM (akb#684).** It subtracted a deleted document's one-byte length code
-  instead of its length from the sum the average document length comes from.
-  The average grew with every update and delete until the index was rebuilt,
-  and length normalisation skewed with it.
+- **Length statistics (akb#684).** VACUUM subtracted a deleted document's
+  one-byte length code instead of its length from the sum the average document
+  length comes from. The average grew with every update and delete until the
+  index was rebuilt, and length normalisation skewed with it. Now the build,
+  the insert and VACUUM all count the length the index stores for a document,
+  so VACUUM takes back exactly what was added. The average is the mean of the
+  lengths BM25 scores with, a little below the mean of exact lengths.
 
 What changes:
 
 - **`deploy/postgres/Dockerfile` compiles the extension** from the 0.3.0 source
   with both fixes, in `deploy/postgres/vchord_bm25/`, instead of copying the
   upstream binary.
-  - Its inputs are pinned:
+  - What decides the extension is pinned:
     - the source tarball, by sha256;
     - Rust 1.91.1, by digest (the compiler of the upstream binary);
     - the crates, by a committed `Cargo.lock`;
     - the PostgreSQL headers, at exactly the base's server version.
+  - The Debian toolchain follows bookworm's point releases.
   - The first build compiles the extension. That takes under a minute on a
     many-core host and several minutes on a laptop.
 - **CI tests that image.** Its VChord test lane used to run the upstream image,
@@ -44,7 +48,7 @@ What changes:
   docs that described it as a limit now describe the fixes.
 
 **Upgrading**: an index that the upstream binary built or vacuumed keeps its
-summaries and its inflated average until it is rebuilt. After moving to the new
+summaries and its length sum until it is rebuilt. After moving to the new
 image, run `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
 A new database's index needs nothing.
 

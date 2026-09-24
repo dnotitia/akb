@@ -4,7 +4,7 @@ This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25)
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
 in a block-max index. The Dockerfile compiles it from the 0.3.0 source with two
 fixes, described under [Index builds](#index-builds-akb679) and
-[VACUUM statistics](#vacuum-statistics-akb684). With `vector_store_sparse_shape: auto`, the default, a new
+[Document length statistics](#document-length-statistics-akb684). With `vector_store_sparse_shape: auto`, the default, a new
 database on a server that provides it gets the `vchord` shape. Posting stores
 application-computed weights; identical rankings across the two scorers are not
 a compatibility guarantee.
@@ -44,7 +44,7 @@ This directory is the build context: the Dockerfile copies `vchord_bm25/` from
 it. The first build compiles the extension, which takes under a minute on a
 many-core host and several on a laptop.
 
-Every input that decides the bytes is pinned:
+What decides the extension is pinned:
 
 | Input | Pin |
 | --- | --- |
@@ -54,10 +54,14 @@ Every input that decides the bytes is pinned:
 | Crates | `vchord_bm25/Cargo.lock`, built `--locked`; 0.3.0 ships no lockfile |
 | The fixes | `vchord_bm25/*.patch`, applied with `set -e` and `--fuzz=0` so a patch that no longer fits fails the build |
 
-The PostgreSQL headers are those of exactly the base's server version, from the
-PGDG archive, and bindgen uses the LLVM those headers depend on. The SQL install
-and upgrade scripts and the control file come from the source tree and are
-byte-identical to the upstream release's.
+The PostgreSQL headers are those of exactly the base's server version. PGDG's
+main repository carries the last few releases of a major, and its archive
+carries all of them, so the pin keeps resolving after main drops this release;
+a source that cannot be read fails the build. bindgen uses the LLVM those
+headers depend on. The SQL install and upgrade scripts and the control file
+come from the source tree and are byte-identical to the upstream release's.
+The Debian toolchain (gcc, libc, LLVM 19) follows bookworm's point releases, so
+a later build can differ in bytes, though not in source.
 
 The base references are multi-architecture indexes, so
 `--platform linux/amd64,linux/arm64` works, but compiling a platform under
@@ -167,40 +171,62 @@ REINDEX INDEX CONCURRENTLY vector_index.idx_vi_chunks_bm25;
 
 Use the installation's `vector_store_schema` in place of `vector_index`.
 
-## VACUUM statistics (akb#684)
+## Document length statistics (akb#684)
 
 The metapage keeps the sum of document lengths, and BM25 takes the average
-document length from it. An insert adds a document's exact length. Upstream
-0.3.0's VACUUM subtracted the document's one-byte length code instead. The code
-equals the length only up to 40: 136 to 143 is code 62, 300 is code 72. Every
-update and delete therefore left length behind, and the average grew until the
-index was rebuilt. That skews length normalisation and, with it, the exact
-ranking.
+document length from it. The index stores a one-byte length code per document,
+which keeps lengths up to 40 and rounds longer ones down to their bucket's
+start: 139 is stored as 136, 300 as 280.
 
-`vchord_bm25/0002-vacuum-subtracts-document-length.patch` subtracts the length
-the code stands for. The index stores only the code, so a deleted document now
-leaves less than its bucket's width behind: under 7 at a length of 139, rather
-than about 77. At a length that starts a bucket, such as 64, it leaves nothing.
-A rebuild resets the sum exactly.
+Upstream 0.3.0 added exact lengths on insert and build, and VACUUM subtracted
+the code itself: 62 for a document of length 139. Every update and delete
+therefore left length behind (1 at 41, 14 at 64, 77 at 139), and the average
+grew until the index was rebuilt. Subtracting the code's length instead would
+still leave up to a bucket's width per replaced document, 3 to 4% of the
+average for each replacement of the whole corpus.
+
+`vchord_bm25/0002-count-stored-document-lengths.patch` makes the build, the
+insert and VACUUM all count the stored length. What VACUUM subtracts is exactly
+what was added, however often a document is replaced. The average is now the
+mean of the lengths BM25 scores documents with, a little below the mean of
+exact lengths. On an index the upstream binary built, a `REINDEX` moves it down
+once by that difference.
 
 ## What a bounded scan can still differ on
 
 A block summary is the block's best posting, chosen with the average document
 length of the moment it is written. BM25 at query time uses the current average,
 so a large change in that average can make an old summary underestimate its
-block. With the VACUUM fix, the average moves only as the corpus itself changes.
-`REINDEX INDEX CONCURRENTLY` rewrites every summary with the current average.
+block. With the length statistics fixed, the average moves only as the corpus
+itself changes. `REINDEX INDEX CONCURRENTLY` rewrites every summary with the
+current average.
+
+## Known limits in the extension
+
+- **VACUUM stalls search** (akb#687). The index's VACUUM holds the metapage for
+  its whole pass, which visits every document id the index has assigned. A
+  search that starts meanwhile waits for the pass to end: 3 s for a million
+  documents.
+- **VACUUM's counts are not crash-safe** (akb#687). A backend killed during the
+  pass keeps its delete marks and loses its count update. The counts stay too
+  high until a rebuild. A cancelled VACUUM is safe.
+- **Sealing stalls search.** Inserts collect in a growing segment that every
+  search reads. The insert that seals it holds searches for the duration; one
+  seal of 19,691 rows took 24.7 s.
 
 ## Tests
 
-`test_vchord_index_build_postgres.py` holds both fixes. Each test compares with
-the exact scan right after the index is written:
+`test_vchord_index_build_postgres.py` holds both fixes:
 
-- blocks whose last posting is the best, built by `REINDEX`;
-- the same rows sealed by inserts, the path that never had the defect;
-- a VACUUM that must take back exactly the length an insert added;
-- a 20,000-document corpus, one term at a time and in queries of two or three
-  terms.
+- blocks whose last posting is the best, built by `REINDEX`, compared with the
+  exact scan;
+- the same rows sealed by inserts, the path that never had the defect, compared
+  with the exact scan;
+- the metapage's length sum through a build, inserts and a VACUUM, which must
+  take back exactly what was added, at lengths that are bucket starts and at
+  lengths that are not;
+- a 20,000-document corpus built over existing rows, compared with the exact
+  scan one term at a time and in queries of two or three terms.
 
 Upstream 0.3.0 fails all but the sealed case. Drop a patch only when a new
 upstream pin passes its test without it.

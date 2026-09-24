@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -257,7 +258,7 @@ def test_deployer_builds_the_extension_image_and_deploys_it(tmp_path: Path):
     stream = b"".join(
         str(p.relative_to(context)).encode() + b"\n" + p.read_bytes() for p in inputs if p.is_file()
     )
-    checksum = subprocess.run(["cksum"], input=stream, capture_output=True, check=True).stdout.split()[0].decode()
+    checksum = hashlib.sha256(stream).hexdigest()[:16]
     image = f"registry.example/akb-postgres:pg16-{checksum}"
     postgres_builds = [line for line in builds.read_text().splitlines() if image in line]
     assert len(postgres_builds) == 1, builds.read_text()

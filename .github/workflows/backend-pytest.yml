@@ -86,9 +86,10 @@ jobs:
       # a different reason.
       #
       # It is the image the install paths build, from deploy/postgres: the
-      # production pgvector base plus vchord_bm25 compiled with the akb#679
-      # fix. A prebuilt upstream image would test an extension build that no
-      # installation runs, and the one this lane used to pull has the defect.
+      # production pgvector base plus vchord_bm25 compiled with the akb#679 and
+      # akb#684 fixes. A prebuilt upstream image would test an extension build
+      # that no installation runs, and the one this lane used to pull has both
+      # defects.
       #
       # It runs with the plain `postgres` command, as installations do: no
       # `shared_preload_libraries`. Without a preload the extension's settings
