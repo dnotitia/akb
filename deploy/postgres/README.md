@@ -2,9 +2,10 @@
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
-in a block-max index. The Dockerfile compiles it from the 0.3.0 source with two
-fixes, described under [Index builds](#index-builds-akb679) and
-[Document length statistics](#document-length-statistics-akb684). With `vector_store_sparse_shape: auto`, the default, a new
+in a block-max index. The Dockerfile compiles it from the 0.3.0 source with four
+fixes, described under [Index builds](#index-builds-akb679),
+[Document length statistics](#document-length-statistics-akb684) and
+[VACUUM](#vacuum-akb687). With `vector_store_sparse_shape: auto`, the default, a new
 database on a server that provides it gets the `vchord` shape. Posting stores
 application-computed weights; identical rankings across the two scorers are not
 a compatibility guarantee.
@@ -124,9 +125,12 @@ tokenizer stays exactly where it is.
 
 The sparse query path filters on the sign of the score: a document holding any
 query term scores strictly negative, one holding none scores exactly `-0`, and
-the filter keeps the negatives. That holds because this extension's IDF is a
-log1p variant which stays positive at every document frequency — measured at
-`df = N`, all fifty matching documents still scored below zero.
+the filter keeps the negatives. That holds because this extension's IDF,
+`ln((N + 1) / (df + 0.5))`, stays positive while `df` does not exceed `N` —
+measured at `df = N`, all fifty matching documents still scored below zero.
+`0005` (below) holds a `df` that runs ahead of `N` at `N`, which happens until
+an interrupted VACUUM's recount is finished, and computes the ratio in f64, so
+the IDF stays positive at every `df` and every `N`.
 
 Classic BM25 IDF, `log((N-df+0.5)/(df+0.5))`, turns negative once a term is in
 more than half the corpus. An extension version that switched to it would make
@@ -135,8 +139,8 @@ terms most queries contain.
 
 So when moving this pin, check that a document containing a query term still
 scores below zero at high document frequency before accepting the bump. Then
-run `test_vchord_index_build_postgres.py` against the new version with and
-without the patches; see [Tests](#tests).
+run `test_vchord_index_build_postgres.py` and `test_vchord_vacuum_postgres.py`
+against the new version with and without the patches; see [Tests](#tests).
 
 ## Index builds (akb#679)
 
@@ -193,6 +197,83 @@ exact lengths. An index the upstream binary built keeps its sum as it was,
 neither growing further nor healing, until a `REINDEX` moves it down once: by
 that difference, plus whatever the upstream VACUUM had added.
 
+## VACUUM (akb#687)
+
+VACUUM reaches the index in two steps. The bulk delete marks the documents whose
+rows it removes, and the cleanup recounts how many live documents hold each
+term. A search reads the index's metapage for its whole scan and an insert
+writes it, and upstream 0.3.0 held the metapage through both steps.
+
+- **The bulk delete** held it for a pass over every document id the index has
+  assigned, so a search that started meanwhile waited for the whole pass: 3 s
+  for a million documents. The pass logged each delete mark as it went and the
+  counts once, at the end. A backend killed mid-pass kept its marks and lost the
+  counts, and the next VACUUM skipped the marked documents, so the counts stayed
+  too high until a rebuild.
+- **The cleanup** visited every term id below the largest one indexed, not just
+  the terms that exist, and stored each count with its own page write and WAL
+  record. It could not be cancelled. At 728,984,818 term ids it stalled searches
+  for 44 minutes and inserts for 48, wrote 35.4 GiB of WAL, and allocated
+  2.72 GiB outside `maintenance_work_mem`.
+
+`vchord_bm25/0003-mark-deletions-a-bitmap-page-at-a-time.patch` works through one
+delete bitmap page (65,280 document ids) at a time. It finds the page's dead
+documents with no lock held, then sets their marks and takes them off the counts
+under one WAL record. A crash keeps both or neither, and a VACUUM that runs
+again after a crash or a cancel takes no document off twice.
+
+`vchord_bm25/0004-recount-term-statistics-a-page-at-a-time.patch` recounts one
+term statistic page (2,040 term ids) at a time. It holds the metapage only while
+it reads a page's stored counts, writes a page only if a count on it changed,
+and holds no buffer lock from one page to the next. Searches and inserts go on,
+and a cancel stops it at the next page. It holds the seal lock throughout, so an
+insert that would seal the growing segment skips sealing until the recount ends.
+
+A recount that a cancel or a crash cuts short leaves the statistics it has not
+reached still counting the deleted documents. Upstream recounted only when the
+same VACUUM removed documents, so a VACUUM that found every dead document
+already marked, or had none, never repaired them. The bulk delete now records,
+in the WAL record that takes documents off the counts, that a recount is owed,
+and only a recount that reaches its last page clears it. The next VACUUM that
+cleans up the index, autovacuum included, finishes the recount whatever it
+removes; one run with `INDEX_CLEANUP OFF`, or stopped by the wraparound
+failsafe, leaves it for the one after, and ANALYZE never runs it. Measured on 100,000 documents with 40,000 deleted, the VACUUM
+backend killed during the recount and then a VACUUM with nothing to remove:
+42,001 statistics stayed too high under the upstream condition, none with this.
+
+`vchord_bm25/0005-keep-idf-positive-when-a-statistic-runs-ahead.patch` covers
+the time until then. A term whose statistic still counts deleted documents can
+show more documents than remain, and its IDF went negative: a search for that
+term alone found nothing, 0 rows where 10 were due in the same shape. The IDF
+now holds the statistic at the document count, and takes its ratio in f64. On
+a settled index nothing moves beyond f32 rounding: 58 queries kept their top 20
+in the same order, and no score in them moved by more than 1.4e-7 of itself. A
+term in nearly every document moves by up to about 0.2%, the same for every
+document that holds it, so no order changes. The seal path uses the same IDF
+for block summaries, and a seal while a statistic ran ahead recorded summaries
+that bounded scans then skipped for good: the best document was missing from a
+bounded top 10 even after the recount. 0005 prevents that.
+
+| | 0.3.0 with 0001 and 0002 | This image |
+| --- | --- | --- |
+| A search started during the bulk delete (1M documents, 800,000 deleted) | 2.86 s | 0.001 s |
+| `doc_cnt` after a kill mid-pass and the next VACUUM (200,000 true) | 419,689 | 200,000 |
+| The cleanup at 728,984,818 term ids | 2,906 s | 2.7 s |
+| The longest search during that cleanup | 2,633 s | 0.002 s |
+| Its WAL and the backend's memory | 35.4 GiB, 2.72 GiB | 0.3 MiB, 3.4 MiB |
+| A cancel during the cleanup (3M term ids) takes effect after | 10.8 s | 0.001 s |
+
+Its reads still follow the largest term id. The cleanup reads the whole term
+information array, 4 bytes per id: 2.7 s at 729M ids, 17.5 s under autovacuum's
+default cost delay. A statistic page it writes carries a full-page image after
+each checkpoint, so over a sparse id space, where most terms sit alone on their
+page, one VACUUM of 40,000 documents wrote 2.75 GiB.
+
+On this image, the fix itself needs no rebuild. Two kinds of damage an older
+build left keep until `REINDEX INDEX CONCURRENTLY`: counts a crash damaged
+under the upstream binary, and block summaries sealed while a term's statistic
+ran ahead of the document count.
+
 ## What a bounded scan can still differ on
 
 A block summary is the block's best posting, chosen with the average document
@@ -204,20 +285,28 @@ current average.
 
 ## Known limits in the extension
 
-- **VACUUM stalls search** (akb#687). The index's VACUUM holds the metapage for
-  its whole pass, which visits every document id the index has assigned. A
-  search that starts meanwhile waits for the pass to end: 3 s for a million
-  documents.
-- **VACUUM's counts are not crash-safe** (akb#687). A backend killed during the
-  pass keeps its delete marks and loses its count update. The counts stay too
-  high until a rebuild. A cancelled VACUUM is safe.
+- **Term ids at or above 2^30.** The index addresses its per-term arrays with
+  32-bit byte offsets at 4 bytes per id, and the release build does not check
+  the multiplication. An id of 1,073,741,824 or more therefore lands on the id
+  2^30 below it, whichever way the document arrived:
+  - built over existing rows (`CREATE INDEX`, `REINDEX`, every `pg_restore`), a
+    search for the high id reads the lower id's entries, and the document that
+    holds the high id cannot be found through it;
+  - inserted and then sealed, its posting joins the lower id's list and its
+    document the lower id's count, so searches for the lower term rank a
+    document that does not hold it, and both terms' IDF is wrong.
+  AKB draws term ids from `bm25_term_id_seq`, which has to stay below 2^30.
+- **The recount blocks sealing while it runs.** It holds the seal lock from its
+  first page to its last, so the growing segment, which every search reads in
+  full, keeps growing until it ends.
 - **Sealing stalls search.** Inserts collect in a growing segment that every
   search reads. The insert that seals it holds searches for the duration; one
   seal of 19,691 rows took 24.7 s.
 
 ## Tests
 
-`test_vchord_index_build_postgres.py` holds both fixes:
+`test_vchord_index_build_postgres.py` holds the fixes for builds and length
+statistics:
 
 - blocks whose last posting is the best, built by `REINDEX`, compared with the
   exact scan;
@@ -229,8 +318,22 @@ current average.
 - a 20,000-document corpus built over existing rows, compared with the exact
   scan one term at a time and in queries of two or three terms.
 
-Upstream 0.3.0 fails all but the sealed case. Drop a patch only when a new
-upstream pin passes its test without it.
+`test_vchord_vacuum_postgres.py` holds the VACUUM fixes:
+
+- a cancel during the bulk delete stops it within a second, and the next VACUUM
+  leaves the counts exact;
+- no search waits for the bulk delete;
+- the cleanup over a term id space of 20,000,001 finishes in seconds, no search
+  waits for it, and every term's statistic matches the rows;
+- a VACUUM cancelled after its bulk delete, then one cancelled during its
+  recount, then one with nothing to remove: meanwhile a search for a term in
+  every document still finds its rows, and the last VACUUM leaves every
+  statistic exact.
+
+Upstream 0.3.0 fails all but the sealed case of the first file. Without 0003 and
+0004, the first three tests of the second fail; without the owed recount in
+0004 or without 0005, the fourth does. Drop a patch only when a new upstream pin
+passes its test without it.
 
 ## Licensing
 

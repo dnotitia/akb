@@ -1,5 +1,5 @@
 # AKB's PostgreSQL: the pinned pgvector image plus the vchord_bm25 BM25 index
-# extension, compiled here from its source with two fixes.
+# extension, compiled here from its source with five fixes.
 #
 # The repository's install paths build this image where they run it: Compose,
 # deploy/k8s/deploy.sh, the Helm and Native Kubernetes install commands, and the
@@ -10,7 +10,7 @@
 # published all-in-one image does not include the extension; see the licensing
 # note below.
 #
-# WHY IT IS COMPILED HERE. vchord_bm25 0.3.0 has two defects that AKB's default
+# WHY IT IS COMPILED HERE. vchord_bm25 0.3.0 has defects that AKB's default
 # sparse shape runs into, and no release after 0.3.0 fixes them:
 #   * 0001: building an index over existing rows (CREATE INDEX, REINDEX, and so
 #     every pg_restore) saves a full block's score summary before it records the
@@ -21,6 +21,23 @@
 #     of its length, so the index's average document length inflated with every
 #     update and delete (akb#684). Every side now counts the length the index
 #     stores, so what VACUUM subtracts is exactly what was added.
+#   * 0003: VACUUM's bulk delete held the index metapage for its whole pass, so
+#     every search and insert waited for it: 3 s for a million documents. It
+#     logged each delete mark on its own and the counts once at the end, so a
+#     backend killed mid-pass left the counts too high for good (akb#687). It
+#     now marks one delete bitmap page at a time, and logs the page's marks and
+#     the counts they take off in one record.
+#   * 0004: VACUUM's cleanup recounted every term id up to the largest one
+#     indexed, holding the metapage, with a page write and a WAL record per id.
+#     At 729M term ids that stalled search for 44 minutes, wrote 35 GiB of WAL,
+#     allocated 2.7 GiB, and could not be cancelled (akb#687). It now recounts
+#     a term statistic page at a time, holds no buffer lock from one page to the
+#     next, and writes only the pages whose counts changed. A recount that a
+#     cancel or a crash cuts short stays owed until the next VACUUM finishes it.
+#   * 0005: until then a term's statistic can exceed the document count, and the
+#     IDF went negative: a search for that term alone found nothing (akb#687).
+#     The IDF now holds the statistic at the document count, and takes its
+#     ratio in f64, where in f32 it rounded to 0 past about 8.4M documents.
 # Drop a patch when an upstream release carries its fix; deploy/postgres/README.md
 # says how to check.
 #

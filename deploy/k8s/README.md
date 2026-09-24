@@ -120,7 +120,7 @@ bash deploy/k8s/deploy.sh
 Without `SKIP_BUILD=true`, set `REGISTRY`; the script builds and pushes the
 backend, the frontend and `akb-postgres`. `akb-postgres` is
 `deploy/postgres/Dockerfile`: the pinned pgvector image plus the `vchord_bm25`
-BM25 index, compiled from source with the akb#679 and akb#684 fixes, which gives a new
+BM25 index, compiled from source with the akb#679, akb#684 and akb#687 fixes, which gives a new
 database the default `vchord` sparse shape. Its tag comes from its build inputs
 (the Dockerfile and `deploy/postgres/vchord_bm25/`), so an AKB upgrade that
 leaves them unchanged does not restart PostgreSQL. With `SKIP_BUILD=true`, `POSTGRES_IMAGE`
