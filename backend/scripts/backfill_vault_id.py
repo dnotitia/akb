@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.config import settings
 from app.db.postgres import get_pool, init_db, close_pool
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import decide_sparse_shape_for_settings, get_vector_store
 from app.services.vector_store.pgvector import PgvectorStore
 
 _BATCH = 5000
@@ -54,6 +54,8 @@ _SOURCE_MAP_SQL = """
 
 
 async def _vector_pool():
+    # The store needs a decided shape, as it does at application startup.
+    await decide_sparse_shape_for_settings()
     store = get_vector_store()
     if not isinstance(store, PgvectorStore):
         raise SystemExit(

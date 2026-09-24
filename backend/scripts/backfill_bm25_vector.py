@@ -58,6 +58,11 @@ as a candidate next window, not a proof that concurrent writes are covered:
     flip vector_store_sparse_shape to vchord
     --since <protected instant>    covers index build AND the entire rollout
 
+"Flip" means naming `vchord` in the setting. Under the default `auto` a
+database that has a `posting` table stays on `posting` however far this runbook
+has got; once the setting names `vchord` and the backend has started with it,
+the recorded shape is `vchord` and `auto` follows it from then on.
+
 Do not replace the protected instant with the flip time: that drops edits made
 during index construction. `indexed_at = NOW()` records transaction START, not
 commit; a writer begun before a candidate window may commit after the sweep
@@ -128,7 +133,7 @@ from scripts.bm25_sweep_checkpoint import SweepCheckpoint, open_checkpoint
 from app.config import settings
 from app.db.postgres import close_pool, init_db
 from app.services import sparse_encoder
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import decide_sparse_shape_for_settings, get_vector_store
 from app.services.vector_store.pgvector import _bm25vector_literal, PgvectorStore
 
 # Rows read per round trip. The write is one statement over the batch; the
@@ -188,6 +193,8 @@ async def _vector_pool(writers: int = 1):
     taking them from the thing this migration is supposed to leave alone.
     Two extra connections remain reserved for migration ownership guards.
     """
+    # The store needs a decided shape, as it does at application startup.
+    await decide_sparse_shape_for_settings()
     store = get_vector_store()
     if not isinstance(store, PgvectorStore):
         raise SystemExit(

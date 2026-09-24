@@ -21,19 +21,24 @@ from typing import get_args
 import pytest
 
 from app.config import Settings
-from app.services.sparse_shapes import SPARSE_SHAPES, SparseShape
+from app.services.sparse_shapes import SPARSE_SHAPES, SparseShape, SparseShapeSetting
 from app.services.vector_store import pgvector
 
 
 def test_the_members_are_declared_once():
-    """The setting and the driver argument read the same type, not two copies."""
+    """The setting and the driver argument read the same shapes, not two copies.
+
+    The setting accepts exactly one value more than the driver: `auto`, which
+    startup turns into a shape before any store is built. Anything else the
+    setting accepted and the driver did not would be a value with no branch."""
     assert SPARSE_SHAPES == get_args(SparseShape)
     field = Settings.model_fields["vector_store_sparse_shape"]
     # Equality, not identity — and deliberately, because identity cannot tell
     # the two apart. `typing` caches `Literal`, so a restated
     # `Literal["posting", "arrays"]` IS the shared object. What this catches is
     # the thing that actually hurts: the two disagreeing about members.
-    assert get_args(field.annotation) == get_args(SparseShape), (
+    assert field.annotation is SparseShapeSetting
+    assert get_args(field.annotation) == ("auto", *get_args(SparseShape)), (
         "설정과 드라이버가 서로 다른 멤버를 보고 있다 — 한쪽에 더하면 "
         "다른 쪽은 조용히 폴백한다"
     )

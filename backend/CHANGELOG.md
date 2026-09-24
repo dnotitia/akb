@@ -7,6 +7,53 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### New databases use the `vchord` sparse shape where the server provides it
+
+`vector_store_sparse_shape` and `bm25_external_stats_mode` now default to
+`auto`. The `vchord` shape answers the searches that took `posting` longest: on
+a 2.1M-chunk corpus, the same 160 search pairs measured sparse-leg p50/p90/max
+of 0.13/1.31/8.88 s under `posting` and 0.09/0.76/2.50 s under `vchord`, with
+the top result the same in 154 of 156. It also has no corpus-wide statistics
+recompute to run.
+
+- **Decided once per database, at startup, before the vector store is built**,
+  by API and worker processes alike. The first successful schema setup records
+  the shape in `<vector_store_schema>.install_state`. In order:
+  1. the recorded shape;
+  2. a `posting` table → `posting`;
+  3. the BM25 index → `vchord`, the `arrays` columns → `arrays`;
+  4. a new database → `vchord` where the server provides `vchord_bm25` to AKB's
+     role, `posting` otherwise.
+
+  A populated `chunks` table with none of those signatures, or an installed
+  extension that AKB's role cannot use, stops startup with a message that names
+  the fix. Guessing there would serve empty search while readiness stayed green.
+- **Existing installations keep their shape.** A database that has served
+  `posting` stays on it on any image. Moving it is still
+  `scripts/backfill_bm25_vector.py` and then an explicit
+  `vector_store_sparse_shape: vchord`; after that, `auto` follows the recorded
+  shape. A configuration that names a shape behaves as before, and is recorded
+  too.
+- **The shipped configurations now say `auto`** (compose example, Helm, the
+  Kubernetes manifests, all-in-one). The stock `pgvector/pgvector` image they
+  run does not provide the extension, so their new databases still get
+  `posting` until they run an image that does, such as `deploy/postgres/`.
+- **The extension needs a superuser to create.** Where AKB's role is not one, a
+  superuser runs `CREATE EXTENSION vchord_bm25` and
+  `GRANT USAGE ON SCHEMA bm25_catalog TO <role>` before AKB first starts on the
+  database; without the GRANT, a plain role cannot set the shape up.
+- **External statistics under `auto`**: a `vchord` database with no `posting`
+  table has nothing that reads them, so neither the startup nor the periodic
+  recompute runs. Where a `posting` table exists they are kept, and the table is
+  written, exactly as under `required`.
+- `/health` reports `vector_store.sparse_shape`: `configured`, `effective`,
+  `decided_by`, `posting_table_present` and a one-line note.
+
+Upgrade note: under `auto`, startup reads the vector database before building
+the store. With a separate `vector_store_dsn` that cannot be reached, startup
+now fails instead of starting with sparse search unavailable. A configuration
+that names a shape starts as before and keeps the external statistics.
+
 ### The `vchord` sparse shape completes a short page instead of calling it degraded (akb#673)
 
 When the index-led page for a scope came back short, the driver widened its

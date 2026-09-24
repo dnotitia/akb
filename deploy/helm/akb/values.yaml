@@ -47,7 +47,9 @@ app:
     driver: pgvector
     dsn: ""
     schema: vector_index
-    sparseShape: posting
+    # auto: a database that already serves a shape keeps it; a new one gets
+    # vchord where the PostgreSQL image provides vchord_bm25, posting otherwise.
+    sparseShape: auto
     url: ""
     collection: chunks
   redis:

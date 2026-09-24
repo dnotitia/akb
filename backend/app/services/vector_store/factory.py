@@ -11,12 +11,16 @@ Driver matrix:
 | `seahorse-db`         | `seahorsedb_coordinator_url` (single Coral HTTP URL)       |
 
 The driver and sparse-shape values are validated at config load
-(pydantic Literals); the factory only needs to dispatch.
+(pydantic Literals); the factory only needs to dispatch. The one exception is
+`vector_store_sparse_shape: auto`, a property of the database rather than of
+the configuration: `decide_sparse_shape_for_settings` settles it at startup,
+before the store is built, and building one from an undecided `auto` is refused.
 """
 
 from __future__ import annotations
 
-from app.config import settings
+from app.config import Settings, settings
+from app.services.sparse_shapes import SparseShapeDecision
 
 from .base import VectorStore
 
@@ -47,14 +51,13 @@ def get_vector_store() -> VectorStore:
     elif driver == "pgvector":
         from .pgvector import PgvectorStore
 
-        # `required` keeps posting's statistics fresh for a rollback; the
-        # posting rows follow them, or the way back decays from the day of
-        # the flip (akb#615).
+        shape = settings.effective_sparse_shape
+        # While anything reads posting's statistics — `required`, or `auto`
+        # over a database that has a `posting` table — the posting rows follow
+        # every write, or the way back decays from the day of the flip
+        # (akb#615). A new vchord database has no such table and no reader.
         posting_weights = None
-        if (
-            settings.vector_store_sparse_shape == "vchord"
-            and settings.bm25_external_stats_mode == "required"
-        ):
+        if shape == "vchord" and settings.bm25_external_stats_consumers:
             from app.services.sparse_encoder import saturate_for_posting
 
             posting_weights = saturate_for_posting
@@ -65,7 +68,7 @@ def get_vector_store() -> VectorStore:
             dsn=settings.vector_store_dsn or None,
             schema=settings.vector_store_schema,
             dense_dim=settings.embed_dimensions,
-            sparse_shape=settings.vector_store_sparse_shape,
+            sparse_shape=shape,
             get_main_pool=get_pool,
             posting_weights=posting_weights,
         )
@@ -139,6 +142,42 @@ def get_vector_store() -> VectorStore:
         raise RuntimeError(f"Unknown vector_store_driver: {driver!r}")
 
     return _singleton
+
+
+async def decide_sparse_shape_for_settings(
+    configured: Settings | None = None,
+) -> SparseShapeDecision | None:
+    """Settle the sparse shape for this database before the store is built.
+
+    pgvector only; any other driver returns None. Reads the vector database:
+    `vector_store_dsn` when set, the main pool otherwise. Also learns whether a
+    `posting` table exists, which the external-statistics policy needs even
+    when the shape is configured. Safe to call again; it re-reads."""
+    target = configured if configured is not None else settings
+    if target.vector_store_driver != "pgvector":
+        return None
+    from .sparse_shape_state import decide_sparse_shape
+
+    if target.vector_store_dsn:
+        import asyncpg
+
+        conn = await asyncpg.connect(target.vector_store_dsn)
+        try:
+            decision = await decide_sparse_shape(
+                conn, schema=target.vector_store_schema, configured=target.vector_store_sparse_shape
+            )
+        finally:
+            await conn.close()
+    else:
+        from app.db.postgres import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            decision = await decide_sparse_shape(
+                conn, schema=target.vector_store_schema, configured=target.vector_store_sparse_shape
+            )
+    target.apply_sparse_shape_decision(decision)
+    return decision
 
 
 def reset_singleton_for_tests() -> None:

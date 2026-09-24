@@ -521,7 +521,7 @@ def _use_raw_weights(sparse_shape: str | None = None) -> bool:
     if settings.vector_store_driver in _RAW_WEIGHT_DRIVERS:
         return True
     if settings.vector_store_driver == "pgvector":
-        shape = sparse_shape if sparse_shape is not None else settings.vector_store_sparse_shape
+        shape = sparse_shape if sparse_shape is not None else settings.effective_sparse_shape
         return shape in _RAW_WEIGHT_SHAPES
     return False
 
