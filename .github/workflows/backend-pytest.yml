@@ -86,10 +86,10 @@ jobs:
       # a different reason.
       #
       # It is the image the install paths build, from deploy/postgres: the
-      # production pgvector base plus vchord_bm25 compiled with the akb#679 and
-      # akb#684 fixes. A prebuilt upstream image would test an extension build
-      # that no installation runs, and the one this lane used to pull has both
-      # defects.
+      # production pgvector base plus vchord_bm25 compiled with the akb#679,
+      # akb#684 and akb#687 fixes. A prebuilt upstream image would test an
+      # extension build that no installation runs, and the one this lane used to
+      # pull has all three defects.
       #
       # It runs with the plain `postgres` command, as installations do: no
       # `shared_preload_libraries`. Without a preload the extension's settings
@@ -341,6 +341,7 @@ jobs:
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
             tests/test_vchord_index_build_postgres.py
+            tests/test_vchord_vacuum_postgres.py
             tests/test_vchord_encoding_contract_postgres.py
             tests/test_vchord_external_stats_postgres.py
             # Needs both servers: the decision turns on whether the server

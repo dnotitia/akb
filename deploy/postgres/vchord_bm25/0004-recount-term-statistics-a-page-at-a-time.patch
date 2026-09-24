@@ -1,0 +1,372 @@
+Recount term statistics a page at a time, without holding the metapage
+
+Applies to vchord_bm25 0.3.0 (upstream tag 0.3.0, commit c610b7ab), after 0001
+to 0003.
+
+After a VACUUM that deleted documents, amvacuumcleanup (vacuum.rs) recounted
+the number of live documents that hold each term. It held the metapage for
+reading while it counted, so inserts waited, and then for writing while it
+stored the counts, so searches waited too. Both steps visited every term id
+below term_id_cnt, which is the largest term id indexed plus one, not the
+number of terms. Storing a count cost a page write and a WAL record per term
+id, whether or not the count changed. The counts were held in one vector of
+term_id_cnt entries, outside maintenance_work_mem. Neither loop checked for
+interrupts, and the metapage lock held them off anyway, so the step could not
+be cancelled. The metapage was released and taken again between the two
+steps, so an insert that ran in between lost its counts.
+
+The recount now takes the lock an insert takes to seal the growing segment.
+An insert that cannot get that lock skips sealing, so inserts go on, and the
+sealed segment and the growing segment's pages stay where the recount reads
+them. It then works through one term statistic page (2,040 term ids) at a
+time:
+- It counts the live documents of the page's sealed terms from the term
+  information page and the posting lists, with no lock held. It copies the
+  delete bitmap once; bulk delete is over, so no bit changes.
+- It holds the metapage for reading only while it counts the documents
+  inserted since the last page and reads the page's stored counts. An insert
+  adds to the counts only while it holds the metapage for writing, so the two
+  match exactly.
+- It then writes the page, if a count on it changed, under one WAL record,
+  moving each count by the difference it measured. An insert that ran after
+  the metapage was released keeps its addition.
+- It holds no lock from one page to the next, and applies the cost-based delay
+  and checks for interrupts between pages.
+Memory is the delete bitmap, the growing segment's terms and one page of
+counts. No on-disk format or SQL changes.
+
+Measured on 100,000 documents with 20,000 deleted and one term id of
+728,984,817, so term_id_cnt was 728,984,818, unpatched then patched:
+- the cleanup: 2,906 s, then 2.7 s (17.5 s under autovacuum's cost delay);
+- the longest search: 2,633 s, then 0.002 s;
+- the longest insert: 2,906 s, then 0.008 s;
+- the WAL the VACUUM wrote: 35.4 GiB, then 0.3 MiB;
+- the VACUUM backend's anonymous memory: 2.72 GiB, then 3.4 MiB.
+
+Also measured:
+- A cancel during the cleanup, at about 3,000,000 term ids: unpatched, VACUUM
+  stopped after 10.8 s; patched, after 0.001 s.
+- Inserts running through the VACUUM, 50,000 documents over about 3,050,000
+  term ids: unpatched, 275 inserts got through and 15 term statistics were wrong
+  afterwards; patched, 8,672 got through and none was wrong. With a 2 ms pause
+  forced between reading a page and writing it, writing the new count instead
+  of the difference left 9 and 11 wrong in two runs; the difference, none.
+- 200,000 documents of 120 terms each over the same 728,984,818 term ids,
+  40,000 deleted, under autovacuum's cost delay: the cleanup took 162 s, no
+  search waited more than 0.07 s, and the WAL was 2.75 GiB, a full-page image
+  of each changed statistic page.
+
+License: this patch modifies vchord_bm25 and is offered under the same terms
+as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
+---
+diff --git a/src/index/vacuum.rs b/src/index/vacuum.rs
+index 69c6b50..adb8e37 100644
+--- a/src/index/vacuum.rs
++++ b/src/index/vacuum.rs
+@@ -1,15 +1,15 @@
+-use lending_iterator::LendingIterator;
++use std::collections::BTreeMap;
+ 
+ use crate::{
+-    page::{page_read, page_write_pair, BM25_PAGE_SIZE, METAPAGE_BLKNO},
++    datatype::Bm25VectorBorrowed,
++    page::{page_read, page_write_pair, VirtualPageReader, BM25_PAGE_SIZE, METAPAGE_BLKNO},
+     segment::{
+         delete::{mark_deleted, DeleteBitmapReader, DELETE_BITMAP_PAGE_DOCS},
+         field_norm::{id_to_fieldnorm, FieldNormRead, FieldNormReader},
+-        growing::GrowingSegmentReader,
++        growing::GrowingSegmentTail,
+         meta::MetaPageData,
+         payload::PayloadReader,
+-        sealed::SealedSegmentReader,
+-        term_stat::TermStatReader,
++        posting::{PostingCursor, PostingTermInfo},
+     },
+ };
+ 
+@@ -119,57 +119,145 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
+     }
+ 
+     let index = (*info).index;
++    // Sealing moves growing documents into the sealed segment and frees their
++    // pages. An insert seals only if it gets this lock without waiting, so
++    // holding it keeps both segments where the recount reads them, while
++    // inserts go on.
++    pgrx::pg_sys::LockPage(index, METAPAGE_BLKNO, pgrx::pg_sys::ExclusiveLock as _);
++    recount_term_stats(index);
++    pgrx::pg_sys::UnlockPage(index, METAPAGE_BLKNO, pgrx::pg_sys::ExclusiveLock as _);
+ 
+-    let metapage = page_read(index, METAPAGE_BLKNO);
+-    let meta: &MetaPageData = metapage.as_ref();
+-    let term_id_cnt = meta.term_id_cnt;
+-    let mut term_stats = (0..term_id_cnt).map(|_| 0u32).collect::<Vec<_>>();
+-    let delete_bitmap_reader = DeleteBitmapReader::new(index, meta.delete_bitmap_blkno);
++    stats
++}
++
++const TERMS_PER_PAGE: u32 = (BM25_PAGE_SIZE / std::mem::size_of::<u32>()) as u32;
+ 
+-    if let Some(growing) = meta.growing_segment.as_ref() {
+-        let reader = GrowingSegmentReader::new(index, growing);
+-        let mut doc_id = meta.sealed_doc_id;
+-        let mut iter = reader.into_lending_iter(usize::MAX);
+-        while let Some(vector) = iter.next() {
+-            if !delete_bitmap_reader.is_delete(doc_id) {
+-                for &idx in vector.indexes() {
+-                    term_stats[idx as usize] += 1;
++// Sets each term's statistic to the number of live documents that hold it, one
++// term statistic page at a time. No lock is held from one page to the next, so
++// searches and inserts go on and the recount can be cancelled between pages.
++// A page is written only if a count on it changed.
++unsafe fn recount_term_stats(index: pgrx::pg_sys::Relation) {
++    let (doc_id_end, sealed_doc_id, growing, sealed, term_id_cnt, term_stat_blkno, bitmap_blkno) = {
++        let metapage = page_read(index, METAPAGE_BLKNO);
++        let meta: &MetaPageData = metapage.as_ref();
++        (
++            meta.current_doc_id,
++            meta.sealed_doc_id,
++            meta.growing_segment,
++            meta.sealed_segment,
++            meta.term_id_cnt,
++            meta.term_stat_blkno,
++            meta.delete_bitmap_blkno,
++        )
++    };
++    // Bulk delete is over: no bit below doc_id_end changes, and none above it is set.
++    let deleted = DeleteBitmapReader::new(index, bitmap_blkno).to_bytes(doc_id_end);
++    let is_deleted = |doc_id: u32| {
++        doc_id < doc_id_end && deleted[(doc_id / 8) as usize] & (1 << (doc_id % 8)) != 0
++    };
++    // A term a deleted growing document holds is kept with no count, so its
++    // page is still visited.
++    let mut growing_terms: BTreeMap<u32, u32> = BTreeMap::new();
++    let add_terms = |growing_terms: &mut BTreeMap<u32, u32>, doc_id: u32, vector: Bm25VectorBorrowed<'_>| {
++        let live = u32::from(!is_deleted(doc_id));
++        for &term_id in vector.indexes() {
++            *growing_terms.entry(term_id).or_insert(0) += live;
++        }
++    };
++    let mut tail = GrowingSegmentTail::new(sealed_doc_id);
++    tail.read_until(index, growing.as_ref(), doc_id_end, |doc_id, vector| {
++        add_terms(&mut growing_terms, doc_id, vector)
++    });
++
++    let term_info_reader =
++        (sealed.term_id_cnt > 0).then(|| VirtualPageReader::new(index, sealed.term_info_blkno));
++    let term_stat_reader = VirtualPageReader::new(index, term_stat_blkno);
++    let mut counts = vec![None::<u32>; TERMS_PER_PAGE as usize];
++    let mut first = 0;
++    while first < term_id_cnt {
++        #[cfg(not(feature = "pg18"))]
++        pgrx::pg_sys::vacuum_delay_point();
++        #[cfg(feature = "pg18")]
++        pgrx::pg_sys::vacuum_delay_point(false);
++        let end = term_id_cnt.min(first + TERMS_PER_PAGE);
++        counts.fill(None);
++        if let Some(reader) = term_info_reader.as_ref().filter(|_| first < sealed.term_id_cnt) {
++            let mut meta_blknos = vec![0u32; (sealed.term_id_cnt.min(end) - first) as usize];
++            reader.read_at(first * 4, bytemuck::cast_slice_mut(&mut meta_blknos));
++            for (count, &meta_blkno) in counts.iter_mut().zip(&meta_blknos) {
++                if meta_blkno != pgrx::pg_sys::InvalidBlockNumber {
++                    *count = Some(count_live(index, meta_blkno, &is_deleted));
++                }
++            }
++        } else {
++            // Past the sealed terms only growing documents hold terms.
++            match growing_terms.range(first..term_id_cnt).next() {
++                Some((&term_id, _)) if term_id < end => {}
++                Some((&term_id, _)) => {
++                    first = term_id - term_id % TERMS_PER_PAGE;
++                    continue;
+                 }
++                None => break,
+             }
+-            doc_id += 1;
+         }
++        if counts.iter().all(Option::is_none) && growing_terms.range(first..end).next().is_none() {
++            first = end;
++            continue;
++        }
++        // An insert adds to the statistics only while it holds the metapage for
++        // writing, so none runs while the documents inserted since the last page
++        // are counted and this page's statistics are read. The page is written
++        // after the metapage is released, by the difference measured here, so an
++        // insert in between keeps its addition.
++        let mut stored = vec![0u32; (end - first) as usize];
++        {
++            let metapage = page_read(index, METAPAGE_BLKNO);
++            let meta: &MetaPageData = metapage.as_ref();
++            tail.read_until(index, meta.growing_segment.as_ref(), meta.current_doc_id, |doc_id, vector| {
++                add_terms(&mut growing_terms, doc_id, vector)
++            });
++            term_stat_reader.read_at(first * 4, bytemuck::cast_slice_mut(&mut stored));
++        }
++        for (&term_id, &live) in growing_terms.range(first..end) {
++            let count = &mut counts[(term_id - first) as usize];
++            *count = Some(count.unwrap_or(0) + live);
++        }
++        let changes = stored
++            .iter()
++            .zip(&counts)
++            .enumerate()
++            .filter_map(|(i, (&old, &new))| new.filter(|&new| new != old).map(|new| (i, new, old)))
++            .collect::<Vec<_>>();
++        if !changes.is_empty() {
++            term_stat_reader.update_at(first * 4, (end - first) * 4, |data| {
++                let data: &mut [u32] = bytemuck::cast_slice_mut(data);
++                for (i, new, old) in changes {
++                    data[i] = data[i] - old + new;
++                }
++            });
++        }
++        first = end;
+     }
++}
+ 
+-    let sealed_reader = SealedSegmentReader::new(index, meta.sealed_segment);
+-    for i in 0..meta.sealed_segment.term_id_cnt {
+-        let Some(mut posting) = sealed_reader.get_postings(i) else {
+-            continue;
+-        };
++fn count_live(
++    index: pgrx::pg_sys::Relation,
++    meta_blkno: pgrx::pg_sys::BlockNumber,
++    is_deleted: impl Fn(u32) -> bool,
++) -> u32 {
++    let mut posting = PostingCursor::new(index, PostingTermInfo { meta_blkno });
++    let mut live = 0;
++    loop {
++        posting.decode_block();
+         loop {
+-            posting.decode_block();
+-            loop {
+-                let doc_id = posting.docid();
+-                if !delete_bitmap_reader.is_delete(doc_id) {
+-                    term_stats[i as usize] += 1;
+-                }
+-                if !posting.next_doc() {
+-                    break;
+-                }
+-            }
+-            if !posting.next_block() {
++            live += u32::from(!is_deleted(posting.docid()));
++            if !posting.next_doc() {
+                 break;
+             }
+         }
++        if !posting.next_block() {
++            break;
++        }
+     }
+-
+-    let mut metapage = metapage.upgrade(index);
+-    let meta: &mut MetaPageData = metapage.as_mut();
+-    let term_stat_reader = TermStatReader::new(index, meta);
+-    for i in 0..term_id_cnt {
+-        term_stat_reader.update(i, |tf| {
+-            *tf = term_stats[i as usize];
+-        });
+-    }
+-
+-    stats
++    live
+ }
+diff --git a/src/segment/delete.rs b/src/segment/delete.rs
+index 9ae4d29..8b6fe6a 100644
+--- a/src/segment/delete.rs
++++ b/src/segment/delete.rs
+@@ -28,6 +28,15 @@ impl DeleteBitmapReader {
+     pub fn blkno(&self, doc_id: u32) -> pgrx::pg_sys::BlockNumber {
+         self.0.get_block_id(doc_id / DELETE_BITMAP_PAGE_DOCS)
+     }
++
++    /// The bits of the documents below `doc_id_end`, a page at a time.
++    pub fn to_bytes(&self, doc_id_end: u32) -> Vec<u8> {
++        let mut bytes = vec![0u8; doc_id_end.div_ceil(8) as usize];
++        for (i, chunk) in bytes.chunks_mut(BM25_PAGE_SIZE).enumerate() {
++            self.0.read_at((i * BM25_PAGE_SIZE) as u32, chunk);
++        }
++        bytes
++    }
+ }
+ 
+ /// Sets `doc_id`'s bit on `page`, the page `DeleteBitmapReader::blkno` names for
+diff --git a/src/segment/growing.rs b/src/segment/growing.rs
+index eef6f42..a398da2 100644
+--- a/src/segment/growing.rs
++++ b/src/segment/growing.rs
+@@ -102,6 +102,74 @@ impl GrowingSegmentReader {
+     }
+ }
+ 
++/// Reads a growing segment's documents in order and keeps its place, so a later
++/// call reads only the documents appended since.
++pub struct GrowingSegmentTail {
++    doc_id: u32,
++    blkno: pgrx::pg_sys::BlockNumber,
++    offset: pgrx::pg_sys::OffsetNumber,
++    redirect_data: Vec<u8>,
++}
++
++impl GrowingSegmentTail {
++    /// Starts at `doc_id`, the metapage's `sealed_doc_id`.
++    pub fn new(doc_id: u32) -> Self {
++        Self {
++            doc_id,
++            blkno: pgrx::pg_sys::InvalidBlockNumber,
++            offset: 1,
++            redirect_data: Vec::new(),
++        }
++    }
++
++    /// Calls `f` for each document from where the last call stopped up to
++    /// `doc_id_end`. The caller read `segment` and `doc_id_end` from the
++    /// metapage and keeps the segment from being sealed meanwhile.
++    pub fn read_until(
++        &mut self,
++        index: pgrx::pg_sys::Relation,
++        segment: Option<&GrowingSegmentData>,
++        doc_id_end: u32,
++        mut f: impl FnMut(u32, Bm25VectorBorrowed<'_>),
++    ) {
++        if self.doc_id >= doc_id_end {
++            return;
++        }
++        if self.blkno == pgrx::pg_sys::InvalidBlockNumber {
++            self.blkno = segment.expect("documents without a growing segment").first_blkno.get();
++        }
++        loop {
++            let page = page_read(index, self.blkno);
++            let count = page_get_max_offset_number(&page);
++            while self.offset <= count {
++                if self.doc_id >= doc_id_end {
++                    return;
++                }
++                let item_id = page_get_item_id(&page, self.offset);
++                if item_id.lp_flags() == pgrx::pg_sys::LP_REDIRECT {
++                    self.redirect_data.clear();
++                    let first_blkno: &u32 = page_get_item(&page, item_id);
++                    let mut reader = PageReader::new(index, *first_blkno);
++                    reader.read_to_end(&mut self.redirect_data).unwrap();
++                    let item: &Bm25VectorHeader = unsafe { &*self.redirect_data.as_ptr().cast() };
++                    f(self.doc_id, item.borrow());
++                } else {
++                    let item: &Bm25VectorHeader = page_get_item(&page, item_id);
++                    f(self.doc_id, item.borrow());
++                }
++                self.offset += 1;
++                self.doc_id += 1;
++            }
++            if self.doc_id >= doc_id_end {
++                return;
++            }
++            self.blkno = page.opaque.next_blkno;
++            assert!(self.blkno != pgrx::pg_sys::InvalidBlockNumber, "growing segment ends early");
++            self.offset = 1;
++        }
++    }
++}
++
+ pub struct SealingTask {
+     pub page_count: u32,
+ }

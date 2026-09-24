@@ -54,7 +54,7 @@ def test_every_image_the_extension_build_pulls_is_pinned_by_digest():
 
 
 def test_the_extension_is_compiled_from_pinned_source_with_its_fixes():
-    """akb#679 and akb#684 are fixed by compiling the extension here, so what is compiled is pinned.
+    """akb#679, akb#684 and akb#687 are fixed by compiling the extension here, so what is compiled is pinned.
 
     The upstream tarball by sha256, the crates by a committed lockfile built
     `--locked` (0.3.0 ships none), and the patches applied exactly: a patch that
@@ -72,6 +72,10 @@ def test_the_extension_is_compiled_from_pinned_source_with_its_fixes():
         "akb#679": ["src/segment/posting/serializer.rs"],
         # The length sum is counted the same way on every side: build, insert, VACUUM.
         "akb#684": ["src/segment/builder.rs", "src/index/insert.rs", "src/index/vacuum.rs"],
+        # VACUUM takes the metapage a page at a time: marks and counts in one record,
+        # term statistics recounted page by page.
+        "akb#687": ["src/index/vacuum.rs", "src/page/postgres.rs", "src/segment/delete.rs",
+                    "src/segment/growing.rs"],
     }
     for issue, paths in fixes.items():
         for path in paths:
@@ -83,7 +87,7 @@ def test_the_extension_is_compiled_from_pinned_source_with_its_fixes():
 
 
 def test_nothing_runs_the_upstream_prebuilt_extension():
-    """The upstream 0.3.0 binary has the akb#679 and akb#684 defects.
+    """The upstream 0.3.0 binary has the akb#679, akb#684 and akb#687 defects.
 
     An install path or CI job that pulled the publisher's image would run, or
     test, an extension build no installation should have. The history in the

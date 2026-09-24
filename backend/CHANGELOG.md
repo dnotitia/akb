@@ -7,6 +7,48 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The BM25 index's VACUUM no longer stalls search, and its counts survive a crash (akb#687)
+
+`vchord_bm25` 0.3.0 held the index's metapage through both steps of VACUUM, and a
+search reads the metapage for its whole scan.
+
+- **The bulk delete** held it for a pass over every document id the index has
+  assigned. A search that started meanwhile waited for the whole pass: 3 s for
+  a million documents. The pass logged each delete mark on its own and the
+  counts once, at the end. A backend killed mid-pass therefore left the counts
+  too high until a rebuild; in one reproduction `doc_cnt` stayed at 419,689
+  against 200,000 true.
+- **The cleanup** recounted every term id below the largest one indexed, not
+  just the terms that exist, with one page write and WAL record per id, and it
+  could not be cancelled. With term ids reaching 728,984,818, one VACUUM
+  stalled search for 44 minutes, wrote 35.4 GiB of WAL and allocated 2.72 GiB.
+
+What changes:
+
+- **Two more patches in `deploy/postgres/vchord_bm25/`.**
+  - `0003` marks one delete bitmap page at a time. Each page's marks and the
+    counts they take off go into one WAL record, so a crash keeps both or
+    neither, and a VACUUM that runs again takes no document off twice.
+  - `0004` recounts one term statistic page at a time. It holds no lock from one
+    page to the next, writes only pages whose counts changed, and stops at the
+    next page when cancelled. While it runs, inserts skip sealing the growing
+    segment.
+  - Measured on the same shapes: a search during the bulk delete took 0.001 s
+    instead of 2.86 s. The cleanup at 728,984,818 term ids took 2.7 s, with no
+    search waiting more than 0.002 s, 0.3 MiB of WAL and 3.4 MiB of memory.
+- **`test_vchord_vacuum_postgres.py`, in the VChord lane**, cancels a bulk
+  delete, searches through one, and runs a cleanup over 20,000,001 term ids.
+  The image without the two patches fails all three.
+- **The docs describe the fixes** where they listed VACUUM as a known limit, and
+  name a limit the extension still has: a term id at or above 2^30 reads
+  another term's entries.
+- `deploy/k8s/deploy.sh` gives `akb-postgres` a new tag, because its build
+  inputs changed.
+
+**Upgrading**: rebuild the PostgreSQL image. The fix itself needs no index
+rebuild. An index whose counts a crash damaged under the upstream binary keeps
+them until `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
+
 ### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
 
 `vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release
