@@ -877,13 +877,25 @@ async def recompute_stats(
                 # Ensure all encountered terms have stable vocab ids.  Reading
                 # directly from the temp aggregate avoids materialising the
                 # corpus vocabulary in Python a second time.
+                #
+                # Only terms the vocabulary lacks reach `nextval()`.
+                # `ON CONFLICT DO NOTHING` alone evaluates the select list, and
+                # so draws an id, for every term it then discards: each pass
+                # advanced `bm25_term_id_seq` by the whole vocabulary. The index
+                # extension sizes its per-term arrays by the largest id, not by
+                # the number of terms, and its VACUUM cleanup walks all of them;
+                # one install had 729M ids for 955k terms (akb#687). A term an
+                # encoder inserts concurrently still collides and costs one id.
                 if vocab_count:
                     await lock_conn.execute(
                         """
                         INSERT INTO bm25_vocab (term, term_id)
-                        SELECT term, nextval('bm25_term_id_seq')
-                          FROM bm25_recompute_terms
-                         ORDER BY term
+                        SELECT r.term, nextval('bm25_term_id_seq')
+                          FROM bm25_recompute_terms r
+                         WHERE NOT EXISTS (
+                                 SELECT 1 FROM bm25_vocab v WHERE v.term = r.term
+                               )
+                         ORDER BY r.term
                         ON CONFLICT (term) DO NOTHING
                         """
                     )

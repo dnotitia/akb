@@ -310,3 +310,41 @@ async def test_the_invalidation_boundary_is_the_one_the_run_started_with(monkeyp
         assert await sparse_encoder._should_recompute() is True, (
             "the next tick must still see the write that landed mid-scan"
         )
+
+
+async def test_a_recompute_draws_term_ids_only_for_new_terms(monkeypatch):
+    """A pass over known terms leaves `bm25_term_id_seq` where it was (akb#687).
+
+    The recompute used to call `nextval()` for every term it saw and let
+    `ON CONFLICT` discard the ids of the ones already known, so every pass
+    advanced the sequence by the whole vocabulary. The BM25 index extension
+    sizes its per-term arrays by the largest id, and its VACUUM cleanup walks
+    all of them with the metapage locked.
+    """
+    async with _fresh_database() as pool:
+        monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
+
+        async def vocab_and_sequence():
+            async with pool.acquire() as conn:
+                vocab = {r["term"]: r["term_id"] for r in await conn.fetch("SELECT term, term_id FROM bm25_vocab")}
+                return vocab, await conn.fetchval("SELECT last_value FROM bm25_term_id_seq")
+
+        await sparse_encoder.recompute_stats(batch_size=5)
+        vocab, sequence = await vocab_and_sequence()
+        assert set(vocab) == set(_EXPECTED_DF)
+
+        await sparse_encoder.recompute_stats(batch_size=5)
+        assert await vocab_and_sequence() == (vocab, sequence), "a pass over known terms drew term ids"
+
+        async with pool.acquire() as conn:
+            vault_id = await conn.fetchval("SELECT vault_id FROM chunks LIMIT 1")
+            await conn.execute(
+                "INSERT INTO chunks(id, source_type, source_id, vault_id, section_path, content, chunk_index)"
+                " VALUES($1, 'document', $2, $3, '', 'alpha epsilon', 99)",
+                uuid.UUID(int=99), uuid.uuid4(), vault_id,
+            )
+        await sparse_encoder.recompute_stats(batch_size=5)
+        after, after_sequence = await vocab_and_sequence()
+        assert set(after) - set(vocab) == {"epsilon"}
+        assert after_sequence == sequence + 1, "one new term, one new id"
+        assert {t: after[t] for t in vocab} == vocab, "known terms keep their ids"
