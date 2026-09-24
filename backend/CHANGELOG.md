@@ -130,6 +130,77 @@ now; a term an encoder inserts at the same moment still costs one id.
   database whose shape is not decided yet. `scripts/init_bm25_vocab.py` runs it
   anywhere.
 
+### A command renumbers BM25 term ids densely (akb#687)
+
+The fix above stops ids being drawn and discarded; this renumbers the ones
+already drawn. A term id is a label: BM25 scores come from tf, df, the document
+count and the average length, never from the id. But the `vchord` shape's index
+sizes its per-term arrays by the largest id. On a 2.11M-chunk copy of the
+installation with 955,060 terms over ids up to 728,985,301, the index was
+12.6 GB and built in 223 s; with dense ids, 6.7 GB and 88 s. Its VACUUM walks
+the empty range too, and ids of 2^30 and more alias other terms in it.
+
+`scripts/compact_bm25_term_ids.py` gives every term the rank of its id,
+`0 .. terms - 1`. The mapping keeps the ids' order, so each vector keeps its
+order and only its labels change.
+
+What changes:
+
+- **The command.**
+  - With no flag it is a dry run. It shows the vocabulary, its id range, the
+    indexes a rewrite rebuilds and their sizes, the baseline queries, and
+    anything that forbids the rewrite.
+  - `--apply` rewrites `bm25_vocab`, `bm25_term_id_seq` and the active shape's
+    ids in one transaction: under `vchord`, `sparse_bm25` and its index;
+    under `posting`, `posting.term_id`. It records the mapping in
+    `bm25_term_id_remap`.
+  - Before it commits, it checks three things. The ids are exactly
+    `0 .. terms - 1`. The rebuilt index counts the same documents and lengths
+    and spans no more ids than there are terms. Queries sampled from stored
+    documents rank the same documents with the same scores, within 1e-6. Any
+    failure rolls everything back and exits 1.
+  - `--revert` puts the recorded numbering back.
+- **It refuses (exit 2) where it cannot rewrite every copy.**
+  - Qdrant and SeahorseDB keep their vectors outside PostgreSQL. Renumbering
+    there means indexing every chunk again.
+  - A vector index in a separate database (`vector_store_dsn`).
+  - The `arrays` shape.
+  - Term ids left in the inactive shape, such as a `posting` table kept under
+    `vchord`.
+  - An index whose statistics still count rows VACUUM has not removed. The
+    baseline would not match a rebuild for reasons unrelated to the ids.
+- **The rewrite is a table rewrite** (`ALTER TABLE … ALTER COLUMN … TYPE …
+  USING`). It rebuilds every index on the vector table, a dense HNSW index
+  included.
+  - Updating the rows and building the BM25 index in one transaction does not
+    work. The build also indexes the row versions that transaction deleted:
+    measured, twice the documents, and `term_id_cnt` still at the old largest
+    id.
+  - On 20,000 chunks with 1024-dimension vectors, the rewrite took 16.5 s, of
+    which the HNSW rebuild was 14.0 s. The update route took 51 s and left
+    that broken index.
+  - The vector table and `bm25_vocab` stay locked until the commit, so
+    searches wait for it.
+- **The vocabulary epoch (migration 113).** Encoding a chunk and storing it are
+  separate transactions, so ids read before a renumbering could be stored after
+  it, naming other terms. `bm25_vocab_epoch` counts renumberings.
+  - The encoder reports the epoch its ids were read at.
+  - The indexing worker and the `sparse_bm25` backfill store ids only under a
+    shared advisory lock, and only if the epoch has not moved. A chunk encoded
+    before a renumbering goes to the retry path and is encoded again.
+  - While a renumbering runs, indexing hands its batch back without spending
+    retries.
+  - `scripts/migrate_pgvector_to_seahorsedb.py` stops if the vocabulary is
+    renumbered under it, including between a run and its resume.
+- **The invariant changes.** Migration 005 said term ids are never reassigned.
+  Now they are dense, and only this command reassigns them.
+
+**Upgrading**: every backend process must run this version before
+`--apply`. An older process stores ids without checking the epoch. Then pause
+ingestion, VACUUM the vector table, run the dry run and `--apply`; see
+`docs/vector-store-bm25-statistics.md`. Size `--maintenance-work-mem` for the
+dense index rebuild.
+
 ### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
 
 `vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release

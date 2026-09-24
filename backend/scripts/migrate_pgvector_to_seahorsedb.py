@@ -29,6 +29,10 @@ Caveats
   start) handles table creation idempotently. Re-running this script
   against a partially-migrated table is safe: ``upsert_one`` is
   idempotent on (table_name, id).
+- Every term id it ships must come from one numbering of the BM25
+  vocabulary. A renumbering (``scripts/compact_bm25_term_ids.py``) during a
+  run, or between a run and its resume, stops the script: the target would
+  hold ids from two numberings. Start that target over.
 - This script does NOT touch the source pgvector index. After a
   successful migration the operator flips ``vector_store_driver`` and
   restarts the backend; only then are the pgvector rows orphaned, and
@@ -172,26 +176,52 @@ def _read_progress(progress_file: str | None) -> str | None:
         return None
     if not s:
         return None
+    chunk_id = s.split()[0]
     try:
-        uuid.UUID(s)
+        uuid.UUID(chunk_id)
     except ValueError:
         logger.warning(
             "progress file %s does not contain a UUID, ignoring: %s",
             progress_file, s[:60],
         )
         return None
-    return s
+    return chunk_id
 
 
-def _write_progress(progress_file: str | None, chunk_id: str) -> None:
+def _read_progress_epoch(progress_file: str | None) -> int | None:
+    """The vocabulary epoch the shipped chunks were encoded at, if recorded.
+
+    A progress file from before the epoch existed holds the chunk id alone."""
+    if not progress_file or not Path(progress_file).exists():
+        return None
+    try:
+        parts = Path(progress_file).read_text().split()
+    except OSError:
+        return None
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def _renumbered(shipped: int, now: int | None) -> str:
+    return (
+        f"The BM25 vocabulary was renumbered (epoch {shipped}, now {now}) while "
+        "this migration shipped term ids, so the target holds ids from two "
+        "numberings. Start it over: a new table and no progress file."
+    )
+
+
+def _write_progress(progress_file: str | None, chunk_id: str, epoch: int) -> None:
     """Atomic checkpoint write. tmp + rename guarantees that a crash
     mid-write doesn't leave a half-written UUID; the previous
-    checkpoint is preserved if rename never happens."""
+    checkpoint is preserved if rename never happens. The vocabulary epoch
+    rides along, so a resume can tell whether the ids it adds still share
+    a numbering with the ones already shipped."""
     if not progress_file:
         return
     p = Path(progress_file)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(chunk_id + "\n")
+    tmp.write_text(f"{chunk_id} {epoch}\n")
     tmp.replace(p)
 
 
@@ -230,6 +260,11 @@ async def migrate(
     )
     if dry_run:
         return
+
+    epoch = await sparse_encoder.vocabulary_epoch()
+    shipped_under = _read_progress_epoch(progress_file) if resume_after else None
+    if shipped_under is not None and shipped_under != epoch:
+        raise SystemExit(_renumbered(shipped_under, epoch))
 
     # We don't go through the factory singleton — that one might be
     # configured for pgvector still if the backend is mid-restart.
@@ -285,9 +320,12 @@ async def migrate(
             # Sparse: re-encode from content with the active driver's
             # convention. settings.vector_store_driver is seahorse-db
             # at this point so the encoder emits raw TF.
-            sparse_indices, sparse_values = await sparse_encoder.encode_document(
+            encoded = await sparse_encoder.encode_document_at_epoch(
                 row["content"] or "",
             )
+            if encoded.epoch not in (None, epoch):
+                raise SystemExit(_renumbered(epoch, encoded.epoch))
+            sparse_indices, sparse_values = encoded.indices, encoded.values
             batch_payload.append(ChunkUpsert(
                 chunk_id=row["chunk_id"],
                 content=row["content"] or "",
@@ -389,13 +427,19 @@ async def migrate(
             seen % checkpoint_every < len(batch_payload)
             or seen >= total
         ):
-            _write_progress(progress_file, batch_payload[-1].chunk_id)
+            _write_progress(progress_file, batch_payload[-1].chunk_id, epoch)
 
     # Final checkpoint — pin the last chunk_id we successfully shipped.
     # ``batch_payload`` survives the loop scope; guard against the
     # zero-iteration case (resume already at the end, dry_run skipped).
     if seen > 0 and "batch_payload" in dir() and batch_payload:
-        _write_progress(progress_file, batch_payload[-1].chunk_id)
+        _write_progress(progress_file, batch_payload[-1].chunk_id, epoch)
+
+    # Everything shipped carries ids from `epoch`. A renumbering after the last
+    # encode leaves all of them naming other terms.
+    now = await sparse_encoder.vocabulary_epoch()
+    if now != epoch:
+        raise SystemExit(_renumbered(epoch, now))
 
     elapsed = time.monotonic() - started
     logger.info(

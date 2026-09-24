@@ -14,7 +14,9 @@ Per-batch flow:
      (passing this conn — pgvector driver joins our transaction so
      the vector_index INSERT and chunks UPDATE commit together) +
      mark_success. Atomic. Failures back off via mark_failure on a
-     separate small transaction.
+     separate small transaction. The encoding happens before the
+     transaction, so the transaction first holds the term-id fence and
+     refuses ids a renumbering replaced in between (akb#687).
 
 The per-chunk model means a vector-store crash mid-batch still leaves
 the SoT consistent — only the half-processed chunk reverts and gets
@@ -146,6 +148,19 @@ async def _release_unattempted(pool, rows: list[dict]) -> None:
         )
 
 
+async def _hand_back_during_renumbering(pool, rows: list[dict], error, done: int) -> int:
+    """Return the rest of the batch while a term-id renumbering runs (akb#687).
+
+    Like an outage, it is not these chunks' fault, and it ends when the
+    renumbering commits. Spending a retry on each would take every chunk the
+    worker reaches during the window toward abandonment, so their claim budget
+    goes back and the runner idles until its next pass.
+    """
+    logger.info("indexing pauses for a BM25 term-id renumbering: %s", error)
+    await _release_unattempted(pool, rows)
+    return done
+
+
 async def _process_once() -> int:
     """Process one batch. Returns successfully-indexed count."""
     pool = await get_pool()
@@ -228,8 +243,12 @@ async def _process_once() -> int:
     for position, (row, dense) in enumerate(zip(batch, embeddings_padded)):
         content = row["content"] or ""
         try:
-            sparse_idx, sparse_vals = await sparse_encoder.encode_document(
+            encoded = await sparse_encoder.encode_document_at_epoch(
                 content, sparse_shape=getattr(store, "sparse_shape", None),
+            )
+        except sparse_encoder.VocabularyRenumberingInProgress as e:
+            return await _hand_back_during_renumbering(
+                pool, batch[position:], e, native_processed + succeeded,
             )
         except Exception as e:  # noqa: BLE001
             await _mark_failure(
@@ -237,6 +256,7 @@ async def _process_once() -> int:
                 f"sparse encode failed: {e}",
             )
             continue
+        sparse_idx, sparse_vals = encoded.indices, encoded.values
 
         # Refuse useless points up-front: a chunk with neither dense nor
         # sparse signal would write a NULL+empty pgvector row or a
@@ -255,6 +275,13 @@ async def _process_once() -> int:
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
+                    # The term ids were read before this transaction. Hold the
+                    # fence for the rest of it and refuse ids a renumbering has
+                    # replaced since: stored, they would name other terms.
+                    # First, before this transaction locks anything: a
+                    # renumbering holds the fence while it waits for the tables
+                    # written below.
+                    await sparse_encoder.hold_vocabulary_epoch(conn, encoded.epoch)
                     # Re-check the chunk still exists before upserting.
                     # Between _claim_batch and here, the delete_worker may
                     # have drained the outbox row corresponding to a
@@ -288,6 +315,16 @@ async def _process_once() -> int:
                         vault_id=str(row["vault_id"]),
                     )
                     await _mark_success(conn, row["id"])
+        except sparse_encoder.VocabularyRenumberingInProgress as e:
+            return await _hand_back_during_renumbering(
+                pool, batch[position:], e, native_processed + succeeded,
+            )
+        except sparse_encoder.VocabularyEpochMoved as e:
+            # The retry path encodes the chunk again, under the new numbering.
+            await _mark_failure(
+                pool, row["id"], row["vector_retry_count"], str(e),
+            )
+            continue
         except VectorStoreUnavailable as e:
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"], str(e),

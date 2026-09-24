@@ -8,8 +8,12 @@ Adds:
 - chunks.qdrant_* columns for per-chunk index tracking (mirror of embed_worker pattern)
 - vector_delete_outbox table for async deletion (PG chunks are CASCADE-deleted;
   Qdrant cleanup is lazy via this outbox)
-- bm25_vocab: append-only term → term_id mapping. IDs are never reassigned
-  because Qdrant sparse vectors reference terms by integer id.
+- bm25_vocab: term → term_id mapping. Terms are append-only. IDs are dense,
+  and only `scripts/compact_bm25_term_ids.py` reassigns them: it rewrites
+  every consumer in the same transaction and keeps encoders out through the
+  vocabulary epoch (migration 113). It refuses drivers whose sparse vectors
+  live outside PostgreSQL (Qdrant, SeahorseDB), which hold ids it cannot
+  rewrite.
 - bm25_stats: singleton row holding N, avgdl, tokenizer metadata.
 
 Idempotent — safe to run repeatedly.
@@ -82,9 +86,11 @@ async def _run(conn):
         """
     )
 
-    # BM25 vocabulary: append-only term → integer id.
-    # Qdrant sparse vectors reference terms by id, so ids MUST be stable
-    # across indexing and querying. Never reassign, never delete.
+    # BM25 vocabulary: term → integer id. Never delete a term. Every stored
+    # sparse vector references terms by id, so an id changes only through
+    # scripts/compact_bm25_term_ids.py, which rewrites the vocabulary and every
+    # copy of its ids in one transaction and advances bm25_vocab_epoch in it.
+    # Ids are dense; the command restores that after an allocator burned ids.
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS bm25_vocab (
