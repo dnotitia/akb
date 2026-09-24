@@ -344,6 +344,7 @@ jobs:
             tests/test_vchord_vacuum_postgres.py
             tests/test_vchord_encoding_contract_postgres.py
             tests/test_vchord_external_stats_postgres.py
+            tests/test_bm25_term_id_compaction_postgres.py
             # Needs both servers: the decision turns on whether the server
             # provides vchord_bm25.
             tests/test_sparse_shape_decision_postgres.py

@@ -28,6 +28,7 @@ import pytest
 from app.services.vector_store import VectorStoreUnavailable
 from app.services.vector_store.pgvector import (
     PgvectorStore,
+    TermIdOutOfRange,
     _bm25query_literal,
     _bm25vector_literal,
 )
@@ -311,17 +312,21 @@ def test_the_vector_literal_names_the_bound_the_index_holds():
     remedy named, rather than indexed under a subset of its terms."""
     assert _bm25vector_literal([_MAX_TERM_ID], [1.0]) == "{1073741823:1}"
 
-    with pytest.raises(ValueError) as refused:
+    # Deterministic: a dedicated `ValueError` subclass, so worker paths can
+    # terminate it on the first failure instead of spending retries (akb#687).
+    with pytest.raises(TermIdOutOfRange) as refused:
         _bm25vector_literal([20, _PAST_INDEX], [1.0, 1.0])
     message = str(refused.value)
+    assert refused.value.term_id == _PAST_INDEX
     assert "term id 1073741824 " in message
     assert "(0 to 1,073,741,823)" in message
     assert "2^30 would land on another term's entries" in message
     assert "postings, statistics and search results" in message
     assert "renumbered densely" in message
+    assert "compact_bm25_term_ids" in message
 
     for term in (_PAST_INT4, _PAST_U32, -1):
-        with pytest.raises(ValueError, match=rf"term id {term} .*\(0 to 1,073,741,823\)"):
+        with pytest.raises(TermIdOutOfRange, match=rf"term id {term} .*\(0 to 1,073,741,823\)"):
             _bm25vector_literal([term], [1.0])
 
 

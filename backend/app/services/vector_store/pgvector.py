@@ -91,6 +91,29 @@ _VCHORD_MAX_MATERIALISED_ROWS = 10_000
 _BM25VECTOR_MAX_TERM_ID = 2**30 - 1
 
 
+class TermIdOutOfRange(ValueError):
+    """A term id the vchord BM25 index cannot hold (akb#687).
+
+    A `ValueError` subclass, so existing `except ValueError` callers keep
+    refusing it. Unlike a generic `ValueError`, it is deterministic: no retry
+    will ever index this chunk while the vocabulary numbers ids this way.
+    Worker paths terminate it on the first failure instead of spending the
+    retry budget; the remedy is `scripts/compact_bm25_term_ids.py`.
+    """
+
+    def __init__(self, term_id: int) -> None:
+        self.term_id = int(term_id)
+        super().__init__(
+            f"term id {self.term_id} is outside the range the vchord BM25 index "
+            f"holds (0 to {_BM25VECTOR_MAX_TERM_ID:,}): an id at or above "
+            f"2^30 would land on another term's entries in that index and "
+            f"corrupt its postings, statistics and search results. "
+            f"The BM25 vocabulary's term ids have to be renumbered densely "
+            f"(scripts/compact_bm25_term_ids.py) before a document holding it "
+            f"can be indexed."
+        )
+
+
 async def _set_vchord_candidate_budget(
     conn: asyncpg.Connection, budget: int,
 ) -> None:
@@ -183,14 +206,7 @@ def _bm25vector_literal(
             # term nor the limit. Dropping the term instead would index the
             # document under a subset of what it says, which nothing downstream
             # could notice.
-            raise ValueError(
-                f"term id {term} is outside the range the vchord BM25 index "
-                f"holds (0 to {_BM25VECTOR_MAX_TERM_ID:,}): an id at or above "
-                f"2^30 would land on another term's entries in that index and "
-                f"corrupt its postings, statistics and search results. "
-                f"The BM25 vocabulary's term ids have to be renumbered densely "
-                f"before a document holding it can be indexed."
-            )
+            raise TermIdOutOfRange(term)
     counts: dict[int, int] = {}
     for term, weight in zip(indices, values):
         counts[int(term)] = counts.get(int(term), 0) + max(1, round(float(weight)))

@@ -69,8 +69,9 @@ async def _fresh_database():
         # the migration, not from init.sql (init.sql re-runs against existing
         # databases, where an index on a column `CREATE TABLE IF NOT EXISTS`
         # never added would fail the boot schema). Without it this fixture
-        # builds an `edges` no deployment has.
-        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89, 112):
+        # builds an `edges` no deployment has. 113 is the vocabulary epoch the
+        # embed worker's write reads under the term-id fence (akb#687).
+        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89, 112, 113):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None
@@ -466,7 +467,7 @@ async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(m
 
         async def fake_sparse(_content, *, sparse_shape=None):
             encoded_shapes.append(sparse_shape)
-            return [1], [1.0]
+            return sparse_encoder.EncodedDocument([1], [1.0], 0)
 
         async def fake_get_pool():
             return pool
@@ -474,7 +475,7 @@ async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(m
         monkeypatch.setattr(embed_worker, "get_pool", fake_get_pool)
         monkeypatch.setattr(embed_worker, "generate_embeddings", fake_embeddings)
         monkeypatch.setattr(embed_worker, "get_vector_store", lambda: _FakeStore())
-        monkeypatch.setattr(sparse_encoder, "encode_document", fake_sparse)
+        monkeypatch.setattr(sparse_encoder, "encode_document_at_epoch", fake_sparse)
         monkeypatch.setattr(settings, "embed_base_url", "http://embed.invalid/v1")
 
         assert await embed_worker._process_once() == len(derived_chunk_ids)

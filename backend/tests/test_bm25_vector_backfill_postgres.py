@@ -19,6 +19,7 @@ import uuid
 import asyncpg
 import pytest
 
+from app.db.postgres import _load_migration
 from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
 
@@ -49,6 +50,9 @@ async def _vocab_ddl(conn) -> None:
         """
     )
     await conn.execute("CREATE SEQUENCE IF NOT EXISTS bm25_term_id_seq AS BIGINT START 1")
+    # The encoder reports, and the writers check, the numbering its ids are in
+    # (akb#687) — migration 113 itself rather than a copy of it.
+    await _load_migration("113_bm25_vocab_epoch.py").migrate(conn)
     # The pre-flip write path saturates against these, so they have to be
     # readable — the values do not matter here, only that `posting` encoding
     # produces something and `vchord` encoding ignores them.
