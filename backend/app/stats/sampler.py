@@ -74,7 +74,10 @@ def pgvector_relations() -> tuple[str, ...]:
     bytes are not in this database and the field is reported as absent rather
     than as a number that would break that containment.
     """
-    shape = settings.vector_store_sparse_shape
+    shape = settings.decided_sparse_shape
+    if shape is None:
+        # `auto` before startup has decided it: absent, not a guess.
+        return ()
     if shape == "posting":
         return ("chunks", "posting")
     # Spelled as two comparisons rather than `in ("arrays", "vchord")`: mypy

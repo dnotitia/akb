@@ -51,7 +51,7 @@ from app.services.sso_callback_urls import is_backchannel_logout_uri
 from app.services.search_capabilities import metadata_enabled
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import decide_sparse_shape_for_settings, get_vector_store
 from app.stats import listener as stats_listener, sampler as stats_sampler
 
 logger = logging.getLogger("akb.lifecycle")
@@ -233,6 +233,27 @@ async def init_storage() -> None:
                 logger.info("Cleared %d stale git lock(s) at startup", cleared)
         except Exception as e:  # noqa: BLE001 — never block startup on best-effort cleanup
             logger.warning("Stale-lock self-heal failed (continuing): %s", e)
+    # `vector_store_sparse_shape: auto` is a property of the database, so it is
+    # settled against the database before the store is built. A database whose
+    # shape cannot be told fails here, by name, rather than serving empty search.
+    try:
+        decision = await decide_sparse_shape_for_settings(settings)
+    except Exception:
+        if settings.vector_store_sparse_shape == "auto":
+            raise
+        # A named shape needs no decision. Only the statistics policy loses
+        # its view of the posting table, and it keeps them while it cannot see.
+        logger.warning(
+            "Vector database not readable at startup; BM25 external statistics are kept",
+            exc_info=True,
+        )
+        decision = None
+    if decision is not None:
+        logger.info(
+            "Sparse shape %s (configured %s, decided by %s)%s",
+            decision.shape, settings.vector_store_sparse_shape, decision.decided_by,
+            f": {decision.note}" if decision.note else "",
+        )
     # Force-construct so a misconfigured vector-store URL/DSN fails at startup rather
     # than silently serving empty search results later.
     store = get_vector_store()

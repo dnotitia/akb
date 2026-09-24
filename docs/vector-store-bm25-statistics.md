@@ -11,10 +11,16 @@ The vocabulary registry and external corpus statistics have different lifetimes.
 | SeahorseDB HTTP or gRPC | Raw TF / 1 | Required for search-time metadata |
 | pgvector VChord | Raw TF / 1 | Index owns N, avgdl and df; external stats unnecessary for this consumer |
 
-`bm25_external_stats_mode: required` is the default, including when the local
-process selects VChord. It preserves periodic recomputation for other readers,
-mixed deployments and retained posting rollback. The refresher does not populate
-`sparse_bm25`, update the VChord index, or restore posting vectors.
+`bm25_external_stats_mode: auto` is the default. It keeps external statistics
+wherever something reads them: every consumer above except VChord, and under
+VChord a `posting` table kept as the way back. A VChord database with no
+`posting` table — every new VChord installation — has no reader, so neither the
+startup nor the periodic recompute runs. Startup learns whether the table
+exists when it settles the sparse shape (see `vector_store_sparse_shape: auto`
+in `config/app.yaml.example`); until it has looked, the statistics are kept.
+`required` keeps them regardless, for mixed deployments this process cannot
+see. The refresher does not populate `sparse_bm25`, update the VChord index, or
+restore posting vectors.
 
 `bm25_external_stats_mode: vchord_only_verified` skips startup and periodic
 external-statistics recomputation. Configuration rejects this mode unless the

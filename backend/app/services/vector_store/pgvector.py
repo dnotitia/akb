@@ -13,13 +13,19 @@ Operator deployment modes (no code change between them):
   URL → driver opens a dedicated pool. The main PG never gains a
   vector dependency.
 
-Sparse storage shape is selected at construction time:
+Sparse storage shape is selected at construction time. With the default
+`vector_store_sparse_shape: auto`, startup decides it per database before the
+store is built (`sparse_shape_state.py`), and `_do_ensure` records the shape it
+set up so the decision is stable:
 
+  vchord   — raw integer TF in bm25vector; the BM25 index owns scoring
+             and corpus statistics. What a new database gets where the
+             server provides `vchord_bm25`.
   posting  — chunks(...) + posting(term_id, chunk_id, weight),
              B-tree-indexed on term_id. Sparse search is a single
-             indexed lookup with application-owned BM25 weights.
-  vchord  — raw integer TF in bm25vector; the BM25 index owns scoring
-             and corpus statistics. Exact fallback is size/time bounded.
+             indexed lookup with application-owned BM25 weights. What a
+             server without the extension gets, and what every existing
+             installation keeps until it runs the backfill runbook.
   arrays   — chunks(sparse_terms BIGINT[], sparse_weights REAL[]).
              One row per chunk. Sparse search unnest+JOIN+GROUP BY.
              RETAINED for the bench harness only — don't pick this
@@ -43,6 +49,7 @@ import asyncpg
 from app.services.sparse_shapes import SparseShape
 
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
+from .sparse_shape_state import record_sparse_shape
 
 
 def _advisory_lock_key(schema: str) -> int:
@@ -648,6 +655,10 @@ class PgvectorStore:
                 f'RENAME TO idx_vi_chunks_dense'
             )
         # else: partial index already in place — no-op.
+
+        # Last, so only a setup that succeeded is recorded: the shape this
+        # database now serves, which is what a later `auto` reads first.
+        await record_sparse_shape(conn, schema=self._schema, shape=self._sparse_shape)
 
     async def _build_partial_hnsw(self, conn, *, target_name: str) -> None:
         """Build the partial HNSW dense index under ``target_name``.

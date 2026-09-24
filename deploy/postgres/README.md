@@ -1,14 +1,19 @@
-# PostgreSQL image with the optional BM25 index extension
-
-AKB's sparse retrieval leg does not need this. It works against the `posting`
-table the backend maintains, on the stock `pgvector/pgvector:pg16` image named
-everywhere else in this repository.
+# PostgreSQL image with the BM25 index extension
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
-in a block-max index. Posting stores application-computed weights; identical
-rankings across the two scorers are not a compatibility guarantee. An operator who wants that trade can build the image here and
-get the same bytes we do.
+in a block-max index. With `vector_store_sparse_shape: auto`, the default, a new
+database on a server that provides it gets the `vchord` shape. On the stock
+`pgvector/pgvector:pg16` image named everywhere else in this repository, a new
+database gets `posting`, the table the backend maintains itself. Posting stores
+application-computed weights; identical rankings across the two scorers are not
+a compatibility guarantee. An operator can build the image here and get the same
+bytes we do.
+
+The shape is decided once per database, at startup, and recorded in
+`<vector_store_schema>.install_state`, so an existing installation keeps the
+shape it serves whatever image it later runs on. `/health` reports it under
+`vector_store.sparse_shape`: what was configured, what is in effect, and why.
 
 ## Build
 
@@ -25,13 +30,24 @@ the same time. To move either pin, follow the procedure in
 
 ## Enable
 
+The extension needs a superuser to create. Where AKB's database role is one —
+the stock image's `POSTGRES_USER` is — AKB creates it on a new database by
+itself. Otherwise a superuser runs, in AKB's database, before AKB first starts
+on it:
+
 ```sql
 CREATE EXTENSION vchord_bm25;
+GRANT USAGE ON SCHEMA bm25_catalog TO <akb role>;
 ```
 
+The GRANT is not optional: the extension's schema carries no USAGE for other
+roles, and without it a plain role fails the schema setup with "permission
+denied for schema bm25_catalog". AKB checks both before it decides, and stops
+with this instruction rather than quietly choosing `posting` for a database
+somebody prepared for `vchord`.
+
 The extension installs into its own `bm25_catalog` schema and needs no
-`shared_preload_libraries` entry. A database that never runs `CREATE EXTENSION`
-behaves exactly like the base image.
+`shared_preload_libraries` entry.
 
 Without a preload the library loads the first time a session calls into it, and
 its settings (`bm25_catalog.bm25_limit`) exist only from then on. The backend
@@ -41,24 +57,22 @@ Tests must run against a server started the same way: the upstream image
 preloads the library from its CMD, which hides exactly this, so CI starts it
 with a plain `postgres` command.
 
-Note that installing the extension is not by itself enough for AKB to use it —
-the sparse leg selects its implementation separately. This image only makes the
-option available.
+A database that already serves `posting` stays on it under `auto`, even on this
+image. Moving it is `scripts/backfill_bm25_vector.py`, and then naming `vchord`
+in the setting: select it only after `--index` has built the index. Until then
+the backend refuses the shape rather than building the index itself: at startup
+it would build it inside its schema transaction, blocking writes for the build,
+over a column the backfill had not finished. A new, empty database gets the
+index at startup, built empty and filled by inserts, which also keeps it clear
+of the build-path defect described below.
 
-On a database that already holds chunks, select `vchord` only after
-`scripts/backfill_bm25_vector.py --index` has built the index. Until then the
-backend refuses the shape rather than building the index itself: at startup it
-would build it inside its schema transaction, blocking writes for the build,
-over a column the backfill had not finished. A fresh, empty database gets the
-index at startup as before.
-
-Switching back is kept possible for as long as it is wanted. While
-`bm25_external_stats_mode` is `required` — the default — an installation that
-came from `posting` keeps writing that table too, so setting the shape back to
-`posting` serves the rows as they are. Once the way back is no longer needed,
-set `vchord_only_verified`: the writes to `posting` and the statistics
-recompute both stop, and the table can be dropped. A fresh vchord installation
-has no `posting` to keep.
+Switching back is kept possible for as long as it is wanted. While a `posting`
+table exists, `bm25_external_stats_mode` `auto` — the default — and `required`
+keep writing it too, so setting the shape back to `posting` serves the rows as
+they are. Once the way back is no longer needed, set `vchord_only_verified`: the
+writes to `posting` and the statistics recompute both stop, and the table can
+be dropped. A new vchord installation has no `posting` table, and under `auto`
+nothing recomputes the external statistics for it.
 
 ## Tokenization is not affected
 

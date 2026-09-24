@@ -1,4 +1,9 @@
-"""External statistics remain required until a deployment is VChord-only."""
+"""External statistics are kept wherever something reads them.
+
+`auto` (the default) and `required` behave the same for every configured shape
+here: nothing has told these settings whether a `posting` table exists, and
+keeping the statistics is the reversible side. What `auto` does once startup
+has looked at the database is held by `test_sparse_shape_auto_unit.py`."""
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -19,7 +24,7 @@ from app.services import sparse_encoder
 ])
 def test_existing_consumers_keep_external_stats(driver, shape, consumer):
     configured = Settings(document_revision_backend="bare_git", vector_store_driver=driver, vector_store_sparse_shape=shape)
-    assert configured.bm25_external_stats_mode == "required"
+    assert configured.bm25_external_stats_mode == "auto"
     assert configured.bm25_external_stats_consumers == [consumer]
 
 

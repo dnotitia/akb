@@ -26,9 +26,9 @@ from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from app.services.sparse_shapes import SparseShape
+from app.services.sparse_shapes import SparseShape, SparseShapeDecision, SparseShapeSetting
 
 # Code-owned hard floor for the external-git runner's git version.
 # `http.curloptResolve` — the DNS-pin the hermetic runner depends on — is
@@ -1321,12 +1321,14 @@ class Settings(BaseModel):
     # Pgvector driver settings.
     vector_store_dsn: str = ""  # blank = reuse main PG pool
     vector_store_schema: str = "vector_index"
-    # `posting` (separate term_id table, indexed lookups) is the
-    # production-recommended shape. `arrays` is retained for the bench
-    # harness only — slower at scale.
+    # `auto` (the default) is decided once per database at startup and recorded
+    # there (`vector_store/sparse_shape_state.py`): a database that already
+    # serves a shape keeps it, and a new one gets `vchord` where the server can
+    # give AKB's role the `vchord_bm25` extension, `posting` otherwise. Name a
+    # shape to override. `arrays` is retained for the bench harness only.
     # The members live in `app/services/sparse_shapes.py` so this setting and
     # the driver argument cannot drift apart (akb#623).
-    vector_store_sparse_shape: SparseShape = "posting"
+    vector_store_sparse_shape: SparseShapeSetting = "auto"
 
     # Qdrant driver settings.
     vector_url: str = ""  # e.g. http://qdrant:6333
@@ -1419,10 +1421,14 @@ class Settings(BaseModel):
     # refresher batches that drift. 6 h matches the slow drift of avgdl/df on
     # a steady-state corpus.
     bm25_recompute_interval_secs: int = 21600
-    # Keep external N/avgdl/df for serving and rollback by default. Opt out
-    # only after verifying every reader/writer uses pgvector/vchord and no
-    # posting/arrays rollback or other external-stats consumer remains.
-    bm25_external_stats_mode: Literal["required", "vchord_only_verified"] = "required"
+    # External N/avgdl/df serve `posting`, `arrays`, pre-baked drivers,
+    # SeahorseDB, and a `posting` table kept as the way back from `vchord`.
+    # `auto` (the default) keeps them wherever one of those exists; a `vchord`
+    # database without a `posting` table has no reader, so nothing recomputes
+    # them. `required` keeps them regardless. `vchord_only_verified` is the
+    # operator's statement that a `posting` table may go stale, and needs an
+    # explicit `vchord`.
+    bm25_external_stats_mode: Literal["auto", "required", "vchord_only_verified"] = "auto"
 
     # Periodic PG-RBAC reconcile cadence. Lifecycle hooks emit role
     # DDL online; this timer is the belt-and-suspenders that catches
@@ -1463,13 +1469,72 @@ class Settings(BaseModel):
     # AKB_STATS_PORT) is set. See StatsSettings above.
     stats: StatsSettings = Field(default_factory=StatsSettings)
 
+    # What startup decided for `auto` (and learned about the `posting` table);
+    # None until `apply_sparse_shape_decision`. Private: it is a fact about the
+    # database, not a setting, and `extra="forbid"` keeps it out of app.yaml.
+    _sparse_shape_decision: SparseShapeDecision | None = PrivateAttr(default=None)
+
+    def apply_sparse_shape_decision(self, decision: SparseShapeDecision) -> None:
+        """Hold what startup decided. The configured value stays as written."""
+        configured = self.vector_store_sparse_shape
+        if configured != "auto" and decision.shape != configured:
+            raise ValueError(
+                f"sparse shape decision {decision.shape!r} contradicts the configured {configured!r}"
+            )
+        self._sparse_shape_decision = decision
+
+    @property
+    def decided_sparse_shape(self) -> SparseShape | None:
+        """The shape in effect, or None while `auto` is undecided."""
+        if self.vector_store_sparse_shape != "auto":
+            return cast(SparseShape, self.vector_store_sparse_shape)
+        decision = self._sparse_shape_decision
+        return decision.shape if decision is not None else None
+
+    @property
+    def effective_sparse_shape(self) -> SparseShape:
+        """The shape in effect. An undecided `auto` is refused, never guessed:
+        a guess here would pick a weight convention and a set of tables
+        silently, which is the akb#623 failure."""
+        shape = self.decided_sparse_shape
+        if shape is None:
+            raise RuntimeError(
+                "vector_store_sparse_shape is 'auto' and has not been decided for this "
+                "database yet; startup decides it before building the vector store "
+                "(vector_store.factory.decide_sparse_shape_for_settings)"
+            )
+        return shape
+
+    def sparse_shape_snapshot(self) -> dict:
+        """For /health: what was written, what is in effect, and why."""
+        decision = self._sparse_shape_decision
+        snapshot: dict = {"configured": self.vector_store_sparse_shape, "effective": self.decided_sparse_shape}
+        if decision is not None:
+            snapshot.update({
+                "decided_by": decision.decided_by,
+                "posting_table_present": decision.posting_table_present,
+                "note": decision.note,
+            })
+        return snapshot
+
     @property
     def bm25_external_stats_consumers(self) -> list[str]:
         """Active consumers plus the conservatively retained rollback contract."""
         if self.vector_store_driver == "pgvector":
-            if self.vector_store_sparse_shape != "vchord":
-                return [f"pgvector/{self.vector_store_sparse_shape}"]
+            shape = self.decided_sparse_shape
+            if shape is None:
+                # Keeping them is the reversible side until startup knows.
+                return ["undecided_sparse_shape"]
+            if shape != "vchord":
+                return [f"pgvector/{shape}"]
             if self.bm25_external_stats_mode == "vchord_only_verified":
+                return []
+            decision = self._sparse_shape_decision
+            if (
+                self.bm25_external_stats_mode == "auto"
+                and decision is not None
+                and not decision.posting_table_present
+            ):
                 return []
             return ["posting_rollback_or_mixed_deployment"]
         # SeahorseDB consumes external stats at search time even though it

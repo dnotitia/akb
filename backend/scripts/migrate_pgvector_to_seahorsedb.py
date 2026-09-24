@@ -65,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import settings
 from app.db.postgres import get_pool
 from app.services import sparse_encoder
+from app.services.vector_store import decide_sparse_shape_for_settings
 from app.services.vector_store.base import ChunkUpsert
 from app.services.vector_store.pgvector import PgvectorStore
 from app.services.vector_store.seahorse_db import SeahorseDbStore
@@ -248,11 +249,12 @@ async def migrate(
     # rows out of vector_index.chunks via raw SQL above instead of
     # touching PgvectorStore methods, since the driver's public surface
     # is upsert/search-oriented.
+    await decide_sparse_shape_for_settings()
     PgvectorStore(
         dsn=None,
         schema=settings.vector_store_schema,
         dense_dim=settings.embed_dimensions,
-        sparse_shape=settings.vector_store_sparse_shape,
+        sparse_shape=settings.effective_sparse_shape,
         get_main_pool=get_pool,
     )
 
