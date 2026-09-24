@@ -1354,6 +1354,45 @@ def external_stats_policy_snapshot() -> dict:
     }
 
 
+# The vchord BM25 index addresses its per-term arrays by u32 byte offsets, so a
+# term id at or above 2^30 aliases another term (akb#687, akb#691). Only the
+# vchord shape is bounded; the other shapes store ids as bigint.
+_VCHORD_TERM_ID_LIMIT = 1 << 30
+_TERM_ID_HEADROOM_WARN_AT = 0.9
+
+
+def _is_vchord_shape() -> bool:
+    """Whether this process serves the vchord shape, the only one the 2^30
+    limit applies to. Undecided (startup has not run) reads as not vchord:
+    no warning rather than a wrong one."""
+    try:
+        return settings.effective_sparse_shape == "vchord"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def term_id_headroom(last_drawn: int, *, vchord: bool) -> dict:
+    """How close `bm25_term_id_seq` is to the id the `vchord` index cannot hold.
+
+    `last_drawn` is the sequence's last drawn id (0 when nothing was drawn).
+    Under other shapes the limit does not apply, so there is no warning.
+    At 90% of 2^30 the `warning` names the remedy while there is still time
+    to renumber (`scripts/compact_bm25_term_ids.py`).
+    """
+    headroom: dict = {"last_drawn": int(last_drawn), "vchord_limit": _VCHORD_TERM_ID_LIMIT}
+    if not vchord:
+        return headroom
+    used = (int(last_drawn) / _VCHORD_TERM_ID_LIMIT) if last_drawn else 0
+    headroom["used"] = used
+    if used >= _TERM_ID_HEADROOM_WARN_AT:
+        headroom["warning"] = (
+            f"bm25 term ids are at {used:.0%} of the vchord index limit "
+            f"(2^30 = {_VCHORD_TERM_ID_LIMIT:,}); renumber them densely with "
+            f"scripts/compact_bm25_term_ids.py before new terms are refused"
+        )
+    return headroom
+
+
 async def stats_snapshot() -> dict:
     """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
     so a stuck refresher (total_docs=0 while chunks exist) is visible."""
@@ -1367,6 +1406,10 @@ async def stats_snapshot() -> dict:
             """
         )
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
+        sequence_next = await conn.fetchval(
+            "SELECT last_value + CASE WHEN is_called THEN 1 ELSE 0 END "
+            "FROM bm25_term_id_seq"
+        )
         current_revision = await _current_corpus_revision(conn)
         recompute = await _run_progress(conn)
         recompute_active = await bm25_maintenance.active_bm25_recompute(conn)
@@ -1376,6 +1419,9 @@ async def stats_snapshot() -> dict:
             "total_docs": 0, "avgdl": 0.0,
             "tokenizer": "kiwi@0",
             "vocab_size": int(vocab or 0),
+            "term_id_headroom": term_id_headroom(
+                int(sequence_next or 0) - 1, vchord=_is_vchord_shape(),
+            ),
             "source_chunk_count": 0,
             "source_revision": 0,
             "current_revision": current_revision,
@@ -1391,6 +1437,9 @@ async def stats_snapshot() -> dict:
         "avgdl": float(row["avgdl"] or 0.0),
         "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
         "vocab_size": int(vocab or 0),
+        "term_id_headroom": term_id_headroom(
+            int(sequence_next or 0) - 1, vchord=_is_vchord_shape(),
+        ),
         "source_chunk_count": int(row["source_chunk_count"] or 0),
         "source_revision": source_revision,
         "current_revision": current_revision,

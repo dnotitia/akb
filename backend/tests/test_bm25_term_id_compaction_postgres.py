@@ -422,6 +422,58 @@ async def test_a_chunk_encoded_before_the_renumbering_is_refused_then_stored_ren
         assert max(ids.values()) == len(ids) - 1  # the latecomer was renumbered with the rest
 
 
+async def test_a_term_id_the_index_cannot_hold_abandons_on_the_first_failure(monkeypatch):
+    """G1(a): `TermIdOutOfRange` is deterministic, so no retry is spent on it.
+
+    One term is moved past 2^30 after the encoding, so the write refuses it.
+    The chunk is abandoned on the first failure: no `next_attempt_at`, one
+    error naming the id, the bound and the remedy — not ~8 retries over
+    ~13.6h with an embed call each.
+    """
+    async with _installation(monkeypatch) as install:
+        async with install.pool.acquire() as conn:
+            corpus = await _seed(conn, terms=100, documents=0, max_id=100_000, seed=6)
+            victim = corpus.vocabulary[0]
+            # The vocabulary already numbers this term past what the index
+            # holds: the worker encodes it as-is and the write refuses it.
+            await conn.execute(
+                "UPDATE bm25_vocab SET term_id = $1 WHERE term = $2",
+                (1 << 30), victim,
+            )
+            vault = await conn.fetchval(
+                "INSERT INTO vaults (name, git_path) VALUES ('past-index', '/tmp/past.git') RETURNING id"
+            )
+            content = " ".join([victim, victim, corpus.vocabulary[1]])
+            chunk = await conn.fetchval(
+                """
+                INSERT INTO chunks (source_type, source_id, vault_id, content, chunk_index)
+                VALUES ('document', gen_random_uuid(), $1, $2, 0) RETURNING id
+                """,
+                vault, content,
+            )
+
+        # The return counts successes; the terminal path `continue`s without
+        # reaching `succeeded += 1`, so it returns 0 for this one-chunk
+        # batch. What matters is the row state below: abandoned on the
+        # first failure — retry count still 1 from the claim, no next
+        # attempt — not ~8 retries over ~13.6h.
+        assert await embed_worker._process_once() == 0
+        async with install.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT vector_indexed_at, vector_last_error, vector_retry_count, "
+                "vector_next_attempt_at, vector_abandoned_at IS NOT NULL AS abandoned "
+                "FROM chunks WHERE id = $1",
+                chunk,
+            )
+            assert row["vector_indexed_at"] is None
+            assert row["vector_retry_count"] == 1
+            assert row["vector_next_attempt_at"] is None
+            assert row["abandoned"]
+            assert "term id 1073741824" in row["vector_last_error"]
+            assert "compact_bm25_term_ids" in row["vector_last_error"]
+            assert not await conn.fetchval(f"SELECT EXISTS (SELECT 1 FROM {_SCHEMA}.chunks WHERE chunk_id = $1)", chunk)
+
+
 async def test_indexing_hands_its_batch_back_while_a_renumbering_holds_the_fence(monkeypatch):
     """A renumbering holds the fence for its whole transaction; retries are not spent on it."""
     async with _installation(monkeypatch) as install:

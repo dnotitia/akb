@@ -36,6 +36,7 @@ from app.services.index_service import generate_embeddings
 from app.services.search_capabilities import file_projection_enabled, native_derived_enabled
 from app.services.vector_store import VectorStoreUnavailable, get_vector_store
 from app.services.vector_store.base import has_dense
+from app.services.vector_store.pgvector import TermIdOutOfRange
 
 logger = logging.getLogger("akb.embed_worker")
 
@@ -123,6 +124,25 @@ async def _mark_failure(pool, chunk_id, attempt_count: int, error: str) -> None:
                  WHERE id = $1
                 """,
                 chunk_id, (error or "")[:500], next_at, terminal,
+            )
+
+
+async def _mark_terminal(pool, chunk_id, error: str) -> None:
+    """Abandon a chunk on the first failure. For deterministic faults only:
+    a retry cannot change the outcome (akb#687 `TermIdOutOfRange`), so the
+    retry budget must not be spent on it."""
+    async with pool.acquire() as c:
+        async with c.transaction():
+            await c.execute(
+                """
+                UPDATE chunks
+                   SET vector_last_error = $2,
+                       vector_next_attempt_at = NULL,
+                       vector_claimed_at = NULL,
+                       vector_abandoned_at = NOW()
+                 WHERE id = $1
+                """,
+                chunk_id, (error or "")[:500],
             )
 
 
@@ -323,6 +343,16 @@ async def _process_once() -> int:
             # The retry path encodes the chunk again, under the new numbering.
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"], str(e),
+            )
+            continue
+        except TermIdOutOfRange as e:
+            # Deterministic: no retry will ever index this chunk while the
+            # vocabulary numbers ids this way (akb#687). Terminate on the
+            # first failure instead of spending ~13.6h / ~9 embed calls on
+            # retries that cannot succeed. The remedy names itself.
+            await _mark_terminal(
+                pool, row["id"],
+                f"{e} This chunk is abandoned; renumber the vocabulary first.",
             )
             continue
         except VectorStoreUnavailable as e:

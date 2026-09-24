@@ -37,11 +37,12 @@ What changes:
   document can hold it.
 - The other sparse shapes and drivers are unchanged.
 
-**If it fires**: the indexing worker records the refusal on the chunk and
-retries it like any other per-row failure until it is abandoned; `/health`
-counts it under `vector_store.backfill.upsert`. The chunk's `vector_last_error`
-names the id, the range and the remedy, and `scripts/backfill_bm25_vector.py`
-stops with the same message:
+**If it fires**: the indexing worker abandons the chunk on the first failure
+(`TermIdOutOfRange`, a `ValueError` subclass, is deterministic — no retry can
+index it while the vocabulary numbers ids this way). `/health` counts it under
+`vector_store.backfill.upsert`. The chunk's `vector_last_error` names the id,
+the range and the remedy, and `scripts/backfill_bm25_vector.py` stops with the
+same message:
 
 ```
 term id <id> is outside the range the vchord BM25 index holds (0 to 1,073,741,823): …
@@ -50,7 +51,10 @@ term id <id> is outside the range the vchord BM25 index holds (0 to 1,073,741,82
 Once `bm25_term_id_seq` passes 2^30, every document holding a new term is
 refused, and the vocabulary's ids have to be renumbered densely before such a
 document can be indexed. This change does not renumber them.
-`SELECT last_value FROM bm25_term_id_seq` shows how close an installation is.
+`/health`'s `bm25.term_id_headroom` shows how close an installation is
+(`last_drawn`, the 2^30 `vchord_limit`, the `used` share, and a `warning`
+from 90% naming `scripts/compact_bm25_term_ids.py`); `SELECT last_value FROM
+bm25_term_id_seq` shows the same number directly.
 
 ### The BM25 index's VACUUM no longer stalls search, and its counts survive a crash (akb#687)
 
