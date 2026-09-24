@@ -5,9 +5,9 @@ candidates. SQL predicates applied above that scan can therefore remove every
 candidate even when matching chunks exist beyond the budget. Materialising a
 small ACL set first is deliberately the control case: its ranking does not
 depend on the global BM25 candidate budget. The finite page remains the fast
-path; a growing scan, an invisible row or a skipped block can still make it
-short, so a short page is completed with the -1 exact scan, which is the only
-one that proves exhaustion (akb#673).
+path; a growing scan or an invisible row can still make it short, so a short
+page is completed with the -1 exact scan, which is the only one that proves
+exhaustion (akb#673).
 
 These cases require the extension-capable PostgreSQL image. They create one
 database per test and skip when AKB_VCHORD_TEST_DSN is absent.
@@ -953,16 +953,16 @@ async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
     assert budgets == [5, -1]
 
 
-async def test_page_shortened_by_a_rebuilt_index_is_completed_exactly():
-    """vchord_bm25 0.3.0 can build block summaries that a bounded scan skips.
+async def test_a_rebuilt_index_answers_a_bounded_page_in_full():
+    """An index built over existing rows keeps every block reachable (akb#679).
 
-    CREATE INDEX and REINDEX save a full 128-posting block's summary before the
-    block's best posting is counted, and take the last posting among ties. A
-    block whose best score falls on its last posting is recorded as scoring at
-    most 0, and a bounded scan skips it outright. With 300 identical rows that
-    is both full blocks: the bounded scan sees the 44 rows of the partial block
-    and no others. The exact scan reads every posting, so the page it completes
-    is the whole answer.
+    vchord_bm25 0.3.0 saved a full 128-posting block's summary before it
+    counted the block's best posting, and took the last posting among ties.
+    With 300 identical rows every full block's best is its last posting, so the
+    upstream build recorded both full blocks as scoring 0 and a bounded scan
+    returned only the 44 rows of the partial block. deploy/postgres compiles
+    the extension with that fixed: the bounded page is whole and needs no exact
+    completion.
     """
     target = uuid.UUID(int=0x75)
     async with _store() as (store, pool):
@@ -989,9 +989,7 @@ async def test_page_shortened_by_a_rebuilt_index_is_completed_exactly():
                           WHERE c.sparse_bm25 IS NOT NULL
                           ORDER BY score LIMIT 90) ranked WHERE score < 0
                     """)
-                # The defect this test is about. If a new extension pin stops
-                # skipping those blocks, this is the line to revisit.
-                assert bounded == 44
+                assert bounded == 90, "the index build skips blocks again (akb#679)"
                 with pytest.MonkeyPatch.context() as mp:
                     mp.setattr(type(store), "_filter_is_selective",
                                lambda *a, **k: _constant(False))
@@ -1002,4 +1000,4 @@ async def test_page_shortened_by_a_rebuilt_index_is_completed_exactly():
                         )
 
     assert len(hits) == 90
-    assert budgets == [100, -1]
+    assert budgets == [100]  # whole on the bounded page, no exact completion

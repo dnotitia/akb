@@ -1,7 +1,7 @@
 """The extension image cannot become a second way to move PostgreSQL.
 
-`deploy/postgres/Dockerfile` builds AKB's PostgreSQL with `vchord_bm25` added,
-and the install paths build it. It is also a second place naming a PostgreSQL
+`deploy/postgres/Dockerfile` builds AKB's PostgreSQL with `vchord_bm25`
+compiled in, and the install paths build it. It is also a second place naming a PostgreSQL
 image — and akb#619 was about exactly that failure mode: a reference that moves
 the database while every manifest still reads the same. If the extension image
 ever drifted off the pinned base, enabling BM25-on-index would quietly change
@@ -21,10 +21,17 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 
+def _postgres_dockerfile() -> str:
+    return (REPO / "deploy/postgres/Dockerfile").read_text()
+
+
 def test_the_extension_image_builds_on_the_pinned_deployment_base():
-    dockerfile = (REPO / "deploy/postgres/Dockerfile").read_text()
-    base = re.search(r"^FROM (pgvector/\S+)", dockerfile, re.M)
+    dockerfile = _postgres_dockerfile()
+    base = re.search(r"^ARG PGVECTOR_IMAGE=(pgvector/\S+)", dockerfile, re.M)
     assert base, "확장 이미지가 pgvector 기반이 아니다"
+    # Both the compile stage and the final image stand on it: the headers the
+    # extension is compiled against belong to the server it runs in.
+    assert dockerfile.count("FROM ${PGVECTOR_IMAGE}") == 2
     pinned = re.search(r"^\s*image:\s*(pgvector/\S+)",
                        (REPO / "deploy/k8s/postgres.yaml").read_text(), re.M)
     assert pinned, "배포 매니페스트에서 pgvector 이미지를 못 찾았다"
@@ -34,14 +41,56 @@ def test_the_extension_image_builds_on_the_pinned_deployment_base():
     )
 
 
-def test_every_stage_of_the_extension_image_is_pinned_by_digest():
-    """A mutable tag in either stage reopens akb#619 through the side door."""
-    dockerfile = (REPO / "deploy/postgres/Dockerfile").read_text()
-    refs = re.findall(r"^(?:FROM|ARG \w+=)\s*(\S+)", dockerfile, re.M)
-    refs = [r for r in refs if not r.startswith("${")]
-    assert refs, "이미지 참조를 못 찾았다"
+def test_every_image_the_extension_build_pulls_is_pinned_by_digest():
+    """A mutable tag in any stage reopens akb#619 through the side door."""
+    dockerfile = _postgres_dockerfile()
+    stages = set(re.findall(r"^FROM \S+ AS (\w+)", dockerfile, re.M))
+    refs = re.findall(r"^ARG \w+_IMAGE=(\S+)", dockerfile, re.M)
+    refs += [r for r in re.findall(r"^FROM (\S+)", dockerfile, re.M)
+             if not r.startswith("${") and r not in stages]
+    assert len(refs) >= 2, "이미지 참조를 못 찾았다"
     unpinned = [r for r in refs if "@sha256:" not in r]
     assert not unpinned, f"digest 없이 당기는 참조: {unpinned}"
+
+
+def test_the_extension_is_compiled_from_pinned_source_with_the_fix():
+    """akb#679 is fixed by compiling the extension here, so what is compiled is pinned.
+
+    The upstream tarball by sha256, the crates by a committed lockfile built
+    `--locked` (0.3.0 ships none), and the patch applied exactly: a patch that
+    no longer fits must fail the build rather than be skipped or bent.
+    """
+    dockerfile = _postgres_dockerfile()
+    sha = re.search(r"^ARG VCHORD_BM25_SHA256=([0-9a-f]+)$", dockerfile, re.M)
+    assert sha and len(sha.group(1)) == 64, "소스 tarball 의 sha256 핀이 없다"
+    assert 'sha256sum -c -' in dockerfile
+    assert "cargo build --locked" in dockerfile
+    lockfile = REPO / "deploy/postgres/vchord_bm25/Cargo.lock"
+    assert re.search(r'name = "pgrx"\nversion = "0\.16\.1"', lockfile.read_text()), lockfile
+    patches = sorted((REPO / "deploy/postgres/vchord_bm25").glob("*.patch"))
+    assert patches, "akb#679 패치가 없다"
+    assert "patch -p1 --forward --fuzz=0" in dockerfile
+    fix = patches[0].read_text()
+    assert "src/segment/posting/serializer.rs" in fix
+    assert "AGPL-3.0-only or Elastic-2.0" in fix  # offered under the extension's own terms
+
+
+def test_nothing_runs_the_upstream_prebuilt_extension():
+    """The upstream 0.3.0 binary has the akb#679 build defect.
+
+    An install path or CI job that pulled the publisher's image would run, or
+    test, an extension build no installation should have. The history in the
+    changelog may name it; nothing that runs may.
+    """
+    runnable = [
+        *(REPO / ".github").rglob("*.y*ml"),
+        *_compose_files(),
+        *(p for p in (REPO / "deploy").rglob("*") if p.is_file() and p.suffix != ".md"),
+        *(p for p in (REPO / "scripts").rglob("*") if p.is_file()),
+    ]
+    pulls = [str(p.relative_to(REPO)) for p in runnable
+             if "tensorchord/vchord_bm25-postgres" in p.read_text(errors="replace")]
+    assert not pulls, pulls
 
 
 def _compose_files() -> list[Path]:

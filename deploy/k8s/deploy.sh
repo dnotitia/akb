@@ -129,9 +129,14 @@ else
   : "${REGISTRY:?Set REGISTRY env (for example, ghcr.io/myorg)}"
   BACKEND_IMAGE="${REGISTRY}/akb-backend:latest"
   FRONTEND_IMAGE="${REGISTRY}/akb-frontend:latest"
-  # Tagged by the Dockerfile's content, not the AKB version: an AKB upgrade that
-  # leaves the database image unchanged must not restart PostgreSQL.
-  POSTGRES_IMAGE="${REGISTRY}/akb-postgres:pg16-$(cksum <"${ROOT_DIR}/deploy/postgres/Dockerfile" | cut -d' ' -f1)"
+  # Tagged by its build inputs, not the AKB version: the Dockerfile and the
+  # patch and lockfile it copies, names and contents. An AKB upgrade that leaves
+  # them unchanged must not restart PostgreSQL, and one that changes any of them
+  # must not reuse a tag the nodes already hold.
+  POSTGRES_INPUTS="$(cd "${ROOT_DIR}/deploy/postgres" \
+    && find Dockerfile vchord_bm25 -type f | LC_ALL=C sort \
+    | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done | cksum | cut -d' ' -f1)"
+  POSTGRES_IMAGE="${REGISTRY}/akb-postgres:pg16-${POSTGRES_INPUTS}"
   echo "=== Building Docker images (${IMAGE_PLATFORM}) — version ${VERSION} ==="
   docker buildx build --platform "${IMAGE_PLATFORM}" \
     -t "${REGISTRY}/akb-backend:${VERSION}" -t "${BACKEND_IMAGE}" --push \
