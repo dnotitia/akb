@@ -189,8 +189,9 @@ average for each replacement of the whole corpus.
 insert and VACUUM all count the stored length. What VACUUM subtracts is exactly
 what was added, however often a document is replaced. The average is now the
 mean of the lengths BM25 scores documents with, a little below the mean of
-exact lengths. On an index the upstream binary built, a `REINDEX` moves it down
-once by that difference.
+exact lengths. An index the upstream binary built keeps its sum as it was,
+neither growing further nor healing, until a `REINDEX` moves it down once: by
+that difference, plus whatever the upstream VACUUM had added.
 
 ## What a bounded scan can still differ on
 
