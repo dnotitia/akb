@@ -77,11 +77,18 @@ _VCHORD_MAX_CANDIDATES = 65_535
 # scopes of at most this many rows; a larger one is searched index-led
 # (akb#626). All SQL retains the existing caller/pool budgets.
 _VCHORD_MAX_MATERIALISED_ROWS = 10_000
-# The largest term id a `bm25vector` holds. Its text input parses u32 and
-# answers anything larger, or negative, with "Bad parsing at position N". Term
-# ids are minted as `bigint`, so this, not the column type, is the limit the
-# vchord shape lives under (akb#665).
-_BM25VECTOR_MAX_TERM_ID = 4_294_967_295
+# The largest term id the vchord shape can index. Term ids are minted as
+# `bigint`, and a `bm25vector`'s text input parses u32, answering anything
+# larger, or negative, with "Bad parsing at position N" (akb#665). The index is
+# narrower than both: it addresses its per-term arrays with 32-bit byte offsets,
+# 4 bytes per id, and the release build does not check the multiplication. An
+# id at or above 2^30 therefore lands on the id 2^30 below it, and nothing
+# fails. In an index built over existing rows, a search for the high id reads
+# the low id's entries, and the document holding the high id cannot be found
+# through it. Inserted and then sealed, the high id's posting joins the low
+# id's list and its document the low id's count, so a search for the low term
+# ranks a document that does not hold it, and both terms' IDF is wrong.
+_BM25VECTOR_MAX_TERM_ID = 2**30 - 1
 
 
 async def _set_vchord_candidate_budget(
@@ -170,13 +177,18 @@ def _bm25vector_literal(
         )
     for term in indices:
         if not 0 <= int(term) <= _BM25VECTOR_MAX_TERM_ID:
-            # The index would answer "Bad parsing at position N", naming
-            # neither the term nor the limit. Dropping the term instead would
-            # index the document under a subset of what it says, which nothing
-            # downstream could notice.
+            # Up to u32 the text input takes the id, and the index corrupts
+            # another term's entries without a word; past u32, or below zero,
+            # the input answers "Bad parsing at position N", naming neither the
+            # term nor the limit. Dropping the term instead would index the
+            # document under a subset of what it says, which nothing downstream
+            # could notice.
             raise ValueError(
-                f"term id {term} is outside the range a bm25vector holds "
-                f"(0 to {_BM25VECTOR_MAX_TERM_ID:,})"
+                f"term id {term} is outside the range the vchord BM25 index "
+                f"holds (0 to {_BM25VECTOR_MAX_TERM_ID:,}): an id at or above "
+                f"2^30 would corrupt another term's statistics in that index. "
+                f"The BM25 vocabulary's term ids have to be renumbered densely "
+                f"before a document holding it can be indexed."
             )
     counts: dict[int, int] = {}
     for term, weight in zip(indices, values):
@@ -202,14 +214,15 @@ def _bm25query_literal(terms: list[int]) -> str | None:
     """The query as the same `{id:tf}` text input documents use, or None.
 
     Queries were bound as `int[]`, the extension's only array cast, and asyncpg
-    refuses any id past 2,147,483,647 before the query is sent — while
-    documents, written as text, hold ids up to 4,294,967,295 (akb#665). Built
-    as text, a query reaches every id a document can hold, and the two stay
-    equal: the array cast counts a repeated id the way this literal folds it.
+    refuses any id past 2,147,483,647 before the query is sent, while term ids
+    are minted as `bigint` (akb#665). Built as text, a query goes through the
+    same input and the same bound as a document, and the two stay equal: the
+    array cast counts a repeated id the way this literal folds it.
 
-    A term past that range is in no document, because writing one is refused,
-    so it is dropped here rather than failing the whole search. None means
-    nothing is left to ask.
+    That bound is `_BM25VECTOR_MAX_TERM_ID`, 1,073,741,823: the index cannot
+    address an id at or above 2^30. A term past it is in no document, because
+    writing one is refused, so it is dropped here rather than failing the whole
+    search. None means nothing is left to ask.
     """
     held = [int(t) for t in terms if 0 <= int(t) <= _BM25VECTOR_MAX_TERM_ID]
     if not held:

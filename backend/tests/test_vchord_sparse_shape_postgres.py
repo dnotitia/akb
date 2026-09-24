@@ -26,7 +26,11 @@ import asyncpg
 import pytest
 
 from app.services.vector_store import VectorStoreUnavailable
-from app.services.vector_store.pgvector import PgvectorStore, _bm25vector_literal
+from app.services.vector_store.pgvector import (
+    PgvectorStore,
+    _bm25query_literal,
+    _bm25vector_literal,
+)
 
 pytestmark = pytest.mark.asyncio  # 동기 테스트는 아래에서 개별 해제
 
@@ -242,19 +246,30 @@ async def test_a_written_chunk_comes_back_from_a_search():
         assert str(uuid.UUID(int=1)) in hits, "쓴 청크가 검색에 안 나온다"
 
 
-# Past int4 and inside the u32 range the index stores. Term ids are `bigint`
-# where they are minted; the query path bound them as `int4`.
+# The largest id the index can address, and the first it cannot: it addresses
+# its per-term arrays with 32-bit byte offsets, 4 bytes per id. Written out
+# rather than imported, so a test fails if the bound in the code moves.
+_MAX_TERM_ID = 1_073_741_823  # 2^30 - 1
+_PAST_INDEX = 1_073_741_824  # 2^30
+# Past int4. Term ids are `bigint` where they are minted; the query path bound
+# them as `int4`.
 _PAST_INT4 = 3_000_000_000
-# The first id the index cannot hold: its text input takes u32.
+# Past u32, the first id the text input itself refuses.
 _PAST_U32 = 4_294_967_296
 
 
+@pytest.mark.parametrize("term", [_MAX_TERM_ID, _PAST_INT4], ids=["largest-held", "past-int4"])
 @pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
-async def test_a_query_term_past_int4_reaches_every_query_shape(shape):
-    """Term ids are `bigint` where they are minted, the index holds u32, and
-    the query path bound them as `int4` (akb#665). asyncpg refused any id past
-    2,147,483,647 before the query was sent, so a query holding one failed
-    outright in every shape, and in `hybrid_search` took both legs with it.
+async def test_a_large_query_term_fails_no_query_shape(shape, term):
+    """Term ids are `bigint` where they are minted, and the query path bound
+    them as `int4` (akb#665). asyncpg refused any id past 2,147,483,647 before
+    the query was sent, so a query holding one failed outright in every shape,
+    and in `hybrid_search` took both legs with it.
+
+    Two ids, because they now take different routes. The largest id a document
+    can hold is sent, as text, and no shape may fail on it. An id past int4 is
+    past that bound too, so it is dropped before anything is bound, and the
+    search still has to stand.
 
     Only the query carries the large id. Writing one into the index is left to
     a manual check: the index keeps a structure per id up to its largest, and
@@ -277,7 +292,7 @@ async def test_a_query_term_past_int4_reaches_every_query_shape(shape):
                 mp.setattr(type(store), "_filter_is_selective",
                            lambda *a, **k: _const(shape == "materialised"))
                 hits = await store._search_sparse(
-                    conn, terms=[20, _PAST_INT4], weights=[1.0, 1.0],
+                    conn, terms=[20, term], weights=[1.0, 1.0],
                     filter_uuids=None if shape == "unfiltered" else [vault],
                     filter_col="vault_id", limit=5,
                 )
@@ -286,20 +301,46 @@ async def test_a_query_term_past_int4_reaches_every_query_shape(shape):
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
 def test_the_vector_literal_names_the_bound_the_index_holds():
-    """One bound, stated where every vector is built (akb#665).
+    """One bound, stated where every vector is built.
 
-    The index's text input answers an id past u32, or a negative one, with
-    "Bad parsing at position N". A document holding one is refused with the
-    bound named, rather than indexed under a subset of its terms."""
-    with pytest.raises(ValueError, match="0 to 4,294,967,295"):
-        _bm25vector_literal([20, _PAST_U32], [1.0, 1.0])
-    with pytest.raises(ValueError, match="0 to 4,294,967,295"):
-        _bm25vector_literal([-1], [1.0])
-    assert _bm25vector_literal([4_294_967_295], [1.0]) == "{4294967295:1}"
+    The index addresses its per-term arrays with 32-bit byte offsets, 4 bytes
+    per id, so an id at or above 2^30 lands on the id 2^30 below it, with no
+    error from anything. The text input would take the id: it answers only one
+    past u32, or a negative one, and then with "Bad parsing at position N"
+    (akb#665). A document holding one is refused with the id, the bound and the
+    remedy named, rather than indexed under a subset of its terms."""
+    assert _bm25vector_literal([_MAX_TERM_ID], [1.0]) == "{1073741823:1}"
+
+    with pytest.raises(ValueError) as refused:
+        _bm25vector_literal([20, _PAST_INDEX], [1.0, 1.0])
+    message = str(refused.value)
+    assert "term id 1073741824 " in message
+    assert "(0 to 1,073,741,823)" in message
+    assert "2^30 would corrupt another term's statistics" in message
+    assert "renumbered densely" in message
+
+    for term in (_PAST_INT4, _PAST_U32, -1):
+        with pytest.raises(ValueError, match=rf"term id {term} .*\(0 to 1,073,741,823\)"):
+            _bm25vector_literal([term], [1.0])
 
 
-async def test_a_query_term_the_index_cannot_hold_matches_nothing():
-    """No document can hold such a term, so it cannot fail the search (akb#665)."""
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+def test_a_query_keeps_the_ids_a_document_can_hold_and_drops_the_rest():
+    """The same bound on the query side. A term at or above 2^30 is in no
+    document, because writing one is refused, so it is dropped rather than
+    sent; the largest id a document can hold is kept."""
+    assert _bm25query_literal([20, _MAX_TERM_ID]) == "{20:1, 1073741823:1}"
+    assert _bm25query_literal([_PAST_INDEX, 20, _PAST_INT4, _PAST_U32, -1]) == "{20:1}"
+    assert _bm25query_literal([_PAST_INDEX]) is None
+
+
+@pytest.mark.parametrize("term", [_PAST_INDEX, _PAST_U32], ids=["past-index", "past-u32"])
+async def test_a_query_term_the_index_cannot_hold_matches_nothing(term):
+    """No document can hold such a term, so it cannot fail the search (akb#665).
+
+    Both ids are dropped before the query is sent. The first is one the text
+    input would take; the second it would refuse, failing the whole search, if
+    it were sent."""
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             await store.upsert_one(
@@ -309,11 +350,11 @@ async def test_a_query_term_the_index_cannot_hold_matches_nothing():
                 dense=None, sparse_indices=[20], sparse_values=[1.0], conn=conn,
             )
             alone = await store._search_sparse(
-                conn, terms=[_PAST_U32], weights=[1.0], filter_uuids=None,
+                conn, terms=[term], weights=[1.0], filter_uuids=None,
                 filter_col="vault_id", limit=5,
             )
             mixed = await store._search_sparse(
-                conn, terms=[_PAST_U32, 20], weights=[1.0, 1.0], filter_uuids=None,
+                conn, terms=[term, 20], weights=[1.0, 1.0], filter_uuids=None,
                 filter_col="vault_id", limit=5,
             )
     assert alone == []
