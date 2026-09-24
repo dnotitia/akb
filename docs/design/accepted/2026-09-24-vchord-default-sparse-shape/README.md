@@ -71,9 +71,10 @@ the vector store is built. `/health` reports `vector_store.sparse_shape`.
   included, while readiness stayed green. The order above is what prevents
   that.
 - **Where the extension comes from.** AKB publishes no PostgreSQL image. Its
-  install paths build `deploy/postgres/Dockerfile`, the pinned pgvector image
-  plus the extension, where they run it:
-  - Compose, `deploy/k8s/deploy.sh` and the CI runtime e2e build it themselves.
+  install paths build `deploy/postgres/Dockerfile` where they run it: the
+  pinned pgvector image plus the extension, compiled from the 0.3.0 source with
+  fixes for index builds (akb#679) and VACUUM's length statistics (akb#684).
+  - Compose, `deploy/k8s/deploy.sh` and the CI jobs build it themselves.
   - Helm and the Native Kubernetes overlay take it through the image value that
     their install commands set.
   - The all-in-one leaves it out. It is the one image AKB publishes, and
@@ -98,12 +99,19 @@ the vector store is built. `/health` reports `vector_store.sparse_shape`.
 
 ## Known limits
 
-- **Index builds.** `vchord_bm25` 0.3.0 saves some block summaries too early
-  when it builds an index with `CREATE INDEX` or `REINDEX`, and a bounded scan
-  then skips those blocks. A new database builds the index empty and fills it
-  by insert, which does not have the defect; a restore that rebuilds indexes,
-  a `REINDEX`, and the backfill runbook's `--index` do. A page shortened this
-  way is completed exactly; a full page can still miss better matches.
+- **Indexes the upstream binary built or vacuumed.** Upstream 0.3.0 saved some
+  block summaries too early when it built an index over existing rows
+  (akb#679), and its VACUUM inflated the average document length (akb#684). The
+  image compiles the extension with both fixed; the length sum now counts the
+  length the index stores for each document. An index the upstream binary
+  touched keeps what it wrote until `REINDEX INDEX CONCURRENTLY` rebuilds it on
+  the new image.
+- **Summaries and the moving average.** A block summary is chosen with the
+  average document length of the moment it is written. A large later change in
+  that average can make it underestimate its block. A rebuild rewrites them.
+- **VACUUM.** The index's VACUUM holds its metapage for the whole pass, so
+  searches wait for it, and a backend killed mid-pass leaves the counts too high
+  until a rebuild (akb#687).
 - **Sealing.** Inserts accumulate in the index's growing segment until it
   reaches `bm25_catalog.segment_growing_max_page_size` pages, and every search
   reads that segment in full. The insert that seals it moves the segment into

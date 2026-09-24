@@ -1608,12 +1608,8 @@ class PgvectorStore:
 
         A finite `bm25_limit` is the size of the extension's internal top-k, and
         a page shorter than `limit` does not prove there is nothing more to find:
-
-        * growing-segment rows are scored without the query's filter and take
-          top-k slots, and so can rows this snapshot cannot see;
-        * an index built by CREATE INDEX or REINDEX (vchord_bm25 0.3.0) can store
-          a best score of 0 for the first blocks of a term's list, and a bounded
-          scan skips those blocks outright.
+        growing-segment rows are scored without the query's filter and take
+        top-k slots, and so can rows this snapshot cannot see.
 
         Only `bm25_limit = -1` reads every posting of the query terms and leaves
         visibility and the filter to the executor, so only it is complete.

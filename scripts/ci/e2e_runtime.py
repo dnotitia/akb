@@ -1709,7 +1709,10 @@ class E2ERuntime:
         await terminate_process(managed.process, process_group=managed.process_group)
 
     async def _start_dependencies(self) -> None:
-        await self._compose("up", "--detach", "--wait")
+        # --build: PostgreSQL is built from deploy/postgres, and a project name
+        # reused across runs would otherwise keep the image an earlier checkout
+        # built, patches and all. Unchanged inputs rebuild from the layer cache.
+        await self._compose("up", "--build", "--detach", "--wait")
         await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
         await self._wait_http(
             "MinIO",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -240,15 +241,24 @@ def test_deployer_without_a_postgres_image_keeps_the_base_and_says_what_follows(
 
 
 def test_deployer_builds_the_extension_image_and_deploys_it(tmp_path: Path):
-    """Built from deploy/postgres, tagged by the Dockerfile's content so an AKB
-    upgrade that leaves the image unchanged does not restart PostgreSQL."""
+    """Built from deploy/postgres and tagged by every input of that build.
+
+    The tag covers the Dockerfile and the patch and lockfile it copies, so an
+    AKB upgrade that leaves them unchanged does not restart PostgreSQL, and a
+    changed patch cannot hide behind a tag the nodes already hold.
+    """
     applied = _render_capturing_kubectl(tmp_path)
     builds = tmp_path / "docker.log"
     _write_executable(tmp_path / "docker", f"#!/bin/sh\necho \"$*\" >> '{builds}'\n")
     result = _deploy(tmp_path, REGISTRY="registry.example")
     assert result.returncode == 0, result.stderr
-    checksum = subprocess.run(["cksum"], input=(_K8S.parents[0] / "postgres/Dockerfile").read_bytes(),
-                              capture_output=True, check=True).stdout.split()[0].decode()
+    context = _K8S.parents[0] / "postgres"
+    inputs = [context / "Dockerfile", *sorted((context / "vchord_bm25").rglob("*"))]
+    assert any(p.suffix == ".patch" for p in inputs) and any(p.name == "Cargo.lock" for p in inputs)
+    stream = b"".join(
+        str(p.relative_to(context)).encode() + b"\n" + p.read_bytes() for p in inputs if p.is_file()
+    )
+    checksum = hashlib.sha256(stream).hexdigest()[:16]
     image = f"registry.example/akb-postgres:pg16-{checksum}"
     postgres_builds = [line for line in builds.read_text().splitlines() if image in line]
     assert len(postgres_builds) == 1, builds.read_text()

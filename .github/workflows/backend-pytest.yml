@@ -85,29 +85,25 @@ jobs:
       # which is the failure this job's file list already guards against for
       # a different reason.
       #
-      # This is the SAME digest `deploy/postgres/Dockerfile` copies the
-      # extension out of, so CI exercises the version an operator building
-      # that image would get; it happens to ship pgvector too (0.8.1), enough
-      # for the `vector` column the shared DDL creates. It is NOT the
-      # production base: that is `pgvector/pgvector:pg16`, above, at a newer
-      # pgvector. Nothing in these tests reads a vector.
+      # It is the image the install paths build, from deploy/postgres: the
+      # production pgvector base plus vchord_bm25 compiled with the akb#679 and
+      # akb#684 fixes. A prebuilt upstream image would test an extension build
+      # that no installation runs, and the one this lane used to pull has both
+      # defects.
       #
-      # It is started here rather than as a `services:` entry because the
-      # image's CMD preloads the library (`-c shared_preload_libraries=...`)
-      # and a service cannot override CMD. The image operators build does not
-      # preload it, and that difference is not confined to the DDL: without a
-      # preload the extension's settings exist only once a session has called
-      # into it, and a preloaded server hid the failure of every new pooled
-      # connection's first search (akb#615). A plain `postgres` command runs
-      # the same bytes the way operators do.
-      - name: Start the BM25 extension server, without a preload
+      # It runs with the plain `postgres` command, as installations do: no
+      # `shared_preload_libraries`. Without a preload the extension's settings
+      # exist only once a session has called into it, and a preloaded server
+      # hid the failure of every new pooled connection's first search
+      # (akb#615).
+      - name: Build and start the BM25 extension server
         env:
           VCHORD_PASSWORD: akb  # pragma: allowlist secret
         run: |
+          docker build --tag akb-postgres:ci deploy/postgres
           docker run -d --name vchord -p 15433:5432 \
             -e POSTGRES_USER=akb -e POSTGRES_PASSWORD="$VCHORD_PASSWORD" -e POSTGRES_DB=akb \
-            tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d \
-            postgres
+            akb-postgres:ci postgres
 
       - uses: actions/setup-python@v5
         with:
@@ -344,6 +340,7 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_index_build_postgres.py
             tests/test_vchord_encoding_contract_postgres.py
             tests/test_vchord_external_stats_postgres.py
             # Needs both servers: the decision turns on whether the server

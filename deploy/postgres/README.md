@@ -2,7 +2,9 @@
 
 This image adds [`vchord_bm25`](https://github.com/tensorchord/VectorChord-bm25),
 which stores raw term frequencies and owns corpus statistics and BM25 scoring
-in a block-max index. With `vector_store_sparse_shape: auto`, the default, a new
+in a block-max index. The Dockerfile compiles it from the 0.3.0 source with two
+fixes, described under [Index builds](#index-builds-akb679) and
+[Document length statistics](#document-length-statistics-akb684). With `vector_store_sparse_shape: auto`, the default, a new
 database on a server that provides it gets the `vchord` shape. Posting stores
 application-computed weights; identical rankings across the two scorers are not
 a compatibility guarantee.
@@ -35,14 +37,35 @@ shape it serves whatever image it later runs on. `/health` reports it under
 ## Build
 
 ```bash
-docker buildx build -f deploy/postgres/Dockerfile \
-  --platform linux/amd64,linux/arm64 \
-  -t <registry>/akb-postgres:pg16-bm25 --push .
+docker buildx build -t <registry>/akb-postgres:pg16-bm25 --push deploy/postgres
 ```
 
-Both stages are pinned by multi-architecture index digest, so the build is
-reproducible and enabling the extension does not move the PostgreSQL version at
-the same time. To move either pin, follow the procedure in
+This directory is the build context: the Dockerfile copies `vchord_bm25/` from
+it. The first build compiles the extension, which takes under a minute on a
+many-core host and several on a laptop.
+
+What decides the extension is pinned:
+
+| Input | Pin |
+| --- | --- |
+| PostgreSQL and pgvector | the pgvector base, by digest; the same digest as `deploy/k8s/postgres.yaml`, so adding the extension does not move the PostgreSQL version |
+| Rust | 1.91.1, by digest; the compiler the upstream 0.3.0 binary was built with |
+| Extension source | the upstream 0.3.0 tarball, by sha256 |
+| Crates | `vchord_bm25/Cargo.lock`, built `--locked`; 0.3.0 ships no lockfile |
+| The fixes | `vchord_bm25/*.patch`, applied with `set -e` and `--fuzz=0` so a patch that no longer fits fails the build |
+
+The PostgreSQL headers are those of exactly the base's server version. PGDG's
+main repository carries the last few releases of a major, and its archive
+carries all of them, so the pin keeps resolving after main drops this release;
+a source that cannot be read fails the build. bindgen uses the LLVM those
+headers depend on. The SQL install and upgrade scripts and the control file
+come from the source tree and are byte-identical to the upstream release's.
+The Debian toolchain (gcc, libc, LLVM 19) follows bookworm's point releases, so
+a later build can differ in bytes, though not in source.
+
+The base references are multi-architecture indexes, so
+`--platform linux/amd64,linux/arm64` works, but compiling a platform under
+emulation is slow. To move the pgvector pin, follow the procedure in
 [`../k8s/README.md`](../k8s/README.md).
 
 ## Enable
@@ -70,9 +93,9 @@ Without a preload the library loads the first time a session calls into it, and
 its settings (`bm25_catalog.bm25_limit`) exist only from then on. The backend
 reads that setting on connections that may not have loaded the library yet, so
 it loads it first; a value set in the server configuration is read as is.
-Tests must run against a server started the same way: the upstream image
-preloads the library from its CMD, which hides exactly this, so CI starts it
-with a plain `postgres` command.
+Tests must run against a server started the same way, because a preload hides
+exactly this. CI builds this image and starts it with a plain `postgres`
+command.
 
 A database that already serves `posting` stays on it under `auto`, even on this
 image. Moving it is `scripts/backfill_bm25_vector.py`, and then naming `vchord`
@@ -80,8 +103,7 @@ in the setting: select it only after `--index` has built the index. Until then
 the backend refuses the shape rather than building the index itself: at startup
 it would build it inside its schema transaction, blocking writes for the build,
 over a column the backfill had not finished. A new, empty database gets the
-index at startup, built empty and filled by inserts, which also keeps it clear
-of the build-path defect described below.
+index at startup, built empty and filled by inserts.
 
 Switching back is kept possible for as long as it is wanted. While a `posting`
 table exists, `bm25_external_stats_mode` `auto` — the default — and `required`
@@ -112,7 +134,103 @@ the filter discard real matches for common terms, silently and only for the
 terms most queries contain.
 
 So when moving this pin, check that a document containing a query term still
-scores below zero at high document frequency before accepting the bump.
+scores below zero at high document frequency before accepting the bump. Then
+run `test_vchord_index_build_postgres.py` against the new version with and
+without the patches; see [Tests](#tests).
+
+## Index builds (akb#679)
+
+An index built over existing rows goes through the extension's build path:
+`CREATE INDEX`, `CREATE INDEX CONCURRENTLY`, `REINDEX`, every `pg_restore`, and the
+backfill runbook's `--index`. Upstream 0.3.0 flushed a full 128-posting block
+before it recorded the block's best posting. A block whose best posting was its
+last one therefore kept the best recorded for an earlier block, or 0 if none
+had been. Ties make that common. A bounded scan skips a block by that summary,
+so a page, full or short, could miss better matches. Rows that arrive by insert
+reach sealed blocks through the seal path, which records the best first and
+never had this.
+
+`vchord_bm25/0001-record-block-max-before-flush.patch` records the best posting
+first. It changes no on-disk format and no SQL. Measured against the same SQL:
+
+| Build | 300 identical rows, `REINDEX`, bounded top-90 | 20,000-document corpus, `CREATE INDEX`: terms with a worse bounded top-90 |
+| --- | --- | --- |
+| upstream 0.3.0 | 44 | 14 of 1,227 |
+| this image | 90 | 0 of 1,227 |
+
+On a 2.1M-chunk index built with `CREATE INDEX CONCURRENTLY` by the upstream
+binary, 7 of 159 sampled terms had a worse bounded top-90.
+
+On this image, rebuilding the index is safe. An index that the upstream binary
+built over existing rows keeps its summaries until it is rebuilt. After moving
+such an installation to this image, run:
+
+```sql
+REINDEX INDEX CONCURRENTLY vector_index.idx_vi_chunks_bm25;
+```
+
+Use the installation's `vector_store_schema` in place of `vector_index`.
+
+## Document length statistics (akb#684)
+
+The metapage keeps the sum of document lengths, and BM25 takes the average
+document length from it. The index stores a one-byte length code per document,
+which keeps lengths up to 40 and rounds longer ones down to their bucket's
+start: 139 is stored as 136, 300 as 280.
+
+Upstream 0.3.0 added exact lengths on insert and build, and VACUUM subtracted
+the code itself: 62 for a document of length 139. Every update and delete
+therefore left length behind (1 at 41, 14 at 64, 77 at 139), and the average
+grew until the index was rebuilt. Subtracting the code's length instead would
+still leave up to a bucket's width per replaced document, 3 to 4% of the
+average for each replacement of the whole corpus.
+
+`vchord_bm25/0002-count-stored-document-lengths.patch` makes the build, the
+insert and VACUUM all count the stored length. What VACUUM subtracts is exactly
+what was added, however often a document is replaced. The average is now the
+mean of the lengths BM25 scores documents with, a little below the mean of
+exact lengths. An index the upstream binary built keeps its sum as it was,
+neither growing further nor healing, until a `REINDEX` moves it down once: by
+that difference, plus whatever the upstream VACUUM had added.
+
+## What a bounded scan can still differ on
+
+A block summary is the block's best posting, chosen with the average document
+length of the moment it is written. BM25 at query time uses the current average,
+so a large change in that average can make an old summary underestimate its
+block. With the length statistics fixed, the average moves only as the corpus
+itself changes. `REINDEX INDEX CONCURRENTLY` rewrites every summary with the
+current average.
+
+## Known limits in the extension
+
+- **VACUUM stalls search** (akb#687). The index's VACUUM holds the metapage for
+  its whole pass, which visits every document id the index has assigned. A
+  search that starts meanwhile waits for the pass to end: 3 s for a million
+  documents.
+- **VACUUM's counts are not crash-safe** (akb#687). A backend killed during the
+  pass keeps its delete marks and loses its count update. The counts stay too
+  high until a rebuild. A cancelled VACUUM is safe.
+- **Sealing stalls search.** Inserts collect in a growing segment that every
+  search reads. The insert that seals it holds searches for the duration; one
+  seal of 19,691 rows took 24.7 s.
+
+## Tests
+
+`test_vchord_index_build_postgres.py` holds both fixes:
+
+- blocks whose last posting is the best, built by `REINDEX`, compared with the
+  exact scan;
+- the same rows sealed by inserts, the path that never had the defect, compared
+  with the exact scan;
+- the metapage's length sum through a build, inserts and a VACUUM, which must
+  take back exactly what was added, at lengths that are bucket starts and at
+  lengths that are not;
+- a 20,000-document corpus built over existing rows, compared with the exact
+  scan one term at a time and in queries of two or three terms.
+
+Upstream 0.3.0 fails all but the sealed case. Drop a patch only when a new
+upstream pin passes its test without it.
 
 ## Licensing
 
@@ -121,10 +239,11 @@ the Elastic License v2, at the recipient's option. It is a separate program
 that runs inside the PostgreSQL server and is reached over the PostgreSQL wire
 protocol, so it does not change the licensing of AKB itself.
 
+The patches in `vchord_bm25/` are offered under the extension's own terms.
 Building and running this image is use. **Distributing** the built image is
-distribution of that extension and carries the corresponding obligation —
-unmodified, that is an offer of the upstream source, which the link above
-satisfies.
+distribution of the modified extension and carries the corresponding
+obligation: an offer of its source, which is the upstream tarball plus those
+patches.
 
 ## Bounded search and exact completion
 
@@ -137,11 +256,6 @@ A short finite page is not proof that nothing else matches:
 
 - Growing-segment rows are scored without the query's filter, and they take top-k
   slots. So can rows the current snapshot cannot see.
-- In `vchord_bm25` 0.3.0, an index built by `CREATE INDEX` or `REINDEX` can store a
-  best score of 0 for the first full blocks of a term's list. The build saves a
-  128-posting block's summary before its best posting is counted. A bounded scan
-  skips those blocks outright. The next section covers what this means for full
-  pages.
 
 `-1` reads every posting of the query terms and leaves visibility and the
 filter to the executor, so it is the only complete scan. What it costs is those
@@ -172,29 +286,12 @@ statement timeout, so a query that takes longer than five seconds can still fini
 within the caller's budget. Caller cancellation and server timeouts still roll
 back the local plan, candidate-budget and search-path settings.
 
-### Full pages from a rebuilt index
-
-The block defect above also affects a page that comes back full. The skipped
-blocks' postings never compete for the page, so a full page can be missing better
-matches.
-
-Measured on an index built with `CREATE INDEX CONCURRENTLY` over 2.1M chunks: for
-150 randomly sampled terms with 128 to 20,000 matches, plus nine query terms,
-compared one term at a time, the bounded top-90 had a strictly worse score than
-the exact top-90 at some rank for 7 of the 159 terms.
-
-- An index built empty and filled by inserts does not have the defect, because
-  inserted rows are merged in by a different path.
-- A `REINDEX` brings the defect back.
-
-Check this before rebuilding the index or moving the extension pin.
-
 Run `test_vchord_candidate_budget_postgres.py` against the pinned extension. It
 covers:
 
 - finite pages and their exact completion;
 - scoped materialised ranking;
-- every exact route, including a page shortened by a rebuilt index;
+- every exact route, and a rebuilt index answering a bounded page in full;
 - connection recovery.
 
 Hybrid and service regressions cover:

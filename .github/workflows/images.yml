@@ -10,9 +10,10 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-# Build every Dockerfile in the repository. Nothing is pushed. None of the test
-# jobs builds an image, so the frontend and all-in-one images stopped building
-# after #652 while every check stayed green (#669).
+# Build every Dockerfile in the repository. Nothing is pushed. The test jobs
+# build only the PostgreSQL image, and before this job the frontend and
+# all-in-one images stopped building after #652 while every check stayed green
+# (#669).
 jobs:
   build:
     name: Docker image (${{ matrix.image }})
@@ -33,7 +34,8 @@ jobs:
             context: .
           - image: postgres
             file: deploy/postgres/Dockerfile
-            context: .
+            # The Dockerfile copies its patch and lockfile from here.
+            context: deploy/postgres
     steps:
       - uses: actions/checkout@v4
       - name: Build ${{ matrix.image }}

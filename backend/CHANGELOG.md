@@ -7,19 +7,65 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
+
+`vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release
+after 0.3.0 fixes them.
+
+- **Index builds (akb#679).** An index built over existing rows (`CREATE INDEX`,
+  `CREATE INDEX CONCURRENTLY`, `REINDEX`, and so every `pg_restore` and the
+  backfill runbook's `--index`) flushed a full block before it recorded the
+  block's best posting. A bounded search then skipped such blocks, and a page,
+  full or short, could miss better matches. On a 2.1M-chunk index, 7 of 159
+  sampled terms had a worse top-90.
+- **Length statistics (akb#684).** VACUUM subtracted a deleted document's
+  one-byte length code instead of its length from the sum the average document
+  length comes from. The average grew with every update and delete until the
+  index was rebuilt, and length normalisation skewed with it. Now the build,
+  the insert and VACUUM all count the length the index stores for a document,
+  so VACUUM takes back exactly what was added. The average is the mean of the
+  lengths BM25 scores with, a little below the mean of exact lengths.
+
+What changes:
+
+- **`deploy/postgres/Dockerfile` compiles the extension** from the 0.3.0 source
+  with both fixes, in `deploy/postgres/vchord_bm25/`, instead of copying the
+  upstream binary.
+  - What decides the extension is pinned:
+    - the source tarball, by sha256;
+    - Rust 1.91.1, by digest (the compiler of the upstream binary);
+    - the crates, by a committed `Cargo.lock`;
+    - the PostgreSQL headers, at exactly the base's server version.
+  - The Debian toolchain follows bookworm's point releases.
+  - The first build compiles the extension. That takes under a minute on a
+    many-core host and several minutes on a laptop.
+- **CI tests that image.** Its VChord test lane used to run the upstream image,
+  which is an extension build no installation should have.
+- **`deploy/k8s/deploy.sh` tags `akb-postgres` by all of its build inputs.** A
+  changed patch or lockfile therefore produces a new tag.
+- **The defect's traces are gone.** The test that pinned it (`bounded == 44`) is
+  now its regression test, beside `test_vchord_index_build_postgres.py`. The
+  docs that described it as a limit now describe the fixes.
+
+**Upgrading**: an index that the upstream binary built or vacuumed keeps its
+summaries and its length sum until it is rebuilt. After moving to the new
+image, run `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
+A new database's index needs nothing.
+
 ### The install paths build PostgreSQL with the BM25 index extension
 
 The default sparse shape needs `vchord_bm25` in the server. AKB publishes no
 PostgreSQL image, so the install paths now build `deploy/postgres/Dockerfile`
-where they run it: the same pinned pgvector image, plus the extension's files.
+where they run it: the same pinned pgvector image, plus the extension compiled
+with the fixes above.
 
 - **Compose** builds it as the `postgres` service, and so does the CI runtime
   e2e. The Native quickstart builds `postgres` along with the frontend before
   its `up --no-build`.
 - **`deploy/k8s/deploy.sh`** builds and pushes `akb-postgres` next to the
   backend and frontend, and puts it in the rendered manifests.
-  - The tag comes from the Dockerfile's content, so an AKB upgrade that leaves
-    the image unchanged does not restart PostgreSQL.
+  - The tag comes from the image's build inputs, so an AKB upgrade that leaves
+    them unchanged does not restart PostgreSQL.
   - With `SKIP_BUILD=true`, `POSTGRES_IMAGE` names it.
 - **Helm** and the **Native Kubernetes overlay** get it through their install
   commands: `postgres.image`, and an `images` entry.
@@ -106,13 +152,6 @@ posting it could. Measured on the same corpus, completion took 60 ms to 2.5 s,
 including queries of several common terms that are absent from the scope. The
 widening probes are gone, and this shape no longer raises
 `sparse_search_budget_exceeded`.
-
-A short page is not the only thing the exact scan corrects. `vchord_bm25`
-0.3.0 builds some block summaries wrongly under `CREATE INDEX` and `REINDEX`,
-and a bounded scan then skips whole blocks. That can shorten a page, which is
-now completed, but it can also leave a full page missing better matches. On the
-measured index this was 7 of 159 sampled terms. `deploy/postgres/README.md`
-describes the defect and what avoids it.
 
 ### A refused tool call sets `isError` in the MCP result
 
