@@ -316,7 +316,8 @@ def test_the_vector_literal_names_the_bound_the_index_holds():
     message = str(refused.value)
     assert "term id 1073741824 " in message
     assert "(0 to 1,073,741,823)" in message
-    assert "2^30 would corrupt another term's statistics" in message
+    assert "2^30 would land on another term's entries" in message
+    assert "postings, statistics and search results" in message
     assert "renumbered densely" in message
 
     for term in (_PAST_INT4, _PAST_U32, -1):
