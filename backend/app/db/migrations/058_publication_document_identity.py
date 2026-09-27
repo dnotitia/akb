@@ -171,7 +171,9 @@ from pathlib import Path
 
 import asyncpg
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+_BACKEND_ROOT = str(Path(__file__).parent.parent.parent.parent)
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
 
 from app.db.postgres import close_pool, get_pool, init_db
 from app.services.uri_service import parse_uri
