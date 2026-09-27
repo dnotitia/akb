@@ -68,6 +68,17 @@ def test_a_success_does_not_set_is_error(monkeypatch, quiet_sinks):
     assert body["content"] == "body"
 
 
+@pytest.mark.parametrize("results", [[], [{"uri": "akb://v/doc/a.md", "title": "Alpha", "score": 0.1}]])
+def test_incomplete_search_is_a_success_with_its_partial_results_and_diagnostics(monkeypatch, quiet_sinks, results):
+    payload = {
+        "kind": "search", "query": "alpha", "returned": len(results),
+        "results": results, "degraded": True, "degradation_reason": "dense_leg_failed",
+    }
+    out, body = _call(monkeypatch, payload)
+    assert out.is_error is False
+    assert body == payload
+
+
 @pytest.mark.parametrize(
     "payload",
     [
