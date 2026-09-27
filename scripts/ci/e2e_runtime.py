@@ -1813,6 +1813,7 @@ class E2ERuntime:
                                'auth_runtime_epoch_upgrade',
                                'auth_runtime_state',
                                'bm25_stats',
+                               'bm25_vocab_epoch',
                                'document_revision_bootstrap_claims',
                                'document_revision_authority_pending',
                                'document_revision_authority_marker',
@@ -1822,6 +1823,13 @@ class E2ERuntime:
                            );
                         IF table_list IS NOT NULL THEN
                             EXECUTE format('TRUNCATE TABLE %s RESTART IDENTITY CASCADE', table_list);
+                        END IF;
+                        -- Fixture-only recovery for a prior reset that cleared
+                        -- the singleton. Preserve every existing epoch value;
+                        -- production readers still reject a missing row.
+                        IF to_regclass('public.bm25_vocab_epoch') IS NOT NULL THEN
+                            INSERT INTO public.bm25_vocab_epoch (id) VALUES (1)
+                            ON CONFLICT (id) DO NOTHING;
                         END IF;
                     END
                     $cleanup$
