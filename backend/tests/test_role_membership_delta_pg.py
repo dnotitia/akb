@@ -22,8 +22,8 @@ async def _fixture():
         groups = [vault_group_role_name(vault, x) for x in ('reader', 'writer', 'admin')]
         external = 'operator_fixture_' + uuid.uuid4().hex
         try:
-            await conn.execute("""CREATE TABLE users(id uuid PRIMARY KEY, account_status text); CREATE TABLE tokens(id uuid, user_id uuid, vault_scope jsonb, expires_at timestamptz); CREATE TABLE vaults(id uuid PRIMARY KEY, owner_id uuid, status text, name text, public_access text DEFAULT 'none'); CREATE TABLE vault_access(vault_id uuid,user_id uuid,role text); CREATE TABLE fixture_private(id int); INSERT INTO fixture_private VALUES(42)""")
-            await conn.execute("INSERT INTO users VALUES($1,'active'),($2,'active')", owner, member)
+            await conn.execute("""CREATE TABLE users(id uuid PRIMARY KEY, account_status text, is_admin boolean DEFAULT false); CREATE TABLE tokens(id uuid, user_id uuid, vault_scope jsonb, expires_at timestamptz); CREATE TABLE vaults(id uuid PRIMARY KEY, owner_id uuid, status text, name text, public_access text DEFAULT 'none', description text, updated_at timestamptz); CREATE TABLE vault_access(vault_id uuid,user_id uuid,role text); CREATE TABLE fixture_private(id int); INSERT INTO fixture_private VALUES(42)""")
+            await conn.execute("INSERT INTO users(id,account_status) VALUES($1,'active'),($2,'active')", owner, member)
             await conn.execute("INSERT INTO vaults(id,owner_id,status,name) VALUES($1,$2,'archived',$3)", vault, owner, str(vault))
             for role in users + groups + [external]:
                 await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
@@ -252,3 +252,42 @@ async def test_stale_table_callback_cannot_grant_an_unregistered_table():
         await asyncio.wait_for(sync.on_table_create(vault, 'vt_fixture__unregistered'), 3)
         assert not sync.metrics.total_failures()
         assert not await conn.fetchval("SELECT has_table_privilege($1,'vt_fixture__unregistered','SELECT')", groups[0])
+
+
+@pytest.mark.parametrize("setter", ["public", "metadata"])
+async def test_public_mutation_rechecks_owner_after_waiting_for_authority(monkeypatch, setter):
+    from app.exceptions import ForbiddenError
+    from app.services import access_service
+    from app.services.role_authority import role_authority_transaction
+
+    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+        async def get_pool():
+            return sync.pool
+        async def no_policy(vault_id, *, conn):
+            return None
+        monkeypatch.setattr(access_service, "get_pool", get_pool)
+        monkeypatch.setattr(access_service.write_policy_repo, "get_policy", no_policy)
+        monkeypatch.setattr(access_service, "get_role_sync", lambda: sync)
+        await conn.execute("UPDATE vaults SET status='active' WHERE id=$1", vault)
+        task = None
+        try:
+            async with role_authority_transaction(conn):
+                call = (
+                    access_service.set_public_access(str(owner), str(vault), "writer")
+                    if setter == "public" else
+                    access_service.update_vault_metadata(str(owner), str(vault), "stale owner", "writer")
+                )
+                task = asyncio.create_task(call)
+                async with asyncio.timeout(3):
+                    while not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)"):
+                        await asyncio.sleep(0.005)
+                await conn.execute("UPDATE vaults SET owner_id=$1 WHERE id=$2", member, vault)
+            with pytest.raises(ForbiddenError, match="Requires 'owner'"):
+                await asyncio.wait_for(task, 3)
+            row = await conn.fetchrow("SELECT public_access, description FROM vaults WHERE id=$1", vault)
+            assert row["public_access"] == "none"
+            assert row["description"] is None
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)

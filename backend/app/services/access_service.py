@@ -9,6 +9,7 @@ import asyncio
 import contextvars
 import logging
 import uuid
+from contextlib import asynccontextmanager
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
@@ -236,9 +237,21 @@ def check_vault_scope(vault_name: str, required_role: str) -> None:
         )
 
 
+@asynccontextmanager
+async def _access_connection(existing_conn=None):
+    """Reuse a caller's authority transaction without a second pool checkout."""
+    if existing_conn is not None:
+        yield existing_conn
+    else:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            yield conn
+
+
 async def check_vault_access(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
+    _conn=None,
 ) -> dict:
     """Authorize `user_id` on `vault_name`, then RECORD that authorization.
 
@@ -252,9 +265,10 @@ async def check_vault_access(
 
     See `_authorized_vault` for who consumes this and why.
     """
+    connection_args = {"_conn": _conn} if _conn is not None else {}
     result = await _check_vault_access_impl(
         user_id, vault_name, required_role,
-        allow_archived=allow_archived, write_action=write_action,
+        allow_archived=allow_archived, write_action=write_action, **connection_args,
     )
     _authorized_vault.set(vault_name)
     _authorized_vault_id.set(str(result["vault_id"]))
@@ -264,6 +278,7 @@ async def check_vault_access(
 async def _check_vault_access_impl(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
+    _conn=None,
 ) -> dict:
     """Check if user has at least the required role on a vault.
 
@@ -285,10 +300,9 @@ async def _check_vault_access_impl(
     MARKED vault also requires a grant or the admin bypass — the owner
     alone cannot delete it.
     """
-    pool = await get_pool()
     uid = uuid.UUID(user_id)
 
-    async with pool.acquire() as conn:
+    async with _access_connection(_conn) as conn:
         vault = await conn.fetchrow("SELECT id, name, owner_id, status, public_access FROM vaults WHERE name = $1", vault_name)
         if not vault:
             raise NotFoundError("Vault", vault_name)
@@ -1347,7 +1361,6 @@ async def update_vault_metadata(
     Either field may be omitted to leave it untouched. Public access goes
     through the same enum guard as create_vault so a typo can't slip in
     via PATCH that wouldn't have been allowed at create time."""
-    await check_vault_access(user_id, vault_name, required_role="owner")
 
     sets: list[str] = []
     args: list = []
@@ -1359,6 +1372,7 @@ async def update_vault_metadata(
         sets.append(f"public_access = ${len(args) + 1}")
         args.append(public_access)
     if not sets:
+        await check_vault_access(user_id, vault_name, required_role="owner")
         return {"vault": vault_name, "updated": False}
 
     args.append(vault_name)
@@ -1367,6 +1381,8 @@ async def update_vault_metadata(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with role_authority_transaction(conn):
+            # Ownership may change while waiting for the shared authority guard.
+            await check_vault_access(user_id, vault_name, required_role="owner", _conn=conn)
             await conn.execute(sql, *args)
             if public_access is not None:
                 vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name=$1", vault_name)
@@ -1391,11 +1407,12 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
     or the RBAC hook call.
     """
     level = validate_public_access(level)
-    await check_vault_access(user_id, vault_name, required_role="owner")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with role_authority_transaction(conn):
+            # Ownership may change while waiting for the shared authority guard.
+            await check_vault_access(user_id, vault_name, required_role="owner", _conn=conn)
             vault = await conn.fetchrow(
                 "SELECT id, status FROM vaults WHERE name = $1", vault_name,
             )

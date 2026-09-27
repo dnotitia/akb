@@ -1212,11 +1212,10 @@ class RoleSync:
         structured diff that operators can inspect via
         ``GET /admin/role-state`` before triggering a reconcile.
 
-        All passes use bulk catalog queries (one `pg_roles`, one
-        `pg_auth_members`, one `information_schema.role_table_grants`)
-        so the total cost is O(catalog rows) regardless of vault count.
-        Per-table `has_table_privilege` introspection is explicitly
-        avoided.
+        Catalog membership and table-grant inventories use bulk queries.
+        Existing desired memberships also require option validation; these
+        per-edge checks add round trips proportional to the desired edges.
+        Per-table `has_table_privilege` introspection is explicitly avoided.
         """
         diff = RoleStateDiff()
         async with self.pool.acquire() as conn:
