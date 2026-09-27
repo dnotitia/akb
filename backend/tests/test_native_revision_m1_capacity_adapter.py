@@ -518,3 +518,70 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
             await pool.close()
         await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["read_error", "timeout", "cancel"])
+async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, failure):
+    if not await _reachable():
+        pytest.skip("Postgres is not reachable for focused M1 capacity test")
+    base, _ = DSN.rsplit("/", 1)
+    name = f"akb_revision_m1_measurement_cleanup_{uuid.uuid4().hex[:10]}"
+    admin = await asyncpg.connect(DSN)
+    await admin.execute(f'CREATE DATABASE "{name}"')
+    pool = None
+    delayed_tasks = []
+    original_create_task = asyncio.create_task
+    original_grep = CAPACITY.M1NativeGrepService.grep
+    grep_calls = 0
+    probe_started = asyncio.Event()
+    never = asyncio.Event()
+
+    def capture_task(coro, *args, **kwargs):
+        task = original_create_task(coro, *args, **kwargs)
+        if coro.__name__ == "delayed_failed_delivery":
+            delayed_tasks.append(task)
+        return task
+
+    async def probe_grep(self, *args, **kwargs):
+        nonlocal grep_calls
+        grep_calls += 1
+        if grep_calls == 2:
+            probe_started.set()
+            if failure == "read_error":
+                raise RuntimeError("probe read failed before delivery release")
+            await never.wait()
+        return await original_grep(self, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_task", capture_task)
+    monkeypatch.setattr(CAPACITY.M1NativeGrepService, "grep", probe_grep)
+    try:
+        pool, _database, owner, _ = await CAPACITY._setup(f"{base}/{name}")
+        cell = CAPACITY.Cell("test", "probe-cleanup", 1, "same-vault", 1024,
+                             "localized", "closed-loop", None, 1,
+                             CAPACITY.Timing(0, 1, 1, 1, 3, .01))
+        task = original_create_task(CAPACITY._run_cell(pool, owner, cell))
+        if failure == "cancel":
+            await asyncio.wait_for(probe_started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            assert result["closed"] is False
+            assert result["settled"]["derived_probe"]["closed"] is False
+            expected = "RuntimeError" if failure == "read_error" else "TimeoutError"
+            assert result["settled"]["derived_probe"]["error"] == expected
+            assert result["settled"]["cleanup"]["closed"] is True
+        assert len(delayed_tasks) == 1
+        assert delayed_tasks[0].done()
+        assert delayed_tasks[0].cancelled()
+    finally:
+        # The negative control must also leave no fixture tasks behind.
+        for delayed in delayed_tasks:
+            delayed.cancel()
+        await asyncio.gather(*delayed_tasks, return_exceptions=True)
+        if pool is not None:
+            await pool.close()
+        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await admin.close()

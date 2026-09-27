@@ -675,17 +675,24 @@ async def _run_cell(
             return await drain(probe_ns, fail_once=True)
 
         delayed_task = asyncio.create_task(delayed_failed_delivery())
-        await asyncio.wait_for(delivery_started.wait(), timeout=cell.timing.drain_timeout_seconds)
-        visible = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
-        grepped = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
-        reads_completed_before_delivery = not delayed_task.done()
-        release_delivery.set()
-        failed = await asyncio.wait_for(delayed_task, timeout=cell.timing.drain_timeout_seconds)
-        retried = await drain(probe_ns); duplicate = await drain(probe_ns)
-        probe_current = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
-        retry_projection_exact = await asyncio.wait_for(_projection_matches_current_head(pool, namespace_id=probe_ns, resource_id=probe_resource, revision_id=probe_current.revision_id, text=probe_current.text), timeout=cell.timing.request_timeout_seconds)
-        retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0} and retry_projection_exact
-        return retry_ok, retry_projection_exact, {"failed": failed, "retry": retried, "duplicate": duplicate}
+        try:
+            await asyncio.wait_for(delivery_started.wait(), timeout=cell.timing.drain_timeout_seconds)
+            visible = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
+            grepped = await asyncio.wait_for(grep.grep("m1-capacity-needle", user_id=owner, resource_id=probe_resource), timeout=cell.timing.request_timeout_seconds)
+            reads_completed_before_delivery = not delayed_task.done()
+            release_delivery.set()
+            failed = await asyncio.wait_for(delayed_task, timeout=cell.timing.drain_timeout_seconds)
+            retried = await drain(probe_ns); duplicate = await drain(probe_ns)
+            probe_current = await asyncio.wait_for(service.get_current(namespace_id=probe_ns, surface="document", path=probe_path), timeout=cell.timing.request_timeout_seconds)
+            retry_projection_exact = await asyncio.wait_for(_projection_matches_current_head(pool, namespace_id=probe_ns, resource_id=probe_resource, revision_id=probe_current.revision_id, text=probe_current.text), timeout=cell.timing.request_timeout_seconds)
+            retry_ok = reads_completed_before_delivery and failed["failed"] == 1 and visible.revision_id == probe.revision_id and grepped["results"][0]["revision"] == probe.revision_id and retried["delivered"] + retried["coalesced"] >= 1 and duplicate == {"delivered": 0, "coalesced": 0, "failed": 0} and retry_projection_exact
+            return retry_ok, retry_projection_exact, {"failed": failed, "retry": retried, "duplicate": duplicate}
+        finally:
+            # A read failure or parent cancellation may precede delivery release.
+            # Join the task before leaving the probe so it cannot outlive its cell.
+            if not delayed_task.done():
+                delayed_task.cancel()
+            await asyncio.gather(delayed_task, return_exceptions=True)
 
     async def cleanup() -> tuple[dict[str, int], dict[str, int]]:
         delivery = {"delivered": 0, "coalesced": 0, "failed": 0}
