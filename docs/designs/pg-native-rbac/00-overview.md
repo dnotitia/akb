@@ -357,3 +357,18 @@ serialize ordinary content writes, profile updates, token last-used recording,
 or SQL reads. Do not acquire a second pool connection while holding it.
 Direct administrative catalog/role SQL outside the application must coordinate
 with this guard; it is not automatically intercepted by PostgreSQL.
+
+### PostgreSQL cluster ownership for full reconciliation
+
+Role names and memberships are cluster-global. Full orphan pruning assumes
+exclusive ownership of AKB's managed UUID role namespace in that PostgreSQL
+cluster; putting independent AKB catalogs in different databases does not
+isolate those roles. Ordinary membership deltas are catalog-scoped, while
+full orphan pruning retains this existing ownership requirement.
+
+The full role-prune regression oracle therefore runs separately on an
+exclusively owned test cluster, before other database fixtures allocate
+managed UUID roles. `AKB_ROLE_CLUSTER_EXCLUSIVE=1` opts into that oracle,
+which also refuses a foreign managed-role inventory before reconciliation.
+The remaining role tests can run in disposable databases on a shared test
+server without invoking that full prune oracle.

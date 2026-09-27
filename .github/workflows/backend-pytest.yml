@@ -152,6 +152,16 @@ jobs:
           docker logs vchord
           exit 1
 
+      # Full role pruning is cluster-global: run this oracle before any
+      # other DB fixture creates managed UUID roles on the same service.
+      - name: Run exclusive role-prune namespace oracle
+        working-directory: backend
+        env:
+          AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+          AKB_ROLE_CLUSTER_EXCLUSIVE: '1'
+          REQUIRE_REAL_PG: '1'
+        run: pytest tests/test_role_membership_delta_pg.py -k full_reconcile -v --tb=short
+
       - name: Run pgvector DB-backed e2e tests
         working-directory: backend
         env:

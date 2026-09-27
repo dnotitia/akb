@@ -1,12 +1,13 @@
 """Actual PG role-switch oracles for catalog membership convergence."""
 import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
 
 import asyncpg
 import pytest
 
-from app.services.role_sync import ReconcileReport, RoleStateDiff, RoleSync, user_role_name, vault_group_role_name
+from app.services.role_sync import ReconcileReport, RoleStateDiff, RoleSync, _is_catalog_role, user_role_name, vault_group_role_name
 from tests.test_boot_schema_serialization_pg import _empty_database
 
 pytestmark = pytest.mark.asyncio
@@ -231,7 +232,16 @@ async def test_foreign_token_membership_prevents_false_success_and_rolls_back():
 
 
 async def test_full_reconcile_preserves_similarly_prefixed_operator_roles():
+    # PostgreSQL roles are cluster-global. This full prune oracle must run
+    # separately before other fixtures allocate UUID roles in another DB.
+    if os.environ.get("AKB_ROLE_CLUSTER_EXCLUSIVE") != "1":
+        pytest.skip("full role-prune oracle requires an exclusively owned PG cluster")
     async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+        managed = {
+            row["rolname"] for row in await conn.fetch("SELECT rolname FROM pg_roles")
+            if any(_is_catalog_role(row["rolname"], kind) for kind in ("user", "vault", "token"))
+        }
+        assert managed == set(users + groups), "foreign managed roles in exclusive cluster"
         suffix = uuid.uuid4().hex
         operator_roles = [f'akb_{kind}_operator_{suffix}' for kind in ('user', 'vault', 'token')]
         await conn.execute('CREATE TABLE vault_tables(vault_id uuid, name text)')

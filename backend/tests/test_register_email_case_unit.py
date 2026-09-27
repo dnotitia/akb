@@ -28,6 +28,10 @@ def _patch_pool(monkeypatch, *, existing=None):
     conn.fetchrow = AsyncMock(return_value=existing)
     conn.fetchval = AsyncMock(return_value=False)
     conn.fetch = AsyncMock(return_value=[])
+    async def execute(query, *args):
+        assert "pg_advisory_xact_lock" in query
+        assert args == ("akb:role-sync:reconcile",)
+    conn.execute = AsyncMock(side_effect=execute)
 
     @asynccontextmanager
     async def _acquire():

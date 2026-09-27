@@ -91,6 +91,10 @@ class _FakeConn:
         self._vault_name = vault_name
         self._taken = taken
 
+    async def execute(self, query, *args):
+        assert "pg_advisory_xact_lock" in query
+        assert args == ("akb:role-sync:reconcile",)
+
     def transaction(self, **kwargs):
         # create_table pins isolation="read_committed"
         return _AsyncCtx()

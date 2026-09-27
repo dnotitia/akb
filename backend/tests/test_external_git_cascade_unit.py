@@ -729,7 +729,14 @@ def test_the_sidecar_row_is_created_in_create_vaults_transaction():
     tx_blocks = [
         n for n in ast.walk(create_vault)
         if isinstance(n, ast.AsyncWith)
-        and any("transaction()" in ast.unparse(item.context_expr) for item in n.items)
+        and any(
+            "transaction()" in ast.unparse(item.context_expr)
+            or (isinstance(item.context_expr, ast.Call)
+                and ast.unparse(item.context_expr.func) == "role_authority_transaction"
+                and len(item.context_expr.args) == 1
+                and ast.unparse(item.context_expr.args[0]) == "conn")
+            for item in n.items
+        )
     ]
     assert tx_blocks, "create_vault opens no transaction"
 

@@ -41,7 +41,15 @@ async def test_repository_maps_only_vault_name_unique_constraint(monkeypatch):
             self.constraint_name = constraint_name
 
     class _Connection:
+        def transaction(self, *, isolation):
+            assert isolation == "read_committed"
+            return _AsyncContext(self)
+
         async def execute(self, sql, *args):
+            if "pg_advisory_xact_lock" in sql:
+                assert args == ("akb:role-sync:reconcile",)
+                return
+            assert "INSERT INTO vaults" in sql
             raise _FakeUniqueViolation("vaults_name_key")
 
     monkeypatch.setattr(
@@ -67,7 +75,15 @@ async def test_repository_does_not_mask_an_unrelated_unique_constraint(monkeypat
             self.constraint_name = constraint_name
 
     class _Connection:
+        def transaction(self, *, isolation):
+            assert isolation == "read_committed"
+            return _AsyncContext(self)
+
         async def execute(self, sql, *args):
+            if "pg_advisory_xact_lock" in sql:
+                assert args == ("akb:role-sync:reconcile",)
+                return
+            assert "INSERT INTO vaults" in sql
             raise _FakeUniqueViolation("some_other_key")
 
     monkeypatch.setattr(

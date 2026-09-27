@@ -423,7 +423,7 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
             pool, owner,
             cell,
         )
-        assert result["closed"] is True
+        assert result["closed"] is True, result["settled"]
         assert result["settled"]["exact_current_head"] is True
         assert result["settled"]["direct_head_grep"] is True
         assert result["settled"]["derived_projection_exact_current_head"] is True
