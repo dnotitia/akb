@@ -7,6 +7,36 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.16.1 — 2026-09-27
+
+### Fix search fallback, concurrent bootstrap, and PostgreSQL role convergence
+
+- pgvector hybrid search retains a healthy retrieval leg after a transient
+  failure in its sibling and reports incomplete results. The UI keeps partial
+  hits usable and distinguishes an unavailable search from a healthy empty
+  result. Query embedding failure is also reported. The driver never turns
+  authorization, schema, vocabulary-epoch, or cancellation failures into
+  sibling-leg partial success; existing service-level failure handling is
+  unchanged.
+- Concurrent schema bootstrap retries only deadlock and lock-timeout failures,
+  with a five-second lock wait and at most five attempts. Each attempt rolls
+  back atomically, and migrations run once after bootstrap succeeds.
+- Catalog authority changes and role reconciliation share a transaction guard.
+  Delayed callbacks re-read the catalog instead of restoring revoked access;
+  reconciliation removes stale memberships and detects unsupported membership
+  options or grantor dependencies. Public-owner checks run inside that guard.
+  Full namespace pruning still requires an AKB-exclusive PostgreSQL role
+  namespace; this release does not add multi-AKB shared-cluster isolation.
+- Repeated migration imports no longer accumulate duplicate backend paths.
+  Migration functions and SQL are unchanged. An already-running interpreter
+  with duplicate paths needs a restart to benefit from the fix.
+- The measurement-only Native capacity adapter cancels and joins delayed
+  delivery after read failure, timeout, or parent cancellation, preserving its
+  original failure and false-green checks.
+
+This is a compatible patch release: no API, migration body, or data epoch
+changes. The independently versioned `akb-mcp` proxy is unchanged.
+
 ## 0.16.0 — 2026-09-27
 
 ### The `vchord` shape refuses a term id of 2^30 or more instead of corrupting another term
