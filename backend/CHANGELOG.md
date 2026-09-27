@@ -7,6 +7,8 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+## 0.16.0 — 2026-09-27
+
 ### The `vchord` shape refuses a term id of 2^30 or more instead of corrupting another term
 
 A term id reaches the BM25 index in a `bm25vector`, and AKB refused only the ids
