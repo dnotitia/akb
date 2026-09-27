@@ -396,6 +396,14 @@ class EncodedDocument(NamedTuple):
     epoch: int | None
 
 
+class EncodedQuery(NamedTuple):
+    """Query weights and the numbering they must execute against."""
+
+    indices: list[int]
+    values: list[float]
+    epoch: int | None
+
+
 # A lookup that sees the epoch move starts over. A renumbering is a maintenance
 # command; one committing inside every attempt of the same lookup is a fault.
 _VOCABULARY_EPOCH_ATTEMPTS = 3
@@ -800,6 +808,27 @@ async def encode_query(
         f"bm25 vocabulary was renumbered during each of {_VOCABULARY_EPOCH_ATTEMPTS} "
         "attempts at one query"
     )
+
+
+async def encode_query_at_epoch(
+    text: str, *, sparse_shape: str | None = None,
+) -> EncodedQuery:
+    """Encode one numbering, retaining its epoch through sparse execution.
+
+    The existing tuple API remains available for consumers whose vocabulary
+    cannot be renumbered. Pgvector searches pass this epoch to the driver,
+    which checks it under the shared fence before querying the index.
+    """
+    pool = await get_pool()
+    for _attempt in range(_VOCABULARY_EPOCH_ATTEMPTS):
+        async with pool.acquire() as conn:
+            if not await conn.fetchval(_FENCE_SQL, bm25_maintenance.BM25_VOCAB_EPOCH_LOCK_KEY):
+                raise VocabularyRenumberingInProgress()
+            epoch = await _vocabulary_epoch(conn)
+        indices, values = await encode_query(text, sparse_shape=sparse_shape)
+        if await vocabulary_epoch() == epoch:
+            return EncodedQuery(indices, values, epoch if indices else None)
+    raise VocabularyEpochMoved(epoch, await vocabulary_epoch())
 
 
 async def _query_weights(vocab: dict[str, int]) -> tuple[list[int], list[float]]:

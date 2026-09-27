@@ -1951,9 +1951,26 @@ class SearchService:
         raises it too, for a hit whose source row is gone or stale. What both
         producers have in common is that something WENT WRONG — a filter
         honouring the request never sets it (akb#604)."""
+        store = get_vector_store()
+        query_epoch = None
+
+        async def encode_sparse():
+            nonlocal query_epoch
+            if getattr(store, "query_epoch_supported", False):
+                encoded = await sparse_encoder.encode_query_at_epoch(
+                    query_text, sparse_shape=getattr(store, "sparse_shape", None),
+                )
+                query_epoch = encoded.epoch
+                return encoded.indices, encoded.values
+            return await sparse_encoder.encode_query(query_text)
+
         sparse_failed = False
         try:
-            sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
+            sparse_idx, sparse_vals = await encode_sparse()
+        except sparse_encoder.VocabularyRenumberingInProgress:
+            return [], "bm25_renumbering"
+        except sparse_encoder.VocabularyEpochMoved:
+            return [], "bm25_vocabulary_moved"
         except Exception as e:  # noqa: BLE001
             logger.warning("sparse encode_query failed (%s); dense-only path", e)
             sparse_idx, sparse_vals = [], []
@@ -1984,20 +2001,36 @@ class SearchService:
         prefetch_per_leg = max(limit * 3, 50)
 
         try:
-            hits = await get_vector_store().hybrid_search(
-                query_text=query_text,
-                query_dense=query_embedding,
-                query_sparse_indices=sparse_idx,
-                query_sparse_values=sparse_vals,
-                source_ids=candidate_source_ids,
-                vault_ids=candidate_vault_ids,
-                source_types=source_types,
-                limit=limit,
-                prefetch_per_leg=prefetch_per_leg,
-            )
+            for attempt in range(3):
+                try:
+                    epoch_args = (
+                        {"query_sparse_epoch": query_epoch}
+                        if getattr(store, "query_epoch_supported", False) else {}
+                    )
+                    hits = await store.hybrid_search(
+                        query_text=query_text,
+                        query_dense=query_embedding,
+                        query_sparse_indices=sparse_idx,
+                        query_sparse_values=sparse_vals,
+                        source_ids=candidate_source_ids,
+                        vault_ids=candidate_vault_ids,
+                        source_types=source_types,
+                        limit=limit,
+                        prefetch_per_leg=prefetch_per_leg,
+                        **epoch_args,
+                    )
+                    break
+                except sparse_encoder.VocabularyEpochMoved:
+                    if attempt == 2:
+                        raise
+                    sparse_idx, sparse_vals = await encode_sparse()
             # `sparse_reason` is None on the normal path; set when the sparse leg
             # was down and we ran dense-only (degraded-but-has-results).
             return hits, sparse_reason
+        except sparse_encoder.VocabularyRenumberingInProgress:
+            return [], "bm25_renumbering"
+        except sparse_encoder.VocabularyEpochMoved:
+            return [], "bm25_vocabulary_moved"
         except VectorSearchDegraded as e:
             logger.warning("vector search degraded (%s); retaining %d hits", e.reason, len(e.hits))
             return e.hits, e.reason

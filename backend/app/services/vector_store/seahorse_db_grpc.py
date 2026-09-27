@@ -373,6 +373,7 @@ class SeahorseDbGrpcStore:
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
         source_types: list[str] | None = None,
+        query_sparse_epoch: int | None = None,
     ) -> list[VectorHit]:
         """Server-streaming search. Each ``ResultStreamEvent`` carries
         one of ``header`` / ``chunk`` / ``result_set_boundary`` /

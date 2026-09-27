@@ -385,6 +385,7 @@ class SeahorseCloudStore:
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
         source_types: list[str] | None = None,
+        query_sparse_epoch: int | None = None,
     ) -> list[VectorHit]:
         # Seahorse runs its own RRF prefetch internally; the caller's
         # prefetch_per_leg hint isn't surfaced as an API knob.

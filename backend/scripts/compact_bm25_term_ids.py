@@ -197,7 +197,7 @@ class Survey:
     @property
     def dense(self) -> bool:
         """The ids are exactly 0 .. terms - 1, the numbering this command makes."""
-        return self.terms == 0 or self.max_id == self.terms - 1
+        return self.terms == 0 or (self.min_id == 0 and self.max_id == self.terms - 1)
 
     @property
     def rewritten(self) -> str:
@@ -660,6 +660,7 @@ async def _verify(
 class Outcome:
     facts: Survey
     changed: bool
+    sequence_only: bool = False
     epoch: int | None = None
     next_id: int | None = None
     metapage: dict[str, int] | None = None
@@ -696,7 +697,20 @@ async def apply(
         )
         timings["locks and survey"] = time.monotonic() - started
         if facts.dense:
-            return Outcome(facts=facts, changed=False, timings=timings)
+            if facts.sequence_next == facts.terms:
+                return Outcome(facts=facts, changed=False, timings=timings)
+            # Old allocators can burn the sequence even when every stored id
+            # is already dense. Repair only its next value under the same
+            # window locks; no ids move, so the epoch and revert receipt stay
+            # valid, and no expensive vector/HNSW rewrite is needed.
+            await conn.execute(f"ALTER SEQUENCE bm25_term_id_seq RESTART WITH {facts.terms}")
+            sequence = await conn.fetchrow("SELECT last_value, is_called FROM bm25_term_id_seq")
+            if sequence["last_value"] != facts.terms or sequence["is_called"]:
+                raise VerificationFailed(["the repaired sequence does not continue after the dense ids"])
+            return Outcome(
+                facts=facts, changed=True, sequence_only=True,
+                epoch=facts.epoch, next_id=facts.terms, timings=timings,
+            )
 
         mark = time.monotonic()
         baseline = await _rankings(conn, facts, top_k)
@@ -911,7 +925,13 @@ def render_survey(facts: Survey) -> str:
         lines.append("  --apply would refuse:")
         lines += [f"    - {reason}" for reason in facts.refusals]
     elif facts.dense:
-        lines.append("  the ids are already dense; --apply has nothing to do")
+        if facts.sequence_next == facts.terms:
+            lines.append("  the ids are already dense; --apply has nothing to do")
+        else:
+            lines.append(
+                f"  the ids are already dense; --apply repairs only the sequence to continue "
+                f"at {facts.terms:,}, without rewriting vectors or changing their epoch"
+            )
     else:
         rewritten = "the vectors" if facts.shape == "vchord" else "posting"
         lines.append(
@@ -929,6 +949,12 @@ def render_outcome(outcome: Outcome, action: str) -> str:
     facts = outcome.facts
     if not outcome.changed:
         return "BM25 term-id renumbering: the ids are already dense; nothing to do"
+    if outcome.sequence_only:
+        return (
+            "BM25 term-id renumbering: sequence repaired, verified and committed\n"
+            f"  the sequence continues at {outcome.next_id:,}; term ids, vectors, indexes, "
+            f"vocabulary epoch {outcome.epoch} and the recorded revert mapping are unchanged"
+        )
     lines = [f"BM25 term-id renumbering: {action}, verified and committed"]
     lines.append(
         f"  {facts.terms:,} terms, ids {facts.min_id:,} .. {facts.max_id:,} renumbered; "
@@ -990,6 +1016,16 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
 def _memory(value: str) -> str:
     if not _MEMORY_RE.match(value):
         raise argparse.ArgumentTypeError("a PostgreSQL memory size, e.g. 512MB or 2GB")
@@ -1012,6 +1048,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--maintenance-work-mem", type=_memory, default=_MAINTENANCE_WORK_MEM,
                     help="maintenance_work_mem for the index rebuilds; a dense HNSW index "
                          f"builds far faster when its graph fits (default {_MAINTENANCE_WORK_MEM})")
+    ap.add_argument("--max-parallel-maintenance-workers", type=_nonnegative_int, default=None,
+                    help="session-only parallel index-build worker limit; 0 selects serial "
+                         "builds when shared memory cannot hold a parallel HNSW graph")
     return ap.parse_args(argv)
 
 
@@ -1041,14 +1080,17 @@ async def _run(args: argparse.Namespace) -> int:
 
     # A connection of its own: the application pool's 30-second statement
     # timeout would cancel the rewrite partway through.
+    server_settings = {
+        "application_name": "akb-bm25-compact-term-ids",
+        "statement_timeout": "0",
+        "idle_in_transaction_session_timeout": "0",
+    }
+    if args.max_parallel_maintenance_workers is not None:
+        server_settings["max_parallel_maintenance_workers"] = str(args.max_parallel_maintenance_workers)
     conn = await asyncpg.connect(
         settings.asyncpg_dsn,
         command_timeout=None,
-        server_settings={
-            "application_name": "akb-bm25-compact-term-ids",
-            "statement_timeout": "0",
-            "idle_in_transaction_session_timeout": "0",
-        },
+        server_settings=server_settings,
     )
     try:
         if not (args.apply or args.revert):

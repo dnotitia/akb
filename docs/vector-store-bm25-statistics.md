@@ -107,12 +107,24 @@ What `--apply` does, in one transaction:
   HNSW index included. On a large corpus that rebuild sets the length of the
   window. The dry run lists the indexes and their sizes. Give the rebuild
   memory with `--maintenance-work-mem` (default `1GB`); a parallel build takes
-  it from `/dev/shm`.
+  it from `/dev/shm`. If shared memory cannot hold the graph, select a serial
+  build with `--max-parallel-maintenance-workers 0`. This changes only the
+  command's database session and requires no PostgreSQL restart.
 - The vector table and `bm25_vocab` stay exclusively locked until the commit.
-  Searches wait. Indexing hands its batches back and resumes after the commit
-  without spending retries.
+  Dense searches wait. Sparse searches acquire the shared vocabulary fence
+  and validate the query's epoch before touching the table. A query encoded
+  before a completed renumbering is re-encoded; a held fence returns the
+  explicit degradation reason `bm25_renumbering`. Indexing hands its batches
+  back and resumes after the commit without spending retries. Drain API
+  requests as well as ingestion for an announced maintenance window.
 - A lock that stays busy longer than `--lock-timeout` (default 10 s) refuses
   the run instead of queueing everything behind it.
 
 Keep `bm25_term_id_remap` and `bm25_term_id_remap_run` while a revert may be
 wanted, and drop them afterwards. A later `--apply` replaces them.
+
+If the vocabulary IDs are already dense but the sequence's next value differs
+from the vocabulary size, `--apply` repairs only the sequence. It does not
+rewrite vectors or indexes, change the epoch, or replace an existing revert
+mapping. This also recovers sequence exhaustion when the stored IDs themselves
+have no gaps.

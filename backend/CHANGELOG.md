@@ -164,6 +164,9 @@ What changes:
     documents rank the same documents with the same scores, within 1e-6. Any
     failure rolls everything back and exits 1.
   - `--revert` puts the recorded numbering back.
+  - If IDs are already dense but the sequence was exhausted or advanced past
+    them, `--apply` repairs only the sequence, preserving vectors, indexes,
+    the epoch and an existing revert mapping.
 - **It refuses (exit 2) where it cannot rewrite every copy.**
   - Qdrant and SeahorseDB keep their vectors outside PostgreSQL. Renumbering
     there means indexing every chunk again.
@@ -183,8 +186,10 @@ What changes:
   - On 20,000 chunks with 1024-dimension vectors, the rewrite took 16.5 s, of
     which the HNSW rebuild was 14.0 s. The update route took 51 s and left
     that broken index.
-  - The vector table and `bm25_vocab` stay locked until the commit, so
-    searches wait for it.
+  - The vector table and `bm25_vocab` stay locked until the commit. Dense
+    searches wait; sparse searches report `bm25_renumbering` while its fence
+    is held. `--max-parallel-maintenance-workers 0` selects a serial rebuild
+    in this session when `/dev/shm` cannot hold a parallel HNSW graph.
 - **The vocabulary epoch (migration 113).** Encoding a chunk and storing it are
   separate transactions, so ids read before a renumbering could be stored after
   it, naming other terms. `bm25_vocab_epoch` counts renumberings.
@@ -194,6 +199,10 @@ What changes:
     before a renumbering goes to the retry path and is encoded again.
   - While a renumbering runs, indexing hands its batch back without spending
     retries.
+  - Query encodings carry their epoch through sparse execution too. The
+    search transaction checks it under the shared fence, and the search
+    service re-encodes a query if the epoch moved. A search encoded before
+    the commit cannot silently retrieve another term's documents afterwards.
   - `scripts/migrate_pgvector_to_seahorsedb.py` stops if the vocabulary is
     renumbered under it, including between a run and its resume.
 - **The invariant changes.** Migration 005 said term ids are never reassigned.

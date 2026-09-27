@@ -52,6 +52,31 @@ _TOP = 20
 _TOLERANCE = 1e-6
 
 
+async def test_dense_ids_repair_an_exhausted_sequence_without_rebuilding(monkeypatch, capsys):
+    """Sequence exhaustion can recur without a gap in the vocabulary itself."""
+    async with _installation(monkeypatch) as inst:
+        async with inst.pool.acquire() as conn:
+            await _seed(conn, terms=30, documents=50, max_id=1000, seed=741)
+        assert await compact.main(["--apply"]) == 0
+        capsys.readouterr()
+        async with inst.pool.acquire() as conn:
+            before = await conn.fetch("SELECT term, term_id FROM bm25_vocab ORDER BY term_id")
+            epoch = await conn.fetchval("SELECT epoch FROM bm25_vocab_epoch WHERE id = 1")
+            index_node = await conn.fetchval("SELECT pg_relation_filenode($1::regclass)", _INDEX)
+            mapping = await conn.fetch("SELECT * FROM bm25_term_id_remap ORDER BY term")
+            await conn.execute("SELECT setval('bm25_term_id_seq', $1)", 1 << 30)
+        assert await compact.main([]) == 0
+        assert "sequence" in capsys.readouterr().out
+        assert await compact.main(["--apply"]) == 0
+        assert "sequence repaired" in capsys.readouterr().out
+        async with inst.pool.acquire() as conn:
+            assert await conn.fetch("SELECT term, term_id FROM bm25_vocab ORDER BY term_id") == before
+            assert await conn.fetchval("SELECT epoch FROM bm25_vocab_epoch WHERE id = 1") == epoch
+            assert await conn.fetchval("SELECT pg_relation_filenode($1::regclass)", _INDEX) == index_node
+            assert await conn.fetch("SELECT * FROM bm25_term_id_remap ORDER BY term") == mapping
+            assert await conn.fetchval("SELECT nextval('bm25_term_id_seq')") == 30
+
+
 @dataclass
 class _Installation:
     pool: asyncpg.Pool

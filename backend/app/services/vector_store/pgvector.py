@@ -46,6 +46,7 @@ from typing import assert_never
 
 import asyncpg
 
+from app.services import sparse_encoder
 from app.services.sparse_shapes import SparseShape
 
 from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
@@ -952,6 +953,11 @@ class PgvectorStore:
 
     # ── Search ────────────────────────────────────────────────────
 
+    @property
+    def query_epoch_supported(self) -> bool:
+        """Only the layout the atomic renumbering can change needs fencing."""
+        return not self._dsn and self._sparse_shape in {"posting", "vchord"}
+
     async def hybrid_search(
         self,
         *,
@@ -964,6 +970,7 @@ class PgvectorStore:
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
         source_types: list[str] | None = None,
+        query_sparse_epoch: int | None = None,
     ) -> list[VectorHit]:
         del query_text  # debug-only on this driver; keep signature parity
         started = time.perf_counter()
@@ -1038,13 +1045,21 @@ class PgvectorStore:
                 async with pool.acquire() as c:
                     timings["sparse_wait"] = time.perf_counter() - begin
                     await self._ensure_codec(c)
-                    return await self._search_sparse(
-                        c, terms=list(query_sparse_indices),
-                        weights=list(query_sparse_values),
-                        filter_uuids=filter_uuids, filter_col=filter_col,
-                        source_type_values=source_type_values,
-                        limit=prefetch_per_leg,
-                    )
+                    async with c.transaction():
+                        if self.query_epoch_supported:
+                            # First lock in this transaction, before touching
+                            # the vector table. Old bare IDs are safe only
+                            # while no renumbering has ever committed.
+                            await sparse_encoder.hold_vocabulary_epoch(
+                                c, query_sparse_epoch if query_sparse_epoch is not None else 0,
+                            )
+                        return await self._search_sparse(
+                            c, terms=list(query_sparse_indices),
+                            weights=list(query_sparse_values),
+                            filter_uuids=filter_uuids, filter_col=filter_col,
+                            source_type_values=source_type_values,
+                            limit=prefetch_per_leg,
+                        )
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
@@ -1055,9 +1070,16 @@ class PgvectorStore:
             # two conns. The pool max (default 8) accommodates this even
             # under burst.
             if has_dense and has_sparse:
-                dense_ids, sparse_ids = await asyncio.gather(
-                    _dense_leg(), _sparse_leg(),
-                )
+                legs = [asyncio.create_task(_dense_leg()), asyncio.create_task(_sparse_leg())]
+                try:
+                    dense_ids, sparse_ids = await asyncio.gather(*legs)
+                except BaseException:
+                    # A refused sparse encoding must not leave the dense leg
+                    # queued on the rewritten table, holding a pool slot.
+                    for leg in legs:
+                        leg.cancel()
+                    await asyncio.gather(*legs, return_exceptions=True)
+                    raise
             elif has_dense:
                 dense_ids = await _dense_leg()
                 sparse_ids = []
