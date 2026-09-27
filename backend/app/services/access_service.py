@@ -10,6 +10,7 @@ import contextvars
 import logging
 import uuid
 
+from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import (
     ConflictError,
@@ -532,7 +533,7 @@ async def grant_access(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
@@ -588,17 +589,7 @@ async def grant_access(
                     "applied": outcome.applied,
                 },
             )
-
-    # PG-native RBAC: GRANT akb_vault_<vid>_<role> TO akb_user_<uid>.
-    # Best-effort — reconciler covers drift.
-    #
-    # The EFFECTIVE role, not the requested one: granting `reader` to somebody a
-    # rule already made a `writer` must not demote them in PostgreSQL, or the
-    # database layer would disagree with every application read.
-    if outcome.effective_role is not None:
-        await get_role_sync().on_grant(
-            vault["id"], target["id"], outcome.effective_role,
-        )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
     return {
@@ -640,7 +631,7 @@ async def revoke_access(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
@@ -706,16 +697,7 @@ async def revoke_access(
                     "applied": outcome.applied,
                 },
             )
-
-    # PG-native RBAC. A surviving basis is a DOWNGRADE, not a removal: revoking
-    # all memberships there while the catalog still holds `reader` would take
-    # away in the database what the application still grants.
-    if outcome.effective_role is None:
-        await get_role_sync().on_revoke(vault["id"], target["id"])
-    else:
-        await get_role_sync().on_grant(
-            vault["id"], target["id"], outcome.effective_role,
-        )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", target_username, vault_name)
     return {
@@ -1162,7 +1144,7 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
@@ -1213,16 +1195,8 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                     "to_user_id": str(new_owner["id"]),
                 },
             )
-
-    # PG-native RBAC: mirror the two membership outcomes —
-    #   - new owner gets admin (vaults.owner_id moved)
-    #   - old owner gets admin (vault_access row added above)
-    # `on_grant("admin")` is idempotent and internally clears any
-    # weaker (reader/writer) membership the user previously had,
-    # so no explicit on_revoke step is required here.
-    rs = get_role_sync()
-    await rs.on_grant(vault["id"], new_owner["id"], "admin")
-    await rs.on_grant(vault["id"], vault["owner_id"], "admin")
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
 
     logger.info("Transferred ownership of %s to %s", vault_name, new_owner_username)
     return {"vault": vault_name, "new_owner": new_owner_username, "transferred": True}
@@ -1392,14 +1366,12 @@ async def update_vault_metadata(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(sql, *args)
-        if public_access is not None:
-            # Need vault_id to update PG ACL via RoleSync.
-            vault_id = await conn.fetchval(
-                "SELECT id FROM vaults WHERE name = $1", vault_name,
-            )
-            if vault_id is not None:
-                await get_role_sync().on_public_access_change(vault_id, public_access)
+        async with role_authority_transaction(conn):
+            await conn.execute(sql, *args)
+            if public_access is not None:
+                vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name=$1", vault_name)
+                if vault_id is not None:
+                    await get_role_sync().on_public_access_change_in_conn(conn, vault_id, public_access)
 
     logger.info("Updated vault metadata: %s", vault_name)
     return {"vault": vault_name, "updated": True}
@@ -1423,28 +1395,26 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        vault = await conn.fetchrow(
-            "SELECT id, status FROM vaults WHERE name = $1", vault_name,
-        )
-        if not vault:
-            raise NotFoundError("Vault", vault_name)
-        if vault["status"] == "archived":
-            raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
-        await conn.execute(
-            "UPDATE vaults SET public_access = $1, updated_at = NOW() WHERE id = $2",
-            level, vault["id"],
-        )
-        await emit_event(
-            conn, "vault.public_access",
-            vault_id=vault["id"],
-            resource_uri=vault_uri(vault_name),
-            actor_id=user_id,
-            payload={"vault": vault_name, "level": level},
-        )
-
-    # PG-native RBAC: grant/revoke the corresponding vault group role
-    # TO akb_authenticated so public access maps to a real PG ACL.
-    await get_role_sync().on_public_access_change(vault["id"], level)
+        async with role_authority_transaction(conn):
+            vault = await conn.fetchrow(
+                "SELECT id, status FROM vaults WHERE name = $1", vault_name,
+            )
+            if not vault:
+                raise NotFoundError("Vault", vault_name)
+            if vault["status"] == "archived":
+                raise ForbiddenError(f"Vault '{vault_name}' is archived (read-only)")
+            await conn.execute(
+                "UPDATE vaults SET public_access = $1, updated_at = NOW() WHERE id = $2",
+                level, vault["id"],
+            )
+            await get_role_sync().on_public_access_change_in_conn(conn, vault["id"], level)
+            await emit_event(
+                conn, "vault.public_access",
+                vault_id=vault["id"],
+                resource_uri=vault_uri(vault_name),
+                actor_id=user_id,
+                payload={"vault": vault_name, "level": level},
+            )
 
     logger.info("Set public_access for %s → %s", vault_name, level)
     return {"vault": vault_name, "public_access": level}
@@ -1887,7 +1857,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             # Lock before enumerating object keys. Image uploads register a
             # pending row before PUT and revalidate this lock at finalization,
             # so the sweep includes every key that can become readable.
@@ -2061,20 +2031,21 @@ async def delete_user_account(user_id: str) -> dict:
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        protected = await conn.fetchrow(
-            "SELECT is_recovery_admin, password_hash FROM users WHERE id = $1",
-            uid,
-        )
-        if protected is not None and (
-            protected["is_recovery_admin"]
-            or is_retired_recovery_admin_password(protected["password_hash"])
-        ):
-            raise RecoveryAdminProtectedError()
-        owned_vault_names = [
-            r["name"] for r in await conn.fetch(
-                "SELECT name FROM vaults WHERE owner_id = $1", uid
+        async with role_authority_transaction(conn):
+            protected = await conn.fetchrow(
+                "SELECT is_recovery_admin, password_hash FROM users WHERE id = $1",
+                uid,
             )
-        ]
+            if protected is not None and (
+                protected["is_recovery_admin"]
+                or is_retired_recovery_admin_password(protected["password_hash"])
+            ):
+                raise RecoveryAdminProtectedError()
+            owned_vault_names = [
+                r["name"] for r in await conn.fetch(
+                    "SELECT name FROM vaults WHERE owner_id = $1", uid
+                )
+            ]
 
     deleted_vaults: list[str] = []
     for vname in owned_vault_names:
@@ -2086,14 +2057,15 @@ async def delete_user_account(user_id: str) -> dict:
 
     async with pool.acquire() as conn:
         # Detach residual references rather than deleting the artifacts
-        await conn.execute("UPDATE vault_access SET granted_by = NULL WHERE granted_by = $1", uid)
-        await conn.execute(
-            "UPDATE vault_access_contributions SET granted_by = NULL WHERE granted_by = $1",
-            uid,
-        )
-        await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
-        # CASCADE handles tokens + vault_access.user_id + the bases behind it
-        await conn.execute("DELETE FROM users WHERE id = $1", uid)
+        async with role_authority_transaction(conn):
+            await conn.execute("UPDATE vault_access SET granted_by = NULL WHERE granted_by = $1", uid)
+            await conn.execute(
+                "UPDATE vault_access_contributions SET granted_by = NULL WHERE granted_by = $1",
+                uid,
+            )
+            await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
+            # CASCADE handles tokens + vault_access.user_id + the bases behind it
+            await conn.execute("DELETE FROM users WHERE id = $1", uid)
 
     # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles
     # were already dropped by the per-vault delete_vault calls above.

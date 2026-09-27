@@ -22,6 +22,7 @@ import asyncpg
 import bcrypt
 import jwt
 
+from app.services.role_authority import role_authority_transaction
 from app.config import AuthModeConfigurationError, settings
 from app.db.postgres import get_pool
 from app.exceptions import (
@@ -272,31 +273,32 @@ async def register(username: str, email: str, password: str, display_name: str |
         # sign-in until an admin approves them. The UNIQUE index on
         # lower(email) (migration 109) is the race-proof backstop; this
         # check is the friendly 409 before it.
-        existing = await conn.fetchrow(
-            "SELECT id FROM users WHERE username = $1 OR lower(email) = lower($2)",
-            username,
-            email,
-        )
-        if existing:
-            raise ConflictError("Username or email already exists")
+        async with role_authority_transaction(conn):
+            existing = await conn.fetchrow(
+                "SELECT id FROM users WHERE username = $1 OR lower(email) = lower($2)",
+                username,
+                email,
+            )
+            if existing:
+                raise ConflictError("Username or email already exists")
 
-        # Self-service signup deliberately leaves credential_change_required
-        # at its false default: this password was chosen by the person who
-        # will use it, never delivered to them, so there is nothing to
-        # replace. Arming it here would force a change on an account that
-        # was never issued a credential.
-        is_admin = await conn.fetchval(
-            """
-            INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
-            VALUES ($1, $2, $3, $4, $5, false)
-            RETURNING is_admin
-            """,
-            user_id,
-            username,
-            email,
-            pw_hash,
-            display_name,
-        )
+            # Self-service signup deliberately leaves credential_change_required
+            # at its false default: this password was chosen by the person who
+            # will use it, never delivered to them, so there is nothing to
+            # replace. Arming it here would force a change on an account that
+            # was never issued a credential.
+            is_admin = await conn.fetchval(
+                """
+                INSERT INTO users (id, username, email, password_hash, display_name, is_admin)
+                VALUES ($1, $2, $3, $4, $5, false)
+                RETURNING is_admin
+                """,
+                user_id,
+                username,
+                email,
+                pw_hash,
+                display_name,
+            )
 
     # PG-native RBAC: emit the per-user PG role so akb_sql works.
     # Best-effort — reconciler at next startup catches any failure here.
@@ -536,7 +538,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
     if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
         raise AuthenticationError("Identity provider has not verified this email address")
     display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
-    async with conn.transaction():
+    async with role_authority_transaction(conn):
         targets = await conn.fetch(
             """
             SELECT id, username, email, display_name, is_admin,
@@ -667,7 +669,7 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
         # Authority logins additionally serialize on the claimed address so
         # different subjects cannot adopt the same account concurrently.
         # All browser paths acquire subject, then address, then user-row locks.
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             pre_email = (_optional_external_string(claims, "email") or "").strip().lower()
             if provider_alias is not None:
                 pre_domain = _authority_domain_of(
@@ -748,7 +750,7 @@ async def _resolve_unbound_keycloak_user(
     display_name = _optional_external_string(claims, "name") or raw_preferred_username
     user_id = uuid.uuid4()
     try:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             # Deliberately do not SELECT by email or username first. Their
             # unique constraints are atomic collision guards, never
             # identity resolution or account-linking inputs.
@@ -1190,7 +1192,7 @@ async def create_pat(
     vault_scope_json = json.dumps(vault_scope.to_db_json()) if vault_scope else None
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             if issuer is None:
                 user_row = await conn.fetchrow("SELECT account_status FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
             else:
@@ -1300,11 +1302,12 @@ async def list_pats(user_id: str) -> list[dict]:
 async def revoke_pat(user_id: str, token_id: str) -> bool:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM tokens WHERE id = $1 AND user_id = $2",
-            uuid.UUID(token_id),
-            uuid.UUID(user_id),
-        )
+        async with role_authority_transaction(conn):
+            result = await conn.execute(
+                "DELETE FROM tokens WHERE id = $1 AND user_id = $2",
+                uuid.UUID(token_id),
+                uuid.UUID(user_id),
+            )
     deleted = "DELETE 1" in result
     if deleted:
         # PG-native RBAC: drop the narrow akb_token_<tid> role (a no-op for an

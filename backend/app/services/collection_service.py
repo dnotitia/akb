@@ -14,6 +14,7 @@ import uuid
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
@@ -276,7 +277,7 @@ class CollectionService:
         commit_msg_for_git: str = ""
 
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during collection deletion")
                 # ── Lock + snapshot under prefix ────────────────

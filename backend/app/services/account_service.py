@@ -6,6 +6,7 @@ import uuid
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import (
@@ -150,7 +151,7 @@ async def ensure_human_external_identity(
 
     async with pool.acquire() as conn:
         try:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     f"external-identity:{len(issuer)}:{issuer}{subject}",
@@ -354,7 +355,7 @@ async def ensure_service_user(
 
     async with pool.acquire() as conn:
         try:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     f"service-user:{len(username)}:{username}{email}",
@@ -456,7 +457,7 @@ async def adopt_current_admin_as_service(
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             current = await conn.fetchrow(
                 """
                 SELECT id, username, email, password_hash, display_name, is_admin,
@@ -750,7 +751,7 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
     user_uuid = _uuid(user_id, "user_id")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             current = await conn.fetchrow(
                 """
                 SELECT account_status, account_kind, is_recovery_admin
@@ -906,7 +907,7 @@ async def suspend_user(user_id: str, *, actor_id: str) -> dict:
     user_uuid = _uuid(user_id, "user_id")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             token_ids = await _suspend_user_in_conn(
                 conn,
                 user_uuid,
@@ -925,7 +926,7 @@ async def activate_user(user_id: str, *, actor_id: str) -> dict:
     user_uuid = _uuid(user_id, "user_id")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             row = await conn.fetchrow(
                 """
                 UPDATE users
@@ -963,7 +964,7 @@ async def revoke_user_token(user_id: str, token_id: str, *, actor_id: str) -> di
     pool = await get_pool()
     needs_cleanup = False
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             locked_user_id = await conn.fetchval(
                 "SELECT id FROM users WHERE id = $1 FOR UPDATE",
                 user_uuid,

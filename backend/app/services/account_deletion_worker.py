@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
+from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner
 from app.services.role_sync import get_role_sync, token_role_name, user_role_name
@@ -16,7 +17,7 @@ async def process_once() -> int:
     processed = 0
     for _ in range(8):
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 row = await conn.fetchrow("""SELECT * FROM account_deletion_cleanup WHERE completed_at IS NULL
                     AND next_attempt_at<=clock_timestamp() ORDER BY next_attempt_at,role_kind,resource_id
                     FOR UPDATE SKIP LOCKED LIMIT 1""")

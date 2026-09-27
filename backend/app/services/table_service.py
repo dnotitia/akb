@@ -24,6 +24,7 @@ from typing import Any
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.models.vault_scope import current_token_uuid, current_vault_scope
@@ -922,7 +923,7 @@ async def create_table(
         # to a constraint violation it cannot recover from. The pool pins
         # no isolation level (app/db/postgres.py), so a deployment-level
         # default must not be able to break this.
-        async with conn.transaction(isolation="read_committed"):
+        async with role_authority_transaction(conn):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
@@ -1221,7 +1222,7 @@ async def drop_table(
     edges referencing the table URI + metadata chunk."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))

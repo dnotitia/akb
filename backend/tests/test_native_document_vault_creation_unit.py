@@ -24,7 +24,10 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
             return False
 
     class _Connection:
-        def transaction(self):
+        async def execute(self, query, *args):
+            assert "pg_advisory_xact_lock" in query
+
+        def transaction(self, **kwargs):
             return _Transaction()
 
     connection = _Connection()
@@ -127,7 +130,10 @@ async def test_create_vault_drops_a_stale_negative_skill_cache_entry(monkeypatch
             return False
 
     class _Connection:
-        def transaction(self):
+        async def execute(self, query, *args):
+            assert "pg_advisory_xact_lock" in query
+
+        def transaction(self, **kwargs):
             return _Transaction()
 
     connection = _Connection()

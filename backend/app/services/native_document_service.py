@@ -16,6 +16,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import NoReturn
+from app.services.role_authority import role_authority_transaction
 from app.services.search_filters import ArchiveScope
 
 import asyncpg
@@ -1779,7 +1780,7 @@ class NativeDocumentService(DocumentService):
         # back both the row and role DDL if either hook fails or is cancelled.
         try:
             async with pool.acquire() as conn:
-                async with conn.transaction():
+                async with role_authority_transaction(conn):
                     vault_id = await vault_repo.create(
                         name=name,
                         description=description,

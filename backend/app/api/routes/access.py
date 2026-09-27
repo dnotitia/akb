@@ -1070,6 +1070,8 @@ async def admin_role_state(user: AuthenticatedUser = Depends(get_current_user)):
         "missing_token_roles": diff.missing_token_roles,
         "orphan_token_roles": diff.orphan_token_roles,
         "missing_memberships": diff.missing_memberships,
+        "stale_memberships": diff.stale_memberships,
+        "invalid_membership_options": diff.invalid_membership_options,
         "missing_public_grants": diff.missing_public_grants,
         "stale_public_grants": diff.stale_public_grants,
         "missing_table_grants": diff.missing_table_grants,

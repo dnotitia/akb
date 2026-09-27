@@ -30,6 +30,12 @@ class _Pool:
 
 
 class _RegistrationConnection:
+    def transaction(self, **kwargs):
+        return _Acquire(self)
+
+    async def execute(self, query, *args):
+        assert "pg_advisory_xact_lock" in query
+
     async def fetchrow(self, query, *_args):
         assert "SELECT id FROM users" in query
         return None
