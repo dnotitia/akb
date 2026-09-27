@@ -25,6 +25,7 @@ from app.services.role_sync import (
     AUTHENTICATED_ROLE,
     HookMetrics,
     RoleSync,
+    ReconcileReport,
     _is_safe_pg_table_name,
     _public_access_scope,
     user_role_name,
@@ -324,7 +325,11 @@ async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles)
     vid = uuid.uuid4()
     roles = [vault_group_role_name(vid, s) for s in ("reader", "writer", "admin")]
     created.extend(roles)
+    await _seed_catalog(pool, vid=vid)
     await role_sync.on_vault_create(vid, owner_user_id=None)
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM pg_roles WHERE rolname=ANY($1::text[])", roles) == 3
+        await conn.execute("DELETE FROM vaults WHERE id=$1", vid)
 
     await role_sync.on_vault_delete(vid)
     async with pool.acquire() as conn:
@@ -355,8 +360,9 @@ async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles
         assert role in diff.missing_user_roles
         assert not diff.is_clean()
 
-        # After reconcile, the same diff is clean again for this user.
-        await role_sync.reconcile_from_catalog()
+        # Repair only this user's creation domain. Full orphan pruning is
+        # cluster-global and is tested separately on an exclusive cluster.
+        await role_sync.on_user_create(uid)
         diff2 = await role_sync.diff_against_catalog()
         assert role not in diff2.missing_user_roles
         assert uid not in [
@@ -458,8 +464,15 @@ async def test_diff_detects_missing_table_grant(pool, role_sync, cleanup_roles):
         assert "SELECT" in hits[0]["missing_privileges"]
         assert not diff2.is_clean()
 
-        # Reconcile should re-apply the GRANT.
-        await role_sync.reconcile_from_catalog()
+        # The table-grant repair domain should re-apply the GRANT without
+        # invoking full cluster-global orphan pruning on a shared test PG.
+        from app.services.role_authority import role_authority_transaction
+        report = ReconcileReport()
+        async with pool.acquire() as conn:
+            async with role_authority_transaction(conn):
+                await role_sync._reconcile_table_grants(conn, report)
+        assert not report.errors
+        assert report.table_grants_applied == 1
         diff3 = await role_sync.diff_against_catalog()
         residual = [
             tg for tg in diff3.missing_table_grants if tg["table"] == pg_name

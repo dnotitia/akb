@@ -245,11 +245,27 @@ async def test_full_reconcile_preserves_similarly_prefixed_operator_roles():
         suffix = uuid.uuid4().hex
         operator_roles = [f'akb_{kind}_operator_{suffix}' for kind in ('user', 'vault', 'token')]
         await conn.execute('CREATE TABLE vault_tables(vault_id uuid, name text)')
+        physical = 'vt_' + str(vault).replace('-', '_') + '__oracle'
+        await conn.execute(f'CREATE TABLE "{physical}"(id int); INSERT INTO "{physical}" VALUES(42)')
+        await conn.execute("INSERT INTO vault_tables VALUES($1,'oracle')", vault)
+        # Full reconciliation must really create a missing user and repair
+        # missing table privileges; this keeps those full-pass oracles in
+        # the exclusive cluster instead of shared-server domain tests.
+        await conn.execute(f'DROP ROLE "{users[1]}"')
+        assert not await conn.fetchval('SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)', users[1])
+        assert not await conn.fetchval("SELECT has_table_privilege($1,$2,'SELECT')", groups[0], physical)
         for role in operator_roles:
             await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
         try:
             report = await asyncio.wait_for(sync.reconcile_from_catalog(), 5)
             assert not report.errors
+            assert report.user_roles_created == 1
+            assert report.table_grants_applied == 1
+            assert await conn.fetchval("SELECT pg_has_role($1,$2,'MEMBER')", users[1], 'akb_authenticated')
+            assert await conn.fetchval("SELECT has_table_privilege($1,$2,'SELECT')", groups[0], physical)
+            async with conn.transaction():
+                await conn.execute(f'SET LOCAL ROLE "{users[0]}"')
+                assert await conn.fetchval(f'SELECT id FROM "{physical}"') == 42
             assert await conn.fetchval('SELECT count(*) FROM pg_roles WHERE rolname=ANY($1::text[])', operator_roles) == 3
         finally:
             for role in operator_roles:
