@@ -132,6 +132,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const [results, setResults] = useState<GlobalSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [incomplete, setIncomplete] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [activeSource, setActiveSource] = useState<SearchSourceFilter>("all");
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
@@ -158,6 +159,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     setVault(next);
     setResults([]);
     setError(null);
+    setIncomplete(false);
     setActiveIndex(-1);
     setLoading(Boolean(normalizedQuery));
     setRecentSearches([]);
@@ -206,12 +208,14 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
       setResults([]);
       setLoading(false);
       setError(null);
+      setIncomplete(false);
       setActiveIndex(-1);
       return;
     }
 
     setResults([]);
     setError(null);
+    setIncomplete(false);
     setActiveIndex(-1);
     setLoading(true);
     const timer = window.setTimeout(() => {
@@ -221,7 +225,10 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           const nextResults = (response.results || []) as GlobalSearchResult[];
           setResults(nextResults);
           setActiveIndex(nextResults.length > 0 ? 0 : -1);
-          if (response.degraded) setError("Search is incomplete; the retrieval service is temporarily unavailable. Please retry.");
+          if (response.degraded) {
+            if (nextResults.length > 0) setIncomplete(true);
+            else setError("Search is incomplete; the retrieval service is temporarily unavailable. Please retry.");
+          }
         })
         .catch((caught: unknown) => {
           if (currentRequest !== requestId.current) return;
@@ -310,7 +317,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     : error
       ? "Search failed"
       : normalizedQuery
-        ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}`
+        ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}${incomplete ? "; search is incomplete" : ""}`
         : "";
 
   return (
@@ -630,6 +637,15 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                 className="mt-3"
                 onClick={() => setRetryKey((current) => current + 1)}
               >
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {normalizedQuery && !loading && incomplete && (
+            <div className="flex items-center justify-between gap-3 border-b border-border bg-warning-soft px-4 py-3 text-warning-soft-foreground sm:px-5">
+              <p className="text-xs leading-relaxed">Search is incomplete. Available matches are shown; retry to search all retrieval methods.</p>
+              <Button type="button" variant="outline" size="sm" onClick={() => setRetryKey((current) => current + 1)}>
                 Retry
               </Button>
             </div>

@@ -40,7 +40,7 @@ from app.services.grep_replace import (
     validate_max_replacements,
 )
 from app.services.vector_store import VectorHit, get_vector_store
-from app.services.vector_store.base import VectorSearchDegraded, VectorStoreUnavailable, supports_vault_filter
+from app.services.vector_store.base import VectorSearchDegraded, VectorStoreUnavailable, has_dense, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
@@ -956,14 +956,14 @@ class SearchService:
             logger.warning("query embedding failed: %s", e)
             embeddings = []
         query_embedding = embeddings[0] if embeddings else None
+        embedding_failed = bool(settings.embed_base_url) and not has_dense(query_embedding)
+        if not has_dense(query_embedding):
+            query_embedding = None
         phases["embedding"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        # A None embedding here is intentionally NOT surfaced as `degraded`:
-        # sparse-only is a legitimate by-design mode (a deployment may leave
-        # `embed_base_url` unset), and we can't cheaply tell "configured but
-        # transiently down" from "intentionally absent" at this point. The
-        # symmetric sparse-leg failure IS flagged degraded in _run_vector_search
-        # because the BM25 vocab is always present when the feature is on.
+        # Unconfigured embeddings are intentional sparse-only mode. A configured
+        # endpoint returning an empty vector (or raising) lost a retrieval leg;
+        # preserve sparse hits, but report incomplete retrieval to the caller.
 
         # Always pre-filter when user_id is provided so we never leak
         # documents from vaults the user can't read.
@@ -1221,6 +1221,8 @@ class SearchService:
             limit=target_unique * 3,
         )
         phases["retrieval"] = time.perf_counter() - phase_started
+        if degraded_reason is None and embedding_failed:
+            degraded_reason = "query_embedding_failed"
 
         if not hits:
             _log_search_timing(started, phases, 0)

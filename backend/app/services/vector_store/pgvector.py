@@ -49,7 +49,7 @@ import asyncpg
 from app.services import sparse_encoder
 from app.services.sparse_shapes import SparseShape
 
-from .base import ChunkUpsert, VectorHit, VectorStoreUnavailable, has_dense
+from .base import ChunkUpsert, VectorHit, VectorSearchDegraded, VectorStoreUnavailable, has_dense
 from .sparse_shape_state import record_sparse_shape
 
 
@@ -78,6 +78,21 @@ _VCHORD_MAX_CANDIDATES = 65_535
 # scopes of at most this many rows; a larger one is searched index-led
 # (akb#626). All SQL retains the existing caller/pool budgets.
 _VCHORD_MAX_MATERIALISED_ROWS = 10_000
+
+
+def _leg_unavailable(error: Exception) -> bool:
+    """Only availability failures permit a healthy-leg fallback.
+
+    Permission, schema, vocabulary-fence and programming errors must refuse
+    the whole request; rescuing hits would hide a broken security boundary.
+    PostgreSQL statement cancellation includes the server's query timeout.
+    Caller cancellation is a BaseException and never reaches this predicate.
+    """
+    return isinstance(error, (TimeoutError, OSError, asyncpg.PostgresConnectionError)) or (
+        isinstance(error, asyncpg.PostgresError)
+        and error.sqlstate in {"57014", "57P01", "57P02", "57P03", "53300", "53400", "53200"}
+    )
+
 # The largest term id the vchord shape can index. Term ids are minted as
 # `bigint`, and a `bm25vector`'s text input parses u32, answering anything
 # larger, or negative, with "Bad parsing at position N" (akb#665). The index is
@@ -1063,6 +1078,18 @@ class PgvectorStore:
             finally:
                 timings["sparse"] = time.perf_counter() - begin
 
+        failed_legs: list[str] = []
+
+        async def _available_leg(name: str, run: Callable[[], Awaitable[list[str]]]) -> list[str] | None:
+            try:
+                return await run()
+            except Exception as error:
+                if not _leg_unavailable(error):
+                    raise
+                failed_legs.append(name)
+                logger.warning("hybrid leg unavailable: leg=%s type=%s", name, type(error).__name__)
+                return None
+
         succeeded = False
         try:
             # Two legs run in parallel — same PG, different conns. asyncpg
@@ -1070,7 +1097,10 @@ class PgvectorStore:
             # two conns. The pool max (default 8) accommodates this even
             # under burst.
             if has_dense and has_sparse:
-                legs = [asyncio.create_task(_dense_leg()), asyncio.create_task(_sparse_leg())]
+                legs = [
+                    asyncio.create_task(_available_leg("dense", _dense_leg)),
+                    asyncio.create_task(_available_leg("sparse", _sparse_leg)),
+                ]
                 try:
                     dense_ids, sparse_ids = await asyncio.gather(*legs)
                 except BaseException:
@@ -1081,17 +1111,26 @@ class PgvectorStore:
                     await asyncio.gather(*legs, return_exceptions=True)
                     raise
             elif has_dense:
-                dense_ids = await _dense_leg()
+                dense_ids = await _available_leg("dense", _dense_leg)
                 sparse_ids = []
             else:
                 dense_ids = []
-                sparse_ids = await _sparse_leg()
+                sparse_ids = await _available_leg("sparse", _sparse_leg)
+
+            if (dense_ids is None and sparse_ids is None) or (
+                dense_ids is None and not has_sparse
+            ) or (sparse_ids is None and not has_dense):
+                raise VectorStoreUnavailable("no retrieval leg available")
+            dense_available = has_dense and dense_ids is not None
+            sparse_available = has_sparse and sparse_ids is not None
+            dense_ids = dense_ids or []
+            sparse_ids = sparse_ids or []
 
             # Single-leg paths skip RRF.
-            if has_dense and not has_sparse:
+            if dense_available and not sparse_available:
                 top_ids = dense_ids[:limit]
                 scoring = [(cid, 1.0 / (RRF_K + i)) for i, cid in enumerate(top_ids, start=1)]
-            elif has_sparse and not has_dense:
+            elif sparse_available and not dense_available:
                 top_ids = sparse_ids[:limit]
                 scoring = [(cid, 1.0 / (RRF_K + i)) for i, cid in enumerate(top_ids, start=1)]
             else:
@@ -1110,6 +1149,8 @@ class PgvectorStore:
                 for cid, score in scoring
                 if cid in by_id
             ]
+            if failed_legs:
+                raise VectorSearchDegraded(hits=hits, reason=f"{failed_legs[0]}_leg_failed")
             succeeded = True
             return hits
         except asyncpg.PostgresError as e:

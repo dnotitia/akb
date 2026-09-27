@@ -11,8 +11,7 @@ from app.services.vector_store import VectorSearchDegraded, VectorStoreUnavailab
 from tests.test_search_archive_scope_vault_path_unit import VAULT_ID, _Conn, _hit, _install
 
 pytestmark = pytest.mark.asyncio
-# Any partial driver result. No shipped driver raises this today: the VChord
-# shape completes a short page exactly instead of refusing it (akb#673).
+# Any partial driver result, independent of a driver's specific failure cause.
 _REASON = "partial_driver_result"
 
 

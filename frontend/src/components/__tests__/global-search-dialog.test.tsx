@@ -381,7 +381,7 @@ describe("GlobalSearchDialog", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/draft?view=edit");
   });
 
-  it("does not expose or activate hidden partial results during a degraded response", async () => {
+  it("warns about incomplete search and keeps partial results actionable by keyboard", async () => {
     const response = await searchDocsMock("postgres");
     searchDocsMock.mockResolvedValue({ ...response, degraded: true });
     const user = userEvent.setup();
@@ -390,12 +390,28 @@ describe("GlobalSearchDialog", () => {
     const input = screen.getByRole("combobox");
     await user.type(input, "postgres");
     await screen.findByText(/Search is incomplete/);
-    expect(input).toHaveAttribute("aria-expanded", "false");
-    expect(input).not.toHaveAttribute("aria-controls");
-    expect(input).not.toHaveAttribute("aria-activedescendant");
-    await user.keyboard("{ArrowDown}{Enter}");
-    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(input).toHaveAttribute("aria-controls", "global-search-results");
+    expect(input).toHaveAttribute("aria-activedescendant", "global-search-result-0");
+    expect(screen.getByRole("option", { name: /PostgreSQL tuning/ })).toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/notes%2Fpostgres.md");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("reports a degraded empty response as unavailable and retry clears the warning", async () => {
+    const response = await searchDocsMock("postgres");
+    searchDocsMock.mockResolvedValueOnce({ ...response, results: [], degraded: true }).mockResolvedValue(response);
+    const user = userEvent.setup();
+    renderDialog();
+    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await user.type(screen.getByRole("combobox"), "postgres");
+    await screen.findByText("Search is unavailable");
+    expect(screen.queryByRole("option")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No results for/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByRole("option", { name: /PostgreSQL tuning/ });
+    expect(screen.queryByText(/Search is incomplete/)).not.toBeInTheDocument();
   });
 
   it("opens in place, focuses the search field, and returns focus on Escape", async () => {
