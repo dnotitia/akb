@@ -164,6 +164,8 @@ What changes:
     documents rank the same documents with the same scores, within 1e-6. Any
     failure rolls everything back and exits 1.
   - `--revert` puts the recorded numbering back.
+    It refuses VChord mappings outside `0 .. 2^30-1`, including a formerly
+    unindexed high-ID term indexed safely after compaction.
   - If IDs are already dense but the sequence was exhausted or advanced past
     them, `--apply` repairs only the sequence, preserving vectors, indexes,
     the epoch and an existing revert mapping.

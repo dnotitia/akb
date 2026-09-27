@@ -128,3 +128,8 @@ from the vocabulary size, `--apply` repairs only the sequence. It does not
 rewrite vectors or indexes, change the epoch, or replace an existing revert
 mapping. This also recovers sequence exhaustion when the stored IDs themselves
 have no gaps.
+
+`--revert` refuses a proposed VChord numbering with negative IDs or IDs at or
+above 2^30. A formerly unindexed term above that limit can acquire a safe ID
+during compaction and be indexed afterwards; restoring its old ID would corrupt
+the rebuilt index. Keep the compact numbering in that case.

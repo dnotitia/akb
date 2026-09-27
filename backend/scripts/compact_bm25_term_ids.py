@@ -567,6 +567,16 @@ async def _relabel(conn, facts: Survey, *, mapping_sql: str, mapping_args: tuple
         f"INSERT INTO pg_temp.akb_bm25_relabel_map (current_id, target_id) {mapping_sql}",
         *mapping_args,
     )
+    if facts.shape == "vchord":
+        bounds = await conn.fetchrow(
+            "SELECT min(target_id) AS lo, max(target_id) AS hi FROM pg_temp.akb_bm25_relabel_map"
+        )
+        if bounds["lo"] is not None and (bounds["lo"] < 0 or bounds["hi"] >= _ALIASING_ID):
+            raise Refused([
+                f"the proposed numbering includes ids {bounds['lo']:,} .. {bounds['hi']:,}; "
+                f"vchord can represent only 0 .. {_ALIASING_ID - 1:,}. "
+                "Keep the safe compact numbering instead of restoring ids that alias another term."
+            ])
     # Planned per call inside the functions below: without statistics the map
     # is read in full for every id.
     await conn.execute("ANALYZE pg_temp.akb_bm25_relabel_map")
