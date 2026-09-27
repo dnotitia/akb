@@ -260,7 +260,7 @@ async def _run_boot_schema(conn, *, init_sql: str | None = None) -> None:
     await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
     try:
         if init_sql is not None:
-            await conn.execute(init_sql)
+            await _run_init_schema(conn, init_sql)
         applied = {
             r["filename"]
             for r in await conn.fetch("SELECT filename FROM schema_migrations")
@@ -268,6 +268,29 @@ async def _run_boot_schema(conn, *, init_sql: str | None = None) -> None:
         await _apply_pending_migrations(conn, applied)
     finally:
         await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
+
+
+async def _run_init_schema(
+    conn, init_sql: str, *, retries: int = 5, lock_timeout: float = 5.0, backoff: float = 1.0,
+) -> None:
+    """Retry only the atomic bootstrap DDL after a writer lock conflict.
+
+    The outer session lock serializes boot callers, but existing workers do not
+    take it. Even CREATE INDEX IF NOT EXISTS locks existing tables and can meet
+    an opposite-order documents/chunks writer. Each failed attempt must roll
+    back all bootstrap locks before waiting; migration bodies are not replayed.
+    """
+    for attempt in range(retries):
+        try:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('lock_timeout', $1, true)", f"{lock_timeout}s")
+                await conn.execute(init_sql)
+            return
+        except (asyncpg.DeadlockDetectedError, asyncpg.LockNotAvailableError):
+            if attempt == retries - 1:
+                raise
+            logger.warning("Bootstrap schema blocked on a lock (attempt %d/%d); retrying", attempt + 1, retries)
+            await asyncio.sleep(backoff)
 
 
 async def _apply_pending_migrations(conn, applied: set[str]) -> None:
