@@ -119,8 +119,23 @@ COPY vchord_bm25/ /vchord_bm25/
 RUN set -eu; \
     for p in /vchord_bm25/*.patch; do patch -p1 --forward --fuzz=0 --batch < "$p"; done; \
     cp /vchord_bm25/Cargo.lock Cargo.lock
-RUN PGRX_PG_CONFIG_PATH="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
-    cargo build --locked --lib --features "pg${PG_MAJOR}" --release
+# Cargo's OpenSSL 3.5 TLS 1.3 first key share can exceed one TCP segment; defer
+# that key share for this download only. https://docs.openssl.org/3.5/man3/SSL_CTX_set1_curves/
+RUN set -eu; \
+    openssl_config="$(mktemp)"; \
+    trap 'rm -f "$openssl_config"' EXIT; \
+    printf '%s\n' \
+        'openssl_conf = openssl_init' \
+        '[openssl_init]' \
+        'ssl_conf = ssl_section' \
+        '[ssl_section]' \
+        'system_default = default_section' \
+        '[default_section]' \
+        'Groups = ?X25519MLKEM768:DEFAULT' \
+        > "$openssl_config"; \
+    OPENSSL_CONF="$openssl_config" \
+    PGRX_PG_CONFIG_PATH="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
+        cargo build --locked --lib --features "pg${PG_MAJOR}" --release
 RUN mkdir -p /out/lib /out/extension \
  && cp target/release/libvchord_bm25.so /out/lib/vchord_bm25.so \
  && cp "sql/install/vchord_bm25--${VCHORD_BM25_VERSION}.sql" sql/vchord_bm25--*--*.sql /out/extension/ \
