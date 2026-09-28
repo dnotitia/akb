@@ -54,8 +54,8 @@
     "vitest": "^4.1.11"
   },
   "dependencies": {
-    "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@akb/markdown-editor": "workspace:*",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dismissable-layer": "^1.1.11",
@@ -81,6 +81,7 @@
     "react-force-graph-2d": "^1.29.1",
     "react-router-dom": "^7.18.4",
     "tailwind-merge": "^3.5.0",
-    "tailwindcss": "^4.2.2"
+    "tailwindcss": "^4.2.2",
+    "yaml": "^2.9.1"
   }
 }

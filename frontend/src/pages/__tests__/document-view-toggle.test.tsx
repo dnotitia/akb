@@ -90,6 +90,54 @@ const browseVaultMock = browseVault as unknown as ReturnType<typeof vi.fn>;
 const moveDocumentMock = moveDocument as unknown as ReturnType<typeof vi.fn>;
 
 const SAMPLE_CONTENT = "# BodyHeading\n\nworld";
+const SYNTHETIC_FRONTMATTER_WITH_BODY_SEPARATOR = [
+  "---",
+  "type: test",
+  "status: active",
+  'title: "Synthetic operations guide"',
+  'tags: ["synthetic"]',
+  "implements: []",
+  "",
+  "# Synthetic Operations Guide",
+  "",
+  "Opening synthetic paragraph before the subsections.",
+  "",
+  "## Purpose",
+  "",
+  "## Components",
+  "",
+  "## Data Flow",
+  "",
+  "## Parsing",
+  "",
+  "## Validation",
+  "",
+  "## Rendering",
+  "",
+  "## Navigation",
+  "",
+  "## Access Control",
+  "",
+  "## Recovery",
+  "",
+  "## Failure Handling",
+  "",
+  "## Observability",
+  "",
+  "## Testing",
+  "",
+  "## Rollout",
+  "",
+  "## Summary",
+  "",
+  "Synthetic closing paragraph before the separator.",
+  "",
+  "---",
+  "",
+  "## Timeline",
+  "",
+  "- Synthetic retained timeline entry.",
+].join("\n");
 const UPDATED_COMMIT = "fedcba987654321"; // pragma: allowlist secret — synthetic Git commit
 const CURRENT_USER = {
   user_id: "document-reader",
@@ -482,6 +530,52 @@ describe("DocumentPage resource navigation", () => {
 });
 
 describe("DocumentPage view toggle", () => {
+  it("preserves 16 synthetic headings across malformed frontmatter and the body separator", async () => {
+    const user = userEvent.setup();
+    const content = SYNTHETIC_FRONTMATTER_WITH_BODY_SEPARATOR;
+    const expectedHeadings = [
+      "Synthetic Operations Guide",
+      "Purpose",
+      "Components",
+      "Data Flow",
+      "Parsing",
+      "Validation",
+      "Rendering",
+      "Navigation",
+      "Access Control",
+      "Recovery",
+      "Failure Handling",
+      "Observability",
+      "Testing",
+      "Rollout",
+      "Summary",
+      "Timeline",
+    ];
+    getDocumentMock.mockResolvedValue(makeDoc({ content, title: "Synthetic operations guide" }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("heading", { name: expectedHeadings[0] });
+    const markdownBody = document.querySelector(".akb-md");
+    expect(markdownBody).not.toBeNull();
+    const renderedHeadings = within(markdownBody as HTMLElement)
+      .getAllByRole("heading")
+      .map((heading) => heading.textContent?.trim());
+    expect(renderedHeadings).toEqual(expectedHeadings);
+    expect(screen.getByText("Opening synthetic paragraph before the subsections.")).toBeVisible();
+    expect(screen.getByText("Synthetic closing paragraph before the separator.")).toBeVisible();
+    expect(screen.getByText("Synthetic retained timeline entry.")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Table of contents" }));
+    const outline = await screen.findByRole("navigation", { name: "Document outline" });
+    expect(within(outline).getAllByRole("link").map(link => link.textContent?.trim())).toEqual(expectedHeadings);
+    await user.click(screen.getByRole("button", { name: "Close document panel" }));
+
+    await user.click(screen.getByRole("tab", { name: "Raw" }));
+    expect((await screen.findByTestId("doc-raw")).textContent).toBe(content);
+    await user.click(screen.getByRole("tab", { name: "Preview" }));
+    expect(await screen.findByRole("heading", { name: "Synthetic Operations Guide" })).toBeVisible();
+    expect(screen.getByText("Synthetic retained timeline entry.")).toBeVisible();
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+  });
   it("discloses publication options from the toolbar without creating a public link", async () => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue({ role: "writer" });
