@@ -727,9 +727,11 @@ class ToolCallRecorder:
         *,
         operation_map: dict[str, list[str]],
         secrets: tuple[str, ...],
+        candidate_operation_map: dict[str, dict[str, str]] | None = None,
         capture_result_fields: dict[str, list[str]] | None = None,
     ) -> None:
         self.operation_map = operation_map
+        self.candidate_operation_map = candidate_operation_map or {}
         self.secrets = secrets
         self.calls: list[_ObservedCall] = []
         self.input_schemas: dict[str, dict[str, Any]] = {}
@@ -873,17 +875,26 @@ def _redact_vault_skill_ack(value: Any) -> Any:
 def capture_result_fields_for_task(
     task: TaskManifest,
     operation_map: dict[str, list[str]] | None = None,
+    candidate_operation_map: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, list[str]]:
     fields: dict[str, set[str]] = defaultdict(set)
     for binding in task.expected_result_bindings:
         attempt = task.expected_material_attempts[binding.source_attempt - 1]
-        tool_names = (
+        logical_tools = (
             [attempt.tool_name]
             if attempt.tool_name is not None
             else (operation_map or {}).get(attempt.logical_operation, [])
         )
-        if not tool_names:
+        if not logical_tools:
             raise ValueError("result bindings require an exact tool or registered logical operation")
+        tool_names = []
+        for logical_tool in logical_tools:
+            candidate_tools = [
+                candidate_name
+                for candidate_name, actions in (candidate_operation_map or {}).items()
+                if logical_tool in actions.values()
+            ]
+            tool_names.extend(candidate_tools or [logical_tool])
         for tool_name in tool_names:
             fields[tool_name].add(binding.source_field)
     return {tool_name: sorted(names) for tool_name, names in fields.items()}
@@ -1537,7 +1548,12 @@ class TrialExecutor:
         recorder = ToolCallRecorder(
             operation_map=self.manifest.operation_map,
             secrets=secrets,
-            capture_result_fields=capture_result_fields_for_task(task, self.manifest.operation_map),
+            candidate_operation_map=self.manifest.candidate_operation_map,
+            capture_result_fields=capture_result_fields_for_task(
+                task,
+                self.manifest.operation_map,
+                self.manifest.candidate_operation_map,
+            ),
         )
         input_schemas = self.input_schemas_by_profile.get(task.fixture.credential_profile)
         if input_schemas is not None:
@@ -1680,7 +1696,12 @@ async def execute_smoke(
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=secrets,
-        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
+        candidate_operation_map=manifest.candidate_operation_map,
+        capture_result_fields=capture_result_fields_for_task(
+            task,
+            manifest.operation_map,
+            manifest.candidate_operation_map,
+        ),
     )
     if input_schemas is not None:
         recorder.set_input_schemas(input_schemas)
@@ -1878,6 +1899,7 @@ def outcome_from_run(
         secrets,
         input_schemas=recorder.input_schemas,
         tool_resources=tool_resources,
+        candidate_operation_map=recorder.candidate_operation_map,
     )
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
@@ -2037,6 +2059,7 @@ def bind_tool_calls(
     *,
     input_schemas: dict[str, dict[str, Any]] | None = None,
     tool_resources: dict[str, ResourceType] | None = None,
+    candidate_operation_map: dict[str, dict[str, str]] | None = None,
 ) -> list[ToolCallRecord]:
     records: list[ToolCallRecord] = []
     remaining = list(server_calls)
@@ -2048,8 +2071,12 @@ def bind_tool_calls(
             ToolCallRecord(
                 order=order,
                 tool_name=name,
-                logical_operation=logical_operation_for(name, operation_map),
-                resource_type=(tool_resources or {}).get(name, "unknown"),
+                logical_operation=logical_operation_for(
+                    name, operation_map, raw_dict, candidate_operation_map
+                ),
+                resource_type=resource_type_for(
+                    name, raw_dict, tool_resources, candidate_operation_map
+                ),
                 tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
                 raw_model_args=raw_args,
                 server_args=observed.server_args if observed else None,
@@ -2079,8 +2106,18 @@ def bind_tool_calls(
             ToolCallRecord(
                 order=len(records) + 1,
                 tool_name=observed.tool_name,
-                logical_operation=logical_operation_for(observed.tool_name, operation_map),
-                resource_type=(tool_resources or {}).get(observed.tool_name, "unknown"),
+                logical_operation=logical_operation_for(
+                    observed.tool_name,
+                    operation_map,
+                    observed.server_args,
+                    candidate_operation_map,
+                ),
+                resource_type=resource_type_for(
+                    observed.tool_name,
+                    observed.server_args,
+                    tool_resources,
+                    candidate_operation_map,
+                ),
                 tool_exists=(
                     observed.tool_name in input_schemas if input_schemas is not None else True
                 ),
@@ -2380,11 +2417,39 @@ def decode_raw_args(raw_args: Any) -> tuple[dict[str, Any] | None, bool]:
     return (decoded, True) if isinstance(decoded, dict) else (None, False)
 
 
-def logical_operation_for(tool_name: str, operation_map: dict[str, list[str]]) -> str:
+def candidate_logical_tool_for(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    candidate_operation_map: dict[str, dict[str, str]] | None,
+) -> str:
+    if not isinstance(arguments, dict):
+        return tool_name
+    return (candidate_operation_map or {}).get(tool_name, {}).get(
+        arguments.get("action"), tool_name
+    )
+
+
+def logical_operation_for(
+    tool_name: str,
+    operation_map: dict[str, list[str]],
+    arguments: dict[str, Any] | None = None,
+    candidate_operation_map: dict[str, dict[str, str]] | None = None,
+) -> str:
+    logical_tool = candidate_logical_tool_for(tool_name, arguments, candidate_operation_map)
     for logical, names in operation_map.items():
-        if tool_name in names:
+        if logical_tool in names:
             return logical
     return "unknown"
+
+
+def resource_type_for(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    tool_resources: dict[str, ResourceType] | None,
+    candidate_operation_map: dict[str, dict[str, str]] | None,
+) -> ResourceType | Literal["unknown"]:
+    logical_tool = candidate_logical_tool_for(tool_name, arguments, candidate_operation_map)
+    return (tool_resources or {}).get(logical_tool, "unknown")
 
 
 def response_matches_rubric(text: str, task: TaskManifest) -> bool:

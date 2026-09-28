@@ -747,6 +747,7 @@ class BenchmarkRunManifest(ContractModel):
     provider_sensitivity: ProviderSensitivity = Field(default_factory=ProviderSensitivity)
     budget: Budget
     operation_map: dict[str, list[str]]
+    candidate_operation_map: dict[str, dict[str, str]]
     tool_resources: dict[str, ResourceType]
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
@@ -854,6 +855,24 @@ class BenchmarkRunManifest(ContractModel):
         duplicates = [tool for tool, count in Counter(tool for tools in self.operation_map.values() for tool in tools).items() if count > 1]
         if duplicates:
             raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
+        candidate_targets: list[str] = []
+        candidate_pairs: set[tuple[str, str]] = set()
+        for tool_name, actions in self.candidate_operation_map.items():
+            if re.fullmatch(r"^[A-Za-z][A-Za-z0-9_.-]*$", tool_name) is None or not actions:
+                raise ValueError(f"invalid Candidate action map for tool: {tool_name}")
+            for action, legacy_tool in actions.items():
+                if re.fullmatch(r"^[a-z][a-z0-9_]*$", action) is None:
+                    raise ValueError(f"invalid Candidate action name: {tool_name}/{action}")
+                if legacy_tool not in registered_tools:
+                    raise ValueError(f"Candidate action maps to an unregistered logical tool: {legacy_tool}")
+                candidate_pairs.add((tool_name, action))
+                candidate_targets.append(legacy_tool)
+        if len(candidate_pairs) != len(candidate_targets):
+            raise ValueError("Candidate tool/action pairs must be unique")
+        if len(candidate_targets) != len(set(candidate_targets)):
+            raise ValueError("each logical tool must map to one Candidate action")
+        if set(candidate_targets) != registered_tools - {"akb_help", "akb_sql"}:
+            raise ValueError("candidate_operation_map must cover every capability action exactly once")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:

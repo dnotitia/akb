@@ -15,6 +15,7 @@ from app.services.auth_service import AuthenticatedUser
 from mcp_server.operation_registry import (
     CANDIDATE_LEGACY_NAMES,
     CANDIDATE_REPLACED_NAMES,
+    DEFERRED_OPERATION_COVERAGE,
     DEFERRED_OPERATION_REASONS,
     DEFERRED_OPERATION_NAMES,
     INDEPENDENT_OPERATION_REASONS,
@@ -61,10 +62,22 @@ def test_candidate_catalog_is_registry_owned_with_all_backend_writes() -> None:
     assert set(tools) == capability_tools | independent_tools
     assert CANDIDATE_REPLACED_NAMES.isdisjoint(tools)
     assert CANDIDATE_LEGACY_NAMES.isdisjoint(DEFERRED_OPERATION_NAMES)
+    assert {tool for tool, _action in DEFERRED_OPERATION_COVERAGE.values()}.isdisjoint(tools)
     assert DEFERRED_OPERATION_NAMES == {
         "akb_put_file",
         "akb_get_file",
+        "akb_update_file",
         "akb_delete_file",
+        "akb_put_image",
+        "akb_discard_image",
+    }
+    assert DEFERRED_OPERATION_COVERAGE == {
+        "akb_put_file": ("akb_file_write", "put_file"),
+        "akb_get_file": ("akb_file_read", "read"),
+        "akb_update_file": ("akb_file_write", "update_file"),
+        "akb_delete_file": ("akb_file_write", "delete_file"),
+        "akb_put_image": ("akb_file_write", "put_image"),
+        "akb_discard_image": ("akb_file_write", "discard_image"),
     }
     expected_coverage = {
         "akb_list_vaults": ("akb_discover", "list_vaults"),
@@ -112,6 +125,7 @@ def test_candidate_catalog_is_registry_owned_with_all_backend_writes() -> None:
         "akb_import": ("akb_bundle_manage", "import"),
     }
     assert CANDIDATE_REGISTRY.operation_coverage() == expected_coverage
+    assert len(expected_coverage) + len(INDEPENDENT_OPERATION_REASONS) + len(DEFERRED_OPERATION_COVERAGE) == 51
 
     expected_write_contract = {
         "akb_put": ("parent", "writer", "write"),

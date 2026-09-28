@@ -29,7 +29,7 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     coverage.validate_tasks(tasks)
     coverage.validate_manifest(manifest)
     assert len(tasks) == 26
-    assert len(coverage.entries) == 50
+    assert len(coverage.entries) == 51
     assert {model.class_name for model in manifest.models} == {"primary", "lightweight"}
     assert {task.category for task in tasks} == set(manifest.category_minimums)
     assert {task.suite for task in tasks} == {"capability", "tool_surface_risk"}
