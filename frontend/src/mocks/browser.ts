@@ -291,7 +291,7 @@ function filePreviewRawResponse(file: FilePreviewFixture) {
     });
   }
   return new HttpResponse(file.raw_text || "", {
-    headers: { "Content-Type": "text/plain; charset=utf-8" },
+    headers: { "Content-Type": file.mime_type || "application/octet-stream" },
   });
 }
 
@@ -646,13 +646,13 @@ export const handlers = [
   ),
   http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug + "/raw", () =>
     new HttpResponse(FILE_PREVIEW_PUBLICATION.raw_text, {
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      headers: { "Content-Type": FILE_PREVIEW_PUBLICATION.mime_type },
     }),
   ),
   http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug + "/download", () =>
     new HttpResponse(FILE_PREVIEW_PUBLICATION.raw_text, {
       headers: {
-        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Type": FILE_PREVIEW_PUBLICATION.mime_type,
         "Content-Disposition": "attachment; filename=\"" + FILE_PREVIEW_PUBLICATION.name + "\"",
       },
     }),

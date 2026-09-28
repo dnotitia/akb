@@ -52,8 +52,9 @@ describe("browser mock handlers", () => {
       window.location.origin,
     ));
     const ordinary = await ordinaryAccess.json() as { download_url: string };
-    expect(await (await fetch(new URL(ordinary.download_url, window.location.origin))).text())
-      .toBe(FILE_PREVIEW_YAML_TEXT);
+    const ordinaryRaw = await fetch(new URL(ordinary.download_url, window.location.origin));
+    expect(ordinaryRaw.headers.get("content-type")).toBe("application/yaml");
+    expect(await ordinaryRaw.text()).toBe(FILE_PREVIEW_YAML_TEXT);
 
     const publicResponse = await fetch(new URL(
       apiUrl("/public/" + FILE_PREVIEW_PUBLICATION.slug),
@@ -69,7 +70,18 @@ describe("browser mock handlers", () => {
       apiUrl("/public/" + FILE_PREVIEW_PUBLICATION.slug + "/raw"),
       window.location.origin,
     ));
+    expect(publicRaw.headers.get("content-type")).toBe("application/yaml");
     expect(await publicRaw.text()).toBe(FILE_PREVIEW_PUBLICATION.raw_text);
+
+    const publicDownload = await fetch(new URL(
+      apiUrl("/public/" + FILE_PREVIEW_PUBLICATION.slug + "/download"),
+      window.location.origin,
+    ));
+    expect(publicDownload.headers.get("content-type")).toBe("application/yaml");
+    expect(publicDownload.headers.get("content-disposition")).toBe(
+      'attachment; filename="' + FILE_PREVIEW_PUBLICATION.name + '"',
+    );
+    expect(await publicDownload.text()).toBe(FILE_PREVIEW_PUBLICATION.raw_text);
   });
 
   it("serves the mock MIME matrix, including malformed YAML and existing viewer formats", async () => {
@@ -91,6 +103,9 @@ describe("browser mock handlers", () => {
       const access = await accessResponse.json() as { download_url: string };
       const rawResponse = await fetch(new URL(access.download_url, window.location.origin));
       expect(rawResponse.status).toBe(200);
+      expect(rawResponse.headers.get("content-type")).toBe(
+        file.mime_type || "application/octet-stream",
+      );
       if (file.raw_text !== null) {
         expect(await rawResponse.text()).toBe(file.raw_text);
       } else {
