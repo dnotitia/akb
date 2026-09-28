@@ -7,11 +7,11 @@ import { createMarkdownExtensions } from '../src/extensions.js'
 import {
   createMarkdownSlashCommandExtension,
   createMarkdownSlashCommandRegistry,
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   filterMarkdownSlashCommands,
   getMarkdownSlashMenuBoundary,
   resolveMarkdownSlashMenuPosition,
 } from '../src/react/markdown-slash-command.js'
+import { getMarkdownMessages } from '../src/react/markdown-locale.js'
 
 const editors: Editor[] = []
 
@@ -44,12 +44,13 @@ afterEach(() => {
 
 describe('markdown slash command menu', () => {
   it('defines all common blocks and filters translated labels and keywords', () => {
-    expect(DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES.sections).toEqual({
+    const messages = getMarkdownMessages('en').slash
+    expect(messages.sections).toEqual({
       text: 'Text',
       lists: 'Lists',
       structure: 'Structure',
     })
-    const commands = createMarkdownSlashCommandRegistry(DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES)
+    const commands = createMarkdownSlashCommandRegistry(messages)
 
     expect(commands).toHaveLength(10)
     expect(filterMarkdownSlashCommands(commands, 'table').map(item => item.id)).toEqual(['table'])

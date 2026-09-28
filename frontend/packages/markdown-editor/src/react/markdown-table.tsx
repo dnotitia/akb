@@ -10,37 +10,11 @@ import {
   markdownTableState,
 } from '../table.js'
 import type { MarkdownTableState } from '../table.js'
-
-export interface MarkdownTableLabels {
-  editableTable: string
-  readOnlyTable: string
-  actions: string
-  insertTable: string
-  addRow: string
-  addColumn: string
-  removeRow: string
-  removeColumn: string
-  continueBelow: string
-  deleteTable: string
-}
+import { useMarkdownMessages } from './markdown-locale.js'
 
 export interface MarkdownTableOptions {
-  labels?: Partial<MarkdownTableLabels>
   tableClassName?: string
   captionClassName?: string
-}
-
-export const DEFAULT_MARKDOWN_TABLE_LABELS: MarkdownTableLabels = {
-  editableTable: 'Editable table',
-  readOnlyTable: 'Table',
-  actions: 'Table actions',
-  insertTable: 'Insert table',
-  addRow: 'Add row after selected row',
-  addColumn: 'Add column right of selected column',
-  removeRow: 'Remove selected row',
-  removeColumn: 'Remove selected column',
-  continueBelow: 'Continue below',
-  deleteTable: 'Delete table',
 }
 
 const DEFAULT_TABLE_CLASS_NAME = 'w-full min-w-[36rem] border-collapse border border-border text-sm'
@@ -62,10 +36,12 @@ function useTableHosts(
   editor: Editor | null,
   readOnly: boolean,
   options: MarkdownTableOptions | undefined,
-  labels: MarkdownTableLabels,
+  labels: ReturnType<typeof useMarkdownMessages>['table'],
 ): TableHost[] {
   const [hosts, setHosts] = useState<TableHost[]>([])
   const hostsRef = useRef<TableHost[]>([])
+  const labelsRef = useRef(labels)
+  const syncRef = useRef<(() => void) | undefined>(undefined)
   const tableClassName = [DEFAULT_TABLE_CLASS_NAME, options?.tableClassName].filter(Boolean).join(' ')
   const captionClassName = [DEFAULT_CAPTION_CLASS_NAME, options?.captionClassName].filter(Boolean).join(' ')
 
@@ -77,7 +53,10 @@ function useTableHosts(
       const next: TableHost[] = []
       root.querySelectorAll<HTMLTableElement>('table').forEach(table => {
         tableClasses(table, tableClassName)
-        table.setAttribute('aria-label', readOnly ? labels.readOnlyTable : labels.editableTable)
+        table.setAttribute(
+          'aria-label',
+          readOnly ? labelsRef.current.readOnlyTable : labelsRef.current.editableTable,
+        )
 
         const existingCaption = Array.from(table.children).find(
           child => child instanceof HTMLTableCaptionElement && child.dataset.markdownTableCaption === 'true',
@@ -115,6 +94,7 @@ function useTableHosts(
       hostsRef.current = next
       if (!unchanged) setHosts(next)
     }
+    syncRef.current = sync
 
     sync()
     editor.on('transaction', sync)
@@ -126,8 +106,14 @@ function useTableHosts(
       observer?.disconnect()
       for (const current of hostsRef.current) current.host.remove()
       hostsRef.current = []
+      syncRef.current = undefined
     }
-  }, [captionClassName, editor, labels.editableTable, labels.readOnlyTable, readOnly, tableClassName])
+  }, [captionClassName, editor, readOnly, tableClassName])
+
+  useLayoutEffect(() => {
+    labelsRef.current = labels
+    syncRef.current?.()
+  }, [labels])
 
   return hosts
 }
@@ -176,7 +162,7 @@ function TableActionToolbar({
   active,
 }: {
   editor: Editor
-  labels: MarkdownTableLabels
+  labels: ReturnType<typeof useMarkdownMessages>['table']
   state: MarkdownTableState
   active: boolean
 }) {
@@ -186,36 +172,42 @@ function TableActionToolbar({
 
   const controls = useMemo(() => [
     {
+      key: 'add-row',
       label: labels.addRow,
       disabled: !active || !state.canAddRowAfter,
       onClick: commands.addTableRowAfter,
       icon: <Rows3 className="h-3.5 w-3.5" aria-hidden />,
     },
     {
+      key: 'add-column',
       label: labels.addColumn,
       disabled: !active || !state.canAddColumnAfter,
       onClick: commands.addTableColumnAfter,
       icon: <Columns3 className="h-3.5 w-3.5" aria-hidden />,
     },
     {
+      key: 'remove-row',
       label: labels.removeRow,
       disabled: !active || !state.canDeleteRow,
       onClick: commands.deleteTableRow,
       icon: <Rows2 className="h-3.5 w-3.5" aria-hidden />,
     },
     {
+      key: 'remove-column',
       label: labels.removeColumn,
       disabled: !active || !state.canDeleteColumn,
       onClick: commands.deleteTableColumn,
       icon: <Columns2 className="h-3.5 w-3.5" aria-hidden />,
     },
     {
+      key: 'continue-below',
       label: labels.continueBelow,
       disabled: !active || !state.canContinueBelow,
       onClick: commands.continueBelowTable,
       icon: <CornerDownLeft className="h-3.5 w-3.5" aria-hidden />,
     },
     {
+      key: 'delete-table',
       label: labels.deleteTable,
       disabled: !active || !state.canDelete,
       onClick: commands.deleteTable,
@@ -306,7 +298,7 @@ function TableActionToolbar({
       >
         {controls.map((control, index) => (
           <TableActionButton
-            key={control.label}
+            key={control.key}
             label={control.label}
             disabled={control.disabled}
             onClick={control.onClick}
@@ -332,7 +324,7 @@ export function MarkdownTableControls({
   options?: MarkdownTableOptions
 }) {
   const [, setRevision] = useState(0)
-  const labels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...options?.labels }
+  const labels = useMarkdownMessages().table
   const hosts = useTableHosts(editor, readOnly, options, labels)
 
   useEffect(() => {

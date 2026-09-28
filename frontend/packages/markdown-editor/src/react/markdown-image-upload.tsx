@@ -27,24 +27,8 @@ import type {
   MarkdownUploadItem,
 } from '../types.js'
 import { getMarkdownEditor } from './editor-handle.js'
-
-export interface MarkdownImageUploadLabels {
-  group: string
-  insert: string
-  uploading: string
-  checking: (name: string) => string
-  cancel: string
-  failed: string
-  queued: string
-  retry: string
-  upload: string
-  chooseAnother: string
-  dismiss: string
-  successful: string
-  cancelled: (count: number) => string
-  remaining: (count: number) => string
-  previousBatchFinished: string
-}
+import { useMarkdownMessages } from './markdown-locale.js'
+import type { MarkdownUploadPlacementError } from './markdown-locale.js'
 
 export interface MarkdownImageUploadClassNames {
   status?: string
@@ -58,7 +42,6 @@ export interface MarkdownImageUploadOptions {
   adapter: MarkdownUploadAdapter
   context?: Omit<MarkdownUploadContext, 'signal'>
   accept?: string
-  labels?: Partial<MarkdownImageUploadLabels>
   classNames?: MarkdownImageUploadClassNames
   onUploadingChange?: (uploading: boolean) => void
   onAssetUploaded?: (asset: MarkdownAsset, file: Blob) => void
@@ -86,8 +69,21 @@ interface UploadAnchor {
   previousTarget?: string
 }
 
-interface InternalFailure extends MarkdownImageUploadFailure {
+interface InternalFailure {
+  kind: 'error' | 'queued'
+  details: readonly ({ kind: 'adapter'; message: string } | {
+    kind: 'placement'
+    reason: MarkdownUploadPlacementError
+  })[]
+  cancelled: number
+  succeeded: number
+  retryFiles: readonly File[]
+  queuedFiles: readonly File[]
   anchor: UploadAnchor
+}
+
+type InternalUploadState = Omit<MarkdownImageUploadState, 'failure'> & {
+  failure: InternalFailure | null
 }
 
 interface ActiveUpload {
@@ -97,7 +93,6 @@ interface ActiveUpload {
 
 export interface MarkdownImageUploadController {
   state: MarkdownImageUploadState
-  labels: MarkdownImageUploadLabels
   setInputElement: (element: HTMLInputElement | null) => void
   openPicker: () => void
   beginReplacement: (position: number) => void
@@ -110,24 +105,6 @@ export interface MarkdownImageUploadController {
   handleDragOver: (event: DragEvent<HTMLDivElement>) => void
   handleDrop: (event: DragEvent<HTMLDivElement>) => void
   handlePaste: (event: ClipboardEvent<HTMLDivElement>) => void
-}
-
-export const DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS: MarkdownImageUploadLabels = {
-  group: 'Attachments',
-  insert: 'Insert image',
-  uploading: 'Uploading image',
-  checking: name => `Checking ${name}`,
-  cancel: 'Cancel upload',
-  failed: 'Image upload failed',
-  queued: 'Images waiting to upload',
-  retry: 'Retry',
-  upload: 'Upload',
-  chooseAnother: 'Choose another',
-  dismiss: 'Dismiss',
-  successful: 'Successful images remain in the draft.',
-  cancelled: count => `${count} image${count === 1 ? '' : 's'} cancelled.`,
-  remaining: count => `${count} image${count === 1 ? '' : 's'} remain in this batch.`,
-  previousBatchFinished: 'The previous image batch finished. Upload the next batch when ready.',
 }
 
 const DEFAULT_STATUS_CLASS_NAME =
@@ -192,10 +169,10 @@ function anchorAtDrop(editor: Editor, event: DragEvent<HTMLDivElement>): UploadA
   }
 }
 
-function errorForPlacement(message: string) {
+function errorForPlacement(reason: MarkdownUploadPlacementError) {
   return {
     code: 'invalid' as const,
-    message,
+    reason,
     retryable: false,
   }
 }
@@ -206,6 +183,7 @@ export function useMarkdownImageUpload(
   readOnly = false,
 ): MarkdownImageUploadController | null {
   const editor = getMarkdownEditor(editorHandle)
+  const labels = useMarkdownMessages().imageUpload
   const inputRef = useRef<HTMLInputElement>(null)
   const optionsRef = useRef(options)
   const readOnlyRef = useRef(readOnly)
@@ -215,7 +193,7 @@ export function useMarkdownImageUpload(
   const activeRef = useRef<ActiveUpload | null>(null)
   const queuedRef = useRef<Array<{ files: File[]; anchor: UploadAnchor }>>([])
   const failureRef = useRef<InternalFailure | null>(null)
-  const [state, setState] = useState<MarkdownImageUploadState>({
+  const [state, setState] = useState<InternalUploadState>({
     uploading: false,
     currentFileName: '',
     completed: 0,
@@ -258,11 +236,6 @@ export function useMarkdownImageUpload(
   }, [editor])
 
   const enabled = Boolean(editor && options?.adapter && !readOnly)
-  const labels = useMemo(
-    () => ({ ...DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS, ...options?.labels }),
-    [options?.labels],
-  )
-
   const registerAnchor = useCallback((anchor: UploadAnchor): UploadAnchor => {
     anchorsRef.current.add(anchor)
     return anchor
@@ -288,7 +261,7 @@ export function useMarkdownImageUpload(
     }
   }, [editor, registerAnchor])
 
-  const setStateIfMounted = useCallback((next: (current: MarkdownImageUploadState) => MarkdownImageUploadState) => {
+  const setStateIfMounted = useCallback((next: (current: InternalUploadState) => InternalUploadState) => {
     if (mountedRef.current) setState(next)
   }, [])
 
@@ -299,7 +272,7 @@ export function useMarkdownImageUpload(
     if (!editor || editor.isDestroyed || !editor.isEditable || !mountedRef.current) return null
     const target = typeof asset.target === 'string' ? asset.target.trim() : ''
     if (!target) {
-      return errorForPlacement('The image upload returned an invalid asset target.')
+      return errorForPlacement('invalidAssetTarget')
     }
 
     const alt = asset.alt || (file instanceof File ? file.name.replace(/\.[^.]+$/, '') : '') || 'Image'
@@ -308,17 +281,17 @@ export function useMarkdownImageUpload(
     try {
       selection = anchor.bookmark.resolve(editor.state.doc)
     } catch {
-      return errorForPlacement('The original image position is no longer available.')
+      return errorForPlacement('originalPositionUnavailable')
     }
 
     if (anchor.kind === 'replace') {
       if (!(selection instanceof NodeSelection) || selection.node.type.name !== 'image') {
-        return errorForPlacement('The original image position is no longer available.')
+        return errorForPlacement('originalPositionUnavailable')
       }
       const position = selection.from
       const previousTarget = anchor.previousTarget
       if (!commands.replaceImageAt(position, target, alt, asset.title)) {
-        return errorForPlacement('The original image position is no longer available.')
+        return errorForPlacement('imageReplacementFailed')
       }
       if (previousTarget && previousTarget !== target) {
         currentOptions?.onAssetReplaced?.(previousTarget, asset, file)
@@ -339,10 +312,10 @@ export function useMarkdownImageUpload(
     try {
       editor.view.dispatch(editor.state.tr.setSelection(selection))
     } catch {
-      return errorForPlacement('The image insertion position is no longer available.')
+      return errorForPlacement('originalPositionUnavailable')
     }
     if (!commands.insertImage(target, alt, asset.title)) {
-      return errorForPlacement('The image insertion position is no longer available.')
+      return errorForPlacement('imageInsertionFailed')
     }
     anchor.bookmark = editor.state.selection.getBookmark()
     return null
@@ -407,26 +380,22 @@ export function useMarkdownImageUpload(
         const queued = queuedRef.current.splice(0)
         const queuedFiles = queued.flatMap(batch => batch.files)
         const hasErrors = result.failed > 0 || result.cancelled > 0 || placementFailures.length > 0
-        const batchLabels = {
-          ...DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS,
-          ...currentOptions.labels,
-        }
-        const messages = [
+        const details = [
           ...result.items
             .filter(item => item.status !== 'success')
-            .map(item => item.error.message),
-          ...placementFailures.map(failure => failure.error.message),
-          result.cancelled ? batchLabels.cancelled(result.cancelled) : '',
-          (result.succeeded || placementFailures.length) && (hasErrors || queuedFiles.length)
-            ? batchLabels.successful
-            : '',
-          queuedFiles.length ? batchLabels.previousBatchFinished : '',
-        ].filter(Boolean)
+            .map(item => ({ kind: 'adapter' as const, message: item.error.message })),
+          ...placementFailures.map(failure => ({
+            kind: 'placement' as const,
+            reason: failure.error.reason,
+          })),
+        ]
 
-        if (messages.length || queuedFiles.length) {
+        if (details.length || result.cancelled || queuedFiles.length) {
           const currentFailure: InternalFailure = {
             kind: hasErrors ? 'error' : 'queued',
-            message: messages.join(' '),
+            details,
+            cancelled: result.cancelled,
+            succeeded: result.succeeded + placementFailures.length,
             retryFiles: [...retryFiles, ...placementRetryFiles],
             queuedFiles,
             anchor,
@@ -564,9 +533,28 @@ export function useMarkdownImageUpload(
     selectFiles(files)
   }, [enabled, selectFiles])
 
+  const publicState = useMemo<MarkdownImageUploadState>(() => {
+    const publicFailure: MarkdownImageUploadFailure | null = state.failure
+      ? {
+          kind: state.failure.kind,
+          message: [
+            ...state.failure.details.map(detail => detail.kind === 'adapter'
+              ? detail.message
+              : labels.placementError(detail.reason)),
+            state.failure.cancelled ? labels.cancelled(state.failure.cancelled) : '',
+            state.failure.succeeded && (state.failure.kind === 'error' || state.failure.queuedFiles.length)
+              ? labels.successful
+              : '',
+            state.failure.queuedFiles.length ? labels.previousBatchFinished : '',
+          ].filter(Boolean).join(' ') || labels.previousBatchFinished,
+          retryFiles: state.failure.retryFiles,
+          queuedFiles: state.failure.queuedFiles,
+        }
+      : null
+    return { ...state, failure: publicFailure }
+  }, [labels, state])
   const controller = useMemo<MarkdownImageUploadController>(() => ({
-    state,
-    labels,
+    state: publicState,
     setInputElement: element => {
       inputRef.current = element
     },
@@ -592,9 +580,8 @@ export function useMarkdownImageUpload(
     openPicker,
     retry,
     selectFiles,
-    state,
+    publicState,
     uploadQueued,
-    labels,
   ])
 
   return enabled ? controller : null
@@ -646,8 +633,8 @@ export function MarkdownImageUploadStatus({
   options?: MarkdownImageUploadOptions
 }) {
   const controller = useMarkdownImageUploadContext()
+  const labels = useMarkdownMessages().imageUpload
   if (!controller) return null
-  const labels = { ...DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS, ...options?.labels }
   const classNames = options?.classNames
   const current = controller.state
   const failure = current.failure

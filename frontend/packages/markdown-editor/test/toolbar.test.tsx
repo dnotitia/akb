@@ -253,7 +253,8 @@ describe('MarkdownToolbar', () => {
     await user.click(screen.getByRole('button', { name: 'Insert link' }))
     const search = screen.getByRole('combobox', { name: 'Search Vault resources' })
     await user.type(search, 'guide')
-    await user.click(await screen.findByRole('option', { name: `${result.title} (${result.kind})` }))
+    const kindLabel = result.kind === 'document' ? 'Document' : 'File'
+    await user.click(await screen.findByRole('option', { name: `${result.title} (${kindLabel})` }))
 
     expect(screen.getByLabelText('URL')).toHaveValue(result.target)
     expect(screen.getByLabelText('Text')).toHaveValue(result.title)
@@ -286,7 +287,7 @@ describe('MarkdownToolbar', () => {
     await user.click(screen.getByRole('button', { name: 'Insert link' }))
     const search = screen.getByRole('combobox', { name: 'Search Vault resources' })
     await user.type(search, 'guide')
-    await user.click(await screen.findByRole('option', { name: 'Guide (document)' }))
+    await user.click(await screen.findByRole('option', { name: 'Guide (Document)' }))
     expect(screen.getByLabelText('Text')).toHaveValue('text')
 
     await user.click(screen.getByRole('button', { name: 'Insert link' }))
@@ -309,9 +310,11 @@ describe('MarkdownToolbar', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Searching…')
 
     pending.resolve([])
-    expect(await screen.findByText('No documents or files found.')).toBeInTheDocument()
+    expect(await screen.findByText('No matching documents or files found.')).toBeInTheDocument()
     fireEvent.change(search, { target: { value: 'offline' } })
-    expect(await screen.findByRole('alert')).toHaveTextContent('Search failed. Try again.')
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Unable to search resources. Check your access and try again.',
+    )
     expect(screen.getByTestId('markdown')).toHaveTextContent('text')
   })
 
@@ -339,9 +342,9 @@ describe('MarkdownToolbar', () => {
     expect(oldSignal?.aborted).toBe(true)
 
     currentRequest.resolve([{ ...GUIDE, id: 'new', title: 'Newest', target: GUIDE.target }])
-    expect(await screen.findByRole('option', { name: 'Newest (document)' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Newest (Document)' })).toBeInTheDocument()
     oldRequest.resolve([{ ...GUIDE, id: 'old', title: 'Stale', target: GUIDE.target }])
-    await waitFor(() => expect(screen.queryByRole('option', { name: 'Stale (document)' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('option', { name: 'Stale (Document)' })).not.toBeInTheDocument())
     expect(screen.getByTestId('markdown')).toHaveTextContent('text')
   })
 
@@ -364,7 +367,7 @@ describe('MarkdownToolbar', () => {
     await act(async () => pending.resolve([GUIDE]))
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(screen.queryByRole('option', { name: 'Guide (document)' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Guide (Document)' })).not.toBeInTheDocument()
     expect(screen.getByTestId('markdown')).toHaveTextContent('text')
   })
 
@@ -390,7 +393,7 @@ describe('MarkdownToolbar', () => {
     ))
 
     latestRequest.resolve([{ ...GUIDE, id: 'current', title: 'Current vault result' }])
-    expect(await screen.findByRole('option', { name: 'Current vault result (document)' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Current vault result (Document)' })).toBeInTheDocument()
     firstRequest.reject(new Error('stale permission failure'))
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
     expect(screen.getByTestId('markdown')).toHaveTextContent('text')
@@ -406,7 +409,7 @@ describe('MarkdownToolbar', () => {
     await user.click(screen.getByRole('button', { name: 'Insert link' }))
     const search = screen.getByRole('combobox', { name: 'Search Vault resources' })
     await user.type(search, 'reference')
-    await screen.findByRole('option', { name: 'Guide (document)' })
+    await screen.findByRole('option', { name: 'Guide (Document)' })
     await user.keyboard('{ArrowDown}{Enter}')
     expect(screen.getByLabelText('URL')).toHaveValue(GUIDE.target)
 

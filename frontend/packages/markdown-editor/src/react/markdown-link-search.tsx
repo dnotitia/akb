@@ -6,18 +6,11 @@ import type {
   MarkdownSearchContext,
   MarkdownSearchResult,
 } from '../types.js'
+import { useMarkdownMessages } from './markdown-locale.js'
 
 export interface MarkdownLinkSearchLabels {
   inputLabel: string
   inputPlaceholder: string
-  searching: string
-  empty: string
-  error: string
-  retry: string
-  results: string
-  document: string
-  file: string
-  resource: string
 }
 
 interface MarkdownLinkSearchProps {
@@ -36,19 +29,6 @@ interface MarkdownSearchState {
   revision: number
   status: 'idle' | 'empty' | 'error' | 'results'
   results: readonly MarkdownSearchResult[]
-}
-
-const DEFAULT_LABELS: MarkdownLinkSearchLabels = {
-  inputLabel: 'Search resources',
-  inputPlaceholder: 'Find a document or file',
-  searching: 'Searching…',
-  empty: 'No documents or files found.',
-  error: 'Search failed. Try again.',
-  retry: 'Retry search',
-  results: 'Search results',
-  document: 'Document',
-  file: 'File',
-  resource: 'Resource',
 }
 
 const inputClass =
@@ -78,7 +58,7 @@ export function MarkdownLinkSearch({
   inputRef,
   onSelect,
 }: MarkdownLinkSearchProps) {
-  const copy = { ...DEFAULT_LABELS, ...labels }
+  const copy = { ...useMarkdownMessages().linkSearch, ...labels }
   const [query, setQuery] = useState('')
   const [searchState, setSearchState] = useState<MarkdownSearchState | null>(null)
   const [activeIndex, setActiveIndex] = useState(-1)
@@ -251,7 +231,7 @@ export function MarkdownLinkSearch({
                 type="button"
                 role="option"
                 aria-selected={activeIndex === index}
-                aria-label={`${result.title} (${result.kind ?? 'resource'})`}
+                aria-label={copy.resultName(result.title, kindLabel)}
                 className={joinClasses(
                   'flex w-full flex-col items-start gap-0.5 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none',
                   activeIndex === index

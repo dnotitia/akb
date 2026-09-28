@@ -30,50 +30,16 @@ import { useEffect, useRef } from 'react'
 import type {
   MarkdownSlashCommandCategory,
   MarkdownSlashCommandId,
-  MarkdownSlashCommandMessages,
   MarkdownSlashCommandOptions,
 } from '../types.js'
+import { getMarkdownMessages } from './markdown-locale.js'
+import type { MarkdownLocaleSource, MarkdownMessages } from './markdown-locale.js'
 
 export type {
   MarkdownSlashCommandCategory,
   MarkdownSlashCommandId,
-  MarkdownSlashCommandMessages,
   MarkdownSlashCommandOptions,
 } from '../types.js'
-
-export const DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES: MarkdownSlashCommandMessages = {
-  header: 'Insert block',
-  escapeHint: 'Esc',
-  sections: {
-    text: 'Text',
-    lists: 'Lists',
-    structure: 'Structure',
-  },
-  footer: {
-    navigation: '↑↓ Navigate',
-    insert: '↵ Insert',
-    close: 'Esc Close',
-  },
-  empty: 'No matching blocks.',
-  commands: {
-    heading1: { label: 'Heading 1', description: 'Large section heading' },
-    heading2: { label: 'Heading 2', description: 'Medium section heading' },
-    heading3: { label: 'Heading 3', description: 'Small section heading' },
-    quote: { label: 'Quote', description: 'Call out a quotation' },
-    bulletList: {
-      label: 'Bullet list',
-      description: 'Create an unordered list',
-    },
-    numberedList: {
-      label: 'Numbered list',
-      description: 'Create an ordered list',
-    },
-    taskList: { label: 'Task list', description: 'Track work with checkboxes' },
-    table: { label: 'Table', description: 'Insert a basic 3 × 2 table' },
-    codeBlock: { label: 'Code block', description: 'Add a fenced code block' },
-    divider: { label: 'Divider', description: 'Separate sections with a rule' },
-  },
-}
 
 export interface MarkdownSlashCommandDefinition {
   id: MarkdownSlashCommandId
@@ -100,8 +66,7 @@ function replaceSlashTrigger(
 
 /**
  * The common block registry owns filtering, rendering, and the Tiptap command
- * mapping. Products provide copy and styling around this registry; they do not
- * rebuild the editor command set.
+ * mapping. The package supplies locale copy around this registry.
  */
 export const MARKDOWN_SLASH_COMMAND_DEFINITIONS: readonly MarkdownSlashCommandDefinition[] = [
   {
@@ -195,7 +160,7 @@ export const MARKDOWN_SLASH_COMMAND_CATEGORY_ORDER: readonly MarkdownSlashComman
 ]
 
 export function createMarkdownSlashCommandRegistry(
-  messages: MarkdownSlashCommandMessages,
+  messages: MarkdownMessages['slash'],
 ): readonly LocalizedMarkdownSlashCommand[] {
   return MARKDOWN_SLASH_COMMAND_DEFINITIONS.map(definition => ({
     ...definition,
@@ -223,7 +188,7 @@ interface MarkdownSlashCommandMenuProps {
   items: readonly LocalizedMarkdownSlashCommand[]
   selectedIndex: number
   listboxId: string
-  messages: MarkdownSlashCommandMessages
+  messages: MarkdownMessages['slash']
   onActiveChange: (index: number) => void
   onSelect: (command: LocalizedMarkdownSlashCommand) => void
 }
@@ -598,23 +563,27 @@ function positionMarkdownSlashMenu(
 
 function createMarkdownSlashSuggestion(
   options: MarkdownSlashCommandOptions,
+  localeSource?: MarkdownLocaleSource,
 ): Omit<
   SuggestionOptions<LocalizedMarkdownSlashCommand, LocalizedMarkdownSlashCommand>,
   'editor'
 > {
-  const messages = options.messages ?? DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES
-  const commands = createMarkdownSlashCommandRegistry(messages)
+  const messages = () => getMarkdownMessages(localeSource?.getLocale() ?? 'en').slash
+  const commands = () => createMarkdownSlashCommandRegistry(messages())
   let renderer: ReactRenderer<unknown, MarkdownSlashCommandMenuProps> | null = null
   let unmount: (() => void) | undefined
   let selectedIndex = 0
   let items: LocalizedMarkdownSlashCommand[] = []
   let command: ((item: LocalizedMarkdownSlashCommand) => void) | undefined
   let activeEditor: Editor | null = null
+  let query = ''
+  let unsubscribeLocale: (() => void) | undefined
   const listboxId = `markdown-slash-command-list-${Math.random().toString(36).slice(2, 10)}`
 
   function updateRenderer(
     props: SuggestionProps<LocalizedMarkdownSlashCommand, LocalizedMarkdownSlashCommand>,
   ): void {
+    query = props.query
     items = props.items
     selectedIndex = 0
     command = props.command
@@ -629,7 +598,7 @@ function createMarkdownSlashSuggestion(
       items,
       selectedIndex,
       listboxId,
-      messages,
+      messages: messages(),
       onActiveChange: setActiveIndex,
       onSelect: (item: LocalizedMarkdownSlashCommand) => command?.(item),
     })
@@ -658,6 +627,22 @@ function createMarkdownSlashSuggestion(
         true,
       )
     }
+  }
+
+  function updateLocale(): void {
+    if (!renderer || !activeEditor) return
+    const activeId = items[selectedIndex]?.id
+    items = filterMarkdownSlashCommands(commands(), query)
+    const retainedIndex = activeId ? items.findIndex(item => item.id === activeId) : -1
+    selectedIndex = retainedIndex >= 0 ? retainedIndex : 0
+    renderer.updateProps({ items, selectedIndex, messages: messages() })
+    setMarkdownSlashAria(
+      activeEditor,
+      listboxId,
+      items[selectedIndex]?.id,
+      items.length,
+      true,
+    )
   }
 
   return {
@@ -690,7 +675,8 @@ function createMarkdownSlashSuggestion(
       )
       return before.length === 0 ? match : null
     },
-    items: ({ query }: { query: string }) => filterMarkdownSlashCommands(commands, query),
+    items: ({ query: nextQuery }: { query: string }) =>
+      filterMarkdownSlashCommands(commands(), nextQuery),
     command: ({
       editor,
       range,
@@ -708,6 +694,8 @@ function createMarkdownSlashSuggestion(
           exitSuggestion(props.editor.view, markdownSlashCommandPluginKey),
         )
         activeEditor = props.editor
+        query = props.query
+        unsubscribeLocale = localeSource?.subscribe(updateLocale)
         selectedIndex = 0
         items = props.items
         command = props.command
@@ -718,7 +706,7 @@ function createMarkdownSlashSuggestion(
             items,
             selectedIndex,
             listboxId,
-            messages,
+            messages: messages(),
             onActiveChange: setActiveIndex,
             onSelect: (item: LocalizedMarkdownSlashCommand) => command?.(item),
           },
@@ -753,6 +741,8 @@ function createMarkdownSlashSuggestion(
         unmount = undefined
         renderer?.destroy()
         renderer = null
+        unsubscribeLocale?.()
+        unsubscribeLocale = undefined
         items = []
         command = undefined
         selectedIndex = 0
@@ -791,8 +781,9 @@ function createMarkdownSlashSuggestion(
 
 export function createMarkdownSlashCommandExtension(
   options: MarkdownSlashCommandOptions = {},
+  localeSource?: MarkdownLocaleSource,
 ): Extension {
-  const suggestion = createMarkdownSlashSuggestion(options)
+  const suggestion = createMarkdownSlashSuggestion(options, localeSource)
   return Extension.create({
     name: 'markdownSlashCommand',
     addProseMirrorPlugins() {
