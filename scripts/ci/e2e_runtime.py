@@ -1094,11 +1094,22 @@ class E2ERuntime:
                 }
             if action == "member_installation_state":
                 fixtures = self._fixture_catalog.get("fixtures", {})
-                fixture = fixtures.get(target) if isinstance(fixtures, dict) else None
+                fixture = (
+                    fixtures.get("status_active")
+                    if target == "status_active" and isinstance(fixtures, dict)
+                    else None
+                )
                 installation_id = fixture.get("installation_id") if isinstance(fixture, dict) else None
+                active_release_id = fixture.get("release_id") if isinstance(fixture, dict) else None
+                releases = self._fixture_catalog.get("releases", {})
+                next_release = releases.get("target_next") if isinstance(releases, dict) else None
+                next_release_id = next_release.get("id") if isinstance(next_release, dict) else None
                 lifecycle = kind
                 if (
                     not isinstance(installation_id, str)
+                    or not isinstance(active_release_id, str)
+                    or not isinstance(next_release_id, str)
+                    or active_release_id == next_release_id
                     or lifecycle not in {"installing", "active", "upgrading", "blocked", "uninstalled"}
                 ):
                     return {
@@ -1108,6 +1119,13 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "unsupported_target_or_state",
                     }
+                desired_release_id, current_release_id, blocked_reason = {
+                    "installing": (active_release_id, None, None),
+                    "active": (active_release_id, active_release_id, None),
+                    "upgrading": (next_release_id, active_release_id, None),
+                    "blocked": (next_release_id, active_release_id, "fixture_controlled_blocked"),
+                    "uninstalled": (None, active_release_id, None),
+                }[lifecycle]
                 try:
                     import asyncpg
 
@@ -1120,8 +1138,18 @@ class E2ERuntime:
                     )
                     try:
                         result = await connection.execute(
-                            "UPDATE vault_app_installations SET lifecycle=$1 WHERE id=$2",
+                            """
+                            UPDATE vault_app_installations
+                               SET lifecycle=$1,
+                                   desired_release_id=$2,
+                                   current_release_id=$3,
+                                   blocked_reason=$4
+                             WHERE id=$5
+                            """,
                             lifecycle,
+                            uuid.UUID(desired_release_id) if desired_release_id else None,
+                            uuid.UUID(current_release_id) if current_release_id else None,
+                            blocked_reason,
                             uuid.UUID(installation_id),
                         )
                     finally:

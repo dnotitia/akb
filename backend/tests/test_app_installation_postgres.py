@@ -337,6 +337,7 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
 ):
     app_id = await _app(lifecycle_pool, "member-status")
     release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    next_release_id = await _release(lifecycle_pool, app_id, "2.0.0")
     owner_id = await _user(lifecycle_pool, "member-owner")
     reader_id = await _user(lifecycle_pool, "member-reader")
     writer_id = await _user(lifecycle_pool, "member-writer")
@@ -361,7 +362,13 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
     installation_id = uuid.UUID(installed["installation_id"])
     async with lifecycle_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE vault_app_installations SET current_release_id = desired_release_id, lifecycle = 'active' WHERE id = $1",
+            """
+            UPDATE vault_app_installations
+               SET current_release_id = desired_release_id,
+                   lifecycle = 'active',
+                   blocked_reason = NULL
+             WHERE id = $1
+            """,
             installation_id,
         )
 
@@ -387,12 +394,28 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
         assert status == {"active": True}
         assert after == before
 
-    for lifecycle in ("installing", "upgrading", "blocked", "uninstalled"):
+    for lifecycle, desired, current, blocked_reason, expected_active in (
+        ("installing", release_id, None, None, False),
+        ("active", release_id, release_id, None, True),
+        ("upgrading", next_release_id, release_id, None, False),
+        ("blocked", next_release_id, release_id, "fixture_status_blocked", False),
+        ("uninstalled", None, release_id, None, False),
+    ):
         async with lifecycle_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE vault_app_installations SET lifecycle=$2 WHERE id=$1",
+                """
+                UPDATE vault_app_installations
+                   SET lifecycle = $2,
+                       desired_release_id = $3,
+                       current_release_id = $4,
+                       blocked_reason = $5
+                 WHERE id = $1
+                """,
                 installation_id,
                 lifecycle,
+                desired,
+                current,
+                blocked_reason,
             )
         status = await installation.get_member_installation_active_status(
             app_id,
@@ -400,12 +423,20 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
             user=_member_session(reader_id, "reader"),
             correlation_id=str(uuid.uuid4()),
         )
-        assert status == {"active": False}
+        assert status == {"active": expected_active}
 
     async with lifecycle_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE vault_app_installations SET lifecycle='active' WHERE id=$1",
+            """
+            UPDATE vault_app_installations
+               SET lifecycle = 'active',
+                   desired_release_id = $2,
+                   current_release_id = $2,
+                   blocked_reason = NULL
+             WHERE id = $1
+            """,
             installation_id,
+            release_id,
         )
         await conn.execute(
             """

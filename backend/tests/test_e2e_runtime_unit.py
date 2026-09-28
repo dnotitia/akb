@@ -724,6 +724,8 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
     admin_id = uuid.uuid4()
     vault_id = uuid.uuid4()
     installation_id = uuid.uuid4()
+    active_release_id = uuid.uuid4()
+    next_release_id = uuid.uuid4()
     runtime._fixture_catalog = {
         "status": "ready",
         "scenario": "app-installation-lifecycle",
@@ -735,10 +737,12 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
                 "vault_role": "reader",
             },
         },
+        "releases": {"target_next": {"id": str(next_release_id)}},
         "fixtures": {
             "status_active": {
                 "vault_id": str(vault_id),
                 "installation_id": str(installation_id),
+                "release_id": str(active_release_id),
             }
         },
     }
@@ -747,7 +751,35 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
     class FakeConnection:
         async def execute(self, query, *args):
             calls.append((query, args))
-            return "UPDATE 1" if query.startswith("UPDATE") else "DELETE 1"
+            if query.lstrip().startswith("UPDATE vault_app_installations"):
+                required_fields = (
+                    "lifecycle=$1",
+                    "desired_release_id=$2",
+                    "current_release_id=$3",
+                    "blocked_reason=$4",
+                )
+                if not all(field in query.replace(" ", "") for field in required_fields) or len(args) != 5:
+                    raise RuntimeError("CheckViolation: vault_app_installations_release_coherence")
+                lifecycle, desired_release_id, current_release_id, blocked_reason, requested_id = args
+                expected_state = {
+                    "installing": (active_release_id, None, None),
+                    "active": (active_release_id, active_release_id, None),
+                    "upgrading": (next_release_id, active_release_id, None),
+                    "blocked": (
+                        next_release_id,
+                        active_release_id,
+                        "fixture_controlled_blocked",
+                    ),
+                    "uninstalled": (None, active_release_id, None),
+                }.get(lifecycle)
+                actual_state = (desired_release_id, current_release_id, blocked_reason)
+                if requested_id != installation_id or actual_state != expected_state:
+                    raise RuntimeError(
+                        "CheckViolation: vault_app_installations_release_coherence or "
+                        "vault_app_installations_blocked_reason_check"
+                    )
+                return "UPDATE 1"
+            return "DELETE 1"
 
         async def close(self):
             return None
@@ -757,12 +789,16 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
 
     monkeypatch.setattr(asyncpg, "connect", fake_connect)
 
-    state = await runtime.fixture_control(
-        "member_installation_state",
-        "status_active",
-        True,
-        "upgrading",
-    )
+    states = ["installing", "active", "upgrading", "blocked", "uninstalled", "active"]
+    state_results = [
+        await runtime.fixture_control(
+            "member_installation_state",
+            "status_active",
+            True,
+            lifecycle,
+        )
+        for lifecycle in states
+    ]
     access = await runtime.fixture_control(
         "member_access",
         "reader",
@@ -776,17 +812,22 @@ async def test_member_installation_fixture_controls_touch_only_the_selected_fixt
         "status_active",
     )
 
-    assert state["status"] == "accepted"
-    assert state["observed"] == {"installation_state": "upgrading"}
+    assert [result["status"] for result in state_results] == ["accepted"] * len(states)
+    assert state_results[-1]["observed"] == {"installation_state": "active"}
     assert access["status"] == "accepted"
     assert restored_access["status"] == "accepted"
-    assert len(calls) == 3
-    assert calls[0][0].startswith("UPDATE vault_app_installations SET lifecycle=$1")
-    assert calls[0][1] == ("upgrading", installation_id)
-    assert calls[1][0].startswith("DELETE FROM vault_access")
-    assert calls[1][1] == (vault_id, actor_id)
-    assert calls[2][0].lstrip().startswith("INSERT INTO vault_access")
-    assert calls[2][1] == (vault_id, actor_id, admin_id)
+    assert len(calls) == len(states) + 2
+    assert calls[0][0].lstrip().startswith("UPDATE vault_app_installations")
+    assert calls[0][1] == ("installing", active_release_id, None, None, installation_id)
+    assert calls[1][1] == ("active", active_release_id, active_release_id, None, installation_id)
+    assert calls[2][1] == ("upgrading", next_release_id, active_release_id, None, installation_id)
+    assert calls[3][1] == ("blocked", next_release_id, active_release_id, "fixture_controlled_blocked", installation_id)
+    assert calls[4][1] == ("uninstalled", None, active_release_id, None, installation_id)
+    assert calls[5][1] == ("active", active_release_id, active_release_id, None, installation_id)
+    assert calls[-2][0].startswith("DELETE FROM vault_access")
+    assert calls[-2][1] == (vault_id, actor_id)
+    assert calls[-1][0].lstrip().startswith("INSERT INTO vault_access")
+    assert calls[-1][1] == (vault_id, actor_id, admin_id)
 
 
 def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
