@@ -1754,6 +1754,65 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stdio_probe_accepts_candidate_catalog_and_keeps_read_call(monkeypatch, tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="transport-proxy")
+    )
+    names = {"akb_discover", "akb_document_write", "akb_vault_manage"}
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        if method == "tools/list":
+            return {"result": {"tools": [{"name": name} for name in names]}}
+        return {"result": {"content": [{"type": "text", "text": "[]"}]}}
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    await runtime._probe_stdio_behavior()
+
+    assert runtime._stdio_tools_list_observed is True
+    assert runtime._stdio_read_call_observed is True
+    assert calls == [
+        ("tools/list", {}),
+        (
+            "tools/call",
+            {"name": "akb_discover", "arguments": {"action": "list_vaults"}},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing", ["akb_discover", "akb_document_write", "akb_vault_manage"]
+)
+async def test_stdio_probe_rejects_catalog_missing_a_required_capability(
+    monkeypatch, tmp_path, missing
+):
+    runtime = E2ERuntime(
+        dataclasses.replace(make_config(tmp_path), profile="transport-proxy")
+    )
+    names = {"akb_discover", "akb_document_write", "akb_vault_manage"} - {missing}
+    calls = []
+
+    async def request(method, params):
+        calls.append((method, params))
+        return {"result": {"tools": [{"name": name} for name in names]}}
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    with pytest.raises(
+        e2e_runtime.ProductAssertionFailure,
+        match="stdio tools/list omitted a required tool",
+    ):
+        await runtime._probe_stdio_behavior()
+
+    assert calls == [("tools/list", {})]
+    assert runtime._stdio_tools_list_observed is False
+    assert runtime._stdio_read_call_observed is False
+
+
+@pytest.mark.asyncio
 async def test_oidc_profile_serves_jwks_metadata_and_deterministic_variants(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server")
