@@ -1,9 +1,8 @@
-"""Candidate MCP operation registry.
+"""Registry for the bounded MCP capabilities and their operation actions.
 
-The candidate catalog deliberately has one source of truth for the first
-bounded read capabilities.  Legacy handlers remain useful as implementation
-units, but their public names are not candidate operations: the registry
-binds each implementation exactly once to a capability action.
+Legacy handlers remain implementation units, but their public names are not
+candidate operations: the registry binds each implementation to one explicit
+capability action.
 """
 
 from __future__ import annotations
@@ -25,7 +24,20 @@ WRITE_SCOPE = "akb:vault:write"
 Risk = Literal["read", "write", "destructive"]
 VaultRole = Literal["reader", "writer", "admin", "owner", "explain_target"]
 TargetRule = Literal[
-    "none", "vault", "optional_vault", "many_vaults", "uri", "browse", "resource_or_vault"
+    "none",
+    "vault",
+    "optional_vault",
+    "many_vaults",
+    "uri",
+    "document_uri",
+    "table_uri",
+    "browse",
+    "parent",
+    "source",
+    "publication",
+    "publication_target",
+    "publication_slug",
+    "resource_or_vault",
 ]
 
 
@@ -191,15 +203,112 @@ _CANDIDATE_OPERATIONS: tuple[tuple[str, str, str, TargetRule, str], ...] = (
     ),
 )
 
-CANDIDATE_LEGACY_NAMES = frozenset(item[2] for item in _CANDIDATE_OPERATIONS)
-
-# `akb_grep(replace=...)` is an existing mutation operation, not a read alias.
-# Its flat public name remains available only with the write-only contract built
-# by `candidate_tools`; the read half is owned by `akb_discover/grep` above.
-DEFERRED_MUTATION_NAMES = frozenset({"akb_grep"})
-CANDIDATE_REPLACED_NAMES = frozenset(
-    CANDIDATE_LEGACY_NAMES - DEFERRED_MUTATION_NAMES
+_CANDIDATE_WRITES: tuple[
+    tuple[str, str, str, str, TargetRule, VaultRole | None, Risk, str], ...
+] = (
+    # public tool, action, logical operation, legacy handler, target, role, risk, description
+    (
+        "akb_document_write", "put", "akb_put", "akb_put", "parent", "writer", "write",
+        "Create a document using either `parent` or the `vault` plus optional `collection` coordinates.",
+    ),
+    (
+        "akb_document_write", "update", "akb_update", "akb_update", "document_uri", "writer", "write",
+        "Update document content or metadata at its URI, with the existing optional OCC pins.",
+    ),
+    (
+        "akb_document_write", "edit", "akb_edit", "akb_edit", "document_uri", "writer", "write",
+        "Replace an exact document-body string, preserving the existing uniqueness, OCC, and error behavior.",
+    ),
+    (
+        "akb_document_write", "move", "akb_move", "akb_move", "document_uri", "writer", "write",
+        "Move or rename one document within its existing vault.",
+    ),
+    (
+        "akb_document_write", "delete", "akb_delete", "akb_delete", "document_uri", "writer", "destructive",
+        "Delete one document by URI.",
+    ),
+    (
+        "akb_document_write", "grep_replace", "akb_grep_replace", "akb_grep", "many_vaults", "writer", "destructive",
+        "Replace every matching document in an explicit vault scope. `replace` is required; an empty string deletes the matches.",
+    ),
+    (
+        "akb_collection_manage", "create", "akb_create_collection", "akb_create_collection", "vault", "writer", "write",
+        "Create a collection at the requested path in one vault.",
+    ),
+    (
+        "akb_collection_manage", "delete", "akb_delete_collection", "akb_delete_collection", "vault", "writer", "destructive",
+        "Delete a collection, retaining the existing recursive and contained-table permission checks.",
+    ),
+    (
+        "akb_relationship_manage", "link", "akb_link", "akb_link", "source", "writer", "write",
+        "Create one explicit relation between two resources in the same vault.",
+    ),
+    (
+        "akb_relationship_manage", "unlink", "akb_unlink", "akb_unlink", "source", "writer", "destructive",
+        "Remove the selected explicit relation, or all explicit relations between the resources when `relation` is omitted.",
+    ),
+    (
+        "akb_vault_access_manage", "grant", "akb_grant", "akb_grant", "vault", "admin", "write",
+        "Grant a user a vault role, optionally under a named access basis and revision.",
+    ),
+    (
+        "akb_vault_access_manage", "revoke", "akb_revoke", "akb_revoke", "vault", "admin", "destructive",
+        "Revoke one access basis, or all bases when `source_key` is omitted.",
+    ),
+    (
+        "akb_vault_access_manage", "transfer_ownership", "akb_transfer_ownership", "akb_transfer_ownership", "vault", "owner", "destructive",
+        "Transfer vault ownership to another username.",
+    ),
+    (
+        "akb_vault_access_manage", "set_public", "akb_set_public", "akb_set_public", "vault", "owner", "destructive",
+        "Change the vault's public access level.",
+    ),
+    (
+        "akb_publication_manage", "publish", "akb_publish", "akb_publish", "publication", "writer", "write",
+        "Publish a document, file, or table query using the existing resource-specific inputs.",
+    ),
+    (
+        "akb_publication_manage", "snapshot", "akb_publication_snapshot", "akb_publication_snapshot", "publication_slug", "writer", "write",
+        "Freeze a table-query publication into a snapshot, identified by its slug.",
+    ),
+    (
+        "akb_publication_manage", "unpublish", "akb_unpublish", "akb_unpublish", "publication_target", "writer", "destructive",
+        "Remove the publication identified by `slug`, or all publications for a document or file URI.",
+    ),
+    (
+        "akb_vault_manage", "create", "akb_create_vault", "akb_create_vault", "none", None, "write",
+        "Create a new vault. The handler checks the requested name against the caller's vault-creation scope.",
+    ),
+    (
+        "akb_vault_manage", "archive", "akb_archive_vault", "akb_archive_vault", "vault", "owner", "destructive",
+        "Archive one owned vault.",
+    ),
+    (
+        "akb_vault_manage", "delete", "akb_delete_vault", "akb_delete_vault", "vault", "owner", "destructive",
+        "Delete one owned, archived vault.",
+    ),
+    (
+        "akb_table_schema_manage", "create", "akb_create_table", "akb_create_table", "parent", "writer", "write",
+        "Create a table at a `parent` URI or under the requested `vault` and optional `collection`.",
+    ),
+    (
+        "akb_table_schema_manage", "alter", "akb_alter_table", "akb_alter_table", "table_uri", "admin", "destructive",
+        "Alter table columns, constraints, and indexes. The existing admin requirement applies.",
+    ),
+    (
+        "akb_table_schema_manage", "drop", "akb_drop_table", "akb_drop_table", "table_uri", "admin", "destructive",
+        "Drop a table. The existing admin requirement applies.",
+    ),
+    (
+        "akb_bundle_manage", "import", "akb_import", "akb_import", "vault", "writer", "write",
+        "Import a knowledge bundle into one vault using the existing reserved-path and overwrite rules.",
+    ),
 )
+
+CANDIDATE_LEGACY_NAMES = frozenset(item[2] for item in _CANDIDATE_OPERATIONS) | frozenset(
+    item[3] for item in _CANDIDATE_WRITES
+)
+CANDIDATE_REPLACED_NAMES = CANDIDATE_LEGACY_NAMES
 
 INDEPENDENT_OPERATION_REASONS = {
     "akb_help": "Self-documentation remains an independent tool surface.",
@@ -207,37 +316,16 @@ INDEPENDENT_OPERATION_REASONS = {
 }
 
 DEFERRED_OPERATION_REASONS = {
-    "backend_write_manage": "Backend mutations and management actions remain in the later write slice.",
     "stdio_local_files": "Local filesystem operations remain in the stdio proxy surface.",
 }
 
-# Coverage deliberately names what the next candidate slices own.  This is
-# data for tests/review, not a second dispatch catalog.
+# These operations are injected by the stdio proxy after the backend catalog is
+# returned. They remain outside this backend capability registry.
 DEFERRED_OPERATION_NAMES = frozenset(
     {
-        "akb_create_vault",
-        "akb_archive_vault",
-        "akb_delete_vault",
-        "akb_put",
-        "akb_update",
-        "akb_edit",
-        "akb_move",
-        "akb_delete",
-        "akb_create_collection",
-        "akb_delete_collection",
-        "akb_link",
-        "akb_unlink",
-        "akb_create_table",
-        "akb_alter_table",
-        "akb_drop_table",
-        "akb_publish",
-        "akb_publication_snapshot",
-        "akb_unpublish",
-        "akb_grant",
-        "akb_revoke",
-        "akb_transfer_ownership",
-        "akb_set_public",
-        "akb_import",
+        "akb_put_file",
+        "akb_get_file",
+        "akb_delete_file",
     }
 )
 
@@ -252,7 +340,7 @@ def _action_schema(legacy: Tool, action: str) -> dict[str, Any]:
     schema["additionalProperties"] = False
     # The legacy grep tool also performs replacement. The read capability
     # keeps mutation-only arguments out of its action schema.
-    if legacy.name == "akb_grep":
+    if legacy.name == "akb_grep" and action != "grep_replace":
         for name in ("replace", "max_replacements"):
             properties.pop(name, None)
     if legacy.name == "akb_browse":
@@ -262,6 +350,34 @@ def _action_schema(legacy: Tool, action: str) -> dict[str, Any]:
         schema["anyOf"] = [{"required": ["uri"]}, {"required": ["vault"]}]
     if legacy.name == "akb_graph":
         schema["anyOf"] = [{"required": ["uri"]}, {"required": ["vault"]}]
+    if legacy.name in {"akb_put", "akb_create_table"}:
+        schema["anyOf"] = [{"required": ["parent"]}, {"required": ["vault"]}]
+    if legacy.name == "akb_grep" and action == "grep_replace":
+        schema["required"] = [*schema["required"], "replace"]
+        schema["anyOf"] = [{"required": ["vault"]}]
+        properties["vault"]["description"] = (
+            "Required explicit vault scope. Replacement requires writer access to every listed vault."
+        )
+    elif legacy.name == "akb_grep":
+        properties["vault"]["description"] = (
+            "Limit the read-only search to one or more vaults. Omit it to search accessible vaults."
+        )
+    if legacy.name == "akb_publish":
+        schema["anyOf"] = [
+            {
+                "required": ["uri"],
+                "anyOf": [
+                    {"not": {"required": ["resource_type"]}},
+                    {"properties": {"resource_type": {"enum": ["document", "file"]}}},
+                ],
+            },
+            {
+                "properties": {"resource_type": {"const": "table_query"}},
+                "required": ["resource_type", "vault", "query_sql"],
+            },
+        ]
+    if legacy.name == "akb_unpublish":
+        schema["anyOf"] = [{"required": ["slug"]}, {"required": ["uri"]}]
     schema["description"] = f"Candidate action `{action}` input contract."
     return schema
 
@@ -309,7 +425,14 @@ class OperationRegistry:
             "optional_vault",
             "many_vaults",
             "uri",
+            "document_uri",
+            "table_uri",
             "browse",
+            "parent",
+            "source",
+            "publication",
+            "publication_target",
+            "publication_slug",
             "resource_or_vault",
         }:
             raise ValueError(f"invalid vault target rule: {spec.target}")
@@ -397,6 +520,23 @@ class OperationRegistry:
             bound[(spec.public_tool, spec.action)] = handler
         self._handlers = bound
 
+    def replace_contract(self, replacement: OperationRegistry) -> None:
+        """Replace the action schemas while retaining already-bound handlers."""
+        handlers_by_name = {
+            spec.handler: self._handlers[(spec.public_tool, spec.action)]
+            for spec in self._specs
+            if (spec.public_tool, spec.action) in self._handlers
+        }
+        self._specs = list(replacement._specs)
+        self._by_key = dict(replacement._by_key)
+        self._handlers = {
+            (spec.public_tool, spec.action): handlers_by_name[spec.handler]
+            for spec in self._specs
+            if spec.handler in handlers_by_name
+        }
+        self._tools = None
+        self.validate_contract()
+
     def handler_for(self, spec: OperationSpec) -> Any:
         try:
             return self._handlers[(spec.public_tool, spec.action)]
@@ -437,7 +577,9 @@ class OperationRegistry:
             if isinstance(value, str) and value:
                 return (value,)
             if isinstance(value, list):
-                return tuple(item for item in value if isinstance(item, str) and item)
+                return tuple(dict.fromkeys(
+                    item for item in value if isinstance(item, str) and item
+                ))
             return ()
 
         if spec.target == "uri":
@@ -448,6 +590,88 @@ class OperationRegistry:
 
             parsed = parse_uri(value)
             return (parsed.vault,) if parsed is not None else ()
+
+        if spec.target in {"document_uri", "table_uri"}:
+            value = arguments.get("uri")
+            if not isinstance(value, str):
+                return ()
+            from app.services.uri_service import parse_uri
+
+            parsed = parse_uri(value)
+            expected = "doc" if spec.target == "document_uri" else "table"
+            return (parsed.vault,) if parsed is not None and parsed.kind == expected else ()
+
+        if spec.target == "parent":
+            parent = arguments.get("parent")
+            if isinstance(parent, str) and parent:
+                from app.services.uri_service import split_browse_uri
+
+                try:
+                    vault, _collection = split_browse_uri(parent)
+                except ValueError:
+                    return ()
+                return (vault,)
+            value = arguments.get("vault")
+            return (value,) if isinstance(value, str) and value else ()
+
+        if spec.target == "source":
+            source = arguments.get("source")
+            target = arguments.get("target")
+            if not isinstance(source, str) or not isinstance(target, str):
+                return ()
+            from app.services.uri_service import parse_uri
+
+            source_parsed = parse_uri(source)
+            target_parsed = parse_uri(target)
+            if (
+                source_parsed is None
+                or target_parsed is None
+                or source_parsed.vault != target_parsed.vault
+            ):
+                return ()
+            return (source_parsed.vault,)
+
+        if spec.target == "publication":
+            if arguments.get("resource_type", "document") == "table_query":
+                names = [arguments.get("vault"), *(arguments.get("query_vault_names") or [])]
+                return tuple(dict.fromkeys(
+                    value for value in names if isinstance(value, str) and value
+                ))
+            expected_kind = {
+                "document": "doc",
+                "file": "file",
+            }.get(arguments.get("resource_type", "document"))
+            if expected_kind is None:
+                return ()
+            uri = arguments.get("uri")
+            if not isinstance(uri, str):
+                return ()
+            from app.services.uri_service import parse_uri
+
+            parsed = parse_uri(uri)
+            return (
+                (parsed.vault,)
+                if parsed is not None and parsed.kind == expected_kind
+                else ()
+            )
+
+        if spec.target == "publication_target":
+            if arguments.get("slug"):
+                return ()
+            uri = arguments.get("uri")
+            if not isinstance(uri, str):
+                return ()
+            from app.services.uri_service import parse_uri
+
+            parsed = parse_uri(uri)
+            return (
+                (parsed.vault,)
+                if parsed is not None and parsed.kind in {"doc", "file"}
+                else ()
+            )
+
+        if spec.target == "publication_slug":
+            return ()
 
         if spec.target == "resource_or_vault":
             uri = arguments.get("uri")
@@ -476,18 +700,16 @@ class OperationRegistry:
 
     def operation_coverage(self) -> dict[str, tuple[str, str]]:
         return {
-            spec.handler: (spec.public_tool, spec.action)
+            spec.logical_audit_operation: (spec.public_tool, spec.action)
             for spec in self._specs
         }
 
     def validate_contract(self) -> None:
-        handlers = [spec.handler for spec in self._specs]
-        if len(handlers) != len(set(handlers)):
-            raise ValueError("a legacy operation is registered more than once")
+        operations = [spec.logical_audit_operation for spec in self._specs]
+        if len(operations) != len(set(operations)):
+            raise ValueError("a logical operation is registered more than once")
         for public_tool in {spec.public_tool for spec in self._specs}:
             specs = [spec for spec in self._specs if spec.public_tool == public_tool]
-            if len({spec.risk for spec in specs}) != 1:
-                raise ValueError(f"candidate tool mixes risk levels: {public_tool}")
             if len({spec.required_scope for spec in specs}) != 1:
                 raise ValueError(f"candidate tool mixes OAuth scopes: {public_tool}")
 
@@ -512,7 +734,8 @@ class OperationRegistry:
         built: dict[str, Tool] = {}
         for public_tool in dict.fromkeys(spec.public_tool for spec in self._specs):
             specs = [spec for spec in self._specs if spec.public_tool == public_tool]
-            risk = specs[0].risk
+            risks = {spec.risk for spec in specs}
+            read_only = risks == {"read"}
             built[public_tool] = Tool(
                 name=public_tool,
                 description=self._tool_description(public_tool, specs),
@@ -521,9 +744,9 @@ class OperationRegistry:
                     "oneOf": [self._branch_schema(spec) for spec in specs],
                 },
                 annotations=ToolAnnotations(
-                    read_only_hint=risk == "read",
-                    destructive_hint=risk == "destructive",
-                    idempotent_hint=risk == "read",
+                    read_only_hint=read_only,
+                    destructive_hint="destructive" in risks,
+                    idempotent_hint=read_only,
                     open_world_hint=False,
                 ),
             )
@@ -547,6 +770,36 @@ class OperationRegistry:
             )
         else:
             prefixes = {
+                "akb_document_write": (
+                    "Document mutation capability. Choose `put`, `update`, `edit`, `move`, or `delete` "
+                    "for one document, and `grep_replace` only for an explicit scoped replacement."
+                ),
+                "akb_collection_manage": (
+                    "Collection lifecycle capability. Choose `create` or `delete`; recursive deletion "
+                    "retains its extra table permission check."
+                ),
+                "akb_relationship_manage": (
+                    "Relationship mutation capability. Choose `link` or `unlink` for resources in one vault."
+                ),
+                "akb_vault_access_manage": (
+                    "Vault access management capability. Choose `grant`, `revoke`, `transfer_ownership`, "
+                    "or `set_public`; each action retains its own authorization rule."
+                ),
+                "akb_publication_manage": (
+                    "Publication lifecycle capability. Choose `publish`, `snapshot`, or `unpublish` "
+                    "using the corresponding resource or slug."
+                ),
+                "akb_vault_manage": (
+                    "Vault lifecycle capability. Choose `create`, `archive`, or `delete`; create uses "
+                    "the requested name's creation scope and archive/delete require ownership."
+                ),
+                "akb_table_schema_manage": (
+                    "Table schema capability. Choose `create`, `alter`, or `drop`; create requires writer "
+                    "access and alter/drop require admin access."
+                ),
+                "akb_bundle_manage": (
+                    "Knowledge bundle capability. Choose `import` to import a bundle into one vault."
+                ),
                 "akb_relationships": (
                     "Read-only relationship capability. Choose `relations` to inspect one "
                     "resource's edges; choose `graph` for a full vault graph or a bounded URI subgraph."
@@ -598,6 +851,34 @@ def build_candidate_registry(legacy_tools: Mapping[str, Tool]) -> OperationRegis
                 target=target,
                 risk="read",
                 logical_audit_operation=legacy_name,
+                description=description,
+            )
+        )
+    for (
+        public_tool,
+        action,
+        logical_operation,
+        handler,
+        target,
+        vault_role,
+        risk,
+        description,
+    ) in _CANDIDATE_WRITES:
+        try:
+            legacy = legacy_tools[handler]
+        except KeyError as exc:
+            raise ValueError(f"candidate coverage references missing tool: {handler}") from exc
+        registry.register(
+            OperationSpec(
+                public_tool=public_tool,
+                action=action,
+                input_schema=_action_schema(legacy, action),
+                handler=handler,
+                required_scope=WRITE_SCOPE,
+                vault_role=vault_role,
+                target=target,
+                risk=risk,
+                logical_audit_operation=logical_operation,
                 description=description,
             )
         )

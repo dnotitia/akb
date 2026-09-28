@@ -191,6 +191,46 @@ def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
     assert rows[1]["meta"]["replaced_docs"] == 1
 
 
+def test_candidate_grep_replace_keeps_logical_audit_and_recovery_receipts(audit_dir):
+    class _U:
+        username, user_id = "bob", "u2"
+
+    audit_log.record_tool(
+        "akb_document_write",
+        {
+            "action": "grep_replace",
+            "vault": ["v"],
+            "pattern": "x",
+            "replace": "",
+        },
+        _U(),
+        {
+            "replaced_docs": 1,
+            "replacements": [
+                {
+                    "uri": "akb://v/doc/a.md",
+                    "commit": "new-commit",
+                    "previous_commit": "parent-commit",
+                }
+            ],
+        },
+        is_write=True,
+        logical_operation="akb_grep_replace",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in _read_lines(audit_dir / f"akb-audit-{_today()}.jsonl")
+    ]
+    assert [row["action"] for row in rows] == [
+        "akb_grep.replace",
+        "akb_grep_replace",
+    ]
+    assert rows[-1]["meta"]["public_tool"] == "akb_document_write"
+    assert rows[-1]["meta"]["action"] == "grep_replace"
+    assert rows[-1]["meta"]["replaced_docs"] == 1
+
+
 def test_read_only_set_agrees_with_the_mcp_scope_table(tmp_path, monkeypatch):
     """The two classifications must not drift: a tool that needs
     `akb:vault:write` to invoke is by definition state-changing, so it

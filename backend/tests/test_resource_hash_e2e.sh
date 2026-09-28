@@ -84,7 +84,7 @@ mcp_result() {
 
 echo ""
 echo "▸ 1. File byte hash contract"
-R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"hash e2e\"}" | mcp_result)
+R=$(mcp_call akb_vault_manage "{\"action\":\"create\",\"name\":\"$VAULT\",\"description\":\"hash e2e\"}" | mcp_result)
 VAULT_ID=$(echo "$R" | json_get "d['vault_id']")
 [ -n "$VAULT_ID" ] && pass "vault created" || fail "vault" "missing vault_id"
 

@@ -62,8 +62,17 @@ async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(
     monkeypatch.setattr(settings, "document_revision_backend", backend)
 
     def assert_creation_catalog(response):
-        create = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "akb_create_vault")
-        properties = create["inputSchema"]["properties"]
+        manage = next(
+            tool
+            for tool in response.json()["result"]["tools"]
+            if tool["name"] == "akb_vault_manage"
+        )
+        create = next(
+            branch
+            for branch in manage["inputSchema"]["oneOf"]
+            if branch["properties"]["action"].get("const") == "create"
+        )
+        properties = create["properties"]
         assert ("template" in properties) is (backend == "bare_git")
         assert ("external_git" in properties) is (backend == "bare_git")
 

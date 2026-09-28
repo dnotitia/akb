@@ -2341,7 +2341,7 @@ class E2ERuntime:
             for item in result["tools"]
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
-        required = {"akb_discover", "akb_put", "akb_delete_vault"}
+        required = {"akb_discover", "akb_document_write", "akb_vault_manage"}
         if not required.issubset(names):
             raise ProductAssertionFailure("stdio tools/list omitted a required tool")
         self._stdio_tools_list_observed = True

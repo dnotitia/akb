@@ -32,9 +32,7 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
-from copy import deepcopy
-
-from mcp.types import Tool, ToolAnnotations
+from mcp.types import Tool
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
@@ -158,7 +156,7 @@ TOOLS = [
                         "collection. When given, the doc is placed there and "
                         "`vault`/`collection` are derived from the URI. Use "
                         "this in drill-down chains: paste the `uri` from an "
-                        "`akb_browse` response straight back in."
+                        "`akb_discover` action=`browse` response straight back in."
                     ),
                 },
                 "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
@@ -181,7 +179,7 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Lifecycle status. Defaults to 'draft'; pass 'active' to publish on "
-                        "create instead of promoting later with akb_update. Descriptive "
+                        "create instead of promoting later with akb_document_write/action=update. Descriptive "
                         "metadata only — it does not gate search, browse, or access."
                     ),
                     "enum": ["draft", "active", "archived"],
@@ -202,14 +200,14 @@ TOOLS = [
         name="akb_get",
         description=(
             "Retrieve a document by its URI. Returns full content with metadata. "
-            "Use akb_browse or akb_search first to obtain the URI. "
-            "Optionally pass a commit hash (from akb_history) to read a previous version."
+            "Use akb_discover/browse or akb_discover/search first to obtain the URI. "
+            "Optionally pass a commit hash from akb_document_read/history to read a previous version."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"},
-                "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_history)"},
+                "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_document_read/history)"},
             },
             "required": ["uri"],
         },
@@ -220,7 +218,7 @@ TOOLS = [
             "Update an existing document. Only provide fields you want to change. "
             "The `content` field replaces the complete Markdown body; never pass a "
             "partial fragment such as a newly uploaded image. Use a targeted "
-            "akb_edit for inline insertion or replacement."
+            "akb_document_write/action=edit for inline insertion or replacement."
         ),
         input_schema={
             "type": "object",
@@ -256,7 +254,7 @@ TOOLS = [
             "If old_string is not found or appears multiple times, the call fails with a clear error. "
             "Use this for inserting, replacing, or removing an inline image without "
             "resending the complete document body. For find-and-replace across many "
-            "documents, use akb_grep with replace instead."
+            "documents, use akb_document_write with action=grep_replace instead."
         ),
         input_schema={
             "type": "object",
@@ -278,7 +276,7 @@ TOOLS = [
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "base_commit": {
                     "type": "string",
-                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after akb_get to fail-fast on concurrent writers.",
+                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after akb_document_read/get to fail-fast on concurrent writers.",
                 },
             },
             "required": ["uri", "old_string", "new_string"],
@@ -291,7 +289,7 @@ TOOLS = [
             "keeping its identity and full git history. The old akb:// URI keeps "
             "resolving (a redirect is recorded), and graph links/publications are "
             "rewritten. Provide collection and/or slug (at least one must change). "
-            "The title is unchanged; use akb_update to change the displayed title."
+            "The title is unchanged; use akb_document_write/action=update to change the displayed title."
         ),
         input_schema={
             "type": "object",
@@ -413,14 +411,14 @@ TOOLS = [
             "Search documents with hybrid retrieval — dense vector (semantic) fused with "
             "BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language "
             "questions and short keyword queries well. For exact string / regex matches "
-            "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
+            "(code, URLs, version numbers) use akb_discover with action=grep. Returns each hit's `uri`; "
             "`collection_summary` and `vault_description` describe the hit's parent "
             "context but do not affect matching or ranking. "
-            "Use akb_drill_down or akb_get with that URI for full content. "
+            "Use akb_document_read with action=section or action=get for full content. "
             "Response reports `returned` (in `results`) and `total_matches` (size of the "
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
-            "more hits than reported — switch to akb_grep with count_only=true for an exact "
+            "more hits than reported — switch to akb_discover with action=grep and count_only=true for an exact "
             "literal-substring count, or refine the query. "
             "A page shorter than `limit` has exactly two explanations, and they are separate "
             "fields. `excluded` counts what a FILTER removed from this page, keyed by cause "
@@ -431,7 +429,7 @@ TOOLS = [
             "When `degraded=true` a retrieval leg failed (vector-store outage, a degraded leg) "
             "or a hit was lost to a stale source row, AND the page came back short because of "
             "it, so results are incomplete or empty — this is NOT a genuine zero-match; "
-            "`degradation_reason` names the cause. Retry shortly, or fall back to akb_grep for "
+            "`degradation_reason` names the cause. Retry shortly, or fall back to akb_discover/grep for "
             "a literal search. A filter never sets this flag and never appears in that reason. "
             "Neither does a fault the search already made good: when a dropped candidate was "
             "replaced from the prefetch pool the page is complete, so `degraded` stays false "
@@ -465,8 +463,8 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": (
                         "Restrict the search to a specific set of already-known resources "
-                        "by their canonical akb:// URIs (e.g. from a previous akb_search / "
-                        "akb_browse). Hybrid retrieval (dense + BM25 + ranking) runs only "
+                        "by their canonical akb:// URIs (e.g. from a previous "
+                        "akb_discover/search or akb_discover/browse). Hybrid retrieval runs only "
                         "inside this set, intersected with the other filters and your access. "
                         "Omit for the normal whole-vault search."
                     ),
@@ -482,14 +480,14 @@ TOOLS = [
             "On a native Document backend, optionally include admitted "
             "searchable text Files with `include_text_files=true`; binary "
             "Files remain excluded. "
-            "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
+            "Unlike akb_discover/search (semantic/meaning-based), this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
             "Native matching and replacement use per-line Python regex semantics; "
             "case-insensitive literals use the same Unicode rules as replacement. "
             "Native results include body-relative line numbers and searched revision identity. "
             "Returns matching documents (each with its `uri`) and matched lines. "
-            "Optionally pass `replace` to find-and-replace across all matching documents; "
-            "the call writes nothing if the scope exceeds `max_replacements`. "
+            "Read-only search is exposed as `akb_discover` with `action=grep`. "
+            "Replacement is a separate `akb_document_write` action and requires an explicit writer scope. "
             "Three response shapes (mutually exclusive): default lines, `count_only=true` "
             "(grep -c — per-doc counts + total, no snippets), `files_with_matches=true` "
             "(grep -l — just the URIs that contain the pattern). "
@@ -507,7 +505,7 @@ TOOLS = [
                         {"type": "string", "minLength": 1},
                         {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
                     ],
-                    "description": "Limit to one or more vaults. Omit to search accessible vaults; replace requires an explicit nonempty scope with writer access to every vault.",
+                    "description": "Limit to one or more vaults. Omit to search accessible vaults. The write action requires an explicit nonempty scope with writer access to every vault.",
                 },
                 "doc_types": {"type": "array", "items": {"type": "string"}, "description": "Document types (OR); intersects other filters. Excludes Files when nonempty."},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Document tags (OR); intersects other filters. Excludes Files when nonempty."},
@@ -516,7 +514,7 @@ TOOLS = [
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
                 "regex": {"type": "boolean", "default": False, "description": "Treat pattern as regex (native: Python per line; legacy: PostgreSQL candidates). REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
-                "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
+                "replace": {"type": "string", "description": "Required replacement string for the separate grep_replace write action. An empty string removes every matching substring. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_document_write with action=edit."},
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return; does not limit replacement writes"},
                 "max_replacements": {
                     "type": "integer",
@@ -592,7 +590,7 @@ TOOLS = [
         description=(
             "Get activity history for a vault — who changed what, when, and why. "
             "Returns Git commit history with changed file list. "
-            "Use akb_diff to see the actual content changes for a specific commit."
+            "Use akb_document_read with action=diff to see the actual content changes for a specific commit."
         ),
         input_schema={
             "type": "object",
@@ -611,13 +609,13 @@ TOOLS = [
         description=(
             "Get the content diff for a document at a specific commit. "
             "Shows what was added/removed/modified. "
-            "Use akb_history or akb_activity to find commit hashes first."
+            "Use akb_document_read with action=history or action=activity to find commit hashes first."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
-                "commit": {"type": "string", "description": "Commit hash (from akb_history or akb_activity)"},
+                "commit": {"type": "string", "description": "Commit hash (from akb_document_read/history or action=activity)"},
             },
             "required": ["uri", "commit"],
         },
@@ -658,7 +656,7 @@ TOOLS = [
                     "maximum": 5,
                     "description": (
                         "BFS traversal radius in edge hops. Disambiguated from "
-                        "`akb_browse.depth` (which is collection-tree depth) — "
+                        "`akb_discover/browse.depth` (which is collection-tree depth) — "
                         "hops here counts relations followed, not folder levels."
                     ),
                 },
@@ -733,7 +731,7 @@ TOOLS = [
             "same permissions. Define columns with name and type (text, number, "
             "boolean, date, json). Optional `collection` (e.g. 'sessions/learnings') "
             "groups the table under that collection so it appears beside the documents "
-            "and files there in akb_browse; omit for vault root."
+            "and files there with akb_discover/browse; omit for vault root."
         ),
         input_schema={
             "type": "object",
@@ -1069,7 +1067,7 @@ TOOLS = [
         name="akb_publications",
         description=(
             "List every publication in a vault. Each item is the canonical "
-            "publication dict (same shape as `akb_publish` returns)."
+            "publication dict (same shape as `akb_publication_manage` action=`publish` returns)."
         ),
         input_schema={
             "type": "object",
@@ -1316,7 +1314,7 @@ TOOLS = [
         name="akb_history",
         description=(
             "Get version history of a document — who changed it, when, and why. "
-            "Each entry is a Git commit. Use the commit hash with akb_get to read a previous version."
+            "Each entry is a Git commit. Use the commit hash with akb_document_read/action=get to read a previous version."
         ),
         input_schema={
             "type": "object",
@@ -1343,7 +1341,7 @@ TOOLS = [
                     "description": (
                         "What to get help on. Options: "
                         "categories (quickstart, documents, search, tables, files, access, history, publishing, relations), "
-                        "tool names (akb_put, akb_search, etc.), "
+                        "tool names (akb_document_write/put, akb_discover/search, etc.), "
                         "or workflow names (link-resources, research, onboarding, data-tracking, vault-skill)"
                     ),
                 },
@@ -1383,7 +1381,7 @@ TOOLS = [
         name="akb_import",
         description=(
             "Import a knowledge bundle into a vault. Pass `files` as a {path: content} "
-            "map (the shape akb_export returns). `format` selects the bundle format — "
+            "map (the shape akb_export_read/export returns). `format` selects the bundle format — "
             "currently 'okf'. Concept documents are imported as AKB documents; a "
             "`type: table`/`file` concept doc (which carries only schema/metadata, not "
             "rows/bytes) imports as a regular document describing that asset. Existing "
@@ -1420,56 +1418,23 @@ TOOLS = [
 
 from mcp_server.operation_registry import (
     CANDIDATE_LEGACY_NAMES,
-    DEFERRED_MUTATION_NAMES,
     OperationRegistry,
     build_candidate_registry,
 )
 
 
-_LEGACY_TOOLS = {tool.name: tool for tool in TOOLS}
-CANDIDATE_REGISTRY: OperationRegistry = build_candidate_registry(_LEGACY_TOOLS)
-
-
-def _candidate_grep_replace_tool() -> Tool:
-    """Expose the deferred grep mutation without reviving its read mode."""
-    legacy = _LEGACY_TOOLS["akb_grep"]
-    schema = deepcopy(legacy.input_schema)
-    schema["required"] = [*schema.get("required", []), "replace"]
-    schema["additionalProperties"] = False
-    return legacy.model_copy(
-        deep=True,
-        update={
-            "description": (
-                "Deferred write-only grep replacement. The `replace` argument is "
-                "required; read-only exact or regex search is `akb_discover` "
-                "with `action=grep`. Requires writer access to every target vault."
-            ),
-            "input_schema": schema,
-            "annotations": ToolAnnotations(
-                read_only_hint=False,
-                destructive_hint=True,
-                idempotent_hint=False,
-                open_world_hint=False,
-            ),
-        },
-    )
-
-
 def candidate_tools() -> list[Tool]:
     """Return the candidate catalog in deterministic order.
 
-    Registry-owned read operations replace their legacy names. Other backend
-    operations remain at their existing boundary until a later slice owns them.
+    Registry-owned capabilities replace their legacy names. Independent
+    operations, including help and mixed read/write SQL, remain standalone.
     """
+    refresh_candidate_registry()
     result = [tool.model_copy(deep=True) for tool in CANDIDATE_REGISTRY.tools_by_name.values()]
-    result.append(_candidate_grep_replace_tool())
     result.extend(
         tool.model_copy(deep=True)
         for tool in available_tools()
-        if (
-            tool.name not in CANDIDATE_LEGACY_NAMES
-            and tool.name not in DEFERRED_MUTATION_NAMES
-        )
+        if tool.name not in CANDIDATE_LEGACY_NAMES
     )
     return result
 
@@ -1499,3 +1464,15 @@ def available_tools() -> list[Tool]:
         )
         result.append(tool)
     return result
+
+
+# Build action schemas from the effective legacy schemas so deployment-gated
+# creation options stay absent from both standalone and candidate catalogs.
+_LEGACY_TOOLS = {tool.name: tool for tool in available_tools()}
+CANDIDATE_REGISTRY: OperationRegistry = build_candidate_registry(_LEGACY_TOOLS)
+
+
+def refresh_candidate_registry() -> None:
+    """Keep catalog validation aligned with active backend capabilities."""
+    legacy_tools = {tool.name: tool for tool in available_tools()}
+    CANDIDATE_REGISTRY.replace_contract(build_candidate_registry(legacy_tools))

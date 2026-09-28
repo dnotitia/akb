@@ -116,8 +116,8 @@ SID1=$(setup_mcp "$PAT1")
 m1() { mc "$PAT1" "$SID1" "$1" "$2" | mr; }
 
 VAULT="hist-rest-$(date +%s)"
-m1 "akb_create_vault" "{\"name\":\"$VAULT\",\"description\":\"history rest test\"}" >/dev/null
-m1 "akb_grant" "{\"vault\":\"$VAULT\",\"user\":\"$USER2\",\"role\":\"reader\"}" >/dev/null
+m1 "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT\",\"description\":\"history rest test\"}" >/dev/null
+m1 "akb_vault_access_manage" "{\"action\":\"grant\",\"vault\":\"$VAULT\",\"user\":\"$USER2\",\"role\":\"reader\"}" >/dev/null
 pass "vault created, USER2 granted reader"
 
 # Create a doc via the REST write path (author = USER1 username), then
@@ -214,9 +214,9 @@ RECENT1=$(rget "$PAT1" "?vault=$VAULT")
 [ "$(rget "$PAT2" "?vault=$VAULT" | contains_vault "$VAULT")" = "True" ] && pass "granted reader sees recent changes" || fail "recent reader" "vault missing"
 [ "$(rget "$PAT3" | contains_vault "$VAULT")" = "False" ] && pass "private vault does not leak via global recent" || fail "recent privacy" "private vault leaked"
 [ "$(rget_code "$PAT3" "?vault=$VAULT")" = "403" ] && pass "non-member private recent filter → 403" || fail "recent private access" "expected 403"
-m1 "akb_set_public" "{\"vault\":\"$VAULT\",\"level\":\"reader\"}" >/dev/null
+m1 "akb_vault_access_manage" "{\"action\":\"set_public\",\"vault\":\"$VAULT\",\"level\":\"reader\"}" >/dev/null
 [ "$(rget "$PAT3" | contains_vault "$VAULT")" = "True" ] && pass "public reader sees vault in global recent" || fail "recent public" "public vault missing"
-m1 "akb_set_public" "{\"vault\":\"$VAULT\",\"level\":\"none\"}" >/dev/null
+m1 "akb_vault_access_manage" "{\"action\":\"set_public\",\"vault\":\"$VAULT\",\"level\":\"none\"}" >/dev/null
 
 # ── 6. diff normal/unknown compatibility ─────────────────────
 echo ""
@@ -288,7 +288,8 @@ AFTER=$(hget "$PAT1" "$VAULT/$DOCPATH" | hist_count)
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-m1 "akb_delete_vault" "{\"name\":\"$VAULT\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT\"}" >/dev/null 2>&1
 pass "Vault deleted"
 
 # ── Summary ──────────────────────────────────────────────────

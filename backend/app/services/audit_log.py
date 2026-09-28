@@ -438,7 +438,7 @@ def record_tool(
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
         outcome = "error"
         code = result.get("code")
-    if operation_name == "akb_grep" and is_write:
+    if operation_name in {"akb_grep", "akb_grep_replace"} and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
     audit_meta: dict[str, Any] = dict(protocol or {})
     if logical_operation and logical_operation != name:
@@ -465,7 +465,7 @@ def record_tool(
                 "applied": result.get("applied"),
             })
         audit_meta["access"] = access_meta
-    if operation_name == "akb_grep" and is_write:
+    if operation_name in {"akb_grep", "akb_grep_replace"} and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
         action=operation_name,

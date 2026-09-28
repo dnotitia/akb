@@ -90,14 +90,14 @@ mr() { python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['res
 VAULT_A="rbac-a-$(date +%s)"
 VAULT_B="rbac-b-$(($(date +%s)+1))"
 
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_vault" "{\"name\":\"$VAULT_A\",\"description\":\"Alice's vault A\"}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT_A\",\"description\":\"Alice's vault A\"}" | mr)
 echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev/null 2>&1 && pass "Vault A created ($VAULT_A)" || fail "Vault A" "$R"
 
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_vault" "{\"name\":\"$VAULT_B\",\"description\":\"Alice's vault B\"}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT_B\",\"description\":\"Alice's vault B\"}" | mr)
 echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev/null 2>&1 && pass "Vault B created ($VAULT_B)" || fail "Vault B" "$R"
 
 # Table `secrets` in vault A
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_table" "{\"vault\":\"$VAULT_A\",\"name\":\"secrets\",\"description\":\"Sensitive data\",\"columns\":[{\"name\":\"item\",\"type\":\"text\",\"required\":true},{\"name\":\"value\",\"type\":\"text\"}]}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$VAULT_A\",\"name\":\"secrets\",\"description\":\"Sensitive data\",\"columns\":[{\"name\":\"item\",\"type\":\"text\",\"required\":true},{\"name\":\"value\",\"type\":\"text\"}]}" | mr)
 TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('uri') or d.get('name')=='secrets'))" 2>/dev/null)
 [ "$TABLE_OK" = "True" ] && pass "Table 'secrets' created in vault A" || fail "Table create" "$R"
 
@@ -105,7 +105,7 @@ TABLE_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); prin
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"INSERT INTO secrets (item, value) VALUES ('api_key', 'xyzzy-123'), ('db_pw', 'hunter2')\"}" >/dev/null 2>&1
 
 # Also one table in vault B, for cross-vault probe
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_table" "{\"vault\":\"$VAULT_B\",\"name\":\"notes\",\"description\":\"Public-ish notes\",\"columns\":[{\"name\":\"topic\",\"type\":\"text\",\"required\":true}]}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$VAULT_B\",\"name\":\"notes\",\"description\":\"Public-ish notes\",\"columns\":[{\"name\":\"topic\",\"type\":\"text\",\"required\":true}]}" | mr)
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_B\",\"sql\":\"INSERT INTO notes (topic) VALUES ('hello')\"}" >/dev/null 2>&1
 pass "Vault B has table 'notes'"
 
@@ -130,7 +130,7 @@ R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":
 echo "$R" | grep -q '"result"' && pass "Owner INSERT" || fail "Owner INSERT" "$R"
 
 # Grant Bob reader on vault A
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"grant\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" | mr)
 echo "$R" | grep -q '"granted"' && pass "Granted Bob reader on vault A" || fail "Grant" "$R"
 
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"SELECT * FROM secrets\"}" | mr)
@@ -138,7 +138,7 @@ N=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get(
 [ "$N" = "3" ] && pass "Reader Bob SELECT: 3 rows" || fail "Reader SELECT" "got $N rows; raw=$R"
 
 # Upgrade Bob to writer
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"writer\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"grant\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"writer\"}" >/dev/null 2>&1
 
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"INSERT INTO secrets (item, value) VALUES ('bob_added', 'b')\"}" | mr)
 echo "$R" | grep -q '"result"' && pass "Writer Bob INSERT" || fail "Writer INSERT" "$R"
@@ -188,12 +188,12 @@ except Exception:
 }
 
 # Revoke Bob first so we test denial cleanly
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"revoke\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
 # Bob has NO membership on vault B (or A after revoke). Set up: Bob owns
 # his own throw-away vault so he can issue akb_sql with valid auth, but
 # any reference outside his role memberships should fail at PG.
 VAULT_BOB="rbac-bob-vault-$(date +%s)"
-R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_create_vault" "{\"name\":\"$VAULT_BOB\",\"description\":\"Bob's vault\"}" | mr)
+R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT_BOB\",\"description\":\"Bob's vault\"}" | mr)
 echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev/null 2>&1 && pass "Bob's throwaway vault created" || fail "Bob vault" "$R"
 
 # 2a: After revoke, Bob's SELECT on vault A's secrets must fail.
@@ -350,7 +350,7 @@ echo ""
 echo "▸ 2-C. Reader role write-attempt denials (PG ACL)"
 
 # Re-grant Bob reader on vault A.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"grant\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
 
 # Reader cannot INSERT.
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"INSERT INTO secrets (item, value) VALUES ('hack', 'h')\"}" | mr)
@@ -371,7 +371,7 @@ R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"TR
 assert_app_rejected "Reader cannot TRUNCATE (pre-flight)" "$R"
 
 # Restore: revoke for the lifecycle phase below.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"revoke\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
 
 # ── 2-D. Public vault access via akb_authenticated wildcard ─
 echo ""
@@ -379,11 +379,11 @@ echo "▸ 2-D. public_access — non-members reach public vaults via wildcard"
 
 # Alice creates a fresh vault with public_access='reader' from the start.
 VAULT_PUB="rbac-pub-$(date +%s)"
-R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_vault" "{\"name\":\"$VAULT_PUB\",\"description\":\"public-reader test\",\"public_access\":\"reader\"}" | mr)
+R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT_PUB\",\"description\":\"public-reader test\",\"public_access\":\"reader\"}" | mr)
 echo "$R" | python3 -c "import sys,json; json.load(sys.stdin)['vault_id']" >/dev/null 2>&1 && pass "Public vault (reader) created" || fail "Public vault create" "$R"
 
 # Alice adds a table + a row to test reads against.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_create_table" "{\"vault\":\"$VAULT_PUB\",\"name\":\"items\",\"description\":\"public data\",\"columns\":[{\"name\":\"label\",\"type\":\"text\",\"required\":true}]}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$VAULT_PUB\",\"name\":\"items\",\"description\":\"public data\",\"columns\":[{\"name\":\"label\",\"type\":\"text\",\"required\":true}]}" >/dev/null 2>&1
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"INSERT INTO items (label) VALUES ('one'), ('two')\"}" >/dev/null 2>&1
 
 # 2-D-1: Bob (no vault_access row) can SELECT — that's the bug we just fixed.
@@ -396,12 +396,12 @@ R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"
 assert_pg_denied "Non-member INSERT on public-reader denied" "$R"
 
 # 2-D-3: Alice promotes to public_access='writer'.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"writer\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"set_public\",\"vault\":\"$VAULT_PUB\",\"level\":\"writer\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"INSERT INTO items (label) VALUES ('bob_added')\"}" | mr)
 echo "$R" | grep -q '"result"' && pass "Non-member INSERTs after promote to writer" || fail "Promote→writer INSERT" "$R"
 
 # 2-D-4: Alice demotes back to public_access='none'.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"none\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"set_public\",\"vault\":\"$VAULT_PUB\",\"level\":\"none\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_PUB\",\"sql\":\"SELECT label FROM items\"}" | mr)
 # App gate also enforces (check_vault_access rejects non-member on
 # private vault), so the 403 may come from the app layer. Either layer
@@ -411,7 +411,7 @@ echo "$R" | grep -qiE 'denied|forbid|permission|require|access' && pass "Demote�
 # 2-D-5: A user created AFTER public_access flipped back to reader still
 #         gets access — proves on_user_create grants akb_authenticated
 #         membership at registration time (not relying on reconciler).
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_set_public" "{\"vault\":\"$VAULT_PUB\",\"level\":\"reader\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"set_public\",\"vault\":\"$VAULT_PUB\",\"level\":\"reader\"}" >/dev/null 2>&1
 CAROL="rbac-carol-$(date +%s)"
 PAT_CAROL=$(setup_user "$CAROL")
 SID_CAROL=$(setup_mcp "$PAT_CAROL")
@@ -420,26 +420,28 @@ N=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ite
 [ "$N" -ge 1 ] 2>/dev/null && pass "Newly-registered user reads public vault" || fail "New user public read" "$R"
 
 # Cleanup of the public-vault scratchpad.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_delete_vault" "{\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
 
 # ── 3. Lifecycle ────────────────────────────────────────────
 echo ""
 echo "▸ 3. Lifecycle — grant/revoke takes effect, drift recovery"
 
 # 3a: Re-grant Bob, verify access restored
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_grant" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"grant\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\",\"role\":\"reader\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"SELECT COUNT(*) AS n FROM secrets\"}" | mr)
 N=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('items',[{}])[0].get('n',-1))" 2>/dev/null)
 [ "$N" -ge 3 ] 2>/dev/null && pass "Re-grant: Bob can SELECT again ($N rows)" || fail "Re-grant" "$R"
 
 # 3b: Revoke takes effect within next call (same MCP session).
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_revoke" "{\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_access_manage" "{\"action\":\"revoke\",\"vault\":\"$VAULT_A\",\"user\":\"$BOB\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_BOB" "$SID_BOB" "akb_sql" "{\"vault\":\"$VAULT_A\",\"sql\":\"SELECT * FROM secrets\"}" | mr)
 echo "$R" | grep -qiE 'denied|forbid|permission|require' && pass "Revoke takes effect immediately" || fail "Revoke immediate" "$R"
 
 # 3c: Vault delete drops vault group roles. After delete, subsequent
 #     SELECT via the same vault name must 404 / not-found.
-mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_delete_vault" "{\"vault\":\"$VAULT_B\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT_B\"}" >/dev/null 2>&1
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT_B\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_B\",\"sql\":\"SELECT 1\"}" | mr)
 echo "$R" | grep -qiE 'not[ _]?found|does not exist' && pass "Deleted vault → not found" || fail "Vault delete" "$R"
 
