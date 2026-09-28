@@ -145,6 +145,11 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class CandidateOnlyOperationAttribution(ContractModel):
+    operation: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    resource_type: ResourceType
+
+
 class StateProbe(ContractModel):
     """A read-only state endpoint owned by the runtime or application."""
 
@@ -747,7 +752,8 @@ class BenchmarkRunManifest(ContractModel):
     provider_sensitivity: ProviderSensitivity = Field(default_factory=ProviderSensitivity)
     budget: Budget
     operation_map: dict[str, list[str]]
-    candidate_operation_map: dict[str, dict[str, str]]
+    candidate_operation_map: dict[str, dict[str, str | None]]
+    candidate_only_operation_attribution: dict[str, dict[str, CandidateOnlyOperationAttribution]]
     tool_resources: dict[str, ResourceType]
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
@@ -857,22 +863,42 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
         candidate_targets: list[str] = []
         candidate_pairs: set[tuple[str, str]] = set()
+        candidate_only_pairs: set[tuple[str, str]] = set()
         for tool_name, actions in self.candidate_operation_map.items():
             if re.fullmatch(r"^[A-Za-z][A-Za-z0-9_.-]*$", tool_name) is None or not actions:
                 raise ValueError(f"invalid Candidate action map for tool: {tool_name}")
             for action, legacy_tool in actions.items():
                 if re.fullmatch(r"^[a-z][a-z0-9_]*$", action) is None:
                     raise ValueError(f"invalid Candidate action name: {tool_name}/{action}")
-                if legacy_tool not in registered_tools:
-                    raise ValueError(f"Candidate action maps to an unregistered logical tool: {legacy_tool}")
                 candidate_pairs.add((tool_name, action))
-                candidate_targets.append(legacy_tool)
-        if len(candidate_pairs) != len(candidate_targets):
-            raise ValueError("Candidate tool/action pairs must be unique")
+                if legacy_tool is None:
+                    candidate_only_pairs.add((tool_name, action))
+                else:
+                    if legacy_tool not in registered_tools:
+                        raise ValueError(f"Candidate action maps to an unregistered baseline tool: {legacy_tool}")
+                    candidate_targets.append(legacy_tool)
         if len(candidate_targets) != len(set(candidate_targets)):
-            raise ValueError("each logical tool must map to one Candidate action")
-        if set(candidate_targets) != registered_tools - {"akb_help", "akb_sql"}:
-            raise ValueError("candidate_operation_map must cover every capability action exactly once")
+            raise ValueError("each baseline logical tool must map to one Candidate action")
+        independent_tools = {"akb_help", "akb_sql"}
+        if set(candidate_targets) != registered_tools - independent_tools:
+            raise ValueError("candidate_operation_map must cover each baseline-backed capability action exactly once")
+        attributed_pairs = {
+            (tool_name, action)
+            for tool_name, actions in self.candidate_only_operation_attribution.items()
+            for action in actions
+        }
+        if attributed_pairs != candidate_only_pairs:
+            raise ValueError("candidate-only attribution must match Candidate actions without a baseline tool")
+        for tool_name, candidate_attributions in self.candidate_only_operation_attribution.items():
+            if tool_name not in self.candidate_operation_map:
+                raise ValueError(f"candidate-only attribution references an unknown Candidate tool: {tool_name}")
+            for action, attribution in candidate_attributions.items():
+                if self.candidate_operation_map[tool_name].get(action, "missing") is not None:
+                    raise ValueError(f"candidate-only attribution requires a Candidate-only action: {tool_name}/{action}")
+                if attribution.operation not in self.operation_map:
+                    raise ValueError(f"candidate-only operation is not registered in the existing taxonomy: {attribution.operation}")
+        if len(candidate_pairs) + len(independent_tools) != 51:
+            raise ValueError("Candidate catalog plus independent tools must cover 51 logical operations")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:

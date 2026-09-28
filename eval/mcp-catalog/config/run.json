@@ -91,7 +91,7 @@
     "read": ["akb_get", "akb_drill_down", "akb_vault_info", "akb_activity", "akb_diff", "akb_relations", "akb_graph", "akb_provenance", "akb_publication_snapshot", "akb_explain_access", "akb_history", "akb_export", "akb_get_file"],
     "search": ["akb_search", "akb_grep", "akb_sql"],
     "create": ["akb_put", "akb_create_vault", "akb_create_collection", "akb_create_table", "akb_publish", "akb_import"],
-    "update": ["akb_update", "akb_edit", "akb_move", "akb_alter_table", "akb_link", "akb_transfer_ownership", "akb_set_public", "akb_update_file", "akb_grep_replace"],
+    "update": ["akb_update", "akb_edit", "akb_move", "akb_alter_table", "akb_link", "akb_transfer_ownership", "akb_set_public", "akb_update_file"],
     "delete": ["akb_delete", "akb_archive_vault", "akb_delete_vault", "akb_delete_collection", "akb_drop_table", "akb_unpublish", "akb_unlink", "akb_delete_file"],
     "grant": ["akb_grant", "akb_revoke"],
     "file_upload": ["akb_put_file"],
@@ -139,7 +139,7 @@
       "edit": "akb_edit",
       "move": "akb_move",
       "delete": "akb_delete",
-      "grep_replace": "akb_grep_replace"
+      "grep_replace": null
     },
     "akb_collection_manage": {
       "create": "akb_create_collection",
@@ -184,6 +184,11 @@
       "discard_image": "akb_discard_image"
     }
   },
+  "candidate_only_operation_attribution": {
+    "akb_document_write": {
+      "grep_replace": {"operation": "update", "resource_type": "document"}
+    }
+  },
   "tool_resources": {
     "akb_whoami": "identity",
     "akb_list_vaults": "vault",
@@ -221,7 +226,6 @@
     "akb_transfer_ownership": "access",
     "akb_set_public": "access",
     "akb_update_file": "file",
-    "akb_grep_replace": "document",
     "akb_delete": "document",
     "akb_archive_vault": "vault",
     "akb_delete_vault": "vault",

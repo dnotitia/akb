@@ -40,7 +40,7 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
     recorder = ToolCallRecorder(
         operation_map={"read": ["inspect_record"]},
         secrets=(),
-        capture_result_fields={"inspect_record": ["markdown"]},
+        capture_result_fields={("inspect_record", None): ["markdown"]},
     )
     toolset = create_toolset(client, recorder)
     async with toolset:
