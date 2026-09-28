@@ -17,7 +17,6 @@ from mcp_server.operation_registry import (
     CANDIDATE_REPLACED_NAMES,
     DEFERRED_OPERATION_REASONS,
     DEFERRED_OPERATION_NAMES,
-    DEFERRED_MUTATION_NAMES,
     INDEPENDENT_OPERATION_REASONS,
     OperationRegistry,
     OperationValidationError,
@@ -38,11 +37,11 @@ def _candidate_tools() -> dict:
     return {tool.name: tool for tool in candidate_tools()}
 
 
-def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
+def test_candidate_catalog_is_registry_owned_with_all_backend_writes() -> None:
     tools = _candidate_tools()
 
-    later_tools = {tool.name for tool in available_tools()} - CANDIDATE_LEGACY_NAMES
-    candidate_tools = {
+    independent_tools = {tool.name for tool in available_tools()} - CANDIDATE_LEGACY_NAMES
+    capability_tools = {
         "akb_discover",
         "akb_document_read",
         "akb_relationships",
@@ -50,21 +49,24 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
         "akb_identity",
         "akb_publication_read",
         "akb_export_read",
-        "akb_grep",
-        *later_tools,
+        "akb_document_write",
+        "akb_collection_manage",
+        "akb_relationship_manage",
+        "akb_vault_access_manage",
+        "akb_publication_manage",
+        "akb_vault_manage",
+        "akb_table_schema_manage",
+        "akb_bundle_manage",
     }
-    assert set(tools) == candidate_tools
+    assert set(tools) == capability_tools | independent_tools
     assert CANDIDATE_REPLACED_NAMES.isdisjoint(tools)
-    assert DEFERRED_MUTATION_NAMES == {"akb_grep"}
-    assert "akb_grep" in tools
-    assert "replace" in tools["akb_grep"].input_schema["required"]
-    assert tools["akb_grep"].annotations is not None
-    assert tools["akb_grep"].annotations.read_only_hint is False
-    assert tools["akb_grep"].annotations.destructive_hint is True
-    legacy_names = {tool.name for tool in TOOLS}
     assert CANDIDATE_LEGACY_NAMES.isdisjoint(DEFERRED_OPERATION_NAMES)
-    assert DEFERRED_OPERATION_NAMES <= legacy_names
-    assert CANDIDATE_REGISTRY.operation_coverage() == {
+    assert DEFERRED_OPERATION_NAMES == {
+        "akb_put_file",
+        "akb_get_file",
+        "akb_delete_file",
+    }
+    expected_coverage = {
         "akb_list_vaults": ("akb_discover", "list_vaults"),
         "akb_vault_info": ("akb_discover", "vault_info"),
         "akb_browse": ("akb_discover", "browse"),
@@ -84,10 +86,71 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
         "akb_search_users": ("akb_identity", "search_users"),
         "akb_publications": ("akb_publication_read", "list"),
         "akb_export": ("akb_export_read", "export"),
+        "akb_put": ("akb_document_write", "put"),
+        "akb_update": ("akb_document_write", "update"),
+        "akb_edit": ("akb_document_write", "edit"),
+        "akb_move": ("akb_document_write", "move"),
+        "akb_delete": ("akb_document_write", "delete"),
+        "akb_grep_replace": ("akb_document_write", "grep_replace"),
+        "akb_create_collection": ("akb_collection_manage", "create"),
+        "akb_delete_collection": ("akb_collection_manage", "delete"),
+        "akb_link": ("akb_relationship_manage", "link"),
+        "akb_unlink": ("akb_relationship_manage", "unlink"),
+        "akb_grant": ("akb_vault_access_manage", "grant"),
+        "akb_revoke": ("akb_vault_access_manage", "revoke"),
+        "akb_transfer_ownership": ("akb_vault_access_manage", "transfer_ownership"),
+        "akb_set_public": ("akb_vault_access_manage", "set_public"),
+        "akb_publish": ("akb_publication_manage", "publish"),
+        "akb_publication_snapshot": ("akb_publication_manage", "snapshot"),
+        "akb_unpublish": ("akb_publication_manage", "unpublish"),
+        "akb_create_vault": ("akb_vault_manage", "create"),
+        "akb_archive_vault": ("akb_vault_manage", "archive"),
+        "akb_delete_vault": ("akb_vault_manage", "delete"),
+        "akb_create_table": ("akb_table_schema_manage", "create"),
+        "akb_alter_table": ("akb_table_schema_manage", "alter"),
+        "akb_drop_table": ("akb_table_schema_manage", "drop"),
+        "akb_import": ("akb_bundle_manage", "import"),
     }
+    assert CANDIDATE_REGISTRY.operation_coverage() == expected_coverage
+
+    expected_write_contract = {
+        "akb_put": ("parent", "writer", "write"),
+        "akb_update": ("document_uri", "writer", "write"),
+        "akb_edit": ("document_uri", "writer", "write"),
+        "akb_move": ("document_uri", "writer", "write"),
+        "akb_delete": ("document_uri", "writer", "destructive"),
+        "akb_grep_replace": ("many_vaults", "writer", "destructive"),
+        "akb_create_collection": ("vault", "writer", "write"),
+        "akb_delete_collection": ("vault", "writer", "destructive"),
+        "akb_link": ("source", "writer", "write"),
+        "akb_unlink": ("source", "writer", "destructive"),
+        "akb_grant": ("vault", "admin", "write"),
+        "akb_revoke": ("vault", "admin", "destructive"),
+        "akb_transfer_ownership": ("vault", "owner", "destructive"),
+        "akb_set_public": ("vault", "owner", "destructive"),
+        "akb_publish": ("publication", "writer", "write"),
+        "akb_publication_snapshot": ("publication_slug", "writer", "write"),
+        "akb_unpublish": ("publication_target", "writer", "destructive"),
+        "akb_create_vault": ("none", None, "write"),
+        "akb_archive_vault": ("vault", "owner", "destructive"),
+        "akb_delete_vault": ("vault", "owner", "destructive"),
+        "akb_create_table": ("parent", "writer", "write"),
+        "akb_alter_table": ("table_uri", "admin", "destructive"),
+        "akb_drop_table": ("table_uri", "admin", "destructive"),
+        "akb_import": ("vault", "writer", "write"),
+    }
+    assert len(expected_write_contract) == 24
+    for operation, (public_tool, action) in expected_coverage.items():
+        if operation not in expected_write_contract:
+            continue
+        spec = CANDIDATE_REGISTRY.spec_for(public_tool, action)
+        assert spec is not None
+        target, role, risk = expected_write_contract[operation]
+        assert (spec.target, spec.vault_role, spec.risk) == (target, role, risk)
+        assert spec.required_scope == "akb:vault:write"
 
     assert set(INDEPENDENT_OPERATION_REASONS) == {"akb_help", "akb_sql"}
-    assert set(DEFERRED_OPERATION_REASONS) == {"backend_write_manage", "stdio_local_files"}
+    assert set(DEFERRED_OPERATION_REASONS) == {"stdio_local_files"}
 
     for name in {
         "akb_discover",
@@ -106,6 +169,25 @@ def test_candidate_catalog_is_registry_owned_with_deferred_grep_write() -> None:
         for branch in tool.input_schema["oneOf"]:
             assert branch["additionalProperties"] is False
             assert "action" in branch["required"]
+            assert branch["properties"]["action"]["const"] in CANDIDATE_REGISTRY.actions_for(name)
+
+    for name in capability_tools - {
+        "akb_discover",
+        "akb_document_read",
+        "akb_relationships",
+        "akb_vault_access",
+        "akb_identity",
+        "akb_publication_read",
+        "akb_export_read",
+    }:
+        tool = tools[name]
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is False
+        assert tool.annotations.destructive_hint is (
+            name != "akb_bundle_manage"
+        )
+        for branch in tool.input_schema["oneOf"]:
+            assert branch["additionalProperties"] is False
             assert branch["properties"]["action"]["const"] in CANDIDATE_REGISTRY.actions_for(name)
 
 
@@ -174,6 +256,31 @@ def test_registry_validation_rejects_bad_action_shapes() -> None:
             {"action": "get", "uri": "akb://v/doc/n.md", "section": "other-action"},
         ),
         ("akb_discover", {"action": "grep", "pattern": "needle", "replace": "mutation"}),
+        (
+            "akb_document_write",
+            {"action": "grep_replace", "pattern": "needle", "replace": ""},
+        ),
+        (
+            "akb_document_write",
+            {"action": "grep_replace", "vault": "v", "pattern": "needle"},
+        ),
+        ("akb_document_write", {"action": "put", "title": "t", "content": "c"}),
+        (
+            "akb_publication_manage",
+            {"action": "publish", "resource_type": "document", "vault": "v"},
+        ),
+        (
+            "akb_publication_manage",
+            {"action": "publish", "resource_type": "table_query", "vault": "v"},
+        ),
+        (
+            "akb_publication_manage",
+            {"action": "publish", "vault": "v", "query_sql": "SELECT 1"},
+        ),
+        (
+            "akb_publication_manage",
+            {"action": "unpublish"},
+        ),
         ("akb_relationships", {"action": "graph"}),
         ("akb_relationships", {"action": "relations", "uri": "akb://v/doc/n.md", "vault": "v"}),
         ("akb_vault_access", {"action": "explain", "vault": "v"}),
@@ -185,6 +292,29 @@ def test_registry_validation_rejects_bad_action_shapes() -> None:
         with pytest.raises(OperationValidationError):
             CANDIDATE_REGISTRY.validate(public_tool, arguments)
 
+    grep_replace = CANDIDATE_REGISTRY.validate(
+        "akb_document_write",
+        {
+            "action": "grep_replace",
+            "vault": ["v1", "v2"],
+            "pattern": "needle",
+            "replace": "",
+        },
+    )
+    assert grep_replace.required_scope == "akb:vault:write"
+    assert grep_replace.risk == "destructive"
+
+    publish_query = CANDIDATE_REGISTRY.validate(
+        "akb_publication_manage",
+        {
+            "action": "publish",
+            "resource_type": "table_query",
+            "vault": "v",
+            "query_sql": "SELECT 1",
+        },
+    )
+    assert publish_query.logical_audit_operation == "akb_publish"
+
 
 def test_graph_target_resolution_keeps_uri_and_vault_forms() -> None:
     graph = CANDIDATE_REGISTRY.spec_for("akb_relationships", "graph")
@@ -193,6 +323,53 @@ def test_graph_target_resolution_keeps_uri_and_vault_forms() -> None:
         graph, {"uri": "akb://vault-a/doc/spec.md"}
     ) == ("vault-a",)
     assert CANDIDATE_REGISTRY.vaults_for(graph, {"vault": "vault-b"}) == ("vault-b",)
+
+
+def test_write_target_resolution_covers_uri_parent_and_multi_vault_actions() -> None:
+    put = CANDIDATE_REGISTRY.spec_for("akb_document_write", "put")
+    grep = CANDIDATE_REGISTRY.spec_for("akb_document_write", "grep_replace")
+    publish = CANDIDATE_REGISTRY.spec_for("akb_publication_manage", "publish")
+    unpublish = CANDIDATE_REGISTRY.spec_for("akb_publication_manage", "unpublish")
+    link = CANDIDATE_REGISTRY.spec_for("akb_relationship_manage", "link")
+    assert put and grep and publish and unpublish and link
+
+    assert CANDIDATE_REGISTRY.vaults_for(
+        put, {"parent": "akb://parent-v/coll/specs", "vault": "ignored"}
+    ) == ("parent-v",)
+    assert CANDIDATE_REGISTRY.vaults_for(
+        put, {"vault": "fallback-v", "collection": "specs"}
+    ) == ("fallback-v",)
+    assert CANDIDATE_REGISTRY.vaults_for(
+        grep, {"vault": ["v1", "v2", "v1"]}
+    ) == ("v1", "v2")
+    assert CANDIDATE_REGISTRY.vaults_for(
+        publish,
+        {"resource_type": "table_query", "vault": "base", "query_vault_names": ["base", "extra"]},
+    ) == ("base", "extra")
+    assert CANDIDATE_REGISTRY.vaults_for(
+        link,
+        {"source": "akb://same/doc/a.md", "target": "akb://same/table/t"},
+    ) == ("same",)
+    assert CANDIDATE_REGISTRY.vaults_for(
+        link,
+        {"source": "akb://same/doc/a.md", "target": "akb://other/doc/t.md"},
+    ) == ()
+    assert CANDIDATE_REGISTRY.vaults_for(
+        link,
+        {"source": "akb://same/doc/a.md", "target": "not-an-akb-uri"},
+    ) == ()
+    assert CANDIDATE_REGISTRY.vaults_for(
+        publish, {"resource_type": "file", "uri": "akb://v/doc/a.md"}
+    ) == ()
+    assert CANDIDATE_REGISTRY.vaults_for(
+        publish, {"uri": "akb://v/table/t"}
+    ) == ()
+    assert CANDIDATE_REGISTRY.vaults_for(
+        unpublish, {"uri": "akb://v/doc/a.md"}
+    ) == ("v",)
+    assert CANDIDATE_REGISTRY.vaults_for(
+        unpublish, {"uri": "akb://v/table/t"}
+    ) == ()
 
 
 @pytest.mark.asyncio
@@ -222,6 +399,55 @@ async def test_scope_denial_happens_before_candidate_handler(
 
     assert result["code"] == "insufficient_scope"
     assert called is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("public_tool", "arguments", "expected_code"),
+    [
+        (
+            "akb_relationship_manage",
+            {
+                "action": "link",
+                "source": "akb://source-v/doc/a.md",
+                "target": "akb://other-v/doc/b.md",
+                "relation": "related_to",
+            },
+            "invalid_argument",
+        ),
+        (
+            "akb_publication_manage",
+            {
+                "action": "publish",
+                "resource_type": "file",
+                "uri": "akb://publish-v/doc/a.md",
+            },
+            "invalid_uri",
+        ),
+    ],
+)
+async def test_invalid_target_semantics_precede_candidate_rbac(
+    monkeypatch: pytest.MonkeyPatch,
+    server_module,
+    public_tool: str,
+    arguments: dict,
+    expected_code: str,
+) -> None:
+    checked = []
+
+    async def forbidden(_uid, vault, *, required_role):
+        checked.append((vault, required_role))
+        raise ForbiddenError("denied")
+
+    monkeypatch.setattr(server_module, "check_vault_access", forbidden)
+    result = await server_module._dispatch(
+        public_tool,
+        arguments,
+        server_module._MCPUser(user_id="u-1"),
+    )
+
+    assert result["code"] == expected_code
+    assert checked == []
 
 
 @pytest.mark.asyncio
@@ -333,6 +559,92 @@ async def test_vault_rbac_denial_happens_before_candidate_handler(
 
     assert result["code"] == "permission_denied"
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_new_write_actions_check_their_target_role_before_handler(
+    monkeypatch: pytest.MonkeyPatch, server_module
+) -> None:
+    cases = (
+        (
+            "akb_document_write", "put",
+            {"parent": "akb://doc-v/coll/specs", "title": "t", "content": "c"},
+            "doc-v", "writer",
+        ),
+        (
+            "akb_collection_manage", "create", {"vault": "collection-v", "path": "docs"},
+            "collection-v", "writer",
+        ),
+        (
+            "akb_relationship_manage", "link",
+            {
+                "source": "akb://link-v/doc/a.md",
+                "target": "akb://link-v/table/t",
+                "relation": "references",
+            },
+            "link-v", "writer",
+        ),
+        (
+            "akb_vault_access_manage", "grant",
+            {"vault": "access-v", "user": "reader", "role": "reader"},
+            "access-v", "admin",
+        ),
+        (
+            "akb_publication_manage", "publish", {"uri": "akb://publish-v/doc/a.md"},
+            "publish-v", "writer",
+        ),
+        (
+            "akb_vault_manage", "archive", {"vault": "owner-v"},
+            "owner-v", "owner",
+        ),
+        (
+            "akb_table_schema_manage", "alter", {"uri": "akb://table-v/table/t"},
+            "table-v", "admin",
+        ),
+        (
+            "akb_bundle_manage", "import", {"vault": "bundle-v", "files": {}},
+            "bundle-v", "writer",
+        ),
+        (
+            "akb_publication_manage", "snapshot", {"slug": "private-publication"},
+            "slug-v", "writer",
+        ),
+    )
+    checked = []
+    called = []
+
+    async def deny(_uid, vault, *, required_role):
+        checked.append((vault, required_role))
+        raise ForbiddenError("denied")
+
+    async def handler(*_args):
+        called.append(True)
+        return {"ok": True}
+
+    async def publication_vault(_slug):
+        return "slug-v"
+
+    monkeypatch.setattr(server_module, "check_vault_access", deny)
+    monkeypatch.setattr(server_module, "_publication_vault_for_slug", publication_vault)
+    keys = []
+    for public_tool, action, _arguments, _vault, _role in cases:
+        key = (public_tool, action)
+        keys.append((key, CANDIDATE_REGISTRY._handlers[key]))
+        CANDIDATE_REGISTRY._handlers[key] = handler
+    try:
+        for public_tool, action, arguments, _vault, _role in cases:
+            result = await server_module._dispatch(
+                public_tool,
+                {"action": action, **arguments},
+                server_module._MCPUser(user_id="u-1"),
+            )
+            assert result["code"] == "permission_denied", (public_tool, action, result)
+    finally:
+        for key, original in keys:
+            CANDIDATE_REGISTRY._handlers[key] = original
+
+    assert checked == [(vault, role) for *_rest, vault, role in cases]
+    assert called == []
 
 
 @pytest.mark.asyncio
@@ -465,6 +777,14 @@ async def test_candidate_http_catalog_and_action_validation(
                 "akb_identity",
                 "akb_publication_read",
                 "akb_export_read",
+                "akb_document_write",
+                "akb_collection_manage",
+                "akb_relationship_manage",
+                "akb_vault_access_manage",
+                "akb_publication_manage",
+                "akb_vault_manage",
+                "akb_table_schema_manage",
+                "akb_bundle_manage",
                 "akb_help",
                 "akb_sql",
             }
@@ -482,8 +802,16 @@ async def test_candidate_http_catalog_and_action_validation(
                     in CANDIDATE_REGISTRY.actions_for(name)
                     for branch in branches
                 )
-            grep = next(tool for tool in listed_tools if tool["name"] == "akb_grep")
-            assert "replace" in grep["inputSchema"]["required"]
+            document_write = next(
+                tool for tool in listed_tools if tool["name"] == "akb_document_write"
+            )
+            grep_replace = next(
+                branch
+                for branch in document_write["inputSchema"]["oneOf"]
+                if branch["properties"]["action"].get("const") == "grep_replace"
+            )
+            assert {"pattern", "replace"} <= set(grep_replace["required"])
+            assert grep_replace["anyOf"] == [{"required": ["vault"]}]
             discover_grep = next(
                 branch
                 for branch in next(
@@ -570,24 +898,32 @@ async def test_candidate_http_catalog_and_action_validation(
             assert invalid_identity_body["code"] == "invalid_argument"
             assert identity_calls == [{}]
 
-            deferred_rejected = await client.post(
+            unscoped_grep_rejected = await client.post(
                 "/mcp/",
-                headers={**headers, "mcp-method": "tools/call", "mcp-name": "akb_grep"},
+                headers={
+                    **headers,
+                    "mcp-method": "tools/call",
+                    "mcp-name": "akb_document_write",
+                },
                 json={
                     "jsonrpc": "2.0",
                     "id": 4,
                     "method": "tools/call",
                     "params": {
-                        "name": "akb_grep",
-                        "arguments": {"pattern": "needle"},
+                        "name": "akb_document_write",
+                        "arguments": {
+                            "action": "grep_replace",
+                            "pattern": "needle",
+                            "replace": "",
+                        },
                         "_meta": meta,
                     },
                 },
             )
-            deferred_body = json.loads(
-                deferred_rejected.json()["result"]["content"][0]["text"]
+            unscoped_grep_body = json.loads(
+                unscoped_grep_rejected.json()["result"]["content"][0]["text"]
             )
-            assert deferred_body["code"] == "invalid_argument"
+            assert unscoped_grep_body["code"] == "invalid_argument"
 
             read_mutation_rejected = await client.post(
                 "/mcp/",

@@ -54,10 +54,16 @@ async def test_exact_text_edit_contract_and_permissions(
 
     catalog = await mcp_client.list_tools(cache_mode="bypass")
     tool_names = {tool.name for tool in catalog.tools}
-    assert "akb_edit" in tool_names
+    assert "akb_document_write" in tool_names
+    assert "akb_edit" not in tool_names
     assert "akb_patch" not in tool_names
-    edit_tool = next(tool for tool in catalog.tools if tool.name == "akb_edit")
-    assert "old_string" in edit_tool.input_schema.get("required", [])
+    write_tool = next(tool for tool in catalog.tools if tool.name == "akb_document_write")
+    edit_action = next(
+        branch
+        for branch in write_tool.input_schema["oneOf"]
+        if branch["properties"]["action"].get("const") == "edit"
+    )
+    assert "old_string" in edit_action["required"]
 
     vault = await _create_vault(mcp_client, runtime_session, "edit-detail")
     document = await _call_json(

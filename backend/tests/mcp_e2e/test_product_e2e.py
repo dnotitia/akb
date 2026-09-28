@@ -30,6 +30,71 @@ def _text_content(result: mcp_types.CallToolResult, operation: str) -> str:
     pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned no public JSON text")
 
 
+_LEGACY_ACTIONS = {
+    "akb_put": ("akb_document_write", "put"),
+    "akb_update": ("akb_document_write", "update"),
+    "akb_edit": ("akb_document_write", "edit"),
+    "akb_move": ("akb_document_write", "move"),
+    "akb_delete": ("akb_document_write", "delete"),
+    "akb_create_collection": ("akb_collection_manage", "create"),
+    "akb_delete_collection": ("akb_collection_manage", "delete"),
+    "akb_link": ("akb_relationship_manage", "link"),
+    "akb_unlink": ("akb_relationship_manage", "unlink"),
+    "akb_grant": ("akb_vault_access_manage", "grant"),
+    "akb_revoke": ("akb_vault_access_manage", "revoke"),
+    "akb_transfer_ownership": ("akb_vault_access_manage", "transfer_ownership"),
+    "akb_set_public": ("akb_vault_access_manage", "set_public"),
+    "akb_publish": ("akb_publication_manage", "publish"),
+    "akb_publication_snapshot": ("akb_publication_manage", "snapshot"),
+    "akb_unpublish": ("akb_publication_manage", "unpublish"),
+    "akb_create_vault": ("akb_vault_manage", "create"),
+    "akb_archive_vault": ("akb_vault_manage", "archive"),
+    "akb_delete_vault": ("akb_vault_manage", "delete"),
+    "akb_create_table": ("akb_table_schema_manage", "create"),
+    "akb_alter_table": ("akb_table_schema_manage", "alter"),
+    "akb_drop_table": ("akb_table_schema_manage", "drop"),
+    "akb_import": ("akb_bundle_manage", "import"),
+}
+
+
+def _candidate_call(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if name == "akb_grep":
+        public_tool, action = (
+            ("akb_document_write", "grep_replace")
+            if "replace" in arguments
+            else ("akb_discover", "grep")
+        )
+    else:
+        public_tool, action = _LEGACY_ACTIONS.get(name, (name, None))
+    if action is None:
+        return public_tool, arguments
+    return public_tool, {"action": action, **arguments}
+
+
+def test_http_e2e_helper_covers_each_write_action():
+    from mcp_server.tools import CANDIDATE_REGISTRY
+
+    coverage = CANDIDATE_REGISTRY.operation_coverage()
+    for operation, (public_tool, action) in _LEGACY_ACTIONS.items():
+        assert coverage[operation] == (public_tool, action)
+
+    assert _candidate_call("akb_grep", {"pattern": "needle"}) == (
+        "akb_discover",
+        {"action": "grep", "pattern": "needle"},
+    )
+    assert _candidate_call(
+        "akb_grep", {"vault": ["v"], "pattern": "needle", "replace": ""}
+    ) == (
+        "akb_document_write",
+        {
+            "action": "grep_replace",
+            "vault": ["v"],
+            "pattern": "needle",
+            "replace": "",
+        },
+    )
+
+
 async def _call_json(
     client: Client,
     runtime_session: RuntimeContext,
@@ -40,7 +105,8 @@ async def _call_json(
 ) -> dict[str, Any]:
     operation = f"tools/call {name}"
     try:
-        result = await client.call_tool(name, arguments)
+        public_tool, public_arguments = _candidate_call(name, arguments)
+        result = await client.call_tool(public_tool, public_arguments)
     except Exception as exc:
         pytest.fail(f"scenario={SCENARIO} operation={operation}: {redact_error(exc, runtime_session.secrets)}")
 

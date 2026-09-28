@@ -13,7 +13,10 @@ Provides MCP tools for:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+import hashlib
+import hmac
 import json
 import logging
 import sys
@@ -76,7 +79,6 @@ from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.operation_registry import (
     CANDIDATE_REPLACED_NAMES,
-    DEFERRED_MUTATION_NAMES,
     OperationValidationError,
 )
 from mcp_server.tools import (
@@ -362,29 +364,6 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_import": _WRITE_SCOPE,
 }
 
-# Arguments that promote an otherwise read-grade tool to write-grade.
-#
-# `_TOOL_SCOPES` classifies a tool as a whole, which cannot express a
-# read tool that carries an optional mutating argument. `akb_grep` is
-# exactly that: a search tool whose `replace` rewrites EVERY matching
-# document across the scope (git commit + re-index per doc). Mapped flat
-# as read, a read-scoped token passed the gate and reached the rewrite.
-#
-# That was never privilege escalation — `_handle_grep` still requires
-# `check_vault_access(required_role="writer")` — but it defeated the
-# reason read-only tokens exist: handing an agent a read PAT is supposed
-# to mean it cannot change anything, and for a caller who *is* a vault
-# writer it did not.
-#
-# Declared here rather than branched inside `_dispatch` so the next tool
-# that grows a mutating argument has one obvious place to say so, and so
-# a test can assert every trigger names a real argument of that tool (a
-# typo would silently un-promote it — the exact failure this prevents).
-_ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
-    "akb_grep": ("replace",),
-}
-
-
 async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     """Does this credential have READ authority on `vault`?
 
@@ -412,18 +391,14 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
 
 
 def _required_scope(name: str, args: dict) -> str:
-    """Scope a call needs: the tool's mapping, promoted to write when the
-    call carries a mutating argument.
+    """Scope a call needs, selected from its capability action.
 
-    Unmapped tools fail CLOSED to write (see `_dispatch`). A trigger
-    counts only when the argument is actually present and not None —
-    `replace=""` IS a rewrite (it deletes every match), so emptiness must
-    not be mistaken for absence.
+    Unmapped tools fail CLOSED to write (see `_dispatch`). The grep
+    replacement is an explicit write action, so `replace=""` keeps its
+    write scope just like every other replacement value.
     """
     if CANDIDATE_REGISTRY.has_tool(name):
         return CANDIDATE_REGISTRY.required_scope_for(name, args)
-    if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
-        return _WRITE_SCOPE
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
 
 
@@ -1691,15 +1666,12 @@ async def list_tools():
         registry_scope = CANDIDATE_REGISTRY.required_scope_for_tool(tool.name)
         may_write = (
             (registry_scope or _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE)) == _WRITE_SCOPE
-            or tool.name in _ARG_WRITE_TRIGGERS
         )
         if not may_write:
             decorated.append(tool)
             continue
         copied = tool.model_copy(deep=True)
-        copied.input_schema.setdefault("properties", {})[
-            VAULT_SKILL_ACK_ARGUMENT
-        ] = {
+        acknowledgement_schema = {
             "type": "string",
             "maxLength": 128,
             "description": (
@@ -1708,6 +1680,16 @@ async def list_tools():
                 "this value. The bundled proxy supplies it automatically."
             ),
         }
+        branches = copied.input_schema.get("oneOf")
+        if isinstance(branches, list):
+            for branch in branches:
+                branch.setdefault("properties", {})[
+                    VAULT_SKILL_ACK_ARGUMENT
+                ] = acknowledgement_schema
+        else:
+            copied.input_schema.setdefault("properties", {})[
+                VAULT_SKILL_ACK_ARGUMENT
+            ] = acknowledgement_schema
         decorated.append(copied)
     return decorated
 
@@ -1759,6 +1741,145 @@ def _is_error_envelope(result: object) -> bool:
     )
 
 
+async def _publication_vault_for_slug(slug: str) -> str | None:
+    """Resolve the vault needed to authorize a slug-addressed write."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT v.name AS vault_name FROM publications p "
+            "JOIN vaults v ON v.id = p.vault_id WHERE p.slug = $1",
+            slug,
+        )
+    return row["vault_name"] if row else None
+
+
+async def _target_vaults_for_call(
+    name: str, arguments: dict, logical_operation: str | None = None
+) -> tuple[str, ...]:
+    """Resolve the explicit vault targets used by candidate RBAC."""
+    if CANDIDATE_REGISTRY.has_tool(name):
+        action = arguments.get("action")
+        spec = CANDIDATE_REGISTRY.spec_for(name, action) if isinstance(action, str) else None
+        if spec is None:
+            return ()
+        targets = list(CANDIDATE_REGISTRY.vaults_for(spec, arguments))
+        if spec.target in {"publication_slug", "publication_target"}:
+            slug = arguments.get("slug")
+            if isinstance(slug, str) and slug:
+                vault = await _publication_vault_for_slug(slug)
+                if vault:
+                    targets.append(vault)
+        return tuple(dict.fromkeys(targets))
+
+    from app.services.tool_usage import vault_of_call
+
+    vault = vault_of_call(name, arguments, logical_operation=logical_operation)
+    return (vault,) if vault else ()
+
+
+def _batch_vault_skill_ack(payloads: list[tuple[str, dict]]) -> str:
+    material = json.dumps(
+        [
+            [vault, payload.get("version"), payload["ack_token"]]
+            for vault, payload in payloads
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    digest = hashlib.sha256(material).digest()
+    token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"batch1.{token}"
+
+
+def _combine_vault_skill_payloads(
+    payloads: list[tuple[str, dict]], *, acknowledgement: str | None = None
+) -> dict | None:
+    if not payloads:
+        return None
+    if len(payloads) == 1:
+        result = dict(payloads[0][1])
+    else:
+        result = dict(payloads[0][1])
+        result["additional_vaults"] = [
+            {key: value for key, value in payload.items() if key != "ack_token"}
+            for _vault, payload in payloads[1:]
+        ]
+    if acknowledgement is not None:
+        result["ack_token"] = acknowledgement
+    return result
+
+
+async def _vault_skill_preflight(
+    name: str,
+    arguments: dict,
+    logical_operation: str | None,
+    user: "_MCPUser",
+    version: int,
+    acknowledgement: str | None,
+) -> dict | None:
+    from app.services import vault_skill_service
+
+    targets = await _target_vaults_for_call(name, arguments, logical_operation)
+    readable = []
+    for vault in targets:
+        if await _can_read_vault(user, user.user_id, vault):
+            readable.append((vault, authorized_vault_id()))
+
+    if version == 2 and len(readable) <= 1:
+        if not readable:
+            return None
+        vault, vault_id = readable[0]
+        return await vault_skill_service.preflight_payload(
+            _session_id(),
+            vault,
+            vault_id,
+            acknowledgement=acknowledgement,
+        )
+
+    if version == 2:
+        pending = []
+        for vault, vault_id in readable:
+            payload = await vault_skill_service.preflight_payload(
+                _session_id(), vault, vault_id
+            )
+            if payload:
+                pending.append((vault, payload))
+        if not pending:
+            return None
+
+        batch_ack = _batch_vault_skill_ack(pending)
+        if isinstance(acknowledgement, str) and hmac.compare_digest(
+            acknowledgement, batch_ack
+        ):
+            refreshed = []
+            vault_ids = dict(readable)
+            for vault, payload in pending:
+                acknowledged = await vault_skill_service.preflight_payload(
+                    _session_id(),
+                    vault,
+                    vault_ids[vault],
+                    acknowledgement=payload.get("ack_token"),
+                )
+                if acknowledged:
+                    refreshed.append((vault, acknowledged))
+            pending = refreshed
+            if not pending:
+                return None
+            batch_ack = _batch_vault_skill_ack(pending)
+        return _combine_vault_skill_payloads(
+            pending, acknowledgement=batch_ack
+        )
+
+    payloads = []
+    for vault, vault_id in readable:
+        payload = await vault_skill_service.injection_payload(
+            _session_id(), vault, vault_id
+        )
+        if payload:
+            payloads.append((vault, payload))
+    return _combine_vault_skill_payloads(payloads)
+
+
 async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
@@ -1790,10 +1911,20 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         logical_operation = CANDIDATE_REGISTRY.logical_audit_operation_for(
             name, arguments
         )
+        validation_error: dict | None = None
+        if name not in CANDIDATE_REPLACED_NAMES and CANDIDATE_REGISTRY.has_tool(name):
+            try:
+                CANDIDATE_REGISTRY.validate(name, arguments)
+            except OperationValidationError as exc:
+                validation_error = err(
+                    str(exc),
+                    code=UNKNOWN_ARGUMENT if exc.code == "unknown_argument" else INVALID_ARGUMENT,
+                    **exc.details,
+                )
         result: dict | None = (
             err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
             if name in CANDIDATE_REPLACED_NAMES
-            else None
+            else validation_error
         )
 
         # A guide cannot influence a write that has already committed.  For a
@@ -1804,40 +1935,26 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         preflight_version = _vault_skill_preflight_version()
         if result is None and is_write and preflight_version is not None:
             try:
-                from app.services.tool_usage import vault_of_call
-                from app.services import vault_skill_service
-
-                target_vault = vault_of_call(name, arguments)
-                if target_vault and await _can_read_vault(
-                    user, user.user_id, target_vault
-                ):
-                    if preflight_version == 2:
-                        payload = await vault_skill_service.preflight_payload(
-                            _session_id(),
-                            target_vault,
-                            authorized_vault_id(),
-                            acknowledgement=(
-                                vault_skill_ack
-                                if isinstance(vault_skill_ack, str)
-                                else None
-                            ),
-                        )
-                    else:
-                        payload = await vault_skill_service.injection_payload(
-                            _session_id(), target_vault, authorized_vault_id(),
-                        )
-                    if payload:
-                        result = err(
-                            (
-                                "Apply the vault instructions, then retry this write "
-                                "with its acknowledgement."
-                                if preflight_version == 2
-                                else "Apply the vault instructions, then retry this write."
-                            ),
-                            code=VAULT_SKILL_REQUIRED,
-                            retryable=True,
-                        )
-                        result["vault_skill"] = payload
+                payload = await _vault_skill_preflight(
+                    name,
+                    arguments,
+                    logical_operation,
+                    user,
+                    preflight_version,
+                    vault_skill_ack if isinstance(vault_skill_ack, str) else None,
+                )
+                if payload:
+                    result = err(
+                        (
+                            "Apply the vault instructions, then retry this write "
+                            "with its acknowledgement."
+                            if preflight_version == 2
+                            else "Apply the vault instructions, then retry this write."
+                        ),
+                        code=VAULT_SKILL_REQUIRED,
+                        retryable=True,
+                    )
+                    result["vault_skill"] = payload
             except Exception as e:  # noqa: BLE001 — optional projection only
                 logger.debug("vault_skill preflight skipped: %s", e)
 
@@ -1865,6 +1982,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             session_id=_session_id(),
             duration_ms=int((time.perf_counter() - started) * 1000),
             is_write=is_write,
+            logical_operation=logical_operation,
         )
         recorded = True
         # Vault-skill auto-injection: first touch of a vault in this session
@@ -1881,10 +1999,12 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # that exact vault — and a non-member cannot use the presence of the
         # key as a vault-existence oracle either. Fail-closed on None.
         try:
-            from app.services.tool_usage import vault_of_call
             from app.services import vault_skill_service
             if isinstance(result, dict) and result.get("error") is None:
-                target_vault = vault_of_call(name, arguments)
+                target_vaults = await _target_vaults_for_call(
+                    name, arguments, logical_operation
+                )
+                target_vault = target_vaults[0] if len(target_vaults) == 1 else None
                 if (
                     target_vault is not None
                     and await _can_read_vault(user, user.user_id, target_vault)
@@ -1952,6 +2072,9 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 session_id=_session_id(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
+                logical_operation=CANDIDATE_REGISTRY.logical_audit_operation_for(
+                    name, arguments
+                ),
             )
         encoded = json.dumps(envelope, ensure_ascii=False, default=str)
         _log_response_size(
@@ -2027,12 +2150,6 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
             return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
         required = _required_scope(name, args)
 
-    if name in DEFERRED_MUTATION_NAMES and not isinstance(args.get("replace"), str):
-        return err(
-            "akb_grep requires a string 'replace' argument; use akb_discover/grep for read-only search",
-            code=INVALID_ARGUMENT,
-        )
-
     # OAuth scope enforcement — only when the caller's session is
     # authenticated via a Keycloak access token (oauth_scopes is a
     # concrete list, possibly empty). PAT and service credentials keep
@@ -2074,7 +2191,13 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     else:
         required_vault_role = None
     if candidate_spec is not None and required_vault_role is not None:
-        for vault in CANDIDATE_REGISTRY.vaults_for(candidate_spec, args):
+        try:
+            target_vaults = await _target_vaults_for_call(
+                name, args, candidate_spec.logical_audit_operation
+            )
+        except Exception as exc:  # noqa: BLE001 — preserve the canonical guard envelope
+            return exception_envelope(exc)
+        for vault in target_vaults:
             try:
                 await check_vault_access(uid, vault, required_role=required_vault_role)
             except Exception as exc:  # noqa: BLE001 — map the existing guard envelope
