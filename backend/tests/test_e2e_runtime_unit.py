@@ -1661,11 +1661,9 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     postgres = compose["services"]["postgres"]
     assert "image" not in postgres, postgres
     assert (CI_DIR / postgres["build"]["context"]).resolve() == (CI_DIR.parents[1] / "deploy/postgres").resolve()
-    # Same shape as the postgres assertion above, for the same reason: a dated
-    # release tag carrying a digest, not one exact string. The literal that
-    # stood here was the second copy of a pin, and akb#621 moved the pin.
+    # The IBM mirror keeps the upstream artifact pinned by digest.
     minio_image = compose["services"]["minio"]["image"]
-    assert minio_image.startswith("quay.io/minio/minio:RELEASE."), minio_image
+    assert minio_image.startswith("icr.io/fusion-open/minio/minio@sha256:"), minio_image
     assert "@sha256:" in minio_image, minio_image
     assert compose["services"]["postgres"]["ports"] == [
         "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
