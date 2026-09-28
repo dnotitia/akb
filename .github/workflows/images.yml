@@ -4,39 +4,75 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 # Cancel in-flight runs on the same ref — only the latest PR push matters.
 concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-# Build every Dockerfile in the repository. Nothing is pushed. The test jobs
-# build only the PostgreSQL image, and before this job the frontend and
-# all-in-one images stopped building after #652 while every check stayed green
-# (#669).
+# Keep one packaging check alongside the five existing test/static checks.
+# PostgreSQL is already built and run in live-DB and runtime E2E; application
+# image builds still catch packaging failures that those jobs cannot (#669).
 jobs:
   build:
-    name: Docker image (${{ matrix.image }})
+    name: Docker images
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: backend
-            file: backend/Dockerfile
-            context: backend
-          - image: frontend
-            file: frontend/Dockerfile
-            context: frontend
-          - image: all-in-one
-            file: deploy/all-in-one/Dockerfile
-            context: .
-          - image: postgres
-            file: deploy/postgres/Dockerfile
-            # The Dockerfile copies its patches and lockfile from here.
-            context: deploy/postgres
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
     steps:
       - uses: actions/checkout@v4
-      - name: Build ${{ matrix.image }}
-        run: docker build --file "${{ matrix.file }}" --tag "akb-${{ matrix.image }}:ci" "${{ matrix.context }}"
+        with:
+          # Compare the complete PR, including deletions and moves. Workflow
+          # triggers stay unconditional so a docs-only PR gets a completed check.
+          fetch-depth: 0
+
+      - name: Select affected images
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/ci/image_scope.py --event "$CI_EVENT" \
+            --base "$CI_BASE" --head "$CI_HEAD" --github-output "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+        if: steps.scope.outputs.any == 'true'
+
+      # Continue the other selected builds after a failure, as the old
+      # fail-fast:false matrix did. A failed build still fails the whole job.
+      - name: Build backend
+        if: ${{ !cancelled() && steps.buildx.outcome == 'success' && steps.scope.outputs.backend == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: false
+          cache-from: type=gha,scope=akb-ci-backend
+          cache-to: type=gha,mode=max,scope=akb-ci-backend
+
+      - name: Build frontend
+        if: ${{ !cancelled() && steps.buildx.outcome == 'success' && steps.scope.outputs.frontend == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: false
+          cache-from: type=gha,scope=akb-ci-frontend
+          cache-to: type=gha,mode=max,scope=akb-ci-frontend
+
+      - name: Build all-in-one
+        if: ${{ !cancelled() && steps.buildx.outcome == 'success' && steps.scope.outputs.all-in-one == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/all-in-one/Dockerfile
+          push: false
+          cache-from: type=gha,scope=akb-ci-all-in-one
+          cache-to: type=gha,mode=max,scope=akb-ci-all-in-one

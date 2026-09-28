@@ -412,3 +412,50 @@ When changing this area, preserve all of the following:
 
 Run the focused runtime tests and the static checks described in the
 repository contribution guide before committing runtime changes.
+
+## CI checks and packaging coverage
+
+Every PR retains the five existing checks: static analysis/package tests,
+backend unit tests, live PostgreSQL tests, the repository runtime E2E gate,
+and frontend mock E2E. Application packaging is one additional **Docker
+images** check, rather than four independent image jobs.
+
+The PostgreSQL image is built and exercised by both the live-DB job and the
+repository runtime. It needs no third build in the packaging workflow.
+Backend, frontend and all-in-one packaging remain checked because running
+the source tests alone does not prove that their Dockerfiles build.
+
+On PRs, `image_scope.py` compares the complete PR diff against its merge base:
+
+| Changed input | Application images built |
+| --- | --- |
+| Backend source, dependencies or Docker inputs | Backend + all-in-one |
+| Frontend workspace or Docker inputs | Frontend + all-in-one |
+| `deploy/all-in-one/` | All-in-one |
+| Backend tests/changelog, human documentation, agent settings, standalone packages, deployment configuration | None; existing test/static checks still run |
+| Image workflow/selector, root Docker ignore rules, or unclassified input | All three |
+| Main push, manual run, or unavailable PR diff | All three |
+
+The selector keeps deleted paths and both sides of renames. A new shared build
+input must be assigned to its consumers when changing a Dockerfile; currently
+standalone `packages/`, `config/`, `eval/`, and non-image deployment manifests
+are outside the application build inputs. Unclassified paths conservatively
+select all three application images. PostgreSQL changes remain covered by the
+unchanged live-DB and runtime jobs.
+
+Workflow triggers stay unconditional: a PR with no image changes completes the
+packaging check without installing a builder, instead of leaving a required
+workflow pending. Selected builds share one runner and use separate GitHub
+Actions layer-cache scopes. Nothing is published. A failed build still fails
+the job, while the other selected builds continue unless the run is cancelled.
+
+The consolidated status is named `Docker images`; repositories with required
+checks configured should replace the old `Docker image (...)` contexts with
+that name. The five test/static status names are unchanged.
+
+Validate the selector locally without Docker or registry access:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/test_ci_image_scope_unit.py -q
+```
