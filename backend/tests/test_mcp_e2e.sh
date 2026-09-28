@@ -81,8 +81,49 @@ TOOLS_RESP=$(curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Accept: application/json, text/event-stream" \
   -H "mcp-session-id: $SID" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>&1)
-TOOL_COUNT=$(echo "$TOOLS_RESP" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
-[ "$TOOL_COUNT" -ge 22 ] 2>/dev/null && pass "MCP tools/list exposes $TOOL_COUNT tools" || fail "MCP tools/list" "expected >=22, got $TOOL_COUNT"
+CATALOG_STATUS=$(echo "$TOOLS_RESP" | python3 -c '
+import json, sys
+
+tools = json.load(sys.stdin)["result"]["tools"]
+by_name = {tool["name"]: tool for tool in tools}
+expected = {
+    "akb_discover": {"list_vaults", "vault_info", "browse", "search", "grep"},
+    "akb_document_read": {"get", "section", "activity", "history", "diff", "provenance"},
+    "akb_relationships": {"relations", "graph"},
+    "akb_vault_access": {"members", "explain"},
+    "akb_identity": {"whoami", "search_users"},
+    "akb_publication_read": {"list"},
+    "akb_export_read": {"export"},
+    "akb_document_write": {"put", "update", "edit", "move", "delete", "grep_replace"},
+    "akb_collection_manage": {"create", "delete"},
+    "akb_relationship_manage": {"link", "unlink"},
+    "akb_vault_access_manage": {"grant", "revoke", "transfer_ownership", "set_public"},
+    "akb_publication_manage": {"publish", "snapshot", "unpublish"},
+    "akb_vault_manage": {"create", "archive", "delete"},
+    "akb_table_schema_manage": {"create", "alter", "drop"},
+    "akb_bundle_manage": {"import"},
+}
+expected_names = set(expected) | {"akb_help", "akb_sql"}
+actual_names = set(by_name)
+action_diff = {}
+for name, wanted in expected.items():
+    schema = by_name.get(name, {}).get("inputSchema", {})
+    actual = {
+        branch.get("properties", {}).get("action", {}).get("const")
+        for branch in schema.get("oneOf", [])
+    }
+    if actual != wanted:
+        action_diff[name] = {"missing": sorted(wanted - actual), "unexpected": sorted(actual - wanted)}
+if actual_names == expected_names and not action_diff:
+    print("True")
+else:
+    print(json.dumps({
+        "missing_tools": sorted(expected_names - actual_names),
+        "unexpected_tools": sorted(actual_names - expected_names),
+        "action_diff": action_diff,
+    }, sort_keys=True))
+' 2>/dev/null)
+[ "$CATALOG_STATUS" = "True" ] && pass "MCP tools/list exposes the candidate capability/action catalog" || fail "MCP tools/list" "candidate catalog mismatch: $CATALOG_STATUS"
 
 # Repeat the call: behind two replicas a stateful transport failed roughly half
 # of these with `Session not found`, and a single sample would have missed it.

@@ -79,8 +79,8 @@ m1() { mc "$PAT1" "$SID1" "$1" "$2" | mr; }
 VAULT1="graph-e2e-$(date +%s)"
 VAULT2="graph-e2e2-$(($(date +%s)+1))"
 
-m1 "akb_create_vault" "{\"name\":\"$VAULT1\",\"description\":\"graph test\"}" >/dev/null
-m1 "akb_create_vault" "{\"name\":\"$VAULT2\",\"description\":\"cross vault test\"}" >/dev/null
+m1 "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT1\",\"description\":\"graph test\"}" >/dev/null
+m1 "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT2\",\"description\":\"cross vault test\"}" >/dev/null
 pass "2 vaults created"
 
 # ── 1. Cross-Vault SQL ───────────────────────────────────────
@@ -88,8 +88,8 @@ echo ""
 echo "▸ 1. Cross-Vault SQL"
 
 # Create tables in both vaults for the same authenticated SQL user.
-m1 "akb_create_table" "{\"vault\":\"$VAULT1\",\"name\":\"products\",\"columns\":[{\"name\":\"name\",\"type\":\"text\"},{\"name\":\"price\",\"type\":\"number\"}]}" >/dev/null
-m1 "akb_create_table" "{\"vault\":\"$VAULT2\",\"name\":\"orders\",\"columns\":[{\"name\":\"product\",\"type\":\"text\"},{\"name\":\"qty\",\"type\":\"number\"}]}" >/dev/null
+m1 "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$VAULT1\",\"name\":\"products\",\"columns\":[{\"name\":\"name\",\"type\":\"text\"},{\"name\":\"price\",\"type\":\"number\"}]}" >/dev/null
+m1 "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$VAULT2\",\"name\":\"orders\",\"columns\":[{\"name\":\"product\",\"type\":\"text\"},{\"name\":\"qty\",\"type\":\"number\"}]}" >/dev/null
 pass "Tables in 2 vaults"
 
 # Insert data
@@ -131,8 +131,10 @@ REMAINING=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-m1 "akb_delete_vault" "{\"name\":\"$VAULT1\"}" >/dev/null 2>&1
-m1 "akb_delete_vault" "{\"name\":\"$VAULT2\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT1\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT1\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT2\"}" >/dev/null 2>&1
+m1 "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT2\"}" >/dev/null 2>&1
 pass "Vaults deleted"
 
 # ── Summary ──────────────────────────────────────────────────

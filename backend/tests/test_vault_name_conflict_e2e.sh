@@ -121,7 +121,7 @@ curl -sk -X POST "$BASE_URL/mcp/" \
   -H 'Accept: application/json, text/event-stream' \
   -H "mcp-session-id: $MCP_SID" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
-MCP_RESPONSE=$(mcp_call "$BOB_PAT" "$MCP_SID" 2 akb_create_vault "{\"name\":\"$HIDDEN_VAULT\"}")
+MCP_RESPONSE=$(mcp_call "$BOB_PAT" "$MCP_SID" 2 akb_vault_manage "{\"action\":\"create\",\"name\":\"$HIDDEN_VAULT\"}")
 MCP_SAFE=$(echo "$MCP_RESPONSE" | python3 -c '
 import json, sys
 outer = json.load(sys.stdin)

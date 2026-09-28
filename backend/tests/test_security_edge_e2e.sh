@@ -73,10 +73,10 @@ mcp_call() {
 }
 
 VAULT="sec-rest-private-$(date +%s)"
-R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"REST security boundary\"}")
+R=$(mcp_call akb_vault_manage "{\"action\":\"create\",\"name\":\"$VAULT\",\"description\":\"REST security boundary\"}")
 echo "$R" | python3 -c 'import sys,json; assert json.load(sys.stdin).get("vault_id")' >/dev/null 2>&1 \
   && pass "private vault prepared" || { fail "Vault setup" "MCP setup failed"; exit 1; }
-R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"secrets\",\"title\":\"REST Security Document\",\"content\":\"# Private\\nREST_SECURITY_MARKER\"}")
+R=$(mcp_call akb_document_write "{\"action\":\"put\",\"vault\":\"$VAULT\",\"collection\":\"secrets\",\"title\":\"REST Security Document\",\"content\":\"# Private\\nREST_SECURITY_MARKER\"}")
 DOC_URI=$(echo "$R" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri", ""))' 2>/dev/null)
 [ -n "$DOC_URI" ] && pass "REST drill-down document prepared" || fail "Document setup" "missing URI"
 
@@ -125,7 +125,8 @@ ROLE_SOURCE=$(echo "$INFO" | python3 -c 'import sys,json; print(json.load(sys.st
 [ "$ROLE_SOURCE" = "public" ] && pass "non-member role_source=public" || fail "public role_source" "got $ROLE_SOURCE"
 curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT" -H "Authorization: Bearer $PAT1" >/dev/null
 
-R=$(mcp_call akb_delete_vault "{\"vault\":\"$VAULT\"}")
+mcp_call akb_vault_manage "{\"action\":\"archive\",\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+R=$(mcp_call akb_vault_manage "{\"action\":\"delete\",\"vault\":\"$VAULT\"}")
 DELETED=$(echo "$R" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted", False))' 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "private setup vault cleaned" || fail "cleanup" "deleted=$DELETED"
 

@@ -111,12 +111,12 @@ GDN_VAULT="gdn-sql-e2e-$TS"
 NONGDN_VAULT="sql-e2e-other-$TS"
 COLS='[{"name":"k","type":"text","required":true},{"name":"v","type":"text"}]'
 
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_create_vault" "{\"name\":\"$GDN_VAULT\"}" >/dev/null 2>&1
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_create_vault" "{\"name\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
-R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_create_table" "{\"vault\":\"$GDN_VAULT\",\"name\":\"state\",\"columns\":$COLS}" | mr)
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$GDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
+R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$GDN_VAULT\",\"name\":\"state\",\"columns\":$COLS}" | mr)
 echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('uri') or d.get('name')=='state'))" 2>/dev/null | grep -q True \
   && pass "gdn table created ($GDN_VAULT.state)" || fail "gdn table" "$R"
-R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_create_table" "{\"vault\":\"$NONGDN_VAULT\",\"name\":\"facts\",\"columns\":$COLS}" | mr)
+R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_table_schema_manage" "{\"action\":\"create\",\"vault\":\"$NONGDN_VAULT\",\"name\":\"facts\",\"columns\":$COLS}" | mr)
 echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(bool(d.get('uri') or d.get('name')=='facts'))" 2>/dev/null | grep -q True \
   && pass "non-gdn table created ($NONGDN_VAULT.facts, owner=user)" || fail "non-gdn table" "$R"
 # Seed one row in each (owner) so the scoped READ tests have a target.
@@ -153,8 +153,10 @@ R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_sql" "{\"vault\":\"$NONGDN_VAULT\",\"sq
 [ "$(echo "$R" | wrote_ok)" = "True" ] && pass "unscoped PAT CAN INSERT non-gdn (proves denial = scope, not ACL)" || fail "control INSERT" "$R"
 
 # ── Cleanup ──────────────────────────────────────────────────
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$GDN_VAULT\",\"confirm\":true}" >/dev/null 2>&1
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$NONGDN_VAULT\",\"confirm\":true}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$GDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$GDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""
