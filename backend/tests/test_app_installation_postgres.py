@@ -505,7 +505,7 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
     assert missing == {"active": False}
 
     async with lifecycle_pool.acquire() as conn:
-        await conn.execute("UPDATE vaults SET public_access=TRUE WHERE id=$1", vault_id)
+        await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vault_id)
     denials: list[str] = []
     for user, requested_app_id, requested_vault_id in (
         (_member_session(outsider_id, "outsider"), app_id, vault_id),
