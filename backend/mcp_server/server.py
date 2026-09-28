@@ -1916,11 +1916,14 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             try:
                 CANDIDATE_REGISTRY.validate(name, arguments)
             except OperationValidationError as exc:
-                validation_error = err(
-                    str(exc),
-                    code=UNKNOWN_ARGUMENT if exc.code == "unknown_argument" else INVALID_ARGUMENT,
-                    **exc.details,
-                )
+                if exc.code == "unknown_argument":
+                    validation_error = err(
+                        str(exc), code=UNKNOWN_ARGUMENT, **exc.details
+                    )
+                else:
+                    validation_error = err(
+                        str(exc), code=INVALID_ARGUMENT, **exc.details
+                    )
         result: dict | None = (
             err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
             if name in CANDIDATE_REPLACED_NAMES
