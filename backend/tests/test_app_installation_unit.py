@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.api.control_plane_models import InstallationProjection
-from app.exceptions import ValidationError
+from app.api.control_plane_models import InstallationActiveStatus, InstallationProjection
+from app.exceptions import ForbiddenError, ValidationError
 from app.services import app_installation_service as installation
 from app.services import app_resource_service as resources
+from app.services.auth_service import AuthenticatedUser
 
 
 def _row() -> dict:
@@ -116,3 +117,59 @@ def test_projection_keeps_truthful_state_and_redacts_payloads():
     assert "private-worker-payload" not in serialized
     assert "provenance" not in serialized
     assert "issuer" not in serialized
+
+
+def test_member_installation_active_status_is_an_allowlisted_boolean():
+    assert InstallationActiveStatus.model_validate({"active": True}).model_dump() == {
+        "active": True
+    }
+    with pytest.raises(ValueError):
+        InstallationActiveStatus.model_validate(
+            {"active": True, "lifecycle": "active", "recent_error": "private"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_member_installation_status_rejects_app_credentials_before_database(monkeypatch):
+    async def unexpected_pool():
+        raise AssertionError("application credentials must be rejected before database access")
+
+    monkeypatch.setattr(installation, "get_pool", unexpected_pool)
+    app_user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="app-principal",
+        email="app@example.invalid",
+        display_name=None,
+        is_admin=False,
+        auth_method="pat",
+        account_kind="app",
+    )
+
+    with pytest.raises(ForbiddenError, match="Installation request denied"):
+        await installation.get_member_installation_active_status(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            user=app_user,
+            correlation_id="test",
+        )
+
+
+@pytest.mark.asyncio
+async def test_member_installation_unavailable_is_not_reported_as_inactive(monkeypatch):
+    async def unavailable_pool():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(installation, "get_pool", unavailable_pool)
+    user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="member",
+        email="member@example.invalid",
+        display_name=None,
+        is_admin=False,
+        auth_method="jwt",
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await installation.get_member_installation_active_status(
+            uuid.uuid4(), uuid.uuid4(), user=user, correlation_id="test"
+        )

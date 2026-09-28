@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.api import deps
 from app.api.deps import get_current_app, get_current_user
 from app.api.routes import app_installations
 
@@ -148,6 +149,69 @@ def test_app_status_uses_principal_app_and_cannot_select_another_app(monkeypatch
     assert response.headers["cache-control"] == "no-store"
     assert requested[0][0] == app_id
     assert requested[0][1] == vault_id
+
+
+def test_member_active_status_uses_user_session_and_only_returns_active(monkeypatch):
+    app_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    user = _user(is_admin=False)
+    requested: list[dict] = []
+
+    async def fake_status(requested_app_id, requested_vault_id, **kwargs):
+        requested.append(
+            {
+                "app_id": requested_app_id,
+                "vault_id": requested_vault_id,
+                **kwargs,
+            }
+        )
+        return {"active": True}
+
+    monkeypatch.setattr(
+        app_installations, "get_member_installation_active_status", fake_status
+    )
+    response = _client(user=user).get(
+        f"/api/v1/apps/{app_id}/installations/{vault_id}/active"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"active": True}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert requested[0]["app_id"] == app_id
+    assert requested[0]["vault_id"] == vault_id
+    assert requested[0]["user"] is user
+    assert isinstance(requested[0]["correlation_id"], str)
+
+
+def test_member_active_status_invalid_session_is_no_store():
+    response = TestClient(main_app).get(
+        f"/api/v1/apps/{uuid.uuid4()}/installations/{uuid.uuid4()}/active"
+    )
+
+    assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_member_active_status_requires_pat_read_scope(monkeypatch):
+    user = _user(is_admin=False)
+    user.token_scopes = frozenset({"write"})
+
+    async def authorize(_authorization):
+        return user
+
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", authorize)
+    response = TestClient(main_app).get(
+        f"/api/v1/apps/{uuid.uuid4()}/installations/{uuid.uuid4()}/active",
+        headers={"Authorization": "Bearer fixture-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "insufficient_scope"
+    assert response.json()["detail"]["required_scope"] == "read"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
 
 
 def test_delete_replay_status_and_no_store(monkeypatch):

@@ -629,6 +629,166 @@ def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     assert "external-password-value" not in serialized
 
 
+def test_member_installation_discovery_declares_http_contract_and_fixture_controls(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    app_id = str(uuid.uuid4())
+    vault_id = str(uuid.uuid4())
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "namespace": "fixture-members",
+        "actors": {
+            "system_admin": {"id": str(uuid.uuid4()), "role": "system_admin"},
+            "reader": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-reader",
+                "vault_role": "reader",
+            },
+            "writer": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-writer",
+                "vault_role": "writer",
+            },
+            "target_owner": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-owner",
+                "vault_role": "owner",
+            },
+            "target_admin": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-admin",
+                "vault_role": "admin",
+            },
+        },
+        "apps": {"target": {"id": app_id}},
+        "vaults": {"active": {"id": vault_id}},
+        "fixtures": {
+            "status_active": {
+                "app_id": app_id,
+                "vault_id": vault_id,
+                "installation_id": str(uuid.uuid4()),
+            }
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+
+    assert discovery["member_installation_active"] == {
+        "service": "app",
+        "method": "GET",
+        "path": f"/api/v1/apps/{app_id}/installations/{vault_id}/active",
+        "app_id": app_id,
+        "vault_id": vault_id,
+    }
+    assert discovery["controls"]["member_installation_state"] == {
+        "service": "fixture",
+        "method": "POST",
+        "path": "/control",
+        "body": {
+            "action": "member_installation_state",
+            "target": "status_active",
+            "kind": "upgrading",
+            "enabled": True,
+        },
+        "states": ["installing", "active", "upgrading", "blocked", "uninstalled"],
+    }
+    assert discovery["controls"]["member_access"] == {
+        "service": "fixture",
+        "method": "POST",
+        "path": "/control",
+        "body": {
+            "action": "member_access",
+            "target": "reader",
+            "kind": "status_active",
+            "enabled": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_member_installation_fixture_controls_touch_only_the_selected_fixture(
+    tmp_path, monkeypatch
+):
+    import asyncpg
+
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    actor_id = uuid.uuid4()
+    admin_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "actors": {
+            "system_admin": {"id": str(admin_id), "role": "system_admin"},
+            "reader": {
+                "id": str(actor_id),
+                "username": "fixture-reader",
+                "vault_role": "reader",
+            },
+        },
+        "fixtures": {
+            "status_active": {
+                "vault_id": str(vault_id),
+                "installation_id": str(installation_id),
+            }
+        },
+    }
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            return "UPDATE 1" if query.startswith("UPDATE") else "DELETE 1"
+
+        async def close(self):
+            return None
+
+    async def fake_connect(**_kwargs):
+        return FakeConnection()
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+
+    state = await runtime.fixture_control(
+        "member_installation_state",
+        "status_active",
+        True,
+        "upgrading",
+    )
+    access = await runtime.fixture_control(
+        "member_access",
+        "reader",
+        False,
+        "status_active",
+    )
+    restored_access = await runtime.fixture_control(
+        "member_access",
+        "reader",
+        True,
+        "status_active",
+    )
+
+    assert state["status"] == "accepted"
+    assert state["observed"] == {"installation_state": "upgrading"}
+    assert access["status"] == "accepted"
+    assert restored_access["status"] == "accepted"
+    assert len(calls) == 3
+    assert calls[0][0].startswith("UPDATE vault_app_installations SET lifecycle=$1")
+    assert calls[0][1] == ("upgrading", installation_id)
+    assert calls[1][0].startswith("DELETE FROM vault_access")
+    assert calls[1][1] == (vault_id, actor_id)
+    assert calls[2][0].lstrip().startswith("INSERT INTO vault_access")
+    assert calls[2][1] == (vault_id, actor_id, admin_id)
+
+
 def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(
@@ -1290,8 +1450,18 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
             lifecycle_reset = await lifecycle_client.post(
                 "/reset", json={"scenario": "app-installation-lifecycle"}
             )
+            member_control = await lifecycle_client.post(
+                "/control",
+                json={
+                    "action": "member_access",
+                    "target": "reader",
+                    "kind": "status_active",
+                    "enabled": False,
+                },
+            )
         assert lifecycle_reset.status_code == 200
         assert lifecycle_runtime.reset_count == 1
+        assert member_control.status_code == 200
         unsupported = await client.post("/reset", json={"scenario": "project"})
         assert unsupported.status_code == 422
         openapi = await client.get("/openapi.json")
