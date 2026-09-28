@@ -1167,22 +1167,24 @@ class PgvectorStore:
                 timings[f"{name}_wait"] = time.perf_counter() - begin
                 await self._ensure_codec(conn)
                 async with conn.transaction():
-                    # Server cancellation precedes the client deadline. Each
-                    # statement is bounded; the supervisor also bounds their
-                    # aggregate, codec registration, pool wait and rollback.
-                    millis = int((query_deadline - loop.time()) * 1000) - 1
-                    if millis <= 0:
-                        raise TimeoutError
-                    # pg_settings reports this setting in milliseconds. Respect
-                    # an operator's stricter nonzero server/session timeout.
-                    await conn.execute(
-                        "SELECT set_config('statement_timeout', "
-                        "LEAST(NULLIF(setting::bigint, 0), $1::bigint)::text, true) "
-                        "FROM pg_settings WHERE name='statement_timeout'", millis,
-                    )
-                    if loop.time() >= query_deadline:
-                        raise TimeoutError
                     try:
+                        # Capture setup failures too: a lost connection here can
+                        # also be masked by asyncpg's transaction-exit wrapper.
+                        # Server cancellation precedes the client deadline. Each
+                        # statement is bounded; the supervisor also bounds their
+                        # aggregate, codec registration, pool wait and rollback.
+                        millis = int((query_deadline - loop.time()) * 1000) - 1
+                        if millis <= 0:
+                            raise TimeoutError
+                        # pg_settings reports this setting in milliseconds. Respect
+                        # an operator's stricter nonzero server/session timeout.
+                        await conn.execute(
+                            "SELECT set_config('statement_timeout', "
+                            "LEAST(NULLIF(setting::bigint, 0), $1::bigint)::text, true) "
+                            "FROM pg_settings WHERE name='statement_timeout'", millis,
+                        )
+                        if loop.time() >= query_deadline:
+                            raise TimeoutError
                         yield conn
                     except BaseException as exc:
                         body_error = exc

@@ -114,6 +114,41 @@ async def test_pg_sleep_timeout_preserves_peer_and_resets_both_connections(monke
         await _assert_pool_reusable(pool, original_timeout)
 
 
+@pytest.mark.parametrize("failed_leg", ["dense", "sparse"])
+async def test_connection_loss_during_timeout_setup_preserves_peer(monkeypatch, failed_leg):
+    async with _store(monkeypatch) as (store, pool):
+        async with pool.acquire() as conn:
+            original_timeout = await conn.fetchval("SHOW statement_timeout")
+
+        peer_finished = asyncio.Event()
+        peer_leg = "sparse" if failed_leg == "dense" else "dense"
+        search_peer = getattr(store, f"_search_{peer_leg}")
+        execute = asyncpg.Connection.execute
+
+        async def finish_peer(conn, **kwargs):
+            ids = await search_peer(conn, **kwargs)
+            peer_finished.set()
+            return ids
+
+        async def lose_connection_during_setup(conn, sql, *args, **kwargs):
+            if ("statement_timeout" in sql
+                    and asyncio.current_task().get_name() == f"pgvector-search-{failed_leg}"):
+                await peer_finished.wait()
+                # Drop the real server connection during setup. asyncpg's
+                # transaction exit will try to unwind an already closed socket.
+                return await execute(conn, "SELECT pg_terminate_backend(pg_backend_pid())")
+            return await execute(conn, sql, *args, **kwargs)
+
+        monkeypatch.setattr(store, f"_search_{peer_leg}", finish_peer)
+        monkeypatch.setattr(asyncpg.Connection, "execute", lose_connection_during_setup)
+        with pytest.raises(VectorSearchDegraded) as caught:
+            await _search(store)
+        assert caught.value.reason == f"{failed_leg}_leg_failed"
+        assert [hit.chunk_id for hit in caught.value.hits] == [HIT_ID]
+        await _assert_pool_reusable(pool, original_timeout)
+        assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("pgvector-search-")]
+
+
 async def test_exhausted_pool_stops_before_starting_queries(monkeypatch):
     async with _store(monkeypatch) as (store, pool):
         async with pool.acquire() as first, pool.acquire() as second:
