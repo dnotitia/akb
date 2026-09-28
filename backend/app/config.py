@@ -750,6 +750,10 @@ class Settings(BaseModel):
     # the legacy behavior (prefetch only when rerank is enabled). Raising this
     # lets rerank-off searches dedup over a wider dense+BM25 candidate set.
     search_prefetch: int = Field(default=0, ge=0)
+    # Shared pgvector retrieval budget (pool wait, both legs and payload read).
+    # Query embedding, schema initialization and canonical hydration are outside
+    # this driver-level budget. Other vector drivers retain their own timeouts.
+    search_retrieval_timeout_secs: float = Field(default=30.0, gt=0, le=30)
 
     @model_validator(mode="after")
     def validate_model_api_governance(self) -> "Settings":

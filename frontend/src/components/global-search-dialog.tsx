@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Alert } from "@/components/ui/alert";
 import { SearchVaultPicker } from "@/components/search-vault-picker";
 import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
@@ -225,10 +226,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           const nextResults = (response.results || []) as GlobalSearchResult[];
           setResults(nextResults);
           setActiveIndex(nextResults.length > 0 ? 0 : -1);
-          if (response.degraded) {
-            if (nextResults.length > 0) setIncomplete(true);
-            else setError("Search is incomplete; the retrieval service is temporarily unavailable. Please retry.");
-          }
+          setIncomplete(Boolean(response.degraded));
         })
         .catch((caught: unknown) => {
           if (currentRequest !== requestId.current) return;
@@ -316,9 +314,13 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     ? "Searching knowledge…"
     : error
       ? "Search failed"
-      : normalizedQuery
-        ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}${incomplete ? "; search is incomplete" : ""}`
-        : "";
+      : incomplete
+        ? visibleResults.length > 0
+          ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"} shown; search is incomplete`
+          : "Search is incomplete; no results are available yet"
+        : normalizedQuery
+          ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}`
+          : "";
 
   return (
     <Dialog open={open} onOpenChange={next => {
@@ -412,7 +414,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           </DialogClose>
         </div>
 
-        <p role="status" aria-live="polite" className="sr-only">
+        <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
           {resultStatus}
         </p>
 
@@ -431,7 +433,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                   type="button"
                   aria-pressed={selected}
                   aria-label={
-                    normalizedQuery && !loading && !error
+                    normalizedQuery && !loading && !error && !incomplete
                       ? `${label}, ${count} result${count === 1 ? "" : "s"}`
                       : label
                   }
@@ -456,7 +458,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                 >
                   <FilterIcon className="h-3.5 w-3.5" aria-hidden />
                   {label}
-                  {normalizedQuery && !loading && !error && (
+                  {normalizedQuery && !loading && !error && !incomplete && (
                     <span className="tabular-nums text-foreground-muted">
                       {count}
                     </span>
@@ -642,16 +644,32 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             </div>
           )}
 
-          {normalizedQuery && !loading && incomplete && (
-            <div className="flex items-center justify-between gap-3 border-b border-border bg-warning-soft px-4 py-3 text-warning-soft-foreground sm:px-5">
-              <p className="text-xs leading-relaxed">Search is incomplete. Available matches are shown; retry to search all retrieval methods.</p>
-              <Button type="button" variant="outline" size="sm" onClick={() => setRetryKey((current) => current + 1)}>
+          {normalizedQuery && !loading && !error && incomplete && (
+            <Alert
+              variant="warning"
+              role="note"
+              aria-label="Incomplete search results"
+              title="Search is incomplete"
+              className="m-3 sm:m-4"
+            >
+              <p>
+                {results.length > 0
+                  ? "Some matches may be missing. You can open the results below or retry."
+                  : "No results are available yet. Retry to check for matches."}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                onClick={() => setRetryKey((current) => current + 1)}
+              >
                 Retry
               </Button>
-            </div>
+            </Alert>
           )}
 
-          {normalizedQuery && !loading && !error && results.length === 0 && (
+          {normalizedQuery && !loading && !error && !incomplete && results.length === 0 && (
             <div className="flex min-h-56 flex-col items-center justify-center px-5 text-center">
               <Search className="h-5 w-5 text-foreground-muted" aria-hidden />
               <p className="mt-3 text-sm font-semibold text-foreground">
@@ -675,9 +693,11 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                   Top matches
                 </h2>
                 <span className="text-xs tabular-nums text-foreground-muted">
-                  {activeSource === "all"
-                    ? `${results.length} result${results.length === 1 ? "" : "s"}`
-                    : `${visibleResults.length} of ${results.length}`}
+                  {incomplete
+                    ? `${visibleResults.length} shown`
+                    : activeSource === "all"
+                      ? `${results.length} result${results.length === 1 ? "" : "s"}`
+                      : `${visibleResults.length} of ${results.length}`}
                 </span>
               </div>
               <ul id={`${id}-search-results`} role="listbox" aria-label="Knowledge search results">

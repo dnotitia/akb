@@ -36,9 +36,9 @@ function LocationProbe() {
   );
 }
 
-function renderDialog() {
+function renderDialog(route = "/") {
   return render(
-    <MemoryRouter initialEntries={["/"]}>
+    <MemoryRouter initialEntries={[route]}>
       <GlobalSearchDialog />
       <LocationProbe />
       <Routes>
@@ -239,7 +239,7 @@ describe("GlobalSearchDialog", () => {
     expect(screen.getByRole("button", { name: "Search scope: All vaults" })).toBeInTheDocument();
   });
 
-  it("ignores an old Vault response after the user explicitly expands the scope", async () => {
+  it.each([false, true])("ignores an old Vault response (degraded: %s) after the user explicitly expands the scope", async (degraded) => {
     const response = await searchDocsMock("postgres");
     searchDocsMock.mockClear();
     let finishOld!: (value: typeof response) => void;
@@ -254,13 +254,15 @@ describe("GlobalSearchDialog", () => {
     await user.click(screen.getByRole("button", { name: "Search scope: alpha" }));
     await user.click(screen.getByRole("menuitemradio", { name: /All vaults/ }));
     await waitFor(() => expect(searchDocsMock).toHaveBeenCalledTimes(2));
-    await act(async () => finishOld(response));
+    await act(async () => finishOld({ ...response, results: degraded ? [] : response.results, degraded }));
     expect(screen.queryByRole("option")).not.toBeInTheDocument();
+    expect(screen.queryByRole("note", { name: "Incomplete search results" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("combobox"));
     await user.keyboard("{ArrowDown}{Enter}");
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/vault\/alpha$/);
     await act(async () => finishNew({ ...response, results: [{ ...response.results[0], title: "Global result" }] }));
     expect(await screen.findByRole("option", { name: /Global result/ })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/^1 result$/);
   });
 
   it("preserves the query but restores the visible route default on reopening", async () => {
@@ -360,7 +362,9 @@ describe("GlobalSearchDialog", () => {
     expect(trigger).toHaveFocus();
   });
 
-  it("consults the active editor before a search result or advanced search leaves it", async () => {
+  it.each([false, true])("consults the active editor before a search result (degraded: %s) or advanced search leaves it", async (degraded) => {
+    const response = await searchDocsMock("postgres");
+    searchDocsMock.mockResolvedValue({ ...response, degraded });
     const guard = vi.fn(() => false);
     function DirtyEditor() { useResourceNavigationGuard(guard); return <p>Unsaved draft</p>; }
     const user = userEvent.setup();
@@ -381,37 +385,106 @@ describe("GlobalSearchDialog", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/draft?view=edit");
   });
 
-  it("warns about incomplete search and keeps partial results actionable by keyboard", async () => {
+  it.each([
+    { route: "/", navigation: "keyboard" },
+    { route: "/", navigation: "click" },
+    { route: "/vault/alpha", navigation: "keyboard" },
+    { route: "/vault/alpha", navigation: "click" },
+  ])("keeps incomplete results available through $navigation navigation from $route", async ({ route, navigation }) => {
     const response = await searchDocsMock("postgres");
     searchDocsMock.mockResolvedValue({ ...response, degraded: true });
+    const user = userEvent.setup();
+    renderDialog(route);
+    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    const input = screen.getByRole("combobox");
+    await user.type(input, "postgres");
+    expect(await screen.findByRole("note", { name: "Incomplete search results" })).toHaveTextContent(
+      "Search is incomplete",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("1 result shown; search is incomplete");
+    expect(screen.getByText("1 shown")).toBeInTheDocument();
+    const filters = within(screen.getByRole("group", { name: "Limit global search by content kind" }));
+    for (const label of ["All", "Documents", "Tables", "Files"]) {
+      expect(filters.getByRole("button", { name: label })).toHaveTextContent(label);
+    }
+    expect(filters.queryByText(/^\d+$/)).not.toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(input).toHaveAttribute("aria-controls", "global-search-results");
+    expect(input).toHaveAttribute("aria-activedescendant", "global-search-result-0");
+    const result = screen.getByRole("option", { name: /PostgreSQL tuning/i });
+    expect(screen.queryByText("Search is unavailable")).toBeNull();
+    if (navigation === "keyboard") {
+      await user.keyboard("{ArrowDown}{Enter}");
+    } else {
+      await user.click(result);
+    }
+    expect(await screen.findByText("Opened document")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it.each(["/", "/vault/alpha"])("does not describe an empty incomplete response as zero matches and retries its scope from %s", async (route) => {
+    searchDocsMock.mockResolvedValueOnce({
+      query: "postgres", total: 0, returned: 0, total_matches: 0, results: [], degraded: true,
+    });
+    const user = userEvent.setup();
+    renderDialog(route);
+    await user.click(screen.getByRole("button", { name: "Search knowledge" }));
+    const input = screen.getByRole("combobox");
+    await user.type(input, "postgres");
+    expect(await screen.findByRole("note", { name: "Incomplete search results" })).toHaveTextContent(
+      "No results are available yet",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Search is incomplete");
+    expect(screen.queryByText(/No results for|0 results/)).toBeNull();
+    expect(screen.queryByText("Search is unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Search all vaults instead" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "All" })).toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-expanded", "false");
+    expect(input).not.toHaveAttribute("aria-controls");
+    expect(input).not.toHaveAttribute("aria-activedescendant");
+    await user.keyboard("{ArrowDown}{Enter}");
+    expect(screen.getByTestId("location").textContent).toBe(route);
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("option", { name: /PostgreSQL tuning/i })).toBeInTheDocument();
+    expect(screen.queryByRole("note", { name: "Incomplete search results" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^1 result$/);
+    expect(searchDocsMock).toHaveBeenLastCalledWith("postgres", route === "/" ? [] : ["alpha"], 12, { source_type: undefined });
+  });
+
+  it("keeps fatal search errors separate from incomplete responses", async () => {
+    searchDocsMock.mockRejectedValueOnce(new Error("Connection failed"));
     const user = userEvent.setup();
     renderDialog();
     await user.click(screen.getByRole("button", { name: "Search knowledge" }));
     const input = screen.getByRole("combobox");
     await user.type(input, "postgres");
-    await screen.findByText(/Search is incomplete/);
-    expect(input).toHaveAttribute("aria-expanded", "true");
-    expect(input).toHaveAttribute("aria-controls", "global-search-results");
-    expect(input).toHaveAttribute("aria-activedescendant", "global-search-result-0");
-    expect(screen.getByRole("option", { name: /PostgreSQL tuning/ })).toBeInTheDocument();
-    await user.keyboard("{Enter}");
-    expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/notes%2Fpostgres.md");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(await screen.findByText("Search is unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Connection failed")).toBeInTheDocument();
+    expect(screen.queryByRole("option")).toBeNull();
+    expect(screen.queryByRole("note", { name: "Incomplete search results" })).toBeNull();
+    await user.keyboard("{ArrowDown}{Enter}");
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
-  it("reports a degraded empty response as unavailable and retry clears the warning", async () => {
+  it("ignores an older incomplete response after a newer query completes", async () => {
     const response = await searchDocsMock("postgres");
-    searchDocsMock.mockResolvedValueOnce({ ...response, results: [], degraded: true }).mockResolvedValue(response);
+    let resolveOldRequest!: (response: Awaited<ReturnType<typeof searchDocs>>) => void;
+    searchDocsMock.mockResolvedValue({ ...response, query: "current" });
+    searchDocsMock.mockImplementationOnce(() => new Promise((resolve) => { resolveOldRequest = resolve; }));
     const user = userEvent.setup();
     renderDialog();
     await user.click(screen.getByRole("button", { name: "Search knowledge" }));
-    await user.type(screen.getByRole("combobox"), "postgres");
-    await screen.findByText("Search is unavailable");
-    expect(screen.queryByRole("option")).not.toBeInTheDocument();
-    expect(screen.queryByText(/No results for/)).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Retry" }));
-    await screen.findByRole("option", { name: /PostgreSQL tuning/ });
-    expect(screen.queryByText(/Search is incomplete/)).not.toBeInTheDocument();
+    const input = screen.getByRole("combobox");
+    await user.type(input, "old");
+    await waitFor(() => expect(searchDocsMock).toHaveBeenCalledWith("old", [], 12, expect.any(Object)));
+    await user.clear(input);
+    await user.type(input, "current");
+    expect(await screen.findByRole("option", { name: /PostgreSQL tuning/i })).toBeInTheDocument();
+    await act(async () => { resolveOldRequest({ ...response, results: [], degraded: true }); });
+    expect(screen.getByRole("option", { name: /PostgreSQL tuning/i })).toBeInTheDocument();
+    expect(screen.queryByRole("note", { name: "Incomplete search results" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^1 result$/);
   });
 
   it("opens in place, focuses the search field, and returns focus on Escape", async () => {

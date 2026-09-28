@@ -7,6 +7,19 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Scoped pgvector posting searches choose term-first, scope-first, or bounded
+  point lookups while retaining the same filters and exact sparse scores.
+  Explicit Native document scopes use separate indexed path and UUID lookups.
+- pgvector dense candidates are sorted by actual distance before rank fusion,
+  with iterative HNSW scans enabled for source-type-only filters too.
+- `search_retrieval_timeout_secs` bounds pgvector pool acquisition, concurrent
+  retrieval, payload loading and cleanup (default 30 seconds). Healthy peer
+  results survive a timeout; cancellation drains queries without masking
+  authorization or schema failures. This is a retrieval budget, not an HTTP
+  request timeout.
+- Incomplete search responses keep available hits usable, distinguish an
+  incomplete empty response from no matches, and avoid definitive result counts.
+
 ## 0.16.1 — 2026-09-27
 
 ### Fix search fallback, concurrent bootstrap, and PostgreSQL role convergence

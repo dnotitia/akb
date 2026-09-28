@@ -737,6 +737,7 @@ class SearchService:
     ) -> tuple[list[str], dict[str, int]]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
+        source_scope_join = ""
         if vaults:
             params.append(vaults)
             conditions.append(f"v.name = ANY(${len(params)})")
@@ -765,14 +766,12 @@ class SearchService:
                     f"(got {len(source_uris)}); split the request or use a "
                     "vault scope instead"
                 )
-            # Pairwise scope match via unnested (vault, identifier) rows: the SQL
-            # text stays constant-size no matter how many URIs arrive (only the
-            # bind arrays grow). Each pair matches exactly the way the old
-            # per-URI OR expansion did — vault AND (path OR id) PER PAIR — so
-            # no cross-pairing: vault A can never match vault B's identifier.
-            # (A naive `v.name = ANY($1) AND ident = ANY($2)` WOULD cross-match
-            # and pollute the scope across vaults.) Non-doc URIs are skipped,
-            # so every identifier here is a doc path-or-id by construction.
+            # Drive lookups from the bounded URI set. A path-OR-id predicate
+            # against the whole corpus prevents the path/UUID indexes from
+            # bounding the work, even when only one resource was requested.
+            # Keep each vault paired with its identifier and probe the two
+            # existing indexes separately; UNION preserves the old behavior
+            # when a UUID-shaped path also names a different resource by id.
             uri_pairs: list[tuple[str, str]] = []
             for uri in source_uris:
                 parsed = parse_uri(uri)
@@ -781,21 +780,49 @@ class SearchService:
                 uri_pairs.append((parsed.vault, parsed.identifier))
             if not uri_pairs:
                 return [], {}
+            resource_ids: list[uuid.UUID | None] = []
+            for _, identifier in uri_pairs:
+                try:
+                    parsed_id = uuid.UUID(identifier)
+                except ValueError:
+                    parsed_id = None
+                # The previous id::text comparison accepted canonical UUID
+                # spellings only. Other spellings can still match a path.
+                resource_ids.append(
+                    parsed_id if parsed_id is not None and str(parsed_id) == identifier else None
+                )
             params.extend([
                 [v for v, _ in uri_pairs],
                 [i for _, i in uri_pairs],
+                resource_ids,
             ])
-            pair_idx = len(params) - 1
-            ident_idx = len(params)
-            conditions.append(
-                f"((v.name, r.current_path) IN ("
-                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])) OR "
-                f"(v.name, r.resource_id::text) IN ("
-                f"SELECT * FROM unnest(${pair_idx}::text[], ${ident_idx}::text[])))"
-            )
+            pair_idx, ident_idx, resource_idx = len(params) - 2, len(params) - 1, len(params)
+            source_scope_join = f"""
+              JOIN (
+                  SELECT DISTINCT matched.resource_id
+                    FROM unnest(${pair_idx}::text[], ${ident_idx}::text[],
+                                ${resource_idx}::uuid[])
+                         AS requested(vault_name, identifier, resource_id)
+                    JOIN vaults requested_vault ON requested_vault.name = requested.vault_name
+                    CROSS JOIN LATERAL (
+                        SELECT scoped.resource_id
+                          FROM native_resources scoped
+                         WHERE scoped.namespace_id = requested_vault.id
+                           AND scoped.current_path = requested.identifier
+                           AND scoped.lifecycle = 'live' AND scoped.surface = 'document'
+                        UNION
+                        SELECT scoped.resource_id
+                          FROM native_resources scoped
+                         WHERE scoped.resource_id = requested.resource_id
+                           AND scoped.namespace_id = requested_vault.id
+                           AND scoped.lifecycle = 'live' AND scoped.surface = 'document'
+                    ) matched
+              ) requested_resources ON requested_resources.resource_id = r.resource_id
+            """
 
-        joins = """
+        joins = f"""
               FROM native_resources r
+              {source_scope_join}
               JOIN vaults v ON v.id = r.namespace_id
               JOIN native_revisions nr
                 ON nr.resource_id = r.resource_id
