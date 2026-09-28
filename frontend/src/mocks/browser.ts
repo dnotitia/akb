@@ -3,6 +3,7 @@ import { http, HttpResponse } from "msw";
 import {
   currentUser as fixtureUser,
   localAuthConfig,
+  skillTemplateHandler,
   vaultHealth,
 } from "@/stories/page-story-fixtures";
 import {
@@ -273,7 +274,7 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   return (await request.json()) as Record<string, unknown>;
 }
 
-const handlers = [
+export const handlers = [
   http.get(`${API}/auth/config`, async () => {
     await syncPublicReset();
     return HttpResponse.json(isDocumentScenario() ? documentScenarioAuthConfig : localAuthConfig);
@@ -652,6 +653,7 @@ const handlers = [
   }),
   http.get("/health", () => HttpResponse.json(vaultHealth)),
   http.get(/\/health\/vault\/fixture(?:\?.*)?$/, () => HttpResponse.json(vaultHealth)),
+  skillTemplateHandler,
   // Mock product APIs never fall through to a real backend.
   http.all(`${API}/*`, () =>
     HttpResponse.json({ error: "unhandled_mock_api_request" }, { status: 501 }),
