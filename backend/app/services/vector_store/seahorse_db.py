@@ -484,6 +484,7 @@ class SeahorseDbStore:
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
         source_types: list[str] | None = None,
+        query_sparse_epoch: int | None = None,
     ) -> list[VectorHit]:
         """Coral's hybrid search takes:
 

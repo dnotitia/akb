@@ -58,6 +58,11 @@ as a candidate next window, not a proof that concurrent writes are covered:
     flip vector_store_sparse_shape to vchord
     --since <protected instant>    covers index build AND the entire rollout
 
+"Flip" means naming `vchord` in the setting. Under the default `auto` a
+database that has a `posting` table stays on `posting` however far this runbook
+has got; once the setting names `vchord` and the backend has started with it,
+the recorded shape is `vchord` and `auto` follows it from then on.
+
 Do not replace the protected instant with the flip time: that drops edits made
 during index construction. `indexed_at = NOW()` records transaction START, not
 commit; a writer begun before a candidate window may commit after the sweep
@@ -128,7 +133,7 @@ from scripts.bm25_sweep_checkpoint import SweepCheckpoint, open_checkpoint
 from app.config import settings
 from app.db.postgres import close_pool, init_db
 from app.services import sparse_encoder
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import decide_sparse_shape_for_settings, get_vector_store
 from app.services.vector_store.pgvector import _bm25vector_literal, PgvectorStore
 
 # Rows read per round trip. The write is one statement over the batch; the
@@ -188,6 +193,8 @@ async def _vector_pool(writers: int = 1):
     taking them from the thing this migration is supposed to leave alone.
     Two extra connections remain reserved for migration ownership guards.
     """
+    # The store needs a decided shape, as it does at application startup.
+    await decide_sparse_shape_for_settings()
     store = get_vector_store()
     if not isinstance(store, PgvectorStore):
         raise SystemExit(
@@ -315,7 +322,13 @@ async def _build_index(pool, schema: str) -> None:
 
 
 async def _encode(content: str, gate: asyncio.Semaphore) -> str:
-    """Exactly what the store would write for this chunk.
+    """Exactly what the store would write for this chunk."""
+    literal, _epoch = await _encode_at_epoch(content, gate)
+    return literal
+
+
+async def _encode_at_epoch(content: str, gate: asyncio.Semaphore) -> tuple[str, int | None]:
+    """Exactly what the store would write for this chunk, and the epoch of its ids.
 
     Going through `encode_document` rather than reimplementing the raw-TF
     branch is deliberate: the weight convention is chosen from the shape in one
@@ -328,10 +341,32 @@ async def _encode(content: str, gate: asyncio.Semaphore) -> str:
     a pool sized for a web service.
     """
     async with gate:
-        idx, vals = await sparse_encoder.encode_document(
+        encoded = await sparse_encoder.encode_document_at_epoch(
             content, sparse_shape="vchord"
         )
-    return _bm25vector_literal(idx, vals)
+    return _bm25vector_literal(encoded.indices, encoded.values), encoded.epoch
+
+
+async def _hold_numbering(conn, epochs: set[int]) -> None:
+    """The term-id fence for one batch write (akb#687).
+
+    The batch was encoded before this transaction, and a renumbering committing
+    in between would leave its ids naming other terms. The bulk guard already
+    keeps `scripts/compact_bm25_term_ids.py` from running beside this command;
+    this is the check that does not depend on that.
+
+    Held where the vocabulary shares this database. A vector index kept in its
+    own database (`vector_store_dsn`) has no epoch beside it to lock, and the
+    renumbering refuses that layout, so no epoch moves under such a write.
+    """
+    if not epochs:
+        return
+    if not await conn.fetchval("SELECT to_regclass('bm25_vocab_epoch') IS NOT NULL"):
+        return
+    if len(epochs) > 1:
+        # Encoded on both sides of a renumbering: none of it may be written.
+        raise sparse_encoder.VocabularyEpochMoved(min(epochs), max(epochs))
+    await sparse_encoder.hold_vocabulary_epoch(conn, next(iter(epochs)))
 
 
 async def _gather_drained(*operations):
@@ -354,12 +389,13 @@ async def _apply(pool, schema: str, rows, attempts: int = _DEADLOCK_RETRIES) -> 
     every other encoder in this process — and the stats recompute, and the
     indexer — is also writing. Re-encoding on a retry is wasted work and is
     the right kind: the alternative is holding an encoding across the retry and
-    writing it onto a row that may have moved in the meantime.
+    writing it onto a row that may have moved in the meantime. An encoding
+    whose term ids were renumbered before its write is retried the same way.
     """
     for attempt in range(attempts):
         try:
             return await _apply_once(pool, schema, rows)
-        except asyncpg.exceptions.DeadlockDetectedError:
+        except (asyncpg.exceptions.DeadlockDetectedError, sparse_encoder.VocabularyEpochMoved):
             if attempt == attempts - 1:
                 raise
             # Back off unevenly. Two writers that collided and then retried in
@@ -388,8 +424,9 @@ async def _apply_once(pool, schema: str, rows) -> int:
     """
     gate = asyncio.Semaphore(_CONCURRENCY)
     encoded = await _gather_drained(
-        *(_encode(r["content"] or "", gate) for r in rows)
+        *(_encode_at_epoch(r["content"] or "", gate) for r in rows)
     )
+    epochs = {epoch for _literal, epoch in encoded if epoch is not None}
     sql = f"""
         UPDATE "{schema}".chunks c
            SET sparse_bm25 = m.v::bm25_catalog.bm25vector
@@ -400,10 +437,11 @@ async def _apply_once(pool, schema: str, rows) -> int:
     """
     async with pool.acquire() as c:
         async with c.transaction():
+            await _hold_numbering(c, epochs)
             res = await c.execute(
                 sql,
                 [r["chunk_id"] for r in rows],
-                list(encoded),
+                [literal for literal, _epoch in encoded],
                 [r["indexed_at"] for r in rows],
                 timeout=_WRITE_TIMEOUT,
             )

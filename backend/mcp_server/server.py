@@ -1223,8 +1223,9 @@ async def _handle_create_table(args: dict, uid: str, user: _MCPUser) -> dict:
             can_read_existing=await _can_read_vault(user, uid, vault),
         )
     except (ValidationError, ValueError) as e:
-        # ValidationError: bad table name / over-long PG identifier (422).
-        # ValueError: still raised by _validate_column_name. Both are
+        # ValidationError: a bad table name, the refused column names (all
+        # of them, from _refuse_bad_column_names) or an over-long PG
+        # identifier (422); ValueError is its base class. Both are
         # caller-fixable — keep the precise invalid_argument code rather
         # than letting them fall to the dispatch catch-all as `internal`.
         return err(str(e), code=INVALID_ARGUMENT)
@@ -1743,6 +1744,21 @@ def _log_response_size(tool: str, encoded: str, *, duration_ms: int) -> None:
         pass
 
 
+def _is_error_envelope(result: object) -> bool:
+    """True when a tool's result is the canonical ``err()`` envelope.
+
+    MCP reports a tool execution error inside the result with ``isError: true``;
+    AKB's refusals travel as ``{"error": <message>, "code": <code>, ...}``, so
+    the flag follows the envelope. The body stays exactly as it was, and clients
+    that read it keep working.
+    """
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("error"), str)
+        and isinstance(result.get("code"), str)
+    )
+
+
 async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # Capability-v2 acknowledgement is transport metadata expressed as a
     # reserved tool argument so generic MCP clients can send it through their
@@ -1898,7 +1914,8 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return CallToolResult(
-            content=[TextContent(type="text", text=encoded)]
+            content=[TextContent(type="text", text=encoded)],
+            is_error=_is_error_envelope(result),
         )
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
@@ -1948,7 +1965,8 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                     type="text",
                     text=encoded,
                 )
-            ]
+            ],
+            is_error=True,
         )
 
 

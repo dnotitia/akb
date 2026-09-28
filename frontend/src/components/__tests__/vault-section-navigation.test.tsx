@@ -12,25 +12,29 @@ function renderNavigation(route: string, vault = "team") {
 
 describe("VaultSectionNavigation", () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  it("keeps search out of the section row because the header owns its entry point", () => {
+    renderNavigation("/vault/team/members");
+    expect(screen.queryByRole("link", { name: "Search" })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Members" })).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("button", { name: /Search/ })).not.toBeInTheDocument();
+  });
   it("starts with Overview and keeps content destinations before management", () => {
     renderNavigation("/vault/team");
     const navigation = screen.getByRole("navigation", { name: "Vault sections" });
     expect(within(navigation).getAllByRole("link").map(link => link.textContent)).toEqual([
-      "Overview", "Search", "Graph", "Public links", "Members", "Settings",
+      "Overview", "Graph", "Public links", "Members", "Settings",
     ]);
     expect(screen.getAllByRole("link").map(link => link.getAttribute("href"))).toEqual([
-      "/vault/team", "/vault/team/search", "/vault/team/graph", "/vault/team/publications",
+      "/vault/team", "/vault/team/graph", "/vault/team/publications",
       "/vault/team/members", "/vault/team/settings",
     ]);
     expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Search this vault" })).toHaveTextContent("Search");
     for (const link of screen.getAllByRole("link")) expect(link.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
   });
 
   it.each([
-    ["", "Overview"], ["/search", "Search this vault"], ["/graph", "Graph"],
+    ["", "Overview"], ["/graph", "Graph"],
     ["/publications", "Public links"], ["/members", "Members"], ["/settings", "Settings"],
   ])("marks only the exact working-page destination current on %s", (suffix, label) => {
     renderNavigation(`/vault/team${suffix}?filter=anything`);
@@ -38,15 +42,15 @@ describe("VaultSectionNavigation", () => {
     expect(screen.getAllByRole("link").filter(link => link.getAttribute("aria-current") === "page")).toHaveLength(1);
   });
 
-  it("does not mark Overview current on the separate Activity route", () => {
-    renderNavigation("/vault/team/activity");
+  it.each(["activity", "search"])("does not mark another section current on %s", section => {
+    renderNavigation(`/vault/team/${section}`);
     expect(screen.getAllByRole("link").every(link => !link.hasAttribute("aria-current"))).toBe(true);
   });
 
   it.each(["doc/note", "doc/note?view=raw", "doc/note?view=edit", "file/file-id", "table/records"])("keeps Vault links without a false current section on %s", suffix => {
     renderNavigation(`/vault/team/${suffix}`);
     expect(screen.getByRole("navigation", { name: "Vault sections" })).toBeInTheDocument();
-    expect(screen.getAllByRole("link")).toHaveLength(6);
+    expect(screen.getAllByRole("link")).toHaveLength(5);
     expect(screen.getAllByRole("link").every(link => !link.hasAttribute("aria-current"))).toBe(true);
   });
 
@@ -68,12 +72,6 @@ describe("VaultSectionNavigation", () => {
     const overview = screen.getByRole("link", { name: "Overview" });
     expect(overview).toHaveFocus();
     expect(overview).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
-    await user.tab();
-    const search = screen.getByRole("link", { name: "Search this vault" });
-    expect(search).toHaveFocus();
-    expect(search).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault/search");
-    await user.keyboard("{Enter}");
-    expect(search).toHaveAttribute("aria-current", "page");
     await user.tab();
     expect(screen.getByRole("link", { name: "Graph" })).toHaveFocus();
     await user.tab();
@@ -106,16 +104,16 @@ describe("VaultSectionNavigation", () => {
     more.focus();
     await user.keyboard("{Enter}");
     const menu = screen.getByRole("menu", { name: "More vault pages" });
-    expect(within(menu).getAllByRole("menuitem").map(item => item.textContent)).toEqual(["Search", "Graph", "Public links", "Members"]);
-    expect(within(menu).getByRole("menuitem", { name: "Search this vault" })).toHaveAttribute("href", "/vault/team/search");
+    expect(within(menu).getAllByRole("menuitem").map(item => item.textContent)).toEqual(["Graph", "Public links", "Members"]);
+    expect(within(menu).getByRole("menuitem", { name: "Graph" })).toHaveAttribute("href", "/vault/team/graph");
     await user.keyboard("{Escape}");
     expect(more).toHaveFocus();
     await user.keyboard("{Enter}");
-    expect(screen.getByRole("menuitem", { name: "Search this vault" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Graph" })).toHaveFocus();
     await act(async () => { available = 900; resize(); });
     expect(screen.queryByRole("button", { name: "More vault pages" })).not.toBeInTheDocument();
-    expect(screen.getAllByRole("link")).toHaveLength(6);
-    expect(screen.getByRole("link", { name: "Search this vault" })).toHaveFocus();
+    expect(screen.getAllByRole("link")).toHaveLength(5);
+    expect(screen.getByRole("link", { name: "Graph" })).toHaveFocus();
     screen.getByRole("link", { name: "Graph" }).focus();
     await act(async () => { available = 320; resize(); });
     expect(screen.getByRole("button", { name: "More vault pages" })).toHaveFocus();

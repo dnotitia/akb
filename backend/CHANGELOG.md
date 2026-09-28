@@ -1,6 +1,442 @@
-# Pending release: Native installation default
+# AKB Backend — Changelog
 
-Breaking configuration-default change (not yet released): Settings and the
+The AKB backend ships as a Docker image and as the HTTP layer behind
+the `akb-mcp` stdio proxy. This changelog tracks the backend
+specifically; the proxy has its own log in
+`packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
+
+## Unreleased
+
+## 0.16.1 — 2026-09-27
+
+### Fix search fallback, concurrent bootstrap, and PostgreSQL role convergence
+
+- pgvector hybrid search retains a healthy retrieval leg after a transient
+  failure in its sibling and reports incomplete results. The UI keeps partial
+  hits usable and distinguishes an unavailable search from a healthy empty
+  result. Query embedding failure is also reported. The driver never turns
+  authorization, schema, vocabulary-epoch, or cancellation failures into
+  sibling-leg partial success; existing service-level failure handling is
+  unchanged.
+- Concurrent schema bootstrap retries only deadlock and lock-timeout failures,
+  with a five-second lock wait and at most five attempts. Each attempt rolls
+  back atomically, and migrations run once after bootstrap succeeds.
+- Catalog authority changes and role reconciliation share a transaction guard.
+  Delayed callbacks re-read the catalog instead of restoring revoked access;
+  reconciliation removes stale memberships and detects unsupported membership
+  options or grantor dependencies. Public-owner checks run inside that guard.
+  Full namespace pruning still requires an AKB-exclusive PostgreSQL role
+  namespace; this release does not add multi-AKB shared-cluster isolation.
+- Repeated migration imports no longer accumulate duplicate backend paths.
+  Migration functions and SQL are unchanged. An already-running interpreter
+  with duplicate paths needs a restart to benefit from the fix.
+- The measurement-only Native capacity adapter cancels and joins delayed
+  delivery after read failure, timeout, or parent cancellation, preserving its
+  original failure and false-green checks.
+
+This is a compatible patch release: no API, migration body, or data epoch
+changes. The independently versioned `akb-mcp` proxy is unchanged.
+
+## 0.16.0 — 2026-09-27
+
+### The `vchord` shape refuses a term id of 2^30 or more instead of corrupting another term
+
+A term id reaches the BM25 index in a `bm25vector`, and AKB refused only the ids
+its text input cannot parse: negative ones and those past 4,294,967,295
+(akb#665). The index's own limit is lower. `vchord_bm25` 0.3.0 addresses its
+per-term arrays with 32-bit byte offsets at 4 bytes per id, and its release
+build does not check the multiplication. An id of 1,073,741,824 (2^30) or more
+therefore lands on the id 2^30 below it, and nothing reports an error:
+
+- **Built over existing rows** (`CREATE INDEX`, `REINDEX`, every `pg_restore`):
+  a search for the high id reads the lower id's entries, and the document that
+  holds the high id cannot be found through it.
+- **Inserted, then sealed**: the high id's posting joins the lower id's list and
+  its document the lower id's count. Searches for the lower term rank a document
+  that does not hold it, and both terms' IDF is wrong.
+
+Measured on a patched 0.3.0 build. Term ids come from `bm25_term_id_seq`. No
+installation is known to be past 2^30; one long-lived installation is at about
+68% of it.
+
+What changes:
+
+- **The `vchord` shape writes term ids up to 1,073,741,823 (2^30 - 1).** A
+  document holding a larger one is refused before anything reaches the index.
+  The term is not dropped, because that would index the document under part of
+  what it says.
+- **A query term at or above 2^30 is dropped**, as one past u32 already was. No
+  document can hold it.
+- The other sparse shapes and drivers are unchanged.
+
+**If it fires**: the indexing worker abandons the chunk on the first failure
+(`TermIdOutOfRange`, a `ValueError` subclass, is deterministic — no retry can
+index it while the vocabulary numbers ids this way). `/health` counts it under
+`vector_store.backfill.upsert`. The chunk's `vector_last_error` names the id,
+the range and the remedy, and `scripts/backfill_bm25_vector.py` stops with the
+same message:
+
+```
+term id <id> is outside the range the vchord BM25 index holds (0 to 1,073,741,823): …
+```
+
+Once `bm25_term_id_seq` passes 2^30, every document holding a new term is
+refused, and the vocabulary's ids have to be renumbered densely before such a
+document can be indexed. This change does not renumber them.
+`/health`'s `bm25.term_id_headroom` shows how close an installation is
+(`last_drawn`, the 2^30 `vchord_limit`, the `used` share, and a `warning`
+from 90% naming `scripts/compact_bm25_term_ids.py`); `SELECT last_value FROM
+bm25_term_id_seq` shows the same number directly.
+
+### The BM25 index's VACUUM no longer stalls search, and its counts survive a crash (akb#687)
+
+`vchord_bm25` 0.3.0 held the index's metapage through both steps of VACUUM, and a
+search reads the metapage for its whole scan.
+
+- **The bulk delete** held it for a pass over every document id the index has
+  assigned. A search that started meanwhile waited for the whole pass: 3 s for
+  a million documents. The pass logged each delete mark on its own and the
+  counts once, at the end. A backend killed mid-pass therefore left the counts
+  too high until a rebuild; in one reproduction `doc_cnt` stayed at 419,689
+  against 200,000 true.
+- **The cleanup** recounted every term id below the largest one indexed, not
+  just the terms that exist, with one page write and WAL record per id, and it
+  could not be cancelled. With term ids reaching 728,984,818, one VACUUM
+  stalled search for 44 minutes, wrote 35.4 GiB of WAL and allocated 2.72 GiB.
+
+What changes:
+
+- **Three more patches in `deploy/postgres/vchord_bm25/`.**
+  - `0003` marks one delete bitmap page at a time. Each page's marks and the
+    counts they take off go into one WAL record, so a crash keeps both or
+    neither, and a VACUUM that runs again takes no document off twice.
+  - `0004` recounts one term statistic page at a time. It holds no buffer lock
+    from one page to the next, writes only pages whose counts changed, and stops
+    at the next page when cancelled. While it runs, inserts skip sealing the
+    growing segment. A recount that a cancel or a crash cuts short stays owed,
+    and the next VACUUM that cleans up the index finishes it whatever it
+    removes; upstream recounted only
+    when that VACUUM removed documents itself, so the statistics could stay too
+    high: 42,001 of them in one reproduction.
+  - `0005` keeps the IDF positive while a term's statistic still counts deleted
+    documents. It went negative, and a search for that term alone found
+    nothing.
+  - Measured on the same shapes: a search during the bulk delete took 0.001 s
+    instead of 2.86 s. The cleanup at 728,984,818 term ids took 2.7 s, with no
+    search waiting more than 0.002 s, 0.3 MiB of WAL and 3.4 MiB of memory.
+- **`test_vchord_vacuum_postgres.py`, in the VChord lane**, cancels a bulk
+  delete, searches through one, runs a cleanup over 20,000,001 term ids, and
+  interrupts two VACUUMs before a third with nothing to remove. The image
+  without 0003 and 0004 fails the first three; without the owed recount or
+  without 0005, the fourth fails.
+- **The docs describe the fixes** where they listed VACUUM as a known limit, and
+  name a limit the extension still has: a term id at or above 2^30 reads
+  another term's entries.
+- `deploy/k8s/deploy.sh` gives `akb-postgres` a new tag, because its build
+  inputs changed.
+
+**Upgrading**: rebuild the PostgreSQL image. The fix itself needs no index
+rebuild. Two kinds of damage an older build left keep until `REINDEX INDEX
+CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`: counts a crash damaged
+under the upstream binary, and block summaries sealed while a term's statistic
+ran ahead of the document count, which hide their blocks from bounded searches.
+
+### The BM25 statistics recompute draws term ids for new terms only (akb#687)
+
+The recompute registered the terms it counted with
+`INSERT … SELECT term, nextval('bm25_term_id_seq') … ON CONFLICT DO NOTHING`.
+That draws an id for every term, including each one the vocabulary already
+holds and the conflict then discards, so every pass advanced the sequence by
+the whole vocabulary. One long-lived installation reached 728,985,301 ids for
+955,060 terms. The `vchord` shape's index sizes its per-term arrays by the
+largest id rather than by the number of terms, and its VACUUM cleanup walks
+all of them (akb#687). Only terms missing from the vocabulary reach `nextval()`
+now; a term an encoder inserts at the same moment still costs one id.
+
+- Ids already drawn are kept; nothing is renumbered. An installation that has
+  already drawn them keeps its largest id, and with it the `vchord` cleanup
+  cost, until its ids are renumbered or the extension's cleanup no longer walks
+  every id (akb#687). This change stops the growth. The same
+  drawing used part of the range a term id must fit in the `vchord` index: 729M
+  of the 1,073,741,824 ids below 2^30 at that installation.
+- Where the recompute runs: the background refresher runs it wherever external
+  statistics are consumed, which is every non-pgvector driver (Qdrant
+  included), pgvector `arrays` and `posting`, pgvector `vchord` under
+  `required` or, under `auto`, while a `posting` table exists, and any pgvector
+  database whose shape is not decided yet. `scripts/init_bm25_vocab.py` runs it
+  anywhere.
+
+### A command renumbers BM25 term ids densely (akb#687)
+
+The fix above stops ids being drawn and discarded; this renumbers the ones
+already drawn. A term id is a label: BM25 scores come from tf, df, the document
+count and the average length, never from the id. But the `vchord` shape's index
+sizes its per-term arrays by the largest id. On a 2.11M-chunk copy of the
+installation with 955,060 terms over ids up to 728,985,301, the index was
+12.6 GB and built in 223 s; with dense ids, 6.7 GB and 88 s. Its VACUUM walks
+the empty range too, and ids of 2^30 and more alias other terms in it.
+
+`scripts/compact_bm25_term_ids.py` gives every term the rank of its id,
+`0 .. terms - 1`. The mapping keeps the ids' order, so each vector keeps its
+order and only its labels change.
+
+What changes:
+
+- **The command.**
+  - With no flag it is a dry run. It shows the vocabulary, its id range, the
+    indexes a rewrite rebuilds and their sizes, the baseline queries, and
+    anything that forbids the rewrite.
+  - `--apply` rewrites `bm25_vocab`, `bm25_term_id_seq` and the active shape's
+    ids in one transaction: under `vchord`, `sparse_bm25` and its index;
+    under `posting`, `posting.term_id`. It records the mapping in
+    `bm25_term_id_remap`.
+  - Before it commits, it checks three things. The ids are exactly
+    `0 .. terms - 1`. The rebuilt index counts the same documents and lengths
+    and spans no more ids than there are terms. Queries sampled from stored
+    documents rank the same documents with the same scores, within 1e-6. Any
+    failure rolls everything back and exits 1.
+  - `--revert` puts the recorded numbering back.
+    It refuses VChord mappings outside `0 .. 2^30-1`, including a formerly
+    unindexed high-ID term indexed safely after compaction.
+  - If IDs are already dense but the sequence was exhausted or advanced past
+    them, `--apply` repairs only the sequence, preserving vectors, indexes,
+    the epoch and an existing revert mapping.
+- **It refuses (exit 2) where it cannot rewrite every copy.**
+  - Qdrant and SeahorseDB keep their vectors outside PostgreSQL. Renumbering
+    there means indexing every chunk again.
+  - A vector index in a separate database (`vector_store_dsn`).
+  - The `arrays` shape.
+  - Term ids left in the inactive shape, such as a `posting` table kept under
+    `vchord`.
+  - An index whose statistics still count rows VACUUM has not removed. The
+    baseline would not match a rebuild for reasons unrelated to the ids.
+- **The rewrite is a table rewrite** (`ALTER TABLE … ALTER COLUMN … TYPE …
+  USING`). It rebuilds every index on the vector table, a dense HNSW index
+  included.
+  - Updating the rows and building the BM25 index in one transaction does not
+    work. The build also indexes the row versions that transaction deleted:
+    measured, twice the documents, and `term_id_cnt` still at the old largest
+    id.
+  - On 20,000 chunks with 1024-dimension vectors, the rewrite took 16.5 s, of
+    which the HNSW rebuild was 14.0 s. The update route took 51 s and left
+    that broken index.
+  - The vector table and `bm25_vocab` stay locked until the commit. Dense
+    searches wait; sparse searches report `bm25_renumbering` while its fence
+    is held. `--max-parallel-maintenance-workers 0` selects a serial rebuild
+    in this session when `/dev/shm` cannot hold a parallel HNSW graph.
+- **The vocabulary epoch (migration 113).** Encoding a chunk and storing it are
+  separate transactions, so ids read before a renumbering could be stored after
+  it, naming other terms. `bm25_vocab_epoch` counts renumberings.
+  - The encoder reports the epoch its ids were read at.
+  - The indexing worker and the `sparse_bm25` backfill store ids only under a
+    shared advisory lock, and only if the epoch has not moved. A chunk encoded
+    before a renumbering goes to the retry path and is encoded again.
+  - While a renumbering runs, indexing hands its batch back without spending
+    retries.
+  - Query encodings carry their epoch through sparse execution too. The
+    search transaction checks it under the shared fence, and the search
+    service re-encodes a query if the epoch moved. A search encoded before
+    the commit cannot silently retrieve another term's documents afterwards.
+  - `scripts/migrate_pgvector_to_seahorsedb.py` stops if the vocabulary is
+    renumbered under it, including between a run and its resume.
+- **The invariant changes.** Migration 005 said term ids are never reassigned.
+  Now they are dense, and only this command reassigns them.
+
+**Upgrading**: every backend process must run this version before
+`--apply`. An older process stores ids without checking the epoch. Then pause
+ingestion, VACUUM the vector table, run the dry run and `--apply`; see
+`docs/vector-store-bm25-statistics.md`. Size `--maintenance-work-mem` for the
+dense index rebuild.
+
+### The BM25 index extension is compiled with fixes for index builds and VACUUM (akb#679, akb#684)
+
+`vchord_bm25` 0.3.0 has two defects on AKB's default sparse shape. No release
+after 0.3.0 fixes them.
+
+- **Index builds (akb#679).** An index built over existing rows (`CREATE INDEX`,
+  `CREATE INDEX CONCURRENTLY`, `REINDEX`, and so every `pg_restore` and the
+  backfill runbook's `--index`) flushed a full block before it recorded the
+  block's best posting. A bounded search then skipped such blocks, and a page,
+  full or short, could miss better matches. On a 2.1M-chunk index, 7 of 159
+  sampled terms had a worse top-90.
+- **Length statistics (akb#684).** VACUUM subtracted a deleted document's
+  one-byte length code instead of its length from the sum the average document
+  length comes from. The average grew with every update and delete until the
+  index was rebuilt, and length normalisation skewed with it. Now the build,
+  the insert and VACUUM all count the length the index stores for a document,
+  so VACUUM takes back exactly what was added. The average is the mean of the
+  lengths BM25 scores with, a little below the mean of exact lengths.
+
+What changes:
+
+- **`deploy/postgres/Dockerfile` compiles the extension** from the 0.3.0 source
+  with both fixes, in `deploy/postgres/vchord_bm25/`, instead of copying the
+  upstream binary.
+  - What decides the extension is pinned:
+    - the source tarball, by sha256;
+    - Rust 1.91.1, by digest (the compiler of the upstream binary);
+    - the crates, by a committed `Cargo.lock`;
+    - the PostgreSQL headers, at exactly the base's server version.
+  - The Debian toolchain follows bookworm's point releases.
+  - The first build compiles the extension. That takes under a minute on a
+    many-core host and several minutes on a laptop.
+- **CI tests that image.** Its VChord test lane used to run the upstream image,
+  which is an extension build no installation should have.
+- **`deploy/k8s/deploy.sh` tags `akb-postgres` by all of its build inputs.** A
+  changed patch or lockfile therefore produces a new tag.
+- **The akb#679 defect's traces are gone.** The test that pinned it (`bounded == 44`) is
+  now its regression test, beside `test_vchord_index_build_postgres.py`. The
+  docs that described it as a limit now describe the fixes.
+
+**Upgrading**: an index that the upstream binary built or vacuumed keeps its
+summaries and its length sum until it is rebuilt. After moving to the new
+image, run `REINDEX INDEX CONCURRENTLY <vector_store_schema>.idx_vi_chunks_bm25`.
+A new database's index needs nothing.
+
+### The install paths build PostgreSQL with the BM25 index extension
+
+The default sparse shape needs `vchord_bm25` in the server. AKB publishes no
+PostgreSQL image, so the install paths now build `deploy/postgres/Dockerfile`
+where they run it: the same pinned pgvector image, plus the extension compiled
+with the fixes above.
+
+- **Compose** builds it as the `postgres` service, and so does the CI runtime
+  e2e. The Native quickstart builds `postgres` along with the frontend before
+  its `up --no-build`.
+- **`deploy/k8s/deploy.sh`** builds and pushes `akb-postgres` next to the
+  backend and frontend, and puts it in the rendered manifests.
+  - The tag comes from the image's build inputs, so an AKB upgrade that leaves
+    them unchanged does not restart PostgreSQL.
+  - With `SKIP_BUILD=true`, `POSTGRES_IMAGE` names it.
+- **Helm** and the **Native Kubernetes overlay** get it through their install
+  commands: `postgres.image`, and an `images` entry.
+- **The chart and the Kubernetes base manifest keep the stock pgvector image as
+  their default.** Upgrading a release that never set it cannot point a running
+  database at an image nobody has built.
+- **The all-in-one image does not include it.** That image is the one AKB
+  publishes (`dnseahorse/akb`), and publishing an image with the extension in it
+  is distribution of that extension (AGPLv3 or ELv2), which this change does
+  not decide. A new all-in-one database gets `posting`.
+
+Existing installations keep the sparse shape they serve. Moving one to this
+image restarts PostgreSQL once, on the same PostgreSQL and pgvector versions.
+
+**Upgrading a Compose installation**: after updating the checkout, build
+`postgres` (and `frontend`, for the complete stack) before `up --no-build`,
+which never builds. Without that step, Compose stops the API (`backend`) and
+then fails with `No such image: <project>-postgres:latest`, which leaves the API
+down. `docker compose up -d --build` rebuilds every built service by itself.
+
+### New databases use the `vchord` sparse shape where the server provides it
+
+`vector_store_sparse_shape` and `bm25_external_stats_mode` now default to
+`auto`. The `vchord` shape answers the searches that took `posting` longest: on
+a 2.1M-chunk corpus, the same 160 search pairs measured sparse-leg p50/p90/max
+of 0.13/1.31/8.88 s under `posting` and 0.09/0.76/2.50 s under `vchord`, with
+the top result the same in 154 of 156. It also has no corpus-wide statistics
+recompute to run.
+
+- **Decided once per database, at startup, before the vector store is built**,
+  by API and worker processes alike. The first successful schema setup records
+  the shape in `<vector_store_schema>.install_state`. In order:
+  1. the recorded shape;
+  2. a `posting` table → `posting`;
+  3. the BM25 index → `vchord`, the `arrays` columns → `arrays`;
+  4. a new database → `vchord` where the server provides `vchord_bm25` to AKB's
+     role, `posting` otherwise.
+
+  A populated `chunks` table with none of those signatures, or an installed
+  extension that AKB's role cannot use, stops startup with a message that names
+  the fix. Guessing there would serve empty search while readiness stayed green.
+- **Existing installations keep their shape.** A database that has served
+  `posting` stays on it on any image. Moving it is still
+  `scripts/backfill_bm25_vector.py` and then an explicit
+  `vector_store_sparse_shape: vchord`; after that, `auto` follows the recorded
+  shape. A configuration that names a shape behaves as before, and is recorded
+  too.
+- **The shipped configurations now say `auto`** (compose example, Helm, the
+  Kubernetes manifests, all-in-one). On the stock `pgvector/pgvector` image,
+  which does not provide the extension, a new database gets `posting`; the
+  entry above lists the install paths that now build one that does.
+- **The extension needs a superuser to create.** Where AKB's role is not one, a
+  superuser runs `CREATE EXTENSION vchord_bm25` and
+  `GRANT USAGE ON SCHEMA bm25_catalog TO <role>` before AKB first starts on the
+  database; without the GRANT, a plain role cannot set the shape up.
+- **External statistics under `auto`**: a `vchord` database with no `posting`
+  table has nothing that reads them, so neither the startup nor the periodic
+  recompute runs. Where a `posting` table exists they are kept, and the table is
+  written, exactly as under `required`.
+- `/health` reports `vector_store.sparse_shape`: `configured`, `effective`,
+  `decided_by`, `posting_table_present` and a one-line note.
+
+Upgrade note: under `auto`, startup reads the vector database before building
+the store. With a separate `vector_store_dsn` that cannot be reached, startup
+now fails instead of starting with sparse search unavailable. A configuration
+that names a shape starts as before and keeps the external statistics.
+
+### The `vchord` sparse shape completes a short page instead of calling it degraded (akb#673)
+
+When the index-led page for a scope came back short, the driver widened its
+candidate budget up to 65,535. It then refused exact work whenever the corpus
+held more than 10,000 rows, because it measured the whole corpus rather than
+the query. At production size that refused every time. Every search whose scope
+held fewer matches than the page ended with `degraded: true` and
+`sparse_search_budget_exceeded`, after 0.1–8 s of widening probes. Examples
+were a rare term, or a term common elsewhere and absent from this scope. On a
+2.1M-chunk corpus the flag followed that rule in 96 of 96 measured cases.
+
+A short page is now completed with the exact scan (`bm25_limit = -1`), which is
+the only scan that reads every posting of the query terms. Its cost is those
+postings, the growing segment, and the executor's check of each candidate; the
+corpus size does not enter into it. The short page had already read every
+posting it could. Measured on the same corpus, completion took 60 ms to 2.5 s,
+including queries of several common terms that are absent from the scope. The
+widening probes are gone, and this shape no longer raises
+`sparse_search_budget_exceeded`.
+
+### A refused tool call sets `isError` in the MCP result
+
+MCP reports a tool execution error inside the result with `isError: true`.
+AKB's refusals travel as the `{"error", "code", ...}` envelope, and the result
+never set the flag, so a client that branches on it read every refusal as a
+success. Now it does whenever the body is that envelope, whether a handler
+returned it or the dispatch built it from an exception. The body itself is
+unchanged.
+
+For client authors:
+
+- If you read the envelope, nothing changes.
+- If you raise on `isError`, you will now raise where you used to get the
+  envelope back. Handle the envelope before you raise. The first-party
+  collector and gardener clients already do.
+
+### A database password with a URL delimiter no longer breaks the database URL
+
+`Settings.asyncpg_dsn`, which every connection uses (the main pool, the Native
+bootstrap and the BM25 scripts), put the credentials into the URL verbatim. In
+a URL, `/`, `@`, `?` and `#` are delimiters, so a password containing one of
+them was misread:
+
+- With a `/`, part of the password became the host. The backend then looked up
+  a host that does not exist ("Name or service not known") and never started.
+- With a `?`, the connection failed with "bad query field".
+- A literal `%2F` was decoded into `/`, so the wrong password was sent.
+
+A base64-generated password contains `/` about half the time.
+
+The user, password and database name are now percent-encoded. asyncpg decodes
+each part, so PostgreSQL receives exactly the configured values. A password
+made only of letters, digits, `-`, `.`, `_` and `~` yields the same URL as
+before. `database_url` is now the same URL.
+
+## 0.15.0 — 2026-09-23  *(breaking default — PostgreSQL Native for new installations)*
+
+This is the announced default-change release the Native default was held for.
+0.14.3 below was recorded but never tagged; its changes first ship here.
+
+### Breaking: new installations default to PostgreSQL Native
+
+Breaking configuration-default change: Settings and the
 recommended Compose/Kubernetes fresh-install paths select PostgreSQL Native.
 Before upgrading, run `preserve-revision-config` against the active app/secret
 pair and install the reviewed output. It pins previously omitted selectors to
@@ -23,17 +459,38 @@ configuration — `CONTRIBUTING.md` pins `bare_git` for a development stack, and
 `prepare-native-config` generates the identity for a real one.
 
 See [installation and upgrade order](../docs/operations/native-installation.md).
-Publish this change only with an explicitly announced default-change release;
-this entry does not bump a version, publish an artifact or authorize rollout.
 
-# AKB Backend — Changelog
+### A refused column name says why, all at once, and where the header goes
 
-The AKB backend ships as a Docker image and as the HTTP layer behind
-the `akb-mcp` stdio proxy. This changelog tracks the backend
-specifically; the proxy has its own log in
-`packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
+Column names stay SQL identifiers — `akb_sql` runs against the physical table
+and uses them as written — so a header taken from a document often cannot be
+one. What changed is everything around that rule (akb#433):
 
-## Unreleased
+- A create or alter lists every refused column in one error, each with its
+  reason (not ASCII, reserved, uppercase, not starting with a letter, other
+  characters, longer than 63 bytes), and says where the header goes: the
+  column's `description`. It used to stop at the first column and quote a
+  regex, so a document's table taught the rule one call at a time.
+- A name longer than 63 bytes is refused. PostgreSQL keeps 63 bytes of an
+  identifier and silently drops the rest, which left the registry and the
+  physical column naming different things.
+- A name PostgreSQL will not take as a column is refused the same way, with
+  the reason, instead of failing in DDL as a 500: the 101 keywords
+  PostgreSQL 16 reserves for column positions (`user`, `order`, `group`,
+  `select`, …; `CREATE TABLE … (user TEXT)` is a syntax error) and the system
+  column names (`xmin`, `ctid`, `tableoid`, …; 42701, which the add path did
+  not catch). Keywords it does accept (`name`, `type`, `value`, …) stay
+  allowed. A live test compares the list with the server's
+  `pg_get_keywords()`.
+- `akb_create_table` and `akb_alter_table` advertise `description` and state
+  the name rule, so an agent can get it right before a refusal.
+- `akb_vault_info` returns each column's `description` from the registry. It
+  is where an agent reads a schema before writing SQL, and it only listed
+  `pg_attribute` names, so a header kept in `description` was searchable but
+  invisible to the agent writing the query.
+
+The logical/physical name proposal for the same issue is recorded as denied
+(`docs/design/denied/2026-09-17-column-logical-physical-names/`).
 
 ### Changed
 
@@ -117,6 +574,41 @@ silently retries against the legacy endpoint after dropping restrictions.
   `plan_cache_mode` is pinned to a custom plan for the duration: asyncpg always
   prepares, and a generic plan built without the filter's values took the same
   statement from 0.8ms to 1501ms on the eleventh execution.
+- The choice stays a latency decision. Materialising scores every row in scope,
+  so it stays under the exact-work cap, and a selective scope over the cap is
+  now searched index-led instead of refused. Refusing returned no sparse hits
+  for every scope between 10,000 rows and 1% of the corpus — reproduced on a
+  1.2M-row corpus, an 11,000-row scope came back empty, while the index-led
+  shape answered it in 15ms (akb#626).
+- While the way back is retained, the vchord shape keeps `posting` current.
+  `bm25_external_stats_mode = "required"`, the default, already kept
+  posting's statistics fresh for a rollback, but after the flip nothing wrote
+  `posting` itself: new chunks never reached it and rewritten chunks kept
+  their old weights, so switching back would have served a table that had
+  been decaying since the day of the flip. An installation that came from
+  `posting` now writes both on every chunk until the operator sets
+  `vchord_only_verified`. The posting weights come from the raw frequencies
+  already encoded, through the same formula the posting shape uses, so the
+  text is not tokenized twice. A fresh vchord install has no table to keep,
+  and none is created (akb#615).
+- A query term past 2,147,483,647 no longer fails the search. Query vectors
+  were bound as `int[]`, the extension's only array cast, and asyncpg refuses
+  any id past `int4` before the query is sent, while term ids are minted as
+  `bigint` and documents, written as `{id:tf}` text, already held ids up to
+  4,294,967,295. Queries now go through the same text input. That u32 limit is
+  stated once, in `_bm25vector_literal`: a document holding an id outside it
+  is refused with the bound named rather than "Bad parsing at position N",
+  and a query term outside it is dropped, since no document can hold it
+  (akb#665).
+- The first search on a new connection no longer fails. The extension defines
+  `bm25_catalog.bm25_limit` when its library loads, and the image
+  `deploy/postgres/Dockerfile` builds does not preload it, so reading the
+  setting on a session that had not yet called into the extension raised —
+  and that reached `hybrid_search` as a store failure, losing both legs. The
+  backend now loads the library before reading the setting, once per
+  connection. CI missed it because the upstream image preloads the library
+  from its CMD; the pgvector job now starts that image with a plain
+  `postgres` command, as operators run theirs (akb#615).
 - The result is filtered on the sign of the score. `<&>` orders the whole table
   rather than filtering it — a document holding no query term scores exactly
   `-0` — so a plain `ORDER BY ... LIMIT k` tops the page up with irrelevant
@@ -143,7 +635,12 @@ silently retries against the legacy endpoint after dropping restrictions.
   pass ran. Convergence is the run that writes zero.
 - The index is built `CONCURRENTLY`, outside `_do_ensure`. That method runs its
   DDL in one transaction, and a build over a corpus this size holds a
-  `ShareLock` against every INSERT for its duration.
+  `ShareLock` against every INSERT for its duration. `_do_ensure` now builds
+  it only for an empty table (a fresh install) and refuses a populated one
+  that lacks it. Before, selecting the shape ahead of `--index` built the
+  index at startup, in that transaction, over whatever part of the column was
+  filled — bypassing `--index`'s own refusal and serving a partial column
+  with no sign of it (akb#615).
 - Writes are conditioned on the row still holding the content that was encoded,
   so a chunk the indexer rewrites mid-batch keeps what the store gave it rather
   than being stamped with tokens from text it no longer has.
@@ -166,7 +663,6 @@ silently retries against the legacy endpoint after dropping restrictions.
   and the next attempt meets a committed transaction — but the retry is bounded,
   because retrying forever would turn a real problem into a silent stall.
 
-
 ### A sparse shape the code does not handle now fails loudly
 
 - `vector_store_sparse_shape` was branched on as a two-way `if` in four places,
@@ -183,7 +679,6 @@ silently retries against the legacy endpoint after dropping restrictions.
   `pgvector.py` deliberately does not import config and the vector-store
   package's `__init__` imports the factory, which does.
 - No behaviour change for either existing shape.
-
 
 ### An optional PostgreSQL image with a BM25 index extension
 
@@ -210,7 +705,6 @@ silently retries against the legacy endpoint after dropping restrictions.
   it does not change AKB's licensing; `deploy/postgres/README.md` records what
   distributing a built image would entail.
 
-
 ### The PostgreSQL image is pinned by digest
 
 - Every reference that actually pulls `pgvector/pgvector:pg16` now carries the
@@ -235,7 +729,6 @@ silently retries against the legacy endpoint after dropping restrictions.
 - `deploy/k8s/README.md` gains the procedure for moving a pin, including how to
   resolve the multi-architecture index digest rather than a single-platform
   manifest — pinning the latter would strand nodes of every other architecture.
-
 
 ### An interrupted BM25 recompute resumes instead of starting over
 
@@ -427,6 +920,17 @@ silently retries against the legacy endpoint after dropping restrictions.
 
 ### Indexing
 
+- Encoding a chunk no longer locks the vocabulary rows of terms that already
+  exist. Term ids were resolved with `INSERT ... ON CONFLICT DO UPDATE` whose
+  update was a no-op, and a no-op update still locks each existing row until
+  its transaction ends, writes a new row version, and draws a sequence value
+  for every term. Every concurrent indexer and backfill writer shares the common
+  terms, so they queued on the same rows: on a 2.1M-chunk backfill, waiting on
+  each other's vocabulary rows was 42% of the writers' sampled wait, and a
+  long-lived vocabulary had taken 161M updates for 953k rows. Known terms are
+  now read without a lock, only unseen terms are inserted (`DO NOTHING`), and a
+  term another writer committed first is read back. Term ids do not change; the
+  sequence now advances only for new terms.
 - A NUL byte in a body no longer costs the document its place in ranked search.
   Bodies live in the payload store, which accepts the byte; PostgreSQL `text`
   does not, so indexing raised `CharacterNotInRepertoireError` on every attempt

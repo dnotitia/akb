@@ -69,14 +69,14 @@ async def test_deadlock_retry_has_no_surviving_first_attempt_encodes(monkeypatch
                             await four_started.wait()
                             raise asyncpg.DeadlockDetectedError("injected")
                         await asyncio.Event().wait()
-                    return "{}"
+                    return "{}", None  # no term ids, so nothing to fence
                 finally:
                     active -= 1
         finally:
             tasks.discard(task)
 
     monkeypatch.setattr(cli, "_apply_once", once)
-    monkeypatch.setattr(cli, "_encode", encode)
+    monkeypatch.setattr(cli, "_encode_at_epoch", encode)
     try:
         assert await asyncio.wait_for(cli._apply(Pool(), "v", rows(12)), 3) == 12
         assert attempt == 2
@@ -106,7 +106,7 @@ async def test_encode_failure_waits_for_sibling_cleanup(monkeypatch):
         finally:
             tasks.discard(asyncio.current_task())
 
-    monkeypatch.setattr(cli, "_encode", encode)
+    monkeypatch.setattr(cli, "_encode_at_epoch", encode)
     try:
         with pytest.raises(ValueError, match="not a retryable"):
             await cli._apply(Pool(), "v", rows(2))
@@ -127,7 +127,7 @@ async def test_outer_cancellation_drains_encodes(monkeypatch):
             await asyncio.sleep(0)
             cleaned.set()
 
-    monkeypatch.setattr(cli, "_encode", encode)
+    monkeypatch.setattr(cli, "_encode_at_epoch", encode)
     task = asyncio.create_task(cli._apply(Pool(), "v", rows(2)))
     await started.wait()
     task.cancel()

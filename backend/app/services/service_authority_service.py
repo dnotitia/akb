@@ -18,6 +18,7 @@ import uuid
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import (
     AccountSuspendedError,
@@ -90,7 +91,7 @@ async def resolve_service_authority(*, issuer: str, client_id: str, subject: str
 
     async with pool.acquire() as conn:
         try:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 # Serialize concurrent first-use for one authority so two
                 # requests cannot race into two accounts before the unique
                 # constraints see either.

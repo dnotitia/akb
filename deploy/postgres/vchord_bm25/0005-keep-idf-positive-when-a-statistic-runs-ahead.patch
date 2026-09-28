@@ -1,0 +1,62 @@
+Keep the IDF positive when a term statistic runs ahead of the document count
+
+Applies to vchord_bm25 0.3.0 (upstream tag 0.3.0, commit c610b7ab), after 0001
+to 0004.
+
+The IDF (weight.rs) is ln((N + 1) / (n + 0.5)), where N is the number of live
+documents and n the number of them that hold the term. It is positive while n
+does not exceed N. A bulk delete takes its documents off N at once and off each
+term's n only in the recount that follows (0004), so a VACUUM stopped between
+the two leaves n above N for every term the deleted documents held, until the
+next VACUUM finishes the recount. For a term held by more documents than now
+remain, the IDF is then negative, every document that matches only that term
+scores at or below 0, and the top-k scan, whose threshold starts at 0, keeps
+none of them: a search for that term alone finds nothing.
+
+- n is held at N, so the IDF is at least ln(1 + 0.5 / (N + 0.5)), which is
+  positive.
+- The ratio is taken in f64. In f32, (N + 1) / (N + 0.5) rounds to exactly 1
+  once N passes about 8.4 million, so a term in every document already scored
+  0 in a settled index of that size.
+
+The seal path computes each block's summary with the same IDF (append.rs). A
+seal while n ran ahead of N recorded summaries from a negative IDF, and a
+bounded scan then skipped those blocks for good, even once the statistics were
+recounted. This patch prevents that; an index an older build sealed in that
+state keeps it until REINDEX.
+
+Measured on 100,000 documents with a term in every one, 40,000 deleted, after a
+VACUUM cancelled between the bulk delete and the cleanup: a search for that
+term alone returned no rows, and 10 with this patch (bm25_limit 10). On a
+settled index of 45,000 documents, 58 queries returned the same top 20 in the
+same order with and without it, and no score in them moved by more than 1.4e-7
+of itself. A term held by nearly every document moves more, by up to about
+0.2% at 45,000 to 2.1 million documents: f32 rounded its ratio. The move is the
+same for every document holding the term, so no order changes.
+
+License: this patch modifies vchord_bm25 and is offered under the same terms
+as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
+---
+diff --git a/src/weight.rs b/src/weight.rs
+index d2f243a..156142f 100644
+--- a/src/weight.rs
++++ b/src/weight.rs
+@@ -32,9 +32,17 @@ impl Bm25Weight {
+ }
+ 
+ // ln ( (N + 1) / (n(q) + 0.5) )
++//
++// A term's document count never exceeds N once the index is settled, but it
++// runs ahead of N until the recount a bulk delete owes has finished: the bulk
++// delete takes its documents off N at once and off each term's count only in
++// the recount. Held at N, the count gives the smallest IDF the formula has,
++// ln(1 + 0.5 / (N + 0.5)), which is positive. The ratio is taken in f64: in f32
++// it rounds to exactly 1, an IDF of 0, once N passes about 8.4 million.
+ #[inline]
+ pub fn idf(doc_cnt: u32, doc_freq: u32) -> f32 {
+-    (((doc_cnt + 1) as f32) / (doc_freq as f32 + 0.5)).ln()
++    let doc_freq = doc_freq.min(doc_cnt);
++    ((f64::from(doc_cnt) + 1.0) / (f64::from(doc_freq) + 0.5)).ln() as f32
+ }
+ 
+ pub fn bm25_score_batch(

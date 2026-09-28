@@ -27,7 +27,8 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     conn.fetch = AsyncMock(side_effect=fetch)
 
     @asynccontextmanager
-    async def transaction():
+    async def transaction(*, isolation=None):
+        assert isolation in (None, "read_committed")
         yield conn
         events.append("commit")
 
@@ -94,7 +95,7 @@ async def test_native_nonempty_collection_requires_recursive(monkeypatch):
         await f.svc.delete(vault="v", path="c", recursive=False, agent_id=None)
     assert error.value.doc_count == 1
     f.native_delete.assert_not_awaited()
-    f.conn.execute.assert_not_awaited()
+    assert all("pg_advisory_xact_lock" in call.args[0] for call in f.conn.execute.await_args_list)
     f.lane.assert_not_called()
     f.git_factory.assert_not_called()
 

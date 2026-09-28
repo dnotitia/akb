@@ -1,16 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
-  ArrowLeft,
+  CircleHelp,
   CheckCircle2,
   Crown,
   Globe,
-  Lock,
   MoreHorizontal,
   Plus,
   Search,
-  ShieldCheck,
   Trash2,
   UserCog,
   UsersRound,
@@ -33,9 +31,13 @@ import { Input } from "@/components/ui/input";
 import { InviteMemberDialog } from "@/components/invite-member-dialog";
 import { Panel } from "@/components/ui/panel";
 import { RoleSelect } from "@/components/role-select";
-import { RoleBadge } from "@/components/status-badge";
-import { TooltipText } from "@/components/ui/tooltip-text";
-import { TonalIcon } from "@/components/ui/tonal-icon";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
 import { ROLE_ICONS, type Role } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
@@ -54,6 +56,8 @@ interface VaultInfo {
   role?: Role;
   role_source?: "member" | "public";
   public_access?: "none" | "reader" | "writer";
+  is_archived?: boolean;
+  is_external_git?: boolean;
 }
 
 const ROLE_ORDER: Role[] = ["owner", "admin", "writer", "reader"];
@@ -103,7 +107,7 @@ export default function VaultMembersPage() {
         getVaultInfo(name).catch(() => null),
         getVaultMembers(name),
       ]);
-      if (nextInfo) setInfo(nextInfo);
+      setInfo(nextInfo);
       setMembers(nextMembers.members || []);
       setError("");
     } catch (caught: unknown) {
@@ -136,7 +140,6 @@ export default function VaultMembersPage() {
   );
   const canManage = info?.role === "owner" || info?.role === "admin";
   const canTransfer = info?.role === "owner";
-  const canChangePublicAccess = info?.role === "owner";
 
   const filtered = useMemo(() => {
     const list = members || [];
@@ -148,17 +151,6 @@ export default function VaultMembersPage() {
       ),
     );
   }, [members, filter]);
-
-  const roleCounts = useMemo(() => {
-    const counts: Record<Role, number> = {
-      owner: 0,
-      admin: 0,
-      writer: 0,
-      reader: 0,
-    };
-    for (const member of members || []) counts[member.role] += 1;
-    return counts;
-  }, [members]);
 
   async function confirmRevoke() {
     if (!name || !pendingRevoke) return;
@@ -211,26 +203,23 @@ export default function VaultMembersPage() {
   const total = members?.length ?? 0;
   const noMatches =
     members !== null && filter.trim() !== "" && filtered.length === 0;
-  const policy = publicPolicy(info?.public_access);
+  const publicNote = publicAccessNote(info);
 
   return (
     <>
-      <div className="flex min-h-full w-full flex-col xl:h-full xl:min-h-0 xl:p-4 2xl:p-5">
+      <div className="@container/members w-full max-w-none">
         <h1 id="members-heading" className="sr-only">
           Members
         </h1>
-
         <WorkspaceSectionHeader
-          id="direct-access-heading"
+          id="member-roster-heading"
           icon={UsersRound}
-          title="Direct access"
-          description={members === null ? "Loading roster…" : policy.summary}
+          title="Members"
           tone="people"
           testId="member-roster-header"
-          className="mx-3 mt-3 sm:mx-4 lg:mx-5 xl:mx-0 xl:mt-0"
           right={
             <>
-              {members && (
+              {members && !error && (
                 <Badge variant="default">
                   {total} member{total === 1 ? "" : "s"}
                 </Badge>
@@ -249,450 +238,254 @@ export default function VaultMembersPage() {
           }
         />
 
-        <div
-          data-testid="members-workspace-frame"
-          className="grid min-h-0 flex-1 xl:grid-cols-[minmax(0,1fr)_20rem] xl:overflow-hidden xl:rounded-[var(--radius-md)] xl:border xl:border-border 2xl:grid-cols-[minmax(0,1fr)_22rem]"
-        >
-          <main className="rail-scroll rail-scroll-auto min-w-0 px-3 pb-3 sm:px-4 sm:pb-4 lg:px-5 lg:pb-5 xl:overflow-y-auto xl:p-0">
-            {info?.role_source === "public" && (
-              <Alert
-                variant="info"
-                className="mb-3 shrink-0 xl:m-0 xl:rounded-none xl:border-x-0 xl:border-t-0"
-              >
-                <div className="flex flex-wrap items-center gap-2">
-                  <span>
-                    Your current role comes from this vault&apos;s public access
-                    policy.
-                  </span>
-                  <Badge variant="info-outline">
-                    <Globe className="h-3 w-3" aria-hidden />
-                    Public {info.role}
-                  </Badge>
-                </div>
-              </Alert>
-            )}
+        {undoTarget && (
+          <div
+            role="status"
+            className="mb-3 flex flex-wrap items-center gap-3 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2"
+          >
+            <CheckCircle2
+              className="h-4 w-4 shrink-0 text-success"
+              aria-hidden
+            />
+            <span className="text-sm text-foreground">
+              Changed {undoTarget.username} from {undoTarget.prev} to{" "}
+              {undoTarget.next}.
+            </span>
+            <Button variant="ghost" size="sm" onClick={handleUndo}>
+              Undo
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="ml-auto"
+              onClick={() => setUndoTarget(null)}
+              aria-label="Dismiss role change message"
+            >
+              <X className="h-4 w-4" aria-hidden />
+            </Button>
+          </div>
+        )}
+        {undoError && (
+          <Alert variant="destructive" className="mb-3">
+            Undo failed: {undoError}
+          </Alert>
+        )}
 
-            {undoTarget && (
-              <div
-                role="status"
-                className="mb-3 flex shrink-0 items-center gap-3 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2"
-              >
-                <CheckCircle2
-                  className="h-4 w-4 shrink-0 text-success"
+        <Panel
+          variant="workspace"
+          role="region"
+          aria-labelledby="members-heading"
+          inset={false}
+          data-testid="members-workspace-frame"
+          className="overflow-hidden"
+        >
+          {(total > FILTER_THRESHOLD || filter) && (
+            <div
+              data-testid="member-roster-controls"
+              className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2.5 @lg/members:px-4"
+            >
+              <div className="relative w-full @md/members:w-72">
+                <Search
+                  className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted"
                   aria-hidden
                 />
-                <span className="text-sm text-foreground">
-                  Changed {undoTarget.username} from {undoTarget.prev} to{" "}
-                  {undoTarget.next}.
+                <Input
+                  type="search"
+                  value={filter}
+                  onChange={(event) => setFilter(event.target.value)}
+                  placeholder="Filter by name or email…"
+                  aria-label="Filter members"
+                  className="bg-surface pl-9"
+                />
+              </div>
+              {filter && (
+                <span className="text-xs text-foreground-muted">
+                  {filtered.length} of {total} members
                 </span>
-                <button
-                  type="button"
-                  onClick={handleUndo}
-                  className="inline-flex min-h-8 items-center rounded-[var(--radius-sm)] text-xs font-medium text-link hover:text-link-hover hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Undo
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setUndoTarget(null)}
-                  aria-label="Dismiss role change message"
-                  className="ml-auto inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <X className="h-4 w-4" aria-hidden />
-                </button>
-              </div>
-            )}
-            {undoError && (
-              <Alert variant="destructive" className="mb-3 shrink-0">
-                Undo failed: {undoError}
-              </Alert>
-            )}
-
-            <Panel
-              variant="workspace"
-              role="region"
-              aria-labelledby="members-heading"
-              inset={false}
-              className="xl:rounded-none xl:border-x-0 xl:border-t-0 xl:shadow-none"
-            >
-              {total > FILTER_THRESHOLD && (
-                <div
-                  data-testid="member-roster-controls"
-                  className="flex min-h-14 items-center justify-between gap-3 border-b border-border bg-surface px-4 py-2.5 lg:px-5"
-                >
-                  <p className="text-xs font-medium text-foreground-muted">
-                    Filter roster
-                  </p>
-                  <div className="relative w-56 max-w-full">
-                    <Search
-                      className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted"
-                      aria-hidden
-                    />
-                    <Input
-                      type="search"
-                      value={filter}
-                      onChange={(event) => setFilter(event.target.value)}
-                      placeholder="Filter members…"
-                      aria-label="Filter members"
-                      className="bg-surface pl-9"
-                    />
-                  </div>
-                </div>
               )}
+            </div>
+          )}
 
-              {error ? (
-                <div className="p-4">
-                  <Alert variant="destructive" title="Failed to load members">
-                    {error}
-                    <div className="mt-3">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => void refresh()}
-                      >
-                        Try again
-                      </Button>
-                    </div>
-                  </Alert>
-                </div>
-              ) : members === null ? (
-                <MemberListSkeleton />
-              ) : members.length === 0 ? (
-                <div className="p-4">
-                  <EmptyState
-                    title="No members on record"
-                    description="Even the owner should appear here. Refresh to try loading the roster again."
-                  />
-                </div>
-              ) : noMatches ? (
-                <div className="p-4">
-                  <EmptyState
-                    title="No matching members"
-                    description={`No member matches "${filter.trim()}".`}
-                  />
-                  <div className="mt-4 flex justify-center">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setFilter("")}
-                    >
-                      Clear filter
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <span className="sr-only" role="status" aria-live="polite">
-                    {filter.trim()
-                      ? `${filtered.length} of ${total} member${total === 1 ? "" : "s"} shown`
-                      : `${total} member${total === 1 ? "" : "s"}`}
-                  </span>
-                  <div className="overflow-x-auto">
-                    <table
-                      aria-label="Vault members"
-                      className="w-full table-fixed border-collapse"
-                    >
-                      <thead className="bg-surface-2/60 text-left text-xs font-medium text-foreground-muted">
-                        <tr className="border-b border-border">
-                          <th
-                            scope="col"
-                            className="px-4 py-2.5 font-medium lg:px-5"
-                          >
-                            Member
-                          </th>
-                          <th
-                            scope="col"
-                            className="hidden w-64 px-4 py-2.5 font-medium md:table-cell lg:px-5"
-                          >
-                            Contact
-                          </th>
-                          <th
-                            scope="col"
-                            className="hidden w-32 px-4 py-2.5 font-medium lg:table-cell lg:px-5"
-                          >
-                            Joined
-                          </th>
-                          <th
-                            scope="col"
-                            className="w-44 px-4 py-2.5 text-right font-medium lg:px-5"
-                          >
-                            Access
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-border">
-                        {filtered.map((member) => {
-                          const isCurrent =
-                            currentUser?.username === member.username;
-                          const canChangeRole =
-                            canManage &&
-                            member.role !== "owner" &&
-                            currentUser &&
-                            !isCurrent;
-                          const showActions =
-                            canManage && member.role !== "owner" && !isCurrent;
-                          return (
-                            <tr
-                              key={member.username}
-                              className="transition-token hover:bg-surface-hover"
-                            >
-                              <td className="min-w-0 px-4 py-3 align-middle lg:px-5">
-                                <div className="flex min-w-0 items-center gap-3">
-                                  <MemberAvatar member={member} />
-                                  <div className="min-w-0">
-                                    <div className="flex min-w-0 flex-wrap items-center gap-2">
-                                      <TooltipText className="truncate text-sm font-semibold text-foreground">
-                                        {member.display_name?.trim() ||
-                                          member.username}
-                                      </TooltipText>
-                                      {isCurrent && (
-                                        <Badge variant="info-outline">
-                                          You
-                                        </Badge>
-                                      )}
-                                    </div>
-                                    <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 text-xs text-foreground-muted">
-                                      <TooltipText className="truncate">
-                                        @{member.username}
-                                      </TooltipText>
-                                      <span className="md:hidden" aria-hidden>
-                                        ·
-                                      </span>
-                                      <TooltipText className="truncate md:hidden">
-                                        {member.email}
-                                      </TooltipText>
-                                      {member.since && (
-                                        <>
-                                          <span
-                                            className="lg:hidden"
-                                            aria-hidden
-                                          >
-                                            ·
-                                          </span>
-                                          <span className="whitespace-nowrap lg:hidden">
-                                            Joined {timeAgo(member.since)}
-                                          </span>
-                                        </>
-                                      )}
-                                    </div>
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="hidden min-w-0 px-4 py-3 align-middle md:table-cell lg:px-5">
-                                <TooltipText className="block truncate text-sm text-foreground-muted">
-                                  {member.email}
-                                </TooltipText>
-                              </td>
-                              <td className="hidden px-4 py-3 align-middle text-xs text-foreground-muted lg:table-cell lg:px-5">
-                                {member.since ? timeAgo(member.since) : "—"}
-                              </td>
-                              <td className="px-4 py-3 align-middle lg:px-5">
-                                <div className="flex items-center justify-end gap-2">
-                                  {canChangeRole ? (
-                                    <RoleSelect
-                                      vault={name}
-                                      member={member}
-                                      onChanged={(previous, next) =>
-                                        handleRoleChanged(
-                                          member,
-                                          previous,
-                                          next,
-                                        )
-                                      }
-                                    />
-                                  ) : (
-                                    <RoleBadge role={member.role} />
-                                  )}
-                                  {showActions && (
-                                    <MemberActionsMenu
-                                      member={member}
-                                      onTransfer={
-                                        canTransfer
-                                          ? () => setPendingTransfer(member)
-                                          : undefined
-                                      }
-                                      onRevoke={() => setPendingRevoke(member)}
-                                    />
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              )}
-            </Panel>
-
-            {!canManage && members && (
-              <Alert variant="info" className="mt-3 shrink-0 xl:m-4">
-                <UserCog className="h-4 w-4" aria-hidden />
-                The roster is read-only for your {info?.role || "current"} role.
-              </Alert>
-            )}
-          </main>
-
-          <aside
-            aria-label="Member access context"
-            className="min-w-0 border-t border-border bg-surface xl:border-l xl:border-t-0"
-          >
-            <div
-              data-testid="member-access-panel"
-              className="border-b border-border-strong bg-surface"
-            >
-              <div
-                data-testid="member-access-header"
-                className="flex h-14 items-center justify-between gap-3 border-b border-border-strong bg-surface-2/55 px-4"
-              >
-                <div className="flex min-w-0 items-center gap-2.5">
-                  <TonalIcon tone="info" size="sm">
-                    <ShieldCheck aria-hidden />
-                  </TonalIcon>
-                  <div className="min-w-0">
-                    <h2 className="text-sm font-semibold text-foreground">
-                      Access model
-                    </h2>
-                    <p className="truncate text-xs text-foreground-muted">
-                      Roles and vault-wide policy
-                    </p>
-                  </div>
-                </div>
-                {info?.role && <RoleBadge role={info.role} />}
-              </div>
-
-              <section
-                aria-labelledby="role-ladder-heading"
-                className="border-b border-border"
-              >
-                <div
-                  data-testid="role-ladder-header"
-                  className="flex min-h-10 items-center justify-between gap-3 border-b border-border-strong bg-surface-2/40 px-4 py-2"
-                >
-                  <h3
-                    id="role-ladder-heading"
-                    className="text-xs font-semibold text-foreground"
+          {error ? (
+            <div className="p-4">
+              <Alert variant="destructive" title="Failed to load members">
+                {error}
+                <div className="mt-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void refresh()}
                   >
-                    Role ladder
-                  </h3>
-                  <span className="text-xs text-foreground-muted">
-                    Highest to lowest
-                  </span>
+                    Try again
+                  </Button>
                 </div>
-                <ol
-                  aria-label="Roles from highest to lowest access"
-                  className="divide-y divide-border"
+              </Alert>
+            </div>
+          ) : members === null ? (
+            <MemberListSkeleton />
+          ) : members.length === 0 ? (
+            <div className="p-4">
+              <EmptyState
+                title="No members on record"
+                description="Even the owner should appear here. Refresh to try loading the roster again."
+              />
+            </div>
+          ) : noMatches ? (
+            <div className="p-4">
+              <EmptyState
+                title="No matching members"
+                description={`No member matches "${filter.trim()}".`}
+              />
+              <div className="mt-4 flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setFilter("")}
                 >
-                  {ROLE_ORDER.map((role) => {
-                    const Icon = ROLE_ICONS[role];
-                    const current = info?.role === role;
+                  Clear filter
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <span className="sr-only" role="status" aria-live="polite">
+                Showing {filtered.length} of {total} member
+                {total === 1 ? "" : "s"}.
+              </span>
+              <table
+                aria-label="Vault members"
+                className="w-full table-fixed border-collapse"
+              >
+                <thead className="border-b border-border bg-surface-2/45 text-left text-xs text-foreground-muted">
+                  <tr>
+                    <th
+                      scope="col"
+                      className="px-3 py-2.5 font-medium @lg/members:px-4"
+                    >
+                      Member
+                    </th>
+                    <th
+                      scope="col"
+                      className="hidden w-32 px-4 py-2.5 font-medium @3xl/members:table-cell"
+                    >
+                      Joined
+                    </th>
+                    <th
+                      scope="col"
+                      className="w-24 px-2 py-0.5 text-right font-medium @lg/members:w-28"
+                    >
+                      <div className="flex items-center justify-end gap-1">
+                        Role
+                        <RolePermissions currentRole={info?.role} />
+                      </div>
+                    </th>
+                    <th scope="col" className="w-12">
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {filtered.map((member) => {
+                    const isCurrent = currentUser?.username === member.username;
+                    const canChangeRole =
+                      canManage &&
+                      member.role !== "owner" &&
+                      currentUser &&
+                      !isCurrent;
                     return (
-                      <li
-                        key={role}
-                        aria-current={current ? "true" : undefined}
-                        className={
-                          current
-                            ? "border-l-2 border-primary bg-surface-selected px-4 py-2.5"
-                            : "border-l-2 border-transparent px-4 py-2.5"
-                        }
+                      <tr
+                        key={member.username}
+                        className="transition-token hover:bg-surface-hover"
                       >
-                        <div className="flex items-start gap-3">
-                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] bg-surface-2 text-foreground-muted">
-                            <Icon className="h-3.5 w-3.5" aria-hidden />
-                          </span>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-sm font-semibold text-foreground">
-                                {ROLE_LABELS[role]}
-                              </span>
-                              {current && (
-                                <Badge variant="owner">Your role</Badge>
-                              )}
-                              <span className="ml-auto text-xs tabular-nums text-foreground-muted">
-                                {roleCounts[role]}
-                              </span>
+                        <td className="min-w-0 px-3 py-3 align-middle @lg/members:px-4">
+                          <div className="flex min-w-0 items-center gap-3">
+                            <span className="hidden @md/members:block">
+                              <MemberAvatar member={member} />
+                            </span>
+                            <div className="min-w-0">
+                              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+                                <span className="min-w-0 break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
+                                  {member.display_name?.trim() ||
+                                    member.username}
+                                </span>
+                                {isCurrent && (
+                                  <Badge variant="info-outline">You</Badge>
+                                )}
+                              </div>
+                              <p className="mt-0.5 break-words text-xs leading-relaxed text-foreground-muted [overflow-wrap:anywhere]">
+                                {member.email || `@${member.username}`}
+                              </p>
                             </div>
-                            <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                              {ROLE_CAPABILITIES[role]}
-                            </p>
                           </div>
-                        </div>
-                      </li>
+                        </td>
+                        <td className="hidden px-4 py-3 align-middle text-xs text-foreground-muted @3xl/members:table-cell">
+                          {member.since ? (
+                            <time
+                              dateTime={member.since}
+                              title={new Date(member.since).toLocaleString()}
+                            >
+                              {timeAgo(member.since)}
+                            </time>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="px-2 py-3 text-right align-middle">
+                          {canChangeRole ? (
+                            <RoleSelect
+                              vault={name}
+                              member={member}
+                              className="min-h-9 min-w-20 justify-center rounded-[var(--radius-sm)] border-border bg-surface text-xs text-foreground hover:bg-surface-hover"
+                              onChanged={(previous, updated) =>
+                                handleRoleChanged(member, previous, updated)
+                              }
+                            />
+                          ) : (
+                            <span className="inline-flex min-w-20 justify-center text-xs font-medium text-foreground">
+                              {ROLE_LABELS[member.role]}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 pr-2 text-right align-middle">
+                          {canChangeRole && (
+                            <MemberActionsMenu
+                              member={member}
+                              onTransfer={
+                                canTransfer
+                                  ? () => setPendingTransfer(member)
+                                  : undefined
+                              }
+                              onRevoke={() => setPendingRevoke(member)}
+                            />
+                          )}
+                        </td>
+                      </tr>
                     );
                   })}
-                </ol>
-              </section>
-
-              <section aria-labelledby="public-access-heading">
-                <div
-                  data-testid="public-access-header"
-                  className="flex min-h-10 items-center justify-between gap-3 border-b border-border-strong bg-surface-2/40 px-4 py-2"
-                >
-                  <h3
-                    id="public-access-heading"
-                    className="text-xs font-semibold text-foreground"
-                  >
-                    Public access
-                  </h3>
-                  <Badge
-                    variant={canChangePublicAccess ? "info-outline" : "outline"}
-                  >
-                    {canChangePublicAccess ? "Editable" : "View only"}
-                  </Badge>
-                </div>
-                <div className="p-4">
-                  <div className="flex min-w-0 items-start gap-3">
-                    <TonalIcon
-                      tone={
-                        info?.public_access === "writer"
-                          ? "warning"
-                          : info?.public_access === "reader"
-                            ? "success"
-                            : "info"
-                      }
-                    >
-                      {policy.Icon === Lock ? (
-                        <Lock className="h-4 w-4" aria-hidden />
-                      ) : (
-                        <Globe className="h-4 w-4" aria-hidden />
-                      )}
-                    </TonalIcon>
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-semibold text-foreground">
-                        {policy.label}
-                      </h4>
-                      <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                        {policy.description}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-                {canChangePublicAccess ? (
-                  <Link
-                    to={`/vault/${name}/settings#access`}
-                    className="flex min-h-10 items-center justify-between gap-3 border-t border-border px-4 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  >
-                    Change in Settings
-                    <ArrowLeft className="h-4 w-4 rotate-180" aria-hidden />
-                  </Link>
-                ) : (
-                  <div className="flex min-h-10 items-start gap-2 border-t border-border bg-surface-2 px-4 py-3 text-xs leading-relaxed text-foreground-muted">
-                    <ShieldCheck
-                      className="mt-0.5 h-3.5 w-3.5 shrink-0"
-                      aria-hidden
-                    />
-                    <span>
-                      {info?.role_source === "public"
-                        ? "Your role comes from this policy; only the vault owner can change it."
-                        : "Only the vault owner can change public access."}
-                    </span>
-                  </div>
-                )}
-              </section>
+                </tbody>
+              </table>
+            </>
+          )}
+          {members && !error && (publicNote || !canManage) && (
+            <div className="space-y-2 border-t border-border px-3 py-3 text-xs leading-relaxed text-foreground-muted @lg/members:px-4">
+              {publicNote && (
+                <p className="flex items-start gap-2">
+                  <Globe className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                  <span>{publicNote}</span>
+                </p>
+              )}
+              {!canManage && (
+                <p className="flex items-start gap-2">
+                  <UserCog className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                  <span>
+                    The roster is read-only for your {info?.role || "current"}{" "}
+                    role.
+                  </span>
+                </p>
+              )}
             </div>
-          </aside>
-        </div>
+          )}
+        </Panel>
       </div>
 
       <InviteMemberDialog
@@ -822,30 +615,74 @@ function MemberListSkeleton() {
   );
 }
 
-function publicPolicy(access: VaultInfo["public_access"]) {
-  if (access === "writer") {
-    return {
-      label: "Public write",
-      summary: "Public write enabled",
-      description:
-        "Any signed-in person with the link can read and change content.",
-      Icon: Globe,
-    };
+function RolePermissions({ currentRole }: { currentRole?: Role }) {
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Role permissions"
+          title="Role permissions"
+          className="h-11 w-11 text-foreground-muted @lg/members:h-9 @lg/members:w-9"
+        >
+          <CircleHelp className="h-4 w-4" aria-hidden />
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <div className="space-y-1.5 pr-6">
+          <DialogTitle>Role permissions</DialogTitle>
+          <DialogDescription>
+            Roles apply across the vault. Highest access first.
+          </DialogDescription>
+        </div>
+        <ol
+          aria-label="Roles from highest to lowest access"
+          className="divide-y divide-border"
+        >
+          {ROLE_ORDER.map((role) => {
+            const Icon = ROLE_ICONS[role];
+            const current = currentRole === role;
+            return (
+              <li
+                key={role}
+                aria-current={current ? "true" : undefined}
+                className="flex items-start gap-3 py-3"
+              >
+                <Icon
+                  className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted"
+                  aria-hidden
+                />
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold">
+                      {ROLE_LABELS[role]}
+                    </span>
+                    {current && <Badge variant="info-outline">Your role</Badge>}
+                  </div>
+                  <p className="mt-1 text-sm text-foreground-muted">
+                    {ROLE_CAPABILITIES[role]}
+                  </p>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function publicAccessNote(info: VaultInfo | null): string | null {
+  if (info?.public_access === "writer") {
+    return info.is_archived || info.is_external_git
+      ? "People not listed here can also read this vault when signed in. Content is read-only."
+      : "People not listed here can also read and change content when signed in.";
   }
-  if (access === "reader") {
-    return {
-      label: "Public read",
-      summary: "Public read enabled",
-      description: "Any signed-in person with the link can read this vault.",
-      Icon: Globe,
-    };
+  if (info?.public_access === "reader") {
+    return "People not listed here can also read this vault when signed in.";
   }
-  return {
-    label: "Private",
-    summary: "Private Vault",
-    description: "Only people listed on this page can open the vault.",
-    Icon: Lock,
-  };
+  return null;
 }
 
 function initialsFor(label: string): string {

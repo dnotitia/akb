@@ -25,6 +25,7 @@ from app.services.role_sync import (
     AUTHENTICATED_ROLE,
     HookMetrics,
     RoleSync,
+    ReconcileReport,
     _is_safe_pg_table_name,
     _public_access_scope,
     user_role_name,
@@ -49,18 +50,26 @@ async def _can_connect(dsn: str) -> bool:
 
 @pytest_asyncio.fixture
 async def pool():
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
-    init_sql = (
-        Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-    ).read_text()
+    from tests.test_boot_schema_serialization_pg import _empty_database
+    async with _empty_database() as dsn:
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+        init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
+        async with pool.acquire() as conn:
+            await conn.execute(init_sql)
+        try:
+            yield pool
+        finally:
+            await pool.close()
+
+
+async def _seed_catalog(pool, *, uid=None, vid=None, owner=None):
     async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    try:
-        yield pool
-    finally:
-        await pool.close()
+        if uid is not None:
+            await conn.execute("INSERT INTO users(id,username,email,password_hash) VALUES($1,$2,$3,'fixture')",
+                               uid, str(uid), f"{uid}@fixture.invalid")
+        if vid is not None:
+            await conn.execute("INSERT INTO vaults(id,name,git_path,owner_id) VALUES($1,$2,'/fixture',$3)",
+                               vid, str(vid), owner)
 
 
 @pytest_asyncio.fixture
@@ -165,6 +174,7 @@ async def test_on_user_create_idempotent(pool, role_sync, cleanup_roles):
     uid = uuid.UUID(f"00000000-0000-0000-0000-{uuid.uuid4().hex[12:24]}")
     role = user_role_name(uid)
     created.append(role)
+    await _seed_catalog(pool, uid=uid)
     # Two consecutive calls — second is a no-op.
     await role_sync.on_user_create(uid)
     await role_sync.on_user_create(uid)
@@ -198,6 +208,7 @@ async def test_on_vault_create_owner_gets_admin(pool, role_sync, cleanup_roles):
         created.append(vault_group_role_name(vid, scope))
     created.append(user_role_name(uid))
 
+    await _seed_catalog(pool, uid=uid, vid=vid, owner=uid)
     await role_sync.on_vault_create(vid, owner_user_id=uid)
 
     async with pool.acquire() as conn:
@@ -224,10 +235,15 @@ async def test_on_grant_clears_other_scopes_on_downgrade(
         created.append(vault_group_role_name(vid, scope))
     created.append(user_role_name(uid))
 
+    await _seed_catalog(pool, uid=uid, vid=vid)
     await role_sync.on_vault_create(vid, owner_user_id=None)
     await role_sync.on_user_create(uid)
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO vault_access(vault_id,user_id,role) VALUES($1,$2,'writer')", vid, uid)
     await role_sync.on_grant(vid, uid, "writer")
-    # Downgrade to reader: writer membership should be revoked.
+    # Downgrade authority before refreshing its derived role projection.
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vault_access SET role='reader' WHERE vault_id=$1 AND user_id=$2", vid, uid)
     await role_sync.on_grant(vid, uid, "reader")
 
     async with pool.acquire() as conn:
@@ -261,6 +277,7 @@ async def test_on_public_access_change_transitions(
     vid = uuid.uuid4()
     for scope in ("reader", "writer", "admin"):
         created.append(vault_group_role_name(vid, scope))
+    await _seed_catalog(pool, vid=vid)
     await role_sync.on_vault_create(vid, owner_user_id=None)
 
     async def auth_has(scope: str) -> bool:
@@ -277,18 +294,26 @@ async def test_on_public_access_change_transitions(
 
     # none → reader → writer → reader → none. Verify the wildcard
     # only holds the target scope at any moment.
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET public_access=$1 WHERE id=$2", "reader", vid)
     await role_sync.on_public_access_change(vid, "reader")
     assert await auth_has("reader")
     assert not await auth_has("writer")
 
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET public_access=$1 WHERE id=$2", "writer", vid)
     await role_sync.on_public_access_change(vid, "writer")
     assert await auth_has("writer")
     assert not await auth_has("reader")
 
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET public_access=$1 WHERE id=$2", "reader", vid)
     await role_sync.on_public_access_change(vid, "reader")
     assert await auth_has("reader")
     assert not await auth_has("writer")
 
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET public_access=$1 WHERE id=$2", "none", vid)
     await role_sync.on_public_access_change(vid, "none")
     assert not await auth_has("reader")
     assert not await auth_has("writer")
@@ -300,7 +325,11 @@ async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles)
     vid = uuid.uuid4()
     roles = [vault_group_role_name(vid, s) for s in ("reader", "writer", "admin")]
     created.extend(roles)
+    await _seed_catalog(pool, vid=vid)
     await role_sync.on_vault_create(vid, owner_user_id=None)
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM pg_roles WHERE rolname=ANY($1::text[])", roles) == 3
+        await conn.execute("DELETE FROM vaults WHERE id=$1", vid)
 
     await role_sync.on_vault_delete(vid)
     async with pool.acquire() as conn:
@@ -331,8 +360,9 @@ async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles
         assert role in diff.missing_user_roles
         assert not diff.is_clean()
 
-        # After reconcile, the same diff is clean again for this user.
-        await role_sync.reconcile_from_catalog()
+        # Repair only this user's creation domain. Full orphan pruning is
+        # cluster-global and is tested separately on an exclusive cluster.
+        await role_sync.on_user_create(uid)
         diff2 = await role_sync.diff_against_catalog()
         assert role not in diff2.missing_user_roles
         assert uid not in [
@@ -434,8 +464,15 @@ async def test_diff_detects_missing_table_grant(pool, role_sync, cleanup_roles):
         assert "SELECT" in hits[0]["missing_privileges"]
         assert not diff2.is_clean()
 
-        # Reconcile should re-apply the GRANT.
-        await role_sync.reconcile_from_catalog()
+        # The table-grant repair domain should re-apply the GRANT without
+        # invoking full cluster-global orphan pruning on a shared test PG.
+        from app.services.role_authority import role_authority_transaction
+        report = ReconcileReport()
+        async with pool.acquire() as conn:
+            async with role_authority_transaction(conn):
+                await role_sync._reconcile_table_grants(conn, report)
+        assert not report.errors
+        assert report.table_grants_applied == 1
         diff3 = await role_sync.diff_against_catalog()
         residual = [
             tg for tg in diff3.missing_table_grants if tg["table"] == pg_name

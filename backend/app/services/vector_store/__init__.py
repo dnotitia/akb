@@ -6,6 +6,9 @@ Public API:
     VectorStoreUnavailable   — driver-side transient failure
     VectorSearchDegraded     — partial search hits with an explicit reason
     get_vector_store()       — factory; selects driver from settings
+    decide_sparse_shape_for_settings()
+                             — settles `auto` for this database before the
+                               store is built (pgvector only)
 
 Drivers (in sibling modules):
     qdrant.QdrantStore       — native RRF via Query API
@@ -19,7 +22,7 @@ re-upsert from PG.
 """
 
 from .base import VectorHit, VectorSearchDegraded, VectorStore, VectorStoreUnavailable
-from .factory import get_vector_store, reset_singleton_for_tests
+from .factory import decide_sparse_shape_for_settings, get_vector_store, reset_singleton_for_tests
 
 __all__ = [
     "VectorStore",
@@ -27,5 +30,6 @@ __all__ = [
     "VectorStoreUnavailable",
     "VectorSearchDegraded",
     "get_vector_store",
+    "decide_sparse_shape_for_settings",
     "reset_singleton_for_tests",
 ]

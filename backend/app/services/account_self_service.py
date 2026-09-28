@@ -5,6 +5,7 @@ import uuid
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, RecoveryAdminProtectedError
@@ -168,16 +169,17 @@ async def delete_account(
     _require_carrier(user)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        snapshot = await _read_user(conn, uid)
-        _require_local_row(snapshot)
-        if snapshot["username"] != confirm_username:
-            raise ConflictError("Account name does not match.", code="account_identity_changed")
-        await _password_attempt(conn, uid)
+        async with role_authority_transaction(conn):
+            snapshot = await _read_user(conn, uid)
+            _require_local_row(snapshot)
+            if snapshot["username"] != confirm_username:
+                raise ConflictError("Account name does not match.", code="account_identity_changed")
+            await _password_attempt(conn, uid)
     if not await verify_password_async(current_password, snapshot["password_hash"]):
         raise AKBError("Current password is incorrect.", 403, code="reauthentication_failed")
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 # Bound lock waits and roll back all effects on ownership/administrator races.
                 await conn.execute("SET LOCAL lock_timeout='5s'")
                 # Existing admin writers already lock the affected user row. Lock all current

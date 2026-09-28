@@ -77,34 +77,33 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
-      # The BM25 index extension, for `tests/test_vchord_sparse_shape_postgres.py`.
-      # Without this service those tests skip — and a skip here reads exactly
-      # like a pass, which is the failure this job's file list already guards
-      # against for a different reason.
-      #
-      # This is the SAME digest `deploy/postgres/Dockerfile` copies the
-      # extension out of, so CI exercises the version an operator building
-      # that image would get. It is the upstream image rather than ours
-      # because a `services:` entry must be pullable, and this one happens to
-      # ship pgvector too (0.8.1) — enough for the `vector` column the shared
-      # DDL creates. It is NOT the production base: that is
-      # `pgvector/pgvector:pg16`, above, at a newer pgvector. Nothing in these
-      # tests reads a vector, so the difference stays inside the DDL.
-      vchord:
-        image: tensorchord/vchord_bm25-postgres:pg16-v0.3.0@sha256:336a1083db7940dbdc1202b71fca2382fb009d35a6bcc27e4258ffc1ea0fd27d
-        env:
-          POSTGRES_USER: akb
-          POSTGRES_PASSWORD: akb  # pragma: allowlist secret
-          POSTGRES_DB: akb
-        ports:
-          - 15433:5432
-        options: >-
-          --health-cmd "pg_isready -U akb"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@v4
+
+      # The BM25 index extension, for the VChord test modules. Without this
+      # server those tests skip — and a skip here reads exactly like a pass,
+      # which is the failure this job's file list already guards against for
+      # a different reason.
+      #
+      # It is the image the install paths build, from deploy/postgres: the
+      # production pgvector base plus vchord_bm25 compiled with the akb#679,
+      # akb#684 and akb#687 fixes. A prebuilt upstream image would test an
+      # extension build that no installation runs, and the one this lane used to
+      # pull has all three defects.
+      #
+      # It runs with the plain `postgres` command, as installations do: no
+      # `shared_preload_libraries`. Without a preload the extension's settings
+      # exist only once a session has called into it, and a preloaded server
+      # hid the failure of every new pooled connection's first search
+      # (akb#615).
+      - name: Build and start the BM25 extension server
+        env:
+          VCHORD_PASSWORD: akb  # pragma: allowlist secret
+        run: |
+          docker build --tag akb-postgres:ci deploy/postgres
+          docker run -d --name vchord -p 15433:5432 \
+            -e POSTGRES_USER=akb -e POSTGRES_PASSWORD="$VCHORD_PASSWORD" -e POSTGRES_DB=akb \
+            akb-postgres:ci postgres
 
       - uses: actions/setup-python@v5
         with:
@@ -142,6 +141,27 @@ jobs:
           asyncio.run(main())
           PY
 
+      # Over TCP: while the image initialises it runs a temporary server on
+      # the Unix socket only, which would answer a socket probe too early.
+      - name: Wait for the BM25 extension server
+        run: |
+          for _ in $(seq 1 60); do
+            docker exec vchord pg_isready -h 127.0.0.1 -U akb -q && exit 0
+            sleep 1
+          done
+          docker logs vchord
+          exit 1
+
+      # Full role pruning is cluster-global: run this oracle before any
+      # other DB fixture creates managed UUID roles on the same service.
+      - name: Run exclusive role-prune namespace oracle
+        working-directory: backend
+        env:
+          AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+          AKB_ROLE_CLUSTER_EXCLUSIVE: '1'
+          REQUIRE_REAL_PG: '1'
+        run: pytest tests/test_role_membership_delta_pg.py -k full_reconcile -v --tb=short
+
       - name: Run pgvector DB-backed e2e tests
         working-directory: backend
         env:
@@ -155,7 +175,7 @@ jobs:
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
-          # The vchord service above. The sparse-shape tests create and drop
+          # The vchord server started above. The sparse-shape tests create and drop
           # their own database on it, so it is a separate server, not a
           # separate database on the one above.
           AKB_VCHORD_TEST_DSN: postgresql://akb:akb@localhost:15433/akb  # pragma: allowlist secret
@@ -255,6 +275,9 @@ jobs:
             tests/test_migration_058_publication_identity_unit.py
             tests/test_migration_107_native_asset_refs_pg.py
             tests/test_boot_schema_serialization_pg.py
+            tests/test_boot_schema_writer_retry_pg.py
+            tests/test_role_membership_delta_pg.py
+            tests/test_role_sync.py
             tests/test_index_order_unit.py
             tests/concurrency/test_alter_unique_race_unit.py
             tests/test_native_revision_reconcile_pg.py
@@ -309,6 +332,9 @@ jobs:
             tests/test_sso_browser_session_postgres.py
             tests/test_sso_session_epoch_upgrade_postgres.py
             tests/test_bm25_corpus_revision_postgres.py
+            tests/test_bm25_recompute_resume_postgres.py
+            tests/test_bm25_vocab_term_ids_postgres.py
+            tests/test_table_column_reserved_words_postgres.py
             tests/test_notifications_postgres.py
             tests/test_notification_native_postgres.py
             tests/test_notification_unwatch_postgres.py
@@ -327,8 +353,18 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_index_build_postgres.py
+            tests/test_vchord_vacuum_postgres.py
             tests/test_vchord_encoding_contract_postgres.py
             tests/test_vchord_external_stats_postgres.py
+            tests/test_bm25_term_id_compaction_postgres.py
+            tests/test_bm25_query_epoch_postgres.py
+            tests/test_hybrid_leg_failure_postgres.py
+            tests/test_bm25_revert_range_postgres.py
+            tests/test_bm25_runtime_reset_postgres.py
+            # Needs both servers: the decision turns on whether the server
+            # provides vchord_bm25.
+            tests/test_sparse_shape_decision_postgres.py
             tests/test_bm25_run_lock.py
           )
           # A truncated list is the failure this step has already had

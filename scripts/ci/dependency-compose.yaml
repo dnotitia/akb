@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+    # The install paths' PostgreSQL (deploy/postgres/Dockerfile), so the runtime
+    # e2e runs the default route: a new database that gets the `vchord` shape.
+    build:
+      context: ../../deploy/postgres
     environment:
       POSTGRES_USER: akb
       POSTGRES_PASSWORD: akb
@@ -16,7 +19,7 @@ services:
       retries: 12
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: ["server", "/data"]
     environment:
       MINIO_ROOT_USER: akb-ci

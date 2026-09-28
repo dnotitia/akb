@@ -291,11 +291,16 @@ authority before the application starts. Docker Compose 2.24.4+ is required.
 Configure an OpenAI-compatible embedding endpoint for dense search; pgvector
 and Qdrant degrade to BM25-only lexical search when embedding is unavailable.
 
+MinIO uses a mirror with the original upstream server digest pinned after
+the Quay image removal.
+Local, evaluation, CI, and all-in-one builds use the same artifact; bucket
+bootstrap and all-in-one builds use the `mc` bundled in that server image.
+
 ```bash
 # 1. Build this checkout's images. For a registry installation, use a backend
 # image pinned as registry.example.com/akb-backend@sha256:... instead.
 docker build -t akb-backend:native-local ./backend
-docker compose -p my-native-install build frontend
+docker compose -p my-native-install build frontend postgres
 export AKB_NATIVE_IMAGE="$(docker image inspect akb-backend:native-local --format '{{.Id}}')"
 export AKB_NATIVE_CONFIG_DIR="$PWD/config/native"
 
@@ -328,6 +333,13 @@ docker compose -p my-native-install \
 
 open http://localhost:3000
 ```
+
+To upgrade, update the checkout and repeat step 1 before step 3. `up --no-build`
+never builds, so it cannot pick up what the new checkout builds (`frontend`,
+`postgres`): a missing image makes it fail, and an old one keeps running. On the
+upgrade that turned PostgreSQL into a built image, skipping step 1 stops the API
+(`backend`) and then fails with `No such image: my-native-install-postgres:latest`,
+which leaves the API down.
 
 The local image ID pins the locally built bytes; it is not a registry digest.
 For distributed installs, build/push first and use the registry digest for
@@ -489,10 +501,12 @@ Hybrid search (dense + BM25 sparse, RRF-fused) runs through a driver
 interface. Five drivers ship; pick at config time:
 
 - **`pgvector`** (default) — uses the same Postgres container that holds
-  application data. The pgvector/pgvector image pre-installs the
-  extension; the driver creates a separate `vector_index` schema, so the
-  main `chunks` table stays plain PostgreSQL. RRF fusion runs
-  application-side. No external service to operate.
+  application data. The install paths build that container's image from
+  `deploy/postgres/Dockerfile`: pgvector plus the `vchord_bm25` BM25 index,
+  which gives a new database the default `vchord` sparse shape. The driver
+  creates a separate `vector_index` schema, so the main `chunks` table stays
+  plain PostgreSQL. RRF fusion runs application-side. No external service to
+  operate.
 - **`qdrant`** — runs a separate Qdrant container; native RRF via the
   Query API. Useful when you already operate Qdrant or want to scale
   the vector store independently of Postgres.

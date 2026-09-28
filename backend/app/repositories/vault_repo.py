@@ -6,6 +6,7 @@ import uuid
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.exceptions import VaultNameUnavailableError
 
 
@@ -65,10 +66,12 @@ class VaultRepository:
         args = (vault_id, name, description, git_path, owner_id, public_access)
         try:
             if conn is not None:
-                await conn.execute(sql, *args)
+                async with role_authority_transaction(conn):
+                    await conn.execute(sql, *args)
             else:
                 async with self.pool.acquire() as acq:
-                    await acq.execute(sql, *args)
+                    async with role_authority_transaction(acq):
+                        await acq.execute(sql, *args)
         except asyncpg.UniqueViolationError as exc:
             # The database is the final authority for globally unique Vault
             # names.  Mapping here keeps standard, native, external-git, REST,

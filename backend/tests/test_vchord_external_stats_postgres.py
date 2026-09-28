@@ -14,6 +14,7 @@ from collections import Counter
 import asyncpg
 import pytest
 
+from app.db.postgres import _load_migration
 from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
 
@@ -49,6 +50,8 @@ async def _database(monkeypatch):
                     updated_at timestamptz NOT NULL DEFAULT now()
                 );
             """)
+            # The numbering the encoder reports its ids in (akb#687).
+            await _load_migration("113_bm25_vocab_epoch.py").migrate(conn)
         async def get_pool():
             return pool
         monkeypatch.setattr(sparse_encoder, "get_pool", get_pool)

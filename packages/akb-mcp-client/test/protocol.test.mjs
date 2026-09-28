@@ -391,10 +391,44 @@ async function testGenerationMixingIsFailClosed() {
   assert.equal(legacyHandshake.error.code, -32022);
 }
 
+async function testLocalToolRefusalsAreFlaggedAsErrors() {
+  // The proxy answers its file tools itself. Their refusals carry the same
+  // {"error", ...} body the backend sends, and the same isError flag with it.
+  const legacyInit = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "l", version: "1" } },
+  };
+  const putFile = (id) => ({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "akb_put_file", arguments: { vault: "v", file_path: "/nonexistent/akb-proxy-test.bin" } },
+  });
+
+  const failing = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  failing._startBackendMonitor = () => {};
+  failing._fileToolSkillPreflight = async () => null;
+  await failing._handle(legacyInit);
+  const failed = await failing._handle(putFile(2));
+  assert.equal(failed.result.isError, true);
+  assert.match(JSON.parse(failed.result.content[0].text).error, /not found/i);
+
+  const guided = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  guided._startBackendMonitor = () => {};
+  guided._fileToolSkillPreflight = async () => ({ ack_token: "challenge", body: "guide" });
+  await guided._handle(legacyInit);
+  const required = await guided._handle(putFile(3));
+  assert.equal(required.result.isError, true);
+  assert.equal(JSON.parse(required.result.content[0].text).code, "vault_skill_required");
+}
+
 await testModernDegradedProcessWithExternalParser();
 await testModernReachableProcessWithExternalParser();
 await testModernProcess();
 await testLegacyProcess();
 await testLegacyBackendFallback();
 await testGenerationMixingIsFailClosed();
+await testLocalToolRefusalsAreFlaggedAsErrors();
 console.log("  ✓ stdio modern and legacy processes preserve their client surfaces");

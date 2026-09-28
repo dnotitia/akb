@@ -88,7 +88,7 @@ function SearchLocationProbe() {
 }
 
 describe("SearchPage · semantic (dense) mode", () => {
-  it("uses a full-height two-row command workspace with a stable results ledger", async () => {
+  it("separates the query, refinement rail and readable results workspace", async () => {
     const user = userEvent.setup();
     renderAt("/search");
 
@@ -102,14 +102,13 @@ describe("SearchPage · semantic (dense) mode", () => {
       "max-w-none",
       "overflow-hidden",
     );
-    expect(commandHeader).toHaveClass("flex", "min-h-14");
+    expect(commandHeader).toHaveClass("flex");
     expect(workspace.contains(commandHeader)).toBe(true);
     expect(workspace.contains(suggestions)).toBe(true);
     expect(screen.getByRole("group", { name: "Search mode" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Search results" })).toBeTruthy();
     expect(screen.getByTestId("search-tool-row")).toHaveClass(
       "min-h-10",
-      "border-t",
     );
     expect(screen.getByTestId("search-scope-row")).toHaveClass(
       "flex-1",
@@ -119,19 +118,33 @@ describe("SearchPage · semantic (dense) mode", () => {
       "flex-1",
       "overflow-y-auto",
     );
+    expect(screen.getByRole("complementary", { name: "Search refinements" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Tables", pressed: false })).toBeTruthy();
     await user.click(
-      screen.getByRole("button", { name: "Filter by document type" }),
+      screen.getByRole("button", { name: "More filters" }),
     );
     expect(
       screen.getByRole("complementary", { name: "Search filters" }),
     ).toBeTruthy();
   });
 
+  it("offers All as the content-kind reset without changing the query", async () => {
+    mockedSearch.mockResolvedValue({ query: "postgres", total: 0, returned: 0, total_matches: 0, results: [] });
+    const user = userEvent.setup();
+    renderAt("/search?q=postgres&source=table&v=engineering");
+    await screen.findByRole("button", { name: "Tables", pressed: true });
+    await user.click(screen.getByRole("button", { name: "All" }));
+    expect(screen.getByRole("searchbox", { name: "Search query" })).toHaveValue("postgres");
+    expect(screen.getByRole("button", { name: "All", pressed: true })).toBeInTheDocument();
+    await waitFor(() => expect(mockedSearch).toHaveBeenLastCalledWith("postgres", ["engineering"], 25, expect.objectContaining({ source_type: undefined })));
+  });
+
   it("calls searchDocs on initial render with ?q and renders a hit", async () => {
     mockedSearch.mockResolvedValue({
       query: "postgres",
       total: 1,
-      returned: 1,
+      // Exercise a legacy response outside the current strict API type.
+      returned: undefined as unknown as number,
       total_matches: 1,
       results: [
         {
@@ -149,6 +162,7 @@ describe("SearchPage · semantic (dense) mode", () => {
       expect(mockedSearch).toHaveBeenCalledWith("postgres", [], 25, expect.any(Object)),
     );
     expect(await screen.findByText("PostgreSQL tuning")).toBeTruthy();
+    expect(screen.getByText("1 top result loaded")).toBeTruthy();
     expect(screen.getByText("Top match")).toBeTruthy();
     expect(screen.queryByText("91%")).toBeNull();
     expect(mockedGrep).not.toHaveBeenCalled();

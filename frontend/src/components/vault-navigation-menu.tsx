@@ -30,9 +30,11 @@ export function VaultSectionNavigation({ vault }: { vault: string }) {
 }
 
 const linkLayout = "inline-flex h-11 items-center gap-1.5 whitespace-nowrap px-2 text-sm lg:h-10";
+// Padding includes the management divider, so overflow measures its real width.
+const managementStartLayout = "pl-5 before:absolute before:left-1 before:top-1/2 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border-strong";
 
 function VaultNavigationLinks({ vault, route }: { vault: string; route: string }) {
-  const actions = getVaultPageActions(vault);
+  const actions = getVaultPageActions(vault).filter(action => action.key !== "search");
   const { requestNavigation } = useResourceNavigation();
   const navRef = useRef<HTMLElement>(null);
   const measureRef = useRef<HTMLDivElement>(null);
@@ -103,10 +105,10 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) event.stopPropagation();
         } : undefined}
         data-vault-destination={action.key}
-        aria-label={action.key === "search" ? "Search this vault" : label}
+        aria-label={label}
         aria-current={active ? "page" : undefined}
         className={cn(
-          inMenu ? "flex min-h-11 items-center gap-2 rounded-[var(--radius-sm)] px-3 text-sm outline-none data-[highlighted]:bg-surface-hover" : cn(linkLayout, "relative min-w-0 shrink transition-token hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", !overflow.length && action.key === "members" && "@min-[42rem]/vault-content:ml-auto"),
+          inMenu ? "flex min-h-11 items-center gap-2 rounded-[var(--radius-sm)] px-3 text-sm outline-none data-[highlighted]:bg-surface-hover" : cn(linkLayout, "relative min-w-0 shrink transition-token hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", action.key === "members" && managementStartLayout),
           active
             ? "font-semibold text-link after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:bg-link"
             : "font-medium text-foreground-muted hover:text-link",
@@ -119,18 +121,19 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
   };
 
   return (
+    <div className={cn("@container/vault-navigation relative flex h-11 min-w-0 shrink-0 items-center gap-2 px-3 lg:h-10", route === sectionPaths.search ? "bg-surface" : "bg-background")}>
+    <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 border-b border-border" />
     <nav
       ref={navRef}
       aria-label="Vault sections"
       data-slot="vault-section-navigation"
-      className="relative flex h-11 min-w-0 shrink-0 items-center gap-1 bg-surface px-3 lg:h-10 lg:px-5"
+      className="relative flex h-full min-w-0 flex-1 items-center gap-1"
     >
-      <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 border-b border-border" />
       {actions.filter((_, index) => visible.includes(index)).map(action => renderLink(action))}
       {!!overflow.length && <DropdownMenu.Root modal={false} open={open} onOpenChange={value => { if (value) followedLinkRef.current = false; setOpen(value); }}>
         <DropdownMenu.Trigger asChild>
           <Button ref={moreRef} type="button" variant="ghost" aria-label="More vault pages"
-            className={cn(linkLayout, "ml-auto shrink-0 rounded-[var(--radius-sm)] text-foreground-muted data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground")}>
+            className={cn(linkLayout, "shrink-0 rounded-[var(--radius-sm)] text-foreground-muted data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground")}>
             More<ChevronDown className="h-4 w-4" aria-hidden />
           </Button>
         </DropdownMenu.Trigger>
@@ -146,10 +149,11 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
           after font loading and text scaling. They never enter the tab order. */}
       <div aria-hidden inert className="pointer-events-none invisible absolute inset-x-0 top-0 h-0 overflow-hidden">
       <div ref={measureRef} className="flex w-max gap-1">
-        {actions.map(action => <span key={action.key} className={cn(linkLayout, "shrink-0 font-semibold")}><action.icon className="h-4 w-4 shrink-0" />{labelFor(action)}</span>)}
+        {actions.map(action => <span key={action.key} className={cn(linkLayout, "relative shrink-0 font-semibold", action.key === "members" && managementStartLayout)}><action.icon className="h-4 w-4 shrink-0" />{labelFor(action)}</span>)}
         <span className={cn(linkLayout, "shrink-0 font-medium")}>More<ChevronDown className="h-4 w-4" /></span>
       </div>
       </div>
     </nav>
+    </div>
   );
 }

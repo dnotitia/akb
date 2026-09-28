@@ -573,6 +573,8 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
 
     store = get_vector_store()
     vs_info: dict = {"reachable": await store.health()}
+    if settings.vector_store_driver == "pgvector":
+        vs_info["sparse_shape"] = settings.sparse_shape_snapshot()
     try:
         vs_info["backfill"] = await embed_worker.pending_stats()
     except Exception as e:  # noqa: BLE001

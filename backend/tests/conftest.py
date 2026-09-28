@@ -36,6 +36,11 @@ if not _BACKEND_APP_YAML.exists() and _EXAMPLE_APP_YAML.exists():
     # Collection exercises legacy Git services. Pin only this import fixture;
     # Settings defaults and isolated Native subprocess tests stay untouched.
     bootstrap_config["document_revision_backend"] = "bare_git"
+    # The example says `auto`, which startup decides against a database before
+    # building the vector store; importing for collection starts none. Tests
+    # that read the process-global shape get a named one, and the tests of
+    # `auto` build their own Settings.
+    bootstrap_config["vector_store_sparse_shape"] = "posting"
     bootstrap_config["local_session_private_key_path"] = str(
         _BACKEND_LOCAL_KEY_DIR / "private.pem"
     )

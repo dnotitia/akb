@@ -91,6 +91,10 @@ class _FakeConn:
         self._vault_name = vault_name
         self._taken = taken
 
+    async def execute(self, query, *args):
+        assert "pg_advisory_xact_lock" in query
+        assert args == ("akb:role-sync:reconcile",)
+
     def transaction(self, **kwargs):
         # create_table pins isolation="read_committed"
         return _AsyncCtx()
@@ -257,7 +261,7 @@ async def _can_connect(dsn: str) -> bool:
     return True
 
 
-async def test_cross_vault_fusion_end_to_end_pg():
+async def test_cross_vault_fusion_end_to_end_pg(monkeypatch):
     if not await _can_connect(_DSN):
         pytest.skip(f"Postgres not reachable at {_DSN}")
     admin = await asyncpg.connect(_DSN)
@@ -266,10 +270,14 @@ async def test_cross_vault_fusion_end_to_end_pg():
     try:
         base, _ = _DSN.rsplit("/", 1)
         import app.db.postgres as pgmod
+        from app.config import settings
         from app.services import role_sync as role_sync_mod
 
         old_pool, old_rs = pgmod._pool, role_sync_mod._role_sync
         pool = await asyncpg.create_pool(dsn=f"{base}/{dbname}", min_size=1, max_size=4)
+        # init_db uses a dedicated migration pool as well as the injected main
+        # pool. Both must target the disposable fixture database.
+        monkeypatch.setattr(type(settings), "asyncpg_dsn", property(lambda _settings: f"{base}/{dbname}"))
         pgmod._pool = pool
         try:
             await pgmod.init_db()  # real boot path: init.sql + migrations

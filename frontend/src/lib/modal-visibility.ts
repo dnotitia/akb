@@ -24,3 +24,10 @@ const subscribe = (listener: () => void) => {
 export function useModalOpen() {
   return useSyncExternalStore(subscribe, isModalOpen, () => false);
 }
+
+// Supporting inspectors need nested open/close transitions even when their
+// parent reader is already a modal (the boolean snapshot stays true there).
+const modalCount = () => openModals.size;
+export function useModalCount() {
+  return useSyncExternalStore(subscribe, modalCount, () => 0);
+}

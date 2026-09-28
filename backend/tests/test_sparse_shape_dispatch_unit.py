@@ -21,19 +21,24 @@ from typing import get_args
 import pytest
 
 from app.config import Settings
-from app.services.sparse_shapes import SPARSE_SHAPES, SparseShape
+from app.services.sparse_shapes import SPARSE_SHAPES, SparseShape, SparseShapeSetting
 from app.services.vector_store import pgvector
 
 
 def test_the_members_are_declared_once():
-    """The setting and the driver argument read the same type, not two copies."""
+    """The setting and the driver argument read the same shapes, not two copies.
+
+    The setting accepts exactly one value more than the driver: `auto`, which
+    startup turns into a shape before any store is built. Anything else the
+    setting accepted and the driver did not would be a value with no branch."""
     assert SPARSE_SHAPES == get_args(SparseShape)
     field = Settings.model_fields["vector_store_sparse_shape"]
     # Equality, not identity — and deliberately, because identity cannot tell
     # the two apart. `typing` caches `Literal`, so a restated
     # `Literal["posting", "arrays"]` IS the shared object. What this catches is
     # the thing that actually hurts: the two disagreeing about members.
-    assert get_args(field.annotation) == get_args(SparseShape), (
+    assert field.annotation is SparseShapeSetting
+    assert get_args(field.annotation) == ("auto", *get_args(SparseShape)), (
         "설정과 드라이버가 서로 다른 멤버를 보고 있다 — 한쪽에 더하면 "
         "다른 쪽은 조용히 폴백한다"
     )
@@ -110,3 +115,59 @@ def test_driver_and_sampler_agree_on_the_relations_a_shape_creates(shape, monkey
         f"{'만든다' if creates_posting else '안 만든다'} 는데 "
         f"sampler 는 {'센다' if 'posting' in counted else '안 센다'}"
     )
+
+
+async def test_the_posting_weights_kept_under_vchord_are_the_ones_posting_writes(monkeypatch):
+    """A way back must serve what `posting` would have written (akb#615).
+
+    While the rollback is retained, the vchord shape keeps `posting` current
+    from the raw term frequencies it already encoded, rather than tokenizing a
+    second time. That is only a way back if those weights are the ones the
+    posting shape writes for the same text."""
+    from app.services import sparse_encoder
+
+    async def tokenize(text):
+        return ["a", "b", "b", "c", "c", "c"]
+
+    async def term_ids(terms):
+        return {t: i for i, t in enumerate(sorted(terms), start=10)}
+
+    async def stats():
+        return {"total_docs": 100, "avgdl": 4.0, "k1": 1.2, "b": 0.75}
+
+    monkeypatch.setattr(sparse_encoder, "tokenize", tokenize)
+    monkeypatch.setattr(sparse_encoder, "get_or_create_term_ids", term_ids)
+    monkeypatch.setattr(sparse_encoder, "load_stats", stats)
+
+    posting_ids, posting_weights = await sparse_encoder.encode_document("x", sparse_shape="posting")
+    raw_ids, raw_tfs = await sparse_encoder.encode_document("x", sparse_shape="vchord")
+
+    assert raw_ids == posting_ids
+    assert await sparse_encoder.saturate_for_posting(raw_tfs) == pytest.approx(posting_weights)
+
+
+@pytest.mark.parametrize(
+    ("shape", "mode", "keeps"),
+    [
+        ("vchord", "required", True),
+        ("vchord", "vchord_only_verified", False),
+        ("posting", "required", False),
+    ],
+)
+def test_vchord_gets_posting_weights_only_while_the_way_back_is_retained(
+    shape, mode, keeps, monkeypatch,
+):
+    """`required` keeps posting's statistics for a rollback; the rows follow it."""
+    from app.config import settings
+    from app.services import sparse_encoder
+    from app.services.vector_store import factory
+
+    monkeypatch.setattr(settings, "vector_store_driver", "pgvector")
+    monkeypatch.setattr(settings, "vector_store_sparse_shape", shape)
+    monkeypatch.setattr(settings, "bm25_external_stats_mode", mode)
+    factory.reset_singleton_for_tests()
+    try:
+        store = factory.get_vector_store()
+        assert (store._posting_weights is sparse_encoder.saturate_for_posting) is keeps
+    finally:
+        factory.reset_singleton_for_tests()

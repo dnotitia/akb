@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ValidationError
@@ -412,7 +413,7 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
 async def _process_target(target: dict[str, Any]) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             await conn.fetchval("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"app-installation-rollout:{target['installation_id']}")
             ok, reason = await _preflight_target(conn, target)
             if not ok:

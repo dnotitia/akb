@@ -23,10 +23,13 @@
 
 services:
   postgres:
-    # pgvector/pgvector image ships with the `vector` extension
-    # pre-installed, so the same container serves as both the main
-    # app DB and the vector store (under a separate schema).
-    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+    # Built here from deploy/postgres/Dockerfile: the pinned pgvector image plus
+    # the vchord_bm25 BM25 index extension. The same container serves as both
+    # the main app DB and the vector store (under a separate schema), and a new
+    # database gets the default `vchord` sparse shape. Building it locally is
+    # use of the extension, not distribution (see the Dockerfile's licensing note).
+    build:
+      context: deploy/postgres
     environment:
       POSTGRES_DB: akb
       POSTGRES_USER: akb
@@ -43,7 +46,7 @@ services:
     # S3-compatible object store for vault file uploads. Without this,
     # `akb_put_file` / file e2e suites can't run locally — they get
     # routed to a non-existent endpoint and silently 0-out.
-    image: minio/minio:latest
+    image: icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --address :9000 --console-address :9001
     environment:
       MINIO_ROOT_USER: akb-local
@@ -63,10 +66,18 @@ services:
   # exits — no long-lived sidecar. Backend brings up after this finishes
   # so the bucket is guaranteed present on first request.
   minio-bootstrap:
-    image: minio/mc:latest
+    image: icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      # `minio` is a bare Compose service name, so no ambient no_proxy list
+      # contains it. On a host with HTTP_PROXY set, mc honours it, and the
+      # bucket bootstrap fails with the proxy's error page wearing mc's
+      # message -- the same trap deploy/keycloak-dev/broker-chain/run.sh
+      # already names its hosts explicitly to avoid.
+      no_proxy: minio,localhost,127.0.0.1
+      NO_PROXY: minio,localhost,127.0.0.1
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 akb-local akb-local-secret &&

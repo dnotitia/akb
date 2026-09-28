@@ -69,8 +69,13 @@ class _AsyncCtx:
 
 
 class _FakeConn:
-    def transaction(self):
+    def transaction(self, *, isolation=None):
+        assert isolation in (None, "read_committed")
         return _AsyncCtx()
+
+    async def execute(self, query, *args):
+        assert "pg_advisory_xact_lock" in query
+        assert args == ("akb:role-sync:reconcile",)
 
 
 class _FakePool:

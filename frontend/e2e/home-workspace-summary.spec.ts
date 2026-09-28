@@ -60,6 +60,56 @@ async function fixture(page: Page, dark = false) {
   return state;
 }
 
+async function expectPaperHome(page: Page) {
+  const surfaces = await page.evaluate(() => {
+    const header = document.querySelector("header")!;
+    const sidebar = document.querySelector("aside")!;
+    let canvas: Element | null = document.querySelector("main");
+    while (canvas && ["transparent", "rgba(0, 0, 0, 0)"].includes(getComputedStyle(canvas).backgroundColor)) {
+      canvas = canvas.parentElement;
+    }
+    return {
+      header: getComputedStyle(header).backgroundColor,
+      sidebar: getComputedStyle(sidebar).backgroundColor,
+      canvas: canvas && getComputedStyle(canvas).backgroundColor,
+      divider: getComputedStyle(header).borderBottomWidth,
+      height: header.getBoundingClientRect().height,
+    };
+  });
+  expect(surfaces.header, "Home header should connect to the paper surface").toBe(surfaces.sidebar);
+  expect(surfaces.canvas, "Home canvas should retain the same paper surface").toBe(surfaces.sidebar);
+  expect(surfaces.divider).toBe("1px");
+  expect(surfaces.height).toBe(56);
+}
+
+for (const width of [375, 2560]) for (const dark of [false, true]) {
+  test(`Home paper surface stays stable through session loading at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    const state = await fixture(page, dark);
+    let release!: () => void;
+    state.authGate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await page.goto("/");
+      await expect(page.getByRole("status", { name: "Verifying session", exact: true })).toBeVisible();
+      await expectPaperHome(page);
+      await page.screenshot({ path: testInfo.outputPath("home-loading.png"), fullPage: true });
+    } finally {
+      state.authGate = null;
+      release();
+    }
+    await expect(page.getByRole("region", { name: "Workspace summary" })).toContainText("1,284");
+    await expectPaperHome(page);
+    if (width >= 1024) {
+      await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
+      await expect(page.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "true");
+      await expectPaperHome(page);
+      await page.getByRole("button", { name: "Expand sidebar", exact: true }).click();
+      await expectPaperHome(page);
+    }
+  });
+}
+
 for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
   test(`Home summary and connection ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: width === 768 ? 375 : 1000 });
@@ -69,6 +119,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     const totals = page.getByRole("region", { name: "Workspace summary" });
     await expect(totals).toContainText("1,284");
     await expect(totals).toContainText("20");
+    await expectPaperHome(page);
     await expect(totals.getByText("Available to you", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "View all vaults", exact: true })).toBeVisible();
     const invitation = page.getByTestId("home-connection-invitation");
@@ -150,8 +201,8 @@ test("Transparent notifications and global search suspend floating chrome", asyn
   await expect(invitation).toBeHidden();
   await page.keyboard.press("Escape");
   await expect(invitation).toBeVisible();
-  await page.getByRole("button", { name: /Search knowledge/ }).click();
-  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  await expect(page.getByTestId("global-search-dialog")).toBeVisible();
   await expect(invitation).toBeHidden();
   await page.keyboard.press("Escape");
   await expect(invitation).toBeVisible();

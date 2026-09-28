@@ -200,6 +200,81 @@ def test_demo_yaml_preserves_values_and_mounted_overrides(tmp_path, demo_env):
     assert app["rerank_enabled"] is False
 
 
+def _native_stack_builds(tmp_path) -> set[str]:
+    """The services the Native Compose stack builds rather than pulls."""
+    import json
+    import os
+
+    env = {
+        **os.environ,
+        "AKB_NATIVE_IMAGE": "registry.example.com/akb-backend@sha256:" + "0" * 64,
+        "AKB_NATIVE_CONFIG_DIR": str(tmp_path),
+    }
+    rendered = json.loads(subprocess.check_output(
+        ["docker", "compose", "-p", "akb-contract",
+         "-f", str(ROOT / "docker-compose.yaml"), "-f", str(ROOT / "docker-compose.native.yaml"),
+         "config", "--format", "json"],
+        text=True, env=env,
+    ))
+    return {name for name, service in rendered["services"].items() if "build" in service}
+
+
+def _paragraph(text: str, anchor: str) -> str:
+    """The blank-line-separated paragraph of `text` that contains `anchor`."""
+    found = [p for p in text.split("\n\n") if anchor in p]
+    assert len(found) == 1, f"{anchor!r}: {len(found)} paragraphs"
+    return found[0]
+
+
+def test_every_instruction_before_up_no_build_builds_what_the_stack_builds(tmp_path):
+    """`up --no-build` never builds, so an instruction that ends in it must build first.
+
+    When PostgreSQL moved from a pulled image to a built one, an installation
+    that followed its own upgrade instructions (`up -d --no-build`) had Compose
+    stop the API and then fail with `No such image`. And once an image exists,
+    `--no-build` keeps running it after the checkout changes. So each place that
+    tells an operator to run `up --no-build`, for a new installation and for an
+    upgrade, must carry a `docker compose ... build` command naming every
+    service the rendered stack builds.
+    """
+    import re
+
+    if not shutil.which("docker"):
+        pytest.skip("Docker Compose required")
+    built = _native_stack_builds(tmp_path)
+    assert "postgres" in built, built
+
+    def builds(text: str) -> set[str]:
+        """The services named by `docker compose -p <project> build` commands in `text`.
+
+        The project is required: built under another project name, an image
+        does not answer that project's `up --no-build`.
+        """
+        return {name for names in re.findall(r"docker compose -p \S+ build ((?:[a-z-]+ ?)+)", text)
+                for name in names.split()}
+
+    readme = (ROOT / "README.md").read_text()
+    native = (ROOT / "docs/operations/native-installation.md").read_text()
+    compose = (ROOT / "deploy/compose/README.md").read_text()
+    step_1 = _paragraph(readme, "docker compose -p my-native-install build")
+    assert "repeat step 1" in _paragraph(readme, "To upgrade, update the checkout")  # step 1 is the build
+    header = (ROOT / "docker-compose.native.yaml").read_text().split("\nservices:", 1)[0]
+    instructions = {
+        "README step 1": step_1,
+        # The backend stack's command, and the frontend the complete stack adds.
+        "Native guide, new installation": _paragraph(native, "docker compose -p my-native-install build postgres\n")
+        + _paragraph(native, "For the complete local\nstack"),
+        "Native guide, upgrade": _paragraph(native, "On upgrades, update `AKB_NATIVE_IMAGE`"),
+        "Compose README": _paragraph(compose, "`up --no-build` for the complete stack"),
+        "Native overlay header": header,
+    }
+    for where, text in instructions.items():
+        missing = sorted(built - builds(text))
+        assert not missing, f"{where}: no build of {missing}"
+    # The base stack's upgrade must rebuild too: a plain `up -d` keeps an old image.
+    assert "up -d --build" in _paragraph(compose, "PostgreSQL is built from `deploy/postgres`")
+
+
 @pytest.mark.parametrize("filename", ["app.yaml", "secret.yaml"])
 def test_demo_rejects_infrastructure_override_without_exposing_value(tmp_path, demo_env, filename):
     (tmp_path / filename).write_text("db_password: do-not-print-this\n")

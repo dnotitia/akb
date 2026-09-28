@@ -128,9 +128,9 @@ if err:
     msg = err.get("message", "jsonrpc-error") if isinstance(err, dict) else str(err)
     print("ERR:" + str(msg)); sys.exit(0)
 res = d.get("result") or {}
-if res.get("isError"):
-    print("ERR:" + str(res)); sys.exit(0)
-# tools/call wraps the actual return in result.content[0].text (json string)
+# tools/call wraps the actual return in result.content[0].text (json string).
+# Read the AKB error envelope first, so a refusal classifies by its message
+# whether or not the result also sets isError (akb#675).
 try:
     txt = res["content"][0]["text"]
     obj = json.loads(txt)
@@ -138,6 +138,8 @@ try:
         print("ERR:" + str(obj["error"])); sys.exit(0)
 except Exception:
     pass
+if res.get("isError"):
+    print("ERR:" + str(res)); sys.exit(0)
 print("OK")
 '
 }

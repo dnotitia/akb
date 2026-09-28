@@ -345,19 +345,26 @@ vector_store_driver: pgvector
 vector_store_dsn: ""
 vector_store_schema: vector_index
 # Sparse-vector storage shape inside vector_index.chunks.
-#   posting  — separate (term_id, chunk_id, weight) table, GIN-indexed.
-#              Faster sparse queries at scale; slightly more storage.
-#              Default and recommended.
+#   auto     — the default. Decided once per database at startup and recorded
+#              in vector_index.install_state: a database that already serves a
+#              shape keeps it; a new one gets vchord where the server provides
+#              the vchord_bm25 extension to AKB's role, posting otherwise.
+#              /health reports it under vector_store.sparse_shape.
+#   vchord   — raw TF in bm25vector, scored by a VectorChord-BM25 index.
+#              Needs the extension (deploy/postgres/README.md). Moving a
+#              database that serves posting here is scripts/backfill_bm25_vector.py.
+#   posting  — separate (term_id, chunk_id, weight) table with application
+#              BM25 weights. What a server without the extension gets.
 #   arrays   — sparse_terms BIGINT[] + sparse_weights REAL[] columns
-#              on the chunks row. Compact; slower at >100k rows.
-#   vchord   — raw TF in bm25vector, scored using VectorChord-BM25 index stats.
-#              Requires the extension and a validated index/backfill transition.
-vector_store_sparse_shape: posting
-# Preserve external statistics for serving, mixed deployments and posting rollback.
-# Only set vchord_only_verified after verifying ALL API/worker readers and writers
-# use pgvector/vchord, with no external-statistics consumer or posting rollback.
-# This does not disable stable bm25_vocab term ID registration.
-bm25_external_stats_mode: required
+#              on the chunks row. Bench harness only.
+vector_store_sparse_shape: auto
+# External N/avgdl/df for posting, arrays, pre-baked drivers and a posting table
+# kept as the way back from vchord. auto (the default) keeps them wherever one of
+# those exists; a vchord database with no posting table has no reader, so nothing
+# recomputes them. required keeps them regardless. vchord_only_verified states
+# that a posting table may go stale and needs an explicit vchord. None of these
+# disables stable bm25_vocab term ID registration.
+bm25_external_stats_mode: auto
 
 # Qdrant-driver settings (ignored when driver is pgvector).
 # Set vector_url to your Qdrant endpoint (e.g. http://qdrant:6333)

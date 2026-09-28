@@ -54,7 +54,8 @@ class _FakeConn:
         # (vault_id, user_id) -> role
         self.access: dict[tuple, str] = {}
 
-    def transaction(self):
+    def transaction(self, *, isolation=None):
+        assert isolation in (None, "read_committed")
         return _FakeTransaction()
 
     async def fetchval(self, query: str, *args):
@@ -96,7 +97,9 @@ class _FakeConn:
     async def execute(self, query: str, *args):
         q = " ".join(query.split())
         self.executed.append((q, args))
-        if q.startswith("INSERT INTO vault_access_contributions"):
+        if q.startswith("UPDATE vaults SET owner_id"):
+            self.vault_owner = args[0]
+        elif q.startswith("INSERT INTO vault_access_contributions"):
             self.contributions[(args[1], args[2], args[4])] = args[3]
         elif q.startswith("INSERT INTO vault_access "):
             self.access[(args[1], args[2])] = args[3]
@@ -127,7 +130,9 @@ class _RoleSyncRecorder:
     def __init__(self):
         self.grants: list[tuple[uuid.UUID, uuid.UUID, str]] = []
 
-    async def on_grant(self, vault_id, user_id, role):
+    async def sync_vault_user_in_conn(self, conn, vault_id, user_id):
+        role = "admin" if conn.vault_owner == user_id else conn.access.get((vault_id, user_id))
+        assert role is not None
         self.grants.append((vault_id, user_id, role))
 
 

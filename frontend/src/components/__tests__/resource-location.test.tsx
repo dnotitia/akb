@@ -57,6 +57,24 @@ beforeEach(() => {
 });
 
 describe("Resource location", () => {
+  it.each([
+    ["Document", "lucide-file-text"], ["File", "lucide-file"], ["Table", "lucide-table-2"],
+  ] as const)("keeps the %s kind after the title and Collection links text-only", async (kind, iconClass) => {
+    renderResource(<ResourceBreadcrumb location={{ ...location, kind }} />);
+    const trail = screen.getByRole("navigation", { name: "Resource location" });
+    const vault = within(trail).getByRole("link", { name: "팀 Vault" });
+    const collection = await within(trail).findByRole("link", { name: "Team guides" });
+    expect(vault.querySelector(".lucide-box")).toHaveAttribute("aria-hidden", "true");
+    expect(collection.querySelector("svg")).toBeNull();
+    const current = within(trail).getByText("Human document name");
+    const kindIcon = trail.querySelector(`.${iconClass}`);
+    expect(kindIcon).toHaveAttribute("aria-hidden", "true");
+    expect(current.compareDocumentPosition(kindIcon!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(kindIcon?.closest("button, a")).toBeNull();
+    expect(within(trail).getByText(`(${kind})`)).toHaveClass("sr-only");
+    expect(within(trail).queryByRole("img")).not.toBeInTheDocument();
+  });
+
   it("uses one directory query for shared desktop/mobile ancestry and links to real collection destinations", async () => {
     renderResource(<><ResourceBreadcrumb location={location} /><ResourceBreadcrumb location={location} /></>);
     const trails = screen.getAllByRole("navigation", { name: "Resource location" });

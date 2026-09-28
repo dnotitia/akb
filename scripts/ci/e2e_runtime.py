@@ -1709,7 +1709,10 @@ class E2ERuntime:
         await terminate_process(managed.process, process_group=managed.process_group)
 
     async def _start_dependencies(self) -> None:
-        await self._compose("up", "--detach", "--wait")
+        # --build: PostgreSQL is built from deploy/postgres, and a project name
+        # reused across runs would otherwise keep the image an earlier checkout
+        # built, patches and all. Unchanged inputs rebuild from the layer cache.
+        await self._compose("up", "--build", "--detach", "--wait")
         await self._wait_tcp("PostgreSQL", "127.0.0.1", self.config.postgres_port)
         await self._wait_http(
             "MinIO",
@@ -1810,6 +1813,7 @@ class E2ERuntime:
                                'auth_runtime_epoch_upgrade',
                                'auth_runtime_state',
                                'bm25_stats',
+                               'bm25_vocab_epoch',
                                'document_revision_bootstrap_claims',
                                'document_revision_authority_pending',
                                'document_revision_authority_marker',
@@ -1819,6 +1823,13 @@ class E2ERuntime:
                            );
                         IF table_list IS NOT NULL THEN
                             EXECUTE format('TRUNCATE TABLE %s RESTART IDENTITY CASCADE', table_list);
+                        END IF;
+                        -- Fixture-only recovery for a prior reset that cleared
+                        -- the singleton. Preserve every existing epoch value;
+                        -- production readers still reject a missing row.
+                        IF to_regclass('public.bm25_vocab_epoch') IS NOT NULL THEN
+                            INSERT INTO public.bm25_vocab_epoch (id) VALUES (1)
+                            ON CONFLICT (id) DO NOTHING;
                         END IF;
                     END
                     $cleanup$

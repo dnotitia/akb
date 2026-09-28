@@ -191,8 +191,9 @@ Estimated net diff: **+420 / -120 = +300 LOC**.
 
 ## Lifecycle semantics and failure handling
 
-Lifecycle hooks are best-effort: a hook failure is logged + audited
-but does **not** roll back the system DB write. The reconciler
+Post-commit lifecycle hooks are best-effort: their failure is logged + audited.
+Strict access/ownership/public changes roll back with their role projection.
+The reconciler
 catches up at next startup or on-demand via `/admin/reconcile`.
 
 This is the right trade-off because:
@@ -324,3 +325,50 @@ One branch, one merge. Internal commits ordered:
 6. `test_pg_rbac_e2e.sh`.
 7. Local docker-compose verification of all e2e suites.
 8. README + CLAUDE.md + deploy doc updates.
+
+
+### Catalog and role convergence
+
+Catalog authority and PostgreSQL role DDL share `role_authority_transaction`.
+It begins a READ COMMITTED transaction, then takes the role-sync advisory lock
+before user, vault, token, table or cleanup row locks. Reconciliation reads the
+catalog in subsequent statements after acquiring the lock. A repeatable-read
+snapshot established by a waiting lock statement could replay superseded
+access, so it is not used for this convergence transaction.
+
+Grant/revoke, ownership transfer and public-access mutations apply strict role
+changes on the same connection before committing. Native vault/table creation
+retains its same-transaction DDL. Reconciliation grants missing and revokes
+stale direct user/vault edges, preserving owner admin authority and archived
+vaults. Role hierarchy, public wildcard and scoped PAT intersections have
+separate domains. Post-commit callbacks re-read the current catalog so a late
+old grant or revoke cannot undo a newer authority change.
+
+Only exact UUID role names belong to the managed namespace; similarly prefixed
+operator roles are preserved. An unexpected grantor that leaves a membership,
+or noncanonical ADMIN/INHERIT/SET options, is reported as an error/drift.
+Strict authority changes fail and roll back rather than report successful
+withdrawal while that access remains. Repair requires resolving the explicit
+operator-created edge. Read-only role diff adds `stale_memberships` and
+`invalid_membership_options`; existing fields remain available.
+
+The guard serializes authority mutations and full reconciliation. It does not
+serialize ordinary content writes, profile updates, token last-used recording,
+or SQL reads. Do not acquire a second pool connection while holding it.
+Direct administrative catalog/role SQL outside the application must coordinate
+with this guard; it is not automatically intercepted by PostgreSQL.
+
+### PostgreSQL cluster ownership for full reconciliation
+
+Role names and memberships are cluster-global. Full orphan pruning assumes
+exclusive ownership of AKB's managed UUID role namespace in that PostgreSQL
+cluster; putting independent AKB catalogs in different databases does not
+isolate those roles. Ordinary membership deltas are catalog-scoped, while
+full orphan pruning retains this existing ownership requirement.
+
+The full role-prune regression oracle therefore runs separately on an
+exclusively owned test cluster, before other database fixtures allocate
+managed UUID roles. `AKB_ROLE_CLUSTER_EXCLUSIVE=1` opts into that oracle,
+which also refuses a foreign managed-role inventory before reconciliation.
+The remaining role tests can run in disposable databases on a shared test
+server without invoking that full prune oracle.

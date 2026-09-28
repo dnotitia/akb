@@ -591,7 +591,7 @@ export class AKBProxy {
             id,
             result: this._clientResult({
               content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-              isError: false,
+              isError: true,
             }),
           };
         }
@@ -970,7 +970,7 @@ export class AKBProxy {
                 vault_skill: vaultSkill,
               }),
             }],
-            isError: false,
+            isError: true,
           }),
         };
       }
@@ -1016,7 +1016,7 @@ export class AKBProxy {
           content: [
             { type: "text", text: JSON.stringify({ error: err.message }) },
           ],
-          isError: false,
+          isError: true,
         }),
       };
     }

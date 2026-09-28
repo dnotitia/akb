@@ -9,6 +9,7 @@ from typing import Literal
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import (
@@ -148,7 +149,7 @@ async def provision_local_recovery_admin(
 
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 await _lock_provisioning(conn)
                 row = await _designated_user(conn, auth_provider="local")
                 if row is not None:
@@ -252,7 +253,7 @@ async def provision_sso_recovery_admin(
 
     try:
         async with pool.acquire() as conn:
-            async with conn.transaction():
+            async with role_authority_transaction(conn):
                 await _lock_provisioning(conn)
                 row = await _designated_user(conn, auth_provider="keycloak")
                 if row is not None:
@@ -578,7 +579,7 @@ async def retire_local_recovery_admin(
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with role_authority_transaction(conn):
             actor_id = await _require_independent_service_admin(
                 conn,
                 actor_user_id=actor_user_id,

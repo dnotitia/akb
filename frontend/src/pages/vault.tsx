@@ -12,11 +12,14 @@ import {
   FolderInput,
   FolderTree,
   GitCommit,
+  Globe,
+  HelpCircle,
+  LockKeyhole,
   Plug,
-  ShieldCheck,
+  Shield,
   Table as TableIcon,
   Upload,
-  Users,
+  UsersRound,
   type LucideIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -36,10 +39,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
 import { EmptyState } from "@/components/empty-state";
-import {
-  RoleBadge,
-  VaultStateBadge,
-} from "@/components/status-badge";
+import { RoleBadge, VaultStateBadge } from "@/components/status-badge";
 import { VaultIndexingStatus } from "@/components/pending-indexing-badge";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -52,12 +52,6 @@ import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
 import { FileUploadDialog } from "@/components/file-upload-dialog";
 import { TableCreateDialog } from "@/components/table-create-dialog";
 import { parseFileUri } from "@/lib/uri";
-
-interface TableMeta {
-  name: string;
-  row_count?: number;
-  columns?: Array<{ name: string; type: string }>;
-}
 
 interface VaultInfo {
   name: string;
@@ -78,9 +72,6 @@ interface VaultInfo {
   table_count?: number;
   file_count?: number;
   edge_count?: number;
-  // Pre-loaded table schema (name + row_count + columns) — the overview surfaces
-  // it as a tables-at-a-glance band instead of dropping it on a single tile.
-  tables?: TableMeta[];
 }
 
 interface RecentRow {
@@ -107,6 +98,58 @@ interface ActivityRow {
 }
 
 const fmt = (n: number) => n.toLocaleString();
+
+// Older servers may omit optional totals. Absence must not become an empty
+// Vault, an empty table, or an assertion about its access policy.
+function knownCount(value?: number): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function OverviewCount({ value }: { value?: number }) {
+  return knownCount(value) ? (
+    <span className="tabular-nums">{fmt(value)}</span>
+  ) : (
+    <span><span aria-hidden>—</span><span className="sr-only">Not available</span></span>
+  );
+}
+
+/** Passive totals share the creation row, but are not unimplemented buttons. */
+function VaultContentSummary({ info }: { info: VaultInfo | null }) {
+  const contents = [
+    { label: "Documents", value: info?.document_count, Icon: FileText },
+    { label: "Collections", value: info?.collection_count, Icon: FolderTree },
+    { label: "Tables", value: info?.table_count, Icon: TableIcon },
+    { label: "Files", value: info?.file_count, Icon: Files },
+  ];
+  return (
+    <section aria-label="Contents" aria-busy={!info} className="min-w-0 max-w-full">
+      <dl className="flex flex-wrap gap-2">
+        {contents.map(({ label, value, Icon }) => (
+          <div
+            key={label}
+            title={info && !knownCount(value) ? `${label} count is unavailable on this server` : undefined}
+            className="inline-flex min-h-8 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2.5 py-1 text-xs"
+          >
+            <dt className="inline-flex items-center gap-1.5 whitespace-nowrap text-foreground-muted">
+              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+              {label}
+            </dt>
+            <dd className="font-semibold text-foreground">
+              {info ? <OverviewCount value={value} /> : (
+                <span className="block h-3 w-5 animate-pulse rounded bg-surface-muted" aria-hidden />
+              )}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {!info ? (
+        <span className="sr-only">Loading content counts</span>
+      ) : contents.some(({ value }) => !knownCount(value)) && (
+        <p className="mt-1.5 text-xs text-foreground-muted">Some counts aren't available on this server.</p>
+      )}
+    </section>
+  );
+}
 
 /** First prose paragraph of the vault-skill doc, frontmatter + headings
  *  stripped, for the "About this vault" excerpt. */
@@ -147,19 +190,6 @@ function changeMark(change?: string) {
     >
       {m.letter}
     </span>
-  );
-}
-
-function StatTileSkeleton() {
-  return (
-    <div
-      className="flex min-h-12 items-center gap-2 bg-surface px-3 py-2"
-      aria-hidden
-    >
-      <div className="h-4 w-4 shrink-0 rounded bg-surface-muted animate-pulse" />
-      <div className="h-4 w-7 rounded bg-surface-muted animate-pulse" />
-      <div className="h-3 w-14 rounded bg-surface-muted animate-pulse" />
-    </div>
   );
 }
 
@@ -303,55 +333,16 @@ export default function VaultPage() {
   const isEmpty =
     !!info &&
     !skillQuery.isLoading &&
-    (info.document_count ?? 0) - scaffoldDocs <= 0 &&
-    (info.table_count ?? 0) === 0 &&
-    (info.file_count ?? 0) === 0;
-
-  const inventory: Array<{
-    label: string;
-    value: number;
-    Icon: LucideIcon;
-    tone: TonalIconTone;
-  }> = info
-    ? [
-        {
-          label: "Documents",
-          value: info.document_count ?? 0,
-          Icon: FileText,
-          tone: "knowledge",
-        },
-        {
-          label: "Collections",
-          value: info.collection_count ?? 0,
-          Icon: FolderTree,
-          tone: "collection",
-        },
-        {
-          label: "Tables",
-          value: info.table_count ?? 0,
-          Icon: TableIcon,
-          tone: "data",
-        },
-        {
-          label: "Files",
-          value: info.file_count ?? 0,
-          Icon: Files,
-          tone: "file",
-        },
-        {
-          label: "Members",
-          value: info.member_count ?? 0,
-          Icon: Users,
-          tone: "people",
-        },
-      ]
-    : [];
+    knownCount(info.document_count) &&
+    info.document_count - scaffoldDocs <= 0 &&
+    info.table_count === 0 &&
+    info.file_count === 0;
 
   return (
     <div
       role="region"
       aria-label={`${name} Vault overview`}
-      className="flex min-h-full w-full flex-col gap-4 bg-background p-3 sm:p-4 xl:p-5"
+      className="@container/vault-overview flex min-h-full w-full flex-col gap-6 bg-background p-3 sm:p-4 lg:p-6"
     >
       {infoError && (
         <Alert variant="destructive">
@@ -372,30 +363,34 @@ export default function VaultPage() {
         </Alert>
       )}
 
-      <WorkspacePageHeader
-        icon={Box}
-        iconTone="knowledge"
-        title={name}
-        context={
-          info?.description ? (
-            <span className="line-clamp-1 max-w-3xl">{info.description}</span>
-          ) : undefined
-        }
-        meta={
-          <>
-            <VaultContextBadge name={name!} address copyable />
-            {info?.role && <RoleBadge role={info.role} />}
-            <VaultStateBadge
-              archived={info?.is_archived}
-              externalGit={info?.is_external_git}
-              publicAccess={info?.public_access}
-            />
-            <VaultIndexingStatus vaultName={name!} />
-          </>
-        }
-        actions={
-          canCreateContent ? (
+      <section aria-label="Vault summary" className="flex min-w-0 flex-col gap-3 border-b border-border pb-4">
+        <WorkspacePageHeader
+          icon={Box}
+          iconTone="knowledge"
+          title={name}
+          context={
+            info?.description ? (
+              <span className="block max-w-prose break-words [overflow-wrap:anywhere]">{info.description}</span>
+            ) : undefined
+          }
+          meta={
             <>
+              <VaultContextBadge name={name!} address copyable />
+              {info?.role && <RoleBadge role={info.role} />}
+              <VaultStateBadge
+                archived={info?.is_archived}
+                externalGit={info?.is_external_git}
+                publicAccess={info?.public_access}
+              />
+              <VaultIndexingStatus vaultName={name!} />
+            </>
+          }
+          className="min-h-0 rounded-none border-0 bg-transparent p-0 shadow-none [&>div:first-child]:max-w-full [&_h1]:whitespace-normal [&_h1]:break-words [&_h1]:[overflow-wrap:anywhere]"
+        />
+        <div className="flex min-w-0 flex-wrap items-start justify-between gap-x-6 gap-y-3">
+          {!infoError && <VaultContentSummary info={info} />}
+          {canCreateContent && (
+            <div role="group" aria-label="Create content" className="flex max-w-full flex-wrap items-center gap-2">
               <Button
                 ref={uploadButtonRef}
                 variant="outline"
@@ -422,11 +417,10 @@ export default function VaultPage() {
                 <FilePlus className="h-4 w-4" aria-hidden />
                 New document
               </Button>
-            </>
-          ) : undefined
-        }
-        className="rounded-none border-0 border-b border-border-strong bg-transparent px-0 pb-3 pt-0 shadow-none"
-      />
+            </div>
+          )}
+        </div>
+      </section>
 
       {info?.is_archived && (
         <Alert variant="info">
@@ -435,52 +429,7 @@ export default function VaultPage() {
         </Alert>
       )}
 
-      {!infoError && (
-        <Panel variant="workspace" className="min-w-0">
-          <section aria-labelledby="vault-inventory-heading">
-            <h2 id="vault-inventory-heading" className="sr-only">
-              Vault inventory
-            </h2>
-            <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 xl:grid-cols-[8.75rem_repeat(5,minmax(0,1fr))]">
-              <div className="col-span-2 flex min-h-14 items-center gap-2.5 bg-surface-2/70 px-3 text-xs font-semibold text-foreground sm:col-span-3 xl:col-span-1 xl:px-4">
-                <TonalIcon tone="neutral" size="sm">
-                  <FolderTree aria-hidden />
-                </TonalIcon>
-                <span>Inventory</span>
-              </div>
-              {info
-                ? inventory.map(({ label, value, Icon, tone }) => (
-                    <div
-                      key={label}
-                      className="flex min-h-14 min-w-0 items-center gap-2.5 bg-surface px-3 py-2"
-                    >
-                      <TonalIcon tone={tone} size="sm">
-                        <Icon aria-hidden />
-                      </TonalIcon>
-                      <span className="min-w-0">
-                        <span
-                          className={cn(
-                            "block text-sm font-semibold tabular-nums",
-                            value === 0 ? "text-subtle" : "text-foreground",
-                          )}
-                        >
-                          {fmt(value)}
-                        </span>
-                        <span className="block truncate text-xs text-foreground-muted">
-                          {label}
-                        </span>
-                      </span>
-                    </div>
-                  ))
-                : Array.from({ length: 5 }).map((_, i) => (
-                    <StatTileSkeleton key={i} />
-              ))}
-            </div>
-          </section>
-        </Panel>
-      )}
-
-      <div className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_20rem] 2xl:grid-cols-[minmax(0,1fr)_22rem]">
+      <div className="grid min-w-0 items-start gap-6 @[60rem]/vault-overview:grid-cols-[minmax(0,1fr)_20rem]">
         <div className="flex min-w-0 flex-col gap-4">
           {info && isEmpty ? (
             <VaultEmptyOnboarding
@@ -528,6 +477,12 @@ export default function VaultPage() {
             guideCustomized={skillCustomized}
             guideLoading={skillQuery.isLoading}
           />
+        ) : infoError ? (
+          <aside aria-label="Vault overview details">
+            <Panel variant="workspace" className="p-4 text-sm text-foreground-muted">
+              Vault details are unavailable.
+            </Panel>
+          </aside>
         ) : (
           <VaultContextSkeleton />
         )}
@@ -589,12 +544,10 @@ function RecentActivityPanel({
       role="region"
       aria-labelledby="recent-heading"
       aria-busy={loading}
-      className="min-w-0"
+      className="@container/recent min-w-0 rounded-[var(--radius-sm)]"
     >
-      <div className="flex min-h-12 flex-wrap items-center gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2 sm:px-5">
-        <TonalIcon tone="knowledge" size="sm">
-          <FileClock aria-hidden />
-        </TonalIcon>
+      <div className="flex min-h-11 flex-wrap items-center gap-2 border-b border-border bg-background px-4 py-2">
+        <FileClock className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <h2
             id="recent-heading"
@@ -603,9 +556,9 @@ function RecentActivityPanel({
             Recent activity
           </h2>
           {!loading && !error && (
-            <Badge variant="default" className="tabular-nums">
+            <span className="text-xs tabular-nums text-foreground-muted">
               {rows.length} change{rows.length === 1 ? "" : "s"}
-            </Badge>
+            </span>
           )}
         </div>
       </div>
@@ -657,45 +610,34 @@ function RecentActivityPanel({
           {rows.map((row, index) => {
             const Icon = recentIcon(row.type);
             const tone = recentTone(row.type);
+            const collection = row.path?.split("/").slice(0, -1).join(" / ") || "Vault root";
             return (
               <li key={`${row.doc_id}:${row.commit ?? ""}:${index}`}>
                 <Link
                   to={`/vault/${name}/doc/${encodeURIComponent(row.path || row.doc_id)}`}
-                  className="group grid grid-cols-[28px_minmax(0,1fr)_auto] items-center gap-x-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[28px_minmax(0,1fr)_auto_auto] sm:px-5"
+                  className="group grid min-h-14 grid-cols-[1rem_minmax(0,1fr)_auto] items-center gap-x-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                 >
                   <span
-                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)]"
-                    style={{
-                      color: tone,
-                      backgroundColor: `color-mix(in srgb, ${tone} 12%, transparent)`,
-                    }}
+                    className="inline-flex items-center justify-center"
+                    style={{ color: tone }}
                     aria-hidden
                   >
-                    <Icon className="h-3.5 w-3.5" aria-hidden />
+                    <Icon className="h-4 w-4" aria-hidden />
                   </span>
-                  <span className="min-w-0 sm:flex sm:items-baseline sm:gap-2">
+                  <span className="min-w-0">
                     <span
-                      title={row.title}
-                      className="block truncate text-sm font-medium tracking-tight text-foreground transition-colors group-hover:text-link sm:max-w-[42%] sm:shrink-0"
+                      className="block break-words text-sm font-medium text-foreground transition-colors group-hover:text-link [overflow-wrap:anywhere]"
                     >
                       {row.title}
                     </span>
-                    <span title={row.path} className="coord block truncate">
-                      {row.path}
+                    <span className="block break-words text-xs leading-relaxed text-foreground-muted [overflow-wrap:anywhere]">
+                      {collection}
                     </span>
                   </span>
-                  {row.commit && (
-                    <span
-                      className="coord hidden font-mono tabular-nums sm:block"
-                      title={`commit ${row.commit}`}
-                    >
-                      {row.commit.slice(0, 7)}
-                    </span>
-                  )}
-                  <RelativeTime
-                    iso={row.changed_at}
-                    className="w-[60px] justify-end text-right"
-                  />
+                  <span className="text-right">
+                    <span className="sr-only">Updated </span>
+                    <RelativeTime iso={row.changed_at} fallback="—" className="whitespace-nowrap text-xs" />
+                  </span>
                 </Link>
               </li>
             );
@@ -729,20 +671,18 @@ function CommitHistoryPanel({
       role="region"
       aria-labelledby="commit-history-heading"
       aria-busy={loading}
-      className="w-full min-w-0"
+      className="w-full min-w-0 rounded-none border-0 border-t bg-transparent"
     >
-      <div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-border-strong bg-surface-2/55 px-4 py-2 sm:px-5">
-        <TonalIcon tone="neutral" size="sm">
-          <GitCommit aria-hidden />
-        </TonalIcon>
-        <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-2">
+      <div className="flex min-h-11 flex-wrap items-center gap-2 py-2">
+        <div className="flex flex-1 items-center gap-2">
+          <GitCommit className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
           <h2
             id="commit-history-heading"
-            className="text-sm font-semibold text-foreground"
+            className="whitespace-nowrap text-sm font-semibold text-foreground"
           >
             Commit history
           </h2>
-          <span className="text-xs tabular-nums text-foreground-muted">
+          <span className="whitespace-nowrap text-xs tabular-nums text-foreground-muted">
             {loading
               ? "Loading commits…"
               : error
@@ -752,31 +692,33 @@ function CommitHistoryPanel({
                   : "No commits yet"}
           </span>
         </div>
-        {expandable && (
-          <button
-            type="button"
-            aria-expanded={expanded}
-            aria-controls="commit-history-list"
-            onClick={() => setExpanded((current) => !current)}
-            className="inline-flex min-h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        <div className="flex flex-wrap items-center gap-2">
+          {expandable && (
+            <button
+              type="button"
+              aria-expanded={expanded}
+              aria-controls="commit-history-list"
+              onClick={() => setExpanded((current) => !current)}
+              className="inline-flex min-h-9 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {expanded ? "Hide commits" : "Show commits"}
+              <ChevronRight
+                className={cn(
+                  "ml-1 h-3.5 w-3.5 transition-transform",
+                  expanded && "rotate-90",
+                )}
+                aria-hidden
+              />
+            </button>
+          )}
+          <Link
+            to={`/vault/${name}/activity`}
+            className="inline-flex min-h-9 items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {expanded ? "Hide commits" : "Show commits"}
-            <ChevronRight
-              className={cn(
-                "ml-1 h-3.5 w-3.5 transition-transform",
-                expanded && "rotate-90",
-              )}
-              aria-hidden
-            />
-          </button>
-        )}
-        <Link
-          to={`/vault/${name}/activity`}
-          className="inline-flex min-h-8 items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          Full commit log
-          <ChevronRight className="ml-1 h-3.5 w-3.5" aria-hidden />
-        </Link>
+            Full commit log
+            <ChevronRight className="ml-1 h-3.5 w-3.5" aria-hidden />
+          </Link>
+        </div>
       </div>
 
       {expanded && (
@@ -909,171 +851,109 @@ function VaultOverviewAside({
       : guideDefined
         ? "Add purpose, scope, and agent instructions when you are ready to customize this guide."
         : "Set up a vault guide so connected agents understand this knowledge space.";
-  const owner = info.owner_display_name || info.owner || "Not available";
   const publicAccess =
     info.public_access === "writer"
       ? "Public write"
       : info.public_access === "reader"
         ? "Public read"
-        : "Private";
-  const tables = info.tables || [];
-  const shownTables = tables.slice(0, TABLES_PREVIEW);
-  const visibilityVariant =
+        : info.public_access === "none"
+          ? "Private"
+          : "Not available";
+  const visibilityDescription =
     info.public_access === "writer"
-      ? "warning"
+      ? info.is_archived || info.is_external_git
+        ? "Any signed-in person can read this vault. Content is read-only."
+        : "Signed-in users can read, and write when vault policies allow."
       : info.public_access === "reader"
-        ? "info-outline"
-        : "default";
+        ? "Any signed-in person can read this vault."
+        : info.public_access === "none"
+          ? "Only people with access can open this vault."
+          : "Visibility information is unavailable.";
+  const VisibilityIcon = info.public_access === "none"
+    ? LockKeyhole
+    : info.public_access === "reader" || info.public_access === "writer"
+      ? Globe
+      : HelpCircle;
 
   return (
-    <aside className="min-w-0" aria-label="Vault overview details">
-      <Panel variant="workspace" flush className="min-w-0">
-        <div className="flex min-h-12 items-center justify-between gap-3 border-b border-border-strong bg-surface-2/55 px-4 py-2.5">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <TonalIcon tone="neutral" size="sm">
-              <Box aria-hidden />
-            </TonalIcon>
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-foreground">
-                Vault context
-              </h2>
-              <p className="truncate text-xs text-foreground-muted">
-                Guide and access
-              </p>
-            </div>
-          </div>
-          <Badge variant={visibilityVariant}>{publicAccess}</Badge>
-        </div>
-
-        <section
-          aria-labelledby="vault-guide-heading"
-          className="border-b border-border"
-        >
-          <div className="flex items-start gap-3 px-4 py-3.5">
-            <TonalIcon tone="guide" size="sm">
-              <BookText aria-hidden />
-            </TonalIcon>
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h3
-                  id="vault-guide-heading"
-                  className="text-xs font-semibold text-foreground"
-                >
-                  Vault guide
-                </h3>
-                <Badge variant="info-outline">{guideStatus}</Badge>
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-foreground-muted">
-                {summary}
-              </p>
-              {!info.is_external_git && (
+    <aside className="flex min-w-0 flex-col gap-3" aria-label="Vault overview details">
+      <Panel variant="workspace" flush className="min-w-0 rounded-[var(--radius-sm)]" role="region" aria-labelledby="vault-guide-heading">
+        <OverviewContextHeading id="vault-guide-heading" icon={BookText} tone="guide">
+          Vault guide
+        </OverviewContextHeading>
+        <div className="p-4">
+          <p className="line-clamp-3 max-w-prose break-words text-sm leading-relaxed text-foreground [overflow-wrap:anywhere]">
+            {summary}
+          </p>
+          <div className="mt-3 flex max-w-md flex-wrap items-center justify-between gap-2">
+            <Badge id="vault-guide-status" variant="outline" className="rounded-[var(--radius-sm)] text-xs">
+              {info.is_external_git ? "Git managed" : guideStatus}
+            </Badge>
+            {!info.is_external_git && (
+              <Button asChild variant="outline" size="sm" className="h-9 rounded-[var(--radius-sm)] text-link">
                 <Link
                   to={`/vault/${name}/settings#skill`}
-                  aria-label={
-                    guideDefined ? "Open vault guide" : "Set up vault guide"
-                  }
-                  className="mt-2 inline-flex min-h-7 items-center gap-1 rounded-[var(--radius-sm)] text-xs font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={guideDefined ? "Open vault guide" : "Set up vault guide"}
+                  aria-describedby="vault-guide-status"
                 >
                   {guideDefined ? "Open guide" : "Set up guide"}
                   <ChevronRight className="h-3.5 w-3.5" aria-hidden />
-                  <span className="sr-only">{guideStatus}</span>
                 </Link>
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section
-          aria-labelledby="access-overview-heading"
-          className="border-b border-border"
-        >
-          <div className="flex items-center gap-3 px-4 pt-3.5">
-            <TonalIcon
-              tone={info.public_access === "none" ? "info" : "success"}
-              size="sm"
-            >
-              <ShieldCheck aria-hidden />
-            </TonalIcon>
-            <h3
-              id="access-overview-heading"
-              className="min-w-0 flex-1 text-xs font-semibold text-foreground"
-            >
-              Access and ownership
-            </h3>
-            <Link
-              to={`/vault/${name}/members`}
-              className="inline-flex min-h-7 items-center rounded-[var(--radius-sm)] text-xs font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              Members
-            </Link>
-          </div>
-          <dl className="mt-2 divide-y divide-border px-4 pb-1">
-            <OverviewContextRow label="Owner" value={owner} />
-            <OverviewContextRow label="Visibility" value={publicAccess} />
-            <OverviewContextRow
-              label="Members"
-              value={fmt(info.member_count ?? 0)}
-            />
-          </dl>
-        </section>
-
-        {(info.table_count ?? 0) > 0 && (
-          <section aria-labelledby="tables-overview-heading">
-            <div className="flex min-h-11 items-center gap-3 border-b border-border px-4 py-2">
-              <TonalIcon tone="data" size="sm">
-                <TableIcon aria-hidden />
-              </TonalIcon>
-              <h3
-                id="tables-overview-heading"
-                className="min-w-0 flex-1 text-xs font-semibold text-foreground"
-              >
-                Tables
-              </h3>
-              <Badge variant="default" className="tabular-nums">
-                {fmt(info.table_count ?? 0)}
-              </Badge>
-            </div>
-            {shownTables.length > 0 ? (
-              <ul className="divide-y divide-border">
-                {shownTables.map((table) => (
-                  <li key={table.name}>
-                    <Link
-                      to={`/vault/${name}/table/${encodeURIComponent(table.name)}`}
-                      className="group flex min-h-11 items-center gap-2 px-4 py-2 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                    >
-                      <TableIcon
-                        className="h-3.5 w-3.5 shrink-0 text-[var(--color-cat-3)]"
-                        aria-hidden
-                      />
-                      <span className="min-w-0 flex-1 truncate text-sm text-foreground group-hover:text-link">
-                        {table.name}
-                      </span>
-                      <span className="coord shrink-0 tabular-nums">
-                        {fmt(table.row_count ?? 0)} rows
-                      </span>
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="p-4 text-xs leading-relaxed text-foreground-muted">
-                Browse this Vault's tables from Collections.
-              </p>
+              </Button>
             )}
-            {(info.table_count ?? 0) > shownTables.length && (
-              <p className="border-t border-border px-4 py-2.5 text-xs text-foreground-muted">
-                +{fmt((info.table_count ?? 0) - shownTables.length)} more in
-                Collections
-              </p>
-            )}
-          </section>
-        )}
+          </div>
+        </div>
       </Panel>
+
+      <Panel variant="workspace" flush className="min-w-0 rounded-[var(--radius-sm)]" role="region" aria-labelledby="access-overview-heading">
+        <OverviewContextHeading id="access-overview-heading" icon={Shield} tone="people">
+          Access and ownership
+        </OverviewContextHeading>
+        <div className="p-4">
+          <dl className="max-w-md divide-y divide-border">
+            <OverviewContextRow label="Owner" value={info.owner_display_name || info.owner || "Not available"} />
+            <OverviewContextRow label="Visibility" value={
+              <Badge variant="outline" className="rounded-[var(--radius-sm)] text-xs text-foreground">
+                <VisibilityIcon className="h-3.5 w-3.5" aria-hidden />
+                {publicAccess}
+              </Badge>
+            } />
+          </dl>
+          <p className="mt-1 max-w-md text-xs leading-relaxed text-foreground-muted">{visibilityDescription}</p>
+          <Link
+            to={`/vault/${name}/members`}
+            className="mt-3 flex min-h-10 max-w-md items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-background px-3 py-2 text-sm font-medium text-link transition-token hover:border-border-strong hover:bg-surface-hover hover:text-link-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+          >
+            <UsersRound className="h-4 w-4 shrink-0" aria-hidden />
+            <span className="flex-1">Members</span>
+            <span className="text-xs tabular-nums text-foreground-muted"><OverviewCount value={info.member_count} /></span>
+            <ChevronRight className="h-4 w-4 shrink-0" aria-hidden />
+          </Link>
+        </div>
+      </Panel>
+
     </aside>
   );
 }
 
-const TABLES_PREVIEW = 3;
+function OverviewContextHeading({
+  id,
+  icon: Icon,
+  tone,
+  children,
+}: {
+  id: string;
+  icon: LucideIcon;
+  tone: TonalIconTone;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex min-h-12 items-center gap-2.5 border-b border-border bg-background px-4 py-2.5">
+      <TonalIcon tone={tone} size="sm"><Icon aria-hidden /></TonalIcon>
+      <h2 id={id} className="min-w-0 text-sm font-semibold text-foreground">{children}</h2>
+    </div>
+  );
+}
 
 function OverviewContextRow({
   label,
@@ -1083,9 +963,9 @@ function OverviewContextRow({
   value: ReactNode;
 }) {
   return (
-    <div className="flex min-h-10 items-center justify-between gap-3 py-2 text-xs">
+    <div className="flex min-h-9 items-start justify-between gap-3 py-1.5 text-sm">
       <dt className="text-foreground-muted">{label}</dt>
-      <dd className="min-w-0 truncate text-right text-foreground">{value}</dd>
+      <dd className="min-w-0 break-words text-right font-medium text-foreground [overflow-wrap:anywhere]">{value}</dd>
     </div>
   );
 }
@@ -1093,15 +973,36 @@ function OverviewContextRow({
 function VaultContextSkeleton() {
   return (
     <aside
-      className="min-w-0 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface shadow-xs"
-      aria-hidden
+      className="flex min-w-0 flex-col gap-3"
+      aria-label="Loading vault details"
+      aria-busy="true"
     >
-      <div className="h-12 border-b border-border-strong bg-surface-2/55" />
-      <div className="space-y-3 p-4">
-        <div className="h-4 w-24 animate-pulse rounded bg-surface-muted" />
-        <div className="h-3 w-full animate-pulse rounded bg-surface-muted" />
-        <div className="h-3 w-4/5 animate-pulse rounded bg-surface-muted" />
-      </div>
+      <Panel variant="workspace" flush className="rounded-[var(--radius-sm)]" aria-hidden>
+        <div className="flex min-h-12 items-center gap-2.5 border-b border-border bg-background px-4 py-2.5">
+          <div className="h-7 w-7 animate-pulse rounded bg-surface-muted" />
+          <div className="h-4 w-24 animate-pulse rounded bg-surface-muted" />
+        </div>
+        <div className="space-y-3 p-4">
+          <div className="h-16 animate-pulse rounded bg-surface-muted" />
+          <div className="h-9 animate-pulse rounded bg-surface-muted" />
+        </div>
+      </Panel>
+      <Panel variant="workspace" flush className="rounded-[var(--radius-sm)]" aria-hidden>
+        <div className="flex min-h-12 items-center gap-2.5 border-b border-border bg-background px-4 py-2.5">
+          <div className="h-7 w-7 animate-pulse rounded bg-surface-muted" />
+          <div className="h-4 w-36 animate-pulse rounded bg-surface-muted" />
+        </div>
+        <div className="space-y-3 p-4">
+          {Array.from({ length: 2 }, (_, i) => (
+            <div key={i} className="flex h-6 justify-between">
+              <div className="h-3 w-24 animate-pulse rounded bg-surface-muted" />
+              <div className="h-3 w-6 animate-pulse rounded bg-surface-muted" />
+            </div>
+          ))}
+          <div className="h-4 animate-pulse rounded bg-surface-muted" />
+          <div className="h-10 animate-pulse rounded bg-surface-muted" />
+        </div>
+      </Panel>
     </aside>
   );
 }
@@ -1191,7 +1092,7 @@ function VaultEmptyOnboarding({
       </div>
 
       {canWrite && (
-        <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-px bg-border @[40rem]/vault-overview:grid-cols-3">
           <OnboardStep
             icon={FilePlus}
             tone="knowledge"
@@ -1229,7 +1130,7 @@ function VaultEmptyOnboarding({
               Optional next steps
             </span>
           </div>
-          <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+          <div className="grid grid-cols-1 gap-px bg-border @[40rem]/vault-overview:grid-cols-3">
             <OnboardStep
               icon={FolderInput}
               tone="file"

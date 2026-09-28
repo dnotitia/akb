@@ -110,6 +110,15 @@ so a pending request is not briefly displayed as a genuine empty response.
 - A degraded response is incomplete, whether it contains results or not. It must
   never be labelled a genuine zero-match. Retry is available without changing the
   query, and raw server diagnostic details are not displayed as user guidance.
+  Usable partial results remain visible and actionable with an incomplete-search
+  warning, including in the global search dialog. MCP returns them with
+  `isError=false`; `degraded` and `degradation_reason` describe the limitation.
+  The pgvector hybrid path preserves the healthy leg on connection/resource
+  unavailability or statement timeout (`dense_leg_failed` / `sparse_leg_failed`).
+  It does not rescue hits after permission, schema, vocabulary-fence or caller
+  cancellation failures. A configured embedding endpoint yielding no query
+  vector reports `query_embedding_failed`; an unset endpoint is healthy
+  sparse-only mode.
   Degradation reports a component that failed, or a hit lost to a stale source
   row that left the page short of the requested limit. Two things are not
   degradation. A filter is not: excluding the documents the request asked to

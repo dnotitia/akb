@@ -14,11 +14,12 @@ interface Props {
   vault: string;
   member: MemberLike;
   onChanged: (prev: string, next: string) => void;
+  className?: string;
 }
 
 const OPTIONS: Array<"reader" | "writer" | "admin"> = ["reader", "writer", "admin"];
 
-export function RoleSelect({ vault, member, onChanged }: Props) {
+export function RoleSelect({ vault, member, onChanged, className }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -50,6 +51,7 @@ export function RoleSelect({ vault, member, onChanged }: Props) {
             "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
             "hover:border-border-strong",
             "disabled:opacity-50 disabled:cursor-wait",
+            className,
           )}
         >
           {member.role}

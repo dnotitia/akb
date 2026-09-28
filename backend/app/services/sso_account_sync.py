@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
 from app.repositories.events_repo import emit_event
@@ -106,7 +107,7 @@ async def process_once() -> int:
             if state not in {"disabled", "missing"}:
                 raise ProviderControlError("account_sync_user_invalid")
             async with pool.acquire() as conn:
-                async with conn.transaction():
+                async with role_authority_transaction(conn):
                     await conn.execute("SET LOCAL lock_timeout='5s'")
                     await lock_active_sso_session_epoch(conn, authority)
                     user = await conn.fetchrow("SELECT * FROM users WHERE id=$1 FOR UPDATE", identity["user_id"])

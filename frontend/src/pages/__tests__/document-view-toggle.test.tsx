@@ -122,6 +122,13 @@ function makeDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function exactTimestamp(value: string) {
+  return new Date(value).toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "numeric", hour: "numeric",
+    minute: "2-digit", second: "2-digit", timeZoneName: "short",
+  });
+}
+
 describe("document archive and restore", () => {
   it("offers read-only recovery after an accepted restore cannot be verified", async () => {
     const user = userEvent.setup();
@@ -522,13 +529,159 @@ describe("DocumentPage view toggle", () => {
 
     const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
     expect(heading).toHaveClass("sr-only");
-    expect(screen.queryByText("hello.md")).not.toBeVisible();
+    expect(screen.queryByText("hello.md")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
+    await user.click(screen.getByRole("button", { name: "Document info" }));
     await user.click(screen.getByText("Technical details"));
     expect(screen.getByText("hello.md")).toBeInTheDocument();
     expect(screen.getByText("notes/hello.md")).toBeInTheDocument();
+  });
+
+  it("shows the latest edit in the toolbar and exact edit and creation dates in Document info", async () => {
+    const user = userEvent.setup();
+    const updated = "2026-09-14T09:42:30Z";
+    const created = "2026-08-25T01:05:00Z";
+    getDocumentMock.mockResolvedValue(makeDoc({ updated_at: updated, created_at: created }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    const exactText = await screen.findByText(`Last edited: ${exactTimestamp(updated)}`);
+    const timestamp = exactText.closest("time")!;
+    expect(timestamp.tagName).toBe("TIME");
+    expect(timestamp).toHaveAttribute("datetime", new Date(updated).toISOString());
+    expect(exactText).toHaveClass("sr-only");
+    expect(timestamp.querySelector('[aria-hidden="true"]')).toHaveTextContent(/^Last edited /);
+    expect(timestamp).not.toHaveAttribute("aria-label");
+    expect(timestamp.closest('[data-slot="resource-command-row"]')).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Document info" }));
+    const panel = screen.getByRole("dialog", { name: "Document info" });
+    const editValue = within(panel).getByText("Last edited", { exact: true }).nextElementSibling;
+    const createdValue = within(panel).getByText("Created", { exact: true }).nextElementSibling;
+    expect(editValue?.querySelector("time")).toHaveAttribute("datetime", new Date(updated).toISOString());
+    expect(createdValue?.querySelector("time")).toHaveAttribute("datetime", new Date(created).toISOString());
+    expect(editValue).toHaveTextContent("2026");
+    expect(createdValue).toHaveTextContent("2026");
+  });
+
+  it.each([null, "invalid-timestamp"])("omits an unavailable toolbar edit date (%s) and explains it in Info", async updated_at => {
+    const user = userEvent.setup();
+    getDocumentMock.mockResolvedValue(makeDoc({ updated_at, created_at: null }));
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+    await screen.findByRole("heading", { name: "DocTitle" });
+    expect(screen.queryByText(/^Last edited:/)).not.toBeInTheDocument();
+    expect(document.querySelector('[data-slot="resource-command-row"] time')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Document info" }));
+    const panel = screen.getByRole("dialog", { name: "Document info" });
+    expect(within(panel).getByText("Last edited", { exact: true }).nextElementSibling).toHaveTextContent("Not available");
+    expect(within(panel).getByText("Created", { exact: true }).nextElementSibling).toHaveTextContent("Not available");
+  });
+
+  it("waits for the server edit timestamp after saving instead of inventing a browser-clock date", async () => {
+    const user = userEvent.setup();
+    const previousDate = "2026-08-25T01:05:00Z";
+    const savedDate = "2026-09-02T03:04:05Z";
+    let saved = false;
+    let finishRead!: (doc: ReturnType<typeof makeDoc>) => void;
+    const savedRead = new Promise<ReturnType<typeof makeDoc>>(resolve => { finishRead = resolve; });
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async () => saved ? savedRead : makeDoc({ updated_at: previousDate }));
+    updateDocumentMock.mockImplementation(async () => {
+      saved = true;
+      return { current_commit: UPDATED_COMMIT };
+    });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const editor = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.clear(editor);
+    await user.type(editor, "A body accepted by the server");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByRole("button", { name: "Edit" });
+    expect(document.querySelector('[data-slot="resource-command-row"] time')).not.toBeInTheDocument();
+    expect(screen.getByText("A body accepted by the server")).toBeVisible();
+
+    await act(async () => { finishRead(makeDoc({
+      content: "A body accepted by the server", current_commit: UPDATED_COMMIT, updated_at: savedDate,
+    })); });
+    const exactText = await screen.findByText(`Last edited: ${exactTimestamp(savedDate)}`);
+    expect(exactText.closest("time")).toHaveAttribute("datetime", new Date(savedDate).toISOString());
+    await user.click(screen.getByRole("button", { name: "Document info" }));
+    const panel = screen.getByRole("dialog", { name: "Document info" });
+    expect(within(panel).getByText("Last edited", { exact: true }).nextElementSibling?.querySelector("time"))
+      .toHaveAttribute("datetime", new Date(savedDate).toISOString());
+  });
+
+  it("refreshes the edit timestamp after a metadata save even while a saved body override remains", async () => {
+    const user = userEvent.setup();
+    const bodyDate = "2026-09-02T03:04:05Z";
+    const metadataDate = "2026-09-03T06:07:08Z";
+    let current = makeDoc({ updated_at: "2026-08-25T01:05:00Z" });
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async () => current);
+    updateDocumentMock.mockImplementation(async (_vault, _ref, patch: Record<string, unknown>) => {
+      current = makeDoc({
+        ...current, ...patch, current_commit: UPDATED_COMMIT,
+        updated_at: patch.content ? bodyDate : metadataDate,
+      });
+      return { current_commit: UPDATED_COMMIT };
+    });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const editor = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.clear(editor);
+    await user.type(editor, "Saved body remains readable");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByText(`Last edited: ${exactTimestamp(bodyDate)}`);
+    await user.click(screen.getByRole("button", { name: "Document info" }));
+    await user.click(screen.getByRole("button", { name: "Edit properties" }));
+    const editorDialog = screen.getByRole("dialog", { name: "Edit details" });
+    await user.type(within(editorDialog).getByRole("textbox", { name: "SUMMARY" }), "A revised summary");
+    await user.click(within(editorDialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit details" })).not.toBeInTheDocument());
+    const panel = screen.getByRole("dialog", { name: "Document info" });
+    await waitFor(() => expect(within(panel).getByText("Last edited", { exact: true }).nextElementSibling?.querySelector("time"))
+      .toHaveAttribute("datetime", new Date(metadataDate).toISOString()));
+    await user.click(within(panel).getByRole("button", { name: "Close document panel" }));
+    expect(await screen.findByText(`Last edited: ${exactTimestamp(metadataDate)}`)).toHaveClass("sr-only");
+    expect(screen.getByText("Saved body remains readable")).toBeVisible();
+    expect(updateDocumentMock).toHaveBeenCalledTimes(2);
+    expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", expect.objectContaining({ summary: "A revised summary" }));
+  });
+
+  it.each(["", "&view=diff"])("labels a historical toolbar date from the matching history entry (%s)", async suffix => {
+    const user = userEvent.setup();
+    const latestDate = "2026-09-14T09:42:30Z";
+    const versionDate = "2026-09-01T00:00:00Z";
+    const historicalCommit = "1234567abcdef"; // pragma: allowlist secret — synthetic Git commit
+    getDocumentMock.mockResolvedValue(makeDoc({ updated_at: latestDate }));
+    getDocumentHistoryMock.mockResolvedValue({
+      kind: "document_history",
+      source: "document",
+      history: [
+        { hash: "abcdef1234567", message: "Latest edit", author: "user-1", date: latestDate },
+        { hash: historicalCommit, message: "Earlier version", author: "user-1", date: versionDate },
+      ],
+    });
+    renderAt(`/vault/v/doc/notes%2Fhello.md?commit=${historicalCommit.slice(0, 7)}${suffix}`);
+    const exactText = await screen.findByText(`Version saved: ${exactTimestamp(versionDate)}`);
+    const timestamp = exactText.closest("time");
+    expect(timestamp).toHaveAttribute("datetime", new Date(versionDate).toISOString());
+    expect(exactText).toHaveClass("sr-only");
+    expect(timestamp).not.toHaveAttribute("aria-label");
+    expect(screen.queryByText(/^Last edited:/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Document info" }));
+    const panel = screen.getByRole("dialog", { name: "Document info" });
+    expect(within(panel).getByText("Latest edit", { exact: true }).nextElementSibling?.querySelector("time"))
+      .toHaveAttribute("datetime", new Date(latestDate).toISOString());
+    expect(within(panel).getByText("Version saved", { exact: true }).nextElementSibling?.querySelector("time"))
+      .toHaveAttribute("datetime", new Date(versionDate).toISOString());
+  });
+
+  it("does not substitute the latest edit date for a historical version with no matching history", async () => {
+    getDocumentMock.mockResolvedValue(makeDoc({ updated_at: "2026-09-14T09:42:30Z" }));
+    renderAt("/vault/v/doc/notes%2Fhello.md?commit=1234567");
+    await screen.findByRole("heading", { name: "DocTitle" });
+    expect(screen.queryByText(/^(Last edited|Version saved):/)).not.toBeInTheDocument();
+    expect(document.querySelector('[data-slot="resource-command-row"] time')).not.toBeInTheDocument();
   });
 
   it("records a successful document read for Home resume", async () => {
@@ -598,7 +751,7 @@ describe("DocumentPage view toggle", () => {
     );
   });
 
-  it("uses a full-width document canvas with an overlay details drawer", async () => {
+  it("keeps context views on the reader edge and opens a named overlay on a narrow canvas", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
@@ -614,14 +767,14 @@ describe("DocumentPage view toggle", () => {
     expect(article).not.toHaveClass("max-w-6xl");
     expect(article.querySelector(".document-reading-flow")).toBeInTheDocument();
     const documentViewTabs = screen.getByRole("tablist", { name: "Document view" });
-    expect(documentViewTabs.parentElement).toHaveClass("justify-end");
+    expect(screen.getByRole("group", { name: "Document reading tools" })).toContainElement(documentViewTabs);
     expect(
       screen.getByLabelText("Document statistics: 3 lines, 20 Bytes"),
     ).toBeInTheDocument();
     const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
     expect(copyMarkdown).toBeVisible();
     const documentActions = screen.getByRole("group", { name: "Document actions" });
-    expect(documentViewTabs.nextElementSibling).toBe(documentActions);
+    expect(screen.getByRole("group", { name: "Document reading tools" })).toContainElement(documentActions);
     expect(documentActions).toContainElement(copyMarkdown);
     const information = screen.getByRole("group", { name: "Publishing and more options" });
     expect(information).toContainElement(screen.getByRole("button", { name: "Publish" }));
@@ -632,74 +785,86 @@ describe("DocumentPage view toggle", () => {
       "xl:pr-88",
     );
 
-    const details = document.getElementById("document-details-panel") as HTMLElement;
-    const detailsToggle = screen.getByRole("button", { name: "Actions for DocTitle" });
-    expect(details).toHaveAttribute("aria-hidden", "true");
-    expect(details).toHaveClass("translate-x-full");
-    expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
+    const context = screen.getByRole("group", { name: "Document context" });
+    const infoTrigger = within(context).getByRole("button", { name: "Document info" });
+    const outlineTrigger = within(context).getByRole("button", { name: "Table of contents" });
+    const historyTrigger = within(context).getByRole("button", { name: "Version history" });
+    expect(within(context).getAllByRole("button").map(button => button.getAttribute("aria-label"))).toEqual([
+      "Document info", "Table of contents", "Relations", "Version history",
+    ]);
+    expect(infoTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
-    await user.click(detailsToggle);
-    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
-    expect(details).toHaveAttribute("aria-hidden", "false");
-    expect(details).toHaveClass("translate-x-0");
-    expect(detailsToggle).toHaveAttribute("aria-expanded", "false");
-    expect(details).toHaveClass("lg:w-96");
+    await user.click(infoTrigger);
+    const details = screen.getByRole("dialog", { name: "Document info" });
+    expect(details).toHaveAttribute("data-mode", "overlay");
+    expect(within(details).getByRole("heading", { name: "Document info" })).toBeVisible();
+    expect(within(details).getByRole("region", { name: "Document properties" })).toBeVisible();
+    expect(screen.queryByRole("tablist", { name: "Document detail views" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("group", { name: "Document context" })).toHaveLength(1);
+    expect(within(details).getByRole("button", { name: "Document info" })).toHaveAttribute("aria-expanded", "true");
 
-    const detailViews = screen.getByRole("tablist", { name: "Document detail views" });
-    const infoTab = screen.getByRole("tab", { name: "Info" });
-    expect(detailViews).toContainElement(infoTab);
-    expect(infoTab).toHaveAttribute("aria-selected", "true");
-    const infoPanel = screen.getByRole("tabpanel", { name: "Info" });
-    expect(infoPanel).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
+    await user.click(within(details).getByRole("button", { name: "Table of contents" }));
+    expect(screen.getByRole("dialog", { name: "On this page" })).toBeVisible();
+    expect(within(details).getByRole("button", { name: "Table of contents" })).toHaveAttribute("aria-expanded", "true");
+    await user.click(within(details).getByRole("button", { name: "Close document panel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(outlineTrigger).toHaveFocus());
 
-    await user.click(screen.getByRole("tab", { name: /^Outline/ }));
-    expect(screen.getByRole("heading", { level: 3, name: "On this page" })).toBeVisible();
-    expect(screen.getByRole("tabpanel", { name: /^Outline/ })).toHaveClass(
-      "min-h-0",
-      "flex-1",
-      "overflow-y-auto",
-    );
-
-    await user.click(screen.getByRole("button", { name: "Close document panel" }));
-    expect(details).toHaveAttribute("aria-hidden", "true");
-    await waitFor(() => expect(detailsToggle).toHaveFocus());
-
-    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "History" }));
-    expect(details).toHaveAttribute("aria-hidden", "false");
-    expect(screen.getByRole("tab", { name: /^History/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-
+    await user.click(historyTrigger);
+    expect(screen.getByRole("dialog", { name: "Version history" })).toBeVisible();
     await user.keyboard("{Escape}");
-    expect(details).toHaveAttribute("aria-hidden", "true");
-    await waitFor(() => expect(detailsToggle).toHaveFocus());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(historyTrigger).toHaveFocus());
   });
 
-  it("transfers focus for inspector selections and restores Actions for other menu dismissals", async () => {
+  it("keeps context entries out of overflow and restores Actions after reading-width changes and dismissal", async () => {
     const user = userEvent.setup();
     renderAt("/vault/v/doc/notes%2Fhello.md");
     const actions = await screen.findByRole("button", { name: "Actions for DocTitle" });
     await user.click(actions);
-    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
-    const close = screen.getByRole("button", { name: "Close document panel" });
-    await waitFor(() => expect(close).toHaveFocus());
-
-    await user.click(actions);
-    await user.click(screen.getByRole("menuitem", { name: "Table of contents" }));
-    expect(screen.getByRole("tab", { name: /^Outline/ })).toHaveAttribute("aria-selected", "true");
-    await waitFor(() => expect(close).toHaveFocus());
-
-    await user.click(actions);
+    for (const name of ["Document info", "Table of contents", "Relations", "History", "Version history"]) {
+      expect(screen.queryByRole("menuitem", { name })).not.toBeInTheDocument();
+    }
     await user.click(screen.getByRole("menuitemradio", { name: "Wide" }));
     await waitFor(() => expect(actions).toHaveFocus());
-    expect(close).toBeVisible();
+    expect(document.querySelector(".document-reading-wide")).toBeInTheDocument();
 
     await user.click(actions);
     await user.keyboard("{Escape}");
     await waitFor(() => expect(actions).toHaveFocus());
-    expect(close).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("offers rendered reading from the Raw outline instead of inactive heading links", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=raw");
+    await screen.findByTestId("doc-raw");
+    await user.click(screen.getByRole("button", { name: "Table of contents" }));
+    const outline = screen.getByRole("dialog", { name: "On this page" });
+    expect(outline).toHaveTextContent("Headings are available in the rendered document.");
+    expect(within(outline).queryByRole("navigation", { name: "Document outline" })).not.toBeInTheDocument();
+    expect(within(outline).queryByRole("link")).not.toBeInTheDocument();
+    await user.click(within(outline).getByRole("button", { name: "Show rendered document" }));
+    expect(await within(outline).findByRole("link", { name: "BodyHeading" })).toBeVisible();
+    expect(screen.queryByTestId("doc-raw")).not.toBeInTheDocument();
+    expect(screen.getByTestId("location-search")).not.toHaveTextContent("view=raw");
+    await user.click(within(outline).getByRole("link", { name: "BodyHeading" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "BodyHeading" })).toHaveFocus());
+  });
+
+  it("explains why the Diff outline is unavailable without inactive links or a second navigation action", async () => {
+    const user = userEvent.setup();
+    renderAt("/vault/v/doc/notes%2Fhello.md?commit=abcdef1234567&view=diff");
+    await screen.findByRole("table", { name: /unified document changes/i });
+    await user.click(screen.getByRole("button", { name: "Table of contents" }));
+    const outline = screen.getByRole("dialog", { name: "On this page" });
+    expect(outline).toHaveTextContent("Return to the document to navigate its headings. The table of contents is not available in a change comparison.");
+    expect(within(outline).queryByRole("navigation", { name: "Document outline" })).not.toBeInTheDocument();
+    expect(within(outline).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(outline).queryByRole("button", { name: /Show rendered|Back to/ })).not.toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("button", { name: "Back to version" })).toBeVisible();
   });
 
   it("renders Markdown by default", async () => {
@@ -725,7 +890,7 @@ describe("DocumentPage view toggle", () => {
     expect(edit).toHaveTextContent("");
     expect(edit).not.toHaveClass("bg-primary", "shadow-sm");
     expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label") || tab.textContent)).toEqual([
-      "Rendered",
+      "Preview",
       "Raw",
     ]);
 
@@ -788,7 +953,7 @@ describe("DocumentPage view toggle", () => {
     ).toBeInTheDocument();
   });
 
-  it("merges a compact summary into the document viewer toolbar without opening Details", async () => {
+  it("separates document context from reading tools while keeping summary disclosure accessible", async () => {
     getDocumentMock.mockResolvedValue(
       makeDoc({ summary: "A concise orientation to the document before the full body begins." }),
     );
@@ -800,13 +965,17 @@ describe("DocumentPage view toggle", () => {
     );
     const statistics = screen.getByLabelText("Document statistics: 3 lines, 20 Bytes");
     const copyMarkdown = screen.getByRole("button", { name: "Copy markdown" });
-    expect(summary.closest('[data-slot="resource-command-row"]')).toContainElement(statistics);
-    expect(summary.closest('[data-slot="resource-command-row"]')).toContainElement(copyMarkdown);
+    expect(summary).toHaveTextContent("Summary:");
+    const readingTools = screen.getByRole("group", { name: "Document reading tools" });
+    expect(readingTools).toContainElement(statistics);
+    expect(readingTools).toContainElement(copyMarkdown);
+    expect(within(readingTools).getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(readingTools).not.toContainElement(summary);
+    const context = summary.closest('[data-slot="resource-command-row"]');
+    expect(context).not.toContainElement(statistics);
+    expect(context).toContainElement(screen.getByRole("button", { name: "Publish" }));
     expect(screen.queryByRole("region", { name: "Document summary" })).not.toBeInTheDocument();
-    expect(document.getElementById("document-details-panel")).toHaveAttribute(
-      "aria-hidden",
-      "true",
-    );
+    expect(document.querySelector('[data-slot="document-context-panel"]')).not.toBeInTheDocument();
     await userEvent.setup().click(summary);
     expect(await screen.findByRole("dialog", { name: "Document summary" })).toHaveTextContent("A concise orientation");
   });
@@ -837,7 +1006,7 @@ describe("DocumentPage view toggle", () => {
     );
   });
 
-  it("does not include a foreign endpoint in the outer relation count", async () => {
+  it("does not include a foreign endpoint in the relation panel or its count", async () => {
     getRelationsMock.mockResolvedValue({
       relations: [
         {
@@ -860,11 +1029,11 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "Document info" }));
-    const relationsTab = await screen.findByRole("tab", { name: /^Relations/ });
-    expect(relationsTab).toHaveTextContent(/^Relations1$/);
-    expect(relationsTab).not.toHaveTextContent("2");
+    await user.click(await screen.findByRole("button", { name: "Relations" }));
+    const panel = screen.getByRole("dialog", { name: "Relations" });
+    expect(within(panel).getByText("1 relation", { exact: true })).toBeVisible();
+    expect(within(panel).getByRole("link", { name: /local/ })).toBeVisible();
+    expect(within(panel).queryByText(/hidden|private/)).not.toBeInTheDocument();
   });
 
   it("loads logical document lineage instead of path-scoped Vault activity", async () => {
@@ -905,8 +1074,7 @@ describe("DocumentPage view toggle", () => {
     });
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
-    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "History" }));
+    await user.click(await screen.findByRole("button", { name: "Version history" }));
     const changes = await screen.findByRole("button", {
       name: "View changes in version abcdef1",
     });
@@ -916,22 +1084,16 @@ describe("DocumentPage view toggle", () => {
     expect(screen.getByTestId("location-search")).toHaveTextContent(
       "commit=abcdef1234567&view=diff",
     );
-    expect(document.getElementById("document-details-panel")).toHaveAttribute(
-      "aria-hidden",
-      "true",
-    );
+    expect(screen.queryByRole("dialog", { name: "Version history" })).not.toBeInTheDocument();
     expect(screen.queryByRole("tablist", { name: "Document view" })).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Back to version" }));
-    await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
+    await screen.findByRole("heading", { level: 2, name: "BodyHeading", hidden: true });
     expect(screen.getByTestId("location-search")).toHaveTextContent(
       "commit=abcdef1234567",
     );
     expect(screen.getByTestId("location-search")).not.toHaveTextContent("view=diff");
-    expect(document.getElementById("document-details-panel")).toHaveAttribute(
-      "aria-hidden",
-      "false",
-    );
+    expect(screen.getByRole("dialog", { name: "Version history" })).toBeVisible();
     await waitFor(() =>
       expect(
         screen.getByRole("button", { name: "View changes in version abcdef1" }),
@@ -953,8 +1115,7 @@ describe("DocumentPage view toggle", () => {
     });
     renderPreviewAt("/vault/v/doc/notes%2Fhello.md");
 
-    await user.click(await screen.findByRole("button", { name: "Actions for DocTitle" }));
-    await user.click(screen.getByRole("menuitem", { name: "History" }));
+    await user.click(await screen.findByRole("button", { name: "Version history" }));
     await user.click(await screen.findByRole("button", {
       name: "View changes in version abcdef1",
     }));
@@ -1008,7 +1169,7 @@ describe("DocumentPage view toggle", () => {
     await screen.findByRole("heading", { level: 2, name: "BodyHeading" });
 
     const rawTab = screen.getByRole("tab", { name: "Raw" });
-    const renderedTab = screen.getByRole("tab", { name: "Rendered" });
+    const renderedTab = screen.getByRole("tab", { name: "Preview" });
     expect(rawTab).toHaveAttribute("aria-selected", "false");
     expect(renderedTab).toHaveAttribute("aria-selected", "true");
     await user.click(rawTab);
@@ -1019,7 +1180,7 @@ describe("DocumentPage view toggle", () => {
 
     // Selection flips on the segmented control.
     expect(screen.getByRole("tab", { name: "Raw" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: "Rendered" })).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "false");
 
     // The URL search now contains view=raw.
     expect(screen.getByTestId("location-search")).toHaveTextContent("view=raw");

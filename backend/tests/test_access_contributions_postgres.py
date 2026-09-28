@@ -33,7 +33,7 @@ _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
 _MIGRATION_HEAD = (
-    _BACKEND / "app" / "db" / "migrations" / "112_edges_resource_identity.py"
+    _BACKEND / "app" / "db" / "migrations" / "113_bm25_vocab_epoch.py"
 )
 _MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
 
@@ -117,6 +117,16 @@ class _RecordingRoleSync:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+
+    async def sync_vault_user_in_conn(self, conn, vault_id, user_id):
+        row = await conn.fetchrow("SELECT owner_id FROM vaults WHERE id=$1", vault_id)
+        role = "admin" if row["owner_id"] == user_id else await conn.fetchval(
+            "SELECT role FROM vault_access WHERE vault_id=$1 AND user_id=$2", vault_id, user_id,
+        )
+        if role is None:
+            await self.on_revoke(vault_id, user_id)
+        else:
+            await self.on_grant(vault_id, user_id, role)
 
     async def on_grant(self, vault_id, user_id, scope):
         self.calls.append(("grant", str(vault_id), str(user_id), scope))

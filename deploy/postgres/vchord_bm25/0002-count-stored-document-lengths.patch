@@ -1,0 +1,100 @@
+Count every document at the length the index stores for it
+
+Applies to vchord_bm25 0.3.0 (upstream tag 0.3.0, commit c610b7ab).
+
+The metapage keeps doc_term_cnt, the sum of document lengths, and BM25 takes
+the average document length from it. An insert added the document's exact
+length (insert.rs) and a build summed exact lengths (builder.rs), but
+ambulkdelete (vacuum.rs) subtracted field_norm_reader.read(i): the document's
+one-byte length code, not a length. The code equals the length up to 40 and
+compresses above it (136 to 143 is code 62, 300 is code 72), so a deleted
+document left its length minus its code behind: 1 at 41, 14 at 64, 43 at 100,
+77 at 139. The average grew with every update and delete that VACUUM cleaned
+up, until the index was rebuilt.
+
+The index stores only the code, so VACUUM cannot take back an exact length.
+Subtracting the length the code stands for is not enough either: the code
+rounds a length down to the start of its bucket, so a replaced document still
+left up to a bucket's width behind, and replacing every row once raised the
+average by 3 to 4% for lengths between 41 and 600.
+
+This patch makes every side count the length the code stands for,
+id_to_fieldnorm(fieldnorm_to_id(len)): the build, the insert and VACUUM. What
+VACUUM subtracts is then exactly what was added, and the sum stays the sum of
+the remaining documents' stored lengths however often they are replaced. Those
+are also the lengths BM25 scores each document with, so the average is now
+the mean of the lengths it is compared against, a little below the mean of
+exact lengths. No on-disk format or SQL changes.
+
+Measured: 1,000 rows inserted, deleted and vacuumed left doc_term_cnt at
+915,973 against 2,973 true, an average length of 3,578 against 11.61.
+
+License: this patch modifies vchord_bm25 and is offered under the same terms
+as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
+---
+diff --git a/src/index/insert.rs b/src/index/insert.rs
+index 7979ca0..ba6fae6 100644
+--- a/src/index/insert.rs
++++ b/src/index/insert.rs
+@@ -9,7 +9,7 @@ use crate::{
+     },
+     segment::{
+         delete::extend_delete_bit,
+-        field_norm::fieldnorm_to_id,
++        field_norm::{fieldnorm_to_id, id_to_fieldnorm},
+         growing::{GrowingSegmentData, GrowingSegmentReader, SealingTask},
+         meta::MetaPageData,
+         posting::{InvertedAppender, InvertedWriter},
+@@ -74,7 +74,7 @@ unsafe fn aminsertinner(
+     let current_doc_id = meta.current_doc_id;
+     meta.current_doc_id += 1;
+     meta.doc_cnt += 1;
+-    meta.doc_term_cnt += doc_len as u64;
++    meta.doc_term_cnt += id_to_fieldnorm(fieldnorm_to_id(doc_len)) as u64;
+ 
+     let growing_results = crate::segment::growing::growing_segment_insert(index, meta, &vector);
+ 
+diff --git a/src/index/vacuum.rs b/src/index/vacuum.rs
+index fc449a4..c107de0 100644
+--- a/src/index/vacuum.rs
++++ b/src/index/vacuum.rs
+@@ -4,7 +4,7 @@ use crate::{
+     page::{page_read, page_write, BM25_PAGE_SIZE, METAPAGE_BLKNO},
+     segment::{
+         delete::DeleteBitmapReader,
+-        field_norm::{FieldNormRead, FieldNormReader},
++        field_norm::{id_to_fieldnorm, FieldNormRead, FieldNormReader},
+         growing::GrowingSegmentReader,
+         meta::MetaPageData,
+         payload::PayloadReader,
+@@ -58,7 +58,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
+         if callback(tid) {
+             delete_bitmap_reader.delete(i);
+             meta.doc_cnt -= 1;
+-            meta.doc_term_cnt -= field_norm_reader.read(i) as u64;
++            meta.doc_term_cnt -= id_to_fieldnorm(field_norm_reader.read(i)) as u64;
+             stats.tuples_removed += 1.0;
+         } else {
+             stats.num_index_tuples += 1.0;
+diff --git a/src/segment/builder.rs b/src/segment/builder.rs
+index 31b3013..d929ca2 100644
+--- a/src/segment/builder.rs
++++ b/src/segment/builder.rs
+@@ -1,7 +1,7 @@
+ use crate::datatype::Bm25VectorBorrowed;
+ 
+ use super::{
+-    field_norm::FieldNormWriter,
++    field_norm::{fieldnorm_to_id, id_to_fieldnorm, FieldNormWriter},
+     payload::PayloadWriter,
+     posting::{InvertedSerializer, InvertedWriter, TERMINATED_DOC},
+     sealed::SealedSegmentData,
+@@ -35,7 +35,7 @@ impl IndexBuilder {
+         if self.doc_cnt == TERMINATED_DOC {
+             pgrx::error!("bm25 index can only store up to 2^32 - 1 documents");
+         }
+-        self.doc_term_cnt += vector.doc_len() as u64;
++        self.doc_term_cnt += id_to_fieldnorm(fieldnorm_to_id(vector.doc_len())) as u64;
+     }
+ 
+     pub fn finalize_insert(&mut self) {

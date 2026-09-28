@@ -45,6 +45,12 @@ BM25_BULK_OWNER_LOCK_KEY = advisory_lock_key(
 BM25_BULK_CONTROL_LOCK_KEY = advisory_lock_key(
     "akb:bm25-maintenance:bulk:control"
 )
+# The term-id fence. A transaction that stores term ids holds it shared; the
+# renumbering (`scripts/compact_bm25_term_ids.py`) holds it exclusively for
+# the transaction that rewrites them, together with `bm25_vocab_epoch`.
+BM25_VOCAB_EPOCH_LOCK_KEY = advisory_lock_key(
+    "akb:bm25-maintenance:vocab-epoch"
+)
 
 
 BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD = "recompute_lock_held"
@@ -123,6 +129,7 @@ __all__ = [
     "BM25_RECOMPUTE_LOCK_KEY",
     "BM25_BULK_OWNER_LOCK_KEY",
     "BM25_BULK_CONTROL_LOCK_KEY",
+    "BM25_VOCAB_EPOCH_LOCK_KEY",
     "BM25_RECOMPUTE_SKIP_REASON_LOCK_HELD",
     "BM25_RECOMPUTE_SKIP_REASON_VECTOR_QUEUE",
     "BM25_RECOMPUTE_SKIP_REASONS",

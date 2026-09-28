@@ -17,7 +17,7 @@ export function NotificationBell() {
   return <Dialog open={open} onOpenChange={setOpen}>
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{countLabel}</span>
     <DialogTrigger asChild>
-      <Button id="notifications-trigger" variant="ghost" size="icon" className="relative h-9 w-9 shrink-0"
+      <Button id="notifications-trigger" variant="ghost" size="icon" className="relative h-9 w-9 shrink-0 rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-foreground"
         aria-label={countLabel}>
         <Bell className="h-4 w-4" aria-hidden />
         {unread !== undefined && unread > 0 && <span aria-hidden className="absolute -right-1 -top-1 min-w-4 rounded-full bg-primary px-1 text-xs font-medium tabular-nums text-primary-foreground">{unread > 99 ? "99+" : unread}</span>}

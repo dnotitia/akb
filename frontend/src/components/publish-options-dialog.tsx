@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Eye, EyeOff, Globe2 } from "lucide-react";
 import {
   createPublication,
@@ -20,7 +20,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -52,11 +51,13 @@ export function PublicationAccessFields({
   onChange,
   idPrefix,
   disabled = false,
+  compact = false,
 }: {
   value: PublicationAccessOptions;
   onChange: (next: PublicationAccessOptions) => void;
   idPrefix: string;
   disabled?: boolean;
+  compact?: boolean;
 }) {
   const [showPassword, setShowPassword] = useState(false);
   const passwordId = `${idPrefix}-password`;
@@ -76,7 +77,7 @@ export function PublicationAccessFields({
 
   return (
     <div className="space-y-4">
-      <div className="rounded-[var(--radius-md)] border border-border p-3">
+      <div className={compact ? undefined : "rounded-[var(--radius-md)] border border-border p-3"}>
         <label className="flex min-h-9 cursor-pointer items-center gap-2">
           <input
             type="checkbox"
@@ -138,7 +139,7 @@ export function PublicationAccessFields({
 
       <fieldset disabled={disabled}>
         <legend className="mb-1.5 text-xs font-medium text-foreground">Expires</legend>
-        <div className="grid grid-cols-2 gap-px overflow-hidden rounded-[var(--radius-md)] border border-border bg-border sm:grid-cols-5">
+        <div className={`grid gap-px overflow-hidden rounded-[var(--radius-md)] border border-border bg-border ${compact ? "grid-cols-5" : "grid-cols-2 sm:grid-cols-5"}`}>
           {EXPIRY_PRESETS.map((preset) => {
             const active = value.expiresIn === preset.value;
             return (
@@ -193,44 +194,58 @@ export function PublicationAccessFields({
   );
 }
 
-export function PublishOptionsDialog({
-  open,
-  onOpenChange,
+interface PublishOptionsFormProps extends Omit<PublishOptionsDialogProps, "open" | "onOpenChange"> {
+  onCancel: () => void;
+  working: boolean;
+  onWorkingChange: (working: boolean) => void;
+  compact?: boolean;
+  disabledReason?: string;
+  header?: ReactNode;
+}
+
+/** Shared publication contract; the caller owns its modal or anchored surface. */
+export function PublishOptionsForm({
   vault,
   docId,
   resourceType = "document",
   resourceUri,
   resourceName,
   onPublished,
-}: PublishOptionsDialogProps) {
+  onCancel,
+  working,
+  onWorkingChange,
+  compact = false,
+  disabledReason,
+  header,
+}: PublishOptionsFormProps) {
   const [access, setAccess] = useState<PublicationAccessOptions>(
     emptyPublicationAccessOptions,
   );
-  const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const errorRef = useRef<HTMLDivElement | null>(null);
+  const fieldsRef = useRef<HTMLDivElement | null>(null);
+  const idPrefix = useId();
   const accessError = publicationAccessError(access);
   const resourceLabel = resourceType === "file" ? "file" : "document";
 
   useEffect(() => {
-    if (!open) {
-      setAccess(emptyPublicationAccessOptions());
-      setError("");
-    }
-  }, [open]);
-
-  useEffect(() => {
-    if (error) errorRef.current?.focus();
-  }, [error]);
+    const summary = errorRef.current;
+    if (!error || !summary) return;
+    // Reveal the failure inside this surface, never scroll the reading shell.
+    const scroller = compact ? fieldsRef.current : summary.closest<HTMLElement>('[role="dialog"]');
+    if (scroller) scroller.scrollTop += summary.getBoundingClientRect().top - scroller.getBoundingClientRect().top - scroller.clientTop - 4;
+    summary.focus({ preventScroll: true });
+  }, [error, compact]);
 
   async function handlePublish(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (working || disabledReason) return;
     if (accessError) {
       setError(accessError);
       return;
     }
 
-    setWorking(true);
+    onWorkingChange(true);
     setError("");
     try {
       let uri = resourceUri;
@@ -252,7 +267,6 @@ export function PublishOptionsDialog({
         );
         if (existing) {
           onPublished(existing.slug, existing);
-          onOpenChange(false);
           return;
         }
       }
@@ -265,66 +279,72 @@ export function PublishOptionsDialog({
         ...publicationAccessPayload(access),
       });
       onPublished(result.slug, result);
-      onOpenChange(false);
     } catch (caught: unknown) {
       setError(caught instanceof Error ? caught.message : `Failed to publish ${resourceLabel}.`);
     } finally {
-      setWorking(false);
+      onWorkingChange(false);
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={(next) => !working && onOpenChange(next)}>
+    <form onSubmit={handlePublish} className={compact ? "flex min-h-0 flex-col" : "contents"} aria-busy={working}>
+      <div ref={fieldsRef} className={compact ? "min-h-0 space-y-4 overflow-y-auto overscroll-contain scroll-py-4 px-4 pb-4" : "contents"}>
+        {header}
+        {!compact && <Alert variant="info" title="Public link">
+          <span className="inline-flex items-start gap-2">
+            <Globe2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+            Anyone with the link can open this {resourceLabel} without signing in.
+          </span>
+        </Alert>}
+
+        {error && (
+          <div ref={errorRef} tabIndex={-1}>
+            <Alert variant="destructive" title="Publication failed">
+              {error}
+            </Alert>
+          </div>
+        )}
+
+        <PublicationAccessFields
+          value={access}
+          onChange={setAccess}
+          idPrefix={idPrefix}
+          disabled={working || Boolean(disabledReason)}
+          compact={compact}
+        />
+      </div>
+      <div className={compact ? "flex shrink-0 items-center justify-end gap-2 border-t border-border px-4 py-3" : "flex flex-col-reverse gap-2 sm:flex-row sm:justify-end"}>
+        <Button type="button" variant="outline" onClick={onCancel} disabled={working}>
+          Cancel
+        </Button>
+        <Button type="submit" variant="accent" loading={working} disabled={Boolean(accessError) || Boolean(disabledReason)}>
+          {working ? "Publishing…" : "Publish"}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+export function PublishOptionsDialog(props: PublishOptionsDialogProps) {
+  const [working, setWorking] = useState(false);
+  const resourceLabel = props.resourceType === "file" ? "file" : "document";
+  return (
+    <Dialog open={props.open} onOpenChange={(next) => !working && props.onOpenChange(next)}>
       <DialogContent className="max-w-xl">
-        <form onSubmit={handlePublish} className="contents">
-          <DialogHeader>
-            <DialogTitle>Publish {resourceLabel}</DialogTitle>
-            <DialogDescription>
-              Create a public, read-only link with optional access limits.
-            </DialogDescription>
-          </DialogHeader>
-
-          <Alert variant="info" title="Public link">
-            <span className="inline-flex items-start gap-2">
-              <Globe2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-              Anyone with the link can open this {resourceLabel} without signing in.
-            </span>
-          </Alert>
-
-          {error && (
-            <div ref={errorRef} tabIndex={-1}>
-              <Alert variant="destructive" title="Publication failed">
-                {error}
-              </Alert>
-            </div>
-          )}
-
-          <PublicationAccessFields
-            value={access}
-            onChange={setAccess}
-            idPrefix={`${resourceType}-publication`}
-            disabled={working}
-          />
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={working}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              variant="accent"
-              loading={working}
-              disabled={Boolean(accessError)}
-            >
-              {working ? "Publishing…" : "Publish"}
-            </Button>
-          </DialogFooter>
-        </form>
+        <DialogHeader>
+          <DialogTitle>Publish {resourceLabel}</DialogTitle>
+          <DialogDescription>Create a public, read-only link with optional access limits.</DialogDescription>
+        </DialogHeader>
+        <PublishOptionsForm
+          {...props}
+          working={working}
+          onWorkingChange={setWorking}
+          onCancel={() => props.onOpenChange(false)}
+          onPublished={(slug, publication) => {
+            props.onPublished(slug, publication);
+            props.onOpenChange(false);
+          }}
+        />
       </DialogContent>
     </Dialog>
   );

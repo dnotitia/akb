@@ -386,16 +386,16 @@ h1, h2, h3, h4, h5, h6 {
   border-color: var(--glass-border);
 }
 
-/* App header: near-solid surface + a quiet hairline (Swiss). Was a glassy
-   blur with a teal→orange gradient underline + heavy lift — dialed back so
-   the workspace chrome recedes and content leads. A faint blur remains for
-   when content scrolls under it. */
+/* Quiet, opaque application chrome. Vault section links share this surface;
+   the document's white/slate reading surface begins below their boundary. */
 .app-header {
-  background-color: color-mix(in srgb, var(--color-surface) 92%, transparent);
-  backdrop-filter: saturate(130%) blur(8px);
-  -webkit-backdrop-filter: saturate(130%) blur(8px);
+  background-color: var(--color-background);
   border-bottom: 1px solid var(--color-border);
   box-shadow: none;
+}
+/* Paper routes connect the global tools to their content and navigation rails. */
+.app-header[data-surface="paper"] {
+  background-color: var(--color-surface);
 }
 
 /* Gradient brand wordmark */
@@ -818,6 +818,10 @@ body::before {
 /* Reader commands use the available workspace width, not the viewport. Keep
    modes/actions on one metric even when the navigation rails are expanded. */
 .document-command-inner { --reader-control-size: 2.75rem; }
+.document-metadata-row { border-bottom: 0; padding-block: .25rem; }
+.document-metadata-row .document-command-inner { padding-inline: 0; padding-block: 0; min-height: 2.25rem; }
+.document-metadata-row [data-slot="resource-command-meta"] { flex-wrap: nowrap; }
+.document-metadata-row [data-slot="resource-command-actions"] { flex-shrink: 0; }
 .document-command-inner [data-reader-control] {
   height: var(--reader-control-size);
   min-height: var(--reader-control-size);

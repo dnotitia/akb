@@ -3,9 +3,13 @@
 - Tokenization: Kiwi (한국어 형태소 분석). Only content-bearing morphemes are
   kept (nouns, verbs, foreign words, Hanja, numbers); stop-like particles are
   dropped by tag filtering.
-- Vocab: each unique term gets a stable integer id in `bm25_vocab`. Ids are
-  NEVER reassigned — vector-store sparse vectors reference them, so a mutation
-  would corrupt every already-indexed chunk.
+- Vocab: each unique term gets an integer id in `bm25_vocab`, and the ids are
+  dense. Vector-store sparse vectors reference them, so exactly one thing
+  reassigns them: `scripts/compact_bm25_term_ids.py`, which rewrites every
+  consumer in one transaction and advances `bm25_vocab_epoch` in it. Encoding
+  and storing are separate transactions, so an encoding carries the epoch its
+  ids were read at (`encode_document_at_epoch`) and the storing transaction
+  refuses ids from another one (`hold_vocabulary_epoch`).
 - External corpus stats (`bm25_stats`): N, avgdl, tokenizer version, plus
   document frequencies in `bm25_vocab`. Posting/arrays and other pre-baked
   consumers use these weights; Seahorse DB receives them at search time.
@@ -49,7 +53,7 @@ import os
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ProcessPoolExecutor
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import kiwipiepy
 from kiwipiepy import Kiwi
@@ -352,38 +356,200 @@ async def _tokenize_uncached(text: str) -> list[str]:
     return await asyncio.to_thread(_tokenize_sync, text)
 
 
-# ── Vocab management (append-only) ────────────────────────────────
+# ── Vocab management (append-only terms, dense ids) ───────────────
+
+
+class VocabularyRenumberingInProgress(RuntimeError):
+    """A term-id renumbering holds the fence, so no ids can be read or stored.
+
+    Not a fault of the chunk at hand. The renumbering commits in one
+    transaction, and the same work goes through after it."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "a BM25 term-id renumbering holds the vocabulary fence; "
+            "term ids are available again when it commits"
+        )
+
+
+class VocabularyEpochMoved(RuntimeError):
+    """The ids were read under one numbering, and the vocabulary has another."""
+
+    def __init__(self, encoded: int, current: int | None) -> None:
+        self.encoded = encoded
+        self.current = current
+        super().__init__(
+            "BM25 term ids were renumbered after this chunk was encoded "
+            f"(vocabulary epoch {encoded}, now {current}); it is encoded again "
+            "on retry"
+        )
+
+
+class EncodedDocument(NamedTuple):
+    """A document vector and the vocabulary epoch its ids were read at.
+
+    `epoch` is None when the document holds no terms: no id can go stale, so a
+    writer has nothing to fence."""
+
+    indices: list[int]
+    values: list[float]
+    epoch: int | None
+
+
+class EncodedQuery(NamedTuple):
+    """Query weights and the numbering they must execute against."""
+
+    indices: list[int]
+    values: list[float]
+    epoch: int | None
+
+
+# A lookup that sees the epoch move starts over. A renumbering is a maintenance
+# command; one committing inside every attempt of the same lookup is a fault.
+_VOCABULARY_EPOCH_ATTEMPTS = 3
+
+_EPOCH_SQL = "SELECT epoch FROM bm25_vocab_epoch WHERE id = 1"
+_FENCE_SQL = "SELECT pg_try_advisory_xact_lock_shared($1)"
+
+
+async def _vocabulary_epoch(conn) -> int:
+    epoch = await conn.fetchval(_EPOCH_SQL)
+    if epoch is None:
+        raise RuntimeError("bm25_vocab_epoch has no row; migration 113 has not run")
+    return int(epoch)
+
+
+async def vocabulary_epoch() -> int:
+    """The numbering the vocabulary's term ids are in now."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await _vocabulary_epoch(conn)
+
+
+async def hold_vocabulary_epoch(conn, epoch: int | None) -> None:
+    """Keep ids read at `epoch` valid until this transaction ends, or refuse them.
+
+    Call it first in the transaction that stores term ids, before that
+    transaction takes any other lock. It holds the term-id fence shared until
+    the transaction ends, so a renumbering, which holds it exclusively, cannot
+    commit between this check and this write. Then it checks that the ids were
+    read under the numbering in force.
+
+    The lock and the read are two statements, in this order, and must stay so.
+    Read committed gives each statement its own snapshot. An epoch read by the
+    statement that takes the lock would use a snapshot taken before the lock
+    was granted, and so before a renumbering that held it committed. It would
+    pass exactly the ids this exists to stop.
+
+    The fence is tried, not waited for. A renumbering holds it while it
+    rewrites and reindexes the vectors. A writer queued behind it would spend
+    its statement timeout, and with it a retry, on every chunk it attempts.
+    """
+    if epoch is None:
+        return
+    if not await conn.fetchval(_FENCE_SQL, bm25_maintenance.BM25_VOCAB_EPOCH_LOCK_KEY):
+        raise VocabularyRenumberingInProgress()
+    current = await _vocabulary_epoch(conn)
+    if current != epoch:
+        raise VocabularyEpochMoved(epoch, current)
 
 
 async def get_or_create_term_ids(terms: Iterable[str]) -> dict[str, int]:
-    """Return {term: term_id} for given terms. New terms get fresh ids from
-    the sequence. Existing terms are looked up. df is NOT incremented here —
-    df/N/avgdl are rebuilt by `recompute_stats()`.
+    """Return {term: term_id} for given terms, all from one numbering.
+
+    `get_or_create_term_ids_at_epoch` without the epoch, for callers that do
+    not store the ids in a later transaction."""
+    ids, _epoch = await get_or_create_term_ids_at_epoch(terms)
+    return ids
+
+
+async def get_or_create_term_ids_at_epoch(
+    terms: Iterable[str],
+) -> tuple[dict[str, int], int | None]:
+    """Return ({term: term_id}, epoch) for given terms. New terms get fresh ids
+    from the sequence. Existing terms are looked up. df is NOT incremented here —
+    df/N/avgdl are rebuilt by `recompute_stats()`. The epoch is None when
+    there are no terms.
+
+    Almost every term an encoder sees already exists, so existing terms are
+    READ, not upserted. `ON CONFLICT DO UPDATE` with a no-op SET still locks
+    each existing row until its transaction ends, writes a new row version and
+    calls `nextval()` for every term — so encoders sharing common terms queued
+    on the same rows. On a live 2.1M-chunk sweep that queue was 42% of the
+    writers' sampled wait, and the vocabulary had taken 161M updates for 953k
+    rows. A plain read takes no row lock; only unseen terms are inserted.
+
+    Every id returned belongs to the numbering the epoch names. The known ids
+    are read in the same statement as the epoch, and a lookup that is answered
+    by that statement alone is one snapshot. Inserting new terms takes more
+    statements, and a renumbering can commit between them, so that path reads
+    the epoch again at the end and starts over if it moved.
     """
     uniq = list({t for t in terms if t})
     if not uniq:
-        return {}
+        return {}, None
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Upsert: existing rows stay untouched (including their term_id);
-        # new rows get a fresh id from the sequence.
-        # ORDER BY enforces a deterministic row-lock acquisition order so
-        # concurrent encoders processing documents with overlapping vocab
-        # (English stopwords are the dominant case) don't deadlock on the
-        # ON CONFLICT row locks.
-        rows = await conn.fetch(
-            """
-            INSERT INTO bm25_vocab (term, term_id)
-            SELECT t, nextval('bm25_term_id_seq')
-              FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
-            ON CONFLICT (term) DO UPDATE
-                SET updated_at = bm25_vocab.updated_at   -- no-op, returns existing row
-            RETURNING term, term_id
-            """,
-            uniq,
-        )
-    return {r["term"]: int(r["term_id"]) for r in rows}
+        for _attempt in range(_VOCABULARY_EPOCH_ATTEMPTS):
+            # A renumbering locks the vocabulary for its whole transaction.
+            # Asking the fence first refuses now, by name, instead of when the
+            # statement timeout ends a lookup queued behind that lock.
+            if not await conn.fetchval(_FENCE_SQL, bm25_maintenance.BM25_VOCAB_EPOCH_LOCK_KEY):
+                raise VocabularyRenumberingInProgress()
+            row = await conn.fetchrow(
+                """
+                SELECT (SELECT epoch FROM bm25_vocab_epoch WHERE id = 1) AS epoch,
+                       array_agg(term) AS terms, array_agg(term_id) AS ids
+                  FROM bm25_vocab WHERE term = ANY($1::text[])
+                """,
+                uniq,
+            )
+            if row["epoch"] is None:
+                raise RuntimeError("bm25_vocab_epoch has no row; migration 113 has not run")
+            epoch = int(row["epoch"])
+            ids = dict(zip(row["terms"] or (), (int(i) for i in row["ids"] or ())))
+            missing = [t for t in uniq if t not in ids]
+            if not missing:
+                return ids, epoch
+            # ORDER BY gives concurrent callers inserting overlapping new
+            # terms one acquisition order, so they wait instead of deadlocking.
+            # DO NOTHING waits for a conflicting uncommitted insert to finish
+            # and then skips the term; the follow-up read below collects it.
+            rows = await conn.fetch(
+                """
+                INSERT INTO bm25_vocab (term, term_id)
+                SELECT t, nextval('bm25_term_id_seq')
+                  FROM (SELECT unnest($1::text[]) AS t ORDER BY 1) src
+                ON CONFLICT (term) DO NOTHING
+                RETURNING term, term_id
+                """,
+                missing,
+            )
+            ids.update((r["term"], int(r["term_id"])) for r in rows)
+            raced = [t for t in missing if t not in ids]
+            if raced:
+                rows = await conn.fetch(
+                    "SELECT term, term_id FROM bm25_vocab WHERE term = ANY($1::text[])",
+                    raced,
+                )
+                ids.update((r["term"], int(r["term_id"])) for r in rows)
+            if await _vocabulary_epoch(conn) != epoch:
+                # Renumbered between these statements: the ids read first and
+                # the ones inserted after may belong to different numberings.
+                continue
+            unresolved = [t for t in uniq if t not in ids]
+            if unresolved:
+                # The vocabulary is append-only, so this cannot happen by design.
+                # If it does, refuse: `encode_document` would otherwise drop the
+                # terms and store a vector that silently misses part of the
+                # document.
+                raise RuntimeError(f"bm25 vocabulary lost {len(unresolved)} term(s) mid-call")
+            return ids, epoch
+    raise RuntimeError(
+        f"bm25 vocabulary was renumbered during each of {_VOCABULARY_EPOCH_ATTEMPTS} "
+        "attempts at one lookup"
+    )
 
 
 async def lookup_term_ids(terms: Iterable[str]) -> dict[str, int]:
@@ -495,7 +661,7 @@ def _use_raw_weights(sparse_shape: str | None = None) -> bool:
     if settings.vector_store_driver in _RAW_WEIGHT_DRIVERS:
         return True
     if settings.vector_store_driver == "pgvector":
-        shape = sparse_shape if sparse_shape is not None else settings.vector_store_sparse_shape
+        shape = sparse_shape if sparse_shape is not None else settings.effective_sparse_shape
         return shape in _RAW_WEIGHT_SHAPES
     return False
 
@@ -514,7 +680,31 @@ async def encode_document(
 
     term_counts = Counter(tokens)
     vocab = await get_or_create_term_ids(term_counts.keys())
+    return await _document_vector(term_counts, vocab, sparse_shape)
 
+
+async def encode_document_at_epoch(
+    text: str, *, sparse_shape: str | None = None
+) -> EncodedDocument:
+    """`encode_document`, with the vocabulary epoch its ids were read at.
+
+    For a writer that stores the vector in a later transaction: it passes the
+    epoch to `hold_vocabulary_epoch` there, which refuses the ids if a
+    renumbering committed in between.
+    """
+    tokens = await tokenize(text)
+    if not tokens:
+        return EncodedDocument([], [], None)
+
+    term_counts = Counter(tokens)
+    vocab, epoch = await get_or_create_term_ids_at_epoch(term_counts.keys())
+    indices, values = await _document_vector(term_counts, vocab, sparse_shape)
+    return EncodedDocument(indices, values, epoch)
+
+
+async def _document_vector(
+    term_counts: Counter, vocab: dict[str, int], sparse_shape: str | None
+) -> tuple[list[int], list[float]]:
     if _use_raw_weights(sparse_shape):
         # Raw positive integer TF, represented as floats by the shared API.
         # VectorChord owns saturation, document length and index statistics.
@@ -529,34 +719,51 @@ async def encode_document(
                 raw_values.append(float(tf))
         return raw_indices, raw_values
 
-    stats = await load_stats()
-    # total_docs is only needed for query-side IDF (see encode_query); doc
-    # encoding works on TF saturation + dl normalization only.
-    avgdl_raw = float(stats.get("avgdl") or 0)
-    avgdl = avgdl_raw if avgdl_raw > 0 else 1.0
-    k1 = float(stats.get("k1") or settings.bm25_k1)
-    b = float(stats.get("b") or settings.bm25_b)
-
-    # For documents we store TF pre-saturated with the BM25 saturation so
-    # Dot product at query time yields BM25 score. Specifically for
-    # each term t in doc d:
-    #   doc_weight[t] = TF(t,d) * (k1 + 1) / (TF(t,d) + k1 * (1 - b + b*|d|/avgdl))
-    # and query_weight[t] = IDF(t). Then dot = Σ IDF(t) * sat_TF(t,d) = BM25.
-    dl = sum(term_counts.values())
-    dl_norm = 1 - b + b * (dl / avgdl)
-
-    # Document encoding does not read df; IDF belongs to the query side.
+    # Document encoding does not read df; IDF belongs to the query side. The
+    # ids and frequencies are gathered exactly as the raw branch gathers them,
+    # so a caller holding raw frequencies can derive these same weights later
+    # (`saturate_for_posting`).
     indices: list[int] = []
-    values: list[float] = []
+    tfs: list[float] = []
     for term, tf in term_counts.items():
         tid = vocab.get(term)
         if tid is None:
             continue
-        # tf>0 (Counter), k1>0, dl_norm>0 → denom>0, sat_tf>0; no zero guard needed.
-        sat_tf = tf * (k1 + 1) / (tf + k1 * dl_norm)
         indices.append(tid)
-        values.append(float(sat_tf))
-    return indices, values
+        tfs.append(float(tf))
+    return indices, _saturate(tfs, await load_stats(), dl=sum(term_counts.values()))
+
+
+def _saturate(tfs: list[float], stats: dict, *, dl: float | None = None) -> list[float]:
+    """Raw term frequencies → the pre-saturated document weights `posting` stores.
+
+    For each term t in document d:
+      doc_weight[t] = TF(t,d) * (k1 + 1) / (TF(t,d) + k1 * (1 - b + b*|d|/avgdl))
+    and query_weight[t] = IDF(t), so the dot product at query time is BM25.
+    total_docs is only needed for query-side IDF (see encode_query).
+
+    `dl` is the document's token count. Left out, it is the sum of `tfs`, which
+    is the same number whenever every term received an id — and
+    `get_or_create_term_ids` either assigns every one or raises.
+    """
+    avgdl_raw = float(stats.get("avgdl") or 0)
+    avgdl = avgdl_raw if avgdl_raw > 0 else 1.0
+    k1 = float(stats.get("k1") or settings.bm25_k1)
+    b = float(stats.get("b") or settings.bm25_b)
+    length = sum(tfs) if dl is None else dl
+    dl_norm = 1 - b + b * (length / avgdl)
+    # tf>0, k1>0, dl_norm>0 → denom>0; no zero guard needed.
+    return [float(tf * (k1 + 1) / (tf + k1 * dl_norm)) for tf in tfs]
+
+
+async def saturate_for_posting(tfs: list[float]) -> list[float]:
+    """The weights `posting` stores for these raw frequencies, under current stats.
+
+    The vchord shape keeps `posting` current with this while the way back to it
+    is retained (akb#615), from the frequencies it already encoded rather than
+    by tokenizing the text a second time.
+    """
+    return _saturate(tfs, await load_stats())
 
 
 async def encode_query(
@@ -567,16 +774,20 @@ async def encode_query(
 
     Weight convention depends on the active driver and sparse shape (see module
     docstring).
+
+    The ids all come from one numbering. For the raw convention they are one
+    statement, which is one snapshot. The pre-baked convention reads them and
+    then their df in a second statement; a renumbering committing between the
+    two would weight each term with another term's df. So that path reads the
+    epoch before and after, and reads again if it moved.
     """
     tokens = await tokenize(text)
     if not tokens:
         return [], []
     uniq = list(set(tokens))
-    vocab = await lookup_term_ids(uniq)
-    if not vocab:
-        return [], []
 
     if _use_raw_weights(sparse_shape):
+        vocab = await lookup_term_ids(uniq)
         # One weight per known term, regardless of query repetition.
         # VectorChord computes IDF from its index; Seahorse DB obtains the
         # external df metadata in its search driver, not in this encoder.
@@ -585,6 +796,43 @@ async def encode_query(
         values = [1.0] * len(indices)
         return indices, values
 
+    for _attempt in range(_VOCABULARY_EPOCH_ATTEMPTS):
+        epoch = await vocabulary_epoch()
+        vocab = await lookup_term_ids(uniq)
+        if not vocab:
+            return [], []
+        weighted = await _query_weights(vocab)
+        if await vocabulary_epoch() == epoch:
+            return weighted
+    raise RuntimeError(
+        f"bm25 vocabulary was renumbered during each of {_VOCABULARY_EPOCH_ATTEMPTS} "
+        "attempts at one query"
+    )
+
+
+async def encode_query_at_epoch(
+    text: str, *, sparse_shape: str | None = None,
+) -> EncodedQuery:
+    """Encode one numbering, retaining its epoch through sparse execution.
+
+    The existing tuple API remains available for consumers whose vocabulary
+    cannot be renumbered. Pgvector searches pass this epoch to the driver,
+    which checks it under the shared fence before querying the index.
+    """
+    pool = await get_pool()
+    for _attempt in range(_VOCABULARY_EPOCH_ATTEMPTS):
+        async with pool.acquire() as conn:
+            if not await conn.fetchval(_FENCE_SQL, bm25_maintenance.BM25_VOCAB_EPOCH_LOCK_KEY):
+                raise VocabularyRenumberingInProgress()
+            epoch = await _vocabulary_epoch(conn)
+        indices, values = await encode_query(text, sparse_shape=sparse_shape)
+        if await vocabulary_epoch() == epoch:
+            return EncodedQuery(indices, values, epoch if indices else None)
+    raise VocabularyEpochMoved(epoch, await vocabulary_epoch())
+
+
+async def _query_weights(vocab: dict[str, int]) -> tuple[list[int], list[float]]:
+    """IDF query weights, for the pre-baked convention."""
     df_map = await load_df_for_terms(vocab.values())
     stats = await load_stats()
     total_docs = int(stats.get("total_docs") or 0)
@@ -834,13 +1082,25 @@ async def recompute_stats(
                 # Ensure all encountered terms have stable vocab ids.  Reading
                 # directly from the temp aggregate avoids materialising the
                 # corpus vocabulary in Python a second time.
+                #
+                # Only terms the vocabulary lacks reach `nextval()`.
+                # `ON CONFLICT DO NOTHING` alone evaluates the select list, and
+                # so draws an id, for every term it then discards: each pass
+                # advanced `bm25_term_id_seq` by the whole vocabulary. The index
+                # extension sizes its per-term arrays by the largest id, not by
+                # the number of terms, and its VACUUM cleanup walks all of them;
+                # one install had 729M ids for 955k terms (akb#687). A term an
+                # encoder inserts concurrently still collides and costs one id.
                 if vocab_count:
                     await lock_conn.execute(
                         """
                         INSERT INTO bm25_vocab (term, term_id)
-                        SELECT term, nextval('bm25_term_id_seq')
-                          FROM bm25_recompute_terms
-                         ORDER BY term
+                        SELECT r.term, nextval('bm25_term_id_seq')
+                          FROM bm25_recompute_terms r
+                         WHERE NOT EXISTS (
+                                 SELECT 1 FROM bm25_vocab v WHERE v.term = r.term
+                               )
+                         ORDER BY r.term
                         ON CONFLICT (term) DO NOTHING
                         """
                     )
@@ -1123,6 +1383,45 @@ def external_stats_policy_snapshot() -> dict:
     }
 
 
+# The vchord BM25 index addresses its per-term arrays by u32 byte offsets, so a
+# term id at or above 2^30 aliases another term (akb#687, akb#691). Only the
+# vchord shape is bounded; the other shapes store ids as bigint.
+_VCHORD_TERM_ID_LIMIT = 1 << 30
+_TERM_ID_HEADROOM_WARN_AT = 0.9
+
+
+def _is_vchord_shape() -> bool:
+    """Whether this process serves the vchord shape, the only one the 2^30
+    limit applies to. Undecided (startup has not run) reads as not vchord:
+    no warning rather than a wrong one."""
+    try:
+        return settings.effective_sparse_shape == "vchord"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def term_id_headroom(last_drawn: int, *, vchord: bool) -> dict:
+    """How close `bm25_term_id_seq` is to the id the `vchord` index cannot hold.
+
+    `last_drawn` is the sequence's last drawn id (0 when nothing was drawn).
+    Under other shapes the limit does not apply, so there is no warning.
+    At 90% of 2^30 the `warning` names the remedy while there is still time
+    to renumber (`scripts/compact_bm25_term_ids.py`).
+    """
+    headroom: dict = {"last_drawn": int(last_drawn), "vchord_limit": _VCHORD_TERM_ID_LIMIT}
+    if not vchord:
+        return headroom
+    used = (int(last_drawn) / _VCHORD_TERM_ID_LIMIT) if last_drawn else 0
+    headroom["used"] = used
+    if used >= _TERM_ID_HEADROOM_WARN_AT:
+        headroom["warning"] = (
+            f"bm25 term ids are at {used:.0%} of the vchord index limit "
+            f"(2^30 = {_VCHORD_TERM_ID_LIMIT:,}); renumber them densely with "
+            f"scripts/compact_bm25_term_ids.py before new terms are refused"
+        )
+    return headroom
+
+
 async def stats_snapshot() -> dict:
     """Operator-facing snapshot of BM25 corpus stats. Surfaced by /health
     so a stuck refresher (total_docs=0 while chunks exist) is visible."""
@@ -1136,6 +1435,10 @@ async def stats_snapshot() -> dict:
             """
         )
         vocab = await conn.fetchval("SELECT COUNT(*) FROM bm25_vocab")
+        sequence_next = await conn.fetchval(
+            "SELECT last_value + CASE WHEN is_called THEN 1 ELSE 0 END "
+            "FROM bm25_term_id_seq"
+        )
         current_revision = await _current_corpus_revision(conn)
         recompute = await _run_progress(conn)
         recompute_active = await bm25_maintenance.active_bm25_recompute(conn)
@@ -1145,6 +1448,9 @@ async def stats_snapshot() -> dict:
             "total_docs": 0, "avgdl": 0.0,
             "tokenizer": "kiwi@0",
             "vocab_size": int(vocab or 0),
+            "term_id_headroom": term_id_headroom(
+                int(sequence_next or 0) - 1, vchord=_is_vchord_shape(),
+            ),
             "source_chunk_count": 0,
             "source_revision": 0,
             "current_revision": current_revision,
@@ -1160,6 +1466,9 @@ async def stats_snapshot() -> dict:
         "avgdl": float(row["avgdl"] or 0.0),
         "tokenizer": f"{row['tokenizer_name']}@{row['tokenizer_version']}",
         "vocab_size": int(vocab or 0),
+        "term_id_headroom": term_id_headroom(
+            int(sequence_next or 0) - 1, vchord=_is_vchord_shape(),
+        ),
         "source_chunk_count": int(row["source_chunk_count"] or 0),
         "source_revision": source_revision,
         "current_revision": current_revision,

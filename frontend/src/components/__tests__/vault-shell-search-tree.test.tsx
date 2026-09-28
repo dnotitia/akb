@@ -142,15 +142,16 @@ describe("VaultShell search collection tree", () => {
       const routeViewport = document.querySelector('[data-slot="vault-route-viewport"]');
       expect(routeViewport).not.toBeNull();
       const navigation = screen.getByRole("navigation", { name: "Vault sections" });
-      expect(routeViewport?.previousElementSibling).toBe(navigation);
+      expect(routeViewport?.previousElementSibling).toContainElement(navigation);
+      expect(routeViewport?.previousElementSibling).toContainElement(screen.getByRole("navigation", { name: "Vault sections" }));
       expect(within(screen.getByRole("complementary", { name: "Collections" })).queryByRole("link")).not.toBeInTheDocument();
-      if (route === "members" || route === "settings") {
+      if (route === "settings") {
         expect(routeViewport).toHaveClass("xl:overflow-hidden");
       } else {
         expect(routeViewport).not.toHaveClass("xl:overflow-hidden");
       }
 
-      if (route === "activity" || route === "publications") {
+      if (route === "activity" || route === "publications" || route === "members") {
         expect(routeViewport?.firstElementChild).toHaveClass("px-3", "xl:px-5");
       }
     },

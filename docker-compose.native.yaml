@@ -1,6 +1,9 @@
 # Explicit NEW-database Native installation. Requires Compose >= 2.24.4.
 # Generate persistent config/identity first; see docs/operations/native-installation.md.
-# Always use a pinned, prebuilt backend image and `up --no-build`.
+# Always use a pinned, prebuilt backend image and `up --no-build`. `--no-build`
+# never builds, so build what this stack still builds first, and again after
+# every update of the checkout:
+#   docker compose -p <project> build frontend postgres
 services:
   native-bootstrap:
     image: ${AKB_NATIVE_IMAGE:?Set the pinned backend image}

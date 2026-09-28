@@ -25,7 +25,13 @@ import uuid
 import asyncpg
 import pytest
 
-from app.services.vector_store.pgvector import PgvectorStore, _bm25vector_literal
+from app.services.vector_store import VectorStoreUnavailable
+from app.services.vector_store.pgvector import (
+    PgvectorStore,
+    TermIdOutOfRange,
+    _bm25query_literal,
+    _bm25vector_literal,
+)
 
 pytestmark = pytest.mark.asyncio  # 동기 테스트는 아래에서 개별 해제
 
@@ -38,7 +44,7 @@ def _database_dsn(name: str) -> str:
 
 
 @contextlib.asynccontextmanager
-async def _store():
+async def _store(*, posting_first: bool = False, **store_kwargs):
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN 미설정 — 확장이 있는 PostgreSQL 이 필요하다")
     admin = await asyncpg.connect(_DSN)
@@ -48,9 +54,16 @@ async def _store():
     try:
         store = PgvectorStore(
             dsn=_database_dsn(name), schema="vector_index",
-            dense_dim=4, sparse_shape="vchord",
+            dense_dim=4, sparse_shape="vchord", **store_kwargs,
         )
         async with pool.acquire() as conn:
+            if posting_first:
+                # An installation that came from `posting`: its side table is
+                # there before the shape flips.
+                await PgvectorStore(
+                    dsn=_database_dsn(name), schema="vector_index",
+                    dense_dim=4, sparse_shape="posting",
+                )._do_ensure(conn)
             await store._do_ensure(conn)
         yield store, pool
     finally:
@@ -105,6 +118,116 @@ async def test_the_ddl_creates_an_index_the_planner_can_use():
         )
 
 
+async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill():
+    """Startup builds the BM25 index only for an empty table (akb#615).
+
+    Over existing chunks the index is `scripts/backfill_bm25_vector.py
+    --index`'s job: it builds CONCURRENTLY, and refuses while any row still has
+    no vector. `_do_ensure` runs in one transaction, so building it there held
+    a ShareLock against every write for the whole build, over whatever part of
+    the column happened to be filled, and turned the rest of the sweep into the
+    kind that measured 42x slower per batch. Selecting the shape before the
+    runbook has run must fail visibly instead, and build nothing.
+    """
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            chunk = uuid.uuid4()
+            # A row written under `posting`: no vector yet.
+            await conn.execute(
+                """
+                INSERT INTO vector_index.chunks
+                    (chunk_id, source_type, source_id, vault_id,
+                     section_path, content, chunk_index)
+                VALUES ($1, 'document', $1, $2, '', 'indexed under posting', 0)
+                """,
+                chunk, uuid.uuid4(),
+            )
+            await conn.execute("DROP INDEX vector_index.idx_vi_chunks_bm25")
+
+        restarted = PgvectorStore(
+            dsn=store._dsn, schema="vector_index",
+            dense_dim=4, sparse_shape="vchord",
+        )
+        try:
+            with pytest.raises(VectorStoreUnavailable, match="--index"):
+                await restarted.ensure_collection()
+        finally:
+            if restarted._own_pool is not None:
+                await restarted._own_pool.close()
+
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT to_regclass('vector_index.idx_vi_chunks_bm25')"
+            ) is None
+
+
+async def _ten_times(raw: list[float]) -> list[float]:
+    # A mapping a test can check without a vocabulary or corpus statistics.
+    return [w * 10.0 for w in raw]
+
+
+async def _postings(conn, chunk: uuid.UUID) -> list[tuple[int, float]]:
+    rows = await conn.fetch(
+        "SELECT term_id, weight FROM vector_index.posting "
+        "WHERE chunk_id = $1 ORDER BY term_id",
+        chunk,
+    )
+    return [(r["term_id"], r["weight"]) for r in rows]
+
+
+async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
+    """The way back is kept while it is promised (akb#615).
+
+    `bm25_external_stats_mode="required"` keeps posting's statistics fresh for
+    a rollback, but after the flip nothing wrote `posting` itself: new chunks
+    never reached it and rewritten ones kept their old weights. While the way
+    back is retained, an installation that came from `posting` writes both, so
+    switching back serves the rows as they are now.
+    """
+    async with _store(posting_first=True, posting_weights=_ten_times) as (store, pool):
+        vault, chunk = uuid.uuid4(), uuid.UUID(int=1)
+        async with pool.acquire() as conn:
+            async def write(terms: list[int], tfs: list[float]) -> None:
+                await store.upsert_one(
+                    chunk_id=str(chunk), source_type="document",
+                    source_id=str(chunk), vault_id=str(vault),
+                    section_path="", content="doc", chunk_index=0,
+                    dense=None, sparse_indices=terms, sparse_values=tfs, conn=conn,
+                )
+
+            await write([10, 20], [1.0, 2.0])
+            assert await _postings(conn, chunk) == [(10, 10.0), (20, 20.0)]
+            await write([30], [3.0])  # rewritten: the old postings must go
+            assert await _postings(conn, chunk) == [(30, 30.0)]
+
+            back = PgvectorStore(
+                dsn=store._dsn, schema="vector_index",
+                dense_dim=4, sparse_shape="posting",
+            )
+            assert await back._search_sparse(
+                conn, terms=[30], weights=[1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            ) == [str(chunk)]
+
+            await store.delete_point(str(chunk), conn=conn)
+            assert await _postings(conn, chunk) == []
+
+
+async def test_a_fresh_vchord_install_has_no_posting_to_keep():
+    """Nothing to go back to, so nothing is written or created for it."""
+    async with _store(posting_weights=_ten_times) as (store, pool):
+        async with pool.acquire() as conn:
+            await store.upsert_one(
+                chunk_id=str(uuid.UUID(int=1)), source_type="document",
+                source_id=str(uuid.uuid4()), vault_id=str(uuid.uuid4()),
+                section_path="", content="doc", chunk_index=0,
+                dense=None, sparse_indices=[10], sparse_values=[1.0], conn=conn,
+            )
+            assert await conn.fetchval(
+                "SELECT to_regclass('vector_index.posting')"
+            ) is None
+
+
 async def test_a_written_chunk_comes_back_from_a_search():
     async with _store() as (store, pool):
         vid = uuid.uuid4()
@@ -122,6 +245,126 @@ async def test_a_written_chunk_comes_back_from_a_search():
                 filter_col="vault_id", limit=5,
             )
         assert str(uuid.UUID(int=1)) in hits, "쓴 청크가 검색에 안 나온다"
+
+
+# The largest id the index can address, and the first it cannot: it addresses
+# its per-term arrays with 32-bit byte offsets, 4 bytes per id. Written out
+# rather than imported, so a test fails if the bound in the code moves.
+_MAX_TERM_ID = 1_073_741_823  # 2^30 - 1
+_PAST_INDEX = 1_073_741_824  # 2^30
+# Past int4. Term ids are `bigint` where they are minted; the query path bound
+# them as `int4`.
+_PAST_INT4 = 3_000_000_000
+# Past u32, the first id the text input itself refuses.
+_PAST_U32 = 4_294_967_296
+
+
+@pytest.mark.parametrize("term", [_MAX_TERM_ID, _PAST_INT4], ids=["largest-held", "past-int4"])
+@pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
+async def test_a_large_query_term_fails_no_query_shape(shape, term):
+    """Term ids are `bigint` where they are minted, and the query path bound
+    them as `int4` (akb#665). asyncpg refused any id past 2,147,483,647 before
+    the query was sent, so a query holding one failed outright in every shape,
+    and in `hybrid_search` took both legs with it.
+
+    Two ids, because they now take different routes. The largest id a document
+    can hold is sent, as text, and no shape may fail on it. An id past int4 is
+    past that bound too, so it is dropped before anything is bound, and the
+    search still has to stand.
+
+    Only the query carries the large id. Writing one into the index is left to
+    a manual check: the index keeps a structure per id up to its largest, and
+    one row at id 3,000,000,000 measured 152 s and 11 GB. The index-led case
+    asks for more rows than its scope holds, so the global-candidate probe
+    runs as well.
+    """
+    async with _store() as (store, pool):
+        vault = uuid.uuid4()
+        async with pool.acquire() as conn:
+            for i, terms in enumerate([[20, 30], [20]], start=1):
+                await store.upsert_one(
+                    chunk_id=str(uuid.UUID(int=i)), source_type="document",
+                    source_id=str(uuid.uuid4()), vault_id=str(vault),
+                    section_path="", content=f"doc{i}", chunk_index=i,
+                    dense=None, sparse_indices=terms,
+                    sparse_values=[1.0] * len(terms), conn=conn,
+                )
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(type(store), "_filter_is_selective",
+                           lambda *a, **k: _const(shape == "materialised"))
+                hits = await store._search_sparse(
+                    conn, terms=[20, term], weights=[1.0, 1.0],
+                    filter_uuids=None if shape == "unfiltered" else [vault],
+                    filter_col="vault_id", limit=5,
+                )
+        assert set(hits) == {str(uuid.UUID(int=1)), str(uuid.UUID(int=2))}
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+def test_the_vector_literal_names_the_bound_the_index_holds():
+    """One bound, stated where every vector is built.
+
+    The index addresses its per-term arrays with 32-bit byte offsets, 4 bytes
+    per id, so an id at or above 2^30 lands on the id 2^30 below it, with no
+    error from anything. The text input would take the id: it answers only one
+    past u32, or a negative one, and then with "Bad parsing at position N"
+    (akb#665). A document holding one is refused with the id, the bound and the
+    remedy named, rather than indexed under a subset of its terms."""
+    assert _bm25vector_literal([_MAX_TERM_ID], [1.0]) == "{1073741823:1}"
+
+    # Deterministic: a dedicated `ValueError` subclass, so worker paths can
+    # terminate it on the first failure instead of spending retries (akb#687).
+    with pytest.raises(TermIdOutOfRange) as refused:
+        _bm25vector_literal([20, _PAST_INDEX], [1.0, 1.0])
+    message = str(refused.value)
+    assert refused.value.term_id == _PAST_INDEX
+    assert "term id 1073741824 " in message
+    assert "(0 to 1,073,741,823)" in message
+    assert "2^30 would land on another term's entries" in message
+    assert "postings, statistics and search results" in message
+    assert "renumbered densely" in message
+    assert "compact_bm25_term_ids" in message
+
+    for term in (_PAST_INT4, _PAST_U32, -1):
+        with pytest.raises(TermIdOutOfRange, match=rf"term id {term} .*\(0 to 1,073,741,823\)"):
+            _bm25vector_literal([term], [1.0])
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+def test_a_query_keeps_the_ids_a_document_can_hold_and_drops_the_rest():
+    """The same bound on the query side. A term at or above 2^30 is in no
+    document, because writing one is refused, so it is dropped rather than
+    sent; the largest id a document can hold is kept."""
+    assert _bm25query_literal([20, _MAX_TERM_ID]) == "{20:1, 1073741823:1}"
+    assert _bm25query_literal([_PAST_INDEX, 20, _PAST_INT4, _PAST_U32, -1]) == "{20:1}"
+    assert _bm25query_literal([_PAST_INDEX]) is None
+
+
+@pytest.mark.parametrize("term", [_PAST_INDEX, _PAST_U32], ids=["past-index", "past-u32"])
+async def test_a_query_term_the_index_cannot_hold_matches_nothing(term):
+    """No document can hold such a term, so it cannot fail the search (akb#665).
+
+    Both ids are dropped before the query is sent. The first is one the text
+    input would take; the second it would refuse, failing the whole search, if
+    it were sent."""
+    async with _store() as (store, pool):
+        async with pool.acquire() as conn:
+            await store.upsert_one(
+                chunk_id=str(uuid.UUID(int=1)), source_type="document",
+                source_id=str(uuid.uuid4()), vault_id=str(uuid.uuid4()),
+                section_path="", content="doc", chunk_index=1,
+                dense=None, sparse_indices=[20], sparse_values=[1.0], conn=conn,
+            )
+            alone = await store._search_sparse(
+                conn, terms=[term], weights=[1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            )
+            mixed = await store._search_sparse(
+                conn, terms=[term, 20], weights=[1.0, 1.0], filter_uuids=None,
+                filter_col="vault_id", limit=5,
+            )
+    assert alone == []
+    assert mixed == [str(uuid.UUID(int=1))]
 
 
 async def test_both_query_shapes_return_the_same_rows():
@@ -498,12 +741,14 @@ async def test_the_two_shapes_really_do_produce_different_plans():
                 )
             await conn.execute("ANALYZE vector_index.chunks")
 
-            captured: list[str] = []
+            # The arguments are captured with the statement, so the EXPLAIN
+            # binds exactly what the product sent — not a guess at its types.
+            captured: list[tuple[str, tuple]] = []
             real_fetch = type(conn).fetch
 
             async def spy(self, sql, *args, **kwargs):
                 if "sparse_bm25" in sql:
-                    captured.append(sql)
+                    captured.append((sql, args))
                 return await real_fetch(self, sql, *args, **kwargs)
 
             plans = {}
@@ -519,14 +764,12 @@ async def test_the_two_shapes_really_do_produce_different_plans():
                         conn, terms=[10], weights=[1.0], filter_uuids=[vid],
                         filter_col="vault_id", limit=5,
                     )
-                sql = captured[-1]
+                sql, args = captured[-1]
                 async with conn.transaction():
                     await conn.execute(
                         'SET LOCAL search_path TO "$user", public, bm25_catalog'
                     )
-                    rows = await conn.fetch(
-                        f"EXPLAIN {sql}", [10], [vid], 5,
-                    )
+                    rows = await conn.fetch(f"EXPLAIN {sql}", *args)
                 plans[selective] = "\n".join(r[0] for r in rows)
 
         index_node = "Index Scan using idx_vi_chunks_bm25"

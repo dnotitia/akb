@@ -14,8 +14,9 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- `chunks` table (ACCESS EXCLUSIVE lock); re-running them each startup
 -- races live workers' open transactions and can stall a rolling deploy.
 -- With the ledger, a steady-state boot runs zero migration DDL.
--- (init.sql itself is still re-run every boot — it is pure CREATE … IF
--- NOT EXISTS and takes no conflicting locks.)
+-- init.sql still re-runs on boot. CREATE INDEX IF NOT EXISTS takes table
+-- locks even when the index exists; bootstrap retries its atomic transaction
+-- after bounded lock conflicts with ongoing writers.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
     filename   TEXT PRIMARY KEY,

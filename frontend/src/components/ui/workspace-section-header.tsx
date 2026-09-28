@@ -17,7 +17,7 @@ export function WorkspaceSectionHeader({
   id: string;
   icon: LucideIcon;
   title: string;
-  description: ReactNode;
+  description?: ReactNode;
   tone?: TonalIconTone;
   right?: ReactNode;
   className?: string;
@@ -30,7 +30,12 @@ export function WorkspaceSectionHeader({
       className={cn("mb-2.5 border-b border-border px-0.5 pb-3", className)}
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 items-start gap-3">
+        <div
+          className={cn(
+            "flex min-w-0 gap-3",
+            description ? "items-start" : "items-center",
+          )}
+        >
           <TonalIcon tone={tone}>
             <Icon className="h-4 w-4" aria-hidden />
           </TonalIcon>
@@ -41,9 +46,11 @@ export function WorkspaceSectionHeader({
             >
               {title}
             </h2>
-            <p className="mt-0.5 text-xs leading-relaxed text-foreground-muted">
-              {description}
-            </p>
+            {description && (
+              <p className="mt-0.5 text-xs leading-relaxed text-foreground-muted">
+                {description}
+              </p>
+            )}
           </div>
         </div>
 

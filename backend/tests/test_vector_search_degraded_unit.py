@@ -11,7 +11,8 @@ from app.services.vector_store import VectorSearchDegraded, VectorStoreUnavailab
 from tests.test_search_archive_scope_vault_path_unit import VAULT_ID, _Conn, _hit, _install
 
 pytestmark = pytest.mark.asyncio
-_REASON = "sparse_search_budget_exceeded"
+# Any partial driver result, independent of a driver's specific failure cause.
+_REASON = "partial_driver_result"
 
 
 def _partial_store(monkeypatch, hits):

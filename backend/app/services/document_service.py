@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+from app.services.role_authority import role_authority_transaction
 from app.services.search_filters import ArchiveScope
 
 if TYPE_CHECKING:
@@ -2199,7 +2200,7 @@ class DocumentService:
             git_path = str(self.git._bare_path(name))
             pool = await get_pool()
             async with pool.acquire() as conn:
-                async with conn.transaction():
+                async with role_authority_transaction(conn):
                     vault_id = await vault_repo.create(
                         name, description, git_path,
                         owner_id=uid, public_access=public_access, conn=conn,
@@ -2476,7 +2477,7 @@ class DocumentService:
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
-                async with conn.transaction():
+                async with role_authority_transaction(conn):
                     locked = await conn.fetchrow(
                         "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault_id,
                     )

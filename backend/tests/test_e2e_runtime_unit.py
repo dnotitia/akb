@@ -1178,7 +1178,9 @@ async def test_dependency_start_waits_for_compose_health_before_backend_boot(tmp
 
     await runtime._start_dependencies()
 
-    assert compose_calls == [(("up", "--detach", "--wait"), {})]
+    # Always --build: a reused project name must not run an image an earlier
+    # checkout built from deploy/postgres.
+    assert compose_calls == [(("up", "--build", "--detach", "--wait"), {})]
     assert identity_calls == 1
     assert runtime._dependency_identity == dependency_identity
 
@@ -1652,11 +1654,17 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     # which is the disagreement the pinning was meant to remove. Repeating the
     # digest instead would make this a second place to edit on every bump, and
     # the two copies would fall out of step the first time someone forgot.
-    postgres_image = compose["services"]["postgres"]["image"]
-    assert postgres_image.startswith("pgvector/pgvector:pg16@sha256:"), postgres_image
-    assert compose["services"]["minio"]["image"] == (
-        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
-    )
+    # The runtime builds the install paths' PostgreSQL, so the e2e runs the
+    # default route: a new database that gets the `vchord` sparse shape. Its base
+    # and extension pins live in that Dockerfile and are held by
+    # test_container_image_pins_unit.py, not repeated here.
+    postgres = compose["services"]["postgres"]
+    assert "image" not in postgres, postgres
+    assert (CI_DIR / postgres["build"]["context"]).resolve() == (CI_DIR.parents[1] / "deploy/postgres").resolve()
+    # The IBM mirror keeps the upstream artifact pinned by digest.
+    minio_image = compose["services"]["minio"]["image"]
+    assert minio_image.startswith("icr.io/fusion-open/minio/minio@sha256:"), minio_image
+    assert "@sha256:" in minio_image, minio_image
     assert compose["services"]["postgres"]["ports"] == [
         "${AKB_E2E_POSTGRES_PORT:-15432}:5432"
     ]

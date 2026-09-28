@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -123,9 +124,10 @@ describe("vault page guide chip", () => {
   it("reads as 'template' when the body still matches the substituted seed", async () => {
     renderVault();
     const link = await findChip();
-    await waitFor(() => expect(link.textContent).toContain("template"));
+    await waitFor(() => expect(link).toHaveAccessibleDescription("Starter template"));
     expect(link.getAttribute("href")).toBe("/vault/my-v/settings#skill");
     expect(getSkillTemplateMock).toHaveBeenCalled();
+    expect(screen.getByText("Starter template")).not.toHaveAttribute("aria-hidden", "true");
   });
 
   it("reads as 'customized' once the body diverges", async () => {
@@ -134,7 +136,7 @@ describe("vault page guide chip", () => {
     });
     renderVault();
     const link = await findChip();
-    await waitFor(() => expect(link.textContent).toContain("customized"));
+    await waitFor(() => expect(link).toHaveAccessibleDescription("Guide customized"));
     expect(link.getAttribute("href")).toBe("/vault/my-v/settings#skill");
   });
 
@@ -146,7 +148,7 @@ describe("vault page guide chip", () => {
     });
     renderVault();
     const link = await findChip();
-    await waitFor(() => expect(link.textContent).toContain("template"));
+    await waitFor(() => expect(link).toHaveAccessibleDescription("Starter template"));
     expect(
       screen.getByRole("heading", { name: "Vault guide" }),
     ).toBeInTheDocument();
@@ -204,9 +206,7 @@ describe("vault page guide chip", () => {
     ).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Update incident runbook")).toBeInTheDocument();
     expect(screen.getByText("Vault Owner")).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "Vault context" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Contents" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Tables" })).toBeNull();
     await waitFor(() =>
       expect(getVaultActivityMock).toHaveBeenCalledWith("my-v", { limit: 10 }),
@@ -218,8 +218,7 @@ describe("vault page guide chip", () => {
     renderVault();
     const link = await findChip();
     await waitFor(() => expect(getSkillTemplateMock).toHaveBeenCalled());
-    expect(link.textContent).not.toContain("customized");
-    expect(link.textContent).not.toContain("template");
+    expect(link).not.toHaveAccessibleDescription(/customized|template/);
   });
 
   it("withholds the chip on a mirror vault, which carries no guide", async () => {
@@ -285,13 +284,13 @@ describe("vault page guide chip", () => {
       screen.getByRole("heading", { level: 1, name: "my-v" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("region", { name: "Vault inventory" }),
+      screen.getByRole("region", { name: "Contents" }),
     ).toBeInTheDocument();
     const workspace = screen.getByRole("region", {
       name: "my-v Vault overview",
     });
     expect(workspace).toContainElement(
-      screen.getByRole("region", { name: "Vault inventory" }),
+      screen.getByRole("region", { name: "Contents" }),
     );
     const overview = screen.getByRole("complementary", {
       name: "Vault overview details",
@@ -378,5 +377,124 @@ describe("vault page guide chip", () => {
         ],
       }),
     );
+  });
+});
+
+describe("vault overview content hierarchy", () => {
+  it.each([
+    ["none", "Private", "Only people with access can open this vault."],
+    ["reader", "Public read", "Any signed-in person can read this vault."],
+    ["writer", "Public write", "Signed-in users can read, and write when vault policies allow."],
+    [undefined, "Not available", "Visibility information is unavailable."],
+  ])("explains %s access separately from the member destination", async (publicAccess, label, explanation) => {
+    getVaultInfoMock.mockResolvedValue({
+      name: "my-v", role: "reader", document_count: 4,
+      public_access: publicAccess, owner_display_name: "Vault Owner", member_count: 5,
+    });
+    renderVault();
+    const access = await screen.findByRole("region", { name: "Access and ownership" });
+    expect(access).toHaveTextContent(label!);
+    expect(access).toHaveTextContent(explanation!);
+    expect(within(access).getAllByRole("link")).toHaveLength(1);
+    expect(within(access).getByRole("link", { name: /Members.*5/ })).toHaveAttribute("href", "/vault/my-v/members");
+    expect(within(access).queryByRole("button")).toBeNull();
+  });
+
+  it.each(["is_archived", "is_external_git"])("does not promise public writes when %s makes content read-only", async (restriction) => {
+    getVaultInfoMock.mockResolvedValue({
+      name: "my-v", role: "owner", document_count: 4,
+      public_access: "writer", [restriction]: true,
+    });
+    renderVault();
+    const access = await screen.findByRole("region", { name: "Access and ownership" });
+    expect(access).toHaveTextContent("Any signed-in person can read this vault. Content is read-only.");
+    expect(access).not.toHaveTextContent("change content");
+    expect(screen.queryByRole("button", { name: "New document" })).toBeNull();
+  });
+
+  it("keeps identity and passive totals together above the content while membership stays in Access", async () => {
+    getVaultInfoMock.mockResolvedValue({
+      name: "my-v", role: "writer", document_count: 36, collection_count: 8,
+      table_count: 2, file_count: 7, member_count: 5, public_access: "reader",
+      owner_display_name: "Vault Owner", tables: [{ name: "service_catalog", row_count: 18 }],
+    });
+    renderVault();
+    const contents = await screen.findByRole("region", { name: "Contents" });
+    const summary = screen.getByRole("region", { name: "Vault summary" });
+    const details = screen.getByRole("complementary", { name: "Vault overview details" });
+    expect(summary).toContainElement(contents);
+    expect(details).not.toContainElement(contents);
+    expect(within(summary).getByText("writer", { exact: true })).toBeInTheDocument();
+    expect(within(summary).getByText("public:reader")).toBeInTheDocument();
+    expect(within(summary).getByRole("button", { name: "Copy akb://my-v" })).toBeEnabled();
+    expect(within(details).queryByRole("button", { name: "Copy akb://my-v" })).toBeNull();
+    expect(within(contents).queryByRole("button")).toBeNull();
+    for (const [label, value] of [["Documents", "36"], ["Collections", "8"], ["Tables", "2"], ["Files", "7"]]) {
+      expect(within(contents).getByText(label).closest("div")).toHaveTextContent(value);
+    }
+    expect(within(contents).queryByText("Members")).toBeNull();
+    const access = screen.getByRole("region", { name: "Access and ownership" });
+    expect(within(access).getByRole("link", { name: /Members.*5/ })).toHaveAttribute("href", "/vault/my-v/members");
+    expect(access).not.toHaveTextContent("Your role");
+    expect(within(details).queryByRole("region", { name: "Tables" })).toBeNull();
+    expect(screen.queryByRole("link", { name: /service_catalog/ })).toBeNull();
+    const actions = within(summary).getByRole("group", { name: "Create content" });
+    expect(within(actions).getByRole("button", { name: "Upload file" })).toBeEnabled();
+    expect(within(actions).getByRole("button", { name: "New table" })).toBeEnabled();
+  });
+
+  it("distinguishes missing counts from zero and never treats a legacy info response as empty", async () => {
+    getVaultInfoMock.mockResolvedValue({ name: "my-v", role: "reader", file_count: 0 });
+    renderVault();
+    const contents = await screen.findByRole("region", { name: "Contents" });
+    expect(within(contents).getByText("Documents").closest("div")).toHaveTextContent("—");
+    expect(within(contents).getByText("Files").closest("div")).toHaveTextContent("0");
+    expect(screen.getByRole("region", { name: "Access and ownership" })).not.toHaveTextContent("Private");
+    expect(screen.queryByRole("region", { name: "Set up this Vault" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Recent activity" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New table" })).toBeNull();
+  });
+
+  it("keeps document destinations while showing collection context instead of a repeated filename and commit", async () => {
+    getRecentMock.mockResolvedValue({ changes: [
+      { doc_id: "d-runbook", title: "Runbook", path: "team/ops/runbook.md", commit: "abcdef012345", changed_at: "2026-09-21T00:00:00Z" },
+      { doc_id: "d-root", title: "Welcome", path: "welcome.md" },
+    ] });
+    renderVault();
+    const recent = await screen.findByRole("region", { name: "Recent activity" });
+    const runbook = await within(recent).findByRole("link", { name: /Runbook/ });
+    expect(runbook).toHaveAttribute("href", "/vault/my-v/doc/team%2Fops%2Frunbook.md");
+    expect(runbook).toHaveTextContent("team / ops");
+    expect(runbook).not.toHaveTextContent("runbook.md");
+    expect(recent).not.toHaveTextContent("abcdef0");
+    expect(within(recent).getByRole("link", { name: /Welcome/ })).toHaveTextContent("Vault root");
+  });
+
+  it("keeps the sidebar for vault context without treating table inventory as recent activity", async () => {
+    getVaultInfoMock.mockResolvedValue({
+      name: "my-v", role: "reader", table_count: 4, file_count: 2,
+      tables: [{ name: "catalog" }, { name: "inventory", row_count: 100 }],
+    });
+    renderVault();
+    const details = await screen.findByRole("complementary", { name: "Vault overview details" });
+    expect(within(details).getAllByRole("region")).toHaveLength(2);
+    expect(within(details).getByRole("region", { name: "Vault guide" })).toBeInTheDocument();
+    expect(within(details).getByRole("region", { name: "Access and ownership" })).toBeInTheDocument();
+    expect(within(details).queryByRole("region", { name: "Tables" })).toBeNull();
+    expect(screen.queryByRole("link", { name: /catalog|inventory/ })).toBeNull();
+    const contents = screen.getByRole("region", { name: "Contents" });
+    expect(within(contents).getByText("Tables").closest("div")).toHaveTextContent("4");
+    expect(within(contents).getByText("Files").closest("div")).toHaveTextContent("2");
+    const recent = screen.getByRole("region", { name: "Recent activity" });
+    expect(await within(recent).findByText("Nothing written yet")).toBeInTheDocument();
+    expect(within(recent).queryByRole("link")).toBeNull();
+  });
+
+  it("shows an unavailable context rather than a permanent loading skeleton after info fails", async () => {
+    getVaultInfoMock.mockRejectedValue(new Error("Unavailable"));
+    renderVault();
+    expect(await screen.findByText("Vault details are unavailable.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "Contents" })).toBeNull();
   });
 });

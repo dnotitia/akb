@@ -20,7 +20,14 @@ vi.mock("@/lib/api", () => ({
   transferOwnership: vi.fn(),
 }));
 
-import { getMe, getVaultInfo, getVaultMembers } from "@/lib/api";
+import {
+  getMe,
+  getVaultInfo,
+  getVaultMembers,
+  grantAccess,
+  revokeAccess,
+  transferOwnership,
+} from "@/lib/api";
 
 const getMeMock = getMe as unknown as ReturnType<typeof vi.fn>;
 const getVaultInfoMock = getVaultInfo as unknown as ReturnType<typeof vi.fn>;
@@ -77,86 +84,44 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Vault Members redesign", () => {
-  it("presents the roster, current access context, and Settings connection", async () => {
+  it("prioritizes one roster and discloses role guidance only on request", async () => {
+    const user = userEvent.setup();
     renderPage();
-
-    const heading = await screen.findByRole("heading", {
-      level: 1,
-      name: "Members",
-    });
-    expect(heading).toBeInTheDocument();
-    expect(heading.parentElement).toHaveClass(
-      "xl:h-full",
-      "xl:min-h-0",
-      "xl:p-4",
-      "2xl:p-5",
-    );
-    expect(heading.parentElement).not.toHaveClass("fade-up");
-    expect(screen.getByTestId("members-workspace-frame")).toHaveClass(
-      "xl:rounded-[var(--radius-md)]",
-      "xl:border",
-      "xl:overflow-hidden",
-    );
-    expect(heading.parentElement?.querySelector("main")).toHaveClass(
-      "rail-scroll",
-      "rail-scroll-auto",
-    );
-    const roster = screen.getByRole("region", { name: "Members" });
-    expect(roster).toBeInTheDocument();
-    expect(roster).not.toHaveClass("min-h-80", "xl:flex-1");
+    const roster = await screen.findByRole("table", { name: "Vault members" });
     expect(
-      screen.getByRole("table", { name: "Vault members" }),
+      screen.getByRole("heading", { level: 1, name: "Members" }),
     ).toBeInTheDocument();
-    const inspector = screen.getByRole("complementary", {
-      name: "Member access context",
-    });
-    expect(inspector).toHaveClass("xl:border-l");
-    expect(inspector).not.toHaveClass("self-start", "border-y");
-    expect(inspector).not.toHaveClass("xl:h-full");
-    expect(screen.getByTestId("member-access-panel")).toHaveClass(
-      "border-b",
-      "bg-surface",
-    );
-    expect(screen.getByTestId("member-roster-header")).toHaveClass(
-      "border-border",
-      "pb-3",
-    );
-    expect(screen.getByTestId("member-roster-header")).not.toHaveClass(
-      "bg-surface-2/55",
-    );
-    expect(screen.getByRole("columnheader", { name: "Member" })).toHaveClass(
-      "px-4",
-      "lg:px-5",
-    );
-    expect(screen.getByTestId("member-access-header")).toHaveClass(
-      "bg-surface-2/55",
-      "border-border-strong",
-    );
-    expect(screen.getByTestId("role-ladder-header")).toHaveClass(
-      "bg-surface-2/40",
-    );
-    expect(screen.getByTestId("public-access-header")).toHaveClass(
-      "bg-surface-2/40",
-    );
-    const directAccessHeading = screen.getByRole("heading", {
-      level: 2,
-      name: "Direct access",
-    });
-    expect(directAccessHeading).toHaveClass("text-base", "font-semibold");
     expect(
-      within(screen.getByTestId("member-roster-header")).getByText("3 members"),
+      screen.getByRole("heading", { level: 2, name: "Members" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Vault Owner")).toBeInTheDocument();
-    expect(screen.getByText("You")).toBeInTheDocument();
-
-    const ladder = screen.getByRole("list", {
+    expect(
+      screen.queryByRole("complementary", { name: "Member access context" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("list", {
+        name: "Roles from highest to lowest access",
+      }),
+    ).toBeNull();
+    expect(screen.getByText("3 members")).toBeInTheDocument();
+    expect(within(roster).getByText("Vault Owner")).toBeInTheDocument();
+    expect(within(roster).getByText("You")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Settings/ })).toBeNull();
+    expect(screen.queryByText(/People not listed here/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Invite member" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Change role for mina" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "More actions for mina" }),
+    ).toBeEnabled();
+    const trigger = within(roster).getByRole("button", {
+      name: "Role permissions",
+    });
+    await user.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "Role permissions" });
+    const ladder = within(dialog).getByRole("list", {
       name: "Roles from highest to lowest access",
     });
-    expect(ladder).toHaveTextContent("Owner");
-    expect(ladder).toHaveTextContent("Admin");
-    expect(ladder).toHaveTextContent("Writer");
-    expect(ladder).toHaveTextContent("Reader");
-    expect(ladder).toHaveTextContent("Your role");
     expect(
       within(ladder)
         .getAllByRole("listitem")
@@ -169,23 +134,72 @@ describe("Vault Members redesign", () => {
       "aria-current",
       "true",
     );
-
-    const policyLink = screen.getByRole("link", {
-      name: /Change in Settings/i,
-    });
-    expect(policyLink.getAttribute("href")).toBe(
-      "/vault/platform-docs/settings#access",
-    );
-    expect(
-      screen.getByRole("button", { name: "Invite member" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Change role for mina" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "More actions for mina" }),
-    ).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
+
+  it("keeps unknown policy unknown rather than reporting Private", async () => {
+    getVaultInfoMock.mockRejectedValue(new Error("Unavailable"));
+    renderPage();
+    expect(
+      await screen.findByRole("table", { name: "Vault members" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/People not listed here/)).toBeNull();
+    expect(screen.queryByText("Private", { exact: true })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Invite member" })).toBeNull();
+  });
+
+  it("retains filtering and its recovery without hiding the active filter", async () => {
+    getVaultMembersMock.mockResolvedValue({
+      members: [
+        ...MEMBERS,
+        ...Array.from({ length: 8 }, (_, i) => ({
+          username: `user-${i}`,
+          email: `user${i}@example.com`,
+          role: "reader",
+        })),
+      ],
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const search = await screen.findByRole("searchbox", {
+      name: "Filter members",
+    });
+    await user.type(search, "MINA@");
+    expect(
+      screen.getByRole("table", { name: "Vault members" }),
+    ).toHaveTextContent("Mina Park");
+    expect(
+      screen.getByRole("table", { name: "Vault members" }),
+    ).not.toHaveTextContent("Dana Lee");
+    await user.clear(search);
+    await user.type(search, "missing");
+    await user.click(screen.getByRole("button", { name: "Clear filter" }));
+    expect(search).toHaveValue("");
+    expect(
+      screen.getByRole("table", { name: "Vault members" }),
+    ).toHaveTextContent("Dana Lee");
+  });
+
+  it.each(["is_archived", "is_external_git"])(
+    "does not promise public writes when %s restricts content",
+    async (restriction) => {
+      getVaultInfoMock.mockResolvedValue({
+        name: "platform-docs",
+        role: "owner",
+        public_access: "writer",
+        [restriction]: true,
+      });
+      renderPage();
+      await screen.findByRole("table", { name: "Vault members" });
+      expect(
+        screen.getByText(
+          "People not listed here can also read this vault when signed in. Content is read-only.",
+        ),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("opens the member action menu and keeps destructive actions explicit", async () => {
     const user = userEvent.setup();
@@ -231,9 +245,63 @@ describe("Vault Members redesign", () => {
     expect(
       screen.queryByRole("link", { name: /Change in Settings/i }),
     ).toBeNull();
+    expect(screen.queryByText(/People not listed here/)).toBeNull();
+  });
+
+  it("keeps role changes and Undo connected to the API", async () => {
+    vi.mocked(grantAccess).mockResolvedValue({} as never);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(
+      await screen.findByRole("button", { name: "Change role for mina" }),
+    );
+    await user.click(screen.getByRole("menuitemradio", { name: "admin" }));
+    expect(grantAccess).toHaveBeenCalledWith("platform-docs", "mina", "admin");
+    await user.click(await screen.findByRole("button", { name: "Undo" }));
+    expect(grantAccess).toHaveBeenLastCalledWith(
+      "platform-docs",
+      "mina",
+      "writer",
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Undo" })).toBeNull(),
+    );
+  });
+
+  it.each(["revoke", "transfer"] as const)(
+    "requires confirmation before %s and refreshes afterward",
+    async (action) => {
+      const user = userEvent.setup();
+      vi.mocked(revokeAccess).mockResolvedValue({} as never);
+      vi.mocked(transferOwnership).mockResolvedValue({} as never);
+      renderPage();
+      await user.click(
+        await screen.findByRole("button", { name: "More actions for mina" }),
+      );
+      const label =
+        action === "revoke" ? "Revoke access" : "Transfer ownership";
+      const api = action === "revoke" ? revokeAccess : transferOwnership;
+      await user.click(screen.getByRole("menuitem", { name: label }));
+      expect(api).not.toHaveBeenCalled();
+      await user.click(
+        within(screen.getByRole("dialog")).getByRole("button", { name: label }),
+      );
+      expect(api).toHaveBeenCalledWith("platform-docs", "mina");
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(getVaultMembers).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("waits for the current identity before exposing per-member management", async () => {
+    getMeMock.mockRejectedValue(new Error("Session unavailable"));
+    renderPage();
+    await screen.findByRole("table", { name: "Vault members" });
     expect(
-      screen.getByText("Only the vault owner can change public access."),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: /Change role for/ }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /More actions for/ }),
+    ).toBeNull();
   });
 
   it("keeps member management for admins without implying owner-only policy control", async () => {
@@ -253,8 +321,43 @@ describe("Vault Members redesign", () => {
       screen.queryByRole("link", { name: /Change in Settings/i }),
     ).toBeNull();
     expect(
-      screen.getByText("Only the vault owner can change public access."),
+      screen.getByText(
+        "People not listed here can also read this vault when signed in.",
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText("View only")).toBeInTheDocument();
   });
+
+  it.each([
+    [
+      "reader",
+      "People not listed here can also read this vault when signed in.",
+    ],
+    [
+      "writer",
+      "People not listed here can also read and change content when signed in.",
+    ],
+  ])(
+    "explains effective %s access without turning the roster into public settings",
+    async (publicAccess, note) => {
+      getVaultInfoMock.mockResolvedValue({
+        name: "platform-docs",
+        role: "owner",
+        public_access: publicAccess,
+      });
+      renderPage();
+      const roster = await screen.findByRole("table", {
+        name: "Vault members",
+      });
+      const notice = screen.getByText(note);
+      expect(notice).toBeVisible();
+      expect(
+        roster.compareDocumentPosition(notice) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+      expect(screen.queryByRole("link", { name: /Settings/ })).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Change role for mina" }),
+      ).toBeEnabled();
+    },
+  );
 });

@@ -191,6 +191,9 @@ async def test_encoded_values_and_external_stats_consumption(driver, shape, monk
     lookup = AsyncMock(return_value=vocab)
     monkeypatch.setattr(sparse_encoder, "get_or_create_term_ids", register)
     monkeypatch.setattr(sparse_encoder, "lookup_term_ids", lookup)
+    # Pre-baked queries read ids and df in two statements, bracketed by the
+    # vocabulary epoch (akb#687); one numbering throughout here.
+    monkeypatch.setattr(sparse_encoder, "vocabulary_epoch", AsyncMock(return_value=0))
     raw = _EXPECTED_BY_SHAPE[(driver, shape)] == "raw_tf"
     stats = AsyncMock(return_value={"total_docs": 100, "avgdl": 6, "k1": 1.5, "b": 0.75})
     df = AsyncMock(return_value={17: 2, 91: 80})

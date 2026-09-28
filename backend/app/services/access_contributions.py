@@ -39,6 +39,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Iterable
 
+from app.services.role_authority import lock_role_authority
+
 
 # The one role ordering. `access_service` imports it from here so the
 # derivation below and every comparison in the codebase read the same table.
@@ -126,6 +128,7 @@ async def _lock_vault(conn, vault_id) -> None:
     contribution rows instead would not serialize against a concurrent INSERT
     of a *new* basis for the same pair — there is no row yet to lock.
     """
+    await lock_role_authority(conn)
     await conn.fetchval("SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault_id)
 
 

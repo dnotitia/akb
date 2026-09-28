@@ -1,13 +1,48 @@
 ---
-status: proposal
-stage: planning
+status: denied
+stage: denied
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-23
 issue: dnotitia/akb#433
 baseline: d25d6ee
 ---
 
 # Column logical/physical name split
+
+> **Denied, 2026-09-23.** The header this proposal set out to keep already has
+> a place, and the field it would repurpose is the one every machine surface
+> reads. #433 is resolved by keeping `name` an SQL identifier and making the
+> header's place reachable instead. The decision is below; the review that led
+> to it is in `feedback/`.
+
+## Decision (2026-09-23)
+
+The proposal gives the physical identifier a field of its own and hands the
+column's `name` to the human header. But `name` is also the key of the row API
+and its query grammar, of the generated SDK types, of foreign-key references,
+and — through `akb_sql`, which runs against the physical table — of every
+agent's SQL. Making it the header moves the conflict onto all of those rather
+than removing it, and the proposal specifies none of them.
+
+What #433 needed was a place for the header, and a caller who knows where it
+goes. The place exists: `columns[].description` is stored with the column and
+is already part of the table's search chunk. What was missing was the path to
+it:
+
+- a refusal names every refused column at once, with the reason and the way
+  out, instead of the first column and a regex;
+- `akb_create_table` and `akb_alter_table` advertise `description` and say a
+  document's header belongs there;
+- `akb_vault_info` returns each column's `description`, where an agent reads a
+  schema before writing SQL with the column's name;
+- a name longer than 63 bytes is refused rather than silently cut by
+  PostgreSQL.
+
+A separate display label stays possible if the human UI ever needs a short
+header distinct from a longer description. It would be an additive field, and
+nothing here needs it.
+
+The original proposal follows unchanged.
 
 ## Context
 

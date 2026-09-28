@@ -14,7 +14,7 @@ describe("DocumentReadModes", () => {
   it("is a segmented view control, distinct from page-navigation underlines", async () => {
     const user = userEvent.setup();
     render(<Modes />);
-    const rendered = screen.getByRole("tab", { name: "Rendered" });
+    const rendered = screen.getByRole("tab", { name: "Preview" });
     const raw = screen.getByRole("tab", { name: "Raw" });
     expect(rendered).toHaveClass("bg-surface-selected");
     expect(rendered.className).not.toContain("after:");

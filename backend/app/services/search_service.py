@@ -40,7 +40,7 @@ from app.services.grep_replace import (
     validate_max_replacements,
 )
 from app.services.vector_store import VectorHit, get_vector_store
-from app.services.vector_store.base import VectorSearchDegraded, VectorStoreUnavailable, supports_vault_filter
+from app.services.vector_store.base import VectorSearchDegraded, VectorStoreUnavailable, has_dense, supports_vault_filter
 from app.services.rerank_service import RerankError, rerank
 from app.services.uri_service import parse_uri
 
@@ -956,14 +956,14 @@ class SearchService:
             logger.warning("query embedding failed: %s", e)
             embeddings = []
         query_embedding = embeddings[0] if embeddings else None
+        embedding_failed = bool(settings.embed_base_url) and not has_dense(query_embedding)
+        if not has_dense(query_embedding):
+            query_embedding = None
         phases["embedding"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
-        # A None embedding here is intentionally NOT surfaced as `degraded`:
-        # sparse-only is a legitimate by-design mode (a deployment may leave
-        # `embed_base_url` unset), and we can't cheaply tell "configured but
-        # transiently down" from "intentionally absent" at this point. The
-        # symmetric sparse-leg failure IS flagged degraded in _run_vector_search
-        # because the BM25 vocab is always present when the feature is on.
+        # Unconfigured embeddings are intentional sparse-only mode. A configured
+        # endpoint returning an empty vector (or raising) lost a retrieval leg;
+        # preserve sparse hits, but report incomplete retrieval to the caller.
 
         # Always pre-filter when user_id is provided so we never leak
         # documents from vaults the user can't read.
@@ -1221,6 +1221,8 @@ class SearchService:
             limit=target_unique * 3,
         )
         phases["retrieval"] = time.perf_counter() - phase_started
+        if degraded_reason is None and embedding_failed:
+            degraded_reason = "query_embedding_failed"
 
         if not hits:
             _log_search_timing(started, phases, 0)
@@ -1951,9 +1953,26 @@ class SearchService:
         raises it too, for a hit whose source row is gone or stale. What both
         producers have in common is that something WENT WRONG — a filter
         honouring the request never sets it (akb#604)."""
+        store = get_vector_store()
+        query_epoch = None
+
+        async def encode_sparse():
+            nonlocal query_epoch
+            if getattr(store, "query_epoch_supported", False):
+                encoded = await sparse_encoder.encode_query_at_epoch(
+                    query_text, sparse_shape=getattr(store, "sparse_shape", None),
+                )
+                query_epoch = encoded.epoch
+                return encoded.indices, encoded.values
+            return await sparse_encoder.encode_query(query_text)
+
         sparse_failed = False
         try:
-            sparse_idx, sparse_vals = await sparse_encoder.encode_query(query_text)
+            sparse_idx, sparse_vals = await encode_sparse()
+        except sparse_encoder.VocabularyRenumberingInProgress:
+            return [], "bm25_renumbering"
+        except sparse_encoder.VocabularyEpochMoved:
+            return [], "bm25_vocabulary_moved"
         except Exception as e:  # noqa: BLE001
             logger.warning("sparse encode_query failed (%s); dense-only path", e)
             sparse_idx, sparse_vals = [], []
@@ -1984,20 +2003,36 @@ class SearchService:
         prefetch_per_leg = max(limit * 3, 50)
 
         try:
-            hits = await get_vector_store().hybrid_search(
-                query_text=query_text,
-                query_dense=query_embedding,
-                query_sparse_indices=sparse_idx,
-                query_sparse_values=sparse_vals,
-                source_ids=candidate_source_ids,
-                vault_ids=candidate_vault_ids,
-                source_types=source_types,
-                limit=limit,
-                prefetch_per_leg=prefetch_per_leg,
-            )
+            for attempt in range(3):
+                try:
+                    epoch_args = (
+                        {"query_sparse_epoch": query_epoch}
+                        if getattr(store, "query_epoch_supported", False) else {}
+                    )
+                    hits = await store.hybrid_search(
+                        query_text=query_text,
+                        query_dense=query_embedding,
+                        query_sparse_indices=sparse_idx,
+                        query_sparse_values=sparse_vals,
+                        source_ids=candidate_source_ids,
+                        vault_ids=candidate_vault_ids,
+                        source_types=source_types,
+                        limit=limit,
+                        prefetch_per_leg=prefetch_per_leg,
+                        **epoch_args,
+                    )
+                    break
+                except sparse_encoder.VocabularyEpochMoved:
+                    if attempt == 2:
+                        raise
+                    sparse_idx, sparse_vals = await encode_sparse()
             # `sparse_reason` is None on the normal path; set when the sparse leg
             # was down and we ran dense-only (degraded-but-has-results).
             return hits, sparse_reason
+        except sparse_encoder.VocabularyRenumberingInProgress:
+            return [], "bm25_renumbering"
+        except sparse_encoder.VocabularyEpochMoved:
+            return [], "bm25_vocabulary_moved"
         except VectorSearchDegraded as e:
             logger.warning("vector search degraded (%s); retaining %d hits", e.reason, len(e.hits))
             return e.hits, e.reason

@@ -49,6 +49,28 @@ _REL_ENUM = list(LINK_RELATION_TYPES)
 _REL_LIST = ", ".join(LINK_RELATION_TYPES)
 
 
+# A column's name is the SQL identifier `akb_sql` uses as written, so a header
+# taken from a document often cannot be one (akb#433). The header is not lost:
+# it goes in `description`, which akb_vault_info shows and search indexes.
+_COLUMN_NAME_FIELD = {
+    "type": "string",
+    "description": (
+        "SQL identifier, used as written in akb_sql: a lowercase ASCII letter, "
+        "then lowercase letters, digits or underscores, at most 63 bytes, and "
+        "not a word PostgreSQL reserves (`user`, `order`, …) or a system column "
+        "(`xmin`, …). Name the column for what it holds (e.g. `category`)."
+    ),
+}
+_COLUMN_DESCRIPTION_FIELD = {
+    "type": "string",
+    "description": (
+        "What the column holds. When the table comes from a document, put the "
+        "original header here (e.g. `분류`) — akb_vault_info shows it and "
+        "search indexes it."
+    ),
+}
+
+
 TOOLS = [
     Tool(
         name="akb_list_vaults",
@@ -753,9 +775,10 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string"},
+                            "name": _COLUMN_NAME_FIELD,
                             "type": {"type": "string", "enum": ["text", "number", "boolean", "date", "json"]},
                             "required": {"type": "boolean", "default": False},
+                            "description": _COLUMN_DESCRIPTION_FIELD,
                         },
                         "required": ["name", "type"],
                     },
@@ -869,7 +892,8 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string"},
+                            "name": _COLUMN_NAME_FIELD,
+                            "description": _COLUMN_DESCRIPTION_FIELD,
                             "type": {
                                 "type": "string",
                                 "enum": [

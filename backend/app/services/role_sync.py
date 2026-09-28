@@ -44,8 +44,11 @@ boundary. No schemas are reorganized, no data is moved.
 Semantics
 ---------
 
-Lifecycle hooks (`on_user_create`, `on_grant`, …) are **best-effort**.
-A failure is logged but does NOT roll back the system DB write. The
+Post-commit lifecycle hooks are best-effort and re-read current authority.
+Access grant/revoke, ownership and public-access changes use strict same-
+connection projection inside their catalog transaction; projection failure
+rolls back that authority change. All participating writers and reconciliation
+serialize before authority row locks using the shared role-authority guard. The
 reconciler (`reconcile_from_catalog`) reads the catalog at backend
 startup and on demand, emits any missing CREATE/GRANT and drops any
 orphan AKB-owned role. The catalog is the authoritative source of
@@ -79,6 +82,7 @@ from typing import Optional
 
 import asyncpg
 
+from app.services.role_authority import role_authority_transaction
 from app.models.vault_scope import VaultScope
 from app.repositories.table_data_repo import PG_IDENT_MAX_LEN
 
@@ -221,6 +225,8 @@ class RoleStateDiff:
     missing_token_roles: list[str] = field(default_factory=list)
     orphan_token_roles: list[str] = field(default_factory=list)
     missing_memberships: list[dict] = field(default_factory=list)
+    stale_memberships: list[dict] = field(default_factory=list)
+    invalid_membership_options: list[dict] = field(default_factory=list)
     missing_public_grants: list[dict] = field(default_factory=list)
     stale_public_grants: list[dict] = field(default_factory=list)
     missing_table_grants: list[dict] = field(default_factory=list)
@@ -236,6 +242,8 @@ class RoleStateDiff:
             + len(self.missing_token_roles)
             + len(self.orphan_token_roles)
             + len(self.missing_memberships)
+            + len(self.stale_memberships)
+            + len(self.invalid_membership_options)
             + len(self.missing_public_grants)
             + len(self.stale_public_grants)
             + len(self.missing_table_grants)
@@ -290,6 +298,28 @@ class HookMetrics:
 
 
 # ── RoleSync ─────────────────────────────────────────────────
+
+
+def _is_catalog_role(role: str, kind: str) -> bool:
+    """Only exact UUID identifiers belong to the managed role namespace."""
+    prefix = f"akb_{kind}_"
+    if not role.startswith(prefix):
+        return False
+    suffix = role[len(prefix):]
+    scope = None
+    if kind == "vault":
+        try:
+            suffix, scope = suffix.rsplit("_", 1)
+        except ValueError:
+            return False
+        if scope not in ("reader", "writer", "admin"):
+            return False
+    try:
+        uid = uuid.UUID(suffix.replace("_", "-"))
+    except ValueError:
+        return False
+    canonical = str(uid).replace("-", "_")
+    return role == prefix + canonical + ("_" + scope if scope else "")
 
 
 class RoleSync:
@@ -372,9 +402,12 @@ class RoleSync:
         role = user_role_name(user_id)
         try:
             async with self.pool.acquire() as conn:
-                await self._create_role_if_missing(conn, role)
-                await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
-                await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
+                async with role_authority_transaction(conn):
+                    if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", uuid.UUID(str(user_id))):
+                        return
+                    await self._create_role_if_missing(conn, role)
+                    await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+                    await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_user_create", e, user_id)
 
@@ -384,7 +417,9 @@ class RoleSync:
         role = user_role_name(user_id)
         try:
             async with self.pool.acquire() as conn:
-                await self._drop_role_if_present(conn, role)
+                async with role_authority_transaction(conn):
+                    if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", uuid.UUID(str(user_id))):
+                        await self._drop_role_if_present(conn, role)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_user_delete", e, user_id)
 
@@ -407,7 +442,7 @@ class RoleSync:
         role = token_role_name(token_id)
         try:
             async with self.pool.acquire() as conn:
-                async with conn.transaction():
+                async with role_authority_transaction(conn):
                     rows = await self._locked_live_scoped_tokens(
                         conn,
                         token_id=token_id,
@@ -438,7 +473,9 @@ class RoleSync:
         role = token_role_name(token_id)
         try:
             async with self.pool.acquire() as conn:
-                await self._drop_role_if_present(conn, role)
+                async with role_authority_transaction(conn):
+                    if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM tokens WHERE id=$1)", uuid.UUID(str(token_id))):
+                        await self._drop_role_if_present(conn, role)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_token_revoke", e, token_id)
 
@@ -451,7 +488,9 @@ class RoleSync:
         """
         role = token_role_name(token_id)
         async with self.pool.acquire() as conn:
-            await self._drop_role_if_present(conn, role)
+            async with role_authority_transaction(conn):
+                if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM tokens WHERE id=$1)", uuid.UUID(str(token_id))):
+                    await self._drop_role_if_present(conn, role)
 
     async def on_vault_create(
         self,
@@ -461,7 +500,10 @@ class RoleSync:
         """Best-effort wrapper for :meth:`on_vault_create_in_conn`."""
         try:
             async with self.pool.acquire() as conn:
-                await self.on_vault_create_in_conn(conn, vault_id, owner_user_id)
+                async with role_authority_transaction(conn):
+                    row = await conn.fetchrow("SELECT owner_id FROM vaults WHERE id=$1", uuid.UUID(str(vault_id)))
+                    if row is not None:
+                        await self.on_vault_create_in_conn(conn, vault_id, row["owner_id"])
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_vault_create", e, vault_id)
 
@@ -498,9 +540,12 @@ class RoleSync:
         `DROP OWNED BY`. Memberships of dropped roles auto-clean."""
         try:
             async with self.pool.acquire() as conn:
-                for scope in ("admin", "writer", "reader"):
-                    role = vault_group_role_name(vault_id, scope)
-                    await self._drop_role_if_present(conn, role)
+                async with role_authority_transaction(conn):
+                    if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM vaults WHERE id=$1)", uuid.UUID(str(vault_id))):
+                        return
+                    for scope in ("admin", "writer", "reader"):
+                        role = vault_group_role_name(vault_id, scope)
+                        await self._drop_role_if_present(conn, role)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_vault_delete", e, vault_id)
 
@@ -510,74 +555,58 @@ class RoleSync:
         user_id: uuid.UUID | str,
         scope: str,
     ) -> None:
-        """`GRANT akb_vault_<vid>_<scope> TO akb_user_<uid>`. If a stronger
-        scope was previously granted, the older grant remains until
-        `on_revoke` is called explicitly (matches `vault_access` semantics
-        which is unique on `(vault_id, user_id)`)."""
+        """Refresh the current catalog authority; scope is only input validation.
+
+        The caller may have committed before a later downgrade/revoke. Never
+        replay its old scope against the newer catalog.
+        """
         if scope not in ("reader", "writer", "admin"):
             logger.warning("on_grant: invalid scope %r", scope)
             self.metrics.record_failure("on_grant")
             return
-        group = vault_group_role_name(vault_id, scope)
-        user = user_role_name(user_id)
         try:
             async with self.pool.acquire() as conn:
-                # Drop any prior membership in this vault's groups first
-                # so a downgrade (admin → reader) doesn't leave the user
-                # still admin via membership chain.
-                for s in ("reader", "writer", "admin"):
-                    other = vault_group_role_name(vault_id, s)
-                    if other == group:
-                        continue
-                    await self._revoke_membership_if_present(conn, other, user)
-                await self._create_role_if_missing(conn, user)
-                await self._grant_membership(conn, group, user)
-                # Propagate to the grantee's scoped tokens (gain/downgrade
-                # in-scope reach to match the new grant).
-                await self._sync_user_scoped_tokens(conn, user_id)
+                async with role_authority_transaction(conn):
+                    await self.sync_vault_user_in_conn(conn, vault_id, user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_grant", e, vault_id, user_id, scope)
 
-    async def on_revoke(
-        self,
-        vault_id: uuid.UUID | str,
-        user_id: uuid.UUID | str,
-    ) -> None:
-        """Revoke all memberships in this vault's three group roles from
-        the user role. Mirrors `vault_access` DELETE semantics."""
-        user = user_role_name(user_id)
+    async def sync_vault_user_in_conn(self, conn, vault_id, user_id) -> None:
+        """Strict catalog-to-role delta on the caller's guarded transaction."""
+        vid, uid = uuid.UUID(str(vault_id)), uuid.UUID(str(user_id))
+        row = await conn.fetchrow("""
+            SELECT v.owner_id, a.role FROM vaults v
+              LEFT JOIN vault_access a ON a.vault_id=v.id AND a.user_id=$2
+             WHERE v.id=$1
+        """, vid, uid)
+        exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", uid)
+        wanted = None if row is None or not exists else ("admin" if row["owner_id"] == uid else row["role"])
+        user = user_role_name(uid)
+        for scope in ("reader", "writer", "admin"):
+            if scope != wanted:
+                await self._revoke_membership_strict(conn, vault_group_role_name(vid, scope), user)
+        if wanted is not None:
+            await self._create_role_if_missing(conn, user)
+            await self._grant_membership(conn, vault_group_role_name(vid, wanted), user)
+        await self._sync_user_scoped_tokens(conn, uid)
+
+    async def on_revoke(self, vault_id, user_id) -> None:
+        """Re-read authority after a revoke; delayed callbacks cannot undo a later grant."""
         try:
             async with self.pool.acquire() as conn:
-                for scope in ("reader", "writer", "admin"):
-                    group = vault_group_role_name(vault_id, scope)
-                    await self._revoke_membership_if_present(conn, group, user)
-                # Withdraw the revoked vault from the user's scoped tokens too
-                # (effective = owner-ACL ∩ scope; a lost grant must propagate).
-                await self._sync_user_scoped_tokens(conn, user_id)
+                async with role_authority_transaction(conn):
+                    await self.sync_vault_user_in_conn(conn, vault_id, user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_revoke", e, vault_id, user_id)
 
-    async def on_ownership_transfer(
-        self,
-        vault_id: uuid.UUID | str,
-        old_owner_id: Optional[uuid.UUID | str],
-        new_owner_id: uuid.UUID | str,
-    ) -> None:
-        """Grant admin to new owner. The old owner is preserved as admin
-        via the `vault_access` row that `transfer_ownership` writes; that
-        row triggers `on_grant` separately."""
-        admin = vault_group_role_name(vault_id, "admin")
-        new_role = user_role_name(new_owner_id)
+    async def on_ownership_transfer(self, vault_id, old_owner_id, new_owner_id) -> None:
         try:
             async with self.pool.acquire() as conn:
-                await self._create_role_if_missing(conn, new_role)
-                await self._grant_membership(conn, admin, new_role)
-                # New owner's scoped tokens may now reach this vault in-scope.
-                await self._sync_user_scoped_tokens(conn, new_owner_id)
+                async with role_authority_transaction(conn):
+                    for uid in {old_owner_id, new_owner_id} - {None}:
+                        await self.sync_vault_user_in_conn(conn, vault_id, uid)
         except Exception as e:  # noqa: BLE001
-            self._record_failure(
-                "on_ownership_transfer", e, vault_id, old_owner_id, new_owner_id,
-            )
+            self._record_failure("on_ownership_transfer", e, vault_id, old_owner_id, new_owner_id)
 
     async def on_public_access_change(
         self,
@@ -598,7 +627,10 @@ class RoleSync:
         _public_access_scope(level)
         try:
             async with self.pool.acquire() as conn:
-                await self.on_public_access_change_in_conn(conn, vault_id, level)
+                async with role_authority_transaction(conn):
+                    current = await conn.fetchval("SELECT public_access FROM vaults WHERE id=$1", uuid.UUID(str(vault_id)))
+                    if current is not None:
+                        await self.on_public_access_change_in_conn(conn, vault_id, current)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_public_access_change", e, vault_id, level)
 
@@ -617,7 +649,7 @@ class RoleSync:
             if scope == target:
                 continue
             group = vault_group_role_name(vault_id, scope)
-            await self._revoke_membership_if_present(conn, group, AUTHENTICATED_ROLE)
+            await self._revoke_membership_strict(conn, group, AUTHENTICATED_ROLE)
         if target is not None:
             group = vault_group_role_name(vault_id, target)
             await self._grant_membership(conn, group, AUTHENTICATED_ROLE)
@@ -641,7 +673,11 @@ class RoleSync:
             return
         try:
             async with self.pool.acquire() as conn:
-                await self._grant_table(conn, vault_id, pg_table_name)
+                async with role_authority_transaction(conn):
+                    from app.repositories.table_data_repo import pg_table_name as canonical_table_name
+                    rows = await conn.fetch("SELECT vt.name,v.name AS vault_name FROM vault_tables vt JOIN vaults v ON v.id=vt.vault_id WHERE v.id=$1", uuid.UUID(str(vault_id)))
+                    if any(canonical_table_name(row["vault_name"], row["name"]) == pg_table_name for row in rows):
+                        await self._grant_table(conn, vault_id, pg_table_name)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_table_create", e, vault_id, pg_table_name)
 
@@ -687,8 +723,8 @@ class RoleSync:
           3. For each vault → ensure three group roles + hierarchy.
              Drop orphan vault roles.
           4. For each vault_access row + each owner → grant membership.
-             (Membership drift isn't explicitly cleared row-by-row;
-             dropping the parent role clears its memberships.)
+             Remove stale direct vault memberships from managed user roles.
+             Preserve hierarchy, public/token, and operator role domains.
           5. For each vault_tables row → grant table-level perms.
           6. For each vault → sync `public_access` to akb_authenticated
              memberships.
@@ -703,16 +739,10 @@ class RoleSync:
 
         report = ReconcileReport()
         async with self.pool.acquire() as conn:
-            # One catalog snapshot prevents an online signup/vault-create from
-            # appearing in the role scan but not the application-table scan (or
-            # vice versa), which could make the orphan pass drop a live role.
-            # The xact advisory lock also keeps API/worker process startups from
-            # running two destructive convergence passes simultaneously.
-            async with conn.transaction(isolation="repeatable_read"):
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    "akb:role-sync:reconcile",
-                )
+            # Catalog authority writers take this guard before their row
+            # locks. The first SELECT after waiting sees their committed state;
+            # repeatable-read established by the lock query would be stale.
+            async with role_authority_transaction(conn):
                 await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
                 await self._reconcile_user_roles(conn, report)
                 await self._reconcile_vault_roles(conn, report)
@@ -737,12 +767,7 @@ class RoleSync:
     ) -> None:
         rows = await conn.fetch("SELECT id FROM users")
         wanted = {user_role_name(r["id"]) for r in rows}
-        existing = {
-            r["rolname"]
-            for r in await conn.fetch(
-                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_user\\_%' ESCAPE '\\'"
-            )
-        }
+        existing = {r['rolname'] for r in await conn.fetch("SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_user\\_%' ESCAPE '\\'") if _is_catalog_role(r['rolname'], 'user')}
         for role in wanted - existing:
             try:
                 async with conn.transaction():
@@ -783,12 +808,7 @@ class RoleSync:
         for r in rows:
             for scope in ("reader", "writer", "admin"):
                 wanted.add(vault_group_role_name(r["id"], scope))
-        existing = {
-            r["rolname"]
-            for r in await conn.fetch(
-                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_vault\\_%' ESCAPE '\\'"
-            )
-        }
+        existing = {r['rolname'] for r in await conn.fetch("SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_vault\\_%' ESCAPE '\\'") if _is_catalog_role(r['rolname'], 'vault')}
         for role in wanted - existing:
             try:
                 async with conn.transaction():
@@ -825,21 +845,96 @@ class RoleSync:
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"DROP ROLE {orphan}: {e}")
 
+    async def _desired_user_memberships(self, conn) -> dict[tuple[str, str], dict]:
+        """Direct user memberships: ownership overrides any member row.
+
+        Archived vaults retain SQL read authority. Hierarchy, wildcard and
+        token memberships are separate domains and never enter this delta.
+        """
+        owners = await conn.fetch("SELECT id, owner_id FROM vaults")
+        owned = {(r["id"], r["owner_id"]) for r in owners if r["owner_id"]}
+        access = await conn.fetch("SELECT vault_id, user_id, role FROM vault_access")
+        desired = {}
+        for row in access:
+            if (row["vault_id"], row["user_id"]) in owned:
+                continue
+            group = vault_group_role_name(row["vault_id"], row["role"])
+            member = user_role_name(row["user_id"])
+            desired[(group, member)] = {
+                "vault_id": str(row["vault_id"]), "user_id": str(row["user_id"]),
+                "scope": row["role"],
+            }
+        for vid, uid in owned:
+            desired[(vault_group_role_name(vid, "admin"), user_role_name(uid))] = {
+                "vault_id": str(vid), "user_id": str(uid), "scope": "admin",
+            }
+        return desired
+
+    async def _actual_user_memberships(self, conn) -> dict[tuple[str, str], dict]:
+        rows = await conn.fetch("""
+            SELECT r.rolname AS group_role, m.rolname AS member_role
+              FROM pg_auth_members am
+              JOIN pg_roles r ON r.oid = am.roleid
+              JOIN pg_roles m ON m.oid = am.member
+             WHERE r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
+               AND m.rolname LIKE 'akb_user\\_%' ESCAPE '\\'
+        """)
+        catalog_groups = {
+            vault_group_role_name(row["id"], scope)
+            for row in await conn.fetch("SELECT id FROM vaults")
+            for scope in ("reader", "writer", "admin")
+        }
+        catalog_users = {user_role_name(row["id"]) for row in await conn.fetch("SELECT id FROM users")}
+        actual = {}
+        for row in rows:
+            # A similarly named operator role is not an AKB UUID role.
+            group, member = row["group_role"], row["member_role"]
+            if group not in catalog_groups or member not in catalog_users:
+                continue
+            try:
+                vid_text, scope = group.removeprefix("akb_vault_").rsplit("_", 1)
+                vid = uuid.UUID(vid_text.replace("_", "-"))
+                uid = uuid.UUID(member.removeprefix("akb_user_").replace("_", "-"))
+            except ValueError:
+                continue
+            if scope not in ("reader", "writer", "admin"):
+                continue
+            if group != vault_group_role_name(vid, scope) or member != user_role_name(uid):
+                continue
+            actual[(group, member)] = {
+                "vault_id": str(vid), "user_id": str(uid), "scope": scope,
+            }
+        return actual
+
     async def _reconcile_memberships(
         self, conn: asyncpg.Connection, report: ReconcileReport,
     ) -> None:
-        rows = await conn.fetch(
-            "SELECT vault_id, user_id, role FROM vault_access"
-        )
-        for ar in rows:
-            user = user_role_name(ar["user_id"])
-            group = vault_group_role_name(ar["vault_id"], ar["role"])
+        desired = await self._desired_user_memberships(conn)
+        actual = await self._actual_user_memberships(conn)
+        # Revoke before granting a downgraded scope. Each operation is a
+        # savepoint; unsupported grants remain visible as errors and drift.
+        for group, user in sorted(actual.keys() - desired.keys()):
+            try:
+                async with conn.transaction():
+                    await self._revoke_membership_strict(conn, group, user)
+                    if await self._has_direct_membership(conn, group, user):
+                        raise RuntimeError("membership remains under another grantor")
+                report.grants_removed += 1
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"REVOKE {group}→{user}: {e}")
+        for group, user in sorted(desired.keys() - actual.keys()):
             try:
                 async with conn.transaction():
                     await self._grant_membership(conn, group, user)
                 report.grants_added += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"GRANT {group}→{user}: {e}")
+
+        for group, user in sorted(desired.keys() & actual.keys()):
+            try:
+                await self._grant_membership(conn, group, user)
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"membership options {group}→{user}: {e}")
 
     async def _reconcile_public_access(
         self, conn: asyncpg.Connection, report: ReconcileReport,
@@ -860,7 +955,7 @@ class RoleSync:
                         if scope == target:
                             continue
                         group = vault_group_role_name(r["id"], scope)
-                        await self._revoke_membership_if_present(
+                        await self._revoke_membership_strict(
                             conn, group, AUTHENTICATED_ROLE,
                         )
                     if target is not None:
@@ -941,7 +1036,7 @@ class RoleSync:
             """,
             token_role,
         )
-        return {r["group_role"] for r in rows}
+        return {r["group_role"] for r in rows if _is_catalog_role(r["group_role"], "vault")}
 
     async def _locked_live_scoped_tokens(
         self,
@@ -1009,10 +1104,10 @@ class RoleSync:
             await self._create_role_if_missing(conn, role)
             wanted = wanted_token_group_roles(accessible, scope)
             have = await self._token_group_memberships(conn, role)
-            for group in wanted - have:
+            for group in wanted:
                 await self._grant_membership(conn, group, role)
             for group in have - wanted:
-                await self._revoke_membership_if_present(conn, group, role)
+                await self._revoke_membership_strict(conn, group, role)
 
     async def _reconcile_token_roles(
         self, conn: asyncpg.Connection, report: ReconcileReport,
@@ -1050,6 +1145,7 @@ class RoleSync:
             for r in await conn.fetch(
                 "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_token\\_%' ESCAPE '\\'"
             )
+            if _is_catalog_role(r["rolname"], "token")
         }
         for role in wanted_roles - existing:
             try:
@@ -1082,6 +1178,8 @@ class RoleSync:
         )
         actual: dict[str, set[str]] = {}
         for r in mem_rows:
+            if not _is_catalog_role(r["token_role"], "token") or not _is_catalog_role(r["group_role"], "vault"):
+                continue
             actual.setdefault(r["token_role"], set()).add(r["group_role"])
 
         for role, uid, scope in live:
@@ -1092,11 +1190,12 @@ class RoleSync:
                     accessible = await self._fetch_user_accessible(conn, uid)
                     wanted = wanted_token_group_roles(accessible, scope)
                     have = actual.get(role, set())
-                    for group in wanted - have:
+                    for group in wanted:
                         await self._grant_membership(conn, group, role)
-                        added += 1
+                        if group not in have:
+                            added += 1
                     for group in have - wanted:
-                        await self._revoke_membership_if_present(conn, group, role)
+                        await self._revoke_membership_strict(conn, group, role)
                         removed += 1
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"token role {role} membership: {e}")
@@ -1113,11 +1212,10 @@ class RoleSync:
         structured diff that operators can inspect via
         ``GET /admin/role-state`` before triggering a reconcile.
 
-        All passes use bulk catalog queries (one `pg_roles`, one
-        `pg_auth_members`, one `information_schema.role_table_grants`)
-        so the total cost is O(catalog rows) regardless of vault count.
-        Per-table `has_table_privilege` introspection is explicitly
-        avoided.
+        Catalog membership and table-grant inventories use bulk queries.
+        Existing desired memberships also require option validation; these
+        per-edge checks add round trips proportional to the desired edges.
+        Per-table `has_table_privilege` introspection is explicitly avoided.
         """
         diff = RoleStateDiff()
         async with self.pool.acquire() as conn:
@@ -1135,12 +1233,7 @@ class RoleSync:
     ) -> None:
         rows = await conn.fetch("SELECT id FROM users")
         wanted = {user_role_name(r["id"]) for r in rows}
-        existing = {
-            r["rolname"]
-            for r in await conn.fetch(
-                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_user\\_%' ESCAPE '\\'"
-            )
-        }
+        existing = {r['rolname'] for r in await conn.fetch("SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_user\\_%' ESCAPE '\\'") if _is_catalog_role(r['rolname'], 'user')}
         diff.missing_user_roles = sorted(wanted - existing)
         diff.orphan_user_roles = sorted(existing - wanted)
 
@@ -1156,12 +1249,7 @@ class RoleSync:
         for r in rows:
             for scope in ("reader", "writer", "admin"):
                 wanted.add(vault_group_role_name(r["id"], scope))
-        existing = {
-            r["rolname"]
-            for r in await conn.fetch(
-                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_vault\\_%' ESCAPE '\\'"
-            )
-        }
+        existing = {r['rolname'] for r in await conn.fetch("SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_vault\\_%' ESCAPE '\\'") if _is_catalog_role(r['rolname'], 'vault')}
         diff.missing_vault_roles = sorted(wanted - existing)
         diff.orphan_vault_roles = sorted(existing - wanted)
 
@@ -1173,47 +1261,26 @@ class RoleSync:
         # a revoked/expired/de-scoped token whose role lingers. Per-membership
         # token drift is converged by reconcile, not surfaced here.
         rows = await conn.fetch(
-            "SELECT id FROM tokens WHERE vault_scope IS NOT NULL "
-            "AND (expires_at IS NULL OR expires_at > NOW())"
+            "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id "
+            "WHERE t.vault_scope IS NOT NULL AND u.account_status='active' "
+            "AND (t.expires_at IS NULL OR t.expires_at > NOW())"
         )
         wanted = {token_role_name(r["id"]) for r in rows}
-        existing = {
-            r["rolname"]
-            for r in await conn.fetch(
-                "SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_token\\_%' ESCAPE '\\'"
-            )
-        }
+        existing = {r['rolname'] for r in await conn.fetch("SELECT rolname FROM pg_roles WHERE rolname LIKE 'akb_token\\_%' ESCAPE '\\'") if _is_catalog_role(r['rolname'], 'token')}
         diff.missing_token_roles = sorted(wanted - existing)
         diff.orphan_token_roles = sorted(existing - wanted)
 
     async def _diff_memberships(
         self, conn: asyncpg.Connection, diff: RoleStateDiff,
     ) -> None:
-        access_rows = await conn.fetch(
-            "SELECT vault_id, user_id, role FROM vault_access"
-        )
-        # Pull current PG memberships in one go for cheaper comparison.
-        pg_mems = await conn.fetch(
-            """
-            SELECT r.rolname AS group_role, m.rolname AS member_role
-              FROM pg_auth_members am
-              JOIN pg_roles r ON r.oid = am.roleid
-              JOIN pg_roles m ON m.oid = am.member
-             WHERE r.rolname LIKE 'akb_vault\\_%' ESCAPE '\\'
-            """
-        )
-        actual = {(row["group_role"], row["member_role"]) for row in pg_mems}
-        for ar in access_rows:
-            group = vault_group_role_name(ar["vault_id"], ar["role"])
-            member = user_role_name(ar["user_id"])
-            if (group, member) not in actual:
-                diff.missing_memberships.append(
-                    {
-                        "vault_id": str(ar["vault_id"]),
-                        "user_id": str(ar["user_id"]),
-                        "scope": ar["role"],
-                    }
-                )
+        desired = await self._desired_user_memberships(conn)
+        actual = await self._actual_user_memberships(conn)
+        diff.missing_memberships.extend(desired[key] for key in sorted(desired.keys() - actual.keys()))
+        diff.stale_memberships.extend(actual[key] for key in sorted(actual.keys() - desired.keys()))
+
+        for key in sorted(desired.keys() & actual.keys()):
+            if not await self._membership_options_valid(conn, *key):
+                diff.invalid_membership_options.append(desired[key])
 
     async def _diff_public_grants(
         self, conn: asyncpg.Connection, diff: RoleStateDiff,
@@ -1233,7 +1300,7 @@ class RoleSync:
             """,
             AUTHENTICATED_ROLE,
         )
-        actual_grants = {row["group_role"] for row in auth_mems}
+        actual_grants = {row["group_role"] for row in auth_mems if _is_catalog_role(row["group_role"], "vault")}
         wanted_grants: set[str] = set()
         for r in rows:
             scope = _public_access_scope(r["public_access"])
@@ -1381,32 +1448,53 @@ class RoleSync:
         except asyncpg.exceptions.UndefinedObjectError:
             pass
 
+    async def _has_direct_membership(self, conn, group_role, member_role, *, own_grant=False) -> bool:
+        return bool(await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_auth_members am
+                  JOIN pg_roles r ON r.oid = am.roleid
+                  JOIN pg_roles m ON m.oid = am.member
+                  JOIN pg_roles g ON g.oid = am.grantor
+                 WHERE r.rolname = $1 AND m.rolname = $2
+                   AND (NOT $3::boolean OR g.rolname = current_user)
+            )
+        """, group_role, member_role, own_grant))
+
+    async def _membership_options_valid(self, conn, group_role, member_role) -> bool:
+        return not await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_auth_members am
+                  JOIN pg_roles r ON r.oid=am.roleid
+                  JOIN pg_roles m ON m.oid=am.member
+                 WHERE r.rolname=$1 AND m.rolname=$2
+                   AND (am.admin_option OR NOT am.inherit_option OR NOT am.set_option)
+            )
+        """, group_role, member_role)
+
     async def _grant_membership(
-        self,
-        conn: asyncpg.Connection,
-        group_role: str,
-        member_role: str,
+        self, conn: asyncpg.Connection, group_role: str, member_role: str,
     ) -> None:
-        """`GRANT group_role TO member_role`. Idempotent — re-grants are
-        no-ops in PG."""
-        await conn.execute(f'GRANT "{group_role}" TO "{member_role}"')
+        if not await self._has_direct_membership(conn, group_role, member_role):
+            await conn.execute(f'GRANT "{group_role}" TO "{member_role}"')
+        elif not await self._membership_options_valid(conn, group_role, member_role):
+            # Do not report a delegation-capable/disabled edge as the canonical
+            # NOADMIN/INHERIT/SET projection. Operator grantors require explicit
+            # repair rather than silent adoption into product authority.
+            raise RuntimeError("membership options differ from catalog authority")
 
     async def _revoke_membership_if_present(
-        self,
-        conn: asyncpg.Connection,
-        group_role: str,
-        member_role: str,
+        self, conn: asyncpg.Connection, group_role: str, member_role: str,
     ) -> None:
-        # Like CREATE ROLE above, contain missing membership/role errors in a
-        # subtransaction so strict lifecycle callers keep their outer TX live.
-        await conn.execute(
-            f'''DO $$
-            BEGIN
-                REVOKE "{group_role}" FROM "{member_role}";
-            EXCEPTION WHEN undefined_object OR invalid_grant_operation THEN
-                NULL;
-            END $$;'''
-        )
+        # REVOKE of a missing grant emits a WARNING rather than an exception.
+        # Check the current grantor's direct edge; unrelated operator grantors
+        # are not silently claimed removed by this helper.
+        if await self._has_direct_membership(conn, group_role, member_role, own_grant=True):
+            await conn.execute(f'REVOKE "{group_role}" FROM "{member_role}"')
+
+    async def _revoke_membership_strict(self, conn, group_role, member_role) -> None:
+        await self._revoke_membership_if_present(conn, group_role, member_role)
+        if await self._has_direct_membership(conn, group_role, member_role):
+            raise RuntimeError("membership remains under another grantor")
 
     async def _grant_table(
         self,

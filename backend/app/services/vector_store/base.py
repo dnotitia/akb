@@ -290,9 +290,16 @@ class VectorStore(Protocol):
         prefetch_per_leg: int,
         vault_ids: list[str] | None = None,
         source_types: list[str] | None = None,
+        query_sparse_epoch: int | None = None,
     ) -> list[VectorHit]:
         """Dense + sparse search, RRF-fused.
 
+        - `query_sparse_epoch` retains the vocabulary numbering through
+          same-database pgvector sparse execution. Legacy callers without an
+          epoch are accepted only at epoch zero, before any renumbering;
+          thereafter they must re-encode with `encode_query_at_epoch`.
+          External drivers and separate-database indexes cannot be compacted
+          by this maintenance command and do not use the epoch.
         - `query_text` is for driver-side debug/logging only.
         - `query_dense` may be None (embedding API unavailable) — driver
           falls back to sparse-only.
