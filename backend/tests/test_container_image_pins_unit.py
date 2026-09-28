@@ -16,6 +16,7 @@ of a digest fall out of step the first time somebody forgets one.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -111,10 +112,11 @@ def _compose_files() -> list[Path]:
     A list would go stale the first time somebody adds an overlay, and the
     reference this test exists to catch is exactly the one nobody remembered.
     """
-    files = sorted(
-        p for p in REPO.rglob("*compose*.y*ml")
-        if ".git" not in p.parts and "node_modules" not in p.parts
-    )
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z", "--", "*compose*.yaml", "*compose*.yml"],
+        cwd=REPO,
+    ).decode().split("\0")
+    files = sorted(REPO / name for name in tracked if name)
     assert files, "compose 파일을 하나도 못 찾았다"
     return files
 
@@ -150,22 +152,24 @@ def test_every_compose_reference_that_pulls_carries_a_digest():
 
 
 def test_every_stack_runs_the_same_minio():
-    """akb#621 asked for one MinIO version across development, eval and CI.
+    """Server, bucket bootstrap and bundled binaries share one mirrored artifact."""
+    import yaml
 
-    Three compose files name it, so "named once" is enforced as agreement: every
-    reference to the server is the same string, and so is every reference to the
-    client. Before the fix they had drifted into two registries, and only one of
-    them still served the image.
-    """
-    by_image: dict[str, set[str]] = {"minio/minio": set(), "minio/mc": set()}
+    refs: set[str] = set()
     for path in _compose_files():
-        for ref in re.findall(r"^\s*image:\s*(\S+)", path.read_text(), re.M):
-            for name, seen in by_image.items():
-                if re.search(rf"(^|/){re.escape(name)}[:@]", ref):
-                    seen.add(ref)
-    assert by_image["minio/minio"], "MinIO 서버 참조를 하나도 못 찾았다"
-    for name, seen in by_image.items():
-        assert len(seen) <= 1, f"{name} 참조가 스택마다 다르다: {sorted(seen)}"
+        # BaseLoader also accepts Compose overlay tags such as !reset.
+        services = yaml.load(path.read_text(), Loader=yaml.BaseLoader).get("services", {})
+        for name in ("minio", "minio-bootstrap"):
+            service = services.get(name, {})
+            if "image" in service:
+                refs.add(service["image"])
+    dockerfile = (REPO / "deploy/all-in-one/Dockerfile").read_text()
+    stage = re.search(r"^FROM (\S+) AS minio$", dockerfile, re.M)
+    assert stage, "올인원 MinIO stage가 없다"
+    refs.add(stage.group(1))
+    assert len(refs) == 1, f"MinIO 참조가 스택마다 다르다: {sorted(refs)}"
+    assert re.fullmatch(r"icr\.io/fusion-open/minio/minio@sha256:[0-9a-f]{64}", refs.pop())
+    assert "COPY --from=minio /usr/bin/mc /usr/local/bin/mc" in dockerfile
 
 
 def test_the_compose_install_paths_build_the_extension_image():
