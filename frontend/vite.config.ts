@@ -3,6 +3,7 @@ import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { filePreviewDiscovery } from "./src/mocks/file-preview-fixtures.ts";
 
 // Dev proxy target — the local backend started by docker-compose unless an
 // isolated repository runtime supplies its per-run backend origin.
@@ -14,6 +15,7 @@ const mockScenario = [
   "document-edit-recovery",
   "markdown-reference-adapters",
   "markdown-image-rendering",
+  "file-preview",
 ].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
@@ -303,7 +305,9 @@ function mockDescriptor(origin: string) {
               },
             },
           }
-      : null;
+      : mockScenario === "file-preview"
+        ? filePreviewDiscovery(origin)
+        : null;
   return {
     schema_version: 2,
     status: "ready",

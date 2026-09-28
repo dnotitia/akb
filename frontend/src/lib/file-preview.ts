@@ -3,6 +3,7 @@ export function filePreviewKind(mime: string): string {
   if (mime === "application/pdf") return "pdf";
   if (mime === "application/json") return "json";
   if (mime === "text/html") return "html";
+  if (mime === "application/yaml") return "text";
   if (mime.startsWith("text/")) return "text";
   return "binary";
 }

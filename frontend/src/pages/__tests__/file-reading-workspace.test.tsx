@@ -15,9 +15,6 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getVaultInfo: vi.fn(),
   browseVault: vi.fn(async () => ({ items: [] })),
 }));
-vi.mock("@/components/file-viewer", () => ({
-  FilePreviewBody: ({ name }: { name: string }) => <p>Preview of {name}</p>,
-}));
 
 const fileFetch = vi.mocked(authenticatedFetch);
 const vaultInfo = vi.mocked(getVaultInfo);
@@ -72,7 +69,10 @@ beforeEach(() => {
     ? response({ name: firstFile.name, download_url: "https://files.example/first" })
     : response(firstFile));
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("file reading workspace", () => {
   it("publishes resolved location and keeps metadata in the labelled Info disclosure", async () => {
@@ -133,5 +133,56 @@ describe("file reading workspace", () => {
     expect(await screen.findByText("File not found in vault.")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("No resource"));
     expect(screen.queryByRole("link", { name: "Download file" })).not.toBeInTheDocument();
+  });
+
+  it("renders an application/yaml file through the existing text preview without parsing it", async () => {
+    const file = {
+      ...firstFile,
+      name: "deployment.yaml",
+      mime_type: "application/yaml",
+      size_bytes: 94,
+    };
+    const raw = "# Synthetic settings\nservice:\n  message: 'keep: spaces'\n  labels: [unfinished\n";
+    fileFetch.mockImplementation((path) => String(path).endsWith("/download")
+      ? response({
+          name: file.name,
+          download_url: "https://files.example/deployment.yaml",
+          mime_type: "application/octet-stream",
+        })
+      : response(file));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      text: async () => raw,
+    } as Response));
+
+    const { container } = render(<FileHarness />);
+    expect(await screen.findByRole("link", { name: "Download file" })).toHaveAttribute(
+      "href",
+      "https://files.example/deployment.yaml",
+    );
+    await waitFor(() => expect(container.querySelector("pre")?.textContent).toBe(raw));
+    expect(screen.queryByText("Preview unavailable")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "File preview" })).toContainElement(
+      container.querySelector("pre"),
+    );
+  });
+
+  it.each([
+    { name: "missing-type.yaml", mime_type: undefined },
+    { name: "generic-type.yml", mime_type: "application/octet-stream" },
+  ])("infers a text preview for $name from its YAML extension", async ({ name, mime_type }) => {
+    const file = { ...firstFile, name, mime_type };
+    const raw = "# Inferred synthetic settings\nservice:\n  mode: plain\n";
+    fileFetch.mockImplementation((path) => String(path).endsWith("/download")
+      ? response({ name, download_url: "https://files.example/inferred-yaml" })
+      : response(file));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      text: async () => raw,
+    } as Response));
+
+    const { container } = render(<FileHarness />);
+    await screen.findByRole("link", { name: "Download file" });
+    await waitFor(() => expect(container.querySelector("pre")?.textContent).toBe(raw));
+    expect(screen.getByText("Text")).toBeInTheDocument();
+    expect(screen.queryByText("Preview unavailable")).not.toBeInTheDocument();
   });
 });
