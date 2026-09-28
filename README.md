@@ -291,8 +291,8 @@ authority before the application starts. Docker Compose 2.24.4+ is required.
 Configure an OpenAI-compatible embedding endpoint for dense search; pgvector
 and Qdrant degrade to BM25-only lexical search when embedding is unavailable.
 
-MinIO uses the [IBM mirror](https://www.ibm.com/support/pages/node/7289585)
-with the original upstream server digest pinned after the Quay image removal.
+MinIO uses a mirror with the original upstream server digest pinned after
+the Quay image removal.
 Local, evaluation, CI, and all-in-one builds use the same artifact; bucket
 bootstrap and all-in-one builds use the `mc` bundled in that server image.
 
