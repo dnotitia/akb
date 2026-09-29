@@ -1,4 +1,4 @@
-import { useRef, useState, type CSSProperties } from "react";
+import { useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getMe } from "@/lib/api";
@@ -10,17 +10,9 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId } from "@/lib/document-preview-navigation";
-import { isModalOpen } from "@/lib/modal-visibility";
-
-function readWorkspaceLeftOffset() {
-  if (typeof document === "undefined" || typeof window === "undefined") return 32;
-  if (!window.matchMedia("(min-width: 1024px)").matches) return 16;
-
-  const navigation = document.getElementById("vault-workspace-navigation");
-  if (!navigation) return 32;
-  return Math.max(32, Math.round(navigation.getBoundingClientRect().right + 16));
-}
+import { X } from "lucide-react";
+import { DocumentPreviewEditorContext, type PreviewEditorSession } from "@/contexts/document-preview-editor-context";
+import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
 
 /**
  * Route-backed reading surface launched by search results or notifications. The background
@@ -30,12 +22,13 @@ function readWorkspaceLeftOffset() {
 export function DocumentPreviewDialog() {
   const navigate = useNavigate();
   const location = useLocation();
-  const user = useQuery({ queryKey: ["document-preview-user", location.key], queryFn: () => getMe(), retry: false });
+  // Read/Edit changes replace the history entry. Do not reset the identity
+  // provider (and its editor/draft/scroll state) for every mode change.
+  const sessionKey = useRef(location.key);
+  const user = useQuery({ queryKey: ["document-preview-user", sessionKey.current], queryFn: () => getMe(), retry: false });
   const contentRef = useRef<HTMLDivElement | null>(null);
   const closingRef = useRef(false);
-  const [desktopLeftOffset] = useState(readWorkspaceLeftOffset);
-  const returnFocusId = documentPreviewReturnFocusId(location);
-  const returnFocusFallbackId = documentPreviewReturnFocusFallbackId(location);
+  const editorSessionRef = useRef<PreviewEditorSession | null>(null);
 
   function closePreview() {
     // Radix can report the same outside interaction through both the overlay
@@ -45,28 +38,35 @@ export function DocumentPreviewDialog() {
     navigate(-1);
   }
 
+  function requestClose() {
+    if (editorSessionRef.current) editorSessionRef.current.requestExit(closePreview);
+    else closePreview();
+  }
+
   return (
     <Dialog
       open
-      onOpenChange={(open) => {
-        if (!open) closePreview();
-      }}
+      // Native file-picker focus transitions can request false. Only explicit
+      // close, Escape, or a reading-mode backdrop click may dismiss this route.
+      onOpenChange={() => {}}
     >
       <DialogContent
         ref={contentRef}
+        hideClose
         data-testid="document-preview-dialog"
-        className="flex h-dvh max-h-none w-full max-w-none flex-col gap-0 !overflow-hidden rounded-none border-0 p-0 sm:h-[calc(100dvh-1rem)] sm:w-[calc(100%-1rem)] sm:rounded-[var(--radius-xl)] sm:border lg:left-[min(var(--document-preview-left),calc(100vw-57rem))] lg:right-8 lg:h-[calc(100dvh-4rem)] lg:w-auto lg:translate-x-0"
-        style={
-          {
-            "--document-preview-left": `${desktopLeftOffset}px`,
-          } as CSSProperties
-        }
+        className="document-preview-surface flex max-h-none max-w-none flex-col gap-0 !overflow-hidden rounded-none border-0 p-0 sm:rounded-[var(--radius-xl)] sm:border"
         overlayProps={{
           className: "cursor-pointer",
           onClick: (event) => {
             if (event.target !== event.currentTarget) return;
-            closePreview();
+            if (!editorSessionRef.current) requestClose();
           },
+        }}
+        onInteractOutside={(event) => event.preventDefault()}
+        onEscapeKeyDown={(event) => {
+          event.preventDefault();
+          if (editorSessionRef.current?.dismissMenu()) return;
+          requestClose();
         }}
         onOpenAutoFocus={(event) => {
           event.preventDefault();
@@ -74,21 +74,22 @@ export function DocumentPreviewDialog() {
         }}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
-          if (!closingRef.current || !returnFocusId) return;
-          // Navigation can commit later than a fixed number of frames. Wait
-          // until the dialog's focus scope actually releases the background.
-          window.requestAnimationFrame(() => {
-            if (isModalOpen()) return;
-            (document.getElementById(returnFocusId) ??
-              (returnFocusFallbackId ? document.getElementById(returnFocusFallbackId) : null))?.focus({ preventScroll: true });
-          });
+          // AppRoutes restores the committed source entry after this focus
+          // scope releases, including history Back and resumed quick search.
         }}
       >
         <DialogTitle className="sr-only">Document preview</DialogTitle>
         <DialogDescription className="sr-only">
           Read this document without leaving the page you opened it from.
         </DialogDescription>
-        <CurrentUserProvider user={user.data ?? null}><DocumentPage presentation="preview" /></CurrentUserProvider>
+        <button type="button" aria-label="Close dialog" onClick={requestClose} className="absolute right-2 top-2 inline-flex h-9 w-9 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-colors hover:bg-surface-hover hover:text-foreground focus-ring-instant">
+          <X className="h-4 w-4" aria-hidden />
+        </button>
+        <DocumentPreviewEditorContext.Provider value={editorSessionRef}>
+          <ResourceNavigationProvider>
+            <CurrentUserProvider user={user.data ?? null}><DocumentPage presentation="preview" /></CurrentUserProvider>
+          </ResourceNavigationProvider>
+        </DocumentPreviewEditorContext.Provider>
       </DialogContent>
     </Dialog>
   );

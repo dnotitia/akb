@@ -30,6 +30,19 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
 
+const baseDetails = {
+  summary: "Original summary",
+  type: "future-type",
+  domain: "engineering",
+  tags: ["original"],
+  status: "future-status",
+};
+const details = {
+  ...baseDetails,
+  summary: "Local summary",
+  tags: ["original", "local"],
+};
+
 function draft(overrides: Partial<DocumentEditDraftInput> = {}): DocumentEditDraftInput {
   return {
     draftId: "draft-1",
@@ -62,6 +75,71 @@ afterEach(() => {
 });
 
 describe("existing-document draft storage", () => {
+  it("round-trips both detail snapshots, including unknown server type and status values", () => {
+    expect(saveDocumentEditDraft(draft({ baseDetails, details }))).toBe(true);
+
+    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1")).toMatchObject({
+      status: "restored",
+      draft: { baseDetails, details, baseBody: "Original body", body: "Local body" },
+    });
+  });
+
+  it("restores legacy body/title drafts without inventing metadata snapshots", () => {
+    expect(saveDocumentEditDraft(draft())).toBe(true);
+
+    const result = loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1");
+    expect(result.status).toBe("restored");
+    if (result.status !== "restored") throw new Error("Expected a restored legacy draft");
+    expect(result.draft).not.toHaveProperty("baseDetails");
+    expect(result.draft).not.toHaveProperty("details");
+    expect(result.draft.body).toBe("Local body");
+  });
+
+  it.each([
+    { details },
+    { baseDetails },
+    { baseDetails: null, details },
+    { baseDetails, details: null },
+    { baseDetails, details: { ...details, tags: "local" } },
+    { baseDetails: { ...baseDetails, tags: [1] }, details },
+    { baseDetails, details: { ...details, status: 123 } },
+    { baseDetails, details: { summary: "Incomplete" } },
+  ])("keeps malformed or unpaired details copyable: %j", (metadata) => {
+    const key = documentEditDraftStorageKey(USER, VAULT, DOCUMENT, "tab-1", "draft-1");
+    const stored = {
+      ...draft(),
+      ...metadata,
+      version: 2,
+      kind: "document-edit",
+      updatedAt: at(0),
+      expiresAt: at(HOUR),
+    };
+    const raw = JSON.stringify(stored);
+    window.localStorage.setItem(key, raw);
+
+    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1")).toMatchObject({
+      status: "incompatible",
+      draft: { copyTitle: "Local title", copyBody: "Local body", raw: stored },
+    });
+    expect(window.localStorage.getItem(key)).toBe(raw);
+  });
+
+  it("keeps detail drafts isolated by account and tab and retains attachment expiry", () => {
+    saveDocumentEditDraft(draft({ baseDetails, details }));
+    saveDocumentEditDraft(draft({
+      draftId: "draft-2", tabId: "tab-2", baseDetails,
+      details: { ...details, summary: "Other tab summary" },
+    }));
+
+    expect(loadDocumentEditDraft("other-user", VAULT, DOCUMENT, "tab-1")).toEqual({ status: "none" });
+    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-1")).toMatchObject({
+      status: "restored", draft: { details: { summary: "Local summary" }, expiresAt: at(HOUR) },
+    });
+    expect(loadDocumentEditDraft(USER, VAULT, DOCUMENT, "tab-2", new Date(NOW + HOUR))).toMatchObject({
+      status: "expired", draft: { details: { summary: "Other tab summary" }, assetIds: ["asset-1"] },
+    });
+  });
+
   it("isolates drafts by user, vault, document, and tab without overwriting another tab", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-09T00:00:00.000Z"));

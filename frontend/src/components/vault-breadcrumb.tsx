@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { Box, type LucideIcon } from "lucide-react";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { cn } from "@/lib/utils";
+import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 
 /** Shared location grammar for Vault pages and their resource readers. */
 export function VaultBreadcrumb({
@@ -17,8 +18,18 @@ export function VaultBreadcrumb({
   className?: string;
   ariaLabel?: string;
 }) {
+  const { requestNavigation } = useResourceNavigation();
   return (
-    <nav aria-label={ariaLabel} className={cn("@container/resource-location min-w-0 text-sm", className)}>
+    <nav aria-label={ariaLabel} className={cn("@container/resource-location min-w-0 text-sm", className)}
+      onClickCapture={(event) => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+        const anchor = (event.target as HTMLElement).closest<HTMLAnchorElement>("a[href]");
+        if (!anchor || anchor.target === "_blank" || anchor.origin !== window.location.origin) return;
+        if (!requestNavigation(`${anchor.pathname}${anchor.search}${anchor.hash}`)) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      }}>
       <ol className="flex min-w-0 items-center gap-1.5">
         <li className="flex min-w-0 max-w-[30%] items-center">
           <Link

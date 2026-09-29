@@ -100,7 +100,7 @@ export function DocumentView({
   }
 
   if (isLoading) {
-    return <DocumentViewLoading appearance={appearance} />;
+    return <DocumentViewLoading appearance={appearance} bodyOnly={bodyOnly} readingWidth={readingWidth} />;
   }
 
   if (error || !doc) {
@@ -118,6 +118,7 @@ export function DocumentView({
     <section
       aria-label="Document content"
       className={cn(
+        fileAppearance && "document-reading-container",
         fileAppearance && !bodyOnly &&
           "overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
       )}
@@ -147,7 +148,7 @@ export function DocumentView({
           aria-labelledby={`${idPrefix}-tab-rendered`}
           className={cn(
             "min-w-0",
-            fileAppearance && (bodyOnly ? "px-4 py-5 sm:px-6" : "px-5 py-7 sm:px-8 sm:py-9 lg:px-10"),
+            fileAppearance && "document-reading-inset",
           )}
           style={{ maxWidth: "100%" }}
         >
@@ -169,7 +170,7 @@ export function DocumentView({
           aria-labelledby={`${idPrefix}-tab-raw`}
           className={cn(
             "relative",
-            fileAppearance && "bg-surface p-4 sm:p-6",
+            fileAppearance && "document-reading-inset bg-surface",
           )}
         >
           {!fileAppearance && !bodyOnly && (
@@ -187,7 +188,7 @@ export function DocumentView({
             className={cn(
               "font-mono text-[13px] leading-[1.65] whitespace-pre-wrap overflow-x-auto",
               fileAppearance
-                ? "m-0 wrap-anywhere text-foreground"
+                ? cn("document-reading-source m-0 wrap-anywhere text-foreground", readingWidth === "wide" && "document-reading-wide")
                 : "bg-surface-muted p-4 border border-border rounded-[var(--radius-lg)]",
             )}
           >
@@ -199,29 +200,32 @@ export function DocumentView({
   );
 }
 
-function DocumentViewLoading({ appearance }: { appearance: "plain" | "file" }) {
+function DocumentViewLoading({ appearance, bodyOnly, readingWidth }: Pick<DocumentViewProps, "appearance" | "bodyOnly" | "readingWidth">) {
   return (
     <LoadingState
       label="Loading document body"
       className={cn(
-        appearance === "file" &&
+        appearance === "file" && "document-reading-container",
+        appearance === "file" && !bodyOnly &&
           "min-h-[28rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
       )}
     >
       <div className={cn(appearance !== "file" && "py-4")}>
-        <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
+        {!bodyOnly && <div className="flex min-h-11 items-center gap-2 border-b border-border bg-surface-2/60 px-3">
           <Skeleton className="h-7 w-24 rounded-[var(--radius-sm)]" />
           <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
           <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
-        </div>
-        <div className="mx-auto max-w-4xl space-y-4 px-5 py-8 sm:px-8 lg:px-12">
-          <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
-          <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
-          <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
-          <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
-          <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
-          <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
-          <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+        </div>}
+        <div className={appearance === "file" ? "document-reading-inset" : "mx-auto max-w-4xl px-5 py-8 sm:px-8 lg:px-12"}>
+          <div className={cn("space-y-4", appearance === "file" && "document-reading-source", readingWidth === "wide" && "document-reading-wide")}>
+            <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
+            <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-4 w-4/5 rounded-[var(--radius-sm)]" />
+            <Skeleton className="mt-7 h-6 w-2/5 rounded-[var(--radius-md)]" />
+            <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
+            <Skeleton className="h-4 w-5/6 rounded-[var(--radius-sm)]" />
+          </div>
         </div>
       </div>
     </LoadingState>

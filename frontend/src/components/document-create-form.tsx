@@ -12,7 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { ApiError, getDocument, putDocument } from "@/lib/api";
-import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import type { DocType } from "@/lib/doc-constants";
 import {
   clearDocumentDraft,
   loadDocumentDraft,
@@ -23,15 +23,14 @@ import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
+import { DocumentAuthoringLayout } from "@/components/document-authoring-layout";
+import { DocumentDetailsFields } from "@/components/document-details-fields";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SelectMenu } from "@/components/ui/select-menu";
-import { TagInput } from "@/components/ui/tag-input";
-import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
   documentTitleConflictFromError,
@@ -439,73 +438,17 @@ export function DocumentCreateForm({
         </div>
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain rail-scroll @[52rem]:overflow-hidden">
-        <div className="grid min-h-full grid-cols-1 @[52rem]:h-full @[52rem]:min-h-0 @[52rem]:grid-cols-[minmax(0,1fr)_18rem] @[72rem]:grid-cols-[minmax(0,1fr)_20rem]">
-          <main className={cn("min-h-0 min-w-0 bg-surface @[52rem]:overflow-y-auto @[52rem]:overscroll-contain @[52rem]:rail-scroll", invalidField === "body" && "ring-1 ring-inset ring-destructive")} aria-label="Document composition" data-testid="composer-writing-surface">
-            <div className="border-b border-border">
-              <div className="space-y-1.5 px-4 py-4 sm:px-6">
-                <Label htmlFor="doc-title" className="text-xs text-foreground-muted">
-                  Title <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="doc-title"
-                  ref={titleRef}
-                  value={title}
-                  onChange={(event) => {
-                    setTitle(event.target.value);
-                    setServerConflict(null);
-                    if (invalidField === "title") setInvalidField(null);
-                  }}
-                  placeholder="Document title"
-                  className="h-11 rounded-[var(--radius-sm)] border-0 bg-transparent px-0 text-xl font-semibold shadow-none sm:text-2xl"
-                  maxLength={256}
-                  required
-                  aria-required="true"
-                  aria-invalid={invalidField === "title" || undefined}
-                  aria-describedby={error ? "document-create-error" : undefined}
-                  disabled={creating}
-                  autoFocus
-                />
-              </div>
-            </div>
-            <section id="document-create-body">
-              <Label id="doc-body-label" className="sr-only">Content (required)</Label>
-              <Suspense fallback={<MarkdownEditorFallback />}>
-                <MarkdownEditor
-                  value={body}
-                  onChange={(markdown, assetIds) => {
-                    setBody(markdown);
-                    setBodyAssetIds(assetIds);
-                    setServerConflict(null);
-                    if (invalidField === "body") setInvalidField(null);
-                  }}
-                  onAssetExpirationsChange={(expirations) => {
-                    setBodyAssetExpirations(expirations);
-                    onAssetExpirationsChange?.(expirations);
-                  }}
-                  onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
-                  placeholder="Write something worth keeping…"
-                  ariaLabelledby="doc-body-label"
-                  required
-                  readOnly={creating}
-                  vault={vault}
-                  appearance="workspace"
-                  className="!px-4 !text-base sm:!px-6"
-                  sourceClassName="block !px-4 sm:!px-6"
-                  onUploadingChange={(uploading) => {
-                    setUploadingImage(uploading);
-                    if (uploading) setClaimedAssetIds(null);
-                  }}
-                  onSlashOpenChange={onSlashOpenChange}
-                  initialUnclaimedAssetIds={restoredDraft?.assetIds}
-                  initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
-                  preserveUploadsOnUnmount
-                  claimedAssetIds={claimedAssetIds}
-                />
-              </Suspense>
-            </section>
-          </main>
-          <aside id="document-properties" aria-labelledby="document-details-heading" className="min-h-0 min-w-0 border-t border-border bg-surface @[52rem]:overflow-y-auto @[52rem]:overscroll-contain @[52rem]:border-l @[52rem]:border-t-0 @[52rem]:rail-scroll">
+      <DocumentAuthoringLayout
+        writingAs="main"
+        writingProps={{
+          className: cn(invalidField === "body" && "ring-1 ring-inset ring-destructive"),
+          "aria-label": "Document composition",
+          "data-testid": "composer-writing-surface",
+        }}
+        detailsId="document-properties"
+        detailsHeadingId="document-details-heading"
+        details={(
+          <>
             <div className="border-b border-border px-4 py-3">
               <h2 id="document-details-heading" className="text-sm font-semibold">Document details</h2>
             </div>
@@ -532,27 +475,85 @@ export function DocumentCreateForm({
               </div>
               <div className="space-y-4 border-t border-border pt-4">
                 <p className="text-xs text-foreground-muted">Optional context for search and agents.</p>
-                <div className="space-y-1.5">
-                  <Label htmlFor="doc-summary">Summary</Label>
-                  <Textarea id="doc-summary" value={summary} onChange={(event) => setSummary(event.target.value)} rows={4} maxLength={500} placeholder="What does this document cover?" />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="doc-type">Document type</Label>
-                  <SelectMenu id="doc-type" aria-label="Document type" value={type} onValueChange={(value) => setType(value as DocType)} options={DOC_TYPES.map(item => ({ value: item, label: item }))} disabled={creating} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="doc-domain">Domain</Label>
-                  <Input id="doc-domain" value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="e.g. engineering" />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="doc-tags">Tags</Label>
-                  <TagInput id="doc-tags" value={tags} onChange={setTags} />
-                </div>
+                <DocumentDetailsFields
+                  value={{ summary, type, domain, tags, status: "active" }}
+                  onChange={(details) => {
+                    setSummary(details.summary);
+                    setType(details.type as DocType);
+                    setDomain(details.domain);
+                    setTags(details.tags);
+                  }}
+                  idPrefix="doc"
+                  disabled={creating}
+                />
               </div>
             </fieldset>
-          </aside>
+          </>
+        )}
+      >
+        <div className="border-b border-border">
+          <div className="space-y-1.5 px-4 py-4 sm:px-6">
+            <Label htmlFor="doc-title" className="text-xs text-foreground-muted">
+              Title <span className="text-destructive">*</span>
+            </Label>
+            <Input
+              id="doc-title"
+              ref={titleRef}
+              value={title}
+              onChange={(event) => {
+                setTitle(event.target.value);
+                setServerConflict(null);
+                if (invalidField === "title") setInvalidField(null);
+              }}
+              placeholder="Document title"
+              className="h-11 rounded-[var(--radius-sm)] border-0 bg-transparent px-0 text-xl font-semibold shadow-none sm:text-2xl"
+              maxLength={256}
+              required
+              aria-required="true"
+              aria-invalid={invalidField === "title" || undefined}
+              aria-describedby={error ? "document-create-error" : undefined}
+              disabled={creating}
+              autoFocus
+            />
+          </div>
         </div>
-      </div>
+        <section id="document-create-body">
+          <Label id="doc-body-label" className="sr-only">Content (required)</Label>
+          <Suspense fallback={<MarkdownEditorFallback />}>
+            <MarkdownEditor
+              value={body}
+              onChange={(markdown, assetIds) => {
+                setBody(markdown);
+                setBodyAssetIds(assetIds);
+                setServerConflict(null);
+                if (invalidField === "body") setInvalidField(null);
+              }}
+              onAssetExpirationsChange={(expirations) => {
+                setBodyAssetExpirations(expirations);
+                onAssetExpirationsChange?.(expirations);
+              }}
+              onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
+              placeholder="Write something worth keeping…"
+              ariaLabelledby="doc-body-label"
+              required
+              readOnly={creating}
+              vault={vault}
+              appearance="workspace"
+              className="!px-4 !text-base sm:!px-6"
+              sourceClassName="block !px-4 sm:!px-6"
+              onUploadingChange={(uploading) => {
+                setUploadingImage(uploading);
+                if (uploading) setClaimedAssetIds(null);
+              }}
+              onSlashOpenChange={onSlashOpenChange}
+              initialUnclaimedAssetIds={restoredDraft?.assetIds}
+              initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
+              preserveUploadsOnUnmount
+              claimedAssetIds={claimedAssetIds}
+            />
+          </Suspense>
+        </section>
+      </DocumentAuthoringLayout>
       <footer className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-border bg-surface px-4 py-2 text-xs text-foreground-muted">
         <span className="flex min-w-0 items-center gap-1.5" role="status" aria-live="polite">
           {uploadingImage && <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden />}

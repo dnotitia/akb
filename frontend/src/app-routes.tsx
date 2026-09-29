@@ -1,4 +1,4 @@
-import type { ComponentType } from "react";
+import { useEffect, useRef, type ComponentType } from "react";
 import {
   Navigate,
   Route,
@@ -36,7 +36,8 @@ import {
   type AppRouteBoundary,
   type AppRouteComponentName,
 } from "@/app-route-contract";
-import { documentPreviewBackground } from "@/lib/document-preview-navigation";
+import { documentPreviewBackground, documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId, notifyDocumentPreviewClosed } from "@/lib/document-preview-navigation";
+import { isModalOpen } from "@/lib/modal-visibility";
 
 // Old /vault/:name/skill URLs redirect to the guide editor in vault settings —
 // the vault guide is system-managed and has no plain-viewer surface.
@@ -85,6 +86,25 @@ function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
 export function AppRoutes() {
   const location = useLocation();
   const backgroundLocation = documentPreviewBackground(location);
+  const previousPreview = useRef<typeof location | null>(null);
+
+  useEffect(() => {
+    const previous = previousPreview.current;
+    previousPreview.current = documentPreviewBackground(location) ? location : null;
+    const background = previous && documentPreviewBackground(previous);
+    // Restore only after the router committed a return to the exact launching
+    // entry. This handles X and native Back without relying on window URLs
+    // (MemoryRouter/embedded hosts), and excludes explicit page promotion.
+    if (!previous || !background || documentPreviewBackground(location) || background.key !== location.key) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (isModalOpen() || notifyDocumentPreviewClosed(previous)) return;
+      const focusId = documentPreviewReturnFocusId(previous);
+      const fallbackId = documentPreviewReturnFocusFallbackId(previous);
+      ((focusId ? document.getElementById(focusId) : null) ??
+        (fallbackId ? document.getElementById(fallbackId) : null))?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [location]);
 
   return (
     <>

@@ -1,12 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
+import { Box, FileText, Paperclip, Table2, type LucideIcon } from "lucide-react";
 import { LoadingState } from "@/components/ui/loading-state";
 import { getWorkspaceSummary, validCount, WorkspaceSummaryAccessDenied, type WorkspaceCountField } from "@/lib/workspace-summary";
+import { cn } from "@/lib/utils";
 
-const metrics: { field: WorkspaceCountField; label: string }[] = [
-  { field: "vault_count", label: "Vaults" },
-  { field: "document_count", label: "Documents" },
-  { field: "table_count", label: "Tables" },
-  { field: "file_count", label: "Files" },
+const metrics: { field: WorkspaceCountField; label: string; icon: LucideIcon; tone: string }[] = [
+  { field: "vault_count", label: "Vaults", icon: Box, tone: "text-cat-1" },
+  { field: "document_count", label: "Documents", icon: FileText, tone: "text-cat-1" },
+  { field: "table_count", label: "Tables", icon: Table2, tone: "text-cat-3" },
+  { field: "file_count", label: "Files", icon: Paperclip, tone: "text-cat-4" },
 ];
 
 export function HomeWorkspaceSummary({ userId, directoryKey, vaultCount, directoryLoading }: {
@@ -35,23 +37,26 @@ export function HomeWorkspaceSummary({ userId, directoryKey, vaultCount, directo
   const shown = totalVaults === 0 ? metrics.slice(0, 1) : metrics;
   const values = { ...snapshot, vault_count: totalVaults };
   const unavailable = !loading && shown.some(({ field }) => !validCount(values[field]));
+  const summary = <dl className="grid w-full max-w-2xl grid-cols-2 gap-x-4 gap-y-4 sm:grid-cols-4 sm:gap-x-6">
+    {(loading ? metrics : shown).map(({ field, label, icon: Icon, tone }, index) => <div key={field} className={cn(
+      "min-w-0 border-border",
+      index % 2 === 1 && "border-l pl-4 sm:pl-6",
+      index === 2 && "sm:border-l sm:pl-6",
+    )}>
+      <dt className="flex items-center gap-2 text-sm leading-5 text-foreground-muted">
+        <Icon className={cn("h-4 w-4 shrink-0", tone)} aria-hidden />
+        <span className="min-w-0 break-words">{label}</span>
+      </dt>
+      <dd className="mt-1 min-h-7 text-xl font-semibold leading-7 tracking-tight wrap-anywhere tabular-nums text-foreground" aria-label={!loading && !validCount(values[field]) ? "Unavailable" : undefined}>
+        {loading ? <span className="my-1 block h-5 w-12 rounded-[var(--radius-xs)] bg-surface-2" />
+          : validCount(values[field]) ? values[field].toLocaleString() : "—"}
+      </dd>
+    </div>)}
+  </dl>;
 
-  return <section aria-label="Workspace summary" className="mb-5 flex flex-wrap items-baseline gap-x-6 gap-y-2">
+  return <section aria-label="Workspace summary" className="mb-6 space-y-3">
     <span className="sr-only">Resources in vaults you can access.</span>
-    {loading ? <LoadingState label="Loading workspace totals">
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-6">
-        {metrics.map(({ field, label }) => <span key={field} className="inline-flex items-baseline gap-1.5 text-sm text-foreground-muted"><span className="h-4 w-8 self-center rounded-[var(--radius-sm)] bg-surface-2" />{label}</span>)}
-      </div>
-    </LoadingState> : <>
-      <dl className="grid grid-cols-2 gap-x-6 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-6">
-        {shown.map(({ field, label }) => <div key={field} className="flex items-baseline gap-1.5">
-          <dt className="order-2 text-sm text-foreground-muted">{label}</dt>
-          <dd className="text-base font-semibold tabular-nums text-foreground" aria-label={validCount(values[field]) ? undefined : "Unavailable"}>
-            {validCount(values[field]) ? values[field].toLocaleString() : "—"}
-          </dd>
-        </div>)}
-      </dl>
-      {unavailable && <span className="text-xs text-foreground-muted" title="Complete workspace totals are unavailable. You can still open your vaults and documents.">Totals unavailable</span>}
-    </>}
+    {loading ? <LoadingState label="Loading workspace totals">{summary}</LoadingState> : summary}
+    {unavailable && <p className="text-xs text-foreground-muted" title="Complete workspace totals are unavailable. You can still open your vaults and documents.">Totals unavailable</p>}
   </section>;
 }

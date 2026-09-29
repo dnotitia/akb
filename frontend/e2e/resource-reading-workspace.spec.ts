@@ -177,20 +177,32 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await page.screenshot({ path: testInfo.outputPath("vault-search-results.png") });
     const scope = panel.getByRole("button", { name: "Search scope: fixture", exact: true });
     await scope.click();
-    await expect(page.getByRole("menuitemradio", { name: /fixture/ })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByRole("menuitemcheckbox", { name: /fixture/ })).toHaveAttribute("aria-checked", "true");
     await page.keyboard.press("Escape");
     await expect(panel).toBeVisible();
     await expect(scope).toBeFocused();
     await scope.click();
     const expandedRequest = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/search") && !new URL(request.url()).searchParams.has("vault"));
-    await page.getByRole("menuitemradio", { name: /All vaults/ }).click();
+    await page.getByRole("menuitem", { name: "All vaults", exact: true }).click();
     await expandedRequest;
     const allInput = panel.getByRole("combobox", { name: "Search all accessible vaults", exact: true });
     await expect(allInput).toHaveValue("reading");
     await expect(panel.getByRole("option").first()).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("all-vault-search-results.png") });
     await panel.getByRole("button", { name: "Search scope: All vaults", exact: true }).click();
-    await page.getByRole("menuitemradio", { name: /fixture/ }).click();
+    const narrowedRequest = page.waitForRequest(request => {
+      const url = new URL(request.url());
+      return url.pathname.endsWith("/search") && url.searchParams.getAll("vault").join(",") === "fixture";
+    });
+    const fixtureOption = page.getByRole("menuitemcheckbox", { name: /fixture/ });
+    await fixtureOption.click();
+    await narrowedRequest;
+    await expect(fixtureOption).toHaveAttribute("aria-checked", "true");
+    const menu = page.getByRole("menu", { name: /^Search scope:/ });
+    await expect(menu).toBeVisible();
+    await menu.getByRole("menuitem", { name: "Done", exact: true }).click();
+    await expect(menu).toHaveCount(0);
+    await expect(scope).toBeFocused();
     await expect(input).toHaveValue("reading");
     await expect(panel.getByRole("option").first()).toBeVisible();
     await input.press("Enter");
@@ -200,6 +212,11 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await page.keyboard.press("Escape");
     await expect(preview).toHaveCount(0);
     await expect(page).toHaveURL(/\/vault\/fixture\/members$/);
+    await expect(panel).toBeVisible();
+    await expect(input).toHaveValue("reading");
+    await expect(input).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
     await expect(trigger).toBeFocused();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
@@ -211,7 +228,7 @@ for (const scenario of [
   { width: 1440, height: 900, dark: true, route: "/vault/fixture/members" },
   { width: 667, height: 375, dark: false, route: "/vault/fixture/members" },
   { width: 1440, height: 900, dark: false, route: "/" },
-]) test(`quick search selects another accessible Vault at ${scenario.width}x${scenario.height} ${scenario.dark ? "dark" : "light"} from ${scenario.route}`, async ({ page }, testInfo) => {
+]) test(`quick search adds an accessible Vault without dropping selected scopes at ${scenario.width}x${scenario.height} ${scenario.dark ? "dark" : "light"} from ${scenario.route}`, async ({ page }, testInfo) => {
   await page.setViewportSize({ width: scenario.width, height: scenario.height });
   await fixture(page, scenario.dark);
   await page.route("**/api/v1/my/vaults", route => route.fulfill({ json: { vaults: [
@@ -227,6 +244,7 @@ for (const scenario of [
   await query.fill("reading");
   await panel.getByRole("button", { name: "Documents", exact: true }).click();
   await panel.getByRole("button", { name: /^Search scope:/ }).click();
+  // Radix labels the menu through its trigger, including the current selection.
   const menu = page.getByRole("menu", { name: /^Search scope:/ });
   const filter = menu.getByRole("searchbox", { name: "Filter vaults" });
   await expect(filter).toBeFocused();
@@ -235,28 +253,44 @@ for (const scenario of [
   await filter.fill("missing-vault");
   await expect(menu.getByText("No vaults match this filter.")).toBeVisible();
   await filter.fill("beta");
-  await expect(menu.getByRole("menuitemradio", { name: "팀-beta", exact: true })).toBeVisible();
+  const betaOption = menu.getByRole("menuitemcheckbox", { name: "팀-beta", exact: true });
+  await expect(betaOption).toBeVisible();
+  await expect(betaOption).toHaveAttribute("aria-checked", "false");
   await filter.press("ArrowUp");
-  await expect(menu.getByRole("menuitemradio", { name: "팀-beta", exact: true })).toBeFocused();
+  await expect(betaOption).toBeFocused();
+  const selectedVaults = scenario.route.startsWith("/vault/") ? ["fixture", "팀-beta"] : ["팀-beta"];
   const changed = page.waitForRequest(request => {
     const url = new URL(request.url());
-    return url.pathname.endsWith("/search") && url.searchParams.get("vault") === "팀-beta" && url.searchParams.get("source_type") === "document";
+    return url.pathname.endsWith("/search") && url.searchParams.getAll("vault").join(",") === selectedVaults.join(",") && url.searchParams.get("source_type") === "document";
   });
   await page.keyboard.press("Enter");
-  await changed;
+  const requestUrl = new URL((await changed).url());
+  expect(requestUrl.searchParams.get("q")).toBe("reading");
+  await expect(menu).toBeVisible();
+  await expect(betaOption).toHaveAttribute("aria-checked", "true");
   await expect(page).toHaveURL(scenario.route);
+  await menu.getByRole("menuitem", { name: "Done", exact: true }).click();
+  await expect(menu).toHaveCount(0);
+  // The modal dropdown hides the underlying combobox from the accessibility
+  // tree until Done/Escape restores the search dialog's focus scope.
   await expect(query).toHaveValue("reading");
-  await expect(query).toHaveAccessibleName("Search in 팀-beta");
-  const selectedScope = panel.getByRole("button", { name: "Search scope: 팀-beta", exact: true });
+  await expect(query).toHaveAccessibleName(`Search in ${selectedVaults.join(", ")}`);
+  const selectedScope = panel.getByRole("button", { name: `Search scope: ${selectedVaults.join(", ")}`, exact: true });
   await expect(selectedScope).toBeFocused();
   await selectedScope.click();
-  await expect(menu.getByRole("menuitemradio", { name: "팀-beta", exact: true })).toHaveAttribute("aria-checked", "true");
+  await expect(betaOption).toHaveAttribute("aria-checked", "true");
+  if (selectedVaults.length === 2) await expect(menu.getByRole("menuitemcheckbox", { name: /fixture/ })).toHaveAttribute("aria-checked", "true");
   await page.keyboard.press("Escape");
   await expect(menu).toHaveCount(0);
   await expect(panel).toBeVisible();
   await expect(selectedScope).toBeFocused();
   await panel.getByRole("button", { name: "Continue in search page", exact: true }).click();
-  await expect(page).toHaveURL(/\/vault\/%ED%8C%80-beta\/search\?q=reading&source=document$/);
+  await expect(page).toHaveURL(url =>
+    decodeURIComponent(url.pathname) === (selectedVaults.length === 2 ? "/search" : "/vault/팀-beta/search") &&
+    url.searchParams.get("q") === "reading" && url.searchParams.get("source") === "document" &&
+    url.searchParams.get("v") === (selectedVaults.length === 2 ? "fixture,팀-beta" : null),
+  );
+  await expect(page.getByRole("button", { name: `Search scope: ${selectedVaults.join(", ")}`, exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
@@ -331,8 +365,8 @@ for (const width of [375, 1440]) test(`search scope keeps a long Vault name acce
   await expect(scope).toBeInViewport({ ratio: 1 });
   await expect(panel.getByRole("combobox")).toBeInViewport({ ratio: 1 });
   await scope.click();
-  await expect(page.getByRole("menuitemradio", { name: /Current vault/ })).toBeInViewport({ ratio: 1 });
-  await expect(page.getByRole("menuitemradio", { name: /All vaults/ })).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("menuitemcheckbox", { name: /Current vault/ })).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("menuitem", { name: "All vaults", exact: true })).toBeInViewport({ ratio: 1 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("long-vault-search-scope.png") });
 });
@@ -369,7 +403,7 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
   await panel.getByRole("combobox").fill("reading");
   if (scope === "all") {
     await panel.getByRole("button", { name: "Search scope: fixture", exact: true }).click();
-    await page.getByRole("menuitemradio", { name: /All vaults/ }).click();
+    await page.getByRole("menuitem", { name: "All vaults", exact: true }).click();
   }
   if (destination === "result") await panel.getByRole("option").first().click();
   else await panel.getByRole("button", { name: "Continue in search page", exact: true }).click();
@@ -383,7 +417,7 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
   await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
   if (scope === "all") {
     await panel.getByRole("button", { name: "Search scope: fixture", exact: true }).click();
-    await page.getByRole("menuitemradio", { name: /All vaults/ }).click();
+    await page.getByRole("menuitem", { name: "All vaults", exact: true }).click();
   }
   if (destination === "result") await panel.getByRole("option").first().click();
   else await panel.getByRole("button", { name: "Continue in search page", exact: true }).click();
@@ -394,6 +428,13 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
     await page.keyboard.press("Escape");
     await expect(preview).toHaveCount(0);
     await expect(page).toHaveURL(/\?view=edit$/);
+    // Closing a quick-search preview resumes the same search session. The
+    // background editor remains inert until that search dialog is dismissed.
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("combobox")).toHaveValue("reading");
+    await expect(panel.getByRole("button", { name: `Search scope: ${scope === "all" ? "All vaults" : "fixture"}`, exact: true })).toBeVisible();
+    await panel.getByRole("button", { name: "Close search", exact: true }).click();
+    await expect(panel).toHaveCount(0);
     await expect(editor).toContainText(draft);
   } else {
     await expect(page).toHaveURL(url => url.pathname === (scope === "all" ? "/search" : "/vault/fixture/search") && url.searchParams.get("q") === "reading");
@@ -807,13 +848,16 @@ test("a deep document reader opens every Vault page directly and browser Back re
   const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
   await expect(navigation).toBeVisible();
   await expect(navigation.locator('[aria-current="page"]')).toHaveCount(0);
-  const initialPosition = (await navigation.boundingBox())!;
+  // The navigation shares its row with document publishing actions. Its own
+  // width varies by route; the complete section row is the stable boundary.
+  const navigationRow = navigation.locator("..");
+  const initialPosition = (await navigationRow.boundingBox())!;
   for (const [name, href] of vaultDestinations) {
     await openVaultDestination(page, name);
     await expect(page).toHaveURL(new RegExp(`${href}$`));
     await expect(navigation.getByRole("link", { name, exact: true })).toHaveAttribute("aria-current", "page");
     await expect(navigation.locator('[aria-current="page"]')).toHaveCount(1);
-    expect(await navigation.boundingBox()).toEqual(initialPosition);
+    expect(await navigationRow.boundingBox()).toEqual(initialPosition);
     await page.goBack();
     await expect(page).toHaveURL(new RegExp(`/doc/${encodeURIComponent(path)}$`));
     await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
@@ -828,7 +872,7 @@ test("a deep document reader opens every Vault page directly and browser Back re
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
   await expect(navigation.getByRole("link", { name: "Settings", exact: true })).toHaveAttribute("aria-current", "page");
-  expect(await navigation.boundingBox()).toEqual(initialPosition);
+  expect(await navigationRow.boundingBox()).toEqual(initialPosition);
   await page.screenshot({ path: testInfo.outputPath("vault-settings-navigation.png") });
   await page.goBack();
   await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
@@ -1595,7 +1639,7 @@ test("floating context preserves article geometry, scroll and selection while op
   await expect(panel).toHaveCount(0);
 });
 
-test("floating properties and relation dialogs preserve their inputs and inspector", async ({ page }) => {
+test("properties enter unified authoring while relation dialogs retain their inspector", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
@@ -1604,23 +1648,24 @@ test("floating properties and relation dialogs preserve their inputs and inspect
   const panel = page.locator('[data-slot="document-context-panel"]');
   const edit = panel.getByRole("button", { name: "Edit properties", exact: true });
   await edit.click();
-  const form = page.getByRole("dialog", { name: "Edit details", exact: true });
-  const summary = form.getByRole("textbox", { name: "SUMMARY", exact: true });
+  const form = page.getByRole("complementary", { name: "Document details", exact: true });
+  const summary = form.getByRole("textbox", { name: "Summary", exact: true });
+  await expect(summary).toBeFocused();
   await summary.fill("An unsaved properties draft");
   await form.getByRole("button", { name: "Document type", exact: true }).click();
   await page.getByRole("menuitemradio", { name: "reference", exact: true }).click();
   await expect(summary).toHaveValue("An unsaved properties draft");
-  await expect(panel).toHaveCount(1);
-  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
   const discard = page.getByRole("dialog", { name: /Discard/ });
   await expect(discard).toBeVisible();
   await discard.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(summary).toHaveValue("An unsaved properties draft");
-  await form.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await discard.getByRole("button", { name: /Discard/ }).click();
   await expect(form).toHaveCount(0);
-  await expect(panel).toBeVisible();
-  await expect(edit).toBeFocused();
+  await expect(panel).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeFocused();
 
   await rail.getByRole("button", { name: "Relations", exact: true }).click();
   await panel.getByRole("button", { name: "Add", exact: true }).click();
@@ -1655,11 +1700,16 @@ test("floating context dismisses inside a preview without closing the preview", 
   const previewUrl = page.url();
   const previewHistory = await page.evaluate(() => history.state);
   await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
-  await page.getByRole("complementary", { name: "On this page", exact: true }).getByRole("link", { name: "Authored heading", exact: true }).click();
-  await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
-  await expect(preview.getByRole("heading", { name: "Authored heading", exact: true })).toBeFocused();
+  const outline = page.getByRole("complementary", { name: "On this page", exact: true });
+  const headingLink = outline.getByRole("link", { name: "Authored heading", exact: true });
+  await headingLink.click();
+  await expect(outline).toBeVisible();
+  await expect(headingLink).toBeFocused();
   await expect(page).toHaveURL(previewUrl);
   expect(await page.evaluate(() => history.state)).toEqual(previewHistory);
+  await page.keyboard.press("Escape");
+  await expect(outline).toHaveCount(0);
+  await expect(preview).toBeVisible();
 });
 
 test("outline navigation in a short document never scrolls the Vault shell under the header", async ({ page }, testInfo) => {
@@ -1688,8 +1738,10 @@ test("outline navigation in a short document never scrolls the Vault shell under
   });
   const before = await workspaceMetrics();
   await page.locator('[data-slot="document-context-rail"]').getByRole("button", { name: "Table of contents", exact: true }).click();
-  await page.getByRole("navigation", { name: "Document outline" }).getByRole("link", { name: "Checklist", exact: true }).click();
-  await expect(heading).toBeFocused();
+  const outlineLink = page.getByRole("navigation", { name: "Document outline" }).getByRole("link", { name: "Checklist", exact: true });
+  await outlineLink.click();
+  await expect(outlineLink).toBeFocused();
+  await expect(page.locator('[data-slot="document-context-panel"]')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("short-outline-navigation.png") });
   expect(await workspaceMetrics()).toEqual(before);
   expect(await canvas.evaluate(element => element.scrollTop)).toBe(0);
@@ -1716,7 +1768,7 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, parents };
     });
     const before = await workspaceMetrics();
-    const innerMetrics = () => canvas.getByRole("heading", { name: "Section 12", exact: true }).evaluate(element => {
+    const innerMetrics = () => canvas.getByRole("heading", { name: "Section 12", exact: true, includeHidden: true }).evaluate(element => {
       const parents = [];
       for (let node = element.parentElement; node && node.id !== "document-reading-canvas"; node = node.parentElement) {
         parents.push({ tag: node.tagName, className: node.className, scrollTop: node.scrollTop, scrollLeft: node.scrollLeft });
@@ -1731,25 +1783,36 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
     const panel = page.locator('[data-slot="document-context-panel"]');
     await expect(panel.getByRole("navigation", { name: "Document outline" })).toBeVisible();
     expect(await workspaceMetrics()).toEqual(before);
-    await panel.getByRole("link", { name: "Section 12", exact: true }).click();
-    await expect(panel).toHaveCount(0);
-    const heading = canvas.getByRole("heading", { name: "Section 12", exact: true });
-    await expect(heading).toBeFocused();
+    const sectionLink = panel.getByRole("link", { name: "Section 12", exact: true });
+    await sectionLink.click();
+    await expect(panel).toBeVisible();
+    await expect(sectionLink).toBeFocused();
+    await expect(sectionLink).toHaveAttribute("aria-current", "location");
+    const heading = canvas.getByRole("heading", { name: "Section 12", exact: true, includeHidden: true });
     await expect(heading).toBeInViewport();
     expect(await canvas.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
     expect(await workspaceMetrics()).toEqual(before);
     expect(await innerMetrics()).toEqual(innerBefore);
     expect(page.url()).toBe(url);
     expect(await page.evaluate(() => window.history.state)).toEqual(history);
-    // A later return to the first heading must not scroll hidden layout shells.
-    await rail.getByRole("button", { name: "Table of contents", exact: true }).click();
-    await panel.getByRole("link", { name: "Section 1", exact: true }).click();
-    await expect(canvas.getByRole("heading", { name: "Section 1", exact: true })).toBeFocused();
+    // Continue navigating without reopening; keyboard activation preserves the
+    // outline's focus while scrolling only the document canvas.
+    const firstLink = panel.getByRole("link", { name: "Section 1", exact: true });
+    await firstLink.focus();
+    await firstLink.press("Enter");
+    await expect(firstLink).toBeFocused();
+    await expect(firstLink).toHaveAttribute("aria-current", "location");
+    await expect(canvas.getByRole("heading", { name: "Section 1", exact: true, includeHidden: true })).toBeInViewport();
     expect(await workspaceMetrics()).toEqual(before);
-    await rail.getByRole("button", { name: "Table of contents", exact: true }).click();
-    await panel.getByRole("link", { name: "Final section", exact: true }).click();
-    await expect(canvas.getByRole("heading", { name: "Final section", exact: true })).toBeFocused();
+    const finalLink = panel.getByRole("link", { name: "Final section", exact: true });
+    await finalLink.click();
+    await expect(panel).toBeVisible();
+    await expect(finalLink).toBeFocused();
+    await expect(canvas.getByRole("heading", { name: "Final section", exact: true, includeHidden: true })).toBeInViewport();
     expect(await workspaceMetrics()).toEqual(before);
+    await panel.getByRole("button", { name: "Close document panel", exact: true }).click();
+    await expect(panel).toHaveCount(0);
+    await expect(rail.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
   });
 }
 
@@ -1775,16 +1838,17 @@ test("resizing defers context mode changes until nested editing closes", async (
   await page.setViewportSize({ width: 2560, height: 1000 });
   await rail.getByRole("button", { name: "Document info", exact: true }).click();
   await panel.getByRole("button", { name: "Edit properties", exact: true }).click();
-  const details = page.getByRole("dialog", { name: "Edit details", exact: true });
-  await details.getByRole("textbox", { name: "SUMMARY", exact: true }).fill("Preserve on resize");
+  const details = page.getByRole("complementary", { name: "Document details", exact: true });
+  await details.getByRole("textbox", { name: "Summary", exact: true }).fill("Preserve on resize");
   await page.setViewportSize({ width: 375, height: 800 });
   await expect(details).toBeVisible();
-  await expect(details.getByRole("textbox", { name: "SUMMARY", exact: true })).toHaveValue("Preserve on resize");
-  await expect(page.getByRole("dialog", { name: "Discard changes?", exact: true })).toHaveCount(0);
-  await expect(panel).toHaveAttribute("data-mode", "floating");
-  await details.getByRole("button", { name: "Cancel", exact: true }).click();
-  await page.getByRole("dialog", { name: "Discard changes?", exact: true }).getByRole("button", { name: "Discard", exact: true }).click();
+  await expect(details.getByRole("textbox", { name: "Summary", exact: true })).toHaveValue("Preserve on resize");
+  await expect(page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true })).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true }).getByRole("button", { name: "Discard changes", exact: true }).click();
   await expect(details).toHaveCount(0);
+  await rail.getByRole("button", { name: "Document info", exact: true }).click();
   await expect(panel).toHaveAttribute("data-mode", "overlay");
 
   await panel.getByRole("button", { name: "Relations", exact: true }).click();
@@ -1797,6 +1861,153 @@ test("resizing defers context mode changes until nested editing closes", async (
   await expect(relation).toHaveCount(0);
   await expect(panel).toHaveAttribute("data-mode", "floating");
   await expect(panel.getByRole("button", { name: "Close document panel", exact: true })).toBeFocused();
+});
+
+test("preview geometry is independent of its search entry and background sidebars", async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await fixture(page);
+  let expectedBox: Awaited<ReturnType<Locator["boundingBox"]>> = null;
+  for (const folded of [false, true]) {
+    for (const entry of [
+      { route: `/vault/fixture/doc/${encodeURIComponent(path)}`, global: true },
+      { route: "/search?q=reading&source=document", global: true },
+      { route: "/search?q=reading&source=document", global: false },
+      { route: "/vault/fixture/search?q=reading&source=document", global: false },
+    ]) {
+      await page.goto("/search");
+      await page.evaluate(folded => {
+        localStorage.setItem("akb.treeVisible", folded ? "0" : "1");
+        localStorage.setItem("akb.vaultRailCollapsed", folded ? "1" : "0");
+      }, folded);
+      await page.goto(entry.route);
+      if (entry.global) {
+        await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+        const search = page.getByTestId("global-search-dialog");
+        await search.getByRole("combobox").fill("reading");
+        await search.getByRole("option", { name: /문서 읽기 작업공간/ }).click();
+      } else await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
+      const preview = page.getByTestId("document-preview-dialog");
+      await expect(preview.locator(".document-reading-flow")).toBeVisible();
+      const box = (await preview.boundingBox())!;
+      expect(box.x).toBeCloseTo((1920 - box.width) / 2, 0);
+      expect(box.y).toBeCloseTo((1080 - box.height) / 2, 0);
+      expect(box.x).toBeGreaterThanOrEqual(16);
+      expect(box.x).toBeLessThanOrEqual(48);
+      if (expectedBox) expect(box).toEqual(expectedBox);
+      expectedBox = box;
+      await page.mouse.click(box.x / 2, 540);
+      await expect(preview).toHaveCount(0);
+      expect(new URL(page.url()).pathname + new URL(page.url()).search).toBe(entry.route);
+    }
+  }
+});
+
+test("reading gutters adapt to the reader container and align Preview with Raw", async ({ page }) => {
+  await page.setViewportSize({ width: 2560, height: 1440 });
+  await fixture(page, false, true);
+  await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+  await page.getByRole("button", { name: `Actions for ${title}`, exact: true }).click();
+  await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
+  const content = page.getByRole("region", { name: "Document content", exact: true });
+  await expect(content.locator(".document-reading-flow")).toHaveClass(/document-reading-wide/);
+  const paragraph = content.locator(".ProseMirror > p").first();
+  // Simulate the same component embedded in a narrow or wide reading canvas,
+  // without changing the viewport (sidebar/panel changes must reflow it too).
+  for (const { width, gutter } of [{ width: 600, gutter: 16 }, { width: 1200, gutter: 24 }, { width: 1800, gutter: 32 }]) {
+    await content.evaluate((el, width) => { el.style.width = `${width}px`; }, width);
+    const outer = (await content.boundingBox())!;
+    const rendered = (await paragraph.boundingBox())!;
+    const firstBlock = (await content.locator(".ProseMirror > :first-child").boundingBox())!;
+    expect(rendered.x - outer.x).toBeCloseTo(gutter, 0);
+    expect(rendered.width).toBeCloseTo(width - gutter * 2, 0);
+    await page.getByRole("tab", { name: "Raw", exact: true }).click();
+    const raw = (await page.getByTestId("doc-raw").boundingBox())!;
+    expect(raw.x).toBeCloseTo(rendered.x, 0);
+    expect(raw.width).toBeCloseTo(rendered.width, 0);
+    expect(raw.y).toBeCloseTo(firstBlock.y, 0);
+    await page.getByRole("tab", { name: "Preview", exact: true }).click();
+    await expect(content.locator(".document-reading-flow")).toHaveClass(/document-reading-wide/);
+  }
+});
+
+for (const scenario of [
+  { width: 2560, height: 1440, dark: false, entry: "modal" },
+  { width: 2560, height: 1440, dark: true, entry: "modal" },
+  { width: 1440, height: 900, dark: false, entry: "modal" },
+  { width: 375, height: 812, dark: false, entry: "modal" },
+  { width: 1920, height: 1080, dark: false, entry: "page" },
+]) test(`search preview uses fluid content gutters at ${scenario.width}px ${scenario.dark ? "dark" : "light"} from ${scenario.entry}`, async ({ page }, testInfo) => {
+  await page.setViewportSize(scenario);
+  await fixture(page, scenario.dark);
+  await page.goto("/search?q=reading&source=document");
+  const searchTrigger = page.getByRole("button", { name: "Search knowledge", exact: true });
+  if (scenario.entry === "modal") {
+    await searchTrigger.click();
+    const search = page.getByTestId("global-search-dialog");
+    await search.getByRole("combobox").fill("reading");
+    await search.getByRole("option", { name: /문서 읽기 작업공간/ }).click();
+  } else {
+    await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
+  }
+  const preview = page.getByTestId("document-preview-dialog");
+  const canvas = preview.locator("#document-reading-canvas");
+  const flow = preview.locator(".document-reading-flow .ProseMirror");
+  const paragraph = flow.locator(":scope > p").first();
+  await expect(paragraph).toBeVisible();
+  const canvasBox = (await canvas.boundingBox())!;
+  const canvasWidth = await canvas.evaluate(el => el.clientWidth);
+  const inset = (await paragraph.boundingBox())!.x - canvasBox.x;
+  expect(inset).toBeGreaterThanOrEqual(16);
+  expect(inset).toBeLessThanOrEqual(32);
+  if (scenario.width >= 1920) expect(inset).toBeCloseTo(32, 0);
+  for (const block of await flow.locator(":scope > h2, :scope > p:not(:has(img)), :scope > ul, :scope > pre, :scope > .akb-md-table, :scope > .tableWrapper").all()) {
+    const box = (await block.boundingBox())!;
+    expect(box.x - canvasBox.x).toBeCloseTo(inset, 0);
+    expect(box.width).toBeCloseTo(canvasWidth - inset * 2, 0);
+  }
+  // A long code line scrolls locally, never widening the overlay or its canvas.
+  expect(await flow.locator(":scope > pre").evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+  expect(await canvas.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("fluid-preview.png") });
+  if (scenario.width === 2560 && !scenario.dark) {
+    // Resize the already-open dialog across breakpoints; no remount may be
+    // needed to replace a stale sidebar measurement or a viewport-based gutter.
+    for (const width of [1440, 768, 375]) {
+      await page.setViewportSize({ width, height: 900 });
+      const box = (await preview.boundingBox())!;
+      expect(box.x).toBeCloseTo((width - box.width) / 2, 0);
+      expect(box.y).toBeCloseTo((900 - box.height) / 2, 0);
+      if (width < 640) {
+        expect(box.x).toBe(0);
+        expect(box.height).toBe(900);
+      } else {
+        expect(box.x).toBeGreaterThanOrEqual(16);
+        expect(box.x).toBeLessThanOrEqual(48);
+      }
+      const canvasBox = (await canvas.boundingBox())!;
+      const paragraphBox = (await paragraph.boundingBox())!;
+      const gutter = paragraphBox.x - canvasBox.x;
+      expect(gutter).toBeGreaterThanOrEqual(16);
+      expect(gutter).toBeLessThanOrEqual(32);
+      expect(await canvas.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    }
+  }
+  if (scenario.entry === "modal") {
+    await page.keyboard.press("Escape");
+    await expect(preview).toHaveCount(0);
+    const resumedSearch = page.getByTestId("global-search-dialog");
+    await expect(resumedSearch.getByRole("combobox")).toHaveValue("reading");
+    await expect(resumedSearch.getByRole("combobox")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(resumedSearch).toHaveCount(0);
+    await expect(searchTrigger).toBeFocused();
+  } else {
+    await preview.getByRole("button", { name: "Open document in vault", exact: true }).click();
+    await expect(preview).toHaveCount(0);
+    // Full-page reading retains its own Standard default.
+    await expect(page.locator(".document-reading-flow")).not.toHaveClass(/document-reading-wide/);
+  }
 });
 
 test("preview keeps location and full-page promotion together without section navigation", async ({ page }, testInfo) => {
@@ -1841,12 +2052,18 @@ test("Escape closes only the nested context overlay inside a document preview", 
   const previewUrl = page.url();
   const previewHistory = await page.evaluate(() => history.state);
   await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
-  await page.getByRole("dialog", { name: "On this page", exact: true }).getByRole("link", { name: "Authored heading", exact: true }).click();
-  await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
+  const outline = page.getByRole("dialog", { name: "On this page", exact: true });
+  const headingLink = outline.getByRole("link", { name: "Authored heading", exact: true });
+  await headingLink.click();
+  await expect(outline).toBeVisible();
+  await expect(headingLink).toBeFocused();
   await expect(preview).toBeVisible();
-  await expect(preview.getByRole("heading", { name: "Authored heading", exact: true })).toBeFocused();
   await expect(page).toHaveURL(previewUrl);
   expect(await page.evaluate(() => history.state)).toEqual(previewHistory);
+  await page.keyboard.press("Escape");
+  await expect(outline).toHaveCount(0);
+  await expect(preview).toBeVisible();
+  await expect(preview.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
 });
 
 test("foreground access verification preserves the live editor draft", async ({ page }) => {
@@ -1902,6 +2119,12 @@ for (const dark of [false, true]) test(`code blocks follow Standard and Wide rea
     return text.width;
   };
   expect(await checkEdges()).toBe(1024);
+  const standardBox = (await paragraph.boundingBox())!;
+  await page.getByRole("tab", { name: "Raw", exact: true }).click();
+  const rawBox = (await page.getByTestId("doc-raw").boundingBox())!;
+  expect(rawBox.x).toBeCloseTo(standardBox.x, 0);
+  expect(rawBox.width).toBe(1024);
+  await page.getByRole("tab", { name: "Preview", exact: true }).click();
   await page.screenshot({ path: testInfo.outputPath("standard-code-width.png") });
   const actions = page.getByRole("button", { name: `Actions for ${title}`, exact: true });
   await actions.click();

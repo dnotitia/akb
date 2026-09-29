@@ -373,15 +373,20 @@ an `sr-only` summary, never the only signal.
   summary without a visible heading, then Recently viewed or Your vaults when no
   history exists. Its accessible description explains that totals cover Vaults
   the user can access. The summary
-  uses neutral 16px tabular values and 14px labels for accessible Vaults, documents,
-  tables and confirmed files; mobile reflows into two text columns, not cards.
+  uses a compact cardless ledger, capped at 42rem rather than stretched across
+  the page. Each metric places a 16px resource icon and 14px label above a neutral
+  20px tabular value. Reuse the explorer's Box / FileText / Table2 / Paperclip
+  vocabulary and document / table / file categorical tones; color is decorative,
+  never the only label. Quiet vertical separators group four desktop columns or
+  two mobile columns. No fills, shadows, hover effects or invented count links.
+  Skeletons retain this geometry; long counts and enlarged labels may wrap.
   Do not aggregate the four preview cards, count table rows, or add Collections.
   One authenticated count-only snapshot owns totals; missing values remain `—`
   with one quiet availability explanation. Older servers retain the verified
   directory's Vault count only. A verified empty workspace shows only zero Vaults.
   Foreground identity proof gates the summary, then refreshes directory and totals
   even for unchanged local accounts. No private totals persist in browser storage.
-  Leave 20px before the first section without double section padding. Home has an
+  Leave 24px before the first section without double section padding. Home has an
   `sr-only` H1, not a duplicate visible title or generic orientation sentence.
   View all vaults owns navigation without repeating its count; indexing remains in the global
   header and Vault context, not duplicated in the Home masthead or a stats rail.
@@ -884,12 +889,18 @@ an `sr-only` summary, never the only signal.
   a single hairline separates the tools from the body. Do not frame the title
   or add a duplicate context band. Loading reserves the same unified toolbar
   and full-width canvas without an extra metadata strip.
-  Start the body with 16–24px horizontal inset and a 20px top inset; its first
+  The shared reader is an inline-size query container. Its horizontal inset is
+  `clamp(1rem, 2cqi, 2rem)` (16–32px), based on actual content width rather than
+  the browser width, so opening/collapsing navigation also reflows the gutters.
+  Preview, Raw and the loading body use the same inset and 20px block padding.
+  This edge spacing is separate from the user's Standard / Wide reading measure.
+  Its first
   authored block has no additional top margin. Rendered body text uses 16px /
   1.65. Headings, paragraphs, lists, quotes, code blocks and ordinary tables share
   a centered 64rem measure. Short code blocks retain that same outer width;
   long code scrolls inside it rather than expanding past the prose edges.
-  Wide removes the measure for all these blocks together. Target the actual
+  Raw uses the same measure and alignment, rather than jumping sideways on a
+  mode change. Wide removes the measure for all these blocks together. Target the actual
   `.ProseMirror` / `.tableWrapper` DOM, not legacy direct-child selectors.
   Code and wide tables scroll inside their own labelled, keyboard-focusable
   regions. Small images retain natural dimensions and aspect ratio.
@@ -909,11 +920,15 @@ an `sr-only` summary, never the only signal.
   inaccessible. Each view owns the available panel height, without nested tabs.
   Close/Escape restore the selected edge control. Child editing dialogs and
   their portalled menus must not dismiss the inspector or lose drafts when the
-  viewport changes. Following an outline link dismisses either mode and focuses
-  the authored heading, scrolling only the document canvas (never the app shell
-  or sidebars, including when a short article needs no scrolling). Raw and diff modes explain why heading navigation is
+  viewport changes. Following an outline link keeps either panel mode open and
+  focus on that link for continuous navigation. Only the document canvas scrolls
+  to the authored heading (never the app shell or sidebars, including when a
+  short article needs no scrolling); the current section remains highlighted.
+  Close/Escape or an outside interaction dismiss the panel, not heading selection.
+  Raw and diff modes explain why heading navigation is
   unavailable instead of exposing inactive links. Edit hides the rail. Author,
-  full timestamps, tags and technical identifiers live in Info, not a new band.
+  full timestamps and tags live in Info, not a new band. Omit the Technical
+  details disclosure and its filename/path/URI rows from Info.
   Publication management uses its own verified writer-or-higher policy, rejects
   read-only Vaults and historical/diff views, and preserves exact server errors.
   Existing links use a Public link label, not a claim of live availability:
@@ -944,10 +959,21 @@ an `sr-only` summary, never the only signal.
   local-draft recovery behavior. Keep editing is always available; navigation
   cannot abandon an active save or image upload. Modified/new-tab link gestures
   remain ordinary browser navigation and do not dismiss the current editor.
-  Edit owns the human title and body as one document form: its title field sits
+  Create and Edit use `DocumentAuthoringLayout` and `DocumentDetailsFields`.
+  At 52rem of available container width, details occupy an independently
+  scrolling 18rem right rail (20rem at 72rem); narrower workspaces stack them
+  below the body with a Document details focus shortcut. Read-mode context
+  stays floating. Existing Collection is read-only; Move remains separate.
+  Edit owns title, body and details as one revision-checked document form. One
+  Save changes patches only edited fields; local drafts include both original
+  and edited metadata, and older text-only drafts remain recoverable. Its title field sits
   immediately above the editor and one Save changes action patches whichever
   values changed. Use a borderless document-scale title with a visible small
-  label; keep technical title help behind a disclosure. Entering Edit starts at
+  label. Keep the title fluid with 16px / 24px responsive side insets, independent
+  of the centered body measure. Omit technical title help; show validation and
+  duplicate-title feedback only when needed. Local draft feedback below the editor
+  uses the same side insets, 12px vertical padding and a quiet top divider, never
+  flush against the canvas edge. Entering Edit starts at
   the title without scrolling the surrounding workspace. Formatting and the
   compact `Visual` / `Markdown` mode menu share one control row; do not add a
   separate WYSIWYG / Source band. Markdown remains available as a secondary
@@ -994,18 +1020,28 @@ an `sr-only` summary, never the only signal.
   to the nearest text block. All block controls are omitted in read-only mode,
   use Lucide icons, expose accessible names, and never rely on hover alone.
   A document opened from Search uses this same reader inside a route-backed
-  preview dialog rather than replacing the result ledger. The dialog leaves the
-  persistent Vault navigation visible on wide screens, becomes full-screen on
-  narrow screens, and preserves the launching query, filters, scroll position,
-  browser Back behavior, and result focus. On wide screens it retains a clear
-  dismissible backdrop gutter (at least 32px where no persistent rail occupies
-  that edge); clicking that backdrop closes the preview. The compact file
+  preview dialog rather than replacing the result ledger. Every launching
+  surface uses the same viewport-centered geometry: from 640px, all four outer
+  insets use `clamp(1rem, 2vw, 3rem)` (16–48px); narrower screens use a full-screen
+  reader. Never measure background sidebars to position or size this dialog.
+  Resizing reflows it with CSS, without a stale opening-time DOM measurement.
+  The launching query, filters, scroll position, browser Back behavior and
+  result focus remain preserved. Clicking the backdrop closes a reading preview;
+  editing ignores backdrop/focus-outside events (including native file pickers).
+  Inside the dialog, rendered content defaults to Wide with the shared reader's
+  container-responsive 16–32px side insets:
+  the modal already provides the reading boundary, so do not add a second
+  centered 64rem measure. Prose, headings, tables and code share those edges;
+  long code and wide tables still scroll locally. Standard remains available
+  in overflow, and full-page reading keeps its Standard default. The compact file
   identity line exposes the current Vault as a labelled link, deliberately
   leaving the preview for that Vault Overview when selected. Its URL is still the canonical
   document route; clearing the preview history state promotes it to the normal
-  full-page reader. Preview / Raw and version changes retain preview state,
-  while Edit deliberately promotes to the full page so unsaved work never lives
-  in a dismissible reading overlay.
+  full-page reader. Preview / Raw, Edit, save and Cancel retain preview state.
+  Only Open in vault explicitly promotes the reader. Save/Cancel return to
+  the previous reading mode, scroll position and Edit control. X, Escape,
+  breadcrumbs and indexed browser Back/Forward protect unsaved work; navigation
+  waits for active uploads/saves. Escape first dismisses an open editor menu.
 - **File workspace**: use the shared location trail, single command row and flat
   full-bleed viewer. The breadcrumb title is the resolved human filename, not a
   repeated URI. Format and byte size are quiet command metadata; Download, Info
@@ -1291,7 +1327,10 @@ Account or route Vault changes reset the panel's query and results.
 `Continue in search page` carries the query and content kind to the selected
 scope's existing Search route. Both search scopes respect the app-level
 unsaved-resource navigation guard before opening results or the search page;
-document preview dismissal returns focus to the stable app-header trigger.
+document preview dismissal resumes its originating quick-search session with
+query, Vault scope, kind and selected result intact. The search focus scope is
+suspended during preview/edit, never stacked behind it. Page-launched previews
+return to their result ledger. Promotion/account changes invalidate the handoff.
 
 _Roadmap primitives_ (high-drift inline patterns being extracted): `IndexRow`
 (numbered list row), `ToggleGroup`/`ToggleChip` (segmented selection),

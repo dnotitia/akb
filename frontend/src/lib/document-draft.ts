@@ -1,4 +1,5 @@
 import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import { isDocumentDetailsValues, type DocumentDetailsValues } from "@/lib/document-details";
 import { parseDocUri } from "@/lib/uri";
 
 const DRAFT_VERSION = 2;
@@ -58,6 +59,9 @@ export interface StoredDocumentEditDraft {
   baseBody: string;
   title: string;
   body: string;
+  /** Paired snapshots; older title/body-only drafts omit both. */
+  baseDetails?: DocumentDetailsValues;
+  details?: DocumentDetailsValues;
   assetIds: string[];
   /** Server-provided expiry per unclaimed attachment, when available. */
   assetExpiresAt?: Record<string, string>;
@@ -173,6 +177,10 @@ function recordLooksLikeEditDraft(value: unknown): value is StoredDocumentEditDr
     typeof draft.baseBody === "string" &&
     typeof draft.title === "string" &&
     typeof draft.body === "string" &&
+    (
+      (!("baseDetails" in draft) && !("details" in draft)) ||
+      (isDocumentDetailsValues(draft.baseDetails) && isDocumentDetailsValues(draft.details))
+    ) &&
     Array.isArray(draft.assetIds) &&
     draft.assetIds.every((assetId) => typeof assetId === "string") &&
     (draft.assetExpiresAt === undefined || (

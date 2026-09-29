@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppRoutes } from "@/app-routes";
+import { installDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
 import "./index.css";
 
 // Vite dispatches `vite:preloadError` on window when a dynamically-imported
@@ -34,6 +35,9 @@ async function bootstrap() {
       queries: { staleTime: 30_000, retry: 1, refetchOnWindowFocus: false },
     },
   });
+
+  const uninstallHistoryGuard = installDocumentHistoryGuard();
+  import.meta.hot?.dispose(uninstallHistoryGuard);
 
   createRoot(document.getElementById("root")!).render(
     <StrictMode>

@@ -119,6 +119,24 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     const totals = page.getByRole("region", { name: "Workspace summary" });
     await expect(totals).toContainText("1,284");
     await expect(totals).toContainText("20");
+    const dimensions = await totals.locator("dl").evaluate(element => {
+      const rows = Array.from(element.children).map(item => {
+        const label = item.querySelector("dt")!.getBoundingClientRect();
+        const value = item.querySelector("dd")!.getBoundingClientRect();
+        return { labelBottom: label.bottom, valueTop: value.top, valueLeft: value.left, valueRight: value.right };
+      });
+      return { width: element.getBoundingClientRect().width, rows };
+    });
+    // Keep totals grouped by resource kind instead of a sentence-like baseline.
+    for (const row of dimensions.rows) expect(row.valueTop - row.labelBottom).toBeGreaterThanOrEqual(4);
+    expect(dimensions.width).toBeLessThanOrEqual(672);
+    if (width < 640) {
+      expect(dimensions.rows[2].valueTop).toBeGreaterThan(dimensions.rows[0].valueTop);
+      expect(dimensions.rows[0].valueRight).toBeLessThan(dimensions.rows[1].valueLeft);
+    } else {
+      expect(Math.abs(dimensions.rows[0].valueTop - dimensions.rows[3].valueTop)).toBeLessThanOrEqual(1);
+      expect((await totals.boundingBox())!.height).toBeLessThanOrEqual(80);
+    }
     await expectPaperHome(page);
     await expect(totals.getByText("Available to you", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "View all vaults", exact: true })).toBeVisible();

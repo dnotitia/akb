@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { flushSync } from "react-dom";
 import { matchRoutes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
@@ -26,7 +27,8 @@ import { Button } from "@/components/ui/button";
 import { SearchVaultPicker, VaultQuerySuggestions } from "@/components/search-vault-picker";
 import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
-import { documentPreviewState } from "@/lib/document-preview-navigation";
+import { DOCUMENT_PREVIEW_CLOSED_EVENT, documentPreviewBackground, documentPreviewState } from "@/lib/document-preview-navigation";
+import { isModalOpen } from "@/lib/modal-visibility";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import {
@@ -105,7 +107,8 @@ function resultHref(result: GlobalSearchResult): string {
 /** One stable entry point; named Vault routes supply the initial search scope. */
 export function GlobalSearchDialog() {
   const currentUser = useCurrentUser();
-  const { pathname } = useLocation();
+  const location = useLocation();
+  const { pathname } = documentPreviewBackground(location) ?? location;
   const match = matchRoutes([...appRouteContract], pathname)?.at(-1);
   const vault = match?.route.boundary === "vault-shell" ? match.params.name : undefined;
   return <KnowledgeSearchDialog key={JSON.stringify([currentUser?.user_id, vault])} contextVault={vault} />;
@@ -116,6 +119,12 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const currentUserId = currentUser?.user_id;
   const navigate = useNavigate();
   const location = useLocation();
+  const backgroundLocation = documentPreviewBackground(location) ?? location;
+  const searchSessionId = useId();
+  const previewSequence = useRef(0);
+  const previewReturn = useRef<{ token: string; backgroundKey: string; scrollTop: number } | null>(null);
+  const resumingPreview = useRef(false);
+  const restoredScrollTop = useRef<number | null>(null);
   const { requestNavigation } = useResourceNavigation();
   const [vaults, setVaults] = useState<string[]>(contextVault ? [contextVault] : []);
   const [availableVaults, setAvailableVaults] = useState<string[] | null>(null);
@@ -150,6 +159,23 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const visibleResults = loading || error ? [] : results;
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
+
+  useEffect(() => {
+    function restoreSearch(event: Event) {
+      const session = previewReturn.current;
+      if (
+        !session || session.token !== (event as CustomEvent<{ token?: unknown }>).detail?.token ||
+        session.backgroundKey !== backgroundLocation.key || isModalOpen()
+      ) return;
+      event.preventDefault();
+      previewReturn.current = null;
+      resumingPreview.current = true;
+      restoredScrollTop.current = session.scrollTop;
+      setOpen(true);
+    }
+    window.addEventListener(DOCUMENT_PREVIEW_CLOSED_EVENT, restoreSearch);
+    return () => window.removeEventListener(DOCUMENT_PREVIEW_CLOSED_EVENT, restoreSearch);
+  }, [backgroundLocation.key]);
 
   function changeScope(next: string[]) {
     if (vaults.length === next.length && vaults.every(vault => next.includes(vault))) return;
@@ -204,6 +230,13 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
 
   useEffect(() => {
     const currentRequest = ++requestId.current;
+    // The preview temporarily owns the modal focus scope. Keep the Search
+    // ledger intact, and resume it without a fetch resetting its selection.
+    if (!open && previewReturn.current) return;
+    if (open && resumingPreview.current) {
+      resumingPreview.current = false;
+      return;
+    }
     if (!open || !normalizedQuery) {
       setResults([]);
       setLoading(false);
@@ -261,23 +294,36 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
 
   function openResult(result: GlobalSearchResult) {
     rememberGlobalSearch();
-    setOpen(false);
     const href = resultHref(result);
     const source = result.source_type || "document";
+    const returnToken = source === "document" ? suspendSearchForPreview() : undefined;
+    setActiveIndex(results.findIndex(candidate => candidate.uri === result.uri));
+    flushSync(() => setOpen(false));
     const options = {
       state:
         source === "document"
-          ? documentPreviewState(location, triggerId)
+          ? documentPreviewState(backgroundLocation, triggerId, undefined, returnToken)
           : undefined,
     };
     if (requestNavigation(href, options)) navigate(href, options);
   }
 
   function openRecentDocument(document: RecentDocumentView) {
-    setOpen(false);
+    const returnToken = suspendSearchForPreview();
+    flushSync(() => setOpen(false));
     const href = `/vault/${encodeURIComponent(document.vault)}/doc/${encodeURIComponent(document.path)}`;
-    const options = { state: documentPreviewState(location, triggerId) };
+    const options = { state: documentPreviewState(backgroundLocation, triggerId, undefined, returnToken) };
     if (requestNavigation(href, options)) navigate(href, options);
+  }
+
+  function suspendSearchForPreview(): string {
+    const token = `${searchSessionId}:${++previewSequence.current}`;
+    previewReturn.current = {
+      token,
+      backgroundKey: backgroundLocation.key,
+      scrollTop: resultsScrollRef.current?.scrollTop ?? 0,
+    };
+    return token;
   }
 
   function selectResultWithKeyboard(index: number) {
@@ -323,6 +369,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   return (
     <Dialog open={open} onOpenChange={next => {
       if (next) {
+        previewReturn.current = null;
         changeScope(contextVault ? [contextVault] : []);
         setAvailableVaults(null);
         setVaultsError(false);
@@ -349,6 +396,13 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           inputRef.current?.focus();
+          if (restoredScrollTop.current !== null && resultsScrollRef.current) {
+            resultsScrollRef.current.scrollTop = restoredScrollTop.current;
+            restoredScrollTop.current = null;
+          }
+        }}
+        onCloseAutoFocus={event => {
+          if (previewReturn.current) event.preventDefault();
         }}
       >
         <DialogTitle className="sr-only">{vaults.length ? scopeLabel : "Search knowledge"}</DialogTitle>

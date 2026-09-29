@@ -133,6 +133,11 @@
   --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
   --font-display: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
 
+  /* Reader spacing is distinct from its optional prose measure. Dialog edges
+     follow the viewport; body gutters follow the actual reading container. */
+  --spacing-document-preview-edge: clamp(1rem, 2vw, 3rem);
+  --spacing-document-reading-gutter: clamp(1rem, 2cqi, 2rem);
+
   /* ── Radius — soft, rounded family look (12px controls, 14px cards,
      16px modals/hero — mirrors seahorse/akb-platform) ─────────────── */
   --radius: 0.875rem;
@@ -876,12 +881,44 @@ body::before {
   .document-read-modes [role="tab"] { padding-inline: .5rem; }
 }
 
-.document-reading-flow {
+.document-preview-surface {
+  width: 100%;
+  height: 100dvh;
+}
+
+@media (min-width: 40rem) {
+  .document-preview-surface {
+    width: calc(100% - 2 * var(--spacing-document-preview-edge));
+    height: calc(100dvh - 2 * var(--spacing-document-preview-edge));
+  }
+}
+
+.document-reading-container {
+  container-type: inline-size;
+}
+
+.document-reading-inset {
+  padding-inline: var(--spacing-document-reading-gutter);
+  padding-block: 1.25rem;
+}
+
+.document-reading-flow,
+.document-reading-source {
   --document-reading-measure: 64rem;
+}
+
+.document-reading-flow {
   font-size: 1rem;
   line-height: 1.65;
 }
-.document-reading-flow.document-reading-wide { --document-reading-measure: none; }
+.document-reading-flow.document-reading-wide,
+.document-reading-source.document-reading-wide { --document-reading-measure: none; }
+
+.document-reading-source {
+  width: 100%;
+  max-width: var(--document-reading-measure);
+  margin-inline: auto;
+}
 .document-reading-flow .ProseMirror { min-width: 0; }
 /* Nested blocks stay within their parent; top-level blocks share the measure. */
 .document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
