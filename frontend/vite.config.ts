@@ -546,14 +546,8 @@ export default defineConfig(() => {
       alias: {
         "@": path.resolve(__dirname, "./src"),
       },
-      // react-force-graph-2d ships CJS and nests react-kapsule + prop-types;
-      // without dedupe Vite can load a second React copy for them, making
-      // React.useRef resolve to null inside ForceGraph2D. Dedupe forces
-      // every consumer onto the same React instance.
+      // Workspace packages and the application share one React instance.
       dedupe: ["react", "react-dom"],
-    },
-    optimizeDeps: {
-      include: ["react-force-graph-2d", "react-kapsule"],
     },
     cacheDir,
     server: {

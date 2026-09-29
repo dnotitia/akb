@@ -1,7 +1,7 @@
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import SettingsPage from "../settings";
+import SettingsDialog from "../settings/settings-dialog";
 import * as api from "@/lib/api";
 import { ProfileSection } from "../settings/profile-section";
 
@@ -30,7 +30,7 @@ vi.mock("@/hooks/use-theme", () => ({
 function renderSettings(initialPath = "/settings?tab=profile") {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
-      <SettingsPage />
+      <SettingsDialog initialTab={new URLSearchParams(initialPath.split("?")[1]).get("tab") ?? "profile"} onClose={vi.fn()} />
     </MemoryRouter>,
   );
 }
@@ -198,6 +198,58 @@ describe("settings — profile edit", () => {
     fireEvent.click(screen.getByRole("button", { name: "Change password" }));
     await screen.findByText("Password changed");
     await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+  });
+
+  it("keeps the modal busy until both profile and password writes finish", async () => {
+    let finishProfile!: () => void;
+    let finishPassword!: () => void;
+    vi.mocked(api.updateProfile).mockImplementation(async () => {
+      await new Promise<void>(resolve => { finishProfile = resolve; });
+      return { updated: true, username: USER.username, display_name: "Alice Renamed", email: USER.email };
+    });
+    vi.mocked(api.changePassword).mockImplementation(async () => {
+      await new Promise<void>(resolve => { finishPassword = resolve; });
+      return { ok: true };
+    });
+    const onBusyChange = vi.fn();
+    render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onBusyChange={onBusyChange} />);
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Alice Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(onBusyChange).toHaveBeenLastCalledWith(true);
+    expect(screen.getByLabelText("Display name")).toBeDisabled();
+    for (const label of ["Current password", "New password", "Confirm new password"]) {
+      fireEvent.change(screen.getByLabelText(label), { target: { value: "password123" } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(screen.getByLabelText("Current password")).toBeDisabled();
+
+    await act(async () => { finishProfile(); });
+    expect(screen.getByLabelText("Display name")).toBeEnabled();
+    expect(onBusyChange).toHaveBeenLastCalledWith(true);
+    await act(async () => { finishPassword(); });
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+    expect(screen.getByLabelText("Current password")).toBeEnabled();
+  });
+
+  it("clears the busy guard on failure and unmount", async () => {
+    let failProfile!: (reason: Error) => void;
+    vi.mocked(api.updateProfile).mockImplementation(() => new Promise((_, reject) => { failProfile = reject; }));
+    const onBusyChange = vi.fn();
+    const { unmount } = render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onBusyChange={onBusyChange} />);
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Alice Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(onBusyChange).toHaveBeenLastCalledWith(true);
+    await act(async () => { failProfile(new Error("Save unavailable")); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Save unavailable");
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(onBusyChange).toHaveBeenLastCalledWith(true);
+    unmount();
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+    await act(async () => { failProfile(new Error("Save unavailable")); });
   });
 
   it("keeps the compact profile identity once and omits outer cards", () => {

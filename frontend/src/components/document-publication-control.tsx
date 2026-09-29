@@ -134,12 +134,12 @@ export function DocumentPublicationControl({
                   aria-expanded={open && !publishDisabled}
                   aria-disabled={publishDisabled || undefined}
                   aria-describedby={publishDisabled ? reasonId : undefined}
-                  className={`text-sm @max-[32rem]/resource-commands:px-2${publishDisabled ? " opacity-50" : ""}`}
+                  className={`h-9 rounded-[var(--radius-sm)] px-2.5 text-sm lg:h-8${publishDisabled ? " opacity-50" : ""}`}
                   onClick={(event) => {
                     if (publishDisabled) event.preventDefault();
                   }}
                 >
-                  <Globe2 className="h-4 w-4 @max-[32rem]/resource-commands:hidden" aria-hidden />
+                  <Globe2 className="h-4 w-4" aria-hidden />
                   {publicSlug ? "Public link" : "Publish"}
                 </Button>
               </PopoverTrigger>

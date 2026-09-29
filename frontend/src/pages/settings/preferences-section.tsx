@@ -32,22 +32,22 @@ function ThemePreview({ dark }: { dark: boolean }) {
 export function PreferencesSection() {
   const { theme, setTheme } = useTheme();
   return (
-    <section aria-labelledby="appearance-heading" className="max-w-3xl">
+    <section aria-labelledby="appearance-heading" className="@container/appearance min-w-0">
       <div className="border-b border-border pb-4">
         <h2 id="appearance-heading" className="text-base font-semibold text-foreground">Appearance</h2>
         <p id="appearance-description" className="mt-1 text-sm text-foreground-muted">Choose a theme for this browser. Changes apply immediately.</p>
       </div>
-      <fieldset aria-describedby="appearance-description" className="mt-5 grid min-w-0 gap-3 sm:grid-cols-3">
+      <fieldset aria-describedby="appearance-description" className="mt-5 grid min-w-0 gap-3 @min-[32rem]/appearance:grid-cols-3">
         <legend className="sr-only">Theme</legend>
         {themeOptions.map(({ value, label, description, icon: Icon }) => (
           <label key={value} className="group relative min-w-0 cursor-pointer">
             <input type="radio" name="appearance-theme" value={value} checked={theme === value} onChange={() => setTheme(value)} aria-label={label} className="peer sr-only" />
-            <span className="block overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface transition-token group-hover:border-border-strong peer-checked:border-primary peer-checked:ring-1 peer-checked:ring-primary peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-surface">
-              <span className="relative block h-28 overflow-hidden border-b border-border" aria-hidden="true">
+            <span className="grid grid-cols-[7rem_minmax(0,1fr)] overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface transition-token group-hover:border-border-strong peer-checked:border-primary peer-checked:ring-1 peer-checked:ring-primary peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-surface @min-[32rem]/appearance:block">
+              <span className="relative block h-24 overflow-hidden border-r border-border @min-[32rem]/appearance:h-28 @min-[32rem]/appearance:border-r-0 @min-[32rem]/appearance:border-b" aria-hidden="true">
                 <ThemePreview dark={value === "dark"} />
                 {value === "system" && <span className="absolute inset-0 [clip-path:polygon(50%_0,100%_0,100%_100%,50%_100%)]"><ThemePreview dark /></span>}
               </span>
-              <span className="flex items-center gap-2 px-3 py-3">
+              <span className="flex min-w-0 items-center gap-2 p-3 @min-[32rem]/appearance:min-h-20">
                 <Icon className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden="true" />
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-medium text-foreground">{label}</span>

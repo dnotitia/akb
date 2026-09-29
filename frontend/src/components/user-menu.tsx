@@ -1,5 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -10,6 +10,7 @@ import {
 import { getMe, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { TooltipText } from "@/components/ui/tooltip-text";
+import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 
 const THEME_LABELS: Record<Theme, string> = {
   light: "Light",
@@ -34,6 +35,9 @@ function initialsFor(label: string): string {
  */
 export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) {
   const navigate = useNavigate();
+  const settings = useSettingsDialog();
+  const settingsRequested = useRef(false);
+  const trigger = useRef<HTMLButtonElement>(null);
   const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
   const [user, setUser] = useState<CurrentUser | null>(initialUser ?? null);
@@ -87,6 +91,8 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
       }}
     >
       <DropdownMenu.Trigger
+        ref={trigger}
+        id="account-menu-trigger"
         aria-label={`Account menu — ${label}`}
         title={label}
         className="group inline-flex h-9 min-w-9 shrink-0 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] bg-transparent p-1 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:bg-surface-selected sm:max-w-52 sm:pr-1.5"
@@ -104,6 +110,11 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
+          onCloseAutoFocus={event => {
+            if (!settingsRequested.current) return;
+            event.preventDefault(); settingsRequested.current = false;
+            requestAnimationFrame(() => settings ? settings.openSettings("profile", trigger.current) : navigate("/settings"));
+          }}
           align="end"
           sideOffset={6}
           className="z-50 min-w-[240px] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
@@ -159,7 +170,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
           <DropdownMenu.Separator className="h-px bg-border my-1" />
 
           <DropdownMenu.Item
-            onSelect={() => navigate("/settings")}
+            onSelect={() => { settingsRequested.current = true; }}
             className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"
           >
             <SettingsIcon className="h-4 w-4 text-foreground-muted" aria-hidden />

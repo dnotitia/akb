@@ -46,6 +46,7 @@ import { DocumentView } from "@/components/document-view";
 import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentSummary, DocumentTimestamp } from "@/components/document-reading-controls";
 import { DocumentContextPanel } from "@/components/document-context-panel";
 import { DocumentPublicationControl } from "@/components/document-publication-control";
+import { VaultHeaderAction } from "@/components/vault-header-actions";
 import { ResourceCommandRow } from "@/components/resource-command-row";
 import { ResourceBreadcrumb } from "@/components/resource-breadcrumb";
 import { usePublishResourceLocation } from "@/contexts/resource-location-context";
@@ -202,6 +203,15 @@ function DocumentPageContent({
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const editTitleRef = useRef<HTMLInputElement | null>(null);
+  const mountEditTitle = useCallback((input: HTMLInputElement | null) => {
+    editTitleRef.current = input;
+    if (!input) return;
+    // Start the document form at its title. Body autofocus can scroll this
+    // field behind the command row, especially in a short viewport.
+    const canvas = input.closest("main");
+    if (canvas) canvas.scrollTop = 0;
+    input.focus({ preventScroll: true });
+  }, []);
   const titleConflictRef = useRef<HTMLDivElement | null>(null);
   const diffOriginHashRef = useRef<string | null>(null);
   const wasDiffModeRef = useRef(false);
@@ -542,7 +552,6 @@ function DocumentPageContent({
   const titleError =
     titleTouched && !normalizedEditingTitle ? "Enter a document title." : "";
   const titleDescriptionIds = [
-    "document-edit-title-help",
     titleError ? "document-edit-title-error" : "",
     titleConflict ? "document-edit-title-conflict" : "",
   ]
@@ -1393,6 +1402,16 @@ function DocumentPageContent({
     updateRouteParams(params, { replace: false });
   };
 
+  const publication = !inEditMode && (
+    <div role="group" aria-label="Document publishing" className="flex shrink-0 items-center">
+      <DocumentPublicationControl key={resourceScope} vault={name!} docId={docId}
+        publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
+        disabledReason={publishDisabledReason}
+        onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
+        onUnpublish={handleUnpublish} />
+    </div>
+  );
+
   return (
     <>
       <section
@@ -1404,27 +1423,32 @@ function DocumentPageContent({
         {presentation === "preview" && (
           <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border bg-surface py-1 pl-4 pr-12 sm:pr-14">
             {resolvedLocation ? <ResourceBreadcrumb className="flex-1" location={resolvedLocation} /> : <span className="flex-1 text-sm text-foreground-muted">Document</span>}
+            {publication}
             <Button type="button" variant="ghost" size="sm" className="h-11 shrink-0 gap-2 text-link sm:h-9"
               onClick={() => openFullPage(view)} aria-label="Open document in vault">
               <span>Open in vault</span><Maximize2 className="h-4 w-4" aria-hidden />
             </Button>
           </div>
         )}
-        <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
+        {presentation === "page" && publication && <VaultHeaderAction>{publication}</VaultHeaderAction>}
+        <div data-slot="document-viewer-frame" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
+        <div role="group" aria-label={inEditMode ? "Document editing tools" : "Document reading tools"}
+          data-slot="document-reading-toolbar" className="shrink-0 bg-surface">
         <ResourceCommandRow
           appearance="reader"
-          className="document-metadata-row"
+          className="document-unified-toolbar"
           meta={inEditMode ? (
             <span role="status" aria-live="polite" className="text-xs text-foreground-muted">
               {accessChecking || vaultInfoQuery.isPending ? "Checking access…" : !canEdit ? "Read-only · Draft preserved" : uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : draftStatus === "saving" ? "Saving draft locally…" : draftStatus === "saved" ? "Draft saved locally" : "No changes"}
             </span>
           ) : (
-            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
               {doc.status === "draft" && !isHistorical && !isDiffMode && <Badge variant="draft">Draft</Badge>}
               {savedAt && <span role="status" className="inline-flex shrink-0 items-center gap-1 text-xs text-success"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Saved</span>}
               <DocumentTimestamp value={isHistorical || isDiffMode ? selectedHistoryEntry?.date : lastEditedAt}
                 label={isHistorical || isDiffMode ? "Version saved" : "Last edited"} compact />
-              <span className="hidden min-w-0 @[48rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
+              <span className="hidden @min-[32rem]/resource-commands:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
+              <span className="hidden min-w-0 flex-1 @[48rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
             </div>
           )}
         >
@@ -1435,12 +1459,14 @@ function DocumentPageContent({
               {savingBody ? "Saving…" : "Save changes"}
             </Button>
           </> : <>
-            <div role="group" aria-label="Publishing and more options" className="document-command-group">
-            <DocumentPublicationControl key={resourceScope} vault={name!} docId={docId}
-              publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
-              disabledReason={publishDisabledReason}
-              onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
-              onUnpublish={handleUnpublish} />
+            {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
+            <div role="group" aria-label="Document actions" className="document-command-group">
+              <DocumentCopyButton content={doc.content || ""} />
+              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
+                <Pencil className="h-4 w-4" aria-hidden />
+              </DocumentIconButton>}
+            </div>
+            <div role="group" aria-label="More document options" className="document-command-group">
             <ResourceActionsMenu
               triggerRef={actionsTriggerRef}
               resourceName={doc.title || fileName}
@@ -1469,23 +1495,7 @@ function DocumentPageContent({
             </div>
           </>}
         </ResourceCommandRow>
-
-        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
-        {!inEditMode && (
-          <div role="group" aria-label="Document reading tools" data-slot="document-reading-toolbar"
-            className="document-command-inner flex min-h-10 shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
-            <div className="flex min-w-0 items-center gap-3">
-              {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
-              <span className="hidden @min-[32rem]/resource-commands:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
-            </div>
-            <div role="group" aria-label="Document actions" className="document-command-group">
-              <DocumentCopyButton content={doc.content || ""} />
-              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
-                <Pencil className="h-4 w-4" aria-hidden />
-              </DocumentIconButton>}
-            </div>
-          </div>
-        )}
+        </div>
 
         {archiveNotice && <Alert variant="success" className="shrink-0">{archiveNotice}<Button variant="ghost" size="sm" onClick={() => setArchiveNotice("")}>Dismiss</Button></Alert>}
         {doc.status === "archived" && !isHistorical && !isDiffMode && view !== "edit" && (
@@ -1568,7 +1578,7 @@ function DocumentPageContent({
               className={cn(
                 "w-full",
                 inEditMode
-                  ? "px-3 py-4 sm:px-4 sm:py-5 lg:px-5 xl:px-6 2xl:px-8"
+                  ? ""
                   : isDiffMode
                     ? "flex h-full min-h-0 flex-col"
                     : "min-h-full",
@@ -1577,63 +1587,65 @@ function DocumentPageContent({
 
               {inEditMode ? (
                 <section className="min-w-0 bg-surface">
-                  <div
-                    className="p-4 sm:p-6"
-                  >
-                    <div className="mb-5 space-y-2 border-b border-border pb-5">
-                      <Label htmlFor="document-edit-title">Document title</Label>
-                      <Input
-                        ref={editTitleRef}
-                        id="document-edit-title"
-                        value={editingTitle}
-                        onChange={(event) => {
-                          setEditingTitle(event.currentTarget.value);
-                          draftRevisionRef.current += 1;
-                          setServerTitleConflict(null);
-                          setBodyError("");
-                        }}
-                        onBlur={() => setTitleTouched(true)}
-                        disabled={savingBody}
-                        aria-invalid={Boolean(titleError || titleConflict) || undefined}
-                        aria-describedby={titleDescriptionIds}
-                        className="font-display text-base font-semibold"
-                      />
-                      <p
-                        id="document-edit-title-help"
-                        className="text-xs leading-relaxed text-foreground-muted"
-                      >
-                        This is the visible title. Editing it keeps the document path,
-                        links, and version history unchanged.
-                      </p>
-                      {titleError && (
-                        <p
-                          id="document-edit-title-error"
-                          role="alert"
-                          className="text-xs font-medium text-destructive"
-                        >
-                          {titleError}
-                        </p>
-                      )}
-                      {titleConflict && (
-                        <div
-                          id="document-edit-title-conflict"
-                          ref={titleConflictRef}
-                          tabIndex={-1}
-                          className="pt-1 focus:outline-none"
-                        >
-                          <DocumentTitleConflictNotice
-                            conflict={titleConflict}
-                            onOpenExisting={() =>
-                              setPendingExistingPath(titleConflict.existingPath)
-                            }
-                            onChooseAlternative={() => editTitleRef.current?.focus()}
-                            chooseAlternativeLabel="Choose another title"
-                            onKeepBoth={() => void handleSaveDocument("allow")}
-                            keepBothLabel="Save duplicate title"
-                            keepingBoth={savingBody}
-                          />
-                        </div>
-                      )}
+                  <div>
+                    <div className="border-b border-border">
+                      <div className="mx-auto max-w-5xl space-y-1.5 px-6 py-4">
+                        <Label htmlFor="document-edit-title" className="text-xs text-foreground-muted">Document title</Label>
+                        <Input
+                          ref={mountEditTitle}
+                          id="document-edit-title"
+                          value={editingTitle}
+                          onChange={(event) => {
+                            setEditingTitle(event.currentTarget.value);
+                            draftRevisionRef.current += 1;
+                            setServerTitleConflict(null);
+                            setBodyError("");
+                          }}
+                          onBlur={() => setTitleTouched(true)}
+                          disabled={savingBody}
+                          aria-invalid={Boolean(titleError || titleConflict) || undefined}
+                          aria-describedby={titleDescriptionIds || undefined}
+                          className="h-11 rounded-[var(--radius-sm)] border-0 bg-transparent px-0 font-display text-xl font-semibold shadow-none sm:text-2xl"
+                        />
+                        <details className="text-xs text-foreground-muted">
+                          <summary className="w-fit cursor-pointer rounded-[var(--radius-sm)] py-1 hover:text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+                            About document titles
+                          </summary>
+                          <p className="pt-1 leading-relaxed">
+                            This is the visible title. Editing it keeps the document path,
+                            links, and version history unchanged.
+                          </p>
+                        </details>
+                        {titleError && (
+                          <p
+                            id="document-edit-title-error"
+                            role="alert"
+                            className="text-xs font-medium text-destructive"
+                          >
+                            {titleError}
+                          </p>
+                        )}
+                        {titleConflict && (
+                          <div
+                            id="document-edit-title-conflict"
+                            ref={titleConflictRef}
+                            tabIndex={-1}
+                            className="pt-1 focus:outline-none"
+                          >
+                            <DocumentTitleConflictNotice
+                              conflict={titleConflict}
+                              onOpenExisting={() =>
+                                setPendingExistingPath(titleConflict.existingPath)
+                              }
+                              onChooseAlternative={() => editTitleRef.current?.focus()}
+                              chooseAlternativeLabel="Choose another title"
+                              onKeepBoth={() => void handleSaveDocument("allow")}
+                              keepBothLabel="Save duplicate title"
+                              keepingBoth={savingBody}
+                            />
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <Suspense fallback={<MarkdownEditorFallback />}>
                       <MarkdownEditor
@@ -1667,12 +1679,13 @@ function DocumentPageContent({
                         }}
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
                         ariaLabel="Document body (markdown)"
-                        autoFocus
                         readOnly={savingBody || !canEdit}
                         vault={name!}
                         document={doc?.path}
                         commit={editBaseCommit ?? undefined}
                         appearance="workspace"
+                        className="mx-auto !max-w-5xl !px-6 !text-base"
+                        sourceClassName="mx-auto block !max-w-5xl !px-6"
                         onUploadingChange={(uploading) => {
                           setUploadingImage(uploading);
                           if (uploading) setClaimedAssetIds(null);
@@ -1927,7 +1940,6 @@ function DocumentPageContent({
                 </>}
             </DocumentContextPanel>
           )}
-        </div>
         </div>
         </div>
       </section>
@@ -2196,16 +2208,12 @@ function DocumentPageLoading({ presentation }: { presentation: "page" | "preview
   return (
     <LoadingState label="Loading document" className="@container/reader flex h-full min-h-0 flex-col overflow-hidden bg-surface [&>div]:contents">
       {presentation === "preview" && <div className="flex h-14 items-center gap-3 border-b border-border px-4"><Skeleton className="h-4 w-2/3" /></div>}
-      <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
-        <ResourceCommandRow appearance="reader" className="document-metadata-row" meta={<Skeleton className="h-3 w-28" />}>
+      <div data-slot="document-viewer-frame" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
+        <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={<Skeleton className="h-3 w-40" />}>
+          <Skeleton data-reader-control className="w-28" />
+          <Skeleton data-reader-control className="w-16" />
           <Skeleton data-reader-control className="w-28" />
         </ResourceCommandRow>
-        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
-          <div className="document-command-inner flex min-h-10 shrink-0 items-center gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
-            <Skeleton data-reader-control className="w-28" />
-            <Skeleton className="hidden h-3 w-24 @min-[32rem]/resource-commands:block" />
-            <Skeleton data-reader-control className="ml-auto w-20" />
-          </div>
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="mx-auto min-w-0 flex-1 max-w-5xl space-y-4 px-4 py-5 sm:px-6">
               <Skeleton className="h-8 w-3/5" />
@@ -2217,7 +2225,6 @@ function DocumentPageLoading({ presentation }: { presentation: "page" | "preview
               {[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-5 w-4" />)}
             </div>
           </div>
-        </div>
       </div>
     </LoadingState>
   );

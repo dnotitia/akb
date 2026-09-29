@@ -1,24 +1,34 @@
 // frontend/src/hooks/__tests__/use-graph-history.test.ts
 import { describe, it, expect, beforeEach } from "vitest";
+import { createElement, type ReactNode } from "react";
 import { renderHook, act } from "@testing-library/react";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { useGraphHistory } from "../use-graph-history";
+
+function renderHistory(vault: string) {
+  return renderHook(() => useGraphHistory(vault), {
+    wrapper: ({ children }: { children: ReactNode }) => createElement(CurrentUserProvider, {
+      user: { user_id: "history-test", username: "reader", email: "reader@example.com", is_admin: false, display_name: null, auth_method: "local", key_class: null }, children,
+    }),
+  });
+}
 
 beforeEach(() => localStorage.clear());
 
 describe("useGraphHistory · recent", () => {
   it("starts empty", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     expect(result.current.recent).toEqual([]);
   });
 
   it("pushes a recent entry", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.pushRecent({ doc_id: "d-1", title: "First" }));
     expect(result.current.recent).toEqual([{ doc_id: "d-1", title: "First" }]);
   });
 
   it("dedupes and moves to front on re-push", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.pushRecent({ doc_id: "d-1", title: "First" }));
     act(() => result.current.pushRecent({ doc_id: "d-2", title: "Second" }));
     act(() => result.current.pushRecent({ doc_id: "d-1", title: "First again" }));
@@ -27,7 +37,7 @@ describe("useGraphHistory · recent", () => {
   });
 
   it("caps at 5 entries (oldest first eviction)", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     for (let i = 1; i <= 7; i++) {
       act(() => result.current.pushRecent({ doc_id: `d-${i}`, title: `T${i}` }));
     }
@@ -37,7 +47,7 @@ describe("useGraphHistory · recent", () => {
   });
 
   it("clearRecent empties storage", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.pushRecent({ doc_id: "d-1", title: "x" }));
     act(() => result.current.clearRecent());
     expect(result.current.recent).toEqual([]);
@@ -46,18 +56,18 @@ describe("useGraphHistory · recent", () => {
 
 describe("useGraphHistory · saved views", () => {
   it("starts empty", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     expect(result.current.saved).toEqual([]);
   });
 
   it("saves a named view", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.saveView("roadmap", "?entry=d-94d8657f&depth=2"));
     expect(result.current.saved).toEqual([{ name: "roadmap", url: "?entry=d-94d8657f&depth=2" }]);
   });
 
   it("overwrites a duplicate name", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.saveView("roadmap", "?entry=d-1"));
     act(() => result.current.saveView("roadmap", "?entry=d-2"));
     expect(result.current.saved.length).toBe(1);
@@ -65,7 +75,7 @@ describe("useGraphHistory · saved views", () => {
   });
 
   it("caps at 20 entries (oldest evicted)", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     for (let i = 1; i <= 22; i++) {
       act(() => result.current.saveView(`v${i}`, `?entry=d-${i}`));
     }
@@ -75,7 +85,7 @@ describe("useGraphHistory · saved views", () => {
   });
 
   it("deleteView removes by name", () => {
-    const { result } = renderHook(() => useGraphHistory("akb"));
+    const { result } = renderHistory("akb");
     act(() => result.current.saveView("a", "?x=1"));
     act(() => result.current.saveView("b", "?y=2"));
     act(() => result.current.deleteView("a"));
@@ -83,8 +93,8 @@ describe("useGraphHistory · saved views", () => {
   });
 
   it("scopes storage per vault", () => {
-    const { result: a } = renderHook(() => useGraphHistory("vault-a"));
-    const { result: b } = renderHook(() => useGraphHistory("vault-b"));
+    const { result: a } = renderHistory("vault-a");
+    const { result: b } = renderHistory("vault-b");
     act(() => a.current.saveView("a-view", "?x=1"));
     expect(b.current.saved).toEqual([]);
   });

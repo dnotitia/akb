@@ -7,6 +7,57 @@ const title = "문서 읽기 작업공간 — Architecture and operating decisio
 const path = "guides/team/operations/reading.md";
 const lastEdited = "2026-09-14T09:42:30Z";
 const createdAt = "2026-08-25T01:05:00Z";
+
+for (const scenario of [
+  { width: 375, height: 812, dark: false, preview: false },
+  { width: 1440, height: 900, dark: false, preview: false },
+  { width: 2560, height: 1440, dark: true, preview: false },
+  { width: 1280, height: 800, dark: false, preview: true },
+]) test(`document publishing belongs to the upper header at ${scenario.width}px ${scenario.preview ? "preview" : "page"}`, async ({ page }, testInfo) => {
+  await page.setViewportSize(scenario);
+  await fixture(page, scenario.dark, false, body, "reading-public");
+  if (scenario.preview) {
+    await page.goto("/search?q=reading&source=document");
+    await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
+  } else await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+  const publishing = page.getByRole("group", { name: "Document publishing", exact: true });
+  const trigger = publishing.getByRole("button", { name: "Public link", exact: true });
+  await expect(trigger).toBeInViewport({ ratio: 1 });
+  const tools = page.getByRole("group", { name: "Document reading tools", exact: true });
+  await expect(tools.getByRole("button", { name: /Publish|Public link/ })).toHaveCount(0);
+  const triggerBox = (await trigger.boundingBox())!;
+  const toolsBox = (await tools.boundingBox())!;
+  expect(triggerBox.y + triggerBox.height).toBeLessThanOrEqual(toolsBox.y + 1);
+  if (!scenario.preview) {
+    const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
+    const navBox = (await navigation.boundingBox())!;
+    expect(Math.abs(triggerBox.y + triggerBox.height / 2 - navBox.y - navBox.height / 2)).toBeLessThanOrEqual(1);
+    await expect(navigation.locator("..").getByRole("button", { name: "Public link", exact: true })).toHaveCount(1);
+  }
+  const canvas = page.locator("#document-reading-canvas");
+  const before = await canvas.boundingBox();
+  await trigger.click();
+  const panel = page.getByRole("dialog", { name: "Public link", exact: true });
+  await expect(panel).toBeVisible();
+  const panelBox = (await panel.boundingBox())!;
+  expect(panelBox.y).toBeGreaterThanOrEqual(triggerBox.y + triggerBox.height);
+  expect(await canvas.boundingBox()).toEqual(before);
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  // On mobile the anchored panel overlays the authored heading; the resource
+  // breadcrumb stays outside it and must dismiss without changing the article.
+  await page.getByRole("navigation", { name: "Resource location", exact: true }).locator('[aria-current="page"]').click();
+  await expect(panel).toHaveCount(0);
+  expect(await canvas.boundingBox()).toEqual(before);
+  await page.screenshot({ path: testInfo.outputPath("publication-upper-header.png") });
+  if (!scenario.preview) {
+    await page.getByRole("navigation", { name: "Vault sections", exact: true }).getByRole("link", { name: "Overview", exact: true }).click();
+    await expect(publishing).toHaveCount(0);
+  }
+});
+
 const body = [
   "# Authored heading",
   "읽기 흐름을 유지하면서 팀의 지식을 탐색합니다. ".repeat(12),
@@ -247,7 +298,25 @@ for (const dark of [false, true]) test(`Vault header keeps a visible divider (${
     await expect(header.getByRole("button", { name: "Search knowledge", exact: true })).toBeVisible();
     await expect(header).toHaveCSS("border-bottom-width", "1px");
     await expect(header).not.toHaveCSS("border-bottom-color", "rgba(0, 0, 0, 0)");
+    // Header identity and the navigation rail should form one paper surface,
+    // including while no Vault is selected.
+    await expect(header).toHaveCSS("background-color", dark ? "rgb(18, 24, 33)" : "rgb(255, 255, 255)");
   }
+});
+
+for (const dark of [false, true]) for (const width of [375, 1440]) test(`Settings header uses the paper surface at ${width}px (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
+  await page.setViewportSize({ width, height: 900 });
+  await fixture(page, dark);
+  for (const path of ["/settings", "/settings?tab=tokens", "/settings/?tab=preferences"]) {
+    await page.goto(path);
+    const header = page.locator(".app-header");
+    await expect(header).toHaveCSS("background-color", dark ? "rgb(18, 24, 33)" : "rgb(255, 255, 255)");
+    await expect(header).toHaveCSS("border-bottom-width", "1px");
+    await expect(header).toHaveCSS("height", "56px");
+    const workspace = page.getByTestId("account-settings-dialog");
+    await expect(workspace).toHaveCSS("background-color", await header.evaluate(el => getComputedStyle(el).backgroundColor));
+  }
+  await page.screenshot({ path: testInfo.outputPath("settings-paper-header.png") });
 });
 
 for (const width of [375, 1440]) test(`search scope keeps a long Vault name accessible at ${width}px`, async ({ page }, testInfo) => {
@@ -387,7 +456,7 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
       await expect(account.getByText("Reading reviewer", { exact: true })).toBeVisible();
       const headerColor = await header.evaluate(el => getComputedStyle(el).backgroundColor);
       expect(await navigation.locator("..").evaluate(el => getComputedStyle(el).backgroundColor)).toBe(headerColor);
-      expect(await page.locator('[aria-label="Document workspace"]').evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(headerColor);
+      expect(await page.locator('[aria-label="Document workspace"]').evaluate(el => getComputedStyle(el).backgroundColor)).toBe(headerColor);
       expect(await account.evaluate(el => getComputedStyle(el).boxShadow)).toBe("none");
     }
     await expectVaultDestinationsReachable(page);
@@ -444,7 +513,7 @@ for (const width of [320, 1440]) test(`long summaries preserve draft state and p
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   const context = page.locator('[data-slot="resource-command-row"]');
   await expect(context.getByText("Draft", { exact: true })).toBeVisible();
-  await expect(context.getByRole("button", { name: "Public link", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Public link", exact: true })).toBeInViewport({ ratio: 1 });
   await expect(context.getByRole("button", { name: `Actions for ${title}`, exact: true })).toBeInViewport({ ratio: 1 });
   const time = context.locator("time");
   await expect(time).toBeVisible();
@@ -497,11 +566,26 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(readingTools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
     const contextBounds = (await page.locator('[data-slot="resource-command-row"]').boundingBox())!;
     const toolBounds = (await readingTools.boundingBox())!;
-    expect(toolBounds.y).toBeGreaterThanOrEqual(contextBounds.y + contextBounds.height);
+    expect(toolBounds.y).toBe(contextBounds.y);
+    const workspaceBounds = (await page.getByRole("region", { name: "Document workspace" }).boundingBox())!;
+    const frameBounds = (await page.locator('[data-slot="document-viewer-frame"]').boundingBox())!;
+    expect(frameBounds.x).toBe(workspaceBounds.x);
+    expect(frameBounds.width).toBe(workspaceBounds.width);
+    expect(frameBounds.y).toBe(workspaceBounds.y);
+    expect(frameBounds.height).toBe(workspaceBounds.height);
+    const surface = await page.locator("#document-reading-canvas").evaluate(el => getComputedStyle(el).backgroundColor);
+    await expect(page.locator(".app-header")).toHaveCSS("background-color", surface);
+    await expect(readingTools).toHaveCSS("background-color", surface);
+    await expect(page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Publish", exact: true })).toBeInViewport({ ratio: 1 });
+    if (toolBounds.width >= 768) {
+      expect(toolBounds.height).toBeLessThanOrEqual(49);
+      const timeBounds = (await readingTools.locator("time").boundingBox())!;
+      const tabBounds = (await readingTools.getByRole("tablist").boundingBox())!;
+      expect(Math.abs(timeBounds.y + timeBounds.height / 2 - tabBounds.y - tabBounds.height / 2)).toBeLessThanOrEqual(1);
+    }
     const modeBounds = (await readingTools.getByRole("tablist").boundingBox())!;
     const actionBounds = (await readingTools.getByRole("group", { name: "Document actions", exact: true }).boundingBox())!;
     expect(modeBounds.x + modeBounds.width).toBeLessThan(actionBounds.x);
-    await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
     const commandMetrics = await page.locator('[data-slot="resource-command-row"] [data-reader-control]').evaluateAll(elements => elements.map(element => ({
       height: element.getBoundingClientRect().height,
       font: getComputedStyle(element).fontSize,
@@ -519,7 +603,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(editTime.locator(".sr-only")).toHaveText(`Last edited: ${exactEditTime}`);
     if (commandWidth >= 512) await expect(editTime).toBeVisible();
     await expect(page.getByRole("group", { name: "Document actions", exact: true })).toBeVisible();
-    await expect(page.getByRole("group", { name: "Publishing and more options", exact: true })).toBeVisible();
+    await expect(page.getByRole("group", { name: "More document options", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open document info", exact: true })).toHaveCount(0);
     const collections = page.locator('[data-slot="vault-collections-sidebar"]');
     await expect(page.getByRole("button", { name: /^Explore vault:/ })).toHaveCount(0);
@@ -553,9 +637,10 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeFocused();
     }
     if (width === 2560) await page.getByRole("button", { name: "Collapse collections", exact: true }).click();
-    for (const name of ["Edit", "Copy markdown", "Publish", `Actions for ${title}`]) {
+    for (const name of ["Edit", "Copy markdown", `Actions for ${title}`]) {
       await expect(page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name, exact: true })).toBeInViewport();
     }
+    await expect(navigation.locator("..").getByRole("button", { name: "Publish", exact: true })).toBeInViewport();
     await expect(page.getByRole("tab", { name: "Raw", exact: true })).toBeInViewport();
     const flow = page.locator(".document-reading-flow .ProseMirror");
     const measures = await flow.evaluate(root => {
@@ -564,9 +649,9 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
         const rect = el.getBoundingClientRect();
         return { x: rect.x, width: rect.width, top: rect.top, margin: getComputedStyle(el).marginTop };
       };
-      return { heading: box("h2"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul") };
+      return { heading: box("h2"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
     });
-    for (const box of [measures.paragraph, measures.table, measures.list]) {
+    for (const box of [measures.paragraph, measures.table, measures.list, measures.code]) {
       expect(box.x).toBeCloseTo(measures.heading.x, 0);
       expect(box.width).toBeCloseTo(measures.heading.width, 0);
     }
@@ -583,7 +668,9 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     expect(image!.height).toBe(40);
     if (width === 375) {
       const commands = await page.locator('[data-slot="resource-command-row"]').boundingBox();
-      expect(commands!.height).toBeLessThanOrEqual(54);
+      // Metadata now belongs to this same toolbar; allow its compact first
+      // line above the 44px touch controls, but no redundant command band.
+      expect(commands!.height).toBeLessThanOrEqual(86);
     }
     if (width >= 1440) expect(measures.heading.top).toBeLessThanOrEqual(220);
     await expect(page.getByRole("region", { name: "Scrollable table" })).toHaveAttribute("tabindex", "0");
@@ -1222,7 +1309,7 @@ test("toolbar publishing opens a review, never publishes on disclosure, and rest
     if (new URL(request.url()).pathname.includes("/publications") && request.method() !== "GET") mutations += 1;
   });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const publish = page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name: "Publish", exact: true });
+  const publish = page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Publish", exact: true });
   await expect(publish).not.toHaveAttribute("aria-disabled", "true");
   await publish.click();
   const review = page.getByRole("dialog", { name: "Publish document" });
@@ -1367,12 +1454,16 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   expect(await page.locator("body").evaluate(element => getComputedStyle(element).pointerEvents)).not.toBe("none");
   await page.screenshot({ path: testInfo.outputPath("public-link-popover.png") });
 
-  // The first outside click must both close the popover and perform its action.
-  const raw = page.getByRole("tab", { name: "Raw", exact: true });
-  await raw.click();
+  // The upper-header popover intentionally overlays the right-hand read modes.
+  // An uncovered reader action must still work on the first outside click.
+  const summary = page.getByRole("button", { name: "Read document summary", exact: true });
+  await summary.click();
   await expect(panel).toHaveCount(0);
-  await expect(raw).toHaveAttribute("aria-selected", "true");
-  await expect(raw).toBeFocused();
+  const summaryPanel = page.getByRole("dialog", { name: "Document summary", exact: true });
+  await expect(summaryPanel).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(summaryPanel).toHaveCount(0);
+  await expect(summary).toBeFocused();
   await trigger.click();
   await trigger.click();
   await expect(panel).toHaveCount(0);
@@ -1784,6 +1875,49 @@ test("foreground access verification preserves the live editor draft", async ({ 
   await expect(page.getByText("Read-only · Draft preserved")).toBeVisible();
   await expect(page.getByRole("button", { name: "Save changes", exact: true })).toBeDisabled();
   await expect(editor).toContainText("A local draft that must survive verification and continues safely");
+});
+
+for (const dark of [false, true]) test(`code blocks follow Standard and Wide reading width (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 2560, height: 1000 });
+  await fixture(page, dark, true, [
+    "# Code alignment", "The code blocks should share this paragraph’s edges.",
+    '```js\nconsole.log("short");\n```',
+    "```text\n" + "long_code_".repeat(250) + "\n```",
+  ].join("\n\n"));
+  await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+  const flow = page.locator(".document-reading-flow .ProseMirror");
+  const paragraph = flow.locator(":scope > p").first();
+  const blocks = flow.locator(":scope > pre");
+  await expect(blocks).toHaveCount(2);
+  const checkEdges = async () => {
+    const text = (await paragraph.boundingBox())!;
+    for (const block of await blocks.all()) {
+      const box = (await block.boundingBox())!;
+      expect(box.x).toBeCloseTo(text.x, 0);
+      expect(box.width).toBeCloseTo(text.width, 0);
+    }
+    expect(await blocks.first().evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    expect(await blocks.last().evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    return text.width;
+  };
+  expect(await checkEdges()).toBe(1024);
+  await page.screenshot({ path: testInfo.outputPath("standard-code-width.png") });
+  const actions = page.getByRole("button", { name: `Actions for ${title}`, exact: true });
+  await actions.click();
+  await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
+  expect(await checkEdges()).toBeGreaterThan(1024);
+  await actions.click();
+  await page.getByRole("menuitemradio", { name: "Standard", exact: true }).click();
+  expect(await checkEdges()).toBe(1024);
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(await checkEdges()).toBeLessThan(375);
+  const longCode = blocks.last();
+  await expect(longCode).toHaveAttribute("tabindex", "0");
+  await longCode.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(() => longCode.evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
+  await page.screenshot({ path: testInfo.outputPath("mobile-code-width.png") });
 });
 
 test("short prose has no artificial body height", async ({ page }) => {

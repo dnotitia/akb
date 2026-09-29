@@ -48,7 +48,7 @@ export function GraphListView({ nodes, edges, selected, onSelect }: Props) {
   }, [nodes, edges]);
 
   return (
-    <section className="absolute inset-0 overflow-y-auto bg-background rail-scroll" aria-labelledby="graph-list-title">
+    <section className="absolute inset-x-0 bottom-0 top-[var(--graph-tools-bottom,0px)] overflow-y-auto bg-surface pb-16 rail-scroll" aria-labelledby="graph-list-title">
       <div className="mx-auto w-full max-w-6xl px-3 py-4 lg:px-5 lg:py-5">
         <div className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-xs">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-surface-2 px-4 py-3">
@@ -95,7 +95,10 @@ export function GraphListView({ nodes, edges, selected, onSelect }: Props) {
                     <span className="mt-0.5 block truncate text-xs text-foreground-muted" title={location}>
                       {node.group || location}
                     </span>
-                    <span className="mt-1 flex items-center gap-3 text-xs text-foreground-muted md:hidden">
+                    <span className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted md:hidden">
+                      <span className="inline-flex items-center gap-1 capitalize">
+                        <KindSwatch kind={node.kind} />{node.kind}
+                      </span>
                       <span className="inline-flex items-center gap-1">
                         <ArrowUpRight className="h-3 w-3" aria-hidden /> {outgoing} out
                       </span>

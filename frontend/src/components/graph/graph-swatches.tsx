@@ -1,44 +1,43 @@
 // frontend/src/components/graph/graph-swatches.tsx
 //
-// Shared DOM swatches for the graph's visual vocabulary, so the on-canvas
-// legend (GraphCanvas) and the sidebar's legend-as-control (GraphSidebar) read
-// from ONE source instead of re-inlining the kind silhouettes + edge encoding
-// (which must stay in lockstep with traceNode / paintLink on the canvas).
-import { cn } from "@/lib/utils";
+// GraphNodeMarker matches the canvas; KindSwatch uses the app's familiar glyphs.
+// Relations remain neutral; their meaning is
+// communicated by text, while canvas dashes encode source, not relation kind.
+import { FileText, Table2, Paperclip } from "lucide-react";
 import {
-  RELATION_CLASS,
-  RELATION_DASH,
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
 
-/** The kind's canvas silhouette as a small DOM swatch — document = circle,
- *  table = rounded square, file = dashed-ring circle. Mirrors `traceNode`. */
-export function KindSwatch({ kind }: { kind: NodeKind }) {
-  const base = "inline-block h-3 w-3 shrink-0";
-  if (kind === "table")
-    return <span aria-hidden className={cn(base, "border border-foreground rounded-[var(--radius-xs)] bg-surface")} />;
-  if (kind === "file")
-    return <span aria-hidden className={cn(base, "border border-dashed border-foreground-muted rounded-full")} />;
-  return <span aria-hidden className={cn(base, "border border-foreground rounded-full bg-surface-muted")} />;
+/** Flat canvas symbols paired with text in the interactive legend. */
+export function GraphNodeMarker({ kind }: { kind: NodeKind }) {
+  return <svg viewBox="0 0 16 16" aria-hidden className={`h-3.5 w-3.5 shrink-0 ${kind === "table" ? "text-cat-3" : kind === "file" ? "text-cat-4" : "text-cat-1"}`}>
+    {kind === "table" ? <rect x="3.5" y="3.5" width="9" height="9" fill="currentColor" />
+      : kind === "file" ? <path d="M8 1.5 14.5 8 8 14.5 1.5 8Z" fill="currentColor" />
+      : <circle cx="8" cy="8" r="5" fill="currentColor" />}
+  </svg>;
 }
 
-/** A short line in the relation's own canvas encoding — structural ties read
- *  darker + thicker, associative muted + thinner, with each relation's dash —
- *  so the legend/sidebar swatch matches the edge `paintLink` draws. */
-export function RelationSwatch({ relation }: { relation: RelationKind }) {
-  const structural = RELATION_CLASS[relation] === "structural";
-  const dash = RELATION_DASH[relation].join(" ") || undefined;
+/** Kind remains distinguishable without colour. */
+export function KindSwatch({ kind }: { kind: NodeKind }) {
+  const base = "h-3.5 w-3.5 shrink-0";
+  if (kind === "table")
+    return <Table2 aria-hidden className={`${base} text-cat-3`} />;
+  if (kind === "file")
+    return <Paperclip aria-hidden className={`${base} text-cat-4`} />;
+  return <FileText aria-hidden className={`${base} text-cat-1`} />;
+}
+
+export function RelationSwatch(_props: { relation: RelationKind }) {
   return (
-    <svg width="20" height="6" aria-hidden className={structural ? "text-foreground" : "text-foreground-muted"}>
+    <svg width="20" height="6" aria-hidden className="text-foreground-muted">
       <line
         x1="0"
         y1="3"
         x2="20"
         y2="3"
         stroke="currentColor"
-        strokeWidth={structural ? 1.6 : 1.1}
-        strokeDasharray={dash}
+        strokeWidth={1.1}
       />
     </svg>
   );

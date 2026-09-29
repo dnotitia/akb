@@ -11,10 +11,6 @@ describe("MarkdownEditor formatting toolbar", () => {
     render(<MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />);
 
     await user.tab();
-    expect(screen.getByRole("button", { name: "WYSIWYG" })).toHaveFocus();
-    await user.tab();
-    expect(screen.getByRole("button", { name: "Source" })).toHaveFocus();
-    await user.tab();
     expect(screen.getByRole("button", { name: "Paragraph" })).toHaveFocus();
     await user.keyboard("{ArrowRight}");
     expect(screen.getByRole("button", { name: "Heading 1" })).toHaveFocus();
@@ -22,6 +18,13 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(screen.getByRole("button", { name: "Insert image" })).toHaveFocus();
     await user.keyboard("{Home}");
     expect(screen.getByRole("button", { name: "Paragraph" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Editor mode: Visual" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("menuitemradio", { name: "Visual" })).toHaveAttribute("aria-checked", "true");
+    await user.keyboard("{End}{Enter}");
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Markdown source" })).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Editor mode: Markdown" })).toBeVisible();
   });
 
   it("applies the shared bold command to the selected AKB document text", async () => {
@@ -62,7 +65,8 @@ describe("MarkdownEditor formatting toolbar", () => {
     );
 
     await screen.findByRole("textbox", { name: "Document content" });
-    await user.click(screen.getByRole("button", { name: "Source" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
 
     const source = screen.getByRole("textbox", { name: "Document content" });
     expect(source).toHaveValue(`![Before](/api/assets/${previousAssetId})`);
@@ -76,7 +80,8 @@ describe("MarkdownEditor formatting toolbar", () => {
       expect(onChange).toHaveBeenLastCalledWith(`![After](/api/assets/${nextAssetId})`, [nextAssetId]),
     );
 
-    await user.click(screen.getByRole("button", { name: "WYSIWYG" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Visual" }));
     expect(screen.getByRole("textbox", { name: "Document content" }).querySelector("img")).toHaveAttribute(
       "data-markdown-target",
       `/api/assets/${nextAssetId}`,
@@ -99,7 +104,8 @@ describe("MarkdownEditor formatting toolbar", () => {
     editor.focus();
     await user.keyboard("{Control>}a{/Control}");
     await user.click(screen.getByRole("button", { name: "Bold" }));
-    await user.click(screen.getByRole("button", { name: "Source" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
 
     expect(screen.getByRole("textbox", { name: "Document content" })).toHaveValue(
       "**Draft**",
@@ -114,7 +120,8 @@ describe("MarkdownEditor formatting toolbar", () => {
       <MarkdownEditor value="Draft" vault="team" onChange={onChange} />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Source" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
     const source = screen.getByRole("textbox", { name: "Markdown source" });
     rerender(<MarkdownEditor value="Draft" vault="team" readOnly onChange={onChange} />);
 

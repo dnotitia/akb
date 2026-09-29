@@ -63,12 +63,14 @@ test.describe("common Markdown image rendering mock contract", () => {
     ].join("\n");
     await page.goto(startUrl);
 
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toContainText("/api/assets/123e4567-e89b-42d3-a456-426614174000");
     await expect(source).not.toContainText("blob:");
     await source.fill(canonicalMarkdown);
-    await page.getByRole("button", { name: "WYSIWYG", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
     await expect(page.getByRole("textbox", { name: "Document body (markdown)" })).toContainText(
       "Continue below",
     );
@@ -81,7 +83,8 @@ test.describe("common Markdown image rendering mock contract", () => {
     expect(state.document.content).toBe(canonicalMarkdown);
 
     await page.getByRole("button", { name: "Edit" }).click();
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     await expect(page.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(
       canonicalMarkdown,
     );

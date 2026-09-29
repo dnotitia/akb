@@ -3,10 +3,13 @@ import {
   Bookmark,
   Check,
   CircleHelp,
+  ChevronRight,
   File,
   FileText,
   List,
+  Maximize2,
   Network,
+  MoreHorizontal,
   RotateCcw,
   Search,
   SlidersHorizontal,
@@ -14,12 +17,16 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { useDebounce } from "@/hooks/use-debounce";
 import { useGraphHistory } from "@/hooks/use-graph-history";
 import { searchDocs } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { docUri, fileUri, parseUri, tableUri } from "@/lib/uri";
 import { viewToQuery } from "./graph-state";
 import {
   ALL_NODE_KINDS,
@@ -30,17 +37,19 @@ import {
   type NodeKind,
   type RelationKind,
 } from "./graph-types";
-import { KindSwatch, RelationSwatch } from "./graph-swatches";
+import { GraphNodeMarker, KindSwatch, RelationSwatch } from "./graph-swatches";
 import { docIdFromUri } from "./use-graph-data";
 
 export type GraphDisplayMode = "graph" | "list";
+type UpdateView = (update: (current: GraphView) => GraphView) => void;
 
 interface SearchHit {
   docId: string;
-  uri?: string;
+  uri: string;
   title: string;
   kind: NodeKind;
-  source: "search" | "recent" | "hub";
+  source: "search" | "loaded" | "recent";
+  context?: string;
 }
 
 interface ApiSearchResult {
@@ -69,13 +78,11 @@ interface Props {
   hiddenCount: number;
   onUnhideAll: () => void;
   onFit: () => void;
-}
-
-const HOPS_KEY = "akb:graph:hops";
-
-function savedHops(): 1 | 2 | 3 {
-  const value = typeof localStorage !== "undefined" ? localStorage.getItem(HOPS_KEY) : null;
-  return value === "1" ? 1 : value === "3" ? 3 : 2;
+  nodes?: GraphNode[];
+  /** Counts before display filters, limited to resources loaded in this graph. */
+  resourceCounts?: Record<NodeKind, number>;
+  onSelect?: (uri: string) => void;
+  onRearrange?: () => void;
 }
 
 function kindIcon(kind: NodeKind) {
@@ -84,34 +91,49 @@ function kindIcon(kind: NodeKind) {
   return FileText;
 }
 
-export function GraphToolbar({
-  vault,
-  view,
-  onChange,
-  onNavigate,
-  hubs,
-  nodeCount,
-  edgeCount,
-  totalNodes,
-  truncated,
-  focusTitle,
-  displayMode,
-  onDisplayModeChange,
-  orphanCount,
-  hideOrphans,
-  onToggleOrphans,
-  hiddenCount,
-  onUnhideAll,
-  onFit,
-}: Props) {
-  const history = useGraphHistory(vault);
+const RESOURCE_LABELS: Record<NodeKind, string> = {
+  document: "Documents",
+  table: "Tables",
+  file: "Files",
+};
+
+export function GraphToolbar(props: Props) {
+  const user = useCurrentUser();
+  const { revision, checking } = useAccessVerification();
+  const history = useGraphHistory(props.vault);
+  // A scope transition discards transient query/results before the next paint.
+  return <GraphControls key={[user?.user_id, props.vault, revision, checking].join(":")} {...props} history={history} />;
+}
+
+function GraphControls({
+  vault, view, onChange, onNavigate, hubs, nodes, resourceCounts, onSelect, onRearrange,
+  focusTitle, displayMode, onDisplayModeChange, orphanCount, hideOrphans,
+  onToggleOrphans, hiddenCount, onUnhideAll, onFit, history,
+}: Props & { history: ReturnType<typeof useGraphHistory> }) {
+  // URL navigation can commit after another control fires. Compose those
+  // actions against the latest dispatch; external navigation replaces it.
+  const pendingView = useRef(view);
+  useLayoutEffect(() => { pendingView.current = view; }, [view]);
+  const updateView: UpdateView = (update) => {
+    const next = update(pendingView.current);
+    pendingView.current = next;
+    onChange(next);
+  };
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
-  const [searching, setSearching] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [activeUri, setActiveUri] = useState<string>();
+  const [retry, setRetry] = useState(0);
+  const [lookup, setLookup] = useState<{ query: string; status: "loading" | "ready" | "error"; hits: SearchHit[] }>({
+    query: "", status: "ready", hits: [],
+  });
   const searchRootRef = useRef<HTMLDivElement>(null);
-  const debouncedQuery = useDebounce(query, 250);
+  const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const searchId = useId();
+  const resourceCountId = useId();
+  const listId = searchId + "-results";
+  const debouncedQuery = useDebounce(query.trim(), 250);
+  const term = query.trim();
 
   useEffect(() => {
     function closeOnOutside(event: PointerEvent) {
@@ -122,381 +144,254 @@ export function GraphToolbar({
   }, []);
 
   useEffect(() => {
-    if (!debouncedQuery.trim()) {
-      setHits([]);
-      setSearching(false);
-      return;
-    }
-
+    if (!term || term !== debouncedQuery) return;
+    const controller = new AbortController();
     let cancelled = false;
-    setSearching(true);
-    searchDocs(debouncedQuery.trim(), vault, 8)
+    setLookup({ query: term, status: "loading", hits: [] });
+    searchDocs(term, vault, 8, {}, { signal: controller.signal })
       .then((response) => {
         if (cancelled) return;
-        const next = ((response.results || []) as ApiSearchResult[])
-          .slice(0, 8)
-          .map((result): SearchHit | null => {
-            const docId = (result.uri ? docIdFromUri(result.uri) : null) ?? result.path ?? "";
-            if (!docId) return null;
-            const kind: NodeKind =
-              result.source_type === "table"
-                ? "table"
-                : result.source_type === "file"
-                  ? "file"
-                  : "document";
-            return {
-              docId,
-              uri: result.uri,
-              title: result.title || result.path || "Untitled resource",
-              kind,
-              source: "search",
-            };
-          })
-          .filter((item: SearchHit | null): item is SearchHit => item !== null);
-        setHits(next);
-        setActiveIndex(0);
+        const hits = ((response.results || []) as ApiSearchResult[]).flatMap((result): SearchHit[] => {
+          const parsed = parseUri(result.uri);
+          if (result.uri && (!parsed || parsed.kind === "coll" || parsed.kind === "vault")) return [];
+          const kind: NodeKind = parsed?.kind === "table" || parsed?.kind === "file"
+            ? parsed.kind : result.source_type === "table" || result.source_type === "file"
+              ? result.source_type : "document";
+          const path = result.path || "";
+          const slash = path.lastIndexOf("/");
+          const name = path.slice(slash + 1);
+          const collection = slash >= 0 ? path.slice(0, slash) : undefined;
+          const uri = result.uri || (path ? kind === "document" ? docUri(vault, path)
+            : kind === "table" ? tableUri(vault, name, collection) : fileUri(vault, name, collection) : "");
+          const docId = uri ? docIdFromUri(uri) : null;
+          if (!docId) return [];
+          return [{ docId, uri, title: result.title || path || "Untitled resource", kind,
+            source: "search", context: parsed?.collection || collection }];
+        }).slice(0, 8);
+        setLookup({ query: term, status: response.degraded ? "error" : "ready", hits });
       })
       .catch(() => {
-        if (!cancelled) setHits([]);
-      })
-      .finally(() => {
-        if (!cancelled) setSearching(false);
+        if (!cancelled) setLookup({ query: term, status: "error", hits: [] });
       });
+    return () => { cancelled = true; controller.abort(); };
+  }, [term, debouncedQuery, vault, retry]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedQuery, vault]);
-
-  const suggestions = useMemo<SearchHit[]>(() => {
-    if (query.trim()) return hits;
+  const loaded = nodes ?? hubs;
+  const groups = useMemo(() => {
     const seen = new Set<string>();
-    const rows: SearchHit[] = [];
-    for (const recent of history.recent) {
-      if (seen.has(recent.doc_id)) continue;
-      seen.add(recent.doc_id);
-      rows.push({
-        docId: recent.doc_id,
-        uri: recent.uri,
-        title: recent.title,
-        kind: recent.kind || "document",
-        source: "recent",
+    const local = loaded.filter(node => !term || node.name.toLocaleLowerCase().includes(term.toLocaleLowerCase()))
+      .slice(0, 20).map((node): SearchHit => {
+        seen.add(node.uri);
+        return { docId: node.doc_id || docIdFromUri(node.uri) || node.uri, uri: node.uri,
+          title: node.name, kind: node.kind, source: "loaded", context: parseUri(node.uri)?.collection || undefined };
       });
-    }
-    for (const hub of hubs) {
-      const docId = hub.doc_id || docIdFromUri(hub.uri);
-      if (!docId || seen.has(docId)) continue;
-      seen.add(docId);
-      rows.push({ docId, uri: hub.uri, title: hub.name, kind: hub.kind, source: "hub" });
-    }
-    return rows.slice(0, 8);
-  }, [query, hits, history.recent, hubs]);
+    const remote = term && lookup.query === term
+      ? lookup.hits.filter(hit => !seen.has(hit.uri)) : [];
+    // Use current loaded titles for recents: stored metadata is not access proof.
+    const recent = !term ? history.recent.flatMap((entry): SearchHit[] => {
+      const node = loaded.find(node => entry.uri ? node.uri === entry.uri : docIdFromUri(node.uri) === entry.doc_id);
+      if (!node || seen.has(node.uri)) return [];
+      seen.add(node.uri);
+      return [{ docId: entry.doc_id, uri: node.uri, title: node.name, kind: node.kind, source: "recent" }];
+    }) : [];
+    return [
+      { name: "Loaded resources", hits: local },
+      { name: "Recently explored", hits: recent },
+      { name: "Vault search", hits: remote },
+    ].filter(group => group.hits.length > 0);
+  }, [loaded, term, lookup, history.recent]);
+  const suggestions = groups.flatMap(group => group.hits);
+  const activeIndex = Math.max(0, suggestions.findIndex(hit => hit.uri === activeUri));
+  const active = suggestions[activeIndex];
+  const status = lookup.query === term && term === debouncedQuery ? lookup.status : "loading";
+  const activeId = active ? searchId + "-option-" + encodeURIComponent(active.uri) : undefined;
 
-  function focusOn(item: SearchHit) {
+  useEffect(() => {
+    if (!searchOpen || !activeId) return;
+    const option = document.getElementById(activeId);
+    if (option && listRef.current?.contains(option)) option.scrollIntoView({ block: "nearest" });
+  }, [activeId, searchOpen]);
+
+  function choose(item: SearchHit) {
     history.pushRecent({ doc_id: item.docId, title: item.title, kind: item.kind, uri: item.uri });
-    onChange({
-      ...view,
-      entry: item.kind === "document" ? item.docId : item.uri || item.docId,
-      selected: undefined,
-      hops: savedHops(),
-    });
+    if (loaded.some(node => node.uri === item.uri) && onSelect) {
+      onSelect(item.uri);
+    } else {
+      updateView(current => ({ ...current, entry: item.uri, selected: undefined, hops: 1 }));
+    }
     setQuery("");
+    inputRef.current?.focus();
     setSearchOpen(false);
   }
 
-  function setHops(hops: 1 | 2 | 3) {
-    localStorage.setItem(HOPS_KEY, String(hops));
-    onChange({ ...view, hops });
+  const filterCount = ALL_NODE_KINDS.length - view.types.size +
+    ALL_RELATIONS.length - view.relations.size + (hideOrphans ? 1 : 0) + (hiddenCount > 0 ? 1 : 0);
+
+  function toggleType(kind: NodeKind) {
+    updateView(current => {
+      const types = new Set(current.types);
+      if (types.has(kind)) types.delete(kind);
+      else types.add(kind);
+      return { ...current, types };
+    });
   }
 
-  const filterCount =
-    ALL_NODE_KINDS.length - view.types.size +
-    ALL_RELATIONS.length - view.relations.size +
-    (hideOrphans ? 1 : 0) +
-    (hiddenCount > 0 ? 1 : 0);
-
-  const statusText = truncated && totalNodes
-    ? `Showing ${nodeCount} of ${totalNodes} resources`
-    : `${nodeCount} resource${nodeCount === 1 ? "" : "s"}`;
-
   return (
-    <header className="relative z-[var(--z-sticky)] shrink-0 border-b border-border bg-surface">
+    <header className="@container/graph-toolbar relative z-[var(--z-sticky)] flex w-full min-w-0 flex-col gap-2">
       <h1 className="sr-only">Knowledge graph</h1>
-      <div className="flex min-h-14 flex-wrap items-center gap-2 px-3 py-2 lg:px-4">
-        <div ref={searchRootRef} className="relative min-w-0 flex-1 basis-72">
-          <label htmlFor="graph-search" className="sr-only">
-            Find a resource to explore its relationships
-          </label>
-          <Search
-            className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-foreground-muted"
-            aria-hidden
-          />
-          <input
-            id="graph-search"
+      <div className="pointer-events-auto grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-md @min-[40rem]/graph-toolbar:grid-cols-[auto_minmax(0,1fr)_auto] @min-[40rem]/graph-toolbar:gap-x-3">
+        <div role="group" aria-label="Display mode" className="col-span-2 flex items-center gap-1 @min-[40rem]/graph-toolbar:col-span-1">
+          {(["graph", "list"] as const).map(mode => {
+            const Icon = mode === "graph" ? Network : List;
+            return <Button key={mode} type="button" variant="ghost" onClick={() => onDisplayModeChange(mode)} aria-pressed={displayMode === mode}
+              className={cn("relative h-11 min-w-20 flex-1 gap-2 rounded-[var(--radius-sm)] px-3 text-sm focus-visible:ring-inset after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 @min-[40rem]/graph-toolbar:h-9 @min-[40rem]/graph-toolbar:flex-none",
+                displayMode === mode ? "font-semibold text-link after:bg-link hover:bg-surface-hover" : "text-foreground-muted hover:bg-surface-hover hover:text-foreground")}>
+              <Icon className="h-4 w-4" aria-hidden />{mode === "graph" ? "Graph" : "List"}
+            </Button>;
+          })}
+        </div>
+        <div
+          ref={searchRootRef}
+          className="relative w-full min-w-0 justify-self-end @min-[40rem]/graph-toolbar:max-w-md"
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setSearchOpen(false);
+          }}
+        >
+          <label htmlFor={searchId} className="sr-only">Find a resource</label>
+          <Search className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-foreground-muted" aria-hidden />
+          <Input
+            ref={inputRef}
+            id={searchId}
             type="search"
             role="combobox"
+            aria-autocomplete="list"
             aria-expanded={searchOpen}
-            aria-controls="graph-search-results"
-            aria-activedescendant={
-              searchOpen && suggestions[activeIndex]
-                ? `graph-search-option-${activeIndex}`
-                : undefined
-            }
+            aria-controls={listId}
+            aria-activedescendant={searchOpen ? activeId : undefined}
             autoComplete="off"
             value={query}
             onFocus={() => setSearchOpen(true)}
-            onChange={(event) => {
-              setQuery(event.target.value);
-              setSearchOpen(true);
-              setActiveIndex(0);
-            }}
+            onChange={(event) => { setQuery(event.target.value); setSearchOpen(true); setActiveUri(undefined); }}
             onKeyDown={(event) => {
-              if (event.key === "ArrowDown") {
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
                 event.preventDefault();
+                event.stopPropagation();
+                const next = !searchOpen ? event.key === "ArrowDown" ? 0 : suggestions.length - 1
+                  : Math.max(0, Math.min(suggestions.length - 1, activeIndex + (event.key === "ArrowDown" ? 1 : -1)));
                 setSearchOpen(true);
-                setActiveIndex((index) => Math.min(index + 1, suggestions.length - 1));
-              } else if (event.key === "ArrowUp") {
+                setActiveUri(suggestions[next]?.uri);
+              } else if (event.key === "Enter" && searchOpen && active) {
                 event.preventDefault();
-                setActiveIndex((index) => Math.max(index - 1, 0));
-              } else if (event.key === "Enter" && searchOpen && suggestions[activeIndex]) {
+                event.stopPropagation();
+                choose(active);
+              } else if (event.key === "Escape" && searchOpen) {
                 event.preventDefault();
-                focusOn(suggestions[activeIndex]);
-              } else if (event.key === "Escape") {
-                event.preventDefault();
+                event.stopPropagation();
                 setSearchOpen(false);
               }
             }}
-            placeholder="Find a resource to explore…"
-            className="h-10 w-full rounded-[var(--radius-md)] border border-border-strong bg-background pl-9 pr-9 text-sm text-foreground shadow-xs placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            placeholder="Find a resource…"
+            className="h-11 rounded-[var(--radius-md)] bg-background pl-9 pr-11 focus:bg-surface @min-[40rem]/graph-toolbar:h-9"
           />
-          {query && (
-            <button
-              type="button"
-              onClick={() => {
-                setQuery("");
-                setHits([]);
-              }}
-              aria-label="Clear graph search"
-              className="absolute right-2 top-1/2 z-10 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <X className="h-3.5 w-3.5" aria-hidden />
-            </button>
-          )}
-
+          {query && <button type="button" aria-label="Clear graph search"
+            onClick={() => { setQuery(""); setActiveUri(undefined); inputRef.current?.focus(); }}
+            className="absolute right-0 top-1/2 inline-flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring @min-[40rem]/graph-toolbar:h-9 @min-[40rem]/graph-toolbar:w-9">
+            <X className="h-3.5 w-3.5" aria-hidden />
+          </button>}
           {searchOpen && (
-            <div
-              id="graph-search-results"
-              role="listbox"
-              className="absolute inset-x-0 top-[calc(100%+0.5rem)] z-[var(--z-popover)] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg"
-            >
-              <div className="flex items-center justify-between border-b border-border px-3 py-2">
-                <span className="text-xs font-medium text-foreground">
-                  {query.trim() ? "Matches in this Vault" : "Start exploring"}
-                </span>
-                {!query.trim() && history.recent.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={history.clearRecent}
-                    className="text-xs text-foreground-muted hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    Clear recent
-                  </button>
-                )}
+            <div className="absolute left-0 top-[calc(100%+0.5rem)] z-[var(--z-popover)] w-full max-w-[calc(100vw-2rem)] overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface shadow-md">
+              <div className="flex items-center justify-between border-b border-border px-3 py-2 text-xs text-foreground-muted">
+                <span>Select a resource to inspect</span>
+                {!term && history.recent.length > 0 && <button type="button" onClick={history.clearRecent} className="text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">Clear recent</button>}
               </div>
-              <div aria-live="polite" className="sr-only">
-                {searching
-                  ? "Searching"
-                  : `${suggestions.length} graph search suggestion${suggestions.length === 1 ? "" : "s"}`}
-              </div>
-              {searching ? (
-                <div className="px-3 py-6 text-center text-sm text-foreground-muted" role="status">
-                  Searching this Vault…
-                </div>
-              ) : suggestions.length > 0 ? (
-                <ul className="max-h-80 overflow-y-auto py-1 rail-scroll">
-                  {suggestions.map((item, index) => {
+              <div ref={listRef} id={listId} role="listbox" aria-label="Resource suggestions"
+                className="max-h-[min(20rem,50dvh)] overflow-y-auto py-1 rail-scroll">
+                {groups.map(group => <div key={group.name} role="group" aria-label={group.name}>
+                  <p className="px-3 py-1.5 text-xs font-medium text-foreground-muted" aria-hidden>{group.name}</p>
+                  {group.hits.map(item => {
                     const Icon = kindIcon(item.kind);
-                    return (
-                      <li key={`${item.source}:${item.docId}`}>
-                        <button
-                          id={`graph-search-option-${index}`}
-                          type="button"
-                          role="option"
-                          aria-selected={index === activeIndex}
-                          onPointerMove={() => setActiveIndex(index)}
-                          onClick={() => focusOn(item)}
-                          className={cn(
-                            "flex w-full items-center gap-3 px-3 py-2 text-left transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                            index === activeIndex ? "bg-surface-selected" : "hover:bg-surface-hover",
-                          )}
-                        >
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted">
-                            <Icon className="h-4 w-4" aria-hidden />
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-sm font-medium text-foreground">
-                              {item.title}
-                            </span>
-                            <span className="block text-xs text-foreground-muted">
-                              {item.source === "recent"
-                                ? "Recently explored"
-                                : item.source === "hub"
-                                  ? "Connected starting point"
-                                  : item.kind}
-                            </span>
-                          </span>
-                          <span className="text-xs text-link">Focus</span>
-                        </button>
-                      </li>
-                    );
+                    return <button
+                      key={item.uri}
+                      id={searchId + "-option-" + encodeURIComponent(item.uri)}
+                      type="button"
+                      role="option"
+                      tabIndex={-1}
+                      aria-selected={item.uri === active?.uri}
+                      onPointerMove={() => setActiveUri(item.uri)}
+                      onMouseDown={event => event.preventDefault()}
+                      onClick={() => choose(item)}
+                      className={cn("flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                        item.uri === active?.uri ? "bg-surface-selected" : "hover:bg-surface-hover")}
+                    >
+                      <Icon className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium text-foreground">{item.title}</span>
+                        <span className="block truncate text-xs text-foreground-muted">{item.kind}{item.context ? " · " + item.context : ""}</span>
+                      </span>
+                      <span className="text-xs text-link">{loaded.some(node => node.uri === item.uri) ? "Select" : "Focus"}</span>
+                    </button>;
                   })}
-                </ul>
-              ) : (
-                <div className="px-4 py-8 text-center">
-                  <p className="text-sm font-medium text-foreground">
-                    {query.trim() ? "No matching resources" : "No connected starting points yet"}
-                  </p>
-                  <p className="mt-1 text-xs text-foreground-muted">
-                    {query.trim()
-                      ? "Try a title, path, or another term."
-                      : "Create relationships between resources to make exploration useful."}
-                  </p>
-                </div>
-              )}
+                </div>)}
+              </div>
+              {term && status === "loading" && <p role="status" className="border-t border-border px-3 py-3 text-xs text-foreground-muted">Searching this Vault…</p>}
+              {term && status === "error" && <div role="alert" className="border-t border-border p-3 text-xs text-foreground-muted">
+                <p>Vault search is unavailable. Try again.</p>
+                <Button variant="outline" size="sm" className="mt-2" onClick={() => setRetry(value => value + 1)}>Retry Vault search</Button>
+              </div>}
+              {suggestions.length === 0 && (!term || status === "ready") && <p className="px-3 py-4 text-xs text-foreground-muted">
+                {term ? "No matching resources. Try another title or term." : "Type to search this Vault."}
+              </p>}
+              <p aria-live="polite" className="sr-only">{suggestions.length} resource suggestions</p>
             </div>
           )}
         </div>
-
-        <div className="flex min-w-0 items-center gap-1 rounded-[var(--radius-md)] border border-border bg-background p-1">
-          <button
-            type="button"
-            onClick={() => onDisplayModeChange("graph")}
-            aria-pressed={displayMode === "graph"}
-            className={cn(
-              "inline-flex h-8 items-center gap-2 rounded-[var(--radius-sm)] px-3 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-              displayMode === "graph"
-                ? "bg-surface-selected text-surface-selected-foreground shadow-xs"
-                : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-            )}
-          >
-            <Network className="h-3.5 w-3.5" aria-hidden />
-            Graph
-          </button>
-          <button
-            type="button"
-            onClick={() => onDisplayModeChange("list")}
-            aria-pressed={displayMode === "list"}
-            className={cn(
-              "inline-flex h-8 items-center gap-2 rounded-[var(--radius-sm)] px-3 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-              displayMode === "list"
-                ? "bg-surface-selected text-surface-selected-foreground shadow-xs"
-                : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-            )}
-          >
-            <List className="h-3.5 w-3.5" aria-hidden />
-            List
-          </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <GraphFilterMenu view={view} onUpdate={updateView} filterCount={filterCount}
+            orphanCount={orphanCount} hideOrphans={hideOrphans} onToggleOrphans={onToggleOrphans}
+            hiddenCount={hiddenCount} onUnhideAll={onUnhideAll} />
+          <GraphMoreMenu view={view} saved={history.saved} onSave={history.saveView}
+            onDelete={history.deleteView} onNavigate={onNavigate} onFit={onFit} onRearrange={onRearrange} />
         </div>
-
-        <GraphFilterMenu
-          view={view}
-          onChange={onChange}
-          filterCount={filterCount}
-          orphanCount={orphanCount}
-          hideOrphans={hideOrphans}
-          onToggleOrphans={onToggleOrphans}
-          hiddenCount={hiddenCount}
-          onUnhideAll={onUnhideAll}
-        />
-
-        <GraphViewsMenu
-          view={view}
-          saved={history.saved}
-          onSave={history.saveView}
-          onDelete={history.deleteView}
-          onNavigate={onNavigate}
-        />
-
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <Button variant="outline" size="icon" aria-label="Graph help">
-              <CircleHelp className="h-4 w-4" aria-hidden />
-            </Button>
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="end"
-              sideOffset={8}
-              className="z-[var(--z-popover)] w-72 rounded-[var(--radius-lg)] border border-border bg-surface p-3 shadow-lg"
-            >
-              <p className="text-sm font-semibold text-foreground">Explore relationships</p>
-              <ul className="mt-2 space-y-2 text-xs leading-relaxed text-foreground-muted">
-                <li>Click a node to inspect it. Double-click to reveal direct neighbors.</li>
-                <li>Drag the canvas to pan and scroll to zoom. Use List for a keyboard-first view.</li>
-                <li>Search for a resource to switch from the whole Vault to a focused neighborhood.</li>
-              </ul>
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
       </div>
-
-      <div className="flex min-h-10 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border px-3 py-1.5 text-xs lg:px-4">
-        <div className="flex min-w-0 flex-wrap items-center gap-2 text-foreground-muted">
-          {view.entry ? (
-            <>
-              <button
-                type="button"
-                onClick={() => onChange({ ...view, entry: undefined, selected: undefined })}
-                className="font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Whole Vault
-              </button>
-              <span aria-hidden>/</span>
-              <span className="max-w-56 truncate font-medium text-foreground" title={focusTitle || view.entry}>
-                {focusTitle || view.entry}
-              </span>
-              <div className="ml-1 flex items-center rounded-[var(--radius-sm)] border border-border bg-background p-0.5">
-                {([1, 2, 3] as const).map((hops) => (
-                  <button
-                    key={hops}
-                    type="button"
-                    onClick={() => setHops(hops)}
-                    aria-pressed={view.hops === hops}
-                    aria-label={`${hops} hop neighborhood`}
-                    className={cn(
-                      "h-6 min-w-7 rounded-[var(--radius-sm)] px-1.5 tabular-nums transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      view.hops === hops
-                        ? "bg-surface-selected font-medium text-surface-selected-foreground"
-                        : "hover:bg-surface-hover hover:text-foreground",
-                    )}
-                  >
-                    {hops}
-                  </button>
-                ))}
-              </div>
-              <span>hops</span>
-            </>
-          ) : (
-            <span className="font-medium text-foreground">Whole Vault</span>
-          )}
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div role="group" aria-label="Resource types" className="pointer-events-auto flex min-w-0 flex-wrap items-center rounded-[var(--radius-md)] border border-border bg-surface px-1 py-0.5 shadow-xs">
+          <span className="mx-2 hidden text-xs text-foreground-muted @min-[40rem]/graph-toolbar:inline">Show</span>
+          {ALL_NODE_KINDS.map(kind => {
+            const selected = view.types.has(kind);
+            const label = RESOURCE_LABELS[kind];
+            const count = resourceCounts?.[kind];
+            const countId = `${resourceCountId}-${kind}`;
+            return <Button key={kind} type="button" variant="ghost" aria-label={`Show ${label.toLowerCase()}`}
+              aria-pressed={selected} aria-describedby={count === undefined ? undefined : countId}
+              title={count === undefined ? undefined : `${count} ${label.toLowerCase()} loaded in this graph`}
+              onClick={() => toggleType(kind)}
+              className={cn("h-11 gap-1.5 rounded-[var(--radius-sm)] px-1.5 text-xs hover:bg-surface-hover @min-[40rem]/graph-toolbar:h-7 @min-[40rem]/graph-toolbar:px-2",
+                selected ? "text-foreground" : "text-foreground-muted")}>
+              <GraphNodeMarker kind={kind} />
+              <span className={selected ? undefined : "line-through"}>{label}</span>
+              {count !== undefined && <>
+                <span aria-hidden className="min-w-3 text-right tabular-nums text-foreground-muted">{count}</span>
+                <span id={countId} className="sr-only">{`${count} ${label.toLowerCase()} loaded in this graph`}</span>
+              </>}
+              <Check aria-hidden className={cn("h-3 w-3 text-link", !selected && "invisible")} />
+            </Button>;
+          })}
         </div>
-        <div className="flex items-center gap-2 text-foreground-muted">
-          <span className="tabular-nums">{statusText}</span>
-          <span aria-hidden>·</span>
-          <span className="tabular-nums">{edgeCount} relationship{edgeCount === 1 ? "" : "s"}</span>
-          {displayMode === "graph" && nodeCount > 0 && (
-            <>
-              <span aria-hidden>·</span>
-              <button
-                type="button"
-                onClick={onFit}
-                className="font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Fit view
-              </button>
-            </>
-          )}
-        </div>
+        {view.entry && (
+          <div className="pointer-events-auto flex min-w-0 max-w-full flex-wrap items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-2 py-0.5 text-xs shadow-xs">
+            <button type="button" onClick={() => updateView(current => ({ ...current, entry: undefined, selected: undefined, hops: 1 }))}
+              className="min-h-11 font-medium text-link hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring @min-[40rem]/graph-toolbar:min-h-9">Whole Vault</button>
+            <ChevronRight className="h-3 w-3 shrink-0 text-foreground-muted" aria-hidden />
+            <span className="max-w-44 truncate font-medium text-foreground" title={focusTitle || view.entry}>{focusTitle || view.entry}</span>
+            <div role="group" aria-label="Neighborhood depth" className="flex items-center rounded-[var(--radius-sm)] bg-surface-2">
+              {([1, 2, 3] as const).map(hops => <button key={hops} type="button"
+                onClick={() => updateView(current => ({ ...current, hops }))} aria-pressed={view.hops === hops} aria-label={hops + " hop neighborhood"}
+                className={cn("h-11 min-w-11 rounded-[var(--radius-sm)] px-1.5 tabular-nums focus:outline-none focus-visible:ring-2 focus-visible:ring-ring @min-[40rem]/graph-toolbar:h-9 @min-[40rem]/graph-toolbar:min-w-9",
+                  view.hops === hops ? "bg-surface-selected font-medium text-surface-selected-foreground" : "text-foreground-muted hover:bg-surface-hover")}>{hops}</button>)}
+            </div>
+            <span className="text-foreground-muted">hops</span>
+          </div>
+        )}
       </div>
     </header>
   );
@@ -504,7 +399,7 @@ export function GraphToolbar({
 
 function GraphFilterMenu({
   view,
-  onChange,
+  onUpdate,
   filterCount,
   orphanCount,
   hideOrphans,
@@ -514,82 +409,85 @@ function GraphFilterMenu({
 }: Pick<
   Props,
   | "view"
-  | "onChange"
   | "orphanCount"
   | "hideOrphans"
   | "onToggleOrphans"
   | "hiddenCount"
   | "onUnhideAll"
-> & { filterCount: number }) {
+> & { filterCount: number; onUpdate: UpdateView }) {
   function toggleType(kind: NodeKind) {
-    const types = new Set(view.types);
-    if (types.has(kind)) types.delete(kind);
-    else types.add(kind);
-    onChange({ ...view, types });
+    onUpdate(current => {
+      const types = new Set(current.types);
+      if (types.has(kind)) types.delete(kind);
+      else types.add(kind);
+      return { ...current, types };
+    });
   }
 
   function toggleRelation(relation: RelationKind) {
-    const relations = new Set(view.relations);
-    if (relations.has(relation)) relations.delete(relation);
-    else relations.add(relation);
-    onChange({ ...view, relations });
+    onUpdate(current => {
+      const relations = new Set(current.relations);
+      if (relations.has(relation)) relations.delete(relation);
+      else relations.add(relation);
+      return { ...current, relations };
+    });
   }
 
   function reset() {
-    onChange({
-      ...view,
+    onUpdate(current => ({
+      ...current,
       types: new Set(ALL_NODE_KINDS),
       relations: new Set(ALL_RELATIONS),
-    });
+    }));
     if (hideOrphans) onToggleOrphans();
     if (hiddenCount) onUnhideAll();
   }
 
   return (
-    <DropdownMenu.Root>
+    <DropdownMenu.Root modal={false}>
       <DropdownMenu.Trigger asChild>
-        <Button variant="outline" size="md" aria-label={`Filters${filterCount ? `, ${filterCount} active` : ""}`}>
+        <Button variant="outline" size="md" aria-label={`Filters${filterCount ? `, ${filterCount} active` : ""}`} title="Graph filters"
+          className={cn("relative h-11 w-11 gap-2 rounded-[var(--radius-md)] px-2 shadow-none data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground @min-[24rem]/graph-toolbar:w-auto @min-[24rem]/graph-toolbar:px-3 @min-[40rem]/graph-toolbar:h-9",
+            filterCount > 0 && "bg-surface-selected text-surface-selected-foreground")}>
           <SlidersHorizontal className="h-4 w-4" aria-hidden />
-          <span className="hidden sm:inline">Filters</span>
-          {filterCount > 0 && (
-            <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-primary px-1.5 py-0.5 text-xs tabular-nums text-primary-foreground">
-              {filterCount}
-            </span>
-          )}
+          <span className="hidden @min-[24rem]/graph-toolbar:inline">Filters</span>
+          {filterCount > 0 && <span aria-hidden className="absolute -right-1 -top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full border border-border bg-surface-selected px-0.5 text-xs tabular-nums text-surface-selected-foreground">
+            {filterCount}
+          </span>}
         </Button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
           align="end"
           sideOffset={8}
-          className="z-[var(--z-popover)] w-80 rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg"
+          collisionPadding={12}
+          className="z-[var(--z-popover)] max-h-[var(--radix-dropdown-menu-content-available-height)] w-80 max-w-[calc(100vw-1.5rem)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface shadow-md rail-scroll"
         >
           <div className="flex items-center justify-between border-b border-border px-3 py-2.5">
             <div>
-              <p className="text-sm font-semibold text-foreground">Filter the scene</p>
-              <p className="mt-0.5 text-xs text-foreground-muted">Narrow resources without leaving the graph.</p>
+              <p className="text-sm font-semibold text-foreground">Graph filters</p>
+              <p className="mt-0.5 text-xs text-foreground-muted">Filters apply to loaded resources.</p>
             </div>
-            {filterCount > 0 && (
-              <button
-                type="button"
-                onClick={reset}
-                className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs text-link hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                Reset
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={reset}
+              disabled={filterCount === 0}
+              className="inline-flex h-11 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs text-link hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 sm:h-9"
+            >
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+              Reset
+            </button>
           </div>
 
           <div className="p-2">
-            <p className="px-2 pb-1 pt-1 text-xs font-medium text-foreground-muted">Resources</p>
+            <DropdownMenu.Label className="px-2 pb-1 pt-1 text-xs font-medium text-foreground-muted">Resources</DropdownMenu.Label>
             {ALL_NODE_KINDS.map((kind) => (
               <DropdownMenu.CheckboxItem
                 key={kind}
                 checked={view.types.has(kind)}
                 onCheckedChange={() => toggleType(kind)}
                 onSelect={(event) => event.preventDefault()}
-                className="relative flex h-9 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] pl-8 pr-2 text-sm text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover"
+                className="relative flex h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] pl-8 pr-2 text-sm text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover sm:h-9"
               >
                 <DropdownMenu.ItemIndicator className="absolute left-2.5">
                   <Check className="h-3.5 w-3.5 text-primary" aria-hidden />
@@ -600,7 +498,7 @@ function GraphFilterMenu({
             ))}
 
             <DropdownMenu.Separator className="my-2 h-px bg-border" />
-            <p className="px-2 pb-1 text-xs font-medium text-foreground-muted">Relationships</p>
+            <DropdownMenu.Label className="px-2 pb-1 text-xs font-medium text-foreground-muted">Relationships</DropdownMenu.Label>
             <div className="grid grid-cols-1 gap-px sm:grid-cols-2">
               {ALL_RELATIONS.map((relation) => (
                 <DropdownMenu.CheckboxItem
@@ -608,7 +506,7 @@ function GraphFilterMenu({
                   checked={view.relations.has(relation)}
                   onCheckedChange={() => toggleRelation(relation)}
                   onSelect={(event) => event.preventDefault()}
-                  className="relative flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] pl-8 pr-2 text-xs text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover"
+                  className="relative flex min-h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] pl-8 pr-2 text-xs text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover sm:min-h-9"
                 >
                   <DropdownMenu.ItemIndicator className="absolute left-2.5">
                     <Check className="h-3.5 w-3.5 text-primary" aria-hidden />
@@ -627,7 +525,7 @@ function GraphFilterMenu({
                     checked={hideOrphans}
                     onCheckedChange={onToggleOrphans}
                     onSelect={(event) => event.preventDefault()}
-                    className="relative flex min-h-9 cursor-pointer select-none items-center rounded-[var(--radius-sm)] pl-8 pr-2 text-sm text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover"
+                    className="relative flex min-h-11 cursor-pointer select-none items-center rounded-[var(--radius-sm)] pl-8 pr-2 text-sm text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover sm:min-h-9"
                   >
                     <DropdownMenu.ItemIndicator className="absolute left-2.5">
                       <Check className="h-3.5 w-3.5 text-primary" aria-hidden />
@@ -638,7 +536,7 @@ function GraphFilterMenu({
                 {hiddenCount > 0 && (
                   <DropdownMenu.Item
                     onSelect={onUnhideAll}
-                    className="flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2 text-sm text-link outline-none hover:bg-surface-hover focus:bg-surface-hover"
+                    className="flex min-h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2 text-sm text-link outline-none hover:bg-surface-hover focus:bg-surface-hover sm:min-h-9"
                   >
                     <RotateCcw className="h-3.5 w-3.5" aria-hidden />
                     Restore {hiddenCount} hidden resource{hiddenCount === 1 ? "" : "s"}
@@ -653,89 +551,103 @@ function GraphFilterMenu({
   );
 }
 
-function GraphViewsMenu({
-  view,
-  saved,
-  onSave,
-  onDelete,
-  onNavigate,
+function GraphMoreMenu({
+  view, saved, onSave, onDelete, onNavigate, onFit, onRearrange,
 }: {
   view: GraphView;
   saved: Array<{ name: string; url: string }>;
   onSave: (name: string, url: string) => void;
   onDelete: (name: string) => void;
   onNavigate: (url: string) => void;
+  onFit: () => void;
+  onRearrange?: () => void;
 }) {
+  const [panel, setPanel] = useState<"saved" | "help" | null>(null);
   const [name, setName] = useState("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const nameId = useId();
+  const menuItem = "flex min-h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2 text-sm text-foreground outline-none focus:bg-surface-hover sm:min-h-9";
+  const menuLabel = "px-2 py-1.5 text-xs font-medium text-foreground-muted";
 
   function save() {
     const trimmed = name.trim();
     if (!trimmed) return;
-    onSave(trimmed, `?${viewToQuery(view)}`);
+    onSave(trimmed, "?" + viewToQuery(view));
     setName("");
   }
 
   return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <Button variant="outline" size="icon" aria-label="Saved graph views">
-          <Bookmark className="h-4 w-4" aria-hidden />
-        </Button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="end"
-          sideOffset={8}
-          className="z-[var(--z-popover)] w-72 rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-lg"
-        >
-          <div className="px-2 pb-2 pt-1">
-            <p className="text-sm font-semibold text-foreground">Saved views</p>
-            <p className="mt-0.5 text-xs text-foreground-muted">Keep the current focus and filters.</p>
-          </div>
-          <div className="flex gap-1 border-y border-border px-2 py-2">
-            <label htmlFor="graph-view-name" className="sr-only">View name</label>
-            <input
-              id="graph-view-name"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              onKeyDown={(event) => {
-                event.stopPropagation();
-                if (event.key === "Enter") save();
-              }}
-              placeholder="Name this view"
-              className="h-8 min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-background px-2 text-xs text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
-            <Button type="button" size="sm" onClick={save} disabled={!name.trim()}>
-              Save
-            </Button>
-          </div>
-          {saved.length > 0 ? (
-            <ul className="max-h-64 overflow-y-auto py-1 rail-scroll">
-              {saved.map((item) => (
-                <li key={item.name} className="group flex items-center gap-1">
-                  <DropdownMenu.Item
-                    onSelect={() => onNavigate(item.url)}
-                    className="flex h-9 min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 text-sm text-foreground outline-none hover:bg-surface-hover focus:bg-surface-hover"
-                  >
-                    <Bookmark className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
-                    <span className="truncate">{item.name}</span>
-                  </DropdownMenu.Item>
-                  <button
-                    type="button"
-                    onClick={() => onDelete(item.name)}
-                    aria-label={`Delete saved view ${item.name}`}
-                    className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-destructive focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="px-2 py-4 text-center text-xs text-foreground-muted">No saved views yet.</p>
-          )}
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
+    <>
+      <DropdownMenu.Root modal={false}>
+        <DropdownMenu.Trigger asChild>
+          <Button ref={triggerRef} variant="ghost" size="icon" aria-label="More graph actions" title="More graph actions"
+            className="h-11 w-11 shrink-0 rounded-[var(--radius-sm)] data-[state=open]:bg-surface-selected data-[state=open]:text-surface-selected-foreground @min-[40rem]/graph-toolbar:h-9 @min-[40rem]/graph-toolbar:w-9">
+            <MoreHorizontal className="h-4 w-4" aria-hidden />
+          </Button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="end"
+            sideOffset={8}
+            collisionPadding={12}
+            onCloseAutoFocus={event => { if (panel) event.preventDefault(); }}
+            className="z-[var(--z-popover)] max-h-[var(--radix-dropdown-menu-content-available-height)] w-56 max-w-[calc(100vw-1.5rem)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1.5 shadow-md rail-scroll"
+          >
+            <DropdownMenu.Group>
+              <DropdownMenu.Label className={menuLabel}>View</DropdownMenu.Label>
+              <DropdownMenu.Item onSelect={onFit} className={menuItem}><Maximize2 className="h-4 w-4 text-foreground-muted" aria-hidden />Fit view</DropdownMenu.Item>
+              {onRearrange && <DropdownMenu.Item onSelect={onRearrange} className={menuItem}><RotateCcw className="h-4 w-4 text-foreground-muted" aria-hidden />Rearrange</DropdownMenu.Item>}
+            </DropdownMenu.Group>
+            <DropdownMenu.Separator className="my-1 h-px bg-border" />
+            <DropdownMenu.Group>
+              <DropdownMenu.Label className={menuLabel}>Saved views</DropdownMenu.Label>
+              <DropdownMenu.Item onSelect={() => setPanel("saved")} className={menuItem}><Bookmark className="h-4 w-4 text-foreground-muted" aria-hidden />Manage saved views</DropdownMenu.Item>
+            </DropdownMenu.Group>
+            <DropdownMenu.Separator className="my-1 h-px bg-border" />
+            <DropdownMenu.Group>
+              <DropdownMenu.Label className={menuLabel}>Help</DropdownMenu.Label>
+              <DropdownMenu.Item onSelect={() => setPanel("help")} className={menuItem}><CircleHelp className="h-4 w-4 text-foreground-muted" aria-hidden />Graph help</DropdownMenu.Item>
+            </DropdownMenu.Group>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+      <Dialog open={panel !== null} onOpenChange={open => { if (!open) setPanel(null); }}>
+        <DialogContent className="max-w-sm" onCloseAutoFocus={event => {
+          event.preventDefault();
+          triggerRef.current?.focus();
+        }}>
+          <DialogHeader>
+            <DialogTitle>{panel === "saved" ? "Saved graph views" : "Explore relationships"}</DialogTitle>
+            <DialogDescription>{panel === "saved"
+              ? "Save focus, resource types, and relationship filters in this browser. Positions and hidden resources are not saved."
+              : "Read connections, explore a neighborhood, and open the original resource."}</DialogDescription>
+          </DialogHeader>
+          {panel === "saved" ? <>
+            <form onSubmit={event => { event.preventDefault(); save(); }} className="flex gap-2">
+              <label htmlFor={nameId} className="sr-only">View name</label>
+              <Input id={nameId} value={name} onChange={event => setName(event.target.value)} placeholder="Name this view" className="min-w-0 flex-1" />
+              <Button type="submit" disabled={!name.trim()}>Save</Button>
+            </form>
+            {saved.length > 0 ? <ul className="max-h-64 overflow-y-auto rail-scroll">
+              {saved.map(item => <li key={item.name} className="flex items-center gap-1">
+                <button type="button" onClick={() => { onNavigate(item.url); setPanel(null); }}
+                  className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-[var(--radius-sm)] px-2 text-left text-sm text-link hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  <Bookmark className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden /><span className="truncate">{item.name}</span>
+                </button>
+                <Button type="button" variant="ghost" size="icon" onClick={() => onDelete(item.name)} aria-label={"Delete saved view " + item.name}>
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                </Button>
+              </li>)}
+            </ul> : <p className="text-sm text-foreground-muted">No saved views yet.</p>}
+          </> : <ul className="space-y-3 text-sm leading-relaxed text-foreground-muted">
+            <li>Select a resource to inspect its connections. Use Show neighborhood to focus around it.</li>
+            <li>Loaded resources select within this scene. Vault search can open a different neighborhood.</li>
+            <li>Drag to rotate in 3D, right-drag to pan, and scroll to zoom. On touch screens, use two fingers to pan or pinch to zoom.</li>
+            <li>Camera buttons provide the same controls without dragging. Focus the canvas and use arrow keys to rotate, Shift + arrows to pan, + / − to zoom, or Home to fit. List provides a keyboard-accessible view.</li>
+            <li>Pin a position from the resource actions. Rearrange calculates a fresh layout.</li>
+          </ul>}
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

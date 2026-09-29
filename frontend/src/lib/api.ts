@@ -2098,6 +2098,8 @@ export interface GraphApiNode {
   uri: string;
   name?: string;
   resource_type?: string;
+  degree?: number | null;
+  depth?: number | null;
 }
 export interface GraphApiEdge {
   source: string;
@@ -2133,16 +2135,17 @@ export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) 
 export interface GraphOverviewResponse {
   nodes: GraphApiNode[];
   edges: GraphApiEdge[];
-  nodes_total: number;
-  edges_total: number;
-  returned: number;
-  truncated: boolean;
+  // Missing metadata on older servers means unknown, not an empty or complete graph.
+  nodes_total?: number;
+  edges_total?: number;
+  returned?: number;
+  truncated?: boolean;
   // Count of unlinked resources appended as degree-0 isolated nodes (so a vault
   // with no relations still renders its resources, governed by the "Hide
   // orphans" toggle). nodes_total/returned/truncated describe the CONNECTED
   // graph only; `nodes` additionally holds the orphans (len(nodes) = returned +
-  // orphans_returned). INFORMATIONAL — the canvas recomputes its own orphan
-  // count from edge connectivity (graph.tsx), it does not read this field.
+  // orphans_returned). Only server degree=0 confirms an orphan; visible-edge
+  // connectivity can be incomplete after overview truncation or local filtering.
   orphans_returned?: number;
   // True when the orphan set was capped (orphan_limit) — more unlinked
   // resources exist than were returned. Parallel to `truncated` for the

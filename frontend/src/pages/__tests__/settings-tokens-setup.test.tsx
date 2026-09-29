@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import SettingsPage from "../settings";
+import SettingsDialog from "../settings/settings-dialog";
 
 vi.mock("@/lib/api", async () => ({
   ...await vi.importActual<typeof import("@/lib/api")>("@/lib/api"),
@@ -43,7 +43,7 @@ function wrap() {
   return (
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/settings?tab=tokens"]}>
-        <SettingsPage />
+        <SettingsDialog initialTab="tokens" onClose={vi.fn()} />
       </MemoryRouter>
     </QueryClientProvider>
   );

@@ -23,7 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { SearchVaultPicker } from "@/components/search-vault-picker";
+import { SearchVaultPicker, VaultQuerySuggestions } from "@/components/search-vault-picker";
 import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
@@ -85,9 +85,9 @@ const SUGGESTIONS = [
   "onboarding checklist",
 ] as const;
 
-function matchesSearchScope(search: RecentSearch, vault?: string) {
+function matchesSearchScope(search: RecentSearch, vaults: string[]) {
   return search.surface === "global"
-    && (vault ? search.vaults.length === 1 && search.vaults[0] === vault : search.vaults.length === 0);
+    && search.vaults.length === vaults.length && search.vaults.every(vault => vaults.includes(vault));
 }
 
 function resultHref(result: GlobalSearchResult): string {
@@ -117,13 +117,13 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { requestNavigation } = useResourceNavigation();
-  const [vault, setVault] = useState<string | undefined>(contextVault);
+  const [vaults, setVaults] = useState<string[]>(contextVault ? [contextVault] : []);
   const [availableVaults, setAvailableVaults] = useState<string[] | null>(null);
   const [vaultsError, setVaultsError] = useState(false);
   const [vaultsRetry, setVaultsRetry] = useState(0);
   const id = "global";
   const triggerId = `${id}-search-trigger`;
-  const scopeLabel = vault ? `Search in ${vault}` : "Search all accessible vaults";
+  const scopeLabel = vaults.length ? `Search in ${vaults.join(", ")}` : "Search all accessible vaults";
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsScrollRef = useRef<HTMLDivElement>(null);
   const requestId = useRef(0);
@@ -151,12 +151,12 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
 
-  function changeScope(next?: string) {
-    if (vault === next) return;
+  function changeScope(next: string[]) {
+    if (vaults.length === next.length && vaults.every(vault => next.includes(vault))) return;
     // Invalidate immediately: an old response must never be actionable under a
     // newly selected scope, including before the request effect is re-run.
     ++requestId.current;
-    setVault(next);
+    setVaults(next);
     setResults([]);
     setError(null);
     setIncomplete(false);
@@ -193,14 +193,14 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     }
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter(search => matchesSearchScope(search, vault))
+        .filter(search => matchesSearchScope(search, vaults))
         .slice(0, 6),
     );
     const accessible = new Set(availableVaults || []);
     setRecentDocuments(readRecentDocumentViews(currentUserId)
-      .filter(document => (!vault || document.vault === vault) && accessible.has(document.vault))
+      .filter(document => (!vaults.length || vaults.includes(document.vault)) && accessible.has(document.vault))
       .slice(0, 4));
-  }, [currentUserId, open, vault, availableVaults]);
+  }, [currentUserId, open, vaults, availableVaults]);
 
   useEffect(() => {
     const currentRequest = ++requestId.current;
@@ -219,7 +219,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     setActiveIndex(-1);
     setLoading(true);
     const timer = window.setTimeout(() => {
-      void searchDocs(normalizedQuery, vault ? [vault] : [], 12, { source_type: activeSource === "all" ? undefined : activeSource })
+      void searchDocs(normalizedQuery, vaults, 12, { source_type: activeSource === "all" ? undefined : activeSource })
         .then((response) => {
           if (currentRequest !== requestId.current) return;
           const nextResults = (response.results || []) as GlobalSearchResult[];
@@ -242,19 +242,19 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     }, 220);
 
     return () => { window.clearTimeout(timer); ++requestId.current; };
-  }, [normalizedQuery, open, retryKey, activeSource, vault]);
+  }, [normalizedQuery, open, retryKey, activeSource, vaults]);
 
   function rememberGlobalSearch() {
     if (!currentUserId || !normalizedQuery) return;
     recordRecentSearch(currentUserId, {
       query: normalizedQuery,
       mode: "semantic",
-      vaults: vault ? [vault] : [],
+      vaults,
       surface: "global",
     });
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter(search => matchesSearchScope(search, vault))
+        .filter(search => matchesSearchScope(search, vaults))
         .slice(0, 6),
     );
   }
@@ -323,7 +323,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   return (
     <Dialog open={open} onOpenChange={next => {
       if (next) {
-        changeScope(contextVault);
+        changeScope(contextVault ? [contextVault] : []);
         setAvailableVaults(null);
         setVaultsError(false);
       }
@@ -351,16 +351,16 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           inputRef.current?.focus();
         }}
       >
-        <DialogTitle className="sr-only">{vault ? scopeLabel : "Search knowledge"}</DialogTitle>
+        <DialogTitle className="sr-only">{vaults.length ? scopeLabel : "Search knowledge"}</DialogTitle>
         <DialogDescription className="sr-only">
-          {vault ? `Search documents, tables, and files in ${vault}.` : "Search documents, tables, and files across every accessible vault."}
+          {vaults.length ? `Search documents, tables, and files in any selected vault: ${vaults.join(", ")}.` : "Search documents, tables, and files across every accessible vault."}
         </DialogDescription>
 
         <div className="flex shrink-0 items-start gap-2 border-b border-border-strong bg-surface p-2.5 sm:items-center sm:p-3">
-          <div className="flex min-w-0 flex-1 flex-col items-start gap-1 rounded-[var(--radius-md)] border border-border-strong bg-background p-1.5 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring sm:flex-row sm:items-center sm:gap-2.5">
-            <SearchVaultPicker value={vault} contextVault={contextVault} vaults={availableVaults}
+          <div className="@container/scope-query flex min-w-0 flex-1 flex-wrap items-center gap-1.5 rounded-[var(--radius-md)] border border-border-strong bg-background p-1.5 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring">
+            <SearchVaultPicker selected={vaults} contextVault={contextVault} vaults={availableVaults}
               error={vaultsError} onRetry={() => setVaultsRetry(key => key + 1)} onChange={changeScope} />
-            <div className="flex h-9 w-full min-w-0 flex-1 items-center gap-2.5 px-1.5 sm:w-auto">
+            <div className="flex h-9 min-w-0 flex-[1_0_100%] items-center gap-2.5 px-1.5 @min-[30rem]/scope-query:flex-[1_1_12rem]">
             <Search className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
             <label htmlFor={`${id}-search-input`} className="sr-only">
               {scopeLabel}
@@ -392,7 +392,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             {query && !loading && (
               <button
                 type="button"
-                aria-label={vault ? "Clear vault search" : "Clear global search"}
+                aria-label={vaults.length ? "Clear vault search" : "Clear global search"}
                 onClick={() => setQuery("")}
                 className="inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -412,15 +412,21 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           </DialogClose>
         </div>
 
+        <VaultQuerySuggestions query={query} selected={vaults} vaults={availableVaults} onSelect={name => {
+          changeScope([...vaults, name]);
+          setQuery("");
+          inputRef.current?.focus();
+        }} />
+
         <p role="status" aria-live="polite" className="sr-only">
           {resultStatus}
         </p>
 
-        <div className="flex min-h-11 shrink-0 items-center border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
+        <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
           <div
             role="group"
             aria-label={`Limit ${id} search by content kind`}
-            className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5"
+            className="flex min-w-0 flex-[1_0_100%] flex-wrap items-center gap-1.5 md:flex-[1_0_20rem]"
           >
             {SOURCE_FILTERS.map(({ key, label, icon: FilterIcon }) => {
               const selected = activeSource === key;
@@ -498,7 +504,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                       type="button"
                       onClick={() => {
                         if (!currentUserId) return;
-                        clearRecentSearches(currentUserId, { surface: "global", vaults: vault ? [vault] : [] });
+                        clearRecentSearches(currentUserId, { surface: "global", vaults });
                         setRecentSearches([]);
                       }}
                       className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -658,9 +664,9 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                 No results for “{normalizedQuery}”
               </p>
               <p className="mt-1 text-xs text-foreground-muted">
-                {vault ? `No matches in ${vault}. Try fewer words or expand your search.` : "Try fewer words or continue in the search page for exact matching."}
+                {vaults.length ? `No matches in ${vaults.join(", ")}. Try fewer words or expand your search.` : "Try fewer words or continue in the search page for exact matching."}
               </p>
-              {vault && <Button type="button" variant="outline" className="mt-3" onClick={() => { changeScope(undefined); inputRef.current?.focus(); }}>Search all vaults instead</Button>}
+              {vaults.length > 0 && <Button type="button" variant="outline" className="mt-3" onClick={() => { changeScope([]); inputRef.current?.focus(); }}>Search all vaults instead</Button>}
               {activeSource !== "all" && <Button type="button" variant="outline" className="mt-3" onClick={() => setActiveSource("all")}>Show all results</Button>}
             </div>
           )}
@@ -757,7 +763,8 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
               const params = new URLSearchParams();
               if (normalizedQuery) params.set("q", normalizedQuery);
               if (activeSource !== "all") params.set("source", activeSource);
-              const href = `${vault ? `/vault/${encodeURIComponent(vault)}/search` : "/search"}?${params}`;
+              if (vaults.length > 1) params.set("v", vaults.join(","));
+              const href = `${vaults.length === 1 ? `/vault/${encodeURIComponent(vaults[0])}/search` : "/search"}?${params}`;
               if (requestNavigation(href)) navigate(href);
             }}
             className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"

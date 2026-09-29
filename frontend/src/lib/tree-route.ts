@@ -128,6 +128,23 @@ export function kindGroupKey(parentPath: string, kind: ResourceKind): string {
   return `${parentPath || "$root"}:${kind}`;
 }
 
+/** Table names and file IDs do not encode their owning collection path. */
+export function findResourceGroup(
+  nodes: TreeNode[],
+  activeSig: string,
+  parentPath = "",
+): { parentPath: string; kind: ResourceKind } | null {
+  for (const node of nodes) {
+    if (node.kind === "collection") {
+      const match = findResourceGroup(node.children ?? [], activeSig, node.path);
+      if (match) return match;
+    } else if (signatureOf(node) === activeSig) {
+      return { parentPath, kind: node.kind };
+    }
+  }
+  return null;
+}
+
 export function filterTreeByKind(
   nodes: TreeNode[],
   kind: ResourceKind | "all",
@@ -213,7 +230,7 @@ export function flattenVisible(
       const activeLeaf = options.activeSig
         ? kindLeaves.find((leaf) => signatureOf(leaf) === options.activeSig)
         : undefined;
-      const isOpen = forceOpen || Boolean(activeLeaf) || !collapsed.has(key);
+      const isOpen = forceOpen || !collapsed.has(key);
       out.push({
         type: "kind-group",
         kind,

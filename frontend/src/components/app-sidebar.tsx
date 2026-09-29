@@ -16,13 +16,14 @@ import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useCurrentUser } from "@/contexts/current-user-context";
+import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 import { readLegacyVaultFavorites, useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { WorkspacePersonalSections } from "@/components/workspace-personal-sections";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { listVaults } from "@/lib/api";
 import { TooltipText } from "@/components/ui/tooltip-text";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Tooltip,
   TooltipContent,
@@ -67,7 +68,9 @@ export function AppSidebar({
   collapsible?: boolean;
   onCompactChange?: (compact: boolean) => void;
 }) {
-  const { pathname, search } = useLocation();
+  const { pathname } = useLocation();
+  const settings = useSettingsDialog();
+  const navigate = useNavigate();
   const user = useCurrentUser();
   const { favorites, toggleFavorite, importFavorites } = useVaultFavorites();
   const [importOpen, setImportOpen] = useState(false);
@@ -110,8 +113,8 @@ export function AppSidebar({
           compact ? "lg:w-14" : "lg:w-52",
         )}
       >
-        <div className={cn("flex h-14 shrink-0 items-center border-b border-border", compact ? "justify-center" : "px-4")}>
-          <Link to="/" aria-label="AKB home" className="rounded-[var(--radius-sm)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
+        <div className="flex h-14 shrink-0 items-center border-b border-border px-3.5">
+          <Link to="/" aria-label="AKB home" className="flex shrink-0 rounded-[var(--radius-sm)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
             <Logo size={28} wordmark={!compact} variant="header" />
           </Link>
         </div>
@@ -149,7 +152,7 @@ export function AppSidebar({
         <nav
           id="workspace-navigation"
           aria-label="Workspace navigation"
-          className={cn("flex shrink-0 flex-col gap-1 p-2", compact && "items-center")}
+          className="flex shrink-0 flex-col gap-1 p-2"
         >
           {PRIMARY_ITEMS.map((item) => (
             <div key={item.to} className="flex items-center">
@@ -203,13 +206,18 @@ export function AppSidebar({
         {!compact && user && <WorkspacePersonalSections key={user.user_id} userId={user.user_id} vaults={vaults} />}
         {!compact && vaultQuery.isError && <div className="px-4 py-2 text-xs text-foreground-muted" role="status">Personal links unavailable. <button type="button" onClick={() => void vaultQuery.refetch()} className="rounded-[var(--radius-sm)] text-link underline focus-visible:ring-2 focus-visible:ring-ring">Retry</button></div>}
         </div>
-        <nav aria-label="Workspace support" className={cn("flex shrink-0 flex-col gap-1 border-t border-border p-2", compact && "items-center")}>
+        <nav aria-label="Workspace support" className="flex shrink-0 flex-col gap-1 border-t border-border p-2">
           <Tooltip><TooltipTrigger asChild>
-            <button ref={helpTrigger} type="button" onClick={() => setHelpOpen(true)} aria-label="Help" className={cn("flex h-10 items-center gap-3 rounded-[var(--radius-md)] text-sm text-foreground-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset", compact ? "w-10 justify-center" : "w-full px-3")}>
+            <button ref={helpTrigger} type="button" onClick={() => setHelpOpen(true)} aria-label="Help" className="flex h-10 w-full shrink-0 items-center gap-3 rounded-[var(--radius-md)] px-3 text-sm text-foreground-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
               <CircleHelp className="h-4 w-4 shrink-0" aria-hidden />{!compact && "Help"}
             </button>
           </TooltipTrigger>{compact && <TooltipContent side="right">Help</TooltipContent>}</Tooltip>
-          <AppSidebarLink to={pathname === "/settings" ? `${pathname}${search}` : "/settings"} label="Settings" icon={Settings} compact={compact} selected={pathname === "/settings"} />
+          <Tooltip><TooltipTrigger asChild>
+            <button id="workspace-settings-trigger" type="button" aria-label="Settings" aria-haspopup="dialog" onClick={event => settings ? settings.openSettings("profile", event.currentTarget) : navigate("/settings")}
+              className="flex h-10 w-full shrink-0 items-center gap-3 rounded-[var(--radius-md)] px-3 text-sm text-foreground-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+              <Settings className="h-4 w-4 shrink-0" aria-hidden />{!compact && "Settings"}
+            </button>
+          </TooltipTrigger>{compact && <TooltipContent side="right">Settings</TooltipContent>}</Tooltip>
         </nav>
       </aside>
       <ConfirmDialog open={importOpen} onOpenChange={setImportOpen} title="Import saved favorites?" confirmLabel="Import favorites" returnFocusRef={importTrigger}
@@ -223,7 +231,12 @@ export function AppSidebar({
           <p><strong>Recently viewed and Drafts</strong> help you return to work saved in this browser. Drafts are not published documents.</p>
           <p><strong>Watch</strong> a document to receive changes in your Inbox. Pinning does not subscribe you to notifications.</p>
           <p><strong>Search</strong> in the top bar for quick results, or use the Search page for advanced filters.</p>
-          <Link to="/settings?tab=tokens" onClick={() => setHelpOpen(false)} className="inline-flex rounded-[var(--radius-sm)] text-link underline focus-visible:ring-2 focus-visible:ring-ring">Set up an AI tool connection</Link>
+          <Link to="/settings?tab=tokens" onClick={event => {
+            if (settings && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+              event.preventDefault(); setHelpOpen(false);
+              requestAnimationFrame(() => settings.openSettings("tokens", helpTrigger.current));
+            }
+          }} className="inline-flex rounded-[var(--radius-sm)] text-link underline focus-visible:ring-2 focus-visible:ring-ring">Set up an AI tool connection</Link>
         </div>
       </DialogContent></Dialog>
     </TooltipProvider>
@@ -250,8 +263,7 @@ function AppSidebarLink({
       aria-label={compact ? label : undefined}
       aria-current={selected ? "page" : undefined}
       className={cn(
-        "relative flex h-10 min-w-0 flex-auto items-center rounded-[var(--radius-md)] text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        compact ? "w-10 justify-center" : "w-full gap-3 px-3",
+        "relative flex h-10 w-full min-w-0 shrink-0 items-center gap-3 rounded-[var(--radius-md)] px-3 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         selected
           ? "bg-surface-selected text-surface-selected-foreground"
           : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",

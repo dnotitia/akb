@@ -110,9 +110,11 @@ describe("SearchPage · semantic (dense) mode", () => {
     expect(screen.getByTestId("search-tool-row")).toHaveClass(
       "min-h-10",
     );
-    expect(screen.getByTestId("search-scope-row")).toHaveClass(
-      "flex-1",
-      "flex-wrap",
+    expect(commandHeader).toContainElement(
+      screen.getByRole("button", { name: "Search scope: All vaults" }),
+    );
+    expect(screen.getByTestId("search-tool-row")).not.toContainElement(
+      screen.getByRole("button", { name: "Search scope: All vaults" }),
     );
     expect(screen.getByTestId("search-results-pane")).toHaveClass(
       "flex-1",

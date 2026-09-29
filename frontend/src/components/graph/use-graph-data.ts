@@ -1,10 +1,10 @@
 // frontend/src/components/graph/use-graph-data.ts
 import { useQuery } from "@tanstack/react-query";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import {
   getGraph,
   getGraphOverview,
-  type GraphApiNode,
-  type GraphApiEdge,
+  type GraphOverviewResponse,
 } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import { groupOf } from "./cluster";
@@ -18,14 +18,17 @@ import {
   type RelationKind,
 } from "./graph-types";
 
-/** Honest counts behind a possibly-truncated overview, so the UI can render
- *  "showing N of M" instead of silently capping. Only the full-vault overview
- *  load sets this; expansions/filters carry the base load's meta through. */
+/** Overview counts are server evidence, never inferred from the scene size.
+ *  nodesTotal/returned/truncated describe only CONNECTED resources; orphan
+ *  resources are additional. Missing fields from older servers mean unknown.
+ *  Expansions and filters carry the base load's metadata through unchanged. */
 export interface GraphMeta {
-  nodesTotal: number;
-  edgesTotal: number;
-  returned: number;
-  truncated: boolean;
+  nodesTotal?: number;
+  edgesTotal?: number;
+  returned?: number;
+  truncated?: boolean;
+  orphanReturned?: number;
+  orphanTruncated?: boolean;
 }
 
 export interface GraphPayload {
@@ -59,44 +62,54 @@ function normalizeRelation(raw: string | undefined): RelationKind | null {
 /** Convert a backend /graph response into the renderer's payload shape.
  *  Shared by the full-graph load and on-demand node expansion so both map
  *  kinds/relations/groups identically. */
-export function apiToPayload(resp: { nodes: GraphApiNode[]; edges: GraphApiEdge[] }): GraphPayload {
+export function apiToPayload(resp: GraphOverviewResponse): GraphPayload {
   const nodes: GraphNode[] = resp.nodes.map((n) => ({
     uri: n.uri,
     name: n.name || n.uri,
     kind: normalizeKind(n.resource_type),
     group: groupOf(n.uri),
+    degree: n.degree ?? undefined,
+    depth: n.depth ?? undefined,
   }));
   const edges: GraphEdge[] = resp.edges
-    .map((e) => {
+    .map((e): GraphEdge | null => {
       const rel = normalizeRelation(e.relation);
-      return rel ? { source: e.source, target: e.target, relation: rel } : null;
+      return rel ? { source: endpointUri(e.source), target: endpointUri(e.target), relation: rel, kind: e.kind } : null;
     })
     .filter((e): e is GraphEdge => e !== null);
-  return { nodes, edges };
+  const meta: GraphMeta = {
+    nodesTotal: resp.nodes_total,
+    edgesTotal: resp.edges_total,
+    returned: resp.returned,
+    truncated: resp.truncated,
+    orphanReturned: resp.orphans_returned,
+    orphanTruncated: resp.orphans_truncated,
+  };
+  return { nodes, edges, ...(Object.values(meta).some((value) => value !== undefined) ? { meta } : {}) };
 }
 
 export function mergeGraph(a: GraphPayload, b: GraphPayload): GraphPayload {
   const nodeByUri = new Map<string, GraphNode>();
   for (const n of a.nodes) nodeByUri.set(n.uri, n);
   for (const n of b.nodes) if (!nodeByUri.has(n.uri)) nodeByUri.set(n.uri, n);
-  const edgeKey = (e: GraphEdge) => `${e.source}\u0001${e.target}\u0001${e.relation}`;
+  const edgeKey = (e: GraphEdge) => JSON.stringify([
+    endpointUri(e.source), endpointUri(e.target), e.relation, e.kind,
+  ]);
   const edgeKeys = new Set<string>();
   const edges: GraphEdge[] = [];
   for (const e of [...a.edges, ...b.edges]) {
     const k = edgeKey(e);
     if (edgeKeys.has(k)) continue;
     edgeKeys.add(k);
-    edges.push(e);
+    edges.push({ ...e, source: endpointUri(e.source), target: endpointUri(e.target) });
   }
   // `b` is an expansion overlay merged onto base `a`; the base's totals still
   // describe the whole vault, so carry them (not b's neighborhood counts).
   return { nodes: [...nodeByUri.values()], edges, meta: a.meta };
 }
 
-// react-force-graph mutates edge.source/edge.target from string-URI to a
-// node-object reference once the simulation starts. Any downstream filter
-// that does `keep.has(e.source)` would silently drop every edge after the
-// first frame. This extractor normalizes back to the URI string.
+// Legacy graph payloads may carry node-object endpoint references. Normalize
+// them to canonical URI strings for matching, merging, and filtering.
 export function endpointUri(end: unknown): string {
   if (typeof end === "string") return end;
   if (end && typeof end === "object" && "uri" in end) {
@@ -105,10 +118,9 @@ export function endpointUri(end: unknown): string {
   return "";
 }
 
-/** uri → degree (incident visible-edge count). Endpoints are normalized via
- *  endpointUri so it's correct whether the sim has mutated source/target from
- *  URI strings to node objects yet. Shared by the canvas (node sizing + LOD
- *  ranking) and the page (hubs / sr-only list) so the degree rule lives once. */
+/** uri → degree (incident visible-edge count). Normalizes legacy object
+ *  endpoints through endpointUri. Shared by scene labels and page hub ranking
+ *  so the visible-degree rule lives once. */
 export function degreeMap(edges: GraphEdge[]): Map<string, number> {
   const d = new Map<string, number>();
   for (const e of edges) {
@@ -161,7 +173,22 @@ export function impactCones(
 }
 
 export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
-  const nodes = p.nodes.filter((n) => v.types.has(n.kind));
+  return visibleGraph(p, v, new Set(), false);
+}
+
+/** The shared Canvas/List scene. Only server degree=0 establishes that a
+ *  resource is unlinked: a missing visible edge may be filtered or not loaded.
+ *  Clone scene inputs so renderer-owned changes cannot leak into query-cache
+ *  data or another view of the same payload. */
+export function visibleGraph(
+  p: GraphPayload,
+  v: GraphView,
+  hidden: Set<string>,
+  hideOrphans: boolean,
+): GraphPayload {
+  const nodes = p.nodes
+    .filter((n) => v.types.has(n.kind) && !hidden.has(n.uri) && !(hideOrphans && n.degree === 0))
+    .map((n) => ({ ...n }));
   const keep = new Set(nodes.map((n) => n.uri));
   const edges = p.edges
     .filter(
@@ -170,14 +197,12 @@ export function applyFilters(p: GraphPayload, v: GraphView): GraphPayload {
         keep.has(endpointUri(e.source)) &&
         keep.has(endpointUri(e.target)),
     )
-    // Freshen each edge so force-graph mutating source/target on this
-    // render's links doesn't poison the cached base graph for the next
-    // filter toggle. Reset to plain URI strings so the simulation can
-    // re-resolve them against the current node objects.
+    // Keep each scene independent and normalize legacy object endpoints to
+    // canonical URI strings before giving them to the renderer.
     .map((e) => ({
+      ...e,
       source: endpointUri(e.source),
       target: endpointUri(e.target),
-      relation: e.relation,
     }));
   return { nodes, edges, meta: p.meta };
 }
@@ -222,23 +247,17 @@ export function docIdFromUri(uri: string): string | null {
 }
 
 export function useFullGraph(vault: string, enabled: boolean) {
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
   return useQuery({
-    queryKey: ["graph", vault, "overview"],
-    enabled,
+    queryKey: ["graph", user?.user_id, revision, vault, "overview"],
+    enabled: enabled && !!user?.user_id && !checking,
     queryFn: async (): Promise<GraphPayload> => {
       // Degree-ranked overview. `top_k` (200) keeps the highest-degree nodes
       // plus the edges induced among them, with honest totals so the UI can
       // show "showing N of M" instead of the old arbitrary recency cap.
       const resp = await getGraphOverview(vault, 200);
-      return {
-        ...apiToPayload(resp),
-        meta: {
-          nodesTotal: resp.nodes_total,
-          edgesTotal: resp.edges_total,
-          returned: resp.returned,
-          truncated: resp.truncated,
-        },
-      };
+      return apiToPayload(resp);
     },
   });
 }
@@ -261,11 +280,13 @@ export function useNeighborhood(
   entry: string | undefined,
   hops: 1 | 2 | 3,
 ) {
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
   return useQuery({
-    queryKey: ["graph", vault, "neighborhood", entry, hops],
-    enabled: !!entry,
+    queryKey: ["graph", user?.user_id, revision, vault, "neighborhood", entry, hops],
+    enabled: !!entry && !!user?.user_id && !checking,
     // Single server-side BFS call (was N per-node /relations round trips).
-    // `enabled: !!entry` gates this query; entry is defined here.
+    // The enabled guard requires a resource and a verified account.
     queryFn: () => fetchNeighbors(vault, entry!, hops, 200),
   });
 }

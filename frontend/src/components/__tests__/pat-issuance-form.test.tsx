@@ -79,7 +79,9 @@ it("prevents duplicate issuance and requires checking an uncertain result before
   fireEvent.submit(form); fireEvent.submit(form);
   expect(posts()).toHaveLength(1);
   await act(async () => resolve(json({}, 503)));
-  expect(screen.getByRole("link", { name: "Review token list" })).toBeVisible();
+  const review = screen.getByRole("link", { name: "Review token list (opens in a new tab)" });
+  expect(review).toBeVisible();
+  expect(review).toHaveAttribute("target", "_blank");
   expect(screen.queryByRole("button", { name: "Create token" })).not.toBeInTheDocument();
 });
 

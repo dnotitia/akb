@@ -9,6 +9,8 @@ import DocumentPage from "@/pages/document";
 import { readRecentDocumentViews } from "@/lib/recent-document-views";
 import { listDocumentEditDrafts } from "@/lib/document-draft";
 import { ResourceNavigationProvider, useResourceNavigation } from "@/contexts/resource-navigation-context";
+import { VaultHeaderActionsProvider } from "@/components/vault-header-actions";
+import { VaultSectionNavigation } from "@/components/vault-navigation-menu";
 
 const editorAssetIds = vi.hoisted(() => ({ value: [] as readonly string[] }));
 const editorCallbacks = vi.hoisted(() => ({
@@ -218,11 +220,13 @@ function renderAt(url: string, withNavigation = false) {
         <CurrentUserProvider user={access.user ?? CURRENT_USER} checking={access.checking} revision={access.revision}>
           <VaultRefreshProvider refetchVaults={vi.fn()} refetchTree={vi.fn()}>
             <ResourceNavigationProvider>
+            <VaultHeaderActionsProvider>
             {withNavigation && <GuardedSearchLink />}
             <Routes>
-              <Route path="/vault/:name/doc/:id" element={<DocumentPage />} />
+              <Route path="/vault/:name/doc/:id" element={<><VaultSectionNavigation vault="v" /><DocumentPage /></>} />
               <Route path="/vault/:name/search" element={<div>Vault search destination</div>} />
             </Routes>
+            </VaultHeaderActionsProvider>
             </ResourceNavigationProvider>
           </VaultRefreshProvider>
         </CurrentUserProvider>
@@ -776,8 +780,10 @@ describe("DocumentPage view toggle", () => {
     const documentActions = screen.getByRole("group", { name: "Document actions" });
     expect(screen.getByRole("group", { name: "Document reading tools" })).toContainElement(documentActions);
     expect(documentActions).toContainElement(copyMarkdown);
-    const information = screen.getByRole("group", { name: "Publishing and more options" });
-    expect(information).toContainElement(screen.getByRole("button", { name: "Publish" }));
+    const information = screen.getByRole("group", { name: "More document options" });
+    const publish = screen.getByRole("button", { name: "Publish" });
+    expect(screen.getByRole("navigation", { name: "Vault sections" }).parentElement).toContainElement(publish);
+    expect(screen.getByRole("group", { name: "Document reading tools" })).not.toContainElement(publish);
     expect(screen.queryByRole("button", { name: "Open document info" })).not.toBeInTheDocument();
     expect(information).toContainElement(screen.getByRole("button", { name: "Actions for DocTitle" }));
     expect(document.getElementById("document-reading-canvas")).not.toHaveClass(
@@ -908,6 +914,22 @@ describe("DocumentPage view toggle", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Edit" })).toHaveFocus());
   });
 
+  it("starts editing at the document title and discloses title help on demand", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "owner" });
+    renderAt("/vault/v/doc/notes%2Fhello.md");
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }));
+    const title = screen.getByRole("textbox", { name: "Document title" });
+    await waitFor(() => expect(title).toHaveFocus());
+    const help = screen.getByText(/Editing it keeps the document path/);
+    expect(help).not.toBeVisible();
+    await user.click(screen.getByText("About document titles"));
+    expect(help).toBeVisible();
+    expect(title).toHaveValue("DocTitle");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+
   it("confirms before Cancel discards body edits and then returns to reading", async () => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue({ role: "owner" });
@@ -953,7 +975,7 @@ describe("DocumentPage view toggle", () => {
     ).toBeInTheDocument();
   });
 
-  it("separates document context from reading tools while keeping summary disclosure accessible", async () => {
+  it("keeps document context and actions together while keeping summary disclosure accessible", async () => {
     getDocumentMock.mockResolvedValue(
       makeDoc({ summary: "A concise orientation to the document before the full body begins." }),
     );
@@ -970,14 +992,16 @@ describe("DocumentPage view toggle", () => {
     expect(readingTools).toContainElement(statistics);
     expect(readingTools).toContainElement(copyMarkdown);
     expect(within(readingTools).getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
-    expect(readingTools).not.toContainElement(summary);
+    expect(readingTools).toContainElement(summary);
     const context = summary.closest('[data-slot="resource-command-row"]');
-    expect(context).not.toContainElement(statistics);
-    expect(context).toContainElement(screen.getByRole("button", { name: "Publish" }));
+    expect(context).toContainElement(statistics);
+    expect(context).not.toContainElement(screen.getByRole("button", { name: "Publish" }));
     expect(screen.queryByRole("region", { name: "Document summary" })).not.toBeInTheDocument();
     expect(document.querySelector('[data-slot="document-context-panel"]')).not.toBeInTheDocument();
     await userEvent.setup().click(summary);
     expect(await screen.findByRole("dialog", { name: "Document summary" })).toHaveTextContent("A concise orientation");
+    await userEvent.setup().keyboard("{Escape}");
+    await waitFor(() => expect(summary).toHaveFocus());
   });
 
   it("omits the reading summary when the backend does not provide one", async () => {

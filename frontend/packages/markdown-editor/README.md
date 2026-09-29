@@ -53,6 +53,14 @@ The editor instance returned by `useMarkdownEditor` is an opaque package handle;
 it can only be passed to the package-owned surfaces, commands, and state hooks.
 Products persist the Markdown delivered by `onChange` or `onSourceChange`.
 
+Editing updates remain synchronous so an immediate save includes the last
+keystroke. Each parser owns its tokenizer registry; repeated editing or mounting
+must not extend Marked's global parser. Immutable document snapshots reuse their
+serialization, and reference extraction reuses unchanged blocks. Cursor-only
+transactions update formatting controls without reparsing the document. Target
+resolution is refreshed when references or context change, not for unrelated
+typing. Metadata caches are bounded or weakly keyed, not a retained draft history.
+
 `MarkdownSurface` owns the editor content element and accepts
 `contentClassName` / `contentAttributes` for product styling and accessible
 semantics. `MarkdownViewer` additionally accepts presentation-only
@@ -236,7 +244,13 @@ function ProductEditor({ markdown, onChange, readOnly }) {
 synchronization, and focus handoff. Its `toolbar` slot appears only in
 WYSIWYG mode; `modeLabels`, `sourceClassName`, and the source label props adapt
 copy, theme, and accessible names. `modeSwitchDisabled` can lock mode changes
-during an active product operation such as an upload. The optional
+during an active product operation such as an upload. An optional `renderHeader`
+slot receives `{ mode, onModeChange, disabled, toolbar }` to combine the mode
+picker and formatting controls in a product-specific header. Render the supplied
+`toolbar` once (it is `null` in Source), respect `disabled`, and keep the picker
+available in both modes. The slot retains image-upload context; the surface still
+owns mode changes, draft synchronization, and focus handoff. Without this slot,
+the default two-button header and toolbar layout are unchanged. The optional
 `autoFocus` focuses the WYSIWYG editor after it mounts when the surface is
 editable. The optional
 `onWysiwygDragOverCapture` / `onWysiwygDropCapture` handlers attach product

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { SettingsLink } from "@/contexts/settings-dialog-context";
 import {
   AlertTriangle,
   BookText,
@@ -1241,6 +1242,7 @@ function OnboardStep({
   );
 
   if (to) {
+    if (to.startsWith("/settings")) return <SettingsLink to={to} className={className}>{content}</SettingsLink>;
     return (
       <Link to={to} className={className}>
         {content}

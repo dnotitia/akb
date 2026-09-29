@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 for (const width of [1440, 2560, 375]) {
-  test(`Account settings workspace ${width}px`, async ({ page }, testInfo) => {
+  test(`Account settings dialog ${width}px`, async ({ page }, testInfo) => {
     test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures.");
     await page.setViewportSize({ width, height: 1000 });
     await page.emulateMedia({ reducedMotion: "reduce" });
@@ -22,20 +22,17 @@ for (const width of [1440, 2560, 375]) {
     await page.screenshot({ path: testInfo.outputPath("profile.png"), fullPage: true, animations: "disabled" });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     if (width >= 1024) {
-      const settingsLink = page.getByTestId("app-sidebar").getByRole("link", { name: "Settings", exact: true });
-      await expect(settingsLink).toHaveAttribute("aria-current", "page");
-      expect((await settingsLink.boundingBox())!.height).toBe(40);
-      const support = (await page.getByRole("navigation", { name: "Workspace support" }).boundingBox())!;
-      expect(support.y + support.height).toBe(1000);
+      const dialog = page.getByTestId("account-settings-dialog");
+      const bounds = (await dialog.boundingBox())!;
       const rail = (await page.getByRole("complementary", { name: "Settings navigation" }).boundingBox())!;
-      expect(rail.y).toBe(0);
-      expect(rail.width).toBe(220);
-      expect((await page.locator("header.app-header").boundingBox())!.x).toBe(rail.x + rail.width);
+      expect(rail.y).toBeGreaterThan(bounds.y);
+      expect(rail.width).toBe(208);
+      expect(bounds.width).toBeLessThanOrEqual(1040);
       await page.getByLabel("Display name", { exact: true }).fill("Unsaved name");
       await page.getByRole("tab", { name: "Appearance", exact: true }).click();
-      const dialog = page.getByRole("dialog", { name: "Discard unsaved changes?" });
-      await expect(dialog).toBeVisible();
-      await dialog.getByRole("button", { name: "Keep editing" }).click();
+      const confirmation = page.getByRole("dialog", { name: "Discard unsaved changes?" });
+      await expect(confirmation).toBeVisible();
+      await confirmation.getByRole("button", { name: "Keep editing" }).click();
       await expect(page.getByLabel("Display name", { exact: true })).toHaveValue("Unsaved name");
       await page.getByRole("tab", { name: "Appearance", exact: true }).click();
       await page.getByRole("button", { name: "Discard changes", exact: true }).click();
@@ -48,17 +45,18 @@ for (const width of [1440, 2560, 375]) {
     await page.screenshot({ path: testInfo.outputPath("settings-light.png"), fullPage: true, animations: "disabled" });
     await page.getByRole("radio", { name: "Dark", exact: true }).locator("..").click();
     await expect(page.locator("html")).toHaveClass(/dark/);
-    await expect(page.getByTestId("settings-workspace")).toHaveCSS("background-color", "rgb(18, 24, 33)");
+    await expect(page.getByTestId("account-settings-dialog")).toHaveCSS("background-color", "rgb(18, 24, 33)");
     await page.screenshot({ path: testInfo.outputPath("settings-dark.png"), fullPage: true, animations: "disabled" });
     if (width >= 1024) {
+      await page.getByRole("button", { name: "Close settings", exact: true }).click();
       await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
-      const settingsLink = page.getByTestId("app-sidebar").getByRole("link", { name: "Settings", exact: true });
-      await expect(settingsLink).toHaveAttribute("aria-current", "page");
-      await expect(settingsLink).toHaveAttribute("href", "/settings?tab=preferences");
-      expect((await settingsLink.boundingBox())!.height).toBe(40);
-      await settingsLink.hover();
+      const settingsButton = page.getByTestId("app-sidebar").getByRole("button", { name: "Settings", exact: true });
+      await expect(settingsButton).toHaveAttribute("aria-haspopup", "dialog");
+      expect((await settingsButton.boundingBox())!.height).toBe(40);
+      await settingsButton.hover();
       await expect(page.getByRole("tooltip", { name: "Settings", exact: true })).toBeVisible();
-      await settingsLink.click();
+      await settingsButton.click();
+      await page.getByRole("tab", { name: "Appearance", exact: true }).click();
       await expect(page.getByRole("radio", { name: "Dark", exact: true })).toBeChecked();
       await page.screenshot({ path: testInfo.outputPath("settings-compact.png"), fullPage: true, animations: "disabled" });
     }

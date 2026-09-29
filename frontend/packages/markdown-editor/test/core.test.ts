@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { marked } from 'marked'
+import { MarkdownManager } from '@tiptap/markdown'
 
 import {
   canonicalizeMarkdown,
@@ -11,7 +13,7 @@ import {
   serializeMarkdown,
   uploadMarkdownBatch,
 } from '../src/index.js'
-import { createMarkdownEditor, markdownCommands } from '../src/core.js'
+import { createMarkdownEditor, markdownCommands, serializeEditorMarkdown } from '../src/core.js'
 import type { MarkdownAdapters } from '../src/index.js'
 
 const fixture = `# 공통 문법
@@ -45,6 +47,54 @@ afterEach(() => {
 })
 
 describe('Markdown conformance core', () => {
+  it('extracts emitted editor metadata without reparsing the entire Markdown', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: '[Guide](akb://fixture/doc/guide.md) @alice\n\n`@hidden`' })
+    editors.push(editor)
+    const parse = vi.spyOn(MarkdownManager.prototype, 'parse')
+    const markdown = serializeEditorMarkdown(editor)
+    expect(extractMarkdownTargets(markdown)).toEqual([{ kind: 'document', target: 'akb://fixture/doc/guide.md' }])
+    expect(extractMarkdownReferences(markdown).map(item => item.value)).toEqual(['@alice'])
+    expect(parse.mock.calls.every(([source]) => source !== markdown)).toBe(true)
+  })
+  it('resolves freshly typed references the same way before and after metadata cache eviction', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: 'Hello ' })
+    editors.push(editor)
+    editor.view.dispatch(editor.state.tr.insertText('@alice REEF-123', editor.state.doc.content.size - 1))
+    const markdown = serializeEditorMarkdown(editor)
+    const expected = [
+      { kind: 'person', id: 'alice', value: '@alice' },
+      { kind: 'issue', id: 'REEF-123', value: 'REEF-123' },
+    ]
+    expect(extractMarkdownReferences(markdown)).toEqual(expected)
+    for (let index = 0; index < 5; index += 1) extractMarkdownReferences(`Unrelated ${index}`)
+    expect(extractMarkdownReferences(markdown)).toEqual(expected)
+  })
+  it('does not accumulate tokenizers in the process-wide parser across edits and editor mounts', () => {
+    const sharedUse = vi.spyOn(marked, 'use')
+    for (let index = 0; index < 3; index += 1) {
+      const document = parseMarkdown('Hello **team** @alice REEF-123')
+      expect(serializeMarkdown(document)).toContain('Hello **team**')
+      const editor = createMarkdownEditor({ initialMarkdown: 'Hello **team**' })
+      editors.push(editor)
+      expect(serializeEditorMarkdown(editor)).toBe('Hello **team**')
+    }
+    // A growing global tokenizer chain makes every subsequent parse slower.
+    expect(sharedUse).not.toHaveBeenCalled()
+  })
+
+  it('serializes an unchanged immutable document only once, including cursor-only updates', () => {
+    const editor = createMarkdownEditor({ initialMarkdown: 'Hello **team**' })
+    editors.push(editor)
+    const toJSON = vi.spyOn(editor, 'getJSON')
+    expect(serializeEditorMarkdown(editor)).toBe('Hello **team**')
+    editor.commands.setTextSelection(3)
+    expect(serializeEditorMarkdown(editor)).toBe('Hello **team**')
+    expect(toJSON).toHaveBeenCalledTimes(1)
+    editor.commands.insertContent('!')
+    expect(serializeEditorMarkdown(editor)).toBe('He!llo **team**')
+    expect(toJSON).toHaveBeenCalledTimes(2)
+  })
+
   it('parses common Markdown/GFM/math/Mermaid/raw constructs into one semantic document', () => {
     const document = parseMarkdown(fixture)
     const types = document.content?.map(node => node.type)

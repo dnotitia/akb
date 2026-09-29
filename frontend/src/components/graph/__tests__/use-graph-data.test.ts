@@ -3,6 +3,7 @@ import {
   apiToPayload,
   mergeGraph,
   applyFilters,
+  visibleGraph,
   docIdFromUri,
   endpointUri,
   degreeMap,
@@ -12,6 +13,57 @@ import { docUri } from "@/lib/uri";
 import { ALL_RELATIONS, DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
 
 describe("apiToPayload", () => {
+  it("preserves server degree, traversal depth, and relation source without guessing missing values", () => {
+    const out = apiToPayload({
+      nodes: [
+        { uri: "a", resource_type: "document", degree: 8, depth: 0 },
+        { uri: "b", resource_type: "file", degree: 0, depth: 1 },
+        { uri: "legacy", resource_type: "table" },
+      ],
+      edges: [
+        { source: "a", target: "b", relation: "references", kind: "explicit" },
+        { source: "a", target: "b", relation: "references", kind: "implicit" },
+        { source: "a", target: "legacy", relation: "links_to" },
+      ],
+    });
+    expect(out.nodes.map(({ degree, depth }) => ({ degree, depth }))).toEqual([
+      { degree: 8, depth: 0 },
+      { degree: 0, depth: 1 },
+      { degree: undefined, depth: undefined },
+    ]);
+    expect(out.edges.map((edge) => edge.kind)).toEqual(["explicit", "implicit", undefined]);
+  });
+
+  it("preserves connected-only totals separately from returned orphan counts", () => {
+    const out = apiToPayload({
+      nodes: [
+        { uri: "connected", degree: 3 },
+        { uri: "orphan-a", degree: 0 },
+        { uri: "orphan-b", degree: 0 },
+      ],
+      edges: [],
+      nodes_total: 10,
+      edges_total: 12,
+      returned: 1,
+      truncated: true,
+      orphans_returned: 2,
+      orphans_truncated: false,
+    });
+    expect(out.meta).toEqual({
+      nodesTotal: 10, edgesTotal: 12, returned: 1, truncated: true,
+      orphanReturned: 2, orphanTruncated: false,
+    });
+  });
+
+  it("leaves absent overview metadata unknown even for a small legacy response", () => {
+    const out = apiToPayload({ nodes: [{ uri: "a" }], edges: [] });
+    expect(out.meta?.nodesTotal).toBeUndefined();
+    expect(out.meta?.returned).toBeUndefined();
+    expect(out.meta?.truncated).toBeUndefined();
+    expect(out.meta?.orphanReturned).toBeUndefined();
+    expect(out.meta?.orphanTruncated).toBeUndefined();
+  });
+
   it("maps backend nodes/edges into the renderer shape", () => {
     const out = apiToPayload({
       nodes: [
@@ -44,6 +96,26 @@ describe("apiToPayload", () => {
 });
 
 describe("mergeGraph", () => {
+  it("deduplicates normalized endpoints without combining different relation sources", () => {
+    const mutatedEdge = {
+      source: { uri: "a" }, target: { uri: "b" }, relation: "references", kind: "explicit",
+    } as unknown as GraphEdge;
+    const merged = mergeGraph(
+      { nodes: [], edges: [mutatedEdge] },
+      { nodes: [], edges: [
+        { source: "a", target: "b", relation: "references", kind: "explicit" },
+        { source: "a", target: "b", relation: "references", kind: "implicit" },
+        { source: "a", target: "b", relation: "references" },
+      ] },
+    );
+    expect(merged.edges).toEqual([
+      { source: "a", target: "b", relation: "references", kind: "explicit" },
+      { source: "a", target: "b", relation: "references", kind: "implicit" },
+      { source: "a", target: "b", relation: "references" },
+    ]);
+    expect(merged.edges[0]).not.toBe(mutatedEdge);
+  });
+
   it("dedupes nodes by uri", () => {
     const a: GraphNode[] = [{ uri: "n1", name: "A", kind: "document" }];
     const b: GraphNode[] = [
@@ -137,6 +209,15 @@ describe("applyFilters", () => {
     expect(out2.edges[0]).not.toBe(out1.edges[0]);
   });
 
+  it("isolates renderer node coordinates from the source payload", () => {
+    const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
+    out.nodes[0].x = 100;
+    out.nodes[0].fx = 50;
+    expect(nodes[0].x).toBeUndefined();
+    expect(nodes[0].fx).toBeUndefined();
+    expect(applyFilters({ nodes, edges }, DEFAULT_VIEW).nodes[0].x).toBeUndefined();
+  });
+
   it("passes through when filters are at defaults", () => {
     const out = applyFilters({ nodes, edges }, DEFAULT_VIEW);
     expect(out.nodes.length).toBe(3);
@@ -163,6 +244,64 @@ describe("applyFilters", () => {
     const linkEdges: GraphEdge[] = [{ source: "a", target: "b", relation: "links_to" }];
     const out = applyFilters({ nodes: linkNodes, edges: linkEdges }, DEFAULT_VIEW);
     expect(out.edges.map((e) => e.relation)).toEqual(["links_to"]);
+  });
+});
+
+describe("visibleGraph", () => {
+  const nodes: GraphNode[] = [
+    { uri: "a", name: "A", kind: "document", degree: 4, depth: 0 },
+    { uri: "b", name: "B", kind: "table", degree: 1 },
+    { uri: "c", name: "C", kind: "file", degree: 1 },
+    { uri: "orphan", name: "Unlinked", kind: "document", degree: 0 },
+    { uri: "unknown", name: "Legacy", kind: "document" },
+  ];
+  const edges: GraphEdge[] = [
+    { source: "a", target: "b", relation: "references", kind: "explicit" },
+    { source: "a", target: "c", relation: "references", kind: "implicit" },
+    { source: "a", target: "unknown", relation: "related_to" },
+  ];
+
+  it("applies kind, relation, and hidden-resource filters to one shared scene", () => {
+    const view = {
+      ...DEFAULT_VIEW,
+      types: new Set<GraphNode["kind"]>(["document", "table"]),
+      relations: new Set<GraphEdge["relation"]>(["references"]),
+    };
+    const out = visibleGraph({ nodes, edges }, view, new Set(["unknown"]), false);
+    expect(out.nodes.map((node) => node.uri)).toEqual(["a", "b", "orphan"]);
+    expect(out.edges).toEqual([
+      { source: "a", target: "b", relation: "references", kind: "explicit" },
+    ]);
+    const hidden = visibleGraph({ nodes, edges }, DEFAULT_VIEW, new Set(["a"]), false);
+    expect(hidden.nodes.map((node) => node.uri)).toEqual(["b", "c", "orphan", "unknown"]);
+    expect(hidden.edges).toEqual([]);
+  });
+
+  it("hides only server-confirmed orphans even when filters remove every visible edge", () => {
+    const view = { ...DEFAULT_VIEW, relations: new Set<GraphEdge["relation"]>() };
+    const out = visibleGraph({ nodes, edges }, view, new Set(), true);
+    expect(out.nodes.map((node) => node.uri)).toEqual(["a", "b", "c", "unknown"]);
+    expect(out.edges).toEqual([]);
+  });
+
+  it("keeps a node's nonzero global degree distinct from its empty visible neighborhood", () => {
+    const out = visibleGraph({ nodes, edges: [] }, DEFAULT_VIEW, new Set(), true);
+    expect(out.nodes.find((node) => node.uri === "a")).toMatchObject({ degree: 4, depth: 0 });
+    expect(out.nodes.some((node) => node.uri === "unknown")).toBe(true);
+  });
+
+  it("preserves source and metadata while cloning simulation inputs", () => {
+    const meta = { nodesTotal: 15, returned: 3, orphanReturned: 1, orphanTruncated: true };
+    const mutated = [{ ...edges[0], source: nodes[0], target: nodes[1] }] as unknown as GraphEdge[];
+    const out = visibleGraph({ nodes, edges: mutated, meta }, DEFAULT_VIEW, new Set(), false);
+    expect(out.meta).toEqual(meta);
+    expect(out.edges).toEqual([
+      { source: "a", target: "b", relation: "references", kind: "explicit" },
+    ]);
+    out.nodes[0].x = 90;
+    out.edges[0].source = "changed";
+    expect(nodes[0].x).toBeUndefined();
+    expect(mutated[0].source).toBe(nodes[0]);
   });
 });
 

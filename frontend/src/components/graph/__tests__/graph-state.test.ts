@@ -55,19 +55,38 @@ describe("graph-state codec", () => {
     expect(back.selected).toBe(uri);
   });
 
-  it("ignores unknown hops values and clamps to 2", () => {
-    const back = queryToView(new URLSearchParams("hops=7"));
-    expect(back.hops).toBe(2);
+  it("defaults a focused scene to direct connections when hops is absent", () => {
+    const back = queryToView(new URLSearchParams("entry=d-123"));
+    expect(back.hops).toBe(1);
+    expect(viewToQuery({ ...DEFAULT_VIEW, entry: "d-123", hops: 1 })).toBe("entry=d-123");
   });
 
-  // Back-compat: the doc page's "Open in graph" link historically emitted
-  // `?focus=<akb-uri>`, but the graph only consumes `entry=<doc-id>`. queryToView
-  // normalizes a focus URI to its doc-id so already-shipped links land focused
-  // instead of silently dumping the whole vault graph.
-  it("normalizes a legacy ?focus=<uri> into the entry doc-id", () => {
+  it("preserves an explicitly requested second connection step", () => {
+    const back = queryToView(new URLSearchParams("entry=d-123&hops=2"));
+    expect(back.hops).toBe(2);
+    expect(viewToQuery(back)).toContain("hops=2");
+  });
+
+  it("ignores unknown hops values and defaults to direct connections", () => {
+    const back = queryToView(new URLSearchParams("hops=7"));
+    expect(back.hops).toBe(1);
+  });
+
+  // Keep resource kind in legacy focus links so a file or table cannot be
+  // accidentally reconstructed as a document URI when its scene is fetched.
+  it("preserves a legacy ?focus=<uri> as a canonical entry", () => {
     const uri = "akb://akb/doc/specs/2026/foo.md";
     const back = queryToView(new URLSearchParams(`focus=${encodeURIComponent(uri)}`));
-    expect(back.entry).toBe("specs/2026/foo.md");
+    expect(back.entry).toBe(uri);
+  });
+
+  it.each([
+    "akb://akb/coll/assets/file/asset-id",
+    "akb://akb/coll/data/table/metrics",
+  ])("preserves the resource kind in a legacy focus link: %s", (uri) => {
+    const back = queryToView(new URLSearchParams(`focus=${encodeURIComponent(uri)}`));
+    expect(back.entry).toBe(uri);
+    expect(queryToView(new URLSearchParams(viewToQuery(back))).entry).toBe(uri);
   });
 
   it("prefers entry over focus when both are present", () => {
@@ -85,5 +104,12 @@ describe("graph-state codec", () => {
   it("ignores unknown node kinds in types", () => {
     const back = queryToView(new URLSearchParams("types=document,bogus"));
     expect(back.types).toEqual(new Set(["document"]));
+  });
+
+  it("roundtrips deliberately empty filters without restoring every resource and relation", () => {
+    const view: GraphView = { ...DEFAULT_VIEW, types: new Set(), relations: new Set() };
+    const back = queryToView(new URLSearchParams(viewToQuery(view)));
+    expect(back.types.size).toBe(0);
+    expect(back.relations.size).toBe(0);
   });
 });

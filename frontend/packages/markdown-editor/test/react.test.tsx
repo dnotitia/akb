@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { EditorContent } from '@tiptap/react'
+import { MarkdownManager } from '@tiptap/markdown'
 import { useEffect, useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -8,6 +9,7 @@ import {
   MarkdownEditor,
   MarkdownEditingSurface,
   MarkdownSurface,
+  MarkdownToolbar,
   MarkdownViewer,
   useMarkdownCommands,
   useMarkdownEditor,
@@ -57,6 +59,36 @@ function ResolutionProbe({
 }
 
 describe('React surfaces', () => {
+  it('does not serialize or parse the whole document when only moving the cursor', async () => {
+    let handle: ReturnType<typeof useMarkdownEditor> = null
+    function Surface() {
+      const editor = useMarkdownEditor({ initialMarkdown: 'A **large** document\n\nAnother paragraph' })
+      useEffect(() => { handle = editor }, [editor])
+      return <><MarkdownToolbar editor={editor} /><MarkdownSurface editor={editor} editable /></>
+    }
+    const { container, unmount } = render(<Surface />)
+    await waitFor(() => expect(container.querySelector('.ProseMirror')).toBeTruthy())
+    const editor = getMarkdownEditor(handle)!
+    const getMarkdown = vi.spyOn(editor, 'getMarkdown')
+    const parse = vi.spyOn(MarkdownManager.prototype, 'parse')
+    await act(async () => { editor.commands.setTextSelection(5) })
+    expect(getMarkdown).not.toHaveBeenCalled()
+    expect(parse).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Bold' })).toHaveAttribute('aria-pressed', 'true')
+    unmount()
+  })
+
+  it('keeps resolved targets when editing unrelated text', async () => {
+    const resolve = vi.fn(async (target: string) => ({ target, status: 'available' as const, runtimeUrl: '/resolved' }))
+    const resolver = { resolve }
+    const { rerender, unmount } = render(<ResolutionProbe markdown="[Document](akb://fixture/doc/a.md)" resolver={resolver} />)
+    await waitFor(() => expect(screen.getByTestId('resolution')).toHaveAttribute('data-runtime-url', '/resolved'))
+    rerender(<ResolutionProbe markdown="Changed text. [Document](akb://fixture/doc/a.md)" resolver={resolver} />)
+    await act(async () => {})
+    expect(resolve).toHaveBeenCalledTimes(1)
+    unmount()
+  })
+
   it('renders viewer and editor with the same semantic HTML', async () => {
     const markdown = '# 제목\n\n본문'
     const { container } = render(
@@ -187,6 +219,41 @@ describe('React surfaces', () => {
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('처음'))
     await userEvent.setup().click(getByRole('button', { name: 'update' }))
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('외부 갱신'))
+  })
+
+  it('lets a product combine controls without replacing the mode and draft lifecycle', async () => {
+    const user = userEvent.setup()
+    function CustomHeader() {
+      const [markdown, setMarkdown] = useState('Draft')
+      const [locked, setLocked] = useState(false)
+      const editor = useMarkdownEditor({ initialMarkdown: 'Draft', onChange: setMarkdown })
+      return <>
+        <button onClick={() => setLocked(!locked)}>Lock switching</button>
+        <MarkdownEditingSurface editor={editor} markdown={markdown} onSourceChange={setMarkdown}
+          modeSwitchDisabled={locked} toolbar={<button>Format draft</button>}
+          renderHeader={({ mode, onModeChange, disabled, toolbar }) => <div>
+            {toolbar}
+            <button disabled={disabled} onClick={() => onModeChange(mode === 'source' ? 'wysiwyg' : 'source')}>Change mode</button>
+          </div>}>
+          {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+        </MarkdownEditingSurface>
+      </>
+    }
+    const { container } = render(<CustomHeader />)
+    const view = within(container)
+    expect(view.queryByRole('button', { name: 'WYSIWYG' })).toBeNull()
+    expect(view.getAllByRole('button', { name: 'Format draft' })).toHaveLength(1)
+    await user.click(view.getByRole('button', { name: 'Lock switching' }))
+    expect(view.getByRole('button', { name: 'Change mode' })).toBeDisabled()
+    await user.click(view.getByRole('button', { name: 'Lock switching' }))
+    await user.click(view.getByRole('button', { name: 'Change mode' }))
+    expect(view.queryByRole('button', { name: 'Format draft' })).toBeNull()
+    const source = view.getByRole('textbox', { name: 'Markdown source' })
+    await user.clear(source)
+    await user.type(source, 'Updated draft')
+    await user.click(view.getByRole('button', { name: 'Change mode' }))
+    expect(container.querySelector('.ProseMirror')).toHaveTextContent('Updated draft')
+    expect(view.getAllByRole('button', { name: 'Format draft' })).toHaveLength(1)
   })
 
   it('preserves selection and undo history across an unchanged mode roundtrip', async () => {

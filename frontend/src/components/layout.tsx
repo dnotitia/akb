@@ -23,6 +23,7 @@ import type { VaultNavigationControl } from "@/components/vault-shell";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { ResourceLocationProvider } from "@/contexts/resource-location-context";
 import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
+import { SettingsDialogProvider } from "@/contexts/settings-dialog-context";
 import { SearchStatusProvider } from "@/hooks/use-search-status";
 import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -45,6 +46,7 @@ function identityFingerprint(user: CurrentUser): string {
 export function Layout() {
   const queryClient = useQueryClient();
   const location = useLocation();
+  const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
   const [session, setSession] = useState<
     | { status: "checking"; user: null }
     | { status: "authenticated"; user: CurrentUser }
@@ -57,7 +59,7 @@ export function Layout() {
   const searchControlsRef = useRef<HTMLDivElement>(null);
   const accountControlsRef = useRef<HTMLDivElement>(null);
   const [minimumVaultWorkspaceWidth, setMinimumVaultWorkspaceWidth] = useState(656);
-  const [vaultSidebarCollapsed, setVaultSidebarCollapsed] = useState(true);
+  const [vaultSidebar, setVaultSidebar] = useState({ active: wide, compact: true });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem(APP_SIDEBAR_COMPACT_KEY) === "true";
@@ -153,13 +155,18 @@ export function Layout() {
     };
   }, [activeFingerprint, activeUser, queryClient]);
 
-  const wide = appRouteBoundaryForPath(location.pathname) === "vault-shell";
+  // A manual Vault choice belongs to this continuous visit, including section
+  // and history navigation. Reset only when the accepted route crosses the
+  // workspace boundary, before children render with a stale rail width.
+  if (vaultSidebar.active !== wide) {
+    setVaultSidebar({ active: wide, compact: true });
+  }
   const isSearchWorkspace = Boolean(matchPath("/search", location.pathname));
   const isSearchRoute = isSearchWorkspace || Boolean(matchPath("/vault/:name/search", location.pathname));
-  const isSettingsWorkspace = location.pathname === "/settings";
-  const viewportLocked = wide || isSearchWorkspace || isSettingsWorkspace;
-  const sidebarCompact = wide ? vaultSidebarCollapsed : sidebarCollapsed;
-  const surface: AppSurface = location.pathname === "/" || isSearchRoute ? "paper" : "workspace";
+  const isSettingsWorkspace = Boolean(matchPath("/settings", location.pathname));
+  const viewportLocked = wide || isSearchWorkspace;
+  const sidebarCompact = wide ? vaultSidebar.compact : sidebarCollapsed;
+  const surface: AppSurface = location.pathname === "/" || wide || isSearchRoute || isSettingsWorkspace ? "paper" : "workspace";
 
   useLayoutEffect(() => {
     const search = searchControlsRef.current;
@@ -180,7 +187,7 @@ export function Layout() {
 
   function setSidebarCompact(compact: boolean) {
     if (wide) {
-      setVaultSidebarCollapsed(compact);
+      setVaultSidebar({ active: true, compact });
       return;
     }
     setSidebarCollapsed(compact);
@@ -222,7 +229,8 @@ export function Layout() {
     <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
     <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
     <ResourceNavigationProvider>
-    <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : isSettingsWorkspace ? 220 : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
+    <SettingsDialogProvider identity={session.user.user_id}>
+    <div className={`${rootClass} [--workspace-gutter:1rem] sm:[--workspace-gutter:1.5rem] lg:[--workspace-gutter:2rem] xl:[--workspace-gutter:3rem] 2xl:[--workspace-gutter:9rem] ${sidebarCompact ? "lg:pl-14" : "lg:pl-52"}`} style={{ "--vault-navigation-width": `${wide ? vaultNavigationWidth : 0}px` } as CSSProperties} aria-busy={revalidating || undefined}>
       {revalidating && (
         <InlineLoadingState
           label="Refreshing access…"
@@ -363,6 +371,7 @@ export function Layout() {
         </div>
       </div>
     </div>
+    </SettingsDialogProvider>
     </ResourceNavigationProvider>
     </ResourceLocationProvider>
     </CurrentUserProvider>
@@ -388,7 +397,7 @@ function AppShellLoading({ compact, surface }: { compact: boolean; surface: AppS
 
         <div className="flex min-h-0 flex-1">
           <aside className={`fixed inset-y-0 left-0 hidden h-dvh border-r border-border bg-surface lg:block ${compact ? "w-14" : "w-52"}`}>
-            <div className="flex h-14 items-center justify-center border-b border-border">
+            <div className="flex h-14 items-center border-b border-border px-3.5">
               <Logo size={28} wordmark={!compact} variant="header" />
             </div>
             <div className="space-y-2 p-3">

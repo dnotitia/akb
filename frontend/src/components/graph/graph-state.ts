@@ -38,31 +38,29 @@ export function viewToQuery(v: GraphView): string {
 
 function parseHops(raw: string | null): 1 | 2 | 3 {
   if (raw === "1") return 1;
+  if (raw === "2") return 2;
   if (raw === "3") return 3;
-  return 2;
+  return DEFAULT_VIEW.hops;
 }
 
 export function queryToView(q: URLSearchParams): GraphView {
   const types = q.get("types");
   const rel = q.get("rel");
-  // `entry` carries the doc-id the rest of the graph consumes. `focus` is a
-  // back-compat alias that carries a full akb:// URI (the doc page's "Open in
-  // graph" link historically emitted `?focus=<uri>`) — normalize it to a
-  // doc-id so already-shipped links still land focused. `entry` wins if both
-  // are present; an unparseable focus URI falls through to the whole graph.
+  // Preserve resource kind in canonical focus links. Legacy entry document
+  // paths remain supported by the API adapter; entry wins over the alias.
   const focus = q.get("focus");
-  const entry = q.get("entry") || (focus ? docIdFromUri(focus) ?? undefined : undefined);
+  const entry = q.get("entry") || (focus && docIdFromUri(focus) ? focus : undefined);
   return {
     entry: entry || undefined,
     // Read `hops` first; fall back to legacy `depth` from pre-0.3.0
     // bookmarked URLs.
     hops: parseHops(q.get("hops") ?? q.get("depth")),
-    types: types
+    types: types !== null
       ? new Set(
           types.split(",").filter((s): s is NodeKind => (ALL_KIND_SET as Set<string>).has(s)),
         )
       : new Set(ALL_NODE_KINDS),
-    relations: rel
+    relations: rel !== null
       ? new Set(
           rel.split(",").filter((s): s is RelationKind => (ALL_REL_SET as Set<string>).has(s)),
         )

@@ -15,6 +15,7 @@ import { markNotification, markNotificationSnapshot, NotificationConflict, Notif
 import { parseUri } from "@/lib/uri";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
 import { cn, timeAgo } from "@/lib/utils";
+import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 
 const categories = [
   { value: "all", label: "All" },
@@ -35,6 +36,7 @@ export function NotificationInbox({ compact = false, heading, onNavigate, state,
   const menuNavigation = useRef(false);
   const client = useQueryClient();
   const navigate = useNavigate();
+  const settings = useSettingsDialog();
   const location = useLocation();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -82,7 +84,7 @@ export function NotificationInbox({ compact = false, heading, onNavigate, state,
             if (!menuNavigation.current) return;
             event.preventDefault(); menuNavigation.current = false;
             window.requestAnimationFrame(() => {
-              const action = () => navigate("/settings?tab=notifications");
+              const action = () => settings ? settings.openSettings("notifications", document.getElementById("notifications-trigger")) : navigate("/settings?tab=notifications");
               if (onNavigate) onNavigate(action); else action();
             });
           }}>

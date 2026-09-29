@@ -1,4 +1,6 @@
 import * as React from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { Check, ChevronDown } from "lucide-react";
 import {
   DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   MarkdownEditingSurface,
@@ -29,8 +31,47 @@ import {
   EDITOR_IMAGE_MIME_TYPES,
 } from "@/lib/image-assets";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 
 type MarkdownEditorInstance = NonNullable<ReturnType<typeof useMarkdownEditor>>;
+type EditorMode = "wysiwyg" | "source";
+
+function EditorModeMenu({ mode, disabled, onModeChange }: {
+  mode: EditorMode;
+  disabled: boolean;
+  onModeChange: (mode: EditorMode) => void;
+}) {
+  const changed = React.useRef(false);
+  const label = mode === "source" ? "Markdown" : "Visual";
+  return (
+    <DropdownMenu.Root modal={false} onOpenChange={(open) => { if (open) changed.current = false; }}>
+      <DropdownMenu.Trigger asChild>
+        <Button variant="ghost" size="sm" disabled={disabled} aria-label={`Editor mode: ${label}`} className="h-8 shrink-0 gap-1.5 px-2 text-xs text-foreground-muted">
+          {label}<ChevronDown className="h-3.5 w-3.5" aria-hidden />
+        </Button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align="end" sideOffset={6}
+          onCloseAutoFocus={(event) => { if (changed.current) event.preventDefault(); }}
+          className="z-[var(--z-popover)] min-w-40 rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md">
+          <DropdownMenu.RadioGroup value={mode} onValueChange={(next) => {
+            if (next !== "wysiwyg" && next !== "source") return;
+            changed.current = next !== mode;
+            onModeChange(next);
+          }}>
+            {([{ value: "wysiwyg", label: "Visual" }, { value: "source", label: "Markdown" }] as const).map((option) => (
+              <DropdownMenu.RadioItem key={option.value} value={option.value}
+                className="relative flex min-h-9 cursor-pointer items-center rounded-[var(--radius-sm)] py-1.5 pl-8 pr-3 text-sm outline-none data-[highlighted]:bg-surface-hover data-[state=checked]:text-link">
+                <DropdownMenu.ItemIndicator className="absolute left-2"><Check className="h-4 w-4" aria-hidden /></DropdownMenu.ItemIndicator>
+                {option.label}
+              </DropdownMenu.RadioItem>
+            ))}
+          </DropdownMenu.RadioGroup>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
 
 const AKB_MARKDOWN_SLASH_OPTIONS: MarkdownSlashCommandOptions = {
   messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
@@ -110,6 +151,7 @@ function EditorToolbar({
       }}
       table={AKB_MARKDOWN_TABLE_OPTIONS}
       className={cn(
+        "static! min-w-0 flex-1 border-b-0!",
         appearance === "canvas"
           ? "bg-surface/95 px-5 py-2 backdrop-blur-sm sm:px-8 lg:px-10"
           : appearance === "workspace"
@@ -153,6 +195,7 @@ export interface MarkdownEditorProps {
   autoFocus?: boolean;
   readOnly?: boolean;
   className?: string;
+  sourceClassName?: string;
   appearance?: "framed" | "canvas" | "workspace";
   ariaLabel?: string;
   ariaLabelledby?: string;
@@ -180,6 +223,7 @@ export function MarkdownEditor({
   autoFocus,
   readOnly = false,
   className,
+  sourceClassName: sourceClassNameOverride,
   appearance = "framed",
   ariaLabel,
   ariaLabelledby,
@@ -383,6 +427,7 @@ export function MarkdownEditor({
       : appearance === "workspace"
         ? "border-0 bg-transparent px-4 py-4"
         : "border border-border bg-surface px-5 py-4 transition-colors",
+    sourceClassNameOverride,
   );
   const contentAttributes = React.useMemo(() => ({
     role: "textbox",
@@ -426,6 +471,14 @@ export function MarkdownEditor({
         sourceAriaLabelledby={ariaLabelledby}
         sourceRequired={required}
         sourceClassName={sourceClassName}
+        renderHeader={({ mode, onModeChange, disabled, toolbar }) => (
+          <div className="flex min-h-11 items-start justify-between gap-1 border-b border-border bg-surface pr-2" data-editor-controls>
+            {toolbar ?? <span className="px-4 py-3 text-xs text-foreground-muted">{mode === "source" ? "Markdown source" : "Read only"}</span>}
+            <div className="shrink-0 py-1.5">
+              <EditorModeMenu mode={mode} onModeChange={onModeChange} disabled={disabled} />
+            </div>
+          </div>
+        )}
       >
         <MarkdownSurface
           editor={editor}

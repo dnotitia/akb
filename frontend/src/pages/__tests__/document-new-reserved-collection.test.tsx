@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -164,17 +164,38 @@ describe("DocumentCreateDialog reserved collection feedback", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("keeps document properties available through the details inspector", async () => {
+  it("groups the required destination and all metadata in a separate document details sidebar", async () => {
     const user = userEvent.setup();
     renderPage("notes");
 
-    const toggle = screen.getByRole("button", { name: /show document details/i });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const details = screen.getByRole("complementary", { name: "Document details" });
+    expect(within(details).getByLabelText(/^collection/i)).toBeRequired();
+    expect(within(details).getByLabelText(/^summary/i)).toBeVisible();
+    expect(within(details).getByRole("button", { name: "Document type" })).toBeVisible();
+    expect(within(details).getByLabelText(/^domain/i)).toBeVisible();
+    expect(within(details).getByLabelText(/^tags/i)).toBeVisible();
+    expect(within(screen.getByRole("main", { name: "Document composition" })).queryByLabelText(/^collection/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Edit collection: notes" }));
+    expect(within(details).getByLabelText(/^collection/i)).toHaveFocus();
+  });
 
-    await user.click(toggle);
-
-    expect(screen.getByRole("complementary", { name: /document details/i })).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: /hide document details/i })).toHaveLength(2);
+  it("submits metadata from the details sidebar with the document body", async () => {
+    const user = userEvent.setup();
+    putDocument.mockResolvedValueOnce({ path: "notes/a-note.md" });
+    const { onCreated } = renderPage("notes");
+    await user.type(screen.getByLabelText(/^title/i), "A note");
+    await user.type(await screen.findByLabelText(/document body/i), "Knowledge worth keeping");
+    await user.type(screen.getByLabelText(/^summary/i), "A useful summary");
+    await user.type(screen.getByLabelText(/^domain/i), "engineering");
+    await user.click(screen.getByRole("button", { name: "Document type" }));
+    await user.click(screen.getByRole("menuitemradio", { name: "decision" }));
+    await user.type(screen.getByLabelText(/^tags/i), "product{Enter}");
+    await user.click(screen.getByRole("button", { name: /create document/i }));
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("notes/a-note.md"));
+    expect(putDocument).toHaveBeenCalledWith(expect.objectContaining({
+      title: "A note", collection: "notes", summary: "A useful summary", domain: "engineering",
+      type: "decision", tags: ["product"],
+    }));
   });
 
   it("creates through the existing API contract and returns the document path", async () => {

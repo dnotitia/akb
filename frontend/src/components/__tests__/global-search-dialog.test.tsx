@@ -88,18 +88,21 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("GlobalSearchDialog", () => {
+
   it.each(["/", "/vault/alpha/members"])("searches another accessible Vault without changing the page or query from %s", async (route) => {
     listVaultsMock.mockResolvedValue({ vaults: [{ name: "alpha" }, { name: "팀-beta", role: "reader" }] });
     const user = userEvent.setup();
     render(<MemoryRouter initialEntries={[route]}><GlobalSearchDialog /><LocationProbe /></MemoryRouter>);
     await user.click(screen.getByRole("button", { name: "Search knowledge" }));
     const query = screen.getByRole("combobox");
+    if (route !== "/") await user.click(screen.getByRole("button", { name: "Remove alpha from search scope" }));
     await user.type(query, "postgres");
     await user.click(screen.getByRole("button", { name: "Documents" }));
     await user.click(screen.getByRole("button", { name: /^Search scope:/ }));
     await user.type(screen.getByRole("searchbox", { name: "Filter vaults" }), "beta");
-    expect(screen.queryByRole("menuitemradio", { name: /alpha/ })).not.toBeInTheDocument();
-    await user.click(await screen.findByRole("menuitemradio", { name: "팀-beta" }));
+    expect(screen.queryByRole("menuitemcheckbox", { name: /alpha/ })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("menuitemcheckbox", { name: "팀-beta" }));
+    await user.keyboard("{Escape}");
     expect(query).toHaveValue("postgres");
     expect(query).toHaveAccessibleName("Search in 팀-beta");
     expect(screen.getByTestId("location")).toHaveTextContent(route);
@@ -116,7 +119,7 @@ describe("GlobalSearchDialog", () => {
     await user.click(screen.getByRole("button", { name: "Search scope: alpha" }));
     expect(await screen.findByText("Could not load vaults.")).toBeInTheDocument();
     await user.click(screen.getByRole("menuitem", { name: "Retry loading vaults" }));
-    expect(await screen.findByRole("menuitemradio", { name: /alpha/ })).toBeInTheDocument();
+    expect(await screen.findByRole("menuitemcheckbox", { name: /alpha/ })).toBeInTheDocument();
     await user.keyboard("{Escape}");
     expect(screen.getByRole("combobox")).toHaveAccessibleName("Search in alpha");
     await user.type(screen.getByRole("combobox"), "postgres");
@@ -134,6 +137,7 @@ describe("GlobalSearchDialog", () => {
     await waitFor(() => expect(filter).toHaveFocus());
     await user.type(filter, "beta");
     await user.keyboard("{ArrowUp}{Enter}");
+    await user.keyboard("{Escape}");
     expect(screen.getByRole("combobox")).toHaveAccessibleName("Search in beta");
     expect(scope).toHaveFocus();
     await user.click(scope);
@@ -160,7 +164,7 @@ describe("GlobalSearchDialog", () => {
     await user.click(screen.getByRole("button", { name: "Search knowledge" }));
     await user.click(screen.getByRole("button", { name: "Search scope: All vaults" }));
     await act(async () => finishOld({ vaults: [{ name: "private-old-vault" }] }));
-    expect(await screen.findByRole("menuitemradio", { name: "new-account-vault" })).toBeInTheDocument();
+    expect(await screen.findByRole("menuitemcheckbox", { name: "new-account-vault" })).toBeInTheDocument();
     expect(screen.queryByText("private-old-vault")).not.toBeInTheDocument();
   });
 
@@ -176,7 +180,8 @@ describe("GlobalSearchDialog", () => {
     listVaultsMock.mockResolvedValue({ vaults: [{ name: "all" }] });
     await user.click(trigger);
     await user.click(screen.getByRole("button", { name: "Search scope: All vaults" }));
-    await user.click(await screen.findByRole("menuitemradio", { name: "all" }));
+    await user.click(await screen.findByRole("menuitemcheckbox", { name: "all" }));
+    await user.keyboard("{Escape}");
     await user.type(screen.getByRole("combobox"), "postgres");
     await waitFor(() => expect(searchDocsMock).toHaveBeenLastCalledWith("postgres", ["all"], 12, expect.any(Object)));
   });
@@ -208,7 +213,7 @@ describe("GlobalSearchDialog", () => {
     await screen.findByRole("option");
     expect(searchDocsMock).toHaveBeenLastCalledWith("postgres", ["alpha"], 12, expect.any(Object));
     await user.click(screen.getByRole("button", { name: "Search scope: alpha" }));
-    await user.click(screen.getByRole("menuitemradio", { name: /All vaults/ }));
+    await user.click(screen.getByRole("menuitem", { name: /All vaults/ }));
     expect(input).toHaveValue("postgres");
     expect(input).toHaveAccessibleName("Search all accessible vaults");
     await waitFor(() => expect(searchDocsMock).toHaveBeenLastCalledWith("postgres", [], 12, expect.any(Object)));
@@ -252,7 +257,7 @@ describe("GlobalSearchDialog", () => {
     await user.type(screen.getByRole("combobox"), "postgres");
     await waitFor(() => expect(searchDocsMock).toHaveBeenCalledTimes(1));
     await user.click(screen.getByRole("button", { name: "Search scope: alpha" }));
-    await user.click(screen.getByRole("menuitemradio", { name: /All vaults/ }));
+    await user.click(screen.getByRole("menuitem", { name: /All vaults/ }));
     await waitFor(() => expect(searchDocsMock).toHaveBeenCalledTimes(2));
     await act(async () => finishOld(response));
     expect(screen.queryByRole("option")).not.toBeInTheDocument();
@@ -271,7 +276,7 @@ describe("GlobalSearchDialog", () => {
     await user.type(screen.getByRole("combobox"), "postgres");
     await screen.findByRole("option");
     await user.click(screen.getByRole("button", { name: "Search scope: 팀 Vault" }));
-    await user.click(screen.getByRole("menuitemradio", { name: /All vaults/ }));
+    await user.click(screen.getByRole("menuitem", { name: /All vaults/ }));
     await user.keyboard("{Escape}");
     expect(trigger).toHaveFocus();
     await user.click(trigger);

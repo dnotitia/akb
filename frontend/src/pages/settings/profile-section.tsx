@@ -24,6 +24,7 @@ interface Props {
   localProfileEditingEnabled: boolean;
   onUserUpdate: (patch: { display_name?: string; email?: string }) => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onBusyChange?: (busy: boolean) => void;
 }
 
 export function ProfileSection({
@@ -32,6 +33,7 @@ export function ProfileSection({
   localProfileEditingEnabled,
   onUserUpdate,
   onDirtyChange,
+  onBusyChange,
 }: Props) {
   const [profileDisplayName, setProfileDisplayName] = useState(user.display_name ?? "");
   const [profileEmail, setProfileEmail] = useState(user.email ?? "");
@@ -68,6 +70,9 @@ export function ProfileSection({
 
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  const busy = profileBusy || pwBusy;
+  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   // Protect both profile and password work during refresh / external navigation.
   useEffect(() => {
@@ -132,52 +137,54 @@ export function ProfileSection({
   }
 
   return (
-    <div className="grid w-full max-w-6xl items-start gap-10 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] xl:gap-12">
+    <div className="@container/profile min-w-0 space-y-8">
       <section aria-labelledby="profile-heading">
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
+        <header className="border-b border-border pb-4">
           <h2 id="profile-heading" className="text-base font-semibold text-foreground">Public profile</h2>
-          <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted">
-            <span className="break-all">@{user.username}</span>
-            <RoleBadge role={user.is_admin ? "admin" : "user"} />
-          </div>
+          <p className="mt-1 text-sm text-foreground-muted">Your name and contact details.</p>
         </header>
 
-        <div className="my-5 flex items-center gap-4 rounded-[var(--radius-md)] border border-border bg-surface p-4" data-testid="profile-identity">
-          <span className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-surface-selected text-xl font-semibold text-surface-selected-foreground" aria-hidden>
-            {(user.display_name?.trim() || user.username).slice(0, 2) || <UserRound className="h-6 w-6" />}
+        <div className="flex items-center gap-3 py-5" data-testid="profile-identity">
+          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-surface-selected text-base font-semibold text-surface-selected-foreground" aria-hidden>
+            {(user.display_name?.trim() || user.username).slice(0, 2) || <UserRound className="h-5 w-5" />}
           </span>
           <div className="min-w-0">
-            <p className="break-words text-base font-semibold">{user.display_name?.trim() || user.username}</p>
-            <p className="mt-1 break-all text-sm text-foreground-muted">{user.email}</p>
+            <p className="break-words text-sm font-semibold text-foreground">{user.display_name?.trim() || user.username}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
+              <span className="break-all">@{user.username}</span>
+              <RoleBadge role={user.is_admin ? "admin" : "user"} />
+            </div>
           </div>
         </div>
-        <form onSubmit={handleSaveProfile}>
+        <form onSubmit={handleSaveProfile} aria-busy={profileBusy || undefined}>
           <div className="space-y-4">
-            <div>
-              <Label htmlFor="profile-display-name">Display name</Label>
+            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+              <Label htmlFor="profile-display-name" className="@min-[28rem]/profile:pt-3">Display name</Label>
               <Input
                 id="profile-display-name"
+                autoComplete="name"
                 value={profileDisplayName}
                 onChange={(e) => setProfileDisplayName(e.target.value)}
                 placeholder="—"
-                disabled={!localProfileEditingEnabled}
+                disabled={!localProfileEditingEnabled || profileBusy}
               />
             </div>
-            <div>
-              <Label htmlFor="profile-email">Email address</Label>
+            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+              <Label htmlFor="profile-email" className="@min-[28rem]/profile:pt-3">Email address</Label>
               <Input
                 id="profile-email"
                 type="email"
+                autoComplete="email"
                 value={profileEmail}
                 onChange={(e) => setProfileEmail(e.target.value)}
                 required
-                disabled={!localProfileEditingEnabled}
+                disabled={!localProfileEditingEnabled || profileBusy}
               />
             </div>
           </div>
 
           {localProfileEditingEnabled ? (
-            <div className="mt-5 flex flex-wrap items-center gap-3">
+            <div className="mt-4 flex flex-wrap items-center gap-3 @min-[28rem]/profile:pl-40">
               <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
                 Save profile
               </Button>
@@ -207,13 +214,13 @@ export function ProfileSection({
 
       {localPasswordEnabled ? (
         <section aria-labelledby="change-pw-heading">
-          <header className="border-b border-border pb-3">
+          <header className="border-b border-border pb-4">
             <h2 id="change-pw-heading" className="text-base font-semibold text-foreground">Change password</h2>
           </header>
-          <form onSubmit={handleChangePassword} className="pt-5">
+          <form onSubmit={handleChangePassword} className="pt-5" aria-busy={pwBusy || undefined}>
             <div className="space-y-4">
-              <div>
-                <Label htmlFor="pw-current">Current password</Label>
+              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+                <Label htmlFor="pw-current" className="@min-[28rem]/profile:pt-3">Current password</Label>
                 <Input
                   id="pw-current"
                   type="password"
@@ -221,56 +228,63 @@ export function ProfileSection({
                   value={pwCurrent}
                   onChange={(e) => setPwCurrent(e.target.value)}
                   required
+                  disabled={pwBusy}
                 />
               </div>
-              <div>
-                <Label htmlFor="pw-new">New password</Label>
-                <Input
-                  id="pw-new"
-                  type="password"
-                  autoComplete="new-password"
-                  value={pwNew}
-                  onChange={(e) => setPwNew(e.target.value)}
-                  onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
-                  aria-invalid={pwTooShort || undefined}
-                  aria-describedby="pw-new-help"
-                  required
-                />
-                <p id="pw-new-help" className={`mt-1 text-xs ${pwTooShort ? "text-destructive" : "text-foreground-muted"}`}>
-                  Use at least 8 characters.
-                </p>
-              </div>
-              <div>
-                <Label htmlFor="pw-confirm">Confirm new password</Label>
-                <Input
-                  id="pw-confirm"
-                  type="password"
-                  autoComplete="new-password"
-                  value={pwConfirm}
-                  onChange={(e) => setPwConfirm(e.target.value)}
-                  onBlur={() => setPwTouched((t) => ({ ...t, confirm: true }))}
-                  aria-invalid={pwMismatch || undefined}
-                  aria-describedby={pwMismatch ? "pw-confirm-help" : undefined}
-                  required
-                />
-                {pwMismatch && (
-                  <p id="pw-confirm-help" className="mt-1 text-xs text-destructive">
-                    Doesn&apos;t match new password.
+              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+                <Label htmlFor="pw-new" className="@min-[28rem]/profile:pt-3">New password</Label>
+                <div className="min-w-0">
+                  <Input
+                    id="pw-new"
+                    type="password"
+                    autoComplete="new-password"
+                    value={pwNew}
+                    onChange={(e) => setPwNew(e.target.value)}
+                    onBlur={() => setPwTouched((t) => ({ ...t, new: true }))}
+                    aria-invalid={pwTooShort || undefined}
+                    aria-describedby="pw-new-help"
+                    required
+                    disabled={pwBusy}
+                  />
+                  <p id="pw-new-help" className={`mt-1.5 text-xs ${pwTooShort ? "text-destructive" : "text-foreground-muted"}`}>
+                    Use at least 8 characters.
                   </p>
-                )}
+                </div>
+              </div>
+              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+                <Label htmlFor="pw-confirm" className="leading-5 @min-[28rem]/profile:pt-2.5">Confirm new password</Label>
+                <div className="min-w-0">
+                  <Input
+                    id="pw-confirm"
+                    type="password"
+                    autoComplete="new-password"
+                    value={pwConfirm}
+                    onChange={(e) => setPwConfirm(e.target.value)}
+                    onBlur={() => setPwTouched((t) => ({ ...t, confirm: true }))}
+                    aria-invalid={pwMismatch || undefined}
+                    aria-describedby={pwMismatch ? "pw-confirm-help" : undefined}
+                    required
+                    disabled={pwBusy}
+                  />
+                  {pwMismatch && (
+                    <p id="pw-confirm-help" className="mt-1.5 text-xs text-destructive">
+                      Doesn&apos;t match new password.
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
             {pwError && (
-              <p role="alert" className="mt-3 text-xs text-destructive">
+              <p role="alert" className="mt-3 text-sm text-destructive @min-[28rem]/profile:pl-40">
                 {pwError}
               </p>
             )}
             {passwordFlash.message && (
-              <p role="status" aria-live="polite" className="mt-3 text-xs text-success">
+              <p role="status" aria-live="polite" className="mt-3 text-sm text-success @min-[28rem]/profile:pl-40">
                 {passwordFlash.message}
               </p>
             )}
-            <div className="mt-5 flex flex-wrap items-center gap-3">
+            <div className="mt-4 flex flex-wrap items-center gap-3 @min-[28rem]/profile:pl-40">
               <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
                 Change password
               </Button>

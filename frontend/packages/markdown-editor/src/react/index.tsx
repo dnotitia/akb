@@ -247,6 +247,7 @@ export function useMarkdownEditor({
     contentType: 'markdown',
     editable,
     immediatelyRender: false,
+    shouldRerenderOnTransaction: false,
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
@@ -300,9 +301,17 @@ export function useMarkdownCommands(handle: MarkdownEditorHandle | null): Markdo
   )
 }
 
+const stateMarkdown = new WeakMap<Editor['state']['doc'], string>()
+
 function readState(editor: Editor): MarkdownState {
+  const doc = editor.state.doc
+  let markdown = stateMarkdown.get(doc)
+  if (markdown === undefined) {
+    markdown = editor.getMarkdown()
+    stateMarkdown.set(doc, markdown)
+  }
   return {
-    markdown: editor.getMarkdown(),
+    markdown,
     isEmpty: editor.isEmpty,
     isEditable: editor.isEditable,
     table: markdownTableState(editor),
@@ -347,11 +356,9 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
     const update = () => setState(readState(editor))
     update()
     editor.on('transaction', update)
-    editor.on('selectionUpdate', update)
 
     return () => {
       editor.off('transaction', update)
-      editor.off('selectionUpdate', update)
     }
   }, [editor])
 
@@ -368,7 +375,8 @@ export function useMarkdownTargetResolutions(
   context: MarkdownTargetResolverContext = {},
 ): ReadonlyMap<string, MarkdownTargetResolution> {
   const { commit, document, vault } = context
-  const targets = useMemo(() => extractMarkdownTargets(markdown), [markdown])
+  const targetKey = useMemo(() => JSON.stringify(extractMarkdownTargets(markdown)), [markdown])
+  const targets = useMemo<ReturnType<typeof extractMarkdownTargets>>(() => JSON.parse(targetKey), [targetKey])
   const resolutionKey = useMemo(
     () => [vault ?? '', document ?? '', commit ?? '', ...targets.map(target => target.target)].join('\u0000'),
     [commit, document, targets, vault],
@@ -456,7 +464,8 @@ export function useMarkdownReferenceResolutions(
   context: MarkdownReferenceContext = {},
 ): ReadonlyMap<string, MarkdownReferenceResolution> {
   const { commit, document, vault } = context
-  const references = useMemo(() => extractMarkdownReferences(markdown), [markdown])
+  const referenceKey = useMemo(() => JSON.stringify(extractMarkdownReferences(markdown)), [markdown])
+  const references = useMemo<ReturnType<typeof extractMarkdownReferences>>(() => JSON.parse(referenceKey), [referenceKey])
   const resolutionKey = useMemo(
     () => [
       vault ?? '',
@@ -887,7 +896,7 @@ export function MarkdownSurface({
 
     const applyResolutions = () => {
       const managedTargets = new Set(
-        extractMarkdownTargets(editor.getMarkdown()).map(({ target }) => target),
+        extractMarkdownTargets(serializeEditorMarkdown(editor)).map(({ target }) => target),
       )
       const frames = [...root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]')]
       const framedImages = new Set<HTMLImageElement>()
@@ -1282,6 +1291,13 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   autoFocus?: boolean
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
+  /** Optional product header. The surface still owns the draft and mode lifecycle. */
+  renderHeader?: (controls: {
+    mode: MarkdownEditorMode
+    onModeChange: (mode: MarkdownEditorMode) => void
+    disabled: boolean
+    toolbar: ReactNode
+  }) => ReactNode
   table?: MarkdownTableOptions
   imageMenu?: MarkdownImageMenuOptions
   imageUpload?: MarkdownImageUploadOptions
@@ -1295,6 +1311,12 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   onWysiwygDragOverCapture?: DragEventHandler<HTMLDivElement>
   onWysiwygDropCapture?: DragEventHandler<HTMLDivElement>
   children?: ReactNode
+}
+
+function MarkdownEditingHeader({ renderHeader, ...controls }: Parameters<NonNullable<MarkdownEditingSurfaceProps['renderHeader']>>[0] & {
+  renderHeader: NonNullable<MarkdownEditingSurfaceProps['renderHeader']>
+}) {
+  return renderHeader(controls)
 }
 
 /**
@@ -1312,6 +1334,7 @@ export function MarkdownEditingSurface({
   autoFocus = false,
   modeSwitchDisabled = false,
   toolbar,
+  renderHeader,
   table,
   imageMenu,
   imageUpload,
@@ -1367,7 +1390,7 @@ export function MarkdownEditingSurface({
       onDropCapture={handleWysiwygDropCapture}
       onPasteCapture={event => imageUploadController?.handlePaste(event)}
     >
-      {mode === 'wysiwyg' ? toolbar : null}
+      {mode === 'wysiwyg' && !renderHeader ? toolbar : null}
       {imageUploadController ? (
         <MarkdownImageUploadStatus options={imageUpload} />
       ) : null}
@@ -1427,7 +1450,7 @@ export function MarkdownEditingSurface({
   }, [editor, mode])
 
   const selectMode = (nextMode: MarkdownEditorMode) => {
-    if (!editor || nextMode === mode) return
+    if (!editor || effectiveModeSwitchDisabled || nextMode === mode) return
 
     if (nextMode === 'source') {
       const editorMarkdown = serializeEditorMarkdown(editor, { profile })
@@ -1470,13 +1493,21 @@ export function MarkdownEditingSurface({
     </button>
   )
 
-  return (
+  const header = renderHeader ? (
     <div
-      {...props}
-      ref={surfaceRef}
-      className={joinClasses('relative min-w-0', className)}
-      data-markdown-mode={mode}
+      className="sticky top-0 z-10"
+      onDragOverCapture={mode === 'wysiwyg' ? handleWysiwygDragOverCapture : undefined}
+      onDropCapture={mode === 'wysiwyg' ? handleWysiwygDropCapture : undefined}
     >
+      <MarkdownEditingHeader
+        renderHeader={renderHeader}
+        mode={mode}
+        onModeChange={selectMode}
+        disabled={!editor || effectiveModeSwitchDisabled}
+        toolbar={mode === 'wysiwyg' ? toolbar : null}
+      />
+    </div>
+  ) : (
       <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
         <div
           role="group"
@@ -1488,12 +1519,21 @@ export function MarkdownEditingSurface({
           {modeButton('source', labels.source)}
         </div>
       </div>
+  )
 
+  return (
+    <div
+      {...props}
+      ref={surfaceRef}
+      className={joinClasses('relative min-w-0', className)}
+      data-markdown-mode={mode}
+    >
       {imageUploadController ? (
         <MarkdownImageUploadProvider controller={imageUploadController}>
+          {header}
           {wysiwygPanel}
         </MarkdownImageUploadProvider>
-      ) : wysiwygPanel}
+      ) : <>{header}{wysiwygPanel}</>}
 
       <div hidden={mode !== 'source'} data-markdown-mode-panel="source">
         <label id={sourceInputLabelId} htmlFor={sourceInputId} className="sr-only">

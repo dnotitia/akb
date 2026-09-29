@@ -49,6 +49,7 @@ function renderAt(path: string, queryClient = new QueryClient()) {
           <Route element={<Layout />}>
             <Route path="/" element={<div data-testid="home"><AccessProbe /></div>} />
             <Route path="/search" element={<div data-testid="search-page" />} />
+            <Route path="/settings" element={<div data-testid="account-settings" />} />
             <Route
               path="/vault/:name/settings"
               element={<div data-testid="vault-settings" />}
@@ -132,6 +133,15 @@ describe("Layout — auth gate", () => {
     expect(screen.getByRole("button", { name: "Search knowledge" })).toBeInTheDocument();
     expect(within(screen.getByRole("navigation", { name: "Current page" })).getByText("Search")).toHaveAttribute("aria-current", "page");
     expect(document.documentElement).toHaveClass("vault-workspace-scroll-lock");
+  });
+
+  it.each(["/settings", "/settings?tab=tokens", "/settings/?tab=preferences"])("keeps the Settings header on paper before and after authentication at %s", async (path) => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt(path);
+    expect(screen.getByRole("banner", { hidden: true })).toHaveAttribute("data-surface", "paper");
+    await screen.findByTestId("account-settings");
+    expect(screen.getByRole("banner")).toHaveAttribute("data-surface", "paper");
+    expect(screen.getByRole("button", { name: "Search knowledge" })).toBeInTheDocument();
   });
 
   it("keeps the global header full-width without page-level responsive gutters", async () => {

@@ -236,4 +236,45 @@ describe("flattenVisible — resource-kind groups", () => {
       ),
     ).toBe(false);
   });
+
+  it.each(["document", "table", "file"] as const)(
+    "respects an explicitly collapsed %s group containing the current resource",
+    (kind) => {
+      const rows = flattenVisible(
+        [
+          { kind: "document", name: "Doc", path: "doc.md" },
+          { kind: "table", name: "Table", path: "table" },
+          { kind: "file", name: "File", path: "file" },
+        ],
+        new Set(),
+        false,
+        {
+          collapsedKindGroups: new Set([`$root:${kind}`]),
+          activeSig: `${kind}:${kind === "document" ? "doc.md" : kind}`,
+        },
+      );
+
+      expect(rows.find((row) => row.type === "kind-group" && row.kind === kind))
+        .toMatchObject({ isOpen: false });
+      expect(rows.some((row) => row.type === "node" && row.node.kind === kind))
+        .toBe(false);
+    },
+  );
+
+  it("temporarily opens collapsed groups when a text filter reveals matches", () => {
+    const rows = flattenVisible(
+      [
+        { kind: "document", name: "Doc", path: "doc.md" },
+        { kind: "table", name: "Table", path: "table" },
+      ],
+      new Set(),
+      true,
+      { collapsedKindGroups: new Set(["$root:document"]) },
+    );
+
+    expect(rows.find((row) => row.type === "kind-group" && row.kind === "document"))
+      .toMatchObject({ isOpen: true });
+    expect(rows.some((row) => row.type === "node" && row.node.path === "doc.md"))
+      .toBe(true);
+  });
 });
