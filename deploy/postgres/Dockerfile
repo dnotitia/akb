@@ -119,25 +119,8 @@ COPY vchord_bm25/ /vchord_bm25/
 RUN set -eu; \
     for p in /vchord_bm25/*.patch; do patch -p1 --forward --fuzz=0 --batch < "$p"; done; \
     cp /vchord_bm25/Cargo.lock Cargo.lock
-# Defer Cargo's large TLS 1.3 first key share and use HTTP/1.1 for the full
-# sparse-index fetch. https://docs.openssl.org/3.5/man3/SSL_CTX_set1_curves/
-# https://doc.rust-lang.org/cargo/reference/config.html#httpmultiplexing
-RUN set -eu; \
-    openssl_config="$(mktemp)"; \
-    trap 'rm -f "$openssl_config"' EXIT; \
-    printf '%s\n' \
-        'openssl_conf = openssl_init' \
-        '[openssl_init]' \
-        'ssl_conf = ssl_section' \
-        '[ssl_section]' \
-        'system_default = default_section' \
-        '[default_section]' \
-        'Groups = ?X25519MLKEM768:DEFAULT' \
-        > "$openssl_config"; \
-    OPENSSL_CONF="$openssl_config" \
-    CARGO_HTTP_MULTIPLEXING=false \
-    PGRX_PG_CONFIG_PATH="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
-        cargo build --locked --lib --features "pg${PG_MAJOR}" --release
+RUN PGRX_PG_CONFIG_PATH="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
+    cargo build --locked --lib --features "pg${PG_MAJOR}" --release
 RUN mkdir -p /out/lib /out/extension \
  && cp target/release/libvchord_bm25.so /out/lib/vchord_bm25.so \
  && cp "sql/install/vchord_bm25--${VCHORD_BM25_VERSION}.sql" sql/vchord_bm25--*--*.sql /out/extension/ \
