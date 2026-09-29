@@ -814,10 +814,20 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
       await expect(info).toBeFocused();
     } else {
-      await rail.getByRole("button", { name: "Table of contents", exact: true }).click();
-      await page.getByRole("dialog", { name: "On this page", exact: true }).getByRole("link", { name: "Authored heading", exact: true }).click();
-      await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
-      await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeFocused();
+      const outlineTrigger = rail.getByRole("button", { name: "Table of contents", exact: true });
+      await outlineTrigger.click();
+      const outlinePanel = page.getByRole("dialog", { name: "On this page", exact: true });
+      const headingLink = outlinePanel.getByRole("link", { name: "Authored heading", exact: true });
+      await headingLink.click();
+      await expect(outlinePanel).toBeVisible();
+      await expect(headingLink).toBeFocused();
+      // Repeated navigation must preserve the outline, including its focus scope.
+      await headingLink.press("Enter");
+      await expect(outlinePanel).toBeVisible();
+      await expect(headingLink).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(outlinePanel).toHaveCount(0);
+      await expect(outlineTrigger).toBeFocused();
       await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeInViewport();
     }
   });
@@ -2084,7 +2094,8 @@ test("foreground access verification preserves the live editor draft", async ({ 
   await expect(editor).toHaveCount(0);
   release();
   await expect(editor).toContainText("A local draft that must survive verification");
-  await editor.press("End");
+  // macOS uses Command+Right for the line-end caret action; End only scrolls.
+  await editor.press(process.platform === "darwin" ? "Meta+ArrowRight" : "End");
   await editor.pressSequentially(" and continues safely");
   await expect(editor).toContainText("A local draft that must survive verification and continues safely");
   await page.route("**/vaults/fixture/info", route => route.fulfill({ json: { name: "fixture", role: "reader", is_archived: false, is_external_git: false } }));

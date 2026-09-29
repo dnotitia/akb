@@ -561,7 +561,7 @@ export function VaultExplorer({
           )}
       </RailManagement>
 
-      <div ref={filterRowRef} data-slot="collection-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-1.5 border-b border-border px-2 py-1.5">
+      <div ref={filterRowRef} data-slot="collection-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-1.5 border-b border-border px-2 py-1">
         <RailFilterField label="Filter resources" value={filter} onChange={setFilter} />
         <div id={filtersId} hidden={!filtersOpen} className="space-y-2 pb-1">
         <div className="space-y-1">

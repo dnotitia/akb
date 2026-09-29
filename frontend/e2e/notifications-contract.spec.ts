@@ -118,8 +118,14 @@ for (const width of [1440, 1024, 640, 375]) for (const dark of [false, true]) {
     await panel.getByRole("button", { name: "Notification actions" }).click();
     await expect(page.getByRole("menuitem", { name: "Mark all notifications read" })).toBeDisabled();
     await page.getByRole("menuitem", { name: "Notification settings", exact: true }).click();
-    await expect(page).toHaveURL(/\/settings\?tab=notifications/);
+    const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+    await expect(settings).toBeVisible();
+    await expect(settings.getByText("You aren’t watching any documents yet.")).toBeVisible();
+    await expect(page).toHaveURL(/\/notifications\?state=all$/);
     await expect(panel).toHaveCount(0);
     await expect(page.getByRole("menu")).toHaveCount(0);
+    await settings.getByRole("button", { name: "Close settings", exact: true }).click();
+    await expect(settings).toHaveCount(0);
+    await expect(page).toHaveURL(/\/notifications\?state=all$/);
   });
 }
