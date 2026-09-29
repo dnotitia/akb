@@ -226,12 +226,15 @@ describe("Layout — auth gate", () => {
     expect(
       screen.getByRole("button", { name: "Expand sidebar" }),
     ).toHaveAttribute("aria-expanded", "false");
-    const brandLink = within(sidebar).getByRole("link", { name: "AKB home" });
+    const brandLink = within(sidebar).getByRole("link", { name: "AKB home — Agent Knowledgebase" });
     expect(brandLink).toBeInTheDocument();
+    expect(brandLink).toHaveAttribute("href", "/");
     expect(within(brandLink).queryByText("AKB")).not.toBeInTheDocument();
+    expect(within(brandLink).queryByText("Agent Knowledgebase")).not.toBeInTheDocument();
     expect(sidebar).toHaveClass("fixed", "inset-y-0", "bg-surface");
     fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
     expect(within(sidebar).getByText("AKB")).toBeVisible();
+    expect(within(brandLink).getByText("Agent Knowledgebase")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     expect(localStorage.getItem("akb_app_sidebar_compact")).toBe("true");
   });

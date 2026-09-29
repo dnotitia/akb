@@ -114,9 +114,14 @@ export function AppSidebar({
         )}
       >
         <div className="flex h-14 shrink-0 items-center border-b border-border px-3.5">
-          <Link to="/" aria-label="AKB home" className="flex shrink-0 rounded-[var(--radius-sm)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
-            <Logo size={28} wordmark={!compact} variant="header" />
-          </Link>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Link to="/" aria-label="AKB home — Agent Knowledgebase" className="flex h-10 shrink-0 items-center rounded-[var(--radius-sm)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface">
+                <Logo size={28} wordmark={!compact} subtitle variant="header" />
+              </Link>
+            </TooltipTrigger>
+            {compact && <TooltipContent side="right">AKB · Agent Knowledgebase</TooltipContent>}
+          </Tooltip>
         </div>
           <div
             data-slot="workspace-sidebar-heading"

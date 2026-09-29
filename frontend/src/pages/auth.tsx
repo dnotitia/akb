@@ -308,7 +308,7 @@ export default function AuthPage() {
             )}
           </div>
 
-          <p className="mt-5 text-center coord">Dnotitia · Seahorse · v1.0</p>
+          <p className="mt-5 text-center coord">© Dnotitia</p>
         </section>
       </main>
     </div>

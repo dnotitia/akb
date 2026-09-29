@@ -19,6 +19,12 @@ and hairlines carry hierarchy, and color is used with discipline.
 
 - **One brand axis**: teal primary `#004059` + a single orange accent `#e55e2c`.
   Teal is _interactive/identity_; orange is _one marquee moment per screen_.
+- **Product identity is AKB — Agent Knowledgebase.** The shared logo uses the
+  full product name as its subtitle on expanded desktop navigation, sign-in,
+  and public pages. Keep it sentence case and secondary to the wordmark.
+  Internal workspaces have no marketing/copyright footer. Sign-in and public
+  pages retain a quiet `© Dnotitia`; do not show a hardcoded release version or
+  another product's name as AKB's identity.
 - **Accessibility is a floor, not a nice-to-have**: every foreground/background
   pair clears **WCAG AA (4.5:1 text / 3:1 UI)**; AAA where it's free.
 - **Tokens only**: components never hardcode a color/radius/shadow — they read
@@ -267,12 +273,14 @@ an `sr-only` summary, never the only signal.
   Mobile keeps the logo and a compact
   location row with a labelled navigation drawer toggle below the app header.
   All desktop routes use a 20px header inset after the last navigation rail,
-  independent of their content gutters. Home keeps its generous body/footer
+  independent of their content gutters. Home keeps its generous body
   inset without shifting the location label. Account Settings opens above the
   current workspace, leaving its location label unchanged. Section names, icons,
   and permission fallback share one contract inside the dialog.
-  A collapsed rail retains the logo symbol and accessible Home
-  link. Mobile retains its full-width header with the AKB mark/wordmark and compact
+  The expanded rail stacks the full product subtitle below AKB without changing
+  its 56px header or the logo's fixed anchor. Loading uses the same lockup.
+  A collapsed rail retains the logo symbol and a Home link with the full product
+  name in its accessible label and keyboard/pointer tooltip. Mobile retains its full-width header with the AKB mark/wordmark and compact
   navigation, without the long product subtitle. Between `sm` and `lg`, Search
   can shrink within the remaining header width; the account control must remain
   fully inside the viewport. Desktop Search keeps its 256px width and the

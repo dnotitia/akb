@@ -217,7 +217,7 @@ export function Layout() {
     return <Navigate to={to} replace />;
   }
   // Canvas-style workspaces lock to viewport height and own their internal
-  // scroll. Document-flow routes keep natural page scroll and the footer.
+  // scroll. Document-flow routes keep natural page scroll.
   const rootClass = viewportLocked
     ? "h-screen flex flex-col overflow-hidden bg-background text-foreground"
     : surface === "paper"
@@ -253,7 +253,7 @@ export function Layout() {
           <div className="flex shrink-0 items-center px-3 lg:hidden">
             <Link
               to="/"
-              aria-label="AKB home"
+              aria-label="AKB home — Agent Knowledgebase"
               className="shrink-0 rounded-[var(--radius-md)] focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
             >
               <Logo
@@ -358,16 +358,6 @@ export function Layout() {
             )}
           </main>
 
-          {/* Footer — hidden while a viewport-locked workspace owns scrolling. */}
-          {!viewportLocked && (
-            <footer className="border-t border-border">
-              <div className="flex w-full items-center justify-between px-[var(--workspace-gutter)] py-3">
-                <div className="coord">© Dnotitia · Seahorse</div>
-                <div className="coord hidden md:block">Agent Knowledgebase</div>
-                <div className="coord">v1.0</div>
-              </div>
-            </footer>
-          )}
         </div>
       </div>
     </div>
@@ -398,7 +388,7 @@ function AppShellLoading({ compact, surface }: { compact: boolean; surface: AppS
         <div className="flex min-h-0 flex-1">
           <aside className={`fixed inset-y-0 left-0 hidden h-dvh border-r border-border bg-surface lg:block ${compact ? "w-14" : "w-52"}`}>
             <div className="flex h-14 items-center border-b border-border px-3.5">
-              <Logo size={28} wordmark={!compact} variant="header" />
+              <Logo size={28} wordmark={!compact} subtitle variant="header" />
             </div>
             <div className="space-y-2 p-3">
               {[0, 1, 2, 3].map((item) => (

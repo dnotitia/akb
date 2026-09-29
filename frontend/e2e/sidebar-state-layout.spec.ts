@@ -143,17 +143,26 @@ for (const dark of [false, true]) {
     const sidebar = page.getByTestId("app-sidebar");
     await expectCompact(page, false);
     const icons = {
-      logo: sidebar.getByRole("link", { name: "AKB home" }).locator(".brand-mark"),
+      logo: sidebar.getByRole("link", { name: "AKB home — Agent Knowledgebase" }).locator(".brand-mark"),
       home: sidebar.getByRole("link", { name: "Home", exact: true }).locator("svg"),
       search: sidebar.getByRole("link", { name: "Search", exact: true }).locator("svg"),
       vaults: sidebar.getByRole("link", { name: "Vaults", exact: true }).locator("svg"),
       help: sidebar.getByRole("button", { name: "Help", exact: true }).locator("svg"),
       settings: sidebar.getByRole("button", { name: "Settings", exact: true }).locator("svg"),
     };
+    const productName = sidebar.getByText("Agent Knowledgebase", { exact: true });
+    await expect(productName).toBeVisible();
+    const nameBounds = await bounds(productName);
+    const railBounds = await bounds(sidebar);
+    expect(nameBounds.x + nameBounds.width).toBeLessThan(railBounds.x + railBounds.width);
     const expanded = await Promise.all(Object.values(icons).map(bounds));
     await page.screenshot({ path: testInfo.outputPath("expanded.png"), animations: "disabled" });
     await sidebar.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
     await expectCompact(page, true);
+    await expect(productName).toHaveCount(0);
+    await sidebar.getByRole("link", { name: "AKB home — Agent Knowledgebase" }).focus();
+    await expect(page.getByRole("tooltip", { name: "AKB · Agent Knowledgebase" })).toBeVisible();
+    await page.keyboard.press("Escape");
     const collapsed = await Promise.all(Object.values(icons).map(bounds));
     await page.screenshot({ path: testInfo.outputPath("collapsed.png"), animations: "disabled" });
     for (const [index, name] of Object.keys(icons).entries()) {
