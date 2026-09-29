@@ -2,24 +2,20 @@ import * as React from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown } from "lucide-react";
 import {
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
   MarkdownEditingSurface,
+  MarkdownLocaleProvider,
   MarkdownSurface,
   MarkdownToolbar,
   useMarkdownEditor,
   useMarkdownReferenceResolutions,
   useMarkdownTargetResolutions,
-  type MarkdownSlashCommandOptions,
   type MarkdownImageMenuOptions,
   type MarkdownLinkSearchLabels,
 } from "@akb/markdown-editor/react";
 import {
   extractMarkdownTargets,
 } from "@akb/markdown-editor";
-import type {
-  MarkdownAsset,
-  MarkdownReferenceOptions,
-} from "@akb/markdown-editor";
+import type { MarkdownAsset } from "@akb/markdown-editor";
 import { discardAsset } from "@/lib/api";
 import { normalizeEditorLinkUrl } from "@/lib/editor-link";
 import {
@@ -73,23 +69,7 @@ function EditorModeMenu({ mode, disabled, onModeChange }: {
   );
 }
 
-const AKB_MARKDOWN_SLASH_OPTIONS: MarkdownSlashCommandOptions = {
-  messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
-};
-
 const AKB_MARKDOWN_IMAGE_MENU_OPTIONS: Omit<MarkdownImageMenuOptions, "onReplace"> = {
-  labels: {
-    editDescription: (alt) => alt ? `Edit image description: ${alt}` : "Edit image description",
-    replaceImage: (alt) => alt ? `Replace image: ${alt}` : "Replace image",
-    removeImage: (alt) => alt ? `Remove image: ${alt}` : "Remove image",
-    dialogTitle: "Image description",
-    dialogDescription: "This text is used as the image alt text and visible caption.",
-    description: "Description",
-    cancel: "Cancel",
-    saveDescription: "Save description",
-    descriptionRequired: "Describe the image so it remains understandable without sight.",
-    closeDialog: "Close dialog",
-  },
   classNames: {
     host: "flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-surface/90 p-1 shadow-sm backdrop-blur-sm",
     action: "h-7 w-7 text-foreground-muted hover:bg-surface-hover hover:text-foreground",
@@ -119,18 +99,6 @@ interface EditorToolbarProps {
 }
 
 const AKB_MARKDOWN_TABLE_OPTIONS = {
-  labels: {
-    editableTable: "Editable table",
-    readOnlyTable: "Table",
-    actions: "Table actions",
-    insertTable: "Insert table",
-    addRow: "Add row after selected row",
-    addColumn: "Add column right of selected column",
-    removeRow: "Remove selected row",
-    removeColumn: "Remove selected column",
-    continueBelow: "Continue below",
-    deleteTable: "Delete table",
-  },
   tableClassName: "!table",
 };
 
@@ -149,7 +117,6 @@ function EditorToolbar({
         searchContext: { vault },
         searchLabels: AKB_MARKDOWN_SEARCH_LABELS,
       }}
-      table={AKB_MARKDOWN_TABLE_OPTIONS}
       className={cn(
         "static! min-w-0 flex-1 border-b-0!",
         appearance === "canvas"
@@ -165,27 +132,6 @@ function EditorToolbar({
 const AKB_MARKDOWN_SEARCH_LABELS: Partial<MarkdownLinkSearchLabels> = {
   inputLabel: "Search Vault resources",
   inputPlaceholder: "Find a document or file",
-  searching: "Searching…",
-  empty: "No matching documents or files found.",
-  error: "Unable to search resources. Check your access and try again.",
-  retry: "Retry search",
-  results: "Vault resource results",
-  document: "Document",
-  file: "File",
-  resource: "Resource",
-};
-
-const AKB_MARKDOWN_REFERENCE_LABELS: MarkdownReferenceOptions["labels"] = {
-  header: "Insert Vault reference",
-  sections: {
-    person: "People",
-    issue: "Issues",
-    document: "Documents",
-    file: "Files",
-  },
-  searching: "Searching Vault resources…",
-  empty: "No accessible documents or files found.",
-  error: "Unable to search Vault resources. Check your access and try again.",
 };
 
 export interface MarkdownEditorProps {
@@ -216,7 +162,7 @@ export interface MarkdownEditorProps {
   onUnclaimedAssetIdsChange?: (assetIds: readonly string[]) => void;
 }
 
-export function MarkdownEditor({
+function MarkdownEditorContent({
   value,
   onChange,
   placeholder = "Write in markdown — slash commands and shortcuts work.",
@@ -287,18 +233,11 @@ export function MarkdownEditor({
     profile: "preserve",
     editable: !readOnly,
     onChange: handleChange,
-    slash: React.useMemo(
-      () => ({
-        ...AKB_MARKDOWN_SLASH_OPTIONS,
-        onOpenChange: onSlashOpenChange,
-      }),
-      [onSlashOpenChange],
-    ),
+    slash: React.useMemo(() => ({ onOpenChange: onSlashOpenChange }), [onSlashOpenChange]),
     reference: React.useMemo(
       () => ({
         adapter: adapters.reference,
         context: { vault, document, commit },
-        labels: AKB_MARKDOWN_REFERENCE_LABELS,
         onOpenChange: onReferenceOpenChange ?? onSlashOpenChange,
       }),
       [adapters.reference, commit, document, onReferenceOpenChange, onSlashOpenChange, vault],
@@ -500,6 +439,14 @@ export function MarkdownEditor({
         </MarkdownSurface>
       </MarkdownEditingSurface>
     </div>
+  );
+}
+
+export function MarkdownEditor(props: MarkdownEditorProps) {
+  return (
+    <MarkdownLocaleProvider locale="en">
+      <MarkdownEditorContent {...props} />
+    </MarkdownLocaleProvider>
   );
 }
 

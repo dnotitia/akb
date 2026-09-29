@@ -65,11 +65,6 @@ export interface MarkdownTargetRefreshContext {
   signal?: AbortSignal
 }
 
-export interface MarkdownImageLabels {
-  loading: (alt: string) => string
-  unavailable: (alt: string) => string
-}
-
 export interface MarkdownImageClassNames {
   frame?: string
   image?: string
@@ -77,7 +72,6 @@ export interface MarkdownImageClassNames {
 }
 
 export interface MarkdownImageOptions {
-  labels?: Partial<MarkdownImageLabels>
   classNames?: MarkdownImageClassNames
   /** Presentation-only policy applied to rendered image requests. */
   referrerPolicy?: string
@@ -95,8 +89,6 @@ export interface MarkdownTableLayoutOptions {
   className?: string
   /** Classes added to the keyboard-focusable table scroll wrapper. */
   wrapperClassName?: string
-  /** Accessible name for the table scroll wrapper. */
-  ariaLabel?: string
 }
 
 export type MarkdownContentAttributeValue = string | number | boolean | null | undefined
@@ -104,15 +96,6 @@ export type MarkdownContentAttributeValue = string | number | boolean | null | u
 export type MarkdownContentAttributes = Readonly<
   Record<string, MarkdownContentAttributeValue>
 >
-
-export interface MarkdownCodeLabels {
-  /** Accessible name for the keyboard-focusable code scroll region. */
-  region: (language?: string) => string
-}
-
-export interface MarkdownCodeOptions {
-  labels?: Partial<MarkdownCodeLabels>
-}
 
 export interface MarkdownParseOptions {
   profile?: MarkdownProfile
@@ -260,32 +243,9 @@ export interface MarkdownReferenceAdapter {
   ): Promise<MarkdownReferenceResolution>
 }
 
-export interface MarkdownReferenceLabels {
-  header: string
-  escapeHint: string
-  sections: Record<MarkdownReferenceKind, string>
-  searching: string
-  empty: string
-  error: string
-  footer: {
-    navigation: string
-    insert: string
-    close: string
-  }
-}
-
 export interface MarkdownReferenceOptions {
   adapter: MarkdownReferenceAdapter
   context?: Omit<MarkdownReferenceContext, 'signal'>
-  labels?: {
-    header?: string
-    escapeHint?: string
-    searching?: string
-    empty?: string
-    error?: string
-    sections?: Partial<Record<MarkdownReferenceKind, string>>
-    footer?: Partial<MarkdownReferenceLabels['footer']>
-  }
   className?: string
   onOpenChange?: (open: boolean, dismiss?: () => void) => void
 }
@@ -295,23 +255,6 @@ export interface MarkdownReferenceOptions {
  * called; products own any resource-specific canonicalization.
  */
 export type MarkdownLinkUrlNormalizer = (raw: string) => string | null
-
-export interface MarkdownLinkLabels {
-  insertButton: string
-  editButton: string
-  saveButton: string
-  insertTitle: string
-  editTitle: string
-  description: string
-  url: string
-  text: string
-  textPlaceholder: string
-  textHint: string
-  cancel: string
-  remove: string
-  close: string
-  invalidUrl: string
-}
 
 export interface MarkdownTargetResolver {
   resolve(
@@ -348,27 +291,7 @@ export type MarkdownSlashCommandId =
   | 'codeBlock'
   | 'divider'
 
-export interface MarkdownSlashCommandMessages {
-  header: string
-  escapeHint: string
-  sections: Record<MarkdownSlashCommandCategory, string>
-  footer: {
-    navigation: string
-    insert: string
-    close: string
-  }
-  empty: string
-  commands: Record<
-    MarkdownSlashCommandId,
-    {
-      label: string
-      description: string
-    }
-  >
-}
-
 export interface MarkdownSlashCommandOptions {
-  messages?: MarkdownSlashCommandMessages
   /** Keeps a surrounding Dialog/Sheet open while the menu consumes Escape. */
   onOpenChange?: (open: boolean, dismiss?: () => void) => void
 }

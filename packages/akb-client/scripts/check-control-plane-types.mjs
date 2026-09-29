@@ -40,12 +40,13 @@ for (const [path, pathItem] of Object.entries(fixture.paths ?? {})) {
     operations.push({ path, method, ...operation });
   }
 }
-// Legacy adoption is intentionally a REST-only operator surface for this
-// release.  Keep it in the live OpenAPI fixture without inventing a generated
-// SDK facade, while continuing to require a complete typed matrix for the
-// public control-plane SDK operations.
+// Legacy adoption and Vault-member installation status are REST-only
+// surfaces. Keep them in the live OpenAPI fixture without inventing generated
+// SDK facades, while requiring a complete typed matrix for SDK operations.
 const sdkOperations = operations.filter(
-  (operation) => !operation.tags?.includes("app-legacy-adoptions"),
+  (operation) =>
+    !operation.tags?.includes("app-legacy-adoptions") &&
+    !operation.tags?.includes("app-member-installations"),
 );
 const matrix = contract.controlPlane;
 if (!Array.isArray(matrix) || matrix.length !== sdkOperations.length) {

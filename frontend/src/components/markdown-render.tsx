@@ -1,4 +1,5 @@
 import {
+  MarkdownLocaleProvider,
   MarkdownViewer,
 } from "@akb/markdown-editor/react";
 import { useMemo } from "react";
@@ -26,7 +27,6 @@ const AKB_MARKDOWN_VIEWER_TABLE_LAYOUT = {
   className: "w-max min-w-full",
   wrapperClassName:
     "akb-md-table my-5 overflow-x-auto rounded-[var(--radius-lg)] border border-border",
-  ariaLabel: "Scrollable table",
 } as const;
 
 export interface MarkdownRenderProps {
@@ -76,25 +76,27 @@ export function MarkdownRender({
   );
 
   return (
-    <MarkdownViewer
-      markdown={body}
-      className={cn(
-        "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
-        className,
-      )}
-      adapters={{
-        targetResolver: resolver,
-        reference: adapters?.reference,
-      }}
-      resolverContext={authenticated ? {
-        vault: authenticatedVault,
-        document: authenticatedDocument,
-        commit: authenticatedCommit,
-      } : {}}
-      headings={headingOptions}
-      image={AKB_MARKDOWN_VIEWER_IMAGE_OPTIONS}
-      tableLayout={AKB_MARKDOWN_VIEWER_TABLE_LAYOUT}
-    />
+    <MarkdownLocaleProvider locale="en">
+      <MarkdownViewer
+        markdown={body}
+        className={cn(
+          "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
+          className,
+        )}
+        adapters={{
+          targetResolver: resolver,
+          reference: adapters?.reference,
+        }}
+        resolverContext={authenticated ? {
+          vault: authenticatedVault,
+          document: authenticatedDocument,
+          commit: authenticatedCommit,
+        } : {}}
+        headings={headingOptions}
+        image={AKB_MARKDOWN_VIEWER_IMAGE_OPTIONS}
+        tableLayout={AKB_MARKDOWN_VIEWER_TABLE_LAYOUT}
+      />
+    </MarkdownLocaleProvider>
   );
 }
 

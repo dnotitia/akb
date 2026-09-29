@@ -3,6 +3,12 @@ import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import {
+  FILE_PREVIEW_CASES,
+  FILE_PREVIEW_PUBLICATION,
+  filePreviewDiscovery,
+  type FilePreviewFixture,
+} from "./src/mocks/file-preview-fixtures.ts";
 
 // Dev proxy target — the local backend started by docker-compose unless an
 // isolated repository runtime supplies its per-run backend origin.
@@ -14,6 +20,7 @@ const mockScenario = [
   "document-edit-recovery",
   "markdown-reference-adapters",
   "markdown-image-rendering",
+  "file-preview",
 ].includes(requestedMockScenario)
   ? requestedMockScenario
   : "empty";
@@ -303,7 +310,9 @@ function mockDescriptor(origin: string) {
               },
             },
           }
-      : null;
+      : mockScenario === "file-preview"
+        ? filePreviewDiscovery(origin)
+        : null;
   return {
     schema_version: 2,
     status: "ready",
@@ -327,6 +336,47 @@ function mockDescriptor(origin: string) {
       unhandled_api: "error",
       fixture,
     },
+  };
+}
+
+function filePreviewResponse(method: string | undefined, pathname: string) {
+  if (method !== "GET") return null;
+
+  let file: Pick<FilePreviewFixture, "name" | "mime_type" | "raw_text"> | undefined;
+  let attachment = false;
+  const ordinaryMatch = pathname.match(/^\/__akb_mock__\/file-preview\/raw\/([^/]+)$/);
+  if (ordinaryMatch) {
+    file = FILE_PREVIEW_CASES.find((candidate) => candidate.id === ordinaryMatch[1]);
+    attachment = true;
+    if (!file) {
+      return {
+        statusCode: 404,
+        headers: { "Content-Type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error: "file_preview_not_found" })),
+      };
+    }
+  } else if (
+    pathname === `/api/v1/public/${FILE_PREVIEW_PUBLICATION.slug}/raw` ||
+    pathname === `/api/v1/public/${FILE_PREVIEW_PUBLICATION.slug}/download`
+  ) {
+    file = FILE_PREVIEW_PUBLICATION;
+    attachment = pathname.endsWith("/download");
+  } else {
+    return null;
+  }
+
+  const body = file.mime_type === "image/png"
+    ? FIXTURE_PNG
+    : file.mime_type === "application/pdf"
+      ? Buffer.from("%PDF-1.4\n%%EOF\n", "utf8")
+      : Buffer.from(file.raw_text || "", "utf8");
+  return {
+    statusCode: 200,
+    headers: {
+      "Content-Type": file.mime_type || "application/octet-stream",
+      ...(attachment ? { "Content-Disposition": `attachment; filename="${file.name}"` } : {}),
+    },
+    body,
   };
 }
 
@@ -360,6 +410,17 @@ function mockControlPlugin(): Plugin {
       publishMockDescriptor(server);
       server.middlewares.use((request, response, next) => {
         const pathname = new URL(request.url || "/", "http://localhost").pathname;
+        if (mockScenario === "file-preview") {
+          const fileResponse = filePreviewResponse(request.method, pathname);
+          if (fileResponse) {
+            response.statusCode = fileResponse.statusCode;
+            for (const [name, value] of Object.entries(fileResponse.headers)) {
+              response.setHeader(name, value);
+            }
+            response.end(fileResponse.body);
+            return;
+          }
+        }
         if (!pathname.startsWith("/__akb_mock__/")) {
           next();
           return;

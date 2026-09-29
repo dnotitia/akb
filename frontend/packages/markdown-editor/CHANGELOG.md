@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.0
+
+- Add `MarkdownLocaleProvider` with package-owned English and Korean common UI
+  copy. Hosts choose the locale; standalone usage defaults to English.
+- Localize toolbar, Source mode, link, table, image, upload, slash, reference,
+  task, code, and resource-state UI without changing canonical Markdown.
+- Preserve editor identity and active UI state when locale changes, including
+  open menus, pending search requests, and in-progress uploads.
+- Remove common per-feature labels/messages and duplicated AKB copy. Keep
+  product-owned search prompts, custom controls, adapter errors, and style
+  options at the host boundary.
+
 ## 0.15.0
 
 - Close the public editor boundary around the package-owned

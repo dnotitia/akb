@@ -1,3 +1,5 @@
+import { isMap, parseDocument } from "yaml";
+
 export interface Heading {
   level: number;
   text: string;
@@ -21,22 +23,42 @@ export function slugify(text: string): string {
 }
 
 /**
- * Strip a leading YAML frontmatter block (`---\n…\n---`) from a body.
- *
- * The server-managed frontmatter is removed before content reaches us, but
- * some documents carry a *second*, author-embedded frontmatter block inside
- * their body (e.g. distilled docs whose source already had one). That inner
- * block survives stripping, and its closing `---` would otherwise be read as
- * a setext underline — turning the last `tags: […]` / `key: value` line into
- * a spurious heading in both the outline and the rendered body. Removing the
- * block at the source keeps every consumer (outline, renderer, slug queue)
- * consistent. Only a block at the very start counts as frontmatter; a `---`
- * thematic break later in the body is untouched.
+ * Strip one leading frontmatter block only when its contents are a valid YAML
+ * mapping. Malformed or unclosed blocks stay in the Markdown body, so a later
+ * thematic break cannot make the document appear to have valid frontmatter.
  */
 export function stripFrontmatter(md: string): string {
   if (!md) return md;
-  const m = /^\uFEFF?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(md);
-  return m ? md.slice(m[0].length) : md;
+  const opening = /^\uFEFF?---[ \t]*\r?\n/.exec(md);
+  if (!opening) return md;
+
+  let lineStart = opening[0].length;
+  while (lineStart <= md.length) {
+    const newline = md.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? md.length : newline;
+    const rawLine = md.slice(lineStart, lineEnd);
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+
+    if (/^---[ \t]*$/.test(line)) {
+      const metadata = md.slice(opening[0].length, lineStart);
+      return isYamlMetadataMapping(metadata)
+        ? md.slice(newline === -1 ? lineEnd : newline + 1)
+        : md;
+    }
+
+    if (newline === -1) break;
+    lineStart = newline + 1;
+  }
+  return md;
+}
+
+function isYamlMetadataMapping(source: string): boolean {
+  try {
+    const document = parseDocument(source, { logLevel: "silent" });
+    return document.errors.length === 0 && isMap(document.contents);
+  } catch {
+    return false;
+  }
 }
 
 /**

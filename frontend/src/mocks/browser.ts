@@ -3,6 +3,7 @@ import { http, HttpResponse } from "msw";
 import {
   currentUser as fixtureUser,
   localAuthConfig,
+  skillTemplateHandler,
   vaultHealth,
 } from "@/stories/page-story-fixtures";
 import {
@@ -10,19 +11,28 @@ import {
   documentEditDraftTabId,
   listDocumentEditDrafts,
 } from "@/lib/document-draft";
+import {
+  FILE_PREVIEW_CASES,
+  FILE_PREVIEW_PUBLICATION,
+  type FilePreviewFixture,
+} from "./file-preview-fixtures";
 
 const API = "/api/v1";
 const MOCK_TOKEN = "akb-mock-browser-token";
 const FIXTURE_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
-function fixturePngBlob(): Blob {
+function fixturePngBytes(): Uint8Array<ArrayBuffer> {
   const binary = atob(FIXTURE_PNG_BASE64);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index);
   }
-  return new Blob([bytes], { type: "image/png" });
+  return bytes;
+}
+
+function fixturePngBlob(): Blob {
+  return new Blob([fixturePngBytes()], { type: "image/png" });
 }
 
 type MockUser = typeof fixtureUser & { auth_method: "local" };
@@ -265,6 +275,26 @@ function resetState() {
   user = { ...initialUser };
 }
 
+function filePreviewFixture(id: string) {
+  return FILE_PREVIEW_CASES.find((file) => file.id === id);
+}
+
+function filePreviewRawResponse(file: FilePreviewFixture) {
+  if (file.mime_type === "image/png") {
+    return new HttpResponse(fixturePngBytes(), {
+      headers: { "Content-Type": "image/png" },
+    });
+  }
+  if (file.mime_type === "application/pdf") {
+    return new HttpResponse(new TextEncoder().encode("%PDF-1.4\n%%EOF\n"), {
+      headers: { "Content-Type": "application/pdf" },
+    });
+  }
+  return new HttpResponse(file.raw_text || "", {
+    headers: { "Content-Type": file.mime_type || "application/octet-stream" },
+  });
+}
+
 async function syncPublicReset() {
   await syncFixtureState();
 }
@@ -273,7 +303,7 @@ async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   return (await request.json()) as Record<string, unknown>;
 }
 
-const handlers = [
+export const handlers = [
   http.get(`${API}/auth/config`, async () => {
     await syncPublicReset();
     return HttpResponse.json(isDocumentScenario() ? documentScenarioAuthConfig : localAuthConfig);
@@ -572,6 +602,61 @@ const handlers = [
       size_bytes: 5,
     });
   }),
+  http.get(API + "/files/fixture/:fileId", async ({ params }) => {
+    await syncPublicReset();
+    const file = filePreviewFixture(String(params.fileId || ""));
+    if (!file) return new HttpResponse(null, { status: 404 });
+    return HttpResponse.json({
+      uri: "akb://fixture/file/" + file.id,
+      name: file.name,
+      collection: "file-preview",
+      mime_type: file.mime_type,
+      size_bytes: file.raw_text?.length ?? 68,
+    });
+  }),
+  http.get(API + "/files/fixture/:fileId/download", async ({ params }) => {
+    await syncPublicReset();
+    const file = filePreviewFixture(String(params.fileId || ""));
+    if (!file) return new HttpResponse(null, { status: 404 });
+    return HttpResponse.json({
+      kind: "file",
+      name: file.name,
+      download_url: "/__akb_mock__/file-preview/raw/" + file.id,
+      mime_type: file.mime_type,
+      size_bytes: file.raw_text?.length ?? 68,
+    });
+  }),
+  http.get("/__akb_mock__/file-preview/raw/:fileId", ({ params }) => {
+    const file = filePreviewFixture(String(params.fileId || ""));
+    return file ? filePreviewRawResponse(file) : new HttpResponse(null, { status: 404 });
+  }),
+  http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug, async () => {
+    await syncPublicReset();
+    return HttpResponse.json({
+      resource_type: "file",
+      title: "Public synthetic settings",
+      name: FILE_PREVIEW_PUBLICATION.name,
+      mime_type: FILE_PREVIEW_PUBLICATION.mime_type,
+      size_bytes: FILE_PREVIEW_PUBLICATION.raw_text.length,
+      view_grant: "mock-file-preview-view",
+    });
+  }),
+  http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug + "/capabilities", () =>
+    HttpResponse.json({ can_edit: false }),
+  ),
+  http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug + "/raw", () =>
+    new HttpResponse(FILE_PREVIEW_PUBLICATION.raw_text, {
+      headers: { "Content-Type": FILE_PREVIEW_PUBLICATION.mime_type },
+    }),
+  ),
+  http.get(API + "/public/" + FILE_PREVIEW_PUBLICATION.slug + "/download", () =>
+    new HttpResponse(FILE_PREVIEW_PUBLICATION.raw_text, {
+      headers: {
+        "Content-Type": FILE_PREVIEW_PUBLICATION.mime_type,
+        "Content-Disposition": "attachment; filename=\"" + FILE_PREVIEW_PUBLICATION.name + "\"",
+      },
+    }),
+  ),
   http.get("/__akb_mock__/fixture/available-file.png", async () => {
     await syncPublicReset();
     return new HttpResponse(fixturePngBlob(), {
@@ -652,6 +737,7 @@ const handlers = [
   }),
   http.get("/health", () => HttpResponse.json(vaultHealth)),
   http.get(/\/health\/vault\/fixture(?:\?.*)?$/, () => HttpResponse.json(vaultHealth)),
+  skillTemplateHandler,
   // Mock product APIs never fall through to a real backend.
   http.all(`${API}/*`, () =>
     HttpResponse.json({ error: "unhandled_mock_api_request" }, { status: 501 }),

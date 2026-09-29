@@ -23,37 +23,18 @@ import {
 import type {
   MarkdownReferenceCandidate,
   MarkdownReferenceKind,
-  MarkdownReferenceLabels,
   MarkdownReferenceOptions,
 } from '../types.js'
+import { getMarkdownMessages } from './markdown-locale.js'
+import type { MarkdownLocaleSource, MarkdownMessages } from './markdown-locale.js'
 
 export type {
   MarkdownReferenceAdapter,
   MarkdownReferenceCandidate,
   MarkdownReferenceContext,
   MarkdownReferenceKind,
-  MarkdownReferenceLabels,
   MarkdownReferenceOptions,
 } from '../types.js'
-
-export const DEFAULT_MARKDOWN_REFERENCE_LABELS: MarkdownReferenceLabels = {
-  header: 'Insert reference',
-  escapeHint: 'Esc',
-  sections: {
-    person: 'People',
-    issue: 'Issues',
-    document: 'Documents',
-    file: 'Files',
-  },
-  searching: 'Searching…',
-  empty: 'No matching references.',
-  error: 'Unable to search references.',
-  footer: {
-    navigation: '↑↓ Navigate',
-    insert: '↵ Insert',
-    close: 'Esc Close',
-  },
-}
 
 const MARKDOWN_REFERENCE_KIND_ORDER: readonly MarkdownReferenceKind[] = [
   'person',
@@ -77,28 +58,11 @@ interface MarkdownReferenceMenuProps {
   items: readonly MarkdownReferenceCandidate[]
   selectedIndex: number
   listboxId: string
-  labels: MarkdownReferenceLabels
+  labels: MarkdownMessages['reference']
   status: MarkdownReferenceStatus
   errorMessage?: string
   onActiveChange: (index: number) => void
   onSelect: (candidate: MarkdownReferenceCandidate) => void
-}
-
-function mergeMarkdownReferenceLabels(
-  labels?: MarkdownReferenceOptions['labels'],
-): MarkdownReferenceLabels {
-  return {
-    ...DEFAULT_MARKDOWN_REFERENCE_LABELS,
-    ...labels,
-    sections: {
-      ...DEFAULT_MARKDOWN_REFERENCE_LABELS.sections,
-      ...labels?.sections,
-    },
-    footer: {
-      ...DEFAULT_MARKDOWN_REFERENCE_LABELS.footer,
-      ...labels?.footer,
-    },
-  }
 }
 
 function candidateKey(candidate: MarkdownReferenceCandidate): string {
@@ -414,6 +378,7 @@ interface MarkdownReferenceOptionsSource {
 
 function createMarkdownReferenceSuggestion(
   source: MarkdownReferenceOptionsSource,
+  localeSource?: MarkdownLocaleSource,
 ): Omit<
   SuggestionOptions<MarkdownReferenceCandidate, MarkdownReferenceCandidate>,
   'editor'
@@ -428,6 +393,7 @@ function createMarkdownReferenceSuggestion(
   let requestQuery = ''
   let requestStatus: MarkdownReferenceStatus = 'empty'
   let requestError: string | undefined
+  let unsubscribeLocale: (() => void) | undefined
   const listboxId = `markdown-reference-list-${Math.random().toString(36).slice(2, 10)}`
 
   source.subscribe?.(() => {
@@ -447,7 +413,8 @@ function createMarkdownReferenceSuggestion(
     if (options === false || options === undefined) return undefined
     return options
   }
-  const currentLabels = () => mergeMarkdownReferenceLabels(currentOptions()?.labels)
+  const currentLabels = () =>
+    getMarkdownMessages(localeSource?.getLocale() ?? 'en').reference
 
   async function searchReferences({
     query,
@@ -574,6 +541,9 @@ function createMarkdownReferenceSuggestion(
           exitSuggestion(props.editor.view, markdownReferencePluginKey),
         )
         activeEditor = props.editor
+        unsubscribeLocale = localeSource?.subscribe(() => {
+          renderer?.updateProps({ labels: currentLabels() })
+        })
         selectedIndex = 0
         items = normalizeMarkdownReferenceCandidates(props.items)
         command = props.command
@@ -615,6 +585,8 @@ function createMarkdownReferenceSuggestion(
         unmount = undefined
         renderer?.destroy()
         renderer = null
+        unsubscribeLocale?.()
+        unsubscribeLocale = undefined
         items = []
         command = undefined
         selectedIndex = 0
@@ -656,8 +628,9 @@ function createMarkdownReferenceSuggestion(
 
 function createMarkdownReferenceExtensionFromSource(
   source: MarkdownReferenceOptionsSource,
+  localeSource?: MarkdownLocaleSource,
 ): Extension {
-  const suggestion = createMarkdownReferenceSuggestion(source)
+  const suggestion = createMarkdownReferenceSuggestion(source, localeSource)
   return Extension.create({
     name: 'markdownReference',
     addProseMirrorPlugins() {
@@ -676,6 +649,7 @@ export function createMarkdownReferenceExtension(
 export function createLiveMarkdownReferenceExtension(
   getOptions: () => MarkdownReferenceOptions | false | undefined,
   subscribe?: (listener: () => void) => () => void,
+  localeSource?: MarkdownLocaleSource,
 ): Extension {
-  return createMarkdownReferenceExtensionFromSource({ getOptions, subscribe })
+  return createMarkdownReferenceExtensionFromSource({ getOptions, subscribe }, localeSource)
 }

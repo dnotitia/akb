@@ -15,8 +15,8 @@ pytestmark = pytest.mark.asyncio
 _REASON = "partial_driver_result"
 
 
-def _partial_store(monkeypatch, hits):
-    search = AsyncMock(side_effect=VectorSearchDegraded(hits=hits, reason=_REASON))
+def _partial_store(monkeypatch, hits, *, reason=_REASON):
+    search = AsyncMock(side_effect=VectorSearchDegraded(hits=hits, reason=reason))
     store = SimpleNamespace(vault_filter_supported=True, hybrid_search=search)
     monkeypatch.setattr(ss, "get_vector_store", lambda: store)
     monkeypatch.setattr(ss.sparse_encoder, "encode_query", AsyncMock(return_value=([7], [1.0])))
@@ -38,19 +38,21 @@ async def test_partial_exception_is_public_and_retains_filtered_driver_hits(monk
 
 
 @pytest.mark.parametrize("empty", [False, True])
-async def test_partial_search_response_preserves_hydration_and_accounting(monkeypatch, empty):
+@pytest.mark.parametrize("reason", [_REASON, "dense_leg_timeout", "sparse_leg_timeout",
+                                   "retrieval_timeout", "retrieval_unavailable"])
+async def test_partial_search_response_preserves_hydration_and_accounting(monkeypatch, empty, reason):
     active, archived = uuid.uuid4(), uuid.uuid4()
     _install(monkeypatch, _Conn({active: "draft", archived: "archived"}))
     # Actual hydration must filter authoritative archived metadata rather than
     # returning exception hits directly.
-    _partial_store(monkeypatch, [] if empty else [_hit(archived), _hit(active)])
+    _partial_store(monkeypatch, [] if empty else [_hit(archived), _hit(active)], reason=reason)
     sds.reset()
     try:
         response = await ss.SearchService().search(
             "known term", vault="mine", user_id=str(uuid.UUID(int=1)), limit=2,
         )
         assert response.degraded is True
-        assert response.degradation_reason == _REASON
+        assert response.degradation_reason == reason
         assert response.returned == (0 if empty else 1)
         assert len(response.results) == (0 if empty else 1)
         if not empty:
@@ -60,7 +62,7 @@ async def test_partial_search_response_preserves_hydration_and_accounting(monkey
         delta = next(iter(sds._pending.values()))
         assert delta.observed == delta.degraded == 1
         assert delta.degraded_with_results == (0 if empty else 1)
-        assert dict(delta.by_cause) == {_REASON: 1}
+        assert dict(delta.by_cause) == {reason: 1}
     finally:
         sds.reset()
 

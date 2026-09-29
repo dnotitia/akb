@@ -26,13 +26,10 @@ describe('Markdown block rendering', () => {
   afterEach(cleanup)
 
   it('shares headings, lists, quotes, checklists, and highlighted code between editor and viewer', async () => {
-    const codeOptions = {
-      labels: { region: (language?: string) => `Code region${language ? `: ${language}` : ''}` },
-    }
     const { container } = render(
       <>
-        <MarkdownEditor markdown={MIXED_MARKDOWN} code={codeOptions} />
-        <MarkdownViewer markdown={MIXED_MARKDOWN} code={codeOptions} />
+        <MarkdownEditor markdown={MIXED_MARKDOWN} />
+        <MarkdownViewer markdown={MIXED_MARKDOWN} />
       </>,
     )
 
@@ -53,7 +50,7 @@ describe('Markdown block rendering', () => {
     expect(code).toHaveAttribute('data-markdown-code', 'true')
     expect(code).toHaveAttribute('role', 'region')
     expect(code).toHaveAttribute('tabindex', '0')
-    expect(code).toHaveAttribute('aria-label', 'Code region: typescript')
+    expect(code).toHaveAttribute('aria-label', 'Scrollable typescript code block')
     expect(code?.querySelector('.hljs-keyword')).toHaveTextContent('const')
   })
 
@@ -77,7 +74,6 @@ describe('Markdown block rendering', () => {
         tableLayout={{
           className: 'w-max',
           wrapperClassName: 'table-scroll',
-          ariaLabel: 'Scrollable document table',
         }}
       />,
     )
@@ -90,7 +86,7 @@ describe('Markdown block rendering', () => {
     expect(content.querySelector('[data-markdown-table-wrapper="true"]')).toHaveClass('table-scroll')
     expect(content.querySelector('[data-markdown-table-wrapper="true"]')).toHaveAttribute(
       'aria-label',
-      'Scrollable document table',
+      'Scrollable table',
     )
     expect(content.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
   })

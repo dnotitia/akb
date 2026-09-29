@@ -318,6 +318,14 @@ class InstallationProjection(ControlPlaneModel):
     replayed: bool | None = None
 
 
+class InstallationActiveStatus(BaseModel):
+    """Minimal canonical active flag exposed to Vault members."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    active: StrictBool
+
+
 class ObservedStateRequest(ControlPlaneRequest):
     installation_id: uuid.UUID
     observed_generation: int = Field(ge=0)

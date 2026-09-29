@@ -46,12 +46,9 @@ COPY frontend/ ./frontend/
 RUN cd frontend && pnpm run build
 
 # ---------- MinIO server + mc client ----------
-# dl.min.io no longer serves binaries: every archive URL, and the latest one,
-# answers 410 Gone. The same releases' images are pinned by digest instead;
-# their binaries are byte-identical to the archive files the sha256 pins in
-# the final stage were taken from.
-FROM quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS minio
-FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 AS mc
+# IBM mirrors the original upstream server digest after the Quay removal.
+# This image includes both minio and mc; no separate client image is needed.
+FROM icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS minio
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
@@ -70,10 +67,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# MinIO server + mc client (bucket bootstrap), from the pinned release images
+# MinIO server + mc client (bucket bootstrap), from the pinned server image
 # above, verified against the same sha256 pins as before (linux/amd64).
 COPY --from=minio /usr/bin/minio /usr/local/bin/minio
-COPY --from=mc /usr/bin/mc /usr/local/bin/mc
+COPY --from=minio /usr/bin/mc /usr/local/bin/mc
 RUN echo "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  /usr/local/bin/minio" | sha256sum -c - && \
     echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  /usr/local/bin/mc" | sha256sum -c - && \
     chmod +x /usr/local/bin/minio /usr/local/bin/mc

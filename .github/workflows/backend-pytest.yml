@@ -168,6 +168,7 @@ jobs:
           # Matches the fixture default + the dev compose override.
           AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
           AKB_SEARCH_PERF_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
+          AKB_SEARCH_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
           # Migration 057 is deliberately measurement-database-only. Keep
           # generic DB tests on `akb`, and run the M1 File contract in its
           # isolated disposable database so both safety boundaries execute.
@@ -360,6 +361,11 @@ jobs:
             tests/test_bm25_term_id_compaction_postgres.py
             tests/test_bm25_query_epoch_postgres.py
             tests/test_hybrid_leg_failure_postgres.py
+            # Real cancellation/reset, exact scoped scores, and bounded Native
+            # source lookups must run on a fresh DB, not skip in both lanes.
+            tests/test_pgvector_hybrid_deadline_postgres.py
+            tests/test_pgvector_scope_routing_postgres.py
+            tests/test_native_search_source_scope_postgres.py
             tests/test_bm25_revert_range_postgres.py
             tests/test_bm25_runtime_reset_postgres.py
             # Needs both servers: the decision turns on whether the server

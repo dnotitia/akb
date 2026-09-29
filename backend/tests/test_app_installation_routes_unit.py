@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 import tempfile
 
+import asyncpg
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.api import deps
 from app.api.deps import get_current_app, get_current_user
 from app.api.routes import app_installations
+from app.services import app_installation_service as installation
 
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-installation-routes-test-")
 
@@ -148,6 +152,146 @@ def test_app_status_uses_principal_app_and_cannot_select_another_app(monkeypatch
     assert response.headers["cache-control"] == "no-store"
     assert requested[0][0] == app_id
     assert requested[0][1] == vault_id
+
+
+def test_member_active_status_uses_user_session_and_only_returns_active(monkeypatch):
+    app_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    user = _user(is_admin=False)
+    requested: list[dict] = []
+
+    async def fake_status(requested_app_id, requested_vault_id, **kwargs):
+        requested.append(
+            {
+                "app_id": requested_app_id,
+                "vault_id": requested_vault_id,
+                **kwargs,
+            }
+        )
+        return {"active": True}
+
+    monkeypatch.setattr(
+        app_installations, "get_member_installation_active_status", fake_status
+    )
+    response = _client(user=user).get(
+        f"/api/v1/apps/{app_id}/installations/{vault_id}/active"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"active": True}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert requested[0]["app_id"] == app_id
+    assert requested[0]["vault_id"] == vault_id
+    assert requested[0]["user"] is user
+    assert isinstance(requested[0]["correlation_id"], str)
+
+
+def test_member_active_status_query_failure_is_safe_and_no_store(monkeypatch, caplog):
+    user = _user(is_admin=False)
+    vault_id = uuid.uuid4()
+    raw_error_marker = "RAW_MEMBER_INSTALLATION_QUERY_ERROR"
+    raw_credential = "synthetic-fault-credential-abcdef"
+    raw_error = f"{raw_error_marker}; Authorization: Bearer {raw_credential}"
+
+    class FakeConnection:
+        async def fetchrow(self, _query, requested_vault_id):
+            assert requested_vault_id == vault_id
+            return {
+                "id": vault_id,
+                "name": "member-status-vault",
+                "owner_id": uuid.UUID(user.user_id),
+            }
+
+        async def fetchval(self, query, *_args):
+            assert "FROM vault_app_installations" in query
+            raise asyncpg.exceptions.UndefinedTableError(raw_error)
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    async def fake_get_pool():
+        return FakePool()
+
+    async def allow_owner_access(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(installation, "get_pool", fake_get_pool)
+    monkeypatch.setattr(installation, "check_vault_access", allow_owner_access)
+    monkeypatch.setitem(main_app.dependency_overrides, get_current_user, lambda: user)
+
+    with caplog.at_level(logging.ERROR):
+        response = TestClient(main_app, raise_server_exceptions=False).get(
+            f"/api/v1/apps/{uuid.uuid4()}/installations/{vault_id}/active"
+        )
+
+    payload = response.json()
+    observed = {
+        "status": response.status_code,
+        "message": payload.get("message"),
+        "error": payload.get("error"),
+        "code": payload.get("code"),
+        "detail_message": payload.get("detail", {}).get("message")
+        if isinstance(payload.get("detail"), dict)
+        else payload.get("detail"),
+        "cache_control": response.headers.get("cache-control"),
+        "pragma": response.headers.get("pragma"),
+        "raw_error_in_response": raw_error_marker in response.text,
+        "raw_credential_in_response": raw_credential in response.text,
+        "raw_error_in_logs": raw_error_marker in caplog.text,
+        "raw_credential_in_logs": raw_credential in caplog.text,
+    }
+    assert observed == {
+        "status": 503,
+        "message": "Installation status is temporarily unavailable",
+        "error": "Installation status is temporarily unavailable",
+        "code": "member_installation_status_unavailable",
+        "detail_message": "Installation status is temporarily unavailable",
+        "cache_control": "no-store",
+        "pragma": "no-cache",
+        "raw_error_in_response": False,
+        "raw_credential_in_response": False,
+        "raw_error_in_logs": False,
+        "raw_credential_in_logs": False,
+    }
+
+
+def test_member_active_status_invalid_session_is_no_store():
+    response = TestClient(main_app).get(
+        f"/api/v1/apps/{uuid.uuid4()}/installations/{uuid.uuid4()}/active"
+    )
+
+    assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_member_active_status_requires_pat_read_scope(monkeypatch):
+    user = _user(is_admin=False)
+    user.token_scopes = frozenset({"write"})
+
+    async def authorize(_authorization):
+        return user
+
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", authorize)
+    response = TestClient(main_app).get(
+        f"/api/v1/apps/{uuid.uuid4()}/installations/{uuid.uuid4()}/active",
+        headers={"Authorization": "Bearer fixture-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "insufficient_scope"
+    assert response.json()["detail"]["required_scope"] == "read"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
 
 
 def test_delete_replay_status_and_no_store(monkeypatch):

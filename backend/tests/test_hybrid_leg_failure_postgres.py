@@ -1,12 +1,13 @@
 """A failed retrieval leg must preserve the healthy scoped leg, on real PG."""
 import asyncio
+from contextlib import nullcontext
 import uuid
 
 import asyncpg
 import pytest
 
 from app.services import sparse_encoder
-from app.services.vector_store import VectorSearchDegraded, VectorStoreUnavailable
+from app.services.vector_store import VectorSearchDegraded
 from tests.test_bm25_query_epoch_postgres import _seed
 from tests.test_bm25_term_id_compaction_postgres import _installation
 
@@ -55,7 +56,7 @@ async def test_statement_timeout_preserves_the_healthy_scoped_oracle(monkeypatch
         monkeypatch.setattr(install.store, f"_search_{failed}", _timeout)
         with pytest.raises(VectorSearchDegraded) as exc:
             await asyncio.wait_for(install.store.hybrid_search(**kwargs), 3)
-        assert exc.value.reason == f"{failed}_leg_failed"
+        assert exc.value.reason == f"{failed}_leg_timeout"
         assert exc.value.hits == oracle
         async with install.pool.acquire() as conn:
             assert await conn.fetchval("SELECT 1") == 1
@@ -80,9 +81,8 @@ async def test_acl_or_schema_failure_cancels_and_drains_the_other_leg(monkeypatc
 
         monkeypatch.setattr(install.store, "_search_dense", waiting)
         monkeypatch.setattr(install.store, "_search_sparse", refused)
-        with pytest.raises(VectorStoreUnavailable) as exc:
+        with pytest.raises(failure):
             await asyncio.wait_for(install.store.hybrid_search(**kwargs), 3)
-        assert not isinstance(exc.value, VectorSearchDegraded)
         assert cancelled.is_set()
 
 
@@ -91,9 +91,10 @@ async def test_both_legs_failing_produces_no_partial_results(monkeypatch):
         kwargs = await _prepare(install)
         monkeypatch.setattr(install.store, "_search_dense", _timeout)
         monkeypatch.setattr(install.store, "_search_sparse", _timeout)
-        with pytest.raises(VectorStoreUnavailable) as exc:
+        with pytest.raises(VectorSearchDegraded) as exc:
             await asyncio.wait_for(install.store.hybrid_search(**kwargs), 3)
-        assert not isinstance(exc.value, VectorSearchDegraded)
+        assert exc.value.reason == "retrieval_timeout"
+        assert exc.value.hits == []
 
 
 async def test_partial_search_releases_failed_connection_with_a_one_slot_pool(monkeypatch):
@@ -113,7 +114,8 @@ async def test_partial_search_releases_failed_connection_with_a_one_slot_pool(mo
             await tiny.close()
 
 
-async def test_lost_dense_backend_preserves_the_sparse_oracle(monkeypatch):
+@pytest.mark.parametrize("nested_transaction", [False, True])
+async def test_lost_dense_backend_preserves_the_sparse_oracle(monkeypatch, nested_transaction):
     async with _installation(monkeypatch) as install:
         kwargs = await _prepare(install)
         oracle = await install.store.hybrid_search(**{**kwargs, "query_dense": None})
@@ -126,7 +128,8 @@ async def test_lost_dense_backend_preserves_the_sparse_oracle(monkeypatch):
                 await killer.execute("SELECT pg_terminate_backend($1)", pid)
             task = asyncio.create_task(terminate())
             try:
-                await conn.fetchval("SELECT pg_sleep(5)")
+                async with conn.transaction() if nested_transaction else nullcontext():
+                    await conn.fetchval("SELECT pg_sleep(5)")
             finally:
                 await task
                 await killer.close()

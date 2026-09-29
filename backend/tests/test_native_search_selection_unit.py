@@ -312,15 +312,10 @@ async def test_native_search_pushes_source_uri_into_bounded_sql_scope():
     assert candidates == []
     assert stats == {}
 
-    # Pairwise shape: one clause covering all URIs via unnested
-    # (vault, identifier) rows — not one OR per URI, and NOT two independent
-    # ANYs (which would cross-match vault A's identifier against vault B).
-    # The scope query (fetchrow) and the page query (fetch) both carry it.
-    # (" OR " still appears once — the path-OR-id alternation.)
-    assert all("r.current_path" in sql and "r.resource_id::text" in sql for sql, _ in conn.queries)
+    # Both guard and page queries carry the same bounded paired input;
+    # non-UUID paths have no UUID probe but still use the path probe.
     assert all("unnest(" in sql for sql, _ in conn.queries)
-    assert conn.sql.count(" OR ") == 1
-    assert conn.params == (["measure"], ["specs/guide.md"])
+    assert all(params == (["measure"], ["specs/guide.md"], [None]) for _, params in conn.queries)
 
 
 @pytest.mark.asyncio
@@ -342,19 +337,15 @@ async def test_native_search_source_uris_share_one_pairwise_clause():
     )
     assert candidates == []
     assert stats == {}
-    assert conn.sql.count(" OR ") == 1  # only the path-OR-id alternation
     assert "unnest(" in conn.sql
     # Same vault repeated per pair (pairwise), NOT one vault list × one id
     # list (which would cross-match across vaults).
-    assert conn.params == (["measure"] * 5, [f"specs/guide-{i}.md" for i in range(5)])
+    assert conn.params == (["measure"] * 5, [f"specs/guide-{i}.md" for i in range(5)], [None] * 5)
 
 
 @pytest.mark.asyncio
 async def test_native_search_source_uris_do_not_cross_match_vaults():
-    """Pairwise unnest keeps (vault, identifier) together: with URIs from two
-    vaults, the generated SQL cannot match vault A's name against vault B's
-    identifier. Verified by executing the scope predicate shape against a
-    fake conn that evaluates the pairing in Python."""
+    """Keep the pair inputs aligned; real PostgreSQL tests exercise matching."""
 
     seen_sql: list[str] = []
     seen_params: list[tuple] = []
@@ -398,12 +389,10 @@ async def test_native_search_source_uris_do_not_cross_match_vaults():
     assert stats == {}
     # The SQL carries both pairs positionally aligned: index i of the vault
     # array belongs to index i of the identifier array.
-    vaults_param, idents_param = seen_params[-1][-2], seen_params[-1][-1]
+    vaults_param, idents_param, resource_ids = seen_params[-1][-3:]
     assert vaults_param == ["vault-a", "vault-b"]
     assert idents_param == ["specs/guide.md", "other.md"]
-    # And the predicate is a row-constructor IN (pairwise), not two ANYs.
-    assert "(v.name, r.current_path) IN (" in seen_sql[-1]
-    assert "v.name = ANY" not in seen_sql[-1]
+    assert resource_ids == [None, None]
 
 
 @pytest.mark.asyncio

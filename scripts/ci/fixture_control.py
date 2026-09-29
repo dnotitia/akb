@@ -50,7 +50,12 @@ class ControlRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["fault_injection", "restart"]
+    action: Literal[
+        "fault_injection",
+        "member_access",
+        "member_installation_state",
+        "restart",
+    ]
     target: str | None = None
     kind: str | None = None
     enabled: bool = True
