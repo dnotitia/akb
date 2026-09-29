@@ -919,6 +919,86 @@ class E2ERuntime:
             catalog["web"] = self._frontend_discovery()
         if self.oidc_fixture is not None:
             catalog["oidc"] = self.oidc_fixture.discovery()
+        if self.config.scenario == "app-installation-lifecycle":
+            fixtures = catalog.get("fixtures")
+            apps = catalog.get("apps")
+            target_app = apps.get("target") if isinstance(apps, dict) else None
+            active_fixture = fixtures.get("status_active") if isinstance(fixtures, dict) else None
+            if isinstance(target_app, dict) and isinstance(active_fixture, dict):
+                app_id = target_app.get("id")
+                vault_id = active_fixture.get("vault_id")
+                if isinstance(app_id, str) and isinstance(vault_id, str):
+                    catalog["member_installation_active"] = {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{app_id}/installations/{vault_id}/active",
+                        "app_id": app_id,
+                        "vault_id": vault_id,
+                    }
+            installation_id = (
+                active_fixture.get("installation_id")
+                if isinstance(active_fixture, dict)
+                else None
+            )
+            catalog["controls"] = {
+                "member_installation_state": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {
+                        "action": "member_installation_state",
+                        "target": "status_active",
+                        "kind": "upgrading",
+                        "enabled": True,
+                    },
+                    "states": [
+                        "installing",
+                        "active",
+                        "upgrading",
+                        "blocked",
+                        "uninstalled",
+                    ],
+                },
+                "member_access": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {
+                        "action": "member_access",
+                        "target": "reader",
+                        "kind": "status_active",
+                        "enabled": False,
+                    },
+                },
+                "fault_injection": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {
+                        "action": "fault_injection",
+                        "target": "status_active",
+                        "kind": "member_installation_unavailable",
+                        "enabled": True,
+                    },
+                    "disable_body": {
+                        "action": "fault_injection",
+                        "target": "status_active",
+                        "kind": "member_installation_unavailable",
+                        "enabled": False,
+                    },
+                    "kinds": ["member_installation_unavailable"],
+                    "targets": (
+                        [
+                            {
+                                "fixture_id": "status_active",
+                                "installation_id": installation_id,
+                            }
+                        ]
+                        if isinstance(installation_id, str)
+                        else []
+                    ),
+                },
+            }
         if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
             installations = catalog.get("installations", [])
             targets: list[dict[str, str]] = []
@@ -1029,14 +1109,214 @@ class E2ERuntime:
                     self._restart_backend(self._lifecycle_generation),
                     name="backend-restart",
                 )
-        elif action == "fault_injection":
-            if self.config.scenario not in {"app-release-rollout", "app-control-plane"}:
+        elif action in {"member_access", "member_installation_state"}:
+            if self.config.scenario != "app-installation-lifecycle":
                 return {
                     "status": "rejected",
                     "scenario": self.config.scenario,
                     "action": action,
                     "reason": "unsupported_scenario",
                 }
+            if target is None or len(target) > 128 or (kind is not None and len(kind) > 128):
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "enabled": False,
+                    "reason": "unsupported_target",
+                }
+            if action == "member_installation_state":
+                fixtures = self._fixture_catalog.get("fixtures", {})
+                fixture = (
+                    fixtures.get("status_active")
+                    if target == "status_active" and isinstance(fixtures, dict)
+                    else None
+                )
+                installation_id = fixture.get("installation_id") if isinstance(fixture, dict) else None
+                active_release_id = fixture.get("release_id") if isinstance(fixture, dict) else None
+                releases = self._fixture_catalog.get("releases", {})
+                next_release = releases.get("target_next") if isinstance(releases, dict) else None
+                next_release_id = next_release.get("id") if isinstance(next_release, dict) else None
+                lifecycle = kind
+                if (
+                    not isinstance(installation_id, str)
+                    or not isinstance(active_release_id, str)
+                    or not isinstance(next_release_id, str)
+                    or active_release_id == next_release_id
+                    or lifecycle not in {"installing", "active", "upgrading", "blocked", "uninstalled"}
+                ):
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_target_or_state",
+                    }
+                desired_release_id, current_release_id, blocked_reason = {
+                    "installing": (active_release_id, None, None),
+                    "active": (active_release_id, active_release_id, None),
+                    "upgrading": (next_release_id, active_release_id, None),
+                    "blocked": (next_release_id, active_release_id, "fixture_controlled_blocked"),
+                    "uninstalled": (None, active_release_id, None),
+                }[lifecycle]
+                try:
+                    import asyncpg
+
+                    connection = await asyncpg.connect(
+                        host="127.0.0.1",
+                        port=self.config.postgres_port,
+                        user="akb",
+                        password="akb",
+                        database="akb",
+                    )
+                    try:
+                        result = await connection.execute(
+                            """
+                            UPDATE vault_app_installations
+                               SET lifecycle=$1,
+                                   desired_release_id=$2,
+                                   current_release_id=$3,
+                                   blocked_reason=$4
+                             WHERE id=$5
+                            """,
+                            lifecycle,
+                            uuid.UUID(desired_release_id) if desired_release_id else None,
+                            uuid.UUID(current_release_id) if current_release_id else None,
+                            blocked_reason,
+                            uuid.UUID(installation_id),
+                        )
+                    finally:
+                        await connection.close()
+                except Exception:
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fixture_unavailable",
+                    }
+                if result != "UPDATE 1":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fixture_unavailable",
+                    }
+                self._fixture_controls["member_installation_state"] = {
+                    "target": target,
+                    "state": lifecycle,
+                }
+                return {
+                    "status": "accepted",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "enabled": True,
+                    "observed": {"installation_state": lifecycle},
+                }
+
+            actors = self._fixture_catalog.get("actors", {})
+            fixtures = self._fixture_catalog.get("fixtures", {})
+            actor = actors.get(target) if isinstance(actors, dict) else None
+            fixture = fixtures.get(kind) if isinstance(fixtures, dict) else None
+            system_admin = actors.get("system_admin") if isinstance(actors, dict) else None
+            if (
+                target != "reader"
+                or not isinstance(actor, dict)
+                or actor.get("vault_role") != "reader"
+                or not isinstance(fixture, dict)
+                or not isinstance(fixture.get("vault_id"), str)
+                or not isinstance(actor.get("id"), str)
+                or not isinstance(system_admin, dict)
+                or not isinstance(system_admin.get("id"), str)
+            ):
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "enabled": False,
+                    "reason": "unsupported_target",
+                }
+            try:
+                import asyncpg
+
+                connection = await asyncpg.connect(
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
+                )
+                try:
+                    if enabled:
+                        await connection.execute(
+                            """
+                            INSERT INTO vault_access (vault_id, user_id, role, granted_by)
+                            VALUES ($1, $2, 'reader', $3)
+                            ON CONFLICT (vault_id, user_id)
+                            DO UPDATE SET role = 'reader', granted_by = EXCLUDED.granted_by
+                            """,
+                            uuid.UUID(fixture["vault_id"]),
+                            uuid.UUID(actor["id"]),
+                            uuid.UUID(system_admin["id"]),
+                        )
+                    else:
+                        await connection.execute(
+                            "DELETE FROM vault_access WHERE vault_id=$1 AND user_id=$2",
+                            uuid.UUID(fixture["vault_id"]),
+                            uuid.UUID(actor["id"]),
+                        )
+                finally:
+                    await connection.close()
+            except Exception:
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "enabled": False,
+                    "reason": "fixture_unavailable",
+                }
+            self._fixture_controls["member_access"] = {
+                "target": target,
+                "fixture": kind,
+                "enabled": bool(enabled),
+            }
+            return {
+                "status": "accepted",
+                "scenario": self.config.scenario,
+                "action": action,
+                "enabled": bool(enabled),
+            }
+        elif action == "fault_injection":
+            supported_scenarios = {
+                "app-release-rollout",
+                "app-control-plane",
+                "app-installation-lifecycle",
+            }
+            if self.config.scenario not in supported_scenarios:
+                return {
+                    "status": "rejected",
+                    "scenario": self.config.scenario,
+                    "action": action,
+                    "reason": "unsupported_scenario",
+                }
+            if self.config.scenario == "app-installation-lifecycle":
+                if target != "status_active":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_target",
+                    }
+                if kind != "member_installation_unavailable":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_kind",
+                    }
             if target is not None and len(target) > 128:
                 raise ValueError("control target is too long")
             if enabled:
@@ -1054,6 +1334,8 @@ class E2ERuntime:
                 allowed_kinds = {"missing_owned_table"}
                 if self.config.scenario == "app-control-plane":
                     allowed_kinds.add("legacy_schema_drift")
+                if self.config.scenario == "app-installation-lifecycle":
+                    allowed_kinds = {"member_installation_unavailable"}
                 if selected_kind not in allowed_kinds:
                     return {
                         "status": "rejected",
@@ -1062,7 +1344,32 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "unsupported_kind",
                     }
-                if not await self._apply_fault(fixture, selected_kind):
+                selected_fault = {
+                    "target": (
+                        target
+                        if self.config.scenario == "app-installation-lifecycle"
+                        else fixture.get("fixture_id")
+                        or fixture.get("label")
+                        or fixture.get("id")
+                    ),
+                    "kind": selected_kind,
+                }
+                active_fault = self._fixture_controls.get("fault")
+                if (
+                    self.config.scenario == "app-installation-lifecycle"
+                    and active_fault is not None
+                    and active_fault != selected_fault
+                ):
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fault_already_active",
+                    }
+                if active_fault != selected_fault and not await self._apply_fault(
+                    fixture, selected_kind
+                ):
                     return {
                         "status": "rejected",
                         "scenario": self.config.scenario,
@@ -1070,15 +1377,23 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "fault_unavailable",
                     }
-                self._fixture_controls["fault"] = {
-                    "target": fixture.get("fixture_id") or fixture.get("label") or fixture.get("id"),
-                    "kind": selected_kind,
-                }
+                self._fixture_controls["fault"] = selected_fault
             else:
                 active_fault = self._fixture_controls.get("fault")
-                if isinstance(active_fault, dict):
-                    fault_target = target or active_fault.get("target")
-                    fault_kind = kind or active_fault.get("kind")
+                if (
+                    isinstance(active_fault, dict)
+                    or self.config.scenario == "app-installation-lifecycle"
+                ):
+                    fault_target = target or (
+                        active_fault.get("target")
+                        if isinstance(active_fault, dict)
+                        else None
+                    )
+                    fault_kind = kind or (
+                        active_fault.get("kind")
+                        if isinstance(active_fault, dict)
+                        else None
+                    )
                     if not isinstance(fault_target, str) or not isinstance(fault_kind, str):
                         return {
                             "status": "rejected",
@@ -1086,6 +1401,19 @@ class E2ERuntime:
                             "action": action,
                             "enabled": False,
                             "reason": "fault_unavailable",
+                        }
+                    expected_fault = {"target": fault_target, "kind": fault_kind}
+                    if (
+                        self.config.scenario == "app-installation-lifecycle"
+                        and active_fault is not None
+                        and active_fault != expected_fault
+                    ):
+                        return {
+                            "status": "rejected",
+                            "scenario": self.config.scenario,
+                            "action": action,
+                            "enabled": False,
+                            "reason": "unsupported_target",
                         }
                     try:
                         fixture = self._resolve_fault_target(fault_target)
@@ -1120,13 +1448,57 @@ class E2ERuntime:
         }
 
     async def _apply_fault(self, fixture: dict[str, object], kind: str) -> bool:
-        """Seed one bounded schema fault for a fixture installation.
+        """Apply a bounded fault to a target fixture in its isolated database."""
+        if kind == "member_installation_unavailable":
+            if self.config.scenario != "app-installation-lifecycle":
+                return False
+            app_id = fixture.get("app_id")
+            vault_id = fixture.get("vault_id")
+            installation_id = fixture.get("installation_id")
+            if not all(isinstance(value, str) for value in (app_id, vault_id, installation_id)):
+                return False
+            try:
+                import asyncpg
 
-        The target table is removed while ownership remains registered.  The
-        public rollout request therefore still passes its ownership preflight,
-        while the worker deterministically records ``step_failed`` before any
-        migration mutation.  The SQL identifier remains private to the fixture.
-        """
+                connection = await asyncpg.connect(
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
+                )
+                try:
+                    async with connection.transaction():
+                        canonical_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.vault_app_installations') IS NOT NULL"
+                        )
+                        renamed_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.akb_fixture_member_status_unavailable') IS NOT NULL"
+                        )
+                        fixture_exists = await connection.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1
+                                  FROM public.vault_app_installations
+                                 WHERE id = $1 AND app_id = $2 AND vault_id = $3
+                            )
+                            """,
+                            uuid.UUID(installation_id),
+                            uuid.UUID(app_id),
+                            uuid.UUID(vault_id),
+                        ) if canonical_exists and not renamed_exists else False
+                        if not canonical_exists or renamed_exists or not fixture_exists:
+                            return False
+                        await connection.execute(
+                            "ALTER TABLE public.vault_app_installations "
+                            "RENAME TO akb_fixture_member_status_unavailable"
+                        )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind == "legacy_schema_drift":
             try:
                 import asyncpg
@@ -1214,6 +1586,41 @@ class E2ERuntime:
 
     async def _restore_fault(self, fixture: dict[str, object], kind: str) -> bool:
         """Restore the bounded fixture state removed by a fault control."""
+        if kind == "member_installation_unavailable":
+            if self.config.scenario != "app-installation-lifecycle":
+                return False
+            try:
+                import asyncpg
+
+                connection = await asyncpg.connect(
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
+                )
+                try:
+                    async with connection.transaction():
+                        canonical_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.vault_app_installations') IS NOT NULL"
+                        )
+                        renamed_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.akb_fixture_member_status_unavailable') IS NOT NULL"
+                        )
+                        if canonical_exists and not renamed_exists:
+                            return True
+                        if canonical_exists or not renamed_exists:
+                            return False
+                        await connection.execute(
+                            "ALTER TABLE public.akb_fixture_member_status_unavailable "
+                            "RENAME TO vault_app_installations"
+                        )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind == "legacy_schema_drift":
             try:
                 import asyncpg
@@ -3655,6 +4062,7 @@ class E2ERuntime:
         for label in (
             "install",
             "installing",
+            "upgrading",
             "active",
             "blocked",
             "uninstalled",
@@ -3760,6 +4168,24 @@ class E2ERuntime:
             vault_label="installing",
             release_id=release_a,
             installation_id=installing_id,
+        )
+
+        upgrading_id = await self._insert_fixture_installation(
+            connection,
+            app_id=target_app_id,
+            vault_id=target_vault_ids["upgrading"],
+            desired_release_id=release_b,
+            current_release_id=release_a,
+            lifecycle="upgrading",
+            capabilities=["installation:read"],
+            resources=[],
+        )
+        await add_fixture(
+            "status_upgrading",
+            vault_label="upgrading",
+            release_id=release_b,
+            installation_id=upgrading_id,
+            requested_release_id=release_b,
         )
 
         active_id = await self._insert_fixture_installation(
@@ -4177,6 +4603,13 @@ class E2ERuntime:
             try:
                 identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
                 process_before = self._process_identity_snapshot()
+                if self.config.scenario == "app-installation-lifecycle":
+                    if not await self._restore_fault(
+                        {}, "member_installation_unavailable"
+                    ):
+                        raise ProvisioningFailure(
+                            "member installation fault could not be restored before reset"
+                        )
                 self._fixture_controls.clear()
                 self._stdio_initialize_observed = False
                 self._stdio_tools_list_observed = False

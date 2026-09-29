@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 
 from app.api.control_plane_models import (
     InitialGrantApprovalRequest,
+    InstallationActiveStatus,
     InstallationCommandRequest,
     InstallationProjection,
 )
@@ -18,6 +19,7 @@ from app.services.app_installation_service import (
     command_installation,
     get_admin_installation_status,
     get_app_installation_status,
+    get_member_installation_active_status,
     approve_initial_installation_grant,
     uninstall_installation,
 )
@@ -109,6 +111,30 @@ async def get_installation(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     result = await get_admin_installation_status(
+        app_id,
+        vault_id,
+        user=user,
+        correlation_id=request_correlation_id(request),
+    )
+    _mark_no_store(response)
+    return result
+
+
+@router.get(
+    "/apps/{app_id}/installations/{vault_id}/active",
+    response_model=InstallationActiveStatus,
+    operation_id="appsGetInstallationActive",
+    tags=["app-member-installations"],
+    summary="Read the canonical active status of an app installation as a Vault member",
+)
+async def get_member_installation_active(
+    app_id: uuid.UUID,
+    vault_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    result = await get_member_installation_active_status(
         app_id,
         vault_id,
         user=user,

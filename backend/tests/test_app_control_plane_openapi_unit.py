@@ -70,11 +70,30 @@ def test_control_plane_fixture_matches_live_operation_contract():
                     == {"$ref": "#/components/schemas/AkbError"}
                 ), f"{operation['operationId']} {status}"
 
-    assert len(operations) == 35
+    assert len(operations) == 36
     assert len(set(operations)) == len(operations)
     for schema_name, expected_schema in fixture["components"]["schemas"].items():
         assert live["components"]["schemas"].get(schema_name) == expected_schema
     assert fixture["components"].get("securitySchemes") == live["components"].get("securitySchemes")
+
+
+def test_member_installation_active_openapi_is_a_minimal_user_session_contract():
+    schema = app.openapi()
+    operation = schema["paths"][
+        "/api/v1/apps/{app_id}/installations/{vault_id}/active"
+    ]["get"]
+    response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+
+    assert operation["operationId"] == "appsGetInstallationActive"
+    assert response_schema == {
+        "$ref": "#/components/schemas/InstallationActiveStatus"
+    }
+    status_schema = schema["components"]["schemas"]["InstallationActiveStatus"]
+    assert status_schema["required"] == ["active"]
+    assert status_schema["additionalProperties"] is False
+    assert status_schema["properties"] == {
+        "active": {"type": "boolean", "title": "Active"}
+    }
 
 
 def test_registry_openapi_advertises_manifest_shape_and_natural_key_replay_contract():

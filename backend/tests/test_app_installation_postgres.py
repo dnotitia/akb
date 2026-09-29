@@ -124,13 +124,14 @@ async def _release(pool, app_id: uuid.UUID, version: str):
         )
 
 
-async def _vault(pool, label: str) -> uuid.UUID:
+async def _vault(pool, label: str, *, owner_id: uuid.UUID | None = None) -> uuid.UUID:
     name = f"{label}-{uuid.uuid4().hex[:10]}"
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
+            "INSERT INTO vaults (name, git_path, owner_id) VALUES ($1, $2, $3) RETURNING id",
             name,
             f"/tmp/{name}.git",
+            owner_id,
         )
 
 
@@ -154,6 +155,17 @@ def _admin() -> AuthenticatedUser:
         email="operator@example.invalid",
         display_name=None,
         is_admin=True,
+        auth_method="jwt",
+    )
+
+
+def _member_session(user_id: uuid.UUID, username: str) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=str(user_id),
+        username=username,
+        email=f"{username}@example.invalid",
+        display_name=None,
+        is_admin=False,
         auth_method="jwt",
     )
 
@@ -316,6 +328,212 @@ async def test_app_status_requires_a_live_installation_read_grant(lifecycle_pool
         await installation.get_app_installation_status(
             principal,
             vault_id,
+            correlation_id=str(uuid.uuid4()),
+        )
+
+
+async def test_member_active_status_reads_live_lifecycle_and_requires_real_membership(
+    lifecycle_pool,
+):
+    app_id = await _app(lifecycle_pool, "member-status")
+    release_id = await _release(lifecycle_pool, app_id, "1.0.0")
+    next_release_id = await _release(lifecycle_pool, app_id, "2.0.0")
+    owner_id = await _user(lifecycle_pool, "member-owner")
+    reader_id = await _user(lifecycle_pool, "member-reader")
+    writer_id = await _user(lifecycle_pool, "member-writer")
+    vault_admin_id = await _user(lifecycle_pool, "member-vault-admin")
+    foreign_admin_id = await _user(lifecycle_pool, "foreign-vault-admin")
+    outsider_id = await _user(lifecycle_pool, "member-outsider")
+    vault_id = await _vault(lifecycle_pool, "member-status", owner_id=owner_id)
+    foreign_vault_id = await _vault(lifecycle_pool, "member-foreign", owner_id=owner_id)
+    async with lifecycle_pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, $3, $4)",
+            [
+                (vault_id, reader_id, "reader", _ADMIN_ID),
+                (vault_id, writer_id, "writer", _ADMIN_ID),
+                (vault_id, vault_admin_id, "admin", _ADMIN_ID),
+                (vault_id, _ADMIN_ID, "admin", _ADMIN_ID),
+                (foreign_vault_id, foreign_admin_id, "admin", _ADMIN_ID),
+            ],
+        )
+
+    installed = await _command(lifecycle_pool, app_id, vault_id, release_id)
+    installation_id = uuid.UUID(installed["installation_id"])
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE vault_app_installations
+               SET current_release_id = desired_release_id,
+                   lifecycle = 'active',
+                   blocked_reason = NULL
+             WHERE id = $1
+            """,
+            installation_id,
+        )
+
+    members = [
+        (owner_id, "owner"),
+        (reader_id, "reader"),
+        (writer_id, "writer"),
+        (vault_admin_id, "vault-admin"),
+    ]
+    for user_id, label in members:
+        before = await lifecycle_pool.fetchval(
+            "SELECT count(*) FROM vault_app_installations WHERE id=$1", installation_id
+        )
+        status = await installation.get_member_installation_active_status(
+            app_id,
+            vault_id,
+            user=_member_session(user_id, label),
+            correlation_id=str(uuid.uuid4()),
+        )
+        after = await lifecycle_pool.fetchval(
+            "SELECT count(*) FROM vault_app_installations WHERE id=$1", installation_id
+        )
+        assert status == {"active": True}
+        assert after == before
+
+    for lifecycle, desired, current, blocked_reason, expected_active in (
+        ("installing", release_id, None, None, False),
+        ("active", release_id, release_id, None, True),
+        ("upgrading", next_release_id, release_id, None, False),
+        ("blocked", next_release_id, release_id, "fixture_status_blocked", False),
+        ("uninstalled", None, release_id, None, False),
+    ):
+        async with lifecycle_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE vault_app_installations
+                   SET lifecycle = $2,
+                       desired_release_id = $3,
+                       current_release_id = $4,
+                       blocked_reason = $5
+                 WHERE id = $1
+                """,
+                installation_id,
+                lifecycle,
+                desired,
+                current,
+                blocked_reason,
+            )
+        status = await installation.get_member_installation_active_status(
+            app_id,
+            vault_id,
+            user=_member_session(reader_id, "reader"),
+            correlation_id=str(uuid.uuid4()),
+        )
+        assert status == {"active": expected_active}
+
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE vault_app_installations
+               SET lifecycle = 'active',
+                   desired_release_id = $2,
+                   current_release_id = $2,
+                   blocked_reason = NULL
+             WHERE id = $1
+            """,
+            installation_id,
+            release_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO app_installation_observed_states (
+                installation_id, app_id, vault_id, observed_generation,
+                observed_at, observed_release_id, schema_fingerprint,
+                observed_grant_generation
+            ) VALUES ($1, $2, $3, 1, NOW(), $4, $5, 1)
+            """,
+            installation_id,
+            app_id,
+            vault_id,
+            release_id,
+            resources.canonical_table_fingerprint([]),
+        )
+    await installation.uninstall_installation(
+        app_id,
+        vault_id,
+        user=_admin(),
+        correlation_id=str(uuid.uuid4()),
+    )
+    assert await installation.get_member_installation_active_status(
+        app_id,
+        vault_id,
+        user=_member_session(reader_id, "reader"),
+        correlation_id=str(uuid.uuid4()),
+    ) == {"active": False}
+    restored = await _command(
+        lifecycle_pool,
+        app_id,
+        vault_id,
+        release_id,
+        mode="restore",
+    )
+    assert restored["lifecycle"] == "active"
+    assert await installation.get_member_installation_active_status(
+        app_id,
+        vault_id,
+        user=_member_session(reader_id, "reader"),
+        correlation_id=str(uuid.uuid4()),
+    ) == {"active": True}
+
+    without_installation_vault_id = await _vault(
+        lifecycle_pool, "member-status-empty", owner_id=owner_id
+    )
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, 'reader', $3)",
+            without_installation_vault_id,
+            reader_id,
+            _ADMIN_ID,
+        )
+    assert await installation.get_member_installation_active_status(
+        app_id,
+        without_installation_vault_id,
+        user=_member_session(reader_id, "reader"),
+        correlation_id=str(uuid.uuid4()),
+    ) == {"active": False}
+
+    missing = await installation.get_member_installation_active_status(
+        uuid.uuid4(),
+        vault_id,
+        user=_member_session(reader_id, "reader"),
+        correlation_id=str(uuid.uuid4()),
+    )
+    assert missing == {"active": False}
+
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vault_id)
+    denials: list[str] = []
+    for user, requested_app_id, requested_vault_id in (
+        (_member_session(outsider_id, "outsider"), app_id, vault_id),
+        (_member_session(foreign_admin_id, "foreign-admin"), app_id, vault_id),
+        (_admin(), app_id, vault_id),
+        (_member_session(outsider_id, "outsider"), uuid.uuid4(), uuid.uuid4()),
+    ):
+        with pytest.raises(ForbiddenError) as denied:
+            await installation.get_member_installation_active_status(
+                requested_app_id,
+                requested_vault_id,
+                user=user,
+                correlation_id=str(uuid.uuid4()),
+            )
+        denials.append(denied.value.message)
+    assert denials == ["Installation request denied"] * len(denials)
+
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM vault_access WHERE vault_id=$1 AND user_id=$2",
+            vault_id,
+            reader_id,
+        )
+    with pytest.raises(ForbiddenError, match="Installation request denied"):
+        await installation.get_member_installation_active_status(
+            app_id,
+            vault_id,
+            user=_member_session(reader_id, "reader"),
             correlation_id=str(uuid.uuid4()),
         )
 

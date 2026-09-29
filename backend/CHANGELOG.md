@@ -7,6 +7,8 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Search retrieval
+
 - Scoped pgvector posting searches choose term-first, scope-first, or bounded
   point lookups while retaining the same filters and exact sparse scores.
   Explicit Native document scopes use separate indexed path and UUID lookups.
@@ -19,6 +21,13 @@ specifically; the proxy has its own log in
   request timeout.
 - Incomplete search responses keep available hits usable, distinguish an
   incomplete empty response from no matches, and avoid definitive result counts.
+
+### Vault-member app installation status
+
+- Added `GET /api/v1/apps/{app_id}/installations/{vault_id}/active` for Vault
+  owners and members with reader, writer, or admin access. It returns only the
+  canonical active boolean, uses the authenticated user identity, checks live
+  membership, and disables caching.
 
 ## 0.16.1 — 2026-09-27
 

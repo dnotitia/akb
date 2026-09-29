@@ -629,6 +629,458 @@ def test_fixture_discovery_declares_auth_and_observability_without_secrets(
     assert "external-password-value" not in serialized
 
 
+def test_member_installation_discovery_declares_http_contract_and_fixture_controls(tmp_path):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    app_id = str(uuid.uuid4())
+    vault_id = str(uuid.uuid4())
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "namespace": "fixture-members",
+        "actors": {
+            "system_admin": {"id": str(uuid.uuid4()), "role": "system_admin"},
+            "reader": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-reader",
+                "vault_role": "reader",
+            },
+            "writer": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-writer",
+                "vault_role": "writer",
+            },
+            "target_owner": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-owner",
+                "vault_role": "owner",
+            },
+            "target_admin": {
+                "id": str(uuid.uuid4()),
+                "username": "fixture-admin",
+                "vault_role": "admin",
+            },
+        },
+        "apps": {"target": {"id": app_id}},
+        "vaults": {"active": {"id": vault_id}},
+        "fixtures": {
+            "status_active": {
+                "app_id": app_id,
+                "vault_id": vault_id,
+                "installation_id": str(uuid.uuid4()),
+            }
+        },
+    }
+
+    discovery = runtime.fixture_discovery()
+
+    assert discovery["member_installation_active"] == {
+        "service": "app",
+        "method": "GET",
+        "path": f"/api/v1/apps/{app_id}/installations/{vault_id}/active",
+        "app_id": app_id,
+        "vault_id": vault_id,
+    }
+    assert discovery["controls"]["member_installation_state"] == {
+        "service": "fixture",
+        "method": "POST",
+        "path": "/control",
+        "body": {
+            "action": "member_installation_state",
+            "target": "status_active",
+            "kind": "upgrading",
+            "enabled": True,
+        },
+        "states": ["installing", "active", "upgrading", "blocked", "uninstalled"],
+    }
+    assert discovery["controls"]["member_access"] == {
+        "service": "fixture",
+        "method": "POST",
+        "path": "/control",
+        "body": {
+            "action": "member_access",
+            "target": "reader",
+            "kind": "status_active",
+            "enabled": False,
+        },
+    }
+    assert discovery["controls"]["fault_injection"] == {
+        "service": "fixture",
+        "method": "POST",
+        "path": "/control",
+        "body": {
+            "action": "fault_injection",
+            "target": "status_active",
+            "kind": "member_installation_unavailable",
+            "enabled": True,
+        },
+        "disable_body": {
+            "action": "fault_injection",
+            "target": "status_active",
+            "kind": "member_installation_unavailable",
+            "enabled": False,
+        },
+        "kinds": ["member_installation_unavailable"],
+        "targets": [
+            {
+                "fixture_id": "status_active",
+                "installation_id": runtime._fixture_catalog["fixtures"]["status_active"]["installation_id"],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_member_installation_fixture_controls_touch_only_the_selected_fixture(
+    tmp_path, monkeypatch
+):
+    import asyncpg
+
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    actor_id = uuid.uuid4()
+    admin_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    active_release_id = uuid.uuid4()
+    next_release_id = uuid.uuid4()
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "actors": {
+            "system_admin": {"id": str(admin_id), "role": "system_admin"},
+            "reader": {
+                "id": str(actor_id),
+                "username": "fixture-reader",
+                "vault_role": "reader",
+            },
+        },
+        "releases": {"target_next": {"id": str(next_release_id)}},
+        "fixtures": {
+            "status_active": {
+                "vault_id": str(vault_id),
+                "installation_id": str(installation_id),
+                "release_id": str(active_release_id),
+            }
+        },
+    }
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            if query.lstrip().startswith("UPDATE vault_app_installations"):
+                required_fields = (
+                    "lifecycle=$1",
+                    "desired_release_id=$2",
+                    "current_release_id=$3",
+                    "blocked_reason=$4",
+                )
+                if not all(field in query.replace(" ", "") for field in required_fields) or len(args) != 5:
+                    raise RuntimeError("CheckViolation: vault_app_installations_release_coherence")
+                lifecycle, desired_release_id, current_release_id, blocked_reason, requested_id = args
+                expected_state = {
+                    "installing": (active_release_id, None, None),
+                    "active": (active_release_id, active_release_id, None),
+                    "upgrading": (next_release_id, active_release_id, None),
+                    "blocked": (
+                        next_release_id,
+                        active_release_id,
+                        "fixture_controlled_blocked",
+                    ),
+                    "uninstalled": (None, active_release_id, None),
+                }.get(lifecycle)
+                actual_state = (desired_release_id, current_release_id, blocked_reason)
+                if requested_id != installation_id or actual_state != expected_state:
+                    raise RuntimeError(
+                        "CheckViolation: vault_app_installations_release_coherence or "
+                        "vault_app_installations_blocked_reason_check"
+                    )
+                return "UPDATE 1"
+            return "DELETE 1"
+
+        async def close(self):
+            return None
+
+    async def fake_connect(**_kwargs):
+        return FakeConnection()
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+
+    states = ["installing", "active", "upgrading", "blocked", "uninstalled", "active"]
+    state_results = [
+        await runtime.fixture_control(
+            "member_installation_state",
+            "status_active",
+            True,
+            lifecycle,
+        )
+        for lifecycle in states
+    ]
+    access = await runtime.fixture_control(
+        "member_access",
+        "reader",
+        False,
+        "status_active",
+    )
+    restored_access = await runtime.fixture_control(
+        "member_access",
+        "reader",
+        True,
+        "status_active",
+    )
+
+    assert [result["status"] for result in state_results] == ["accepted"] * len(states)
+    assert state_results[-1]["observed"] == {"installation_state": "active"}
+    assert access["status"] == "accepted"
+    assert restored_access["status"] == "accepted"
+    assert len(calls) == len(states) + 2
+    assert calls[0][0].lstrip().startswith("UPDATE vault_app_installations")
+    assert calls[0][1] == ("installing", active_release_id, None, None, installation_id)
+    assert calls[1][1] == ("active", active_release_id, active_release_id, None, installation_id)
+    assert calls[2][1] == ("upgrading", next_release_id, active_release_id, None, installation_id)
+    assert calls[3][1] == ("blocked", next_release_id, active_release_id, "fixture_controlled_blocked", installation_id)
+    assert calls[4][1] == ("uninstalled", None, active_release_id, None, installation_id)
+    assert calls[5][1] == ("active", active_release_id, active_release_id, None, installation_id)
+    assert calls[-2][0].startswith("DELETE FROM vault_access")
+    assert calls[-2][1] == (vault_id, actor_id)
+    assert calls[-1][0].lstrip().startswith("INSERT INTO vault_access")
+    assert calls[-1][1] == (vault_id, actor_id, admin_id)
+
+
+@pytest.mark.asyncio
+async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
+    tmp_path, monkeypatch
+):
+    import asyncpg
+    from app.exceptions import AKBError
+    from app.services import app_installation_service
+    from app.services.auth_service import AuthenticatedUser
+
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    app_id = uuid.uuid4()
+    vault_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="fixture-owner",
+        email="fixture-owner@example.invalid",
+        display_name=None,
+        is_admin=False,
+        auth_method="jwt",
+    )
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-installation-lifecycle",
+        "fixtures": {
+            "status_active": {
+                "app_id": str(app_id),
+                "vault_id": str(vault_id),
+                "installation_id": str(installation_id),
+            }
+        },
+    }
+    relation_state = {"canonical": True, "renamed": False}
+    sql_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeConnection:
+        def transaction(self):
+            return FakeTransaction()
+
+        async def fetchrow(self, _query, requested_vault_id):
+            assert requested_vault_id == vault_id
+            return {
+                "id": vault_id,
+                "name": "fixture-vault",
+                "owner_id": uuid.UUID(user.user_id),
+            }
+
+        async def fetchval(self, query, *args):
+            normalized = " ".join(query.split())
+            sql_calls.append((normalized, args))
+            if "to_regclass('public.vault_app_installations')" in normalized:
+                return relation_state["canonical"]
+            if "to_regclass('public.akb_fixture_member_status_unavailable')" in normalized:
+                return relation_state["renamed"]
+            if "FROM public.vault_app_installations" in normalized:
+                assert args == (installation_id, app_id, vault_id)
+                return True
+            if "FROM vault_app_installations" in normalized:
+                if not relation_state["canonical"]:
+                    raise asyncpg.exceptions.UndefinedTableError(
+                        'relation "vault_app_installations" does not exist'
+                    )
+                return True
+            raise AssertionError(f"unexpected fixture query: {normalized}")
+
+        async def execute(self, query, *args):
+            normalized = " ".join(query.split())
+            sql_calls.append((normalized, args))
+            if normalized == (
+                "ALTER TABLE public.vault_app_installations RENAME TO "
+                "akb_fixture_member_status_unavailable"
+            ):
+                assert relation_state == {"canonical": True, "renamed": False}
+                relation_state.update(canonical=False, renamed=True)
+                return "ALTER TABLE"
+            if normalized == (
+                "ALTER TABLE public.akb_fixture_member_status_unavailable "
+                "RENAME TO vault_app_installations"
+            ):
+                assert relation_state == {"canonical": False, "renamed": True}
+                relation_state.update(canonical=True, renamed=False)
+                return "ALTER TABLE"
+            raise AssertionError(f"unexpected fixture SQL: {normalized}")
+
+        async def close(self):
+            return None
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    async def fake_get_pool():
+        return FakePool()
+
+    async def allow_owner_access(*_args, **_kwargs):
+        return None
+
+    async def fake_connect(**kwargs):
+        assert (
+            kwargs["host"],
+            kwargs["port"],
+            kwargs["user"],
+            kwargs["database"],
+        ) == ("127.0.0.1", runtime.config.postgres_port, "akb", "akb")
+        return FakeConnection()
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(app_installation_service, "get_pool", fake_get_pool)
+    monkeypatch.setattr(
+        app_installation_service, "check_vault_access", allow_owner_access
+    )
+
+    before = await app_installation_service.get_member_installation_active_status(
+        app_id, vault_id, user=user, correlation_id="before-fault"
+    )
+
+    invalid_target = await runtime.fixture_control(
+        "fault_injection", "another_fixture", True, "member_installation_unavailable"
+    )
+    invalid_kind = await runtime.fixture_control(
+        "fault_injection", "status_active", True, "missing_owned_table"
+    )
+    enabled = await runtime.fixture_control(
+        "fault_injection", "status_active", True, "member_installation_unavailable"
+    )
+    with pytest.raises(AKBError) as unavailable:
+        await app_installation_service.get_member_installation_active_status(
+            app_id, vault_id, user=user, correlation_id="during-fault"
+        )
+    disabled = await runtime.fixture_control(
+        "fault_injection", "status_active", False, "member_installation_unavailable"
+    )
+    after = await app_installation_service.get_member_installation_active_status(
+        app_id, vault_id, user=user, correlation_id="after-fault"
+    )
+    other_scenario = E2ERuntime(make_config(tmp_path / "other"))
+    rejected_scenario = await other_scenario.fixture_control(
+        "fault_injection", "status_active", True, "member_installation_unavailable"
+    )
+
+    assert invalid_target["reason"] == "unsupported_target"
+    assert invalid_kind["reason"] == "unsupported_kind"
+    assert before == {"active": True}
+    assert enabled["status"] == "accepted"
+    assert enabled["enabled"] is True
+    assert enabled["observed"]["fault_injection"] == {
+        "target": "status_active",
+        "kind": "member_installation_unavailable",
+    }
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.code == "member_installation_status_unavailable"
+    assert after == {"active": True}
+    assert relation_state == {"canonical": True, "renamed": False}
+    assert disabled["status"] == "accepted"
+    assert disabled["enabled"] is False
+    assert disabled["observed"]["fault_injection"] is None
+    assert rejected_scenario["reason"] == "unsupported_scenario"
+    assert sum(query.startswith("ALTER TABLE") for query, _args in sql_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reset_restores_member_installation_unavailable_fault_before_clearing(
+    tmp_path, monkeypatch
+):
+    runtime = E2ERuntime(
+        dataclasses.replace(
+            make_config(tmp_path), scenario="app-installation-lifecycle"
+        )
+    )
+    runtime._prepared = True
+    runtime._fixture_controls["fault"] = {
+        "target": "status_active",
+        "kind": "member_installation_unavailable",
+    }
+    operations: list[str] = []
+    identity = {"fixture": "stable"}
+    monkeypatch.setattr(runtime, "_dependency_identity_snapshot", lambda: identity)
+    monkeypatch.setattr(runtime, "_process_identity_snapshot", lambda: identity)
+
+    async def restore_fault(fixture, kind):
+        assert fixture == {}
+        assert kind == "member_installation_unavailable"
+        assert runtime._fixture_controls["fault"]["kind"] == kind
+        operations.append("restore")
+        return True
+
+    async def reset_postgres():
+        assert runtime._fixture_controls == {}
+        operations.append("reset_postgres")
+
+    monkeypatch.setattr(runtime, "_restore_fault", restore_fault)
+    monkeypatch.setattr(runtime, "_reset_postgres_in_place", reset_postgres)
+    monkeypatch.setattr(runtime, "_clear_minio_objects", lambda: {"status": "cleared"})
+    monkeypatch.setattr(runtime, "_ensure_minio_bucket", lambda: None)
+
+    async def no_op(*_args):
+        return None
+
+    monkeypatch.setattr(runtime, "_wait_tcp", no_op)
+    monkeypatch.setattr(runtime, "_wait_http", no_op)
+    monkeypatch.setattr(runtime, "_seed_external_credential", no_op)
+    monkeypatch.setattr(runtime, "_mint_runtime_pat", no_op)
+
+    await runtime.reset_scenario()
+
+    assert operations == ["restore", "reset_postgres"]
+    assert runtime._fixture_controls == {}
+
+
 def test_installation_discovery_publishes_success_lifecycle_command_bodies(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(
@@ -1290,8 +1742,18 @@ async def test_fixture_control_exposes_reset_discovery_and_sanitized_logs():
             lifecycle_reset = await lifecycle_client.post(
                 "/reset", json={"scenario": "app-installation-lifecycle"}
             )
+            member_control = await lifecycle_client.post(
+                "/control",
+                json={
+                    "action": "member_access",
+                    "target": "reader",
+                    "kind": "status_active",
+                    "enabled": False,
+                },
+            )
         assert lifecycle_reset.status_code == 200
         assert lifecycle_runtime.reset_count == 1
+        assert member_control.status_code == 200
         unsupported = await client.post("/reset", json={"scenario": "project"})
         assert unsupported.status_code == 422
         openapi = await client.get("/openapi.json")
