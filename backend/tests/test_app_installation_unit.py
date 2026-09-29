@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import uuid
+import traceback
 from datetime import datetime, timezone
 
+import asyncpg
 import pytest
 
 from app.api.control_plane_models import InstallationActiveStatus, InstallationProjection
-from app.exceptions import ForbiddenError, ValidationError
+from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services import app_installation_service as installation
 from app.services import app_resource_service as resources
 from app.services.auth_service import AuthenticatedUser
@@ -156,10 +158,6 @@ async def test_member_installation_status_rejects_app_credentials_before_databas
 
 @pytest.mark.asyncio
 async def test_member_installation_unavailable_is_not_reported_as_inactive(monkeypatch):
-    async def unavailable_pool():
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(installation, "get_pool", unavailable_pool)
     user = AuthenticatedUser(
         user_id=str(uuid.uuid4()),
         username="member",
@@ -168,8 +166,53 @@ async def test_member_installation_unavailable_is_not_reported_as_inactive(monke
         is_admin=False,
         auth_method="jwt",
     )
+    vault_id = uuid.uuid4()
+    raw_error_marker = "RAW_MEMBER_INSTALLATION_QUERY_ERROR"
+    raw_credential = "synthetic-fault-credential-abcdef"
+    raw_error = f"{raw_error_marker}; Authorization: Bearer {raw_credential}"
 
-    with pytest.raises(RuntimeError, match="database unavailable"):
+    class FakeConnection:
+        async def fetchrow(self, _query, requested_vault_id):
+            assert requested_vault_id == vault_id
+            return {
+                "id": vault_id,
+                "name": "member-status-vault",
+                "owner_id": uuid.UUID(user.user_id),
+            }
+
+        async def fetchval(self, query, *_args):
+            assert "FROM vault_app_installations" in query
+            raise asyncpg.exceptions.UndefinedTableError(raw_error)
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    async def fake_get_pool():
+        return FakePool()
+
+    async def allow_owner_access(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(installation, "get_pool", fake_get_pool)
+    monkeypatch.setattr(installation, "check_vault_access", allow_owner_access)
+
+    with pytest.raises(AKBError) as unavailable:
         await installation.get_member_installation_active_status(
-            uuid.uuid4(), uuid.uuid4(), user=user, correlation_id="test"
+            uuid.uuid4(), vault_id, user=user, correlation_id="test"
         )
+
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.code == "member_installation_status_unavailable"
+    assert unavailable.value.message == "Installation status is temporarily unavailable"
+    assert raw_error_marker not in str(unavailable.value)
+    assert raw_credential not in str(unavailable.value)
+    assert raw_error_marker not in "".join(traceback.format_exception(unavailable.value))
+    assert unavailable.value.__suppress_context__

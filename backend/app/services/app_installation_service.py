@@ -1246,19 +1246,26 @@ async def get_member_installation_active_status(
             )
             raise ForbiddenError("Installation request denied") from None
 
-        active = await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM vault_app_installations
-                 WHERE app_id = $1
-                   AND vault_id = $2
-                   AND lifecycle = 'active'
+        try:
+            active = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM vault_app_installations
+                     WHERE app_id = $1
+                       AND vault_id = $2
+                       AND lifecycle = 'active'
+                )
+                """,
+                app_id,
+                vault_id,
             )
-            """,
-            app_id,
-            vault_id,
-        )
+        except asyncpg.PostgresError:
+            raise AKBError(
+                "Installation status is temporarily unavailable",
+                status_code=503,
+                code="member_installation_status_unavailable",
+            ) from None
 
     record_app_audit(
         "app.installation.member_active_status",

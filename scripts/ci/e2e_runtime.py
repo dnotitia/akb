@@ -935,6 +935,11 @@ class E2ERuntime:
                         "app_id": app_id,
                         "vault_id": vault_id,
                     }
+            installation_id = (
+                active_fixture.get("installation_id")
+                if isinstance(active_fixture, dict)
+                else None
+            )
             catalog["controls"] = {
                 "member_installation_state": {
                     "service": "fixture",
@@ -964,6 +969,34 @@ class E2ERuntime:
                         "kind": "status_active",
                         "enabled": False,
                     },
+                },
+                "fault_injection": {
+                    "service": "fixture",
+                    "method": "POST",
+                    "path": "/control",
+                    "body": {
+                        "action": "fault_injection",
+                        "target": "status_active",
+                        "kind": "member_installation_unavailable",
+                        "enabled": True,
+                    },
+                    "disable_body": {
+                        "action": "fault_injection",
+                        "target": "status_active",
+                        "kind": "member_installation_unavailable",
+                        "enabled": False,
+                    },
+                    "kinds": ["member_installation_unavailable"],
+                    "targets": (
+                        [
+                            {
+                                "fixture_id": "status_active",
+                                "installation_id": installation_id,
+                            }
+                        ]
+                        if isinstance(installation_id, str)
+                        else []
+                    ),
                 },
             }
         if self.config.scenario in {"app-release-rollout", "app-control-plane"}:
@@ -1255,13 +1288,35 @@ class E2ERuntime:
                 "enabled": bool(enabled),
             }
         elif action == "fault_injection":
-            if self.config.scenario not in {"app-release-rollout", "app-control-plane"}:
+            supported_scenarios = {
+                "app-release-rollout",
+                "app-control-plane",
+                "app-installation-lifecycle",
+            }
+            if self.config.scenario not in supported_scenarios:
                 return {
                     "status": "rejected",
                     "scenario": self.config.scenario,
                     "action": action,
                     "reason": "unsupported_scenario",
                 }
+            if self.config.scenario == "app-installation-lifecycle":
+                if target != "status_active":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_target",
+                    }
+                if kind != "member_installation_unavailable":
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "unsupported_kind",
+                    }
             if target is not None and len(target) > 128:
                 raise ValueError("control target is too long")
             if enabled:
@@ -1279,6 +1334,8 @@ class E2ERuntime:
                 allowed_kinds = {"missing_owned_table"}
                 if self.config.scenario == "app-control-plane":
                     allowed_kinds.add("legacy_schema_drift")
+                if self.config.scenario == "app-installation-lifecycle":
+                    allowed_kinds = {"member_installation_unavailable"}
                 if selected_kind not in allowed_kinds:
                     return {
                         "status": "rejected",
@@ -1287,7 +1344,32 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "unsupported_kind",
                     }
-                if not await self._apply_fault(fixture, selected_kind):
+                selected_fault = {
+                    "target": (
+                        target
+                        if self.config.scenario == "app-installation-lifecycle"
+                        else fixture.get("fixture_id")
+                        or fixture.get("label")
+                        or fixture.get("id")
+                    ),
+                    "kind": selected_kind,
+                }
+                active_fault = self._fixture_controls.get("fault")
+                if (
+                    self.config.scenario == "app-installation-lifecycle"
+                    and active_fault is not None
+                    and active_fault != selected_fault
+                ):
+                    return {
+                        "status": "rejected",
+                        "scenario": self.config.scenario,
+                        "action": action,
+                        "enabled": False,
+                        "reason": "fault_already_active",
+                    }
+                if active_fault != selected_fault and not await self._apply_fault(
+                    fixture, selected_kind
+                ):
                     return {
                         "status": "rejected",
                         "scenario": self.config.scenario,
@@ -1295,15 +1377,23 @@ class E2ERuntime:
                         "enabled": False,
                         "reason": "fault_unavailable",
                     }
-                self._fixture_controls["fault"] = {
-                    "target": fixture.get("fixture_id") or fixture.get("label") or fixture.get("id"),
-                    "kind": selected_kind,
-                }
+                self._fixture_controls["fault"] = selected_fault
             else:
                 active_fault = self._fixture_controls.get("fault")
-                if isinstance(active_fault, dict):
-                    fault_target = target or active_fault.get("target")
-                    fault_kind = kind or active_fault.get("kind")
+                if (
+                    isinstance(active_fault, dict)
+                    or self.config.scenario == "app-installation-lifecycle"
+                ):
+                    fault_target = target or (
+                        active_fault.get("target")
+                        if isinstance(active_fault, dict)
+                        else None
+                    )
+                    fault_kind = kind or (
+                        active_fault.get("kind")
+                        if isinstance(active_fault, dict)
+                        else None
+                    )
                     if not isinstance(fault_target, str) or not isinstance(fault_kind, str):
                         return {
                             "status": "rejected",
@@ -1311,6 +1401,19 @@ class E2ERuntime:
                             "action": action,
                             "enabled": False,
                             "reason": "fault_unavailable",
+                        }
+                    expected_fault = {"target": fault_target, "kind": fault_kind}
+                    if (
+                        self.config.scenario == "app-installation-lifecycle"
+                        and active_fault is not None
+                        and active_fault != expected_fault
+                    ):
+                        return {
+                            "status": "rejected",
+                            "scenario": self.config.scenario,
+                            "action": action,
+                            "enabled": False,
+                            "reason": "unsupported_target",
                         }
                     try:
                         fixture = self._resolve_fault_target(fault_target)
@@ -1345,13 +1448,57 @@ class E2ERuntime:
         }
 
     async def _apply_fault(self, fixture: dict[str, object], kind: str) -> bool:
-        """Seed one bounded schema fault for a fixture installation.
+        """Apply a bounded fault to a target fixture in its isolated database."""
+        if kind == "member_installation_unavailable":
+            if self.config.scenario != "app-installation-lifecycle":
+                return False
+            app_id = fixture.get("app_id")
+            vault_id = fixture.get("vault_id")
+            installation_id = fixture.get("installation_id")
+            if not all(isinstance(value, str) for value in (app_id, vault_id, installation_id)):
+                return False
+            try:
+                import asyncpg
 
-        The target table is removed while ownership remains registered.  The
-        public rollout request therefore still passes its ownership preflight,
-        while the worker deterministically records ``step_failed`` before any
-        migration mutation.  The SQL identifier remains private to the fixture.
-        """
+                connection = await asyncpg.connect(
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
+                )
+                try:
+                    async with connection.transaction():
+                        canonical_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.vault_app_installations') IS NOT NULL"
+                        )
+                        renamed_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.akb_fixture_member_status_unavailable') IS NOT NULL"
+                        )
+                        fixture_exists = await connection.fetchval(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1
+                                  FROM public.vault_app_installations
+                                 WHERE id = $1 AND app_id = $2 AND vault_id = $3
+                            )
+                            """,
+                            uuid.UUID(installation_id),
+                            uuid.UUID(app_id),
+                            uuid.UUID(vault_id),
+                        ) if canonical_exists and not renamed_exists else False
+                        if not canonical_exists or renamed_exists or not fixture_exists:
+                            return False
+                        await connection.execute(
+                            "ALTER TABLE public.vault_app_installations "
+                            "RENAME TO akb_fixture_member_status_unavailable"
+                        )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind == "legacy_schema_drift":
             try:
                 import asyncpg
@@ -1439,6 +1586,41 @@ class E2ERuntime:
 
     async def _restore_fault(self, fixture: dict[str, object], kind: str) -> bool:
         """Restore the bounded fixture state removed by a fault control."""
+        if kind == "member_installation_unavailable":
+            if self.config.scenario != "app-installation-lifecycle":
+                return False
+            try:
+                import asyncpg
+
+                connection = await asyncpg.connect(
+                    host="127.0.0.1",
+                    port=self.config.postgres_port,
+                    user="akb",
+                    password="akb",
+                    database="akb",
+                )
+                try:
+                    async with connection.transaction():
+                        canonical_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.vault_app_installations') IS NOT NULL"
+                        )
+                        renamed_exists = await connection.fetchval(
+                            "SELECT to_regclass('public.akb_fixture_member_status_unavailable') IS NOT NULL"
+                        )
+                        if canonical_exists and not renamed_exists:
+                            return True
+                        if canonical_exists or not renamed_exists:
+                            return False
+                        await connection.execute(
+                            "ALTER TABLE public.akb_fixture_member_status_unavailable "
+                            "RENAME TO vault_app_installations"
+                        )
+                    return True
+                finally:
+                    await connection.close()
+            except Exception:
+                # Controls are best effort and must not leak database details.
+                return False
         if kind == "legacy_schema_drift":
             try:
                 import asyncpg
@@ -4421,6 +4603,13 @@ class E2ERuntime:
             try:
                 identity_before = await asyncio.to_thread(self._dependency_identity_snapshot)
                 process_before = self._process_identity_snapshot()
+                if self.config.scenario == "app-installation-lifecycle":
+                    if not await self._restore_fault(
+                        {}, "member_installation_unavailable"
+                    ):
+                        raise ProvisioningFailure(
+                            "member installation fault could not be restored before reset"
+                        )
                 self._fixture_controls.clear()
                 self._stdio_initialize_observed = False
                 self._stdio_tools_list_observed = False
