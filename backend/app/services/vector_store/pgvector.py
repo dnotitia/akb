@@ -1152,6 +1152,22 @@ class PgvectorStore:
             return (isinstance(error, asyncpg.InterfaceError)
                     and str(error) == "cannot call Transaction.__aexit__(): the underlying connection is closed")
 
+        def cancelled_rollback(error: BaseException) -> bool:
+            if not isinstance(error, asyncio.CancelledError) or error.__context__ is None:
+                return False
+            # Cancellation during a nested ROLLBACK can replace the query error
+            # before search_connection sees it. Recover only the exception that
+            # asyncpg was unwinding, not unrelated handled exception context on
+            # a cancelled query or successful COMMIT/RELEASE SAVEPOINT.
+            traceback = error.__traceback__
+            while traceback is not None:
+                frame = traceback.tb_frame
+                if (frame.f_code is asyncpg.transaction.Transaction.__aexit__.__code__
+                        and frame.f_locals.get("ex") is error.__context__):
+                    return True
+                traceback = traceback.tb_next
+            return False
+
         @asynccontextmanager
         async def search_connection(name: str, *, query_deadline: float, release_deadline: float):
             """Own this connection through bounded cancellation and pool reset."""
@@ -1190,9 +1206,9 @@ class PgvectorStore:
                         body_error = exc
                         # Inner savepoint cleanup can hide a lost connection or
                         # the query's original error before the outer tx exits.
-                        # Peel only this exact asyncpg cleanup wrapper.
+                        # Peel only validated asyncpg cleanup exceptions.
                         seen = {id(body_error)}
-                        while closed_transaction_error(body_error):
+                        while closed_transaction_error(body_error) or cancelled_rollback(body_error):
                             previous = body_error.__context__
                             if previous is None or id(previous) in seen:
                                 break
@@ -1202,7 +1218,8 @@ class PgvectorStore:
             except BaseException as exc:
                 forced_close = name in terminated and closed_transaction_error(exc)
                 if (body_error is not None and body_error is not exc
-                        and (_leg_unavailable(exc) or closed_transaction_error(exc))
+                        and (_leg_unavailable(exc) or closed_transaction_error(exc)
+                             or isinstance(exc, asyncio.CancelledError))
                         and not (name in terminated and closed_transaction_error(body_error))):
                     # A failed ROLLBACK must not relabel the query's auth or
                     # programming error as an operational degradation.

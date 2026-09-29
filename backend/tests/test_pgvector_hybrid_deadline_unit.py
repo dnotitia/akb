@@ -3,8 +3,10 @@ from contextlib import asynccontextmanager
 import asyncio
 import time
 import uuid
+from types import SimpleNamespace
 
 import asyncpg
+from asyncpg.transaction import Transaction
 import pytest
 
 from app.services.vector_store import VectorSearchDegraded
@@ -485,4 +487,81 @@ async def test_successful_reset_crossing_deadline_preserves_authorization_error(
     with pytest.raises(asyncpg.InsufficientPrivilegeError) as caught:
         await _search(store)
     assert caught.value is denied
+    assert all(conn.released for conn in pool.connections)
+
+
+@pytest.fixture
+def real_transactions(monkeypatch):
+    def transaction(conn):
+        # Exercise asyncpg's actual exception chaining during transaction and
+        # savepoint cleanup. Only the connection I/O below is substituted.
+        if not hasattr(conn, "_pool_release_ctr"):
+            conn._pool_release_ctr = 0
+            conn._top_xact = None
+            conn._protocol = SimpleNamespace(is_in_transaction=lambda: False)
+            conn.is_closed = lambda: conn.terminated
+            conn._get_unique_id = lambda prefix: prefix + "_1"
+        return Transaction(conn, None, False, False)
+
+    monkeypatch.setattr(_Connection, "transaction", transaction)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("caller_cancel", [False, True])
+@pytest.mark.parametrize("error", [asyncpg.InsufficientPrivilegeError("denied"),
+                                   asyncpg.UndefinedTableError("bad SQL"), ValueError("bad vector")])
+async def test_cancelled_rollback_preserves_query_error_unless_caller_cancels(
+    monkeypatch, real_transactions, nested, caller_cancel, error,
+):
+    store, pool = _store(monkeypatch)
+    rollback_started = asyncio.Event()
+    original_execute = _Connection.execute
+
+    async def execute(conn, sql, *args):
+        if sql.startswith("ROLLBACK"):
+            rollback_started.set()
+            await asyncio.Event().wait()
+        return await original_execute(conn, sql, *args)
+
+    async def failed(conn, **kwargs):
+        if nested:
+            async with conn.transaction():
+                raise error
+        raise error
+
+    monkeypatch.setattr(_Connection, "execute", execute)
+    monkeypatch.setattr(store, "_search_sparse", failed)
+    task = asyncio.create_task(_search(store))
+    if caller_cancel:
+        await asyncio.wait_for(rollback_started.wait(), timeout=0.5)
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if caller_cancel else type(error)) as caught:
+        await task
+    if not caller_cancel:
+        assert caught.value is error
+    assert all(conn.released for conn in pool.connections)
+
+
+async def test_cancelled_savepoint_commit_does_not_resurrect_handled_error(monkeypatch, real_transactions):
+    store, pool = _store(monkeypatch)
+    original_execute = _Connection.execute
+
+    async def execute(conn, sql, *args):
+        if sql.startswith("RELEASE SAVEPOINT"):
+            await asyncio.Event().wait()
+        return await original_execute(conn, sql, *args)
+
+    async def recovered(conn, **kwargs):
+        try:
+            raise ValueError("already handled")
+        except ValueError:
+            async with conn.transaction():
+                return [HIT_ID]
+
+    monkeypatch.setattr(_Connection, "execute", execute)
+    monkeypatch.setattr(store, "_search_sparse", recovered)
+    with pytest.raises(VectorSearchDegraded) as caught:
+        await _search(store)
+    assert caught.value.reason == "sparse_leg_timeout"
+    assert [hit.chunk_id for hit in caught.value.hits] == [HIT_ID]
     assert all(conn.released for conn in pool.connections)
