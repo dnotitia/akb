@@ -73,12 +73,12 @@ const routeComponents = {
   NotFoundPage,
 } satisfies Record<AppRouteComponentName, ComponentType>;
 
-function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
+function renderRoutes(boundaries: readonly AppRouteBoundary[], documentActive = true) {
   return appRouteContract
     .filter((route) => boundaries.includes(route.boundary))
     .map((route) => {
       const Component = routeComponents[route.component];
-      return <Route key={`${route.boundary}:${route.path}`} path={route.path} element={<Component />} />;
+      return <Route key={`${route.boundary}:${route.path}`} path={route.path} element={route.component === "DocumentPage" ? <DocumentPage active={documentActive} /> : <Component />} />;
     });
 }
 
@@ -113,7 +113,7 @@ export function AppRoutes() {
         <Route element={<Layout />}>
           {renderRoutes(["app-layout"])}
           <Route element={<VaultShell />}>
-            {renderRoutes(["vault-shell"])}
+            {renderRoutes(["vault-shell"], !backgroundLocation)}
           </Route>
         </Route>
       </Routes>

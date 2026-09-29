@@ -27,14 +27,19 @@ export default function GraphPage() {
   const { name: vault = "" } = useParams<{ name: string }>();
   const user = useCurrentUser();
   const { revision } = useAccessVerification();
-  const [params] = useSearchParams();
-  const view = queryToView(params);
-  // A changed identity or traversal creates a new scene. Pending expansions from
-  // its predecessor cannot update this instance; filters/selection do not remount.
-  return <GraphWorkspace key={JSON.stringify([user?.user_id, revision, vault, view.entry, view.hops])} vault={vault} />;
+  return <GraphPresentation key={JSON.stringify([user?.user_id, revision, vault])} vault={vault} />;
 }
 
-function GraphWorkspace({ vault }: { vault: string }) {
+function GraphPresentation({ vault }: { vault: string }) {
+  const [params] = useSearchParams();
+  const view = queryToView(params);
+  const [mode, setMode] = useState<GraphDisplayMode>(() => window.matchMedia?.("(max-width: 767px)").matches ? "list" : "graph");
+  // Traversals still isolate pending expansions, but do not reset the chosen
+  // presentation (including the accessible fallback when WebGL is unavailable).
+  return <GraphWorkspace key={JSON.stringify([view.entry, view.hops])} vault={vault} mode={mode} setMode={setMode} />;
+}
+
+function GraphWorkspace({ vault, mode, setMode }: { vault: string; mode: GraphDisplayMode; setMode: (mode: GraphDisplayMode) => void }) {
   const [search, setSearch] = useSearchParams();
   const navigate = useNavigate(), location = useLocation();
   const view = useMemo(() => queryToView(search), [search]);
@@ -69,7 +74,6 @@ function GraphWorkspace({ vault }: { vault: string }) {
   // The canvas remains full-size. Only overlays and the scrollable List need
   // clearance; measure wrapping/focus controls rather than guessing a height.
   const toolsBottom = toolsHeight + 24;
-  const [mode, setMode] = useState<GraphDisplayMode>(() => window.matchMedia?.("(max-width: 767px)").matches ? "list" : "graph");
   const graphRevealed = useRef(mode === "graph");
   const focusRelationshipPanel = useCallback((node: HTMLElement | null) => { node?.focus({ preventScroll: true }); }, []);
   const merged = useMemo(() => mergeGraph(base ?? EMPTY, overlay), [base, overlay]);

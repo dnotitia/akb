@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { flushSync } from "react-dom";
 import {
@@ -146,6 +146,8 @@ function isRevisionConflict(error: unknown): error is ApiError {
 interface DocumentPageProps {
   /** Search-launched previews are read-first and keep the search route behind them. */
   presentation?: "page" | "preview";
+  /** A background editor cannot intercept the foreground preview's history. */
+  active?: boolean;
 }
 
 export default function DocumentPage(props: DocumentPageProps) {
@@ -156,6 +158,7 @@ export default function DocumentPage(props: DocumentPageProps) {
 
 function DocumentPageContent({
   presentation = "page",
+  active = true,
 }: DocumentPageProps) {
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
@@ -193,6 +196,11 @@ function DocumentPageContent({
   const [pendingView, setPendingView] = useState<DocView | null>(null);
   const [pendingNavigation, setPendingNavigation] = useState<{ href: string; options?: NavigateOptions } | { proceed: () => void; history?: boolean } | null>(null);
   const [leavingEditor, setLeavingEditor] = useState(false);
+  useLayoutEffect(() => {
+    // A confirmed transition is not permanent permission to leave. The same
+    // editor may remain mounted behind a preview or be reused by another route.
+    setLeavingEditor(false);
+  }, [active, routeLocation.key]);
   const editorMenuDismissRef = useRef<(() => void) | null>(null);
   const navigationFocusRef = useRef<HTMLElement | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
@@ -296,7 +304,7 @@ function DocumentPageContent({
     if (view === "edit" && (hasUnsavedWork || savingBody)) setPendingNavigation({ proceed });
     else proceed();
   }, [hasUnsavedWork, savingBody, view]);
-  useDocumentHistoryGuard(!leavingEditor && view === "edit" && (hasUnsavedWork || savingBody),
+  useDocumentHistoryGuard(active && !leavingEditor && view === "edit" && (hasUnsavedWork || savingBody),
     (proceed) => setPendingNavigation({ proceed, history: true }));
   usePreviewEditorSession(view === "edit" ? {
     requestExit: requestEditorExit,

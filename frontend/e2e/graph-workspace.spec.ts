@@ -673,6 +673,21 @@ test("an expansion arriving after focus changes cannot join the new scene", asyn
   await expect(list).not.toContainText("Late response");
 });
 
+test("List stays selected when exploring connections and changing traversal depth", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/vault/fixture/graph");
+  await graphReady(page, 30);
+  await page.getByRole("button", { name: "List", exact: true }).click();
+  await selectFromSearch(page, "Service metrics");
+  await page.getByRole("button", { name: "Explore connections", exact: true }).click();
+  await expect(page).toHaveURL(/entry=/);
+  await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "2 hop neighborhood", exact: true }).click();
+  await expect(page).toHaveURL(/hops=2/);
+  await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("region", { name: "Relationship index", exact: true })).toBeVisible();
+});
+
 test("following a relationship restores its hidden target to the scene", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await fixture(page);

@@ -81,6 +81,30 @@ test("browser Back does not discard an edit and can be cancelled or confirmed", 
   await expect(page.getByRole("textbox", { name: "Summary", exact: true })).toHaveValue("Keep this local draft");
 });
 
+test("returning from a confirmed search preview re-arms the background editor's Back protection", async ({ page }) => {
+  await fixture(page);
+  const initialPreview = await openPreview(page);
+  await initialPreview.getByRole("button", { name: "Open document in vault", exact: true }).click();
+  await expect(initialPreview).toHaveCount(0);
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.getByRole("textbox", { name: "Summary", exact: true }).fill("Keep the background draft");
+  await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  const search = page.getByTestId("global-search-dialog");
+  await search.getByRole("combobox").fill("reading");
+  await search.getByRole("option").filter({ hasText: title }).first().click();
+  await page.getByRole("button", { name: "Leave document", exact: true }).click();
+  const preview = page.getByTestId("document-preview-dialog");
+  await expect(preview).toBeVisible();
+  await preview.getByRole("button", { name: "Close dialog", exact: true }).click();
+  await expect(search).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("textbox", { name: "Summary", exact: true })).toHaveValue("Keep the background draft");
+  await page.evaluate(() => history.back());
+  await expect(page.getByRole("dialog", { name: "Leave this document?" })).toBeVisible();
+  await page.getByRole("button", { name: "Keep editing", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "Summary", exact: true })).toHaveValue("Keep the background draft");
+});
+
 test("image file selection stays in the preview and uploading blocks every exit", async ({ page }) => {
   const patches = await fixture(page);
   const assetId = "123e4567-e89b-42d3-a456-426614174000";

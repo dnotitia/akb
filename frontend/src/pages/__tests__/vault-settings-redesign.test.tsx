@@ -57,7 +57,9 @@ const VAULT_INFO = {
 
 function BackButton() {
   const navigate = useNavigate();
-  return <button onClick={() => navigate(-1)}>Browser back</button>;
+  return <><button onClick={() => navigate(-1)}>Browser back</button>
+    <button onClick={() => navigate("/vault")}>Leave settings</button>
+    <button onClick={() => navigate("/vault/another/settings")}>Another vault</button></>;
 }
 
 function renderSettings(hash = "") {
@@ -90,6 +92,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Vault Settings redesign", () => {
+  it.each(["Leave settings", "Another vault"])("ignores a delayed save failure after %s", async (destination) => {
+    const user = userEvent.setup();
+    let rejectSave!: (error: Error) => void;
+    updateVaultMock.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSave = reject; }));
+    renderSettings("#access");
+    await user.click(await screen.findByRole("radio", { name: "Public · read" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await user.click(screen.getByRole("tab", { name: "General" }));
+    await user.click(screen.getByRole("button", { name: destination }));
+    if (destination === "Another vault") await screen.findByRole("textbox", { name: "Description" });
+    await act(async () => { rejectSave(new Error("Old vault save failed")); });
+    if (destination === "Leave settings") expect(screen.getByRole("heading", { name: "Vault directory" })).toBeVisible();
+    else expect(screen.getByRole("tab", { name: "General", selected: true })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("keeps Vault details visible without disclosure across settings categories", async () => {
     const user = userEvent.setup();
     renderSettings();

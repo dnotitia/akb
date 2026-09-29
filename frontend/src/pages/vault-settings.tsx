@@ -106,6 +106,10 @@ const PUBLIC_ORDER: PublicAccess[] = ["none", "reader", "writer"];
 
 export default function VaultSettingsPage() {
   const { name } = useParams<{ name: string }>();
+  return <VaultSettingsWorkspace key={name} name={name} />;
+}
+
+function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { refetchVaults } = useVaultRefresh();
@@ -133,6 +137,11 @@ export default function VaultSettingsPage() {
     ? (requestedSection as SettingsSection)
     : "general";
   const selectedSectionRef = useRef<string>(activeSection);
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   function selectSection(section: string) {
     // Pointer-down and focus can both activate a Radix tab before the URL
@@ -162,13 +171,14 @@ export default function VaultSettingsPage() {
     setLoadError("");
     getVaultInfo(vault)
       .then((data) => {
+        if (!mountedRef.current) return;
         setInfo(data);
         setDescription(data.description || "");
         setPublicAccess((data.public_access as PublicAccess) || "none");
       })
-      .catch((error) =>
-        setLoadError(error?.message || "Couldn't load this vault."),
-      );
+      .catch((error) => {
+        if (mountedRef.current) setLoadError(error?.message || "Couldn't load this vault.");
+      });
   }
 
   useEffect(() => {
@@ -248,21 +258,24 @@ export default function VaultSettingsPage() {
       const patch =
         scope === "general" ? { description } : { public_access: publicAccess };
       await updateVault(name, patch);
+      refetchVaults();
+      if (!mountedRef.current) return;
       setInfo({ ...info, ...patch });
       setSavedScope(scope);
-      refetchVaults();
       requestAnimationFrame(() => {
+        if (!mountedRef.current) return;
         const status = (
           scope === "general" ? generalStatusRef : accessStatusRef
         ).current;
         if (status && !status.closest("[hidden]")) status.focus();
       });
     } catch (error: unknown) {
+      if (!mountedRef.current) return;
       setSaveError(error instanceof Error ? error.message : "Save failed");
       setSaveErrorScope(scope);
       selectSection(scope);
     } finally {
-      setSavingScope(null);
+      if (mountedRef.current) setSavingScope(null);
     }
   }
 
