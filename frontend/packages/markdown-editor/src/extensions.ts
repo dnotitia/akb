@@ -12,7 +12,6 @@ import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
-import type { CodeBlockLowlightOptions } from '@tiptap/extension-code-block-lowlight'
 import { Table } from '@tiptap/extension-table'
 import TableCell from '@tiptap/extension-table-cell'
 import TableHeader from '@tiptap/extension-table-header'
@@ -22,13 +21,12 @@ import TaskList from '@tiptap/extension-task-list'
 import { common, createLowlight } from 'lowlight'
 
 import type {
-  MarkdownCodeLabels,
-  MarkdownCodeOptions,
   MarkdownImageOptions,
   MarkdownInlineReferenceKind,
   MarkdownProfile,
   MarkdownReferenceToken,
 } from './types.js'
+import { getMarkdownMessages } from './react/markdown-locale.js'
 
 type RawMarkdownKind = 'html' | 'mdx'
 
@@ -44,27 +42,19 @@ interface MarkdownImageToken extends MarkdownToken {
 
 const MARKDOWN_REFERENCE_MARK = 'markdownReference'
 
-export const DEFAULT_MARKDOWN_CODE_LABELS: MarkdownCodeLabels = {
-  region: (language?: string) =>
-    language ? `Scrollable ${language} code block` : 'Scrollable code block',
+function markdownTaskItemText(node: ProseMirrorNode): string {
+  let text = ''
+  node.forEach(child => {
+    if (child.type.name !== 'taskList') text += child.textContent
+  })
+  return text.trim()
 }
 
 // Keep one registry for every editor instance. CodeBlockLowlight decorates the
 // rendered code without changing the ProseMirror document or its Markdown.
 const markdownLowlight = createLowlight(common)
 
-interface MarkdownCodeBlockOptions extends Partial<CodeBlockLowlightOptions> {
-  labels: MarkdownCodeLabels
-}
-
-const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
-  addOptions() {
-    return {
-      ...this.parent?.(),
-      labels: DEFAULT_MARKDOWN_CODE_LABELS,
-    }
-  },
-
+const MarkdownCodeBlock = CodeBlockLowlight.extend({
   renderHTML({ node, HTMLAttributes }) {
     const parent = this.parent?.({ node, HTMLAttributes })
     if (!parent || !Array.isArray(parent) || typeof parent[0] !== 'string') {
@@ -88,7 +78,7 @@ const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
         'data-markdown-code-language': language,
         role: 'region',
         tabindex: '0',
-        'aria-label': this.options.labels.region(language),
+        'aria-label': getMarkdownMessages('en').codeRegion(language),
       }),
       ...children,
     ]
@@ -108,10 +98,11 @@ const MarkdownTaskItem = TaskItem.extend({
         'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0'
 
       const updateA11y = (currentNode: ProseMirrorNode) => {
+        const taskText = markdownTaskItemText(currentNode)
         const label = this.options.a11y?.checkboxLabel?.(
           currentNode,
           currentNode.attrs.checked,
-        ) || `Task item checkbox for ${currentNode.textContent || 'empty task item'}`
+        ) || getMarkdownMessages('en').taskCheckbox(taskText)
 
         checkbox.setAttribute('aria-label', label)
         checkboxStyler.textContent = label
@@ -203,6 +194,10 @@ const MarkdownTaskItem = TaskItem.extend({
 
           return true
         },
+        ignoreMutation: mutation =>
+          mutation.type === 'attributes' &&
+          mutation.target === checkbox &&
+          mutation.attributeName === 'aria-label',
         destroy() {
           checkbox.removeEventListener('change', handleCheckboxChange, true)
         },
@@ -778,14 +773,14 @@ const RawMarkdownInline = Node.create({
 
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
-  code?: MarkdownCodeOptions
   image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
+  taskCheckboxLabel?: (text: string) => string
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
-  code,
   image,
+  taskCheckboxLabel,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -795,10 +790,7 @@ export function createMarkdownExtensions({
       link: false,
       codeBlock: false,
     }),
-    MarkdownCodeBlock.configure({
-      lowlight: markdownLowlight,
-      labels: { ...DEFAULT_MARKDOWN_CODE_LABELS, ...code?.labels },
-    }),
+    MarkdownCodeBlock.configure({ lowlight: markdownLowlight }),
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
     MarkdownImage.configure({ referrerPolicy: image?.referrerPolicy }),
@@ -809,11 +801,10 @@ export function createMarkdownExtensions({
     TaskList,
     MarkdownTaskItem.configure({
       nested: true,
+      a11y: taskCheckboxLabel
+        ? { checkboxLabel: node => taskCheckboxLabel(markdownTaskItemText(node)) }
+        : undefined,
       HTMLAttributes: { 'data-markdown-task-item': 'true' },
-      a11y: {
-        checkboxLabel: node =>
-          `Task item checkbox for ${node.firstChild?.textContent || 'empty task item'}`,
-      },
     }),
     Mathematics.configure({
       katexOptions: { throwOnError: false },

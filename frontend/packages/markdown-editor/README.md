@@ -2,9 +2,9 @@
 
 `@akb/markdown-editor` is the product-neutral Tiptap Markdown core shared by AKB and Reef.
 It owns the document schema, Markdown parsing/serialization, editor/viewer surfaces, commands,
-state hooks, the default formatting/link/table/slash controls, shared document/file search UI, and
-the conformance contract. Products still own storage, permissions, search adapters and context,
-copy, and product-specific URL policy.
+state hooks, the en/ko common UI catalog, the default formatting/link/table/slash controls, shared
+document/file search UI, and the conformance contract. Products own storage, permissions, search
+adapters and context, product-specific prompts and controls, and URL policy.
 
 The package is built against the exact Tiptap `3.31.3` package set and React 19.
 
@@ -17,13 +17,8 @@ import {
   MarkdownSurface,
   MarkdownViewer,
   MarkdownToolbar,
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+  MarkdownLocaleProvider,
   type MarkdownTableOptions,
-  type MarkdownSlashCommandMessages,
-  type MarkdownCodeOptions,
-  type MarkdownContentAttributes,
-  type MarkdownHeadingOptions,
-  type MarkdownImageOptions,
   type MarkdownTableLayoutOptions,
   canonicalizeMarkdown,
   parseMarkdown,
@@ -34,15 +29,21 @@ import {
 
 const canonical = canonicalizeMarkdown('# Hello\n\n- [x] shared syntax')
 
-function Document({ markdown, onChange }) {
+function Document({ markdown, onChange, locale }) {
   return (
-    <>
+    <MarkdownLocaleProvider locale={locale}>
       <MarkdownEditor markdown={markdown} onChange={onChange} />
       <MarkdownViewer markdown={markdown} />
-    </>
+    </MarkdownLocaleProvider>
   )
 }
 ```
+
+The host resolves and stores the UI locale. `MarkdownLocaleProvider` accepts only `en` or `ko`;
+without a provider, common UI defaults to English. The package never reads browser language,
+cookies, or storage. Locale changes update UI copy while keeping the editor mounted. The package
+owns common control labels, status copy, accessibility names, and menu copy; product prompts,
+adapter messages, user content, and product-added controls remain with the host.
 
 `MarkdownEditor` includes a `WYSIWYG` / `Source` switch for the same Markdown
 draft. Source opens from the current editor body. WYSIWYG changes emit
@@ -70,7 +71,6 @@ updates are applied by the package and never become serialized Markdown:
   tableLayout={{
     className: 'w-max min-w-full',
     wrapperClassName: 'overflow-x-auto',
-    ariaLabel: 'Scrollable table',
   }}
 />
 ```
@@ -86,8 +86,9 @@ listbox/option ARIA relationship, keeps the active option synchronized across
 keyboard and pointer input, scrolls the active option into view, and flips or
 clamps to the viewport and clipping ancestors.
 
-Products provide copy with `slash.messages` and may observe its lifecycle with
-`slash.onOpenChange`. Styling is product-owned through these stable classes:
+Products may observe the menu lifecycle with `slash.onOpenChange`. English and
+Korean command aliases remain searchable after a locale change. Styling is
+product-owned through these stable classes:
 `markdown-slash-command-popup`, `markdown-slash-command-menu`,
 `markdown-slash-command-options`, `markdown-slash-command-option`, and
 `markdown-slash-command-option-selected`. Pass `slash={false}` for a read-only
@@ -95,7 +96,7 @@ or non-WYSIWYG surface such as `MarkdownViewer`.
 
 The WYSIWYG editor also accepts an optional common `@` reference menu through
 `reference`. Products own search, permissions, and context; the package owns
-the menu lifecycle and insertion contract:
+the menu copy, lifecycle, and insertion contract:
 
 ```tsx
 import {
@@ -115,10 +116,6 @@ const referenceAdapter: MarkdownReferenceAdapter = {
   reference={{
     adapter: referenceAdapter,
     context: { vault: activeVault, document: currentDocument, commit },
-    labels: {
-      header: 'Insert reference',
-      empty: 'No accessible references found.',
-    },
   }}
 />
 ```
@@ -192,27 +189,29 @@ import {
   MarkdownEditingSurface,
   MarkdownSurface,
   MarkdownToolbar,
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
-  DEFAULT_MARKDOWN_REFERENCE_LABELS,
+  MarkdownLocaleProvider,
   type MarkdownReferenceAdapter,
   type MarkdownTableOptions,
   useMarkdownEditor,
 } from '@akb/markdown-editor/react'
 
 function ProductEditor({ markdown, onChange, readOnly }) {
-  const tableOptions: MarkdownTableOptions = {
-    labels: { insertTable: 'Insert a data table' },
-    tableClassName: 'min-w-[36rem]',
-  }
+  return (
+    <MarkdownLocaleProvider locale="ko">
+      <ProductEditorContent markdown={markdown} onChange={onChange} readOnly={readOnly} />
+    </MarkdownLocaleProvider>
+  )
+}
+
+function ProductEditorContent({ markdown, onChange, readOnly }) {
+  const tableOptions: MarkdownTableOptions = { tableClassName: 'min-w-[36rem]' }
   const editor = useMarkdownEditor({
     initialMarkdown: markdown,
     editable: !readOnly,
     onChange,
-    slash: { messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES },
     reference: {
       adapter: referenceAdapter,
       context: { vault: activeVault },
-      labels: DEFAULT_MARKDOWN_REFERENCE_LABELS,
     },
   })
 
@@ -222,9 +221,8 @@ function ProductEditor({ markdown, onChange, readOnly }) {
       markdown={markdown}
       readOnly={readOnly}
       table={tableOptions}
-      toolbar={<MarkdownToolbar editor={editor} table={tableOptions} />}
+      toolbar={<MarkdownToolbar editor={editor} />}
       onSourceChange={onChange}
-      modeLabels={{ group: 'Editor mode', source: 'Source' }}
     >
       <MarkdownSurface editor={editor} editable={!readOnly} />
     </MarkdownEditingSurface>
@@ -234,8 +232,10 @@ function ProductEditor({ markdown, onChange, readOnly }) {
 
 `MarkdownEditingSurface` owns mode switching, source input, external-value
 synchronization, and focus handoff. Its `toolbar` slot appears only in
-WYSIWYG mode; `modeLabels`, `sourceClassName`, and the source label props adapt
-copy, theme, and accessible names. `modeSwitchDisabled` can lock mode changes
+WYSIWYG mode; `sourcePlaceholder` can describe product-specific authoring
+context, while the default mode and source copy follow the provider locale.
+`sourceClassName` and the source label props adapt theme and accessible names.
+`modeSwitchDisabled` can lock mode changes
 during an active product operation such as an upload. The optional
 `autoFocus` focuses the WYSIWYG editor after it mounts when the surface is
 editable. The optional
@@ -245,10 +245,10 @@ Source input. `onMarkdownApplied` is an optional product hook for schema-specifi
 normalization after external or Source Markdown is applied. Products continue
 to own persistence, draft/OCC behavior, and asset-reference policy.
 
-`MarkdownToolbar` provides the shared table insertion control. Passing the same
-`MarkdownTableOptions` to the toolbar and editing surface adapts table labels
-and styling. The editing surface attaches a menu to each table; its row and
-column commands use the currently selected cell in that table, and commands for
+`MarkdownToolbar` provides the shared table insertion control. `MarkdownTableOptions`
+on the editing surface adapts table styling, and the package supplies table labels
+in the provider locale. The editing surface attaches a menu to each table; its row
+and column commands use the currently selected cell in that table, and commands for
 other tables stay disabled. “Continue below” focuses the paragraph immediately
 after that table, creating one before the next block when needed. Table deletion
 leaves an editable cursor position and is part of the editor undo history.
@@ -262,7 +262,8 @@ image edits Markdown only; the product still decides whether an uploaded asset
 is discarded, retained, or claimed.
 
 Products pass their target eligibility rule, replacement upload callback,
-accessible labels, and theme classes through `MarkdownImageMenuOptions`. The
+and theme classes through `MarkdownImageMenuOptions`; the package supplies
+image action and dialog copy in the provider locale. The
 callback receives the selected image's ProseMirror document position. The
 package defaults use the shared `surface`, `border`, `foreground`, and
 `destructive` theme tokens; pass `classNames` to adapt them to another product.
@@ -287,7 +288,7 @@ they participate in the same toolbar navigation.
     searchContext: { vault: activeVault },
     searchLabels: {
       inputLabel: 'Search Vault resources',
-      empty: 'No matching documents or files found.',
+      inputPlaceholder: 'Find a document or file',
     },
     searchClassName: 'space-y-2',
   }}
@@ -302,20 +303,8 @@ The shared surfaces render the same headings, paragraphs, blockquotes, ordinary
 and nested lists, task lists, and fenced code. Common languages are highlighted
 with `lowlight`; an unknown language remains readable as plain code while its
 fence language and content stay in the canonical Markdown model. Code blocks
-are bounded scrolling regions with a keyboard-focusable `pre` and a product
-provided accessible name:
-
-```tsx
-const code: MarkdownCodeOptions = {
-  labels: {
-    region: language =>
-      language ? `Scrollable ${language} code block` : 'Scrollable code block',
-  },
-}
-
-<MarkdownEditor markdown={markdown} code={code} />
-<MarkdownViewer markdown={markdown} code={code} />
-```
+are bounded scrolling regions with a keyboard-focusable `pre`; their accessible
+names follow the provider locale.
 
 Nested task checkboxes are independently editable, preserve their checked
 state through save/reopen, and are disabled on read-only surfaces. The
@@ -431,7 +420,6 @@ import {
   MarkdownSurface,
   useMarkdownEditor,
   useMarkdownTargetResolutions,
-  type MarkdownImageOptions,
 } from '@akb/markdown-editor/react'
 
 function ProductSurface({ markdown, resolver }: Props) {
@@ -440,18 +428,10 @@ function ProductSurface({ markdown, resolver }: Props) {
     vault: 'team',
     document: 'notes/guide.md',
   })
-  const image: MarkdownImageOptions = {
-    labels: {
-      loading: alt => alt ? `Loading ${alt}` : 'Loading image',
-      unavailable: alt => alt ? `Unavailable: ${alt}` : 'Image unavailable',
-    },
-  }
-
   return (
     <MarkdownSurface
       editor={editor}
       editable
-      image={image}
       resolutions={resolutions}
       resolvingTargets={Boolean(resolver)}
     />
@@ -475,6 +455,12 @@ with a physical OS IME.
 
 ## Versioning
 
+The `0.16.0` public contract adds `MarkdownLocaleProvider` with package-owned
+English and Korean common UI copy. Common per-feature label and message
+overrides have been removed; product-specific prompts and custom controls stay
+at the host boundary. Locale changes preserve editor state and update open
+menus and status messages without restarting asynchronous work.
+
 The `0.15.0` public contract closes the editor boundary around the package-owned
 `MarkdownEditorHandle`. Raw Tiptap editor values, `EditorContent`, editor
 factories, and engine serialization helpers are no longer public; lower-level
@@ -487,8 +473,8 @@ are presentation-only and do not change canonical Markdown.
 
 The `0.13.0` public contract adds shared block rendering for editor/viewer
 surfaces, common-language code highlighting, keyboard-focusable code scroll
-regions, nested task checkbox behavior, and `MarkdownCodeOptions` for product
-accessible copy. Code decoration and accessibility attributes are
+regions, and nested task checkbox behavior. Code and task accessibility names
+follow the provider locale. Code decoration and accessibility attributes are
 presentation-only; canonical Markdown content, fence languages, and checked
 states remain unchanged.
 
@@ -528,8 +514,8 @@ serialized Markdown meaning.
 
 The `0.6.0` public contract adds shared GFM table insertion, selection-aware
 row/column commands, table-local controls, and continuation immediately below
-the selected table. `MarkdownTableOptions` lets products provide labels and
-styling. It also includes the shared WYSIWYG / Markdown Source surface.
+the selected table. `MarkdownTableOptions` lets products adapt table styling.
+It also includes the shared WYSIWYG / Markdown Source surface.
 
 For a Git consumer, pin both the full commit SHA and the package subdirectory:
 

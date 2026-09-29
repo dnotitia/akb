@@ -5,19 +5,7 @@ import type { Editor } from '@tiptap/core'
 import { Pencil, Replace, X } from 'lucide-react'
 
 import { markdownCommands } from '../core.js'
-
-export interface MarkdownImageMenuLabels {
-  editDescription: (alt: string) => string
-  replaceImage: (alt: string) => string
-  removeImage: (alt: string) => string
-  dialogTitle: string
-  dialogDescription: string
-  description: string
-  cancel: string
-  saveDescription: string
-  descriptionRequired: string
-  closeDialog: string
-}
+import { useMarkdownMessages } from './markdown-locale.js'
 
 export interface MarkdownImageMenuClassNames {
   host?: string
@@ -33,23 +21,9 @@ export interface MarkdownImageMenuClassNames {
  * the adapter boundary. The editor owns target selection and image mutations.
  */
 export interface MarkdownImageMenuOptions {
-  labels?: Partial<MarkdownImageMenuLabels>
   classNames?: MarkdownImageMenuClassNames
   isEditableTarget?: (target: string) => boolean
   onReplace?: (position: number) => void
-}
-
-const DEFAULT_LABELS: MarkdownImageMenuLabels = {
-  editDescription: alt => alt ? `Edit image description: ${alt}` : 'Edit image description',
-  replaceImage: alt => alt ? `Replace image: ${alt}` : 'Replace image',
-  removeImage: alt => alt ? `Remove image: ${alt}` : 'Remove image',
-  dialogTitle: 'Image description',
-  dialogDescription: 'This text is used as the image alt text and visible caption.',
-  description: 'Description',
-  cancel: 'Cancel',
-  saveDescription: 'Save description',
-  descriptionRequired: 'Describe the image so it remains understandable without sight.',
-  closeDialog: 'Close dialog',
 }
 
 const DEFAULT_HOST_CLASS_NAME =
@@ -93,23 +67,23 @@ function ImageMenuActions({
   alt: string
   options: MarkdownImageMenuOptions
 }) {
-  const labels = { ...DEFAULT_LABELS, ...options.labels }
+  const labels = useMarkdownMessages().imageMenu
   const classNames = options.classNames
   const commands = useMemo(() => markdownCommands(editor), [editor])
   const [descriptionOpen, setDescriptionOpen] = useState(false)
   const [description, setDescription] = useState(alt)
-  const [descriptionError, setDescriptionError] = useState('')
+  const [descriptionError, setDescriptionError] = useState(false)
   const descriptionId = useId()
 
   const saveDescription = () => {
     const next = description.trim()
     if (!next) {
-      setDescriptionError(labels.descriptionRequired)
+      setDescriptionError(true)
       return
     }
     const position = imagePosition(editor, image)
     if (position === null || !commands.setImageAltAt(position, next)) return
-    setDescriptionError('')
+    setDescriptionError(false)
     setDescriptionOpen(false)
   }
 
@@ -120,7 +94,7 @@ function ImageMenuActions({
 
   const openDescription = () => {
     setDescription(alt)
-    setDescriptionError('')
+    setDescriptionError(false)
     setDescriptionOpen(true)
   }
 
@@ -173,7 +147,7 @@ function ImageMenuActions({
         open={descriptionOpen}
         onOpenChange={open => {
           setDescriptionOpen(open)
-          if (!open) setDescriptionError('')
+          if (!open) setDescriptionError(false)
         }}
       >
         <DialogPrimitive.Portal>
@@ -202,7 +176,7 @@ function ImageMenuActions({
                 value={description}
                 onChange={event => {
                   setDescription(event.currentTarget.value)
-                  if (descriptionError) setDescriptionError('')
+                  if (descriptionError) setDescriptionError(false)
                 }}
                 aria-invalid={descriptionError ? true : undefined}
                 aria-describedby={descriptionError ? `${descriptionId}-error` : undefined}
@@ -214,7 +188,7 @@ function ImageMenuActions({
                   role="alert"
                   className={['text-xs text-destructive', classNames?.error].filter(Boolean).join(' ')}
                 >
-                  {descriptionError}
+                  {labels.descriptionRequired}
                 </p>
               )}
             </div>

@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMarkdownExtensions } from '../src/extensions.js'
 import {
   createMarkdownReferenceExtension,
-  DEFAULT_MARKDOWN_REFERENCE_LABELS,
   createLiveMarkdownReferenceExtension,
 } from '../src/react/markdown-reference-menu.js'
 import type {
@@ -52,7 +51,6 @@ function mountEditor(
       createMarkdownReferenceExtension({
         adapter,
         context: options.context,
-        labels: DEFAULT_MARKDOWN_REFERENCE_LABELS,
       }),
     ],
     content: markdown,
@@ -227,7 +225,6 @@ describe('markdown @ reference menu', () => {
     let currentOptions = {
       adapter,
       context: { vault: 'first' },
-      labels: DEFAULT_MARKDOWN_REFERENCE_LABELS,
     }
     const listeners = new Set<() => void>()
     const host = document.createElement('div')
