@@ -99,6 +99,96 @@
     "cleanup": ["akb_discard_image"],
     "help": ["akb_help"]
   },
+  "candidate_operation_map": {
+    "akb_discover": {
+      "list_vaults": "akb_list_vaults",
+      "vault_info": "akb_vault_info",
+      "browse": "akb_browse",
+      "search": "akb_search",
+      "grep": "akb_grep"
+    },
+    "akb_document_read": {
+      "get": "akb_get",
+      "section": "akb_drill_down",
+      "activity": "akb_activity",
+      "history": "akb_history",
+      "diff": "akb_diff",
+      "provenance": "akb_provenance"
+    },
+    "akb_relationships": {
+      "relations": "akb_relations",
+      "graph": "akb_graph"
+    },
+    "akb_vault_access": {
+      "members": "akb_vault_members",
+      "explain": "akb_explain_access"
+    },
+    "akb_identity": {
+      "whoami": "akb_whoami",
+      "search_users": "akb_search_users"
+    },
+    "akb_publication_read": {
+      "list": "akb_publications"
+    },
+    "akb_export_read": {
+      "export": "akb_export"
+    },
+    "akb_document_write": {
+      "put": "akb_put",
+      "update": "akb_update",
+      "edit": "akb_edit",
+      "move": "akb_move",
+      "delete": "akb_delete",
+      "grep_replace": null
+    },
+    "akb_collection_manage": {
+      "create": "akb_create_collection",
+      "delete": "akb_delete_collection"
+    },
+    "akb_relationship_manage": {
+      "link": "akb_link",
+      "unlink": "akb_unlink"
+    },
+    "akb_vault_access_manage": {
+      "grant": "akb_grant",
+      "revoke": "akb_revoke",
+      "transfer_ownership": "akb_transfer_ownership",
+      "set_public": "akb_set_public"
+    },
+    "akb_publication_manage": {
+      "publish": "akb_publish",
+      "snapshot": "akb_publication_snapshot",
+      "unpublish": "akb_unpublish"
+    },
+    "akb_vault_manage": {
+      "create": "akb_create_vault",
+      "archive": "akb_archive_vault",
+      "delete": "akb_delete_vault"
+    },
+    "akb_table_schema_manage": {
+      "create": "akb_create_table",
+      "alter": "akb_alter_table",
+      "drop": "akb_drop_table"
+    },
+    "akb_bundle_manage": {
+      "import": "akb_import"
+    },
+    "akb_file_read": {
+      "read": "akb_get_file"
+    },
+    "akb_file_write": {
+      "put_file": "akb_put_file",
+      "update_file": "akb_update_file",
+      "delete_file": "akb_delete_file",
+      "put_image": "akb_put_image",
+      "discard_image": "akb_discard_image"
+    }
+  },
+  "candidate_only_operation_attribution": {
+    "akb_document_write": {
+      "grep_replace": {"operation": "update", "resource_type": "document"}
+    }
+  },
   "tool_resources": {
     "akb_whoami": "identity",
     "akb_list_vaults": "vault",

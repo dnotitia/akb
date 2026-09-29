@@ -34,18 +34,56 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
   return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
 }
-const fileToolNames = [
-  "akb_put_file",
-  "akb_put_image",
-  "akb_discard_image",
-  "akb_get_file",
-  "akb_update_file",
-  "akb_delete_file",
-];
+function candidateDocumentWriteTool() {
+  return {
+    name: "akb_document_write",
+    description: "Candidate document writes",
+    inputSchema: {
+      type: "object",
+      oneOf: [
+        {
+          type: "object",
+          properties: {
+            action: { const: "put" },
+            parent: { type: "string" },
+            vault: { type: "string" },
+            title: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["action", "title", "content"],
+          anyOf: [{ required: ["parent"] }, { required: ["vault"] }],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            action: { const: "update" },
+            uri: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["action", "uri"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            action: { const: "edit" },
+            uri: { type: "string" },
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+          },
+          required: ["action", "uri", "old_string", "new_string"],
+          additionalProperties: false,
+        },
+      ],
+    },
+  };
+}
+const fileToolNames = ["akb_file_read", "akb_file_write"];
 
 // ── initialize is answered locally, never blocking on the backend ────
 
-itAsync("initialize responds locally even when the backend is down", async () => {
+itAsync("initialize describes proxy-local candidate capabilities", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // don't spin a real monitor here
   proxy._ensureBackend = async () => false; // backend unreachable
@@ -59,10 +97,10 @@ itAsync("initialize responds locally even when the backend is down", async () =>
   assert.equal(res.result.protocolVersion, "2025-06-18", "echoes client protocol version");
   assert.equal(res.result.capabilities.tools.listChanged, true, "advertises listChanged");
   assert.equal(res.result.serverInfo.name, "akb-mcp");
-  assert.match(res.result.instructions, /akb_put_image/);
-  assert.match(res.result.instructions, /targeted akb_edit/);
+  assert.match(res.result.instructions, /akb_file_write.*put_image/s);
+  assert.match(res.result.instructions, /akb_document_write.*action=edit/);
   assert.match(res.result.instructions, /replaces the entire document body/);
-  assert.match(res.result.instructions, /akb_discard_image/);
+  assert.match(res.result.instructions, /akb_file_write.*discard_image/s);
   assert.equal(proxy._initialized, true);
 });
 
@@ -135,9 +173,9 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
   );
 });
 
-// ── tools/list degrades to file tools when the backend is unreachable ─
+// ── tools/list degrades to local capabilities when the backend is unreachable ─
 
-itAsync("tools/list serves file tools only when backend is down and nothing cached", async () => {
+itAsync("tools/list serves only proxy-local candidate capabilities when backend is down", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   proxy._ensureBackend = async () => false;
@@ -145,7 +183,7 @@ itAsync("tools/list serves file tools only when backend is down and nothing cach
   const res = await proxy._toolsList(2, {});
   const names = res.result.tools.map((t) => t.name);
 
-  assert.deepEqual(names.sort(), [...fileToolNames].sort(), "only file tools served");
+  assert.deepEqual(names.sort(), [...fileToolNames].sort(), "only local capabilities served");
   assert.equal(proxy._servedDegraded, true, "flags the degraded list for later re-list");
 });
 
@@ -154,7 +192,7 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   proxy._startBackendMonitor = () => {};
   proxy._cachedTools = {
     tools: [
-      { name: "akb_put", inputSchema: { type: "object", properties: {} } },
+      candidateDocumentWriteTool(),
       { name: "akb_search", inputSchema: { type: "object", properties: {} } },
     ],
   };
@@ -162,20 +200,32 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   const res = await proxy._toolsList(3, {});
   const names = res.result.tools.map((t) => t.name);
 
-  for (const n of ["akb_put", "akb_search", ...fileToolNames]) {
+  for (const n of ["akb_document_write", "akb_search", ...fileToolNames]) {
     assert.ok(names.includes(n), `expected ${n} in tools`);
   }
-  const put = res.result.tools.find((t) => t.name === "akb_put");
-  assert.ok(put.inputSchema.properties.file, "file param injected into akb_put");
-  const image = res.result.tools.find((t) => t.name === "akb_put_image");
+  const documentWrite = res.result.tools.find((t) => t.name === "akb_document_write");
+  const branches = Object.fromEntries(
+    documentWrite.inputSchema.oneOf.map((branch) => [branch.properties.action.const, branch]),
+  );
+  assert.ok(branches.put.properties.file, "file param injected into document put");
+  assert.ok(branches.update.properties.file, "file param injected into document update");
+  assert.equal(branches.edit.properties.file, undefined, "file param is limited to put/update");
+  assert.equal(branches.put.required.includes("content"), false);
+  const fileRead = res.result.tools.find((t) => t.name === "akb_file_read");
+  const fileWrite = res.result.tools.find((t) => t.name === "akb_file_write");
+  assert.match(fileWrite.description, /put_image/);
+  assert.match(fileWrite.description, /discard_image/);
+  const image = fileWrite.inputSchema.oneOf.find(
+    (branch) => branch.properties.action.const === "put_image",
+  );
   assert.match(image.description, /maximum 10 MiB/);
-  assert.match(image.description, /targeted akb_edit/);
-  assert.match(image.description, /replaces the entire body/);
-  assert.ok(image.inputSchema.properties._vault_skill_ack);
+  assert.match(image.description, /akb_document_write action=edit/);
+  assert.ok(image.properties._vault_skill_ack);
+  assert.equal(fileRead.annotations.readOnlyHint, true);
   assert.equal(proxy._servedDegraded, false, "cached full list is not degraded");
   // The cache must not be mutated by decoration.
   assert.ok(
-    !proxy._cachedTools.tools[0].inputSchema.properties.file,
+    !proxy._cachedTools.tools[0].inputSchema.oneOf[0].properties.file,
     "cached tool schema left untouched",
   );
 });
@@ -259,8 +309,8 @@ itAsync("vault-guide acknowledgement is attached only to the exact backend retry
     };
   };
   const params = {
-    name: "akb_update",
-    arguments: { content: "new", uri: "akb://v1/doc/a.md" },
+    name: "akb_document_write",
+    arguments: { action: "update", content: "new", uri: "akb://v1/doc/a.md" },
   };
 
   await proxy._handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params });
@@ -270,8 +320,8 @@ itAsync("vault-guide acknowledgement is attached only to the exact backend retry
     method: "tools/call",
     // Reordered keys still identify the unchanged logical operation.
     params: {
-      name: "akb_update",
-      arguments: { uri: "akb://v1/doc/a.md", content: "new" },
+      name: "akb_document_write",
+      arguments: { action: "update", uri: "akb://v1/doc/a.md", content: "new" },
     },
   });
 
@@ -301,11 +351,11 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
   await proxy._handle({
     jsonrpc: "2.0", id: 1, method: "tools/call",
-    params: { name: "akb_put", arguments: { vault: "v1", title: "A", content: "a" } },
+    params: { name: "akb_document_write", arguments: { action: "put", vault: "v1", title: "A", content: "a" } },
   });
   await proxy._handle({
     jsonrpc: "2.0", id: 2, method: "tools/call",
-    params: { name: "akb_put", arguments: { vault: "v1", title: "B", content: "b" } },
+    params: { name: "akb_document_write", arguments: { action: "put", vault: "v1", title: "B", content: "b" } },
   });
 
   assert.equal(forwarded[1].params.arguments._vault_skill_ack, undefined);

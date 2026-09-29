@@ -243,8 +243,9 @@ itAsync("measures a proxy-local file tool too", async () => {
       id: 1,
       method: "tools/call",
       params: {
-        name: "akb_get_file",
+        name: "akb_file_read",
         arguments: {
+          action: "read",
           uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555",
           save_to: "/tmp/a.bin",
         },
@@ -252,7 +253,7 @@ itAsync("measures a proxy-local file tool too", async () => {
     });
 
     const [record] = await readLines(path);
-    assert.equal(record.tool, "akb_get_file");
+    assert.equal(record.tool, "akb_file_read");
     assert.ok(record.result_bytes > 0);
   });
 });

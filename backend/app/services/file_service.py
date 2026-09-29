@@ -1346,11 +1346,12 @@ class FileService:
 
         `already_confirmed` is carried because a deduplicating reservation
         adopts the File that already holds the key — including one whose
-        bytes are final. Writing to that key is how a caller could replace
-        another File's content, and the damage does not stop at replacement:
-        `confirm_upload` re-derives the digest, finds it disagrees with the
-        content-addressed key, and deletes the row. The route uses this to
-        keep the body away from storage in that case.
+        bytes are final. Only a grant to that live key must have its body
+        discarded: a replacement grant belongs to a distinct staging key and
+        needs its body stored before `confirm_replace` can publish it. Writing
+        unrelated bytes to the confirmed live key would let a caller replace
+        another File's content, and `confirm_upload` would then find the
+        digest disagrees with the content-addressed key and delete the row.
 
         A row without `object_key` belongs to the measurement lane, which
         carries its bytes in the database and addresses no object store. It is
@@ -1371,7 +1372,7 @@ class FileService:
             grant = await conn.fetchrow(
                 """
                 SELECT i.file_id, i.vault_id, i.object_key, i.mime_type,
-                       f.upload_state
+                       f.upload_state, f.s3_key AS file_s3_key
                   FROM m1_file_transfer_intents AS i
                   JOIN vault_files AS f
                     ON f.id = i.file_id AND f.vault_id = i.vault_id
@@ -1390,10 +1391,13 @@ class FileService:
             # one AKB normalized when the capability was issued, not one the
             # uploading client restates at PUT time.
             "mime_type": _normalize_content_type(grant["mime_type"]),
-            # Whether this reservation adopted a File that is already
-            # confirmed. It changes what the route may do with the body —
-            # see `upload_by_capability`.
-            "already_confirmed": grant["upload_state"] == "confirmed",
+            # A confirmed deduplicated File already owns its live object, so
+            # writes to that key are discarded. Replacement capabilities use
+            # a separate staging key and still need the request body stored.
+            "already_confirmed": (
+                grant["upload_state"] == "confirmed"
+                and grant["object_key"] == grant["file_s3_key"]
+            ),
         }
 
     async def list_files(

@@ -319,15 +319,19 @@ DEFERRED_OPERATION_REASONS = {
     "stdio_local_files": "Local filesystem operations remain in the stdio proxy surface.",
 }
 
-# These operations are injected by the stdio proxy after the backend catalog is
-# returned. They remain outside this backend capability registry.
-DEFERRED_OPERATION_NAMES = frozenset(
-    {
-        "akb_put_file",
-        "akb_get_file",
-        "akb_delete_file",
-    }
-)
+# The complete Candidate coverage contract includes local operations even though
+# these tool/action pairs are implemented only by the stdio proxy and never
+# appear in the backend catalog. The legacy keys name logical operations for
+# coverage accounting; they are not public aliases.
+DEFERRED_OPERATION_COVERAGE = {
+    "akb_put_file": ("akb_file_write", "put_file"),
+    "akb_get_file": ("akb_file_read", "read"),
+    "akb_update_file": ("akb_file_write", "update_file"),
+    "akb_delete_file": ("akb_file_write", "delete_file"),
+    "akb_put_image": ("akb_file_write", "put_image"),
+    "akb_discard_image": ("akb_file_write", "discard_image"),
+}
+DEFERRED_OPERATION_NAMES = frozenset(DEFERRED_OPERATION_COVERAGE)
 
 
 def _action_schema(legacy: Tool, action: str) -> dict[str, Any]:
