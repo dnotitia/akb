@@ -117,7 +117,7 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       await expect(favorites).toBeVisible();
       const sidebarColor = dark ? "rgb(18, 24, 33)" : "rgb(255, 255, 255)";
       await expect(sidebar).toHaveCSS("background-color", sidebarColor);
-      await expect(sidebar.getByRole("link", { name: "AKB home", exact: true })).toBeVisible();
+      await expect(sidebar.getByRole("link", { name: /^AKB home\b/ })).toBeVisible();
       expect((await sidebar.boundingBox())!.y).toBe(0);
       const logoRow = (await sidebar.locator(":scope > div").first().boundingBox())!;
       const appHeader = (await page.locator("header.app-header").boundingBox())!;
@@ -132,7 +132,7 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
       await expect(sidebar).toHaveAttribute("data-compact", "true");
       await expect(sidebar).toHaveCSS("background-color", sidebarColor);
-      await expect(sidebar.getByRole("link", { name: "AKB home", exact: true })).toBeVisible();
+      await expect(sidebar.getByRole("link", { name: /^AKB home\b/ })).toBeVisible();
       await expect.poll(async () => (await page.locator("header.app-header").boundingBox())!.x).toBe(56);
       await assertHomeAlignment();
       const collapsedSearch = (await page.locator("#global-search-trigger").boundingBox())!;

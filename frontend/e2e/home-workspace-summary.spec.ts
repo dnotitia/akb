@@ -155,11 +155,36 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     expect(state.details).toBeLessThanOrEqual(4);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath("home-workspace.png"), fullPage: true });
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    const footer = page.getByRole("contentinfo");
+    // scrollHeight rounds to CSS pixels; the footer edge may retain a subpixel.
+    await expect(footer).toBeInViewport({ ratio: 0.99 });
+    await expect(footer).not.toContainText("Seahorse");
+    const copyright = footer.getByText("© Dnotitia");
+    const product = footer.getByText("Agent Knowledgebase");
+    await expect(product).toBeVisible();
+    const left = (await copyright.boundingBox())!;
+    const right = (await product.boundingBox())!;
+    const mainBounds = await page.getByRole("main").locator(":scope > div").evaluate(element => {
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return { left: bounds.left + parseFloat(style.paddingLeft), right: bounds.right - parseFloat(style.paddingRight) };
+    });
+    expect(left.x).toBeCloseTo(mainBounds.left, 0);
+    expect(right.x + right.width).toBeCloseTo(mainBounds.right, 0);
+    expect(left.y).toBeCloseTo(right.y, 0);
+    const invitationBounds = (await invitation.boundingBox())!;
+    for (const label of [copyright, product]) {
+      await expect(label).toBeInViewport({ ratio: 1 });
+      const bounds = (await label.boundingBox())!;
+      expect(bounds.x + bounds.width <= invitationBounds.x || bounds.y + bounds.height <= invitationBounds.y || bounds.y >= invitationBounds.y + invitationBounds.height).toBe(true);
+    }
+    await page.screenshot({ path: testInfo.outputPath("home-footer.png") });
   });
 }
 
 for (const reducedMotion of ["no-preference", "reduce"] as const) {
-  test(`Connection launcher stays viewport-fixed on a long Home (${reducedMotion})`, async ({ page }) => {
+  test(`Connection launcher clears the footer and returns to its viewport anchor (${reducedMotion})`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 700 });
     await page.emulateMedia({ reducedMotion });
     const state = await fixture(page);
@@ -173,8 +198,15 @@ for (const reducedMotion of ["no-preference", "reduce"] as const) {
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     await expect(invitation).toBeInViewport({ ratio: 1 });
+    await expect.poll(async () => {
+      const floating = (await invitation.boundingBox())!;
+      const footer = (await page.getByRole("contentinfo").boundingBox())!;
+      return footer.y - floating.y - floating.height;
+    }).toBeGreaterThanOrEqual(16);
     const scrolled = (await invitation.boundingBox())!;
-    expect(scrolled.y).toBeCloseTo(initial.y, 0);
+    expect(scrolled.x).toBeCloseTo(initial.x, 0);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await expect.poll(async () => (await invitation.boundingBox())!.y).toBeCloseTo(initial.y, 0);
     await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
     await expect(page.getByRole("dialog", { name: "Connect an agent", exact: true })).toBeVisible();
   });

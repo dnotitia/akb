@@ -91,8 +91,10 @@ test("ordinary route preference survives Vault toggles, later expansion, and rel
   const sidebar = page.getByTestId("app-sidebar");
   await expectCompact(page, true);
   await sidebar.getByRole("link", { name: "Vaults", exact: true }).click();
+  await expect(sidebar.getByRole("link", { name: "Vaults", exact: true })).toHaveAttribute("aria-current", "page");
   await sidebar.getByRole("button", { name: "Expand sidebar", exact: true }).click();
   await sidebar.getByRole("link", { name: "Home", exact: true }).click();
+  await expect(sidebar.getByRole("link", { name: "Home", exact: true })).toHaveAttribute("aria-current", "page");
   await expectCompact(page, true);
   await sidebar.getByRole("button", { name: "Expand sidebar", exact: true }).click();
   await sidebar.getByRole("link", { name: "Search", exact: true }).click();
@@ -151,10 +153,10 @@ for (const dark of [false, true]) {
       settings: sidebar.getByRole("button", { name: "Settings", exact: true }).locator("svg"),
     };
     const productName = sidebar.getByText("Agent Knowledgebase", { exact: true });
-    await expect(productName).toBeVisible();
-    const nameBounds = await bounds(productName);
-    const railBounds = await bounds(sidebar);
-    expect(nameBounds.x + nameBounds.width).toBeLessThan(railBounds.x + railBounds.width);
+    await expect(productName).toHaveCount(0);
+    const wordmarkBounds = await bounds(sidebar.getByText("AKB", { exact: true }));
+    const markBounds = await bounds(icons.logo);
+    expect(wordmarkBounds.y + wordmarkBounds.height / 2).toBeCloseTo(markBounds.y + markBounds.height / 2, 0);
     const expanded = await Promise.all(Object.values(icons).map(bounds));
     await page.screenshot({ path: testInfo.outputPath("expanded.png"), animations: "disabled" });
     await sidebar.getByRole("button", { name: "Collapse sidebar", exact: true }).click();

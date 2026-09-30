@@ -358,6 +358,15 @@ export function Layout() {
             )}
           </main>
 
+          {/* Document-flow pages retain a footer; full-height workspaces own scrolling. */}
+          {!viewportLocked && (
+            <footer id="app-footer" className="shrink-0 border-t border-border">
+              <div className="flex w-full flex-wrap items-center justify-between gap-x-6 gap-y-1 px-[var(--workspace-gutter)] py-3 text-xs leading-5 text-foreground-muted">
+                <span>© Dnotitia</span>
+                <span className="ml-auto text-right">Agent Knowledgebase</span>
+              </div>
+            </footer>
+          )}
         </div>
       </div>
     </div>
@@ -388,7 +397,7 @@ function AppShellLoading({ compact, surface }: { compact: boolean; surface: AppS
         <div className="flex min-h-0 flex-1">
           <aside className={`fixed inset-y-0 left-0 hidden h-dvh border-r border-border bg-surface lg:block ${compact ? "w-14" : "w-52"}`}>
             <div className="flex h-14 items-center border-b border-border px-3.5">
-              <Logo size={28} wordmark={!compact} subtitle variant="header" />
+              <Logo size={28} wordmark={!compact} variant="header" />
             </div>
             <div className="space-y-2 p-3">
               {[0, 1, 2, 3].map((item) => (

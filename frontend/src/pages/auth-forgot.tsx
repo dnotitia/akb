@@ -106,7 +106,7 @@ export default function AuthForgotPage() {
           </Link>
         </div>
 
-        <p className="mt-5 text-center coord">© Dnotitia</p>
+        <p className="mt-5 text-center text-xs text-foreground-muted">© Dnotitia</p>
       </main>
     </div>
   );

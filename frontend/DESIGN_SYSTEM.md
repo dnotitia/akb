@@ -19,12 +19,17 @@ and hairlines carry hierarchy, and color is used with discipline.
 
 - **One brand axis**: teal primary `#004059` + a single orange accent `#e55e2c`.
   Teal is _interactive/identity_; orange is _one marquee moment per screen_.
-- **Product identity is AKB — Agent Knowledgebase.** The shared logo uses the
-  full product name as its subtitle on expanded desktop navigation, sign-in,
-  and public pages. Keep it sentence case and secondary to the wordmark.
-  Internal workspaces have no marketing/copyright footer. Sign-in and public
-  pages retain a quiet `© Dnotitia`; do not show a hardcoded release version or
-  another product's name as AKB's identity.
+- **Product identity is AKB — Agent Knowledgebase.** Internal app navigation
+  shows the mark and AKB wordmark without a repeated subtitle. Keep the full
+  product name in the Home link's accessible label and compact-rail tooltip.
+  Sign-in and public pages may retain the full product subtitle as introduction.
+  Document-flow pages such as Home retain a quiet footer: `© Dnotitia` left,
+  `Agent Knowledgebase` right, aligned with the body gutters in both themes and
+  on mobile. Floating actions clear the footer when it enters the viewport.
+  Full-height Vault and Search workspaces omit the footer to preserve their
+  scrolling model. Sign-in and public surfaces retain company attribution.
+  Routine chrome does not display a release version or another product's name
+  as AKB's identity.
 - **Accessibility is a floor, not a nice-to-have**: every foreground/background
   pair clears **WCAG AA (4.5:1 text / 3:1 UI)**; AAA where it's free.
 - **Tokens only**: components never hardcode a color/radius/shadow — they read
@@ -277,7 +282,7 @@ an `sr-only` summary, never the only signal.
   inset without shifting the location label. Account Settings opens above the
   current workspace, leaving its location label unchanged. Section names, icons,
   and permission fallback share one contract inside the dialog.
-  The expanded rail stacks the full product subtitle below AKB without changing
+  The expanded rail uses a single-line AKB wordmark beside the mark without changing
   its 56px header or the logo's fixed anchor. Loading uses the same lockup.
   A collapsed rail retains the logo symbol and a Home link with the full product
   name in its accessible label and keyboard/pointer tooltip. Mobile retains its full-width header with the AKB mark/wordmark and compact
@@ -445,7 +450,10 @@ an `sr-only` summary, never the only signal.
   Use opaque surface, border-strong, radius-md, shadow-md, a small plug glyph and
   teal action. Render the floating region in a body portal so animated route
   containers cannot anchor it to the page bottom. Position 24px from bottom/right
-  (16px on mobile), respecting safe areas. Reserve compact-only bottom clearance;
+  (16px on mobile), respecting safe areas. When the app footer enters the viewport,
+  lift the invitation above its top edge by the same gap, and return to the
+  viewport anchor when the footer leaves. Re-measure after body/footer resizing.
+  Reserve compact-only bottom clearance;
   collapse/hide if focused content would be obscured. Page-landmark focus is not
   a hidden control and must not suppress the launcher. Shared Dialog ownership
   suspends the invitation even under

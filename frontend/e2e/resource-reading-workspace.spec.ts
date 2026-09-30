@@ -1187,7 +1187,7 @@ for (const width of [640, 768]) {
     await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
     const header = page.locator(".app-header");
     const mobileNavigation = header.getByRole("navigation", { name: "Primary mobile navigation", exact: true });
-    const logo = header.getByRole("link", { name: "AKB home", exact: true });
+    const logo = header.getByRole("link", { name: /^AKB home\b/ });
     const search = header.getByRole("button", { name: "Search knowledge", exact: true });
     const account = header.getByRole("button", { name: `Account menu — ${displayName}`, exact: true });
     await expect(logo).toContainText("AKB");
