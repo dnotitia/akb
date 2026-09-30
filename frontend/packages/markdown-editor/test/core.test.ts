@@ -146,6 +146,79 @@ describe('Markdown conformance core', () => {
     expect(canonicalizeMarkdown(canonical)).toBe(canonical)
   })
 
+  it('keeps escaped image alt, target, and title stable through repeated save and reopen', () => {
+    const target = 'akb://reef-e2e/file/test-image'
+    const title = 'Original title'
+    const expectedAlt = "reef'\\]" + '"quoted"한글😀.png [unfinished'
+    const sourceAlt = "reef'\\\\" + "\\]" + '"quoted"한글😀.png \\[unfinished'
+    const source = `![${sourceAlt}](${target} "${title}")`
+    const editor = createMarkdownEditor({ initialMarkdown: source })
+    editors.push(editor)
+
+    const imageAttrs = (instance: ReturnType<typeof createMarkdownEditor>) => {
+      let attrs: { alt?: string; target?: string; title?: string | null } | undefined
+      instance.state.doc.descendants(node => {
+        if (node.type.name === 'image') attrs = node.attrs
+      })
+      return attrs
+    }
+
+    expect(imageAttrs(editor)).toMatchObject({ alt: expectedAlt, target, title })
+    let saved = editor.getMarkdown()
+    expect(canonicalizeMarkdown(saved)).toBe(saved)
+
+    const reopened = createMarkdownEditor({ initialMarkdown: saved })
+    editors.push(reopened)
+    expect(imageAttrs(reopened)).toMatchObject({ alt: expectedAlt, target, title })
+    saved = reopened.getMarkdown()
+    expect(canonicalizeMarkdown(saved)).toBe(saved)
+  })
+
+  it('keeps canonical references as marks when reopening their HTML representation', () => {
+    const source = createMarkdownEditor({ initialMarkdown: 'REEF-123' })
+    editors.push(source)
+    const html = source.getHTML()
+    expect(html).toContain('<a data-markdown-reference="true"')
+
+    const reopened = createMarkdownEditor()
+    editors.push(reopened)
+    reopened.commands.setContent(html, { contentType: 'html' })
+
+    let referenceAttrs: Record<string, unknown> | undefined
+    reopened.state.doc.descendants(node => {
+      const mark = node.marks.find(candidate => candidate.type.name === 'markdownReference')
+      if (mark) referenceAttrs = mark.attrs
+    })
+    expect(referenceAttrs).toEqual({
+      kind: 'issue',
+      id: 'REEF-123',
+      value: 'REEF-123',
+      escaped: false,
+    })
+  })
+
+  it('does not parse a resolved reference runtime anchor as an authored link', () => {
+    const html = [
+      '<p><a data-markdown-reference="true" data-markdown-reference-kind="issue"',
+      ' data-markdown-reference-id="AKB-359" data-markdown-reference-value="AKB-359"',
+      ' data-markdown-reference-escaped="false" data-markdown-reference-runtime-url="https://reef.test/issues/AKB-359"',
+      ' data-markdown-reference-title="Issue display title" href="https://reef.test/issues/AKB-359">',
+      '<span data-markdown-reference-token="true" data-markdown-reference-kind="issue"',
+      ' data-markdown-reference-id="AKB-359" data-markdown-reference-value="AKB-359"',
+      ' data-markdown-reference-escaped="false">AKB-359</span></a></p>',
+    ].join('')
+    const editor = createMarkdownEditor()
+    editors.push(editor)
+    editor.commands.setContent(html, { contentType: 'html' })
+
+    let referenceMarks: string[] = []
+    editor.state.doc.descendants(node => {
+      referenceMarks = node.marks.map(mark => mark.type.name)
+    })
+    expect(referenceMarks).toEqual(['markdownReference'])
+    expect(serializeEditorMarkdown(editor)).toBe('AKB-359')
+  })
+
   it('keeps document, file, and attachment targets through image/link editing', () => {
     const attachment = '/api/assets/00000000-0000-4000-8000-000000000001'
     const document = 'akb://vault/coll/notes/doc/guide.md'

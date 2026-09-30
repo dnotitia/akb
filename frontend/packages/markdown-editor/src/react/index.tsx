@@ -137,6 +137,15 @@ export type { MarkdownLocale } from './markdown-locale.js'
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 const EMPTY_REFERENCE_RESOLUTIONS: ReadonlyMap<string, MarkdownReferenceResolution> = new Map()
 const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {}
+const MARKDOWN_REFERENCE_LABEL_STYLE_ID = 'akb-markdown-reference-label-style'
+
+function ensureMarkdownReferenceLabelStyle(document: Document): void {
+  if (document.getElementById(MARKDOWN_REFERENCE_LABEL_STYLE_ID)) return
+  const style = document.createElement('style')
+  style.id = MARKDOWN_REFERENCE_LABEL_STYLE_ID
+  style.textContent = '[data-markdown-reference-title]::after { content: attr(data-markdown-reference-title); }'
+  document.head?.append(style)
+}
 
 function releaseMarkdownResolutions(
   resolutions: ReadonlyMap<string, MarkdownTargetResolution>,
@@ -540,7 +549,7 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
 function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
   return Array.from(
     root.querySelectorAll<HTMLElement>(
-      'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
     ),
   )
 }
@@ -1076,6 +1085,14 @@ export function MarkdownSurface({
     if (!root) return
 
     const applyTaskSemantics = () => {
+      if (editable) {
+        root
+          .querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])')
+          .forEach(link => {
+            if (!link.hasAttribute('tabindex')) link.tabIndex = 0
+          })
+      }
+
       root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(taskItem => {
         const checkbox = taskItem.querySelector<HTMLInputElement>('input[type="checkbox"]')
         if (!checkbox) return
@@ -1106,7 +1123,7 @@ export function MarkdownSurface({
       editor.off('transaction', handleTransaction)
       if (delayedApply !== undefined) clearTimeout(delayedApply)
     }
-  }, [editable, editor])
+  }, [editable, editor, resolutions])
 
   useLayoutEffect(() => {
     const root = editor?.view.dom
@@ -1123,6 +1140,7 @@ export function MarkdownSurface({
     const focusEditorAfterTab = () => {
       pendingTabFocus = { kind: 'editor' }
       editor.commands.focus()
+      root.focus()
     }
 
     const handleKeyboardNavigation = (event: KeyboardEvent) => {
@@ -1141,7 +1159,7 @@ export function MarkdownSurface({
       if (!controls.length) return
 
       const controlTarget = editorTarget?.closest<HTMLElement>(
-        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+        'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
       )
       const currentIndex = controlTarget ? controls.indexOf(controlTarget) : -1
       if (currentIndex >= 0) {
@@ -1195,7 +1213,7 @@ export function MarkdownSurface({
 
       const target = event.target instanceof HTMLElement ? event.target : null
       const controlTarget = target?.closest<HTMLElement>(
-        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+        'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
       )
       if (!controlTarget) return
 
@@ -1220,25 +1238,22 @@ export function MarkdownSurface({
     const root = editor?.view.dom
     if (!root) return
 
-    const removeReferenceLabel = (element: HTMLElement) => {
-      element.querySelector<HTMLElement>('[data-markdown-reference-label]')?.remove()
-    }
-
     const applyReference = (element: HTMLElement) => {
       const tokenElement = element.querySelector<HTMLElement>('[data-markdown-reference-token]')
       const value = tokenElement?.textContent ?? ''
       const reference = parseMarkdownReferenceToken(value)
-      const clearRuntime = (removeLabel = true) => {
+      const clearRuntime = () => {
         element.removeAttribute('href')
         element.removeAttribute('target')
         element.removeAttribute('rel')
         element.removeAttribute('title')
         element.removeAttribute('aria-label')
         element.removeAttribute('aria-disabled')
+        element.removeAttribute('role')
+        element.removeAttribute('tabindex')
         delete element.dataset.markdownReferenceResolution
         delete element.dataset.markdownReferenceRuntimeUrl
         delete element.dataset.markdownReferenceTitle
-        if (removeLabel) removeReferenceLabel(element)
       }
 
       if (element.dataset.markdownReferenceEscaped === 'true') {
@@ -1268,32 +1283,29 @@ export function MarkdownSurface({
         return
       }
 
-      clearRuntime(false)
+      clearRuntime()
       if (resolution.status === 'available') {
         element.dataset.markdownReferenceResolution = 'available'
-        element.dataset.markdownReferenceTitle = resolution.title
         element.setAttribute('title', `${reference.value} — ${resolution.title}`)
         element.setAttribute('aria-label', `${reference.value} ${resolution.title}`)
         if (resolution.runtimeUrl) {
-          element.setAttribute('href', resolution.runtimeUrl)
-          element.setAttribute('target', '_blank')
-          element.setAttribute('rel', 'noreferrer')
           element.dataset.markdownReferenceRuntimeUrl = resolution.runtimeUrl
+          if (editable) {
+            element.setAttribute('role', 'link')
+            element.tabIndex = 0
+          } else {
+            element.setAttribute('href', resolution.runtimeUrl)
+            element.setAttribute('target', '_blank')
+            element.setAttribute('rel', 'noreferrer')
+          }
         }
         if (resolution.title !== reference.value) {
-          const label =
-            element.querySelector<HTMLElement>('[data-markdown-reference-label]') ??
-            document.createElement('span')
-          label.dataset.markdownReferenceLabel = 'true'
-          label.setAttribute('aria-hidden', 'true')
-          label.setAttribute('contenteditable', 'false')
-          if (label.textContent !== resolution.title) label.textContent = resolution.title
-          if (!label.parentElement) element.append(label)
-        } else removeReferenceLabel(element)
+          element.dataset.markdownReferenceTitle = resolution.title
+          ensureMarkdownReferenceLabelStyle(root.ownerDocument)
+        }
         return
       }
 
-      removeReferenceLabel(element)
       element.dataset.markdownReferenceResolution = 'unavailable'
       element.setAttribute('aria-disabled', 'true')
       element.setAttribute('title', resolution.title ?? messagesRef.current.reference.unavailable)

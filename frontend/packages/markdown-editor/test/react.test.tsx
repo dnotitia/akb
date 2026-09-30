@@ -13,6 +13,7 @@ import {
   MarkdownViewer,
   useMarkdownCommands,
   useMarkdownEditor,
+  useMarkdownReferenceResolutions,
   useMarkdownTargetResolutions,
   useMarkdownState,
 } from '../src/index.js'
@@ -189,19 +190,94 @@ describe('React surfaces', () => {
       expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]')).toHaveLength(4)
     })
 
-    const editorReferences = container.querySelectorAll<HTMLElement>(
-      '.ProseMirror[data-placeholder] [data-markdown-reference], .ProseMirror [data-markdown-reference]',
-    )
-    expect(editorReferences).toHaveLength(4)
-    expect(editorReferences[0]).toHaveAttribute('href', '/people/alice')
+    const editorSurface = container.querySelector<HTMLElement>('.ProseMirror[contenteditable="true"]')!
+    const viewerSurface = container.querySelector<HTMLElement>('.ProseMirror[contenteditable="false"]')!
+    const editorReferences = editorSurface.querySelectorAll<HTMLElement>('[data-markdown-reference]')
+    const viewerReferences = viewerSurface.querySelectorAll<HTMLElement>('[data-markdown-reference]')
+    expect(editorReferences).toHaveLength(2)
+    expect(editorReferences[0]).toHaveAttribute('role', 'link')
+    expect(editorReferences[0]).toHaveAttribute('tabindex', '0')
+    expect(editorReferences[0]).not.toHaveAttribute('href')
+    expect(editorReferences[0]).toHaveAttribute('data-markdown-reference-runtime-url', '/people/alice')
     expect(editorReferences[0]).toHaveAttribute('data-markdown-reference-title', 'Ada Lovelace')
-    expect(editorReferences[0]).toHaveTextContent('@aliceAda Lovelace')
-    expect(editorReferences[1]).toHaveAttribute('href', '/issues/REEF-123')
-    expect(editorReferences[1]).toHaveTextContent('REEF-123Reference issue')
+    expect(editorReferences[0]).toHaveTextContent('@alice')
+    expect(editorReferences[1]).toHaveAttribute('role', 'link')
+    expect(editorReferences[1]).toHaveAttribute('data-markdown-reference-runtime-url', '/issues/REEF-123')
+    expect(editorReferences[1]).toHaveTextContent('REEF-123')
+    expect(editorReferences[1]).toHaveAttribute('data-markdown-reference-title', 'Reference issue')
     const editorClick = new MouseEvent('click', { bubbles: true, cancelable: true })
     editorReferences[0]?.dispatchEvent(editorClick)
     expect(editorClick.defaultPrevented).toBe(true)
+    expect(viewerReferences).toHaveLength(2)
+    expect(viewerReferences[0]).toHaveAttribute('href', '/people/alice')
+    expect(viewerReferences[1]).toHaveAttribute('href', '/issues/REEF-123')
     expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('keeps resolved reference display outside saved Markdown after editing inline code', async () => {
+    const markdown = 'AKB-359 @person\n\n`inline code`'
+    const adapter: MarkdownReferenceAdapter = {
+      search: async () => [],
+      resolve: async reference => ({
+        ...reference,
+        status: 'available',
+        title: reference.kind === 'person' ? 'Person display name' : 'Issue display title',
+        ...(reference.kind === 'issue' ? { runtimeUrl: '/issues/AKB-359' } : {}),
+      }),
+    }
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ReferenceSurface() {
+      const editor = useMarkdownEditor({
+        initialMarkdown: markdown,
+        onChange,
+        reference: { adapter },
+      })
+      const referenceResolutions = useMarkdownReferenceResolutions(markdown, adapter)
+      useEffect(() => { activeEditor = editor }, [editor])
+      return (
+        <MarkdownSurface
+          editor={editor}
+          editable
+          referenceResolutions={referenceResolutions}
+          resolvingReferences
+        />
+      )
+    }
+
+    const { container, unmount } = render(<ReferenceSurface />)
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+        .toHaveLength(2)
+    })
+
+    const editor = getMarkdownEditor(activeEditor)!
+    let codeTextPosition: number | undefined
+    editor.state.doc.descendants((node, position) => {
+      if (node.isText && node.marks.some(mark => mark.type.name === 'code')) {
+        codeTextPosition = position
+      }
+    })
+    if (codeTextPosition === undefined) throw new Error('inline code was not parsed')
+    const codePosition = codeTextPosition
+    await act(async () => {
+      editor.commands.setTextSelection(codePosition + 1)
+      editor.commands.insertContent('!')
+    })
+
+    await waitFor(() => expect(onChange).toHaveBeenCalled())
+    const saved = onChange.mock.lastCall?.[0] as string
+    expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+      .toHaveLength(2)
+    expect(container.querySelectorAll('[data-markdown-reference-title]')).toHaveLength(2)
+    expect(saved).toContain('AKB-359')
+    expect(saved).toContain('@person')
+    expect(saved).toContain('`i!nline code`')
+    expect(saved).not.toContain('Issue display title')
+    expect(saved).not.toContain('Person display name')
+    expect(saved).not.toContain('/issues/AKB-359')
+    unmount()
   })
 
   it('supports controlled Markdown updates without replacing an unchanged editor', async () => {

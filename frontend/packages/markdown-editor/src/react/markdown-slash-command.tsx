@@ -377,7 +377,12 @@ export function getMarkdownSlashMenuBoundary(editorRoot: HTMLElement): MarkdownS
     ),
   }
 
+  const dialog = editorRoot.closest<HTMLElement>('dialog, [role="dialog"], [aria-modal="true"]')
   let current: HTMLElement | null = editorRoot
+  if (dialog) {
+    intersectMarkdownSlashBoundary(boundary, dialog.getBoundingClientRect())
+    current = dialog.parentElement
+  }
   while (current && current !== document.body) {
     const styles = getComputedStyle(current)
     if (isClippingOverflow(styles.overflowX) || isClippingOverflow(styles.overflowY)) {
@@ -462,8 +467,10 @@ export function ensureMarkdownSlashOptionVisible(
   const options = option?.closest<HTMLElement>('.markdown-slash-command-options')
   if (!option || !options) return
 
-  const optionTop = option.offsetTop
-  const optionBottom = optionTop + option.offsetHeight
+  const optionsRect = options.getBoundingClientRect()
+  const optionRect = option.getBoundingClientRect()
+  const optionTop = optionRect.top - optionsRect.top + options.scrollTop
+  const optionBottom = optionRect.bottom - optionsRect.top + options.scrollTop
   if (optionTop < options.scrollTop) options.scrollTop = optionTop
   else if (optionBottom > options.scrollTop + options.clientHeight) {
     options.scrollTop = optionBottom - options.clientHeight

@@ -184,7 +184,11 @@ const stored = extractMarkdownReferences(markdown)
 Unknown tokens stay ordinary text. Reference discovery excludes link labels,
 inline/fenced code, and escaped tokens; the public `MarkdownReferenceToken`
 keeps the exact canonical value while `MarkdownReferenceResolution` carries
-only ephemeral product display data. A product can also put the resolver on
+only ephemeral product display data. Resolved titles appear as presentation-only
+labels and accessible names. In the editor, a resolved reference with a runtime
+URL is keyboard-focusable as a link but does not navigate; viewers use the
+runtime URL. The editor's embedded keyboard order also includes regular links,
+task checkboxes, and scrollable code blocks. A product can put the resolver on
 `MarkdownAdapters.reference` when composing the lower-level `/react` surface.
 AKB keeps its existing document/file search adapter and does not enable person
 mentions or issue suggestions.
