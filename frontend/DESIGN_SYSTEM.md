@@ -397,8 +397,13 @@ an `sr-only` summary, never the only signal.
   One authenticated count-only snapshot owns totals; missing values remain `—`
   with one quiet availability explanation. Older servers retain the verified
   directory's Vault count only. A verified empty workspace shows only zero Vaults.
-  Foreground identity proof gates the summary, then refreshes directory and totals
-  even for unchanged local accounts. No private totals persist in browser storage.
+  Foreground identity proof gates both directory and totals, which load in parallel
+  even for unchanged local accounts: the server independently scopes the count-only
+  snapshot. A verified directory's Vault count can appear while resource counts
+  are pending. Skeletons apply per missing metric; one live loading status must
+  not hide ready values from assistive technology. Directory completion must not
+  restart the summary request. No private totals persist in browser storage or
+  remain visible while an identity/access refresh is pending or has failed.
   Leave 24px before the first section without double section padding. Home has an
   `sr-only` H1, not a duplicate visible title or generic orientation sentence.
   View all vaults owns navigation without repeating its count; indexing remains in the global
@@ -575,6 +580,14 @@ an `sr-only` summary, never the only signal.
   Agent connections preserves three explicit phases, stacked in reading order:
   prepare access, configure, then try a read-only request. Never hide the final
   phase until token creation or offer a placeholder secret as usable config.
+  Quickstart and Settings share the same numbered, hairline-separated flow.
+  One tool choice leads into one access-method choice (supported browser sign-in,
+  new token, or saved token), rather than nested tool/auth/token selects.
+  Expiration and write restrictions remain under Advanced options, with the
+  reviewed permissions summary always visible before issuance. Keep the form
+  mounted across method changes; a hidden draft or uncertain result is not reset.
+  Quickstart keeps its header and close controls fixed while only setup content
+  scrolls. On narrow screens, step content uses the full available width.
   Below `md`, use a labelled section selector; below `sm`, fill the viewport.
   The workspace route, scroll position and sidebar preference stay unchanged.
   Sidebar, account menu, watched-document management and onboarding open this

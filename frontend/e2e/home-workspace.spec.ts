@@ -157,9 +157,8 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     }
     await connectionLauncher.click();
     const connection = page.getByRole("dialog", { name: "Connect an agent" });
-    await expect(connection.getByLabel("AI tool", { exact: true })).toBeVisible();
-    await connection.getByLabel("Access token", { exact: true }).click();
-    await page.getByRole("menuitemradio", { name: "Use a saved token" }).click();
+    await expect(connection.getByRole("group", { name: "AI tool", exact: true })).toBeVisible();
+    await connection.getByRole("radio", { name: "Use a saved token" }).locator("..").click();
     await connection.getByLabel("Full saved token").fill("akb_fixture_example_only");
     await expect(connection.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
     await expect(connection.getByText(/This browser cannot verify/)).toBeVisible();
@@ -199,7 +198,7 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await expect(page.getByRole("dialog", { name: "Settings", exact: true })).toBeVisible();
     await page.evaluate(value => document.documentElement.classList.toggle("dark", value), dark);
     await expect(page.getByRole("heading", { name: "Connect an agent" })).toBeVisible();
-    await expect(page.getByLabel("AI tool", { exact: true })).toBeVisible();
+    await expect(page.getByRole("group", { name: "AI tool", exact: true })).toBeVisible();
     await expect(page.getByTestId("account-settings-dialog")).toHaveCSS("background-color", dark ? "rgb(18, 24, 33)" : "rgb(255, 255, 255)");
     if (width >= 1024) {
       const expectedNavigation = dark ? "rgb(18, 24, 33)" : "rgb(255, 255, 255)";

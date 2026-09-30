@@ -249,7 +249,7 @@ describe("Home working set", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Connect an agent" }));
     expect(screen.getByRole("dialog", { name: "Connect an agent" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "1. Choose your tool" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toBeInTheDocument();
   });
 
   it("caps a large favorite set and restores focus if an unpinned card leaves Home", async () => {
