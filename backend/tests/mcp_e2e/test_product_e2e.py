@@ -106,7 +106,22 @@ async def _call_json(
                 f"scenario={SCENARIO} operation={operation}: expected an error envelope, got {state}"
             )
     elif result.is_error:
-        pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned an SDK error")
+        public_error = {
+            key: public[key]
+            for key in ("code", "error")
+            if isinstance(public.get(key), str)
+        }
+        if "error" not in public_error and isinstance(public.get("message"), str):
+            public_error["error"] = public["message"]
+        if public_error:
+            diagnostic = redact_error(
+                RuntimeError(json.dumps(public_error, ensure_ascii=False)),
+                runtime_session.secrets,
+            )[:400]
+            failure = f"tool returned an SDK error: {diagnostic}"
+        else:
+            failure = "tool returned an SDK error"
+        pytest.fail(f"scenario={SCENARIO} operation={operation}: {failure}")
     return public
 
 

@@ -1009,12 +1009,41 @@ export class AKBProxy {
         }),
       };
     } catch (err) {
+      const publicError = { error: err.message };
+      if (
+        Number.isInteger(err?.statusCode)
+        && err.statusCode >= 400
+        && err.statusCode < 500
+        && typeof err.body === "string"
+      ) {
+        try {
+          const payload = JSON.parse(err.body);
+          const message = typeof payload?.error === "string" ? payload.error : payload?.message;
+          if (
+            payload
+            && typeof payload === "object"
+            && !Array.isArray(payload)
+            && typeof payload.code === "string"
+            && typeof message === "string"
+          ) {
+            publicError.error = message;
+            publicError.code = payload.code;
+            for (const key of ["details", "hint"]) {
+              if (Object.prototype.hasOwnProperty.call(payload, key)) {
+                publicError[key] = payload[key];
+              }
+            }
+          }
+        } catch {
+          // Preserve the original HTTP error if the response is not a REST error envelope.
+        }
+      }
       return {
         jsonrpc: "2.0",
         id,
         result: this._clientResult({
           content: [
-            { type: "text", text: JSON.stringify({ error: err.message }) },
+            { type: "text", text: JSON.stringify(publicError) },
           ],
           isError: true,
         }),

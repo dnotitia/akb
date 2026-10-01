@@ -510,6 +510,51 @@ itAsync("proxy-local read attaches the guide to the successful result", async ()
   assert.deepEqual(body.vault_skill, guide);
 });
 
+itAsync("proxy-local file errors preserve the public REST error fields", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  proxy._fileToolSkillPreflight = async () => null;
+  const error = new Error("HTTP 409: stale version");
+  error.statusCode = 409;
+  error.body = JSON.stringify({
+    message: "content_hash moved: expected old, actual current",
+    error: "content_hash moved: expected old, actual current",
+    code: "conflict",
+    details: { expected: "old", actual: "current" },
+    hint: "Fetch the current file before retrying.",
+  });
+  proxy._updateFile = async () => { throw error; };
+
+  const response = await proxy._handleFileTool(9, {
+    name: "akb_update_file",
+    arguments: { uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555" },
+  });
+  assert.equal(response.result.isError, true);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), {
+    error: "content_hash moved: expected old, actual current",
+    code: "conflict",
+    details: { expected: "old", actual: "current" },
+    hint: "Fetch the current file before retrying.",
+  });
+});
+
+itAsync("proxy-local errors do not invent REST codes for unstructured failures", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  proxy._fileToolSkillPreflight = async () => null;
+  const error = new Error("HTTP 409: upstream connection reset");
+  error.statusCode = 409;
+  error.body = "upstream connection reset";
+  proxy._updateFile = async () => { throw error; };
+
+  const response = await proxy._handleFileTool(10, {
+    name: "akb_update_file",
+    arguments: { uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555" },
+  });
+  assert.equal(response.result.isError, true);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), {
+    error: "HTTP 409: upstream connection reset",
+  });
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 
 await Promise.all(pending);
