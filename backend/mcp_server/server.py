@@ -75,6 +75,7 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
 from mcp_server.tools import OPERATIONS, available_tools
+from mcp_server.input_validation import validate_tool_arguments
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -1761,7 +1762,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     recorded = False
     try:
         is_write = _required_scope(name) == _WRITE_SCOPE
-        result: dict | None = None
+        result: dict | None = validate_tool_arguments(name, arguments)
 
         # A guide cannot influence a write that has already committed.  For a
         # reader-authorized caller's first write (or the first write after the
@@ -1769,7 +1770,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
         preflight_version = _vault_skill_preflight_version()
-        if is_write and preflight_version is not None:
+        if result is None and is_write and preflight_version is not None:
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service
@@ -2003,6 +2004,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 f"Unknown argument '{bad}' for {name}",
                 code=UNKNOWN_ARGUMENT,
                 hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
+                field=bad,
                 available_arguments=sorted(allowed),
             )
 
