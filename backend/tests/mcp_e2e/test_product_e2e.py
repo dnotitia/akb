@@ -39,8 +39,10 @@ async def _call_json(
     expect_error: bool = False,
 ) -> dict[str, Any]:
     operation = f"tools/call {name}"
+    request_name = name
+    request_arguments = arguments
     try:
-        result = await client.call_tool(name, arguments)
+        result = await client.call_tool(request_name, request_arguments)
     except Exception as exc:
         pytest.fail(f"scenario={SCENARIO} operation={operation}: {redact_error(exc, runtime_session.secrets)}")
 
@@ -50,6 +52,48 @@ async def _call_json(
         pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned invalid public JSON: {exc}")
     if not isinstance(public, dict):
         pytest.fail(f"scenario={SCENARIO} operation={operation}: public result is not an object")
+
+    if public.get("code") == "vault_skill_required":
+        skill = public.get("vault_skill")
+        if (
+            result.is_error is not True
+            or not isinstance(skill, dict)
+            or not isinstance(skill.get("body"), str)
+            or not skill["body"].strip()
+            or not isinstance(skill.get("ack_token"), str)
+            or not skill["ack_token"]
+        ):
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "vault-skill challenge omitted its error, guide, or acknowledgement"
+            )
+        # The proxy binds its acknowledgement to this exact tool name and
+        # argument set. Retrying these unchanged inputs lets that bridge add
+        # its one-use acknowledgement without changing the operation or scope.
+        try:
+            result = await client.call_tool(request_name, request_arguments)
+        except Exception as exc:
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                f"{redact_error(exc, runtime_session.secrets)}"
+            )
+        try:
+            public = json.loads(_text_content(result, operation))
+        except (TypeError, ValueError) as exc:
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                f"retry returned invalid public JSON: {exc}"
+            )
+        if not isinstance(public, dict):
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "retry public result is not an object"
+            )
+        if public.get("code") == "vault_skill_required":
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "unchanged retry repeated the vault-skill challenge"
+            )
 
     # The HTTP MCP backend returns product failures as a JSON error envelope;
     # the SDK's is_error flag is not guaranteed to mirror that application
