@@ -72,11 +72,9 @@ _GENESIS = "0" * 64
 # was listed here while mapped write-grade, so with `log_reads` off it
 # wrote an S3 snapshot and flipped a publication's mode with no audit line.
 #
-# Tool-level membership is not sufficient on its own: `akb_grep` is a read
-# tool whose `replace` argument rewrites every matching document. The
-# caller therefore passes `is_write`, computed by the same
-# `_required_scope` that gates the call, so an argument-driven write is
-# recorded even though the tool name sits in this set.
+# Exact search is read-only; replacement has its own write-scoped operation.
+# The caller still passes `is_write` from the same scope map that gates the
+# operation, so a newly added write can never be hidden by `log_reads=false`.
 _READ_ONLY_TOOLS = frozenset({
     "akb_get", "akb_search", "akb_browse", "akb_drill_down", "akb_grep",
     "akb_graph", "akb_relations", "akb_history", "akb_diff", "akb_activity",
@@ -345,7 +343,7 @@ def _target_of(args: dict) -> str | None:
 
 
 def _grep_replace_meta(args: dict, result) -> dict | None:
-    """Bounded summary for the argument-driven ``akb_grep`` write mode."""
+    """Bounded summary for the explicit ``akb_grep_replace`` operation."""
     if args.get("replace") is None or not isinstance(result, dict):
         return None
     return {
@@ -433,7 +431,7 @@ def record_tool(
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
         outcome = "error"
         code = result.get("code")
-    if name == "akb_grep" and is_write:
+    if name == "akb_grep_replace" and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
     audit_meta: dict[str, Any] = dict(protocol or {})
     if name in {"akb_grant", "akb_revoke"}:
@@ -456,7 +454,7 @@ def record_tool(
                 "applied": result.get("applied"),
             })
         audit_meta["access"] = access_meta
-    if name == "akb_grep" and is_write:
+    if name == "akb_grep_replace" and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
         action=name,

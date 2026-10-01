@@ -502,29 +502,37 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
             _HANDLERS.pop("akb_search", None)
 
 
-# ── akb_grep: scope depends on the arguments, not just the tool ────
-#
-# Rationale lives with the rule, at `_ARG_WRITE_TRIGGERS` in server.py.
+# ── akb_grep and akb_grep_replace have separate scopes ────────────
 
 
 @pytest.mark.asyncio
-async def test_grep_with_replace_is_refused_for_read_only_oauth_caller():
+async def test_grep_rejects_replacement_arguments():
     from mcp_server.server import _dispatch, _MCPUser
 
     user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
     result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user)
-    assert result.get("code") == "insufficient_scope"
-    assert result.get("details", {}).get("required_scope") == "akb:vault:write"
+    assert result.get("code") == "unknown_argument"
+    assert "replace" not in result.get("details", {}).get("available_arguments", [])
 
 
 @pytest.mark.asyncio
-async def test_grep_with_replace_is_refused_for_read_only_pat():
+async def test_grep_replace_is_refused_for_read_only_oauth_caller():
     from mcp_server.server import _dispatch, _MCPUser
 
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user)
+    result = await _dispatch("akb_grep_replace", {"vault": "v", "pattern": "x", "replace": "y"}, user)
     assert result.get("code") == "insufficient_scope"
     assert result.get("details", {}).get("required_scope") == "write"
+
+
+@pytest.mark.asyncio
+async def test_grep_replace_is_refused_for_read_only_oauth_token():
+    from mcp_server.server import _dispatch, _MCPUser
+
+    user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
+    result = await _dispatch("akb_grep_replace", {"vault": "v", "pattern": "x", "replace": "y"}, user)
+    assert result.get("code") == "insufficient_scope"
+    assert result.get("details", {}).get("required_scope") == "akb:vault:write"
 
 
 @pytest.mark.asyncio
@@ -557,36 +565,18 @@ async def test_grep_with_replace_passes_when_write_scope_present(monkeypatch):
         called.append(args)
         return {"ok": True}
 
-    monkeypatch.setitem(_HANDLERS, "akb_grep", _stub)
+    monkeypatch.setitem(_HANDLERS, "akb_grep_replace", _stub)
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read", "write"}))
     args = {"vault": "v", "pattern": "x", "replace": "y"}
-    assert await _dispatch("akb_grep", args, user) == {"ok": True}
+    assert await _dispatch("akb_grep_replace", args, user) == {"ok": True}
     assert called == [args]
 
 
-def test_arg_sensitive_scope_rule_is_declared_not_hardcoded_in_dispatch():
-    """The rule must live in one reviewable place so the next tool that
-    grows a mutating argument has somewhere obvious to declare it."""
-    from mcp_server.server import _WRITE_SCOPE, _required_scope
+def test_grep_scope_is_static_and_operation_specific():
+    from mcp_server.server import _READ_SCOPE, _WRITE_SCOPE, _required_scope
 
-    assert _required_scope("akb_grep", {"pattern": "x"}) != _WRITE_SCOPE
-    assert _required_scope("akb_grep", {"pattern": "x", "replace": ""}) == _WRITE_SCOPE
-
-
-def test_every_arg_write_trigger_names_a_real_tool_argument():
-    """A typo in a trigger name would silently disable the promotion —
-    the failure mode this whole block exists to prevent. Checked against
-    `_TOOL_ARG_NAMES`, which is the same schema-derived table `_dispatch`
-    rejects unknown arguments with, so a trigger can never name an
-    argument the dispatcher would refuse anyway."""
-    from mcp_server.server import _ARG_WRITE_TRIGGERS, _TOOL_ARG_NAMES
-
-    for tool, triggers in _ARG_WRITE_TRIGGERS.items():
-        assert tool in _TOOL_ARG_NAMES, f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
-        for arg in triggers:
-            assert arg in _TOOL_ARG_NAMES[tool], (
-                f"_ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, which is not an argument of {tool}"
-            )
+    assert _required_scope("akb_grep") == _READ_SCOPE
+    assert _required_scope("akb_grep_replace") == _WRITE_SCOPE
 
 
 def _handler_can_write(handler) -> bool:
@@ -626,42 +616,27 @@ def _handler_can_write(handler) -> bool:
 def test_the_omission_guard_itself_is_not_vacuous():
     """`_handler_can_write` is the whole force of the guard below, and a
     silently-broken predicate would make it pass forever. Pin it against
-    the one handler known to write."""
-    from mcp_server.server import _HANDLERS
+    the shared implementation that contains the writer gate."""
+    from mcp_server.server import _HANDLERS, _run_grep
 
-    assert _handler_can_write(_HANDLERS["akb_grep"]) is True
+    assert _handler_can_write(_run_grep) is True
+    assert _handler_can_write(_HANDLERS["akb_grep_replace"]) is False
+    assert _handler_can_write(_HANDLERS["akb_grep"]) is False
     assert _handler_can_write(_HANDLERS["akb_search"]) is False
 
 
-def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
-    """The omission guard — the failure mode that actually recurs.
-
-    `_TOOL_SCOPES` has a completeness guard (a new tool must be mapped);
-    `_ARG_WRITE_TRIGGERS` needs the mirror of it, or the next read-mapped
-    tool that grows a mutating argument reproduces this bug silently.
-
-    The invariant is checkable against code that already exists: a
-    handler that can reach a writer-gated `check_vault_access` performs a
-    write, so its tool cannot be read-grade unless an argument promotes
-    it.
-    """
-    from mcp_server.server import (
-        _ARG_WRITE_TRIGGERS,
-        _HANDLERS,
-        _READ_SCOPE,
-        _TOOL_SCOPES,
-    )
+def test_read_scoped_operations_do_not_call_writer_gates():
+    """A write handler must use a write-scoped operation name."""
+    from mcp_server.server import _HANDLERS, _READ_SCOPE, _TOOL_SCOPES
 
     offenders = sorted(
         name
         for name, handler in _HANDLERS.items()
-        if _TOOL_SCOPES.get(name) == _READ_SCOPE and name not in _ARG_WRITE_TRIGGERS and _handler_can_write(handler)
+        if _TOOL_SCOPES.get(name) == _READ_SCOPE and _handler_can_write(handler)
     )
     assert offenders == [], (
-        f"Read-scoped tools whose handler performs a writer-gated write, with no "
-        f"_ARG_WRITE_TRIGGERS entry: {offenders}. Either the tool belongs in the "
-        f"write half of _TOOL_SCOPES, or the argument that makes it write must be "
-        f"declared in _ARG_WRITE_TRIGGERS."
+        f"Read-scoped tools with a writer-gated handler: {offenders}. "
+        "Move each write to its own write-scoped operation."
     )
 
 

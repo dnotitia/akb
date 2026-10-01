@@ -62,19 +62,21 @@ async def test_mcp_filters_and_write_acl(monkeypatch):
     monkeypatch.setattr(module, "check_vault_access", check)
     monkeypatch.setattr(module.search_service, "grep", grep)
     user = module._MCPUser(user_id="u", username="alice")
-    filters = dict(vault=["a", "b"], doc_types=["note"], tags=["todo"],
+    filters = dict(vault="a", doc_types=["note"], tags=["todo"],
                    include_archived=False, archive_scope="unarchived", include_text_files=False)
-    await module._handle_grep({"pattern": "x", "replace": "y", **filters}, "u", user)
+    await module._handle_grep_replace({"pattern": "x", "replace": "y", **filters}, "u", user)
     assert [(c.args[1], c.kwargs["required_role"]) for c in check.call_args_list] == [
-        ("a", "writer"), ("b", "writer"),
+        ("a", "writer"),
     ]
     for key, value in filters.items():
         assert grep.call_args.kwargs[key] == value
     assert grep.call_args.kwargs["measurement_include_text_files"] is None
     grep.reset_mock()
-    check.side_effect = [None, PermissionError("denied")]
+    check.side_effect = PermissionError("denied")
     with pytest.raises(PermissionError):
-        await module._handle_grep({"pattern": "x", "replace": "y", "vault": ["a", "b"]}, "u", user)
+        await module._handle_grep_replace(
+            {"pattern": "x", "replace": "y", "vault": "a"}, "u", user
+        )
     grep.assert_not_called()
 
 
@@ -85,8 +87,27 @@ async def test_mcp_empty_write_scope(monkeypatch, vault):
     grep = AsyncMock()
     monkeypatch.setattr(module.search_service, "grep", grep)
     user = module._MCPUser(user_id="u", username="alice")
-    result = await module._handle_grep({"pattern": "x", "replace": "y", "vault": vault}, "u", user)
-    assert "vault is required" in str(result)
+    result = await module._handle_grep_replace(
+        {"pattern": "x", "replace": "y", "vault": vault}, "u", user
+    )
+    assert "vault must name one vault" in str(result)
+    grep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_grep_replace_requires_string_replacement(monkeypatch):
+    import mcp_server.server as module
+
+    grep = AsyncMock()
+    monkeypatch.setattr(module.search_service, "grep", grep)
+    user = module._MCPUser(user_id="u", username="alice")
+
+    result = await module._handle_grep_replace(
+        {"pattern": "x", "vault": "a", "replace": None}, "u", user
+    )
+
+    assert result["code"] == "invalid_argument"
+    assert result["details"]["field"] == "replace"
     grep.assert_not_called()
 
 

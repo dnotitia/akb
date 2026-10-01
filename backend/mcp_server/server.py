@@ -74,7 +74,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import TOOLS, available_tools
+from mcp_server.tools import OPERATIONS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -315,6 +315,7 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_get": _READ_SCOPE,
     "akb_search": _READ_SCOPE,
     "akb_grep": _READ_SCOPE,
+    "akb_grep_replace": _WRITE_SCOPE,
     "akb_drill_down": _READ_SCOPE,
     "akb_activity": _READ_SCOPE,
     "akb_diff": _READ_SCOPE,
@@ -351,29 +352,6 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_import": _WRITE_SCOPE,
 }
 
-# Arguments that promote an otherwise read-grade tool to write-grade.
-#
-# `_TOOL_SCOPES` classifies a tool as a whole, which cannot express a
-# read tool that carries an optional mutating argument. `akb_grep` is
-# exactly that: a search tool whose `replace` rewrites EVERY matching
-# document across the scope (git commit + re-index per doc). Mapped flat
-# as read, a read-scoped token passed the gate and reached the rewrite.
-#
-# That was never privilege escalation — `_handle_grep` still requires
-# `check_vault_access(required_role="writer")` — but it defeated the
-# reason read-only tokens exist: handing an agent a read PAT is supposed
-# to mean it cannot change anything, and for a caller who *is* a vault
-# writer it did not.
-#
-# Declared here rather than branched inside `_dispatch` so the next tool
-# that grows a mutating argument has one obvious place to say so, and so
-# a test can assert every trigger names a real argument of that tool (a
-# typo would silently un-promote it — the exact failure this prevents).
-_ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
-    "akb_grep": ("replace",),
-}
-
-
 async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     """Does this credential have READ authority on `vault`?
 
@@ -400,27 +378,16 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     return True
 
 
-def _required_scope(name: str, args: dict) -> str:
-    """Scope a call needs: the tool's mapping, promoted to write when the
-    call carries a mutating argument.
-
-    Unmapped tools fail CLOSED to write (see `_dispatch`). A trigger
-    counts only when the argument is actually present and not None —
-    `replace=""` IS a rewrite (it deletes every match), so emptiness must
-    not be mistaken for absence.
-    """
-    if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
-        return _WRITE_SCOPE
+def _required_scope(name: str) -> str:
+    """Return the explicit tool scope; unmapped calls fail closed to write."""
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
 
 
-# Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
-# to reject unknown arguments with a fuzzy hint. Built once at import
-# time from the same TOOLS list returned via list_tools, so the
-# "what the agent saw" and "what we accept" can't drift.
+# Operation schemas are the source of accepted argument names. The public
+# catalog is projected from these operations, so exposed and accepted fields
+# stay in sync.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
-    t.name: set((t.input_schema or {}).get("properties", {}).keys())
-    for t in TOOLS
+    t.name: set((t.input_schema or {}).get("properties", {}).keys()) for t in OPERATIONS
 }
 
 
@@ -873,20 +840,31 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
     return result.model_dump()
 
 
-@_h("akb_grep")
-async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
+async def _run_grep(
+    args: dict,
+    uid: str,
+    user: _MCPUser,
+    *,
+    replacement: str | None,
+) -> dict:
     from app.services.search_service import _normalize_vault_scope
 
     vaults = _normalize_vault_scope(args.get("vault"))
-    replace = args.get("replace")
-    if replace is not None and not vaults:
-        return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    is_write = replacement is not None
+    if is_write and (not isinstance(args.get("vault"), str) or not vaults):
+        return err(
+            "vault must name one vault when using akb_grep_replace",
+            code=INVALID_ARGUMENT,
+            field="vault",
+            expected_type="string",
+            hint="Provide one explicit vault name.",
+        )
     limit = args.get("limit", 20)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
         return err("limit must be between 1 and 50", code=INVALID_ARGUMENT)
     for vault in dict.fromkeys(vaults or []):
         await check_vault_access(
-            uid, vault, required_role="writer" if replace is not None else "reader",
+            uid, vault, required_role="writer" if is_write else "reader",
         )
     result = await search_service.grep(
         pattern=args["pattern"],
@@ -894,9 +872,9 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         collection=args.get("collection"),
         regex=args.get("regex", False),
         case_sensitive=args.get("case_sensitive", False),
-        replace=replace,
-        doc_service=doc_service if replace is not None else None,
-        agent_id=user.username if replace is not None else None,
+        replace=replacement,
+        doc_service=doc_service if is_write else None,
+        agent_id=user.username if is_write else None,
         user_id=uid,
         limit=limit,
         max_replacements=args.get("max_replacements", DEFAULT_MAX_REPLACEMENTS),
@@ -912,6 +890,24 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         archive_scope=args.get("archive_scope"),
     )
     return result
+
+
+@_h("akb_grep")
+async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
+    return await _run_grep(args, uid, user, replacement=None)
+
+
+@_h("akb_grep_replace")
+async def _handle_grep_replace(args: dict, uid: str, user: _MCPUser) -> dict:
+    replacement = args.get("replace")
+    if not isinstance(replacement, str):
+        return err(
+            "replace must be a string",
+            code=INVALID_ARGUMENT,
+            field="replace",
+            expected_type="string",
+        )
+    return await _run_grep(args, uid, user, replacement=replacement)
 
 
 @_h("akb_drill_down")
@@ -1670,10 +1666,7 @@ async def list_tools():
     # clients keep the byte-for-byte schemas they already understand.
     decorated = []
     for tool in tools:
-        may_write = (
-            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
-            or tool.name in _ARG_WRITE_TRIGGERS
-        )
+        may_write = _required_scope(tool.name) == _WRITE_SCOPE
         if not may_write:
             decorated.append(tool)
             continue
@@ -1767,7 +1760,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+        is_write = _required_scope(name) == _WRITE_SCOPE
         result: dict | None = None
 
         # A guide cannot influence a write that has already committed.  For a
@@ -1903,7 +1896,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # success path did not already record this invocation (a response-encode
         # failure lands here after a handler that actually succeeded).
         if not recorded:
-            is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+            is_write = _required_scope(name) == _WRITE_SCOPE
             audit_log.record_tool(
                 name, arguments, user, envelope, is_write=is_write, protocol=protocol
             )
@@ -1977,7 +1970,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # A test in `test_mcp_oauth_unit` asserts every registered handler
     # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _required_scope(name, args)
+        required = _required_scope(name)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -1986,7 +1979,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _required_scope(name, args)
+        required = _required_scope(name)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(

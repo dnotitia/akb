@@ -84,6 +84,19 @@ def test_tools_and_handlers_are_in_sync():
     )
 
 
+def test_flat_catalog_separates_read_grep_and_replacement():
+    tools = {tool.name: tool for tool in TOOLS}
+    assert len(tools) == 45
+    assert "akb_grep_replace" in tools
+
+    read_grep = tools["akb_grep"].input_schema["properties"]
+    write_grep = tools["akb_grep_replace"].input_schema["properties"]
+    assert "replace" not in read_grep
+    assert "max_replacements" not in read_grep
+    assert {"pattern", "replace", "vault"} <= write_grep.keys()
+    assert "vault" in tools["akb_grep_replace"].input_schema["required"]
+
+
 def test_relation_tool_descriptions_match_the_vault_boundary():
     tools = {tool.name: tool for tool in TOOLS}
 

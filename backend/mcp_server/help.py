@@ -173,17 +173,17 @@ akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="n
 
     "search": """# Search & Discovery
 
-## akb_grep — Exact Text Search & Replace
+## akb_grep — Exact Text Search
 Find exact strings or regex patterns across documents. Use when you need precision, not meaning.
-Add `replace` to find-and-replace across all matching documents in one call.
-`limit` controls only the returned preview; `max_replacements` is the separate
-write budget and rejects the call before any write when the scope is larger.
+For bulk replacement, use the separate writer operation `akb_grep_replace`.
+`limit` controls only the returned preview; `max_replacements` on the writer
+operation is a separate budget checked before any document changes.
 
 ```
 akb_grep(pattern="PostgreSQL 14")                                      # Find exact string
 akb_grep(pattern="api/v1/.*users", regex=true, vault="eng")           # Regex search
 akb_grep(pattern="TODO", collection="specs")                           # Search in collection
-akb_grep(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16") # Find & replace
+akb_grep_replace(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16") # Find & replace
 ```
 
 ## akb_search — Hybrid Search
@@ -823,7 +823,7 @@ akb_edit(uri="akb://eng/doc/notes/notes.md",
   message="Upgrade Postgres version")
 ```
 
-💡 Tip: for whole-document rewrites use akb_update; for find-and-replace across many documents use akb_grep with `replace`.""",
+💡 Tip: for whole-document rewrites use akb_update; for find-and-replace across many documents use akb_grep_replace.""",
 
     "akb_browse": """# akb_browse — Browse ALL Vault Content
 
@@ -878,25 +878,23 @@ akb_search(query="budget", tags=["finance"], limit=5)
 - `source_type`: `"document"`, `"table"`, or `"file"`
 - `vault`, `collection`, `type`, `tags`: metadata""",
 
-    "akb_grep": """# akb_grep — Exact Text / Regex Search & Replace
+    "akb_grep": """# akb_grep — Exact Text / Regex Search
 
 Find exact strings or regex patterns across document content.
 Unlike akb_search (semantic), this finds **exact matches** — use it for
 specific terms, URLs, code snippets, version numbers, error codes, etc.
 
-Optionally pass `replace` to find-and-replace across all matching documents.
+For bulk replacement, use the separate writer operation `akb_grep_replace`.
 
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
 | pattern | ✓ | Non-empty text or regex to search for |
-| vault | | Limit to a specific vault (required for replace) |
+| vault | | Limit to a specific vault |
 | collection | | Limit to a specific collection |
 | regex | | Treat pattern as regex (default: false) |
 | case_sensitive | | Case-sensitive match (default: false) |
-| replace | | Replacement string — literal unless `regex=true`, which enables backreferences |
-| limit | | Max documents to return (default 20; does not limit writes) |
-| max_replacements | | Replace write budget (default 50, maximum 1000); larger scopes fail before writing |
+| limit | | Max documents to return (default 20) |
 | count_only | | Return exact per-resource counts without snippets |
 | measurement_include_text_files | | Native mode: include admitted searchable text Files; binary Files stay excluded |
 
@@ -920,14 +918,14 @@ akb_grep(pattern="Bearer", case_sensitive=true)
 ## Replace Examples
 ```
 # Simple text replace across a vault
-akb_grep(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16")
+akb_grep_replace(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16")
 
 # Regex replace with capture groups
-akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
+akb_grep_replace(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 ```
 
-**Tip:** Run grep WITHOUT replace first to preview matches, then add replace with
-`max_replacements` set high enough for the intended scope.
+`akb_grep_replace` requires one explicit vault and writer access. Run `akb_grep`
+first to preview matches, then set `max_replacements` high enough for the intended scope.
 Each replaced document gets its own git commit and is re-indexed for search.
 
 ## Result Structure
@@ -939,7 +937,13 @@ also carries `payload_placement` — which body placement the matched bytes were
 read from; it names a storage strategy, never an address. If snippets hit
 response safety bounds,
 `truncated` is true and `truncation` reports the applied match/byte limits.
-When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
+The replacement operation also includes `replaced_docs` count and a `replacements` list.""",
+
+    "akb_grep_replace": """# akb_grep_replace — Bulk Exact Text / Regex Replacement
+
+Replace exact strings or regex matches in documents from exactly one vault. Requires writer access.
+The full match set is checked against `max_replacements` before any document changes.
+See `akb_help(topic="akb_grep")` for search behavior and replacement examples.""",
 
     "akb_drill_down": """# akb_drill_down — Section-Level Reader
 

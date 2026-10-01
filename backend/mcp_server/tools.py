@@ -32,6 +32,8 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
+from copy import deepcopy
+
 from mcp.types import Tool
 
 from app.services import template_registry
@@ -69,7 +71,7 @@ _COLUMN_DESCRIPTION_FIELD = {
 }
 
 
-TOOLS = [
+_SOURCE_TOOLS = [
     Tool(
         name="akb_list_vaults",
         description=(
@@ -254,7 +256,7 @@ TOOLS = [
             "If old_string is not found or appears multiple times, the call fails with a clear error. "
             "Use this for inserting, replacing, or removing an inline image without "
             "resending the complete document body. For find-and-replace across many "
-            "documents, use akb_grep with replace instead."
+            "documents, use akb_grep_replace instead."
         ),
         input_schema={
             "type": "object",
@@ -1414,6 +1416,57 @@ TOOLS = [
         },
     ),
 ]
+
+
+def _split_grep_operation(source_tools: list[Tool]) -> list[Tool]:
+    """Expose exact search and bulk replacement as separate operations."""
+    result: list[Tool] = []
+    for tool in source_tools:
+        if tool.name != "akb_grep":
+            result.append(tool)
+            continue
+
+        read_schema = deepcopy(tool.input_schema)
+        read_properties = read_schema["properties"]
+        read_properties.pop("replace")
+        read_properties.pop("max_replacements")
+        result.append(
+            Tool(
+                name="akb_grep",
+                description=(
+                    "Read-only exact text or regex search across accessible documents. "
+                    "Returns canonical resource URIs, matched text, and revision details. "
+                    "For replacements, use the separate writer operation `akb_grep_replace`."
+                ),
+                input_schema=read_schema,
+            )
+        )
+
+        write_schema = deepcopy(tool.input_schema)
+        write_properties = write_schema["properties"]
+        write_properties["vault"] = {
+            "type": "string",
+            "minLength": 1,
+            "description": "One explicit vault to search and update. Required.",
+        }
+        write_schema["required"] = ["pattern", "replace", "vault"]
+        result.append(
+            Tool(
+                name="akb_grep_replace",
+                description=(
+                    "Replace exact text or regex matches in documents in one explicit vault. "
+                    "Requires writer access. The full match set is checked against "
+                    "`max_replacements` before any document changes; results include each "
+                    "canonical URI and its new and previous revision."
+                ),
+                input_schema=write_schema,
+            )
+        )
+    return result
+
+
+OPERATIONS = _split_grep_operation(_SOURCE_TOOLS)
+TOOLS = OPERATIONS
 
 
 def available_tools() -> list[Tool]:

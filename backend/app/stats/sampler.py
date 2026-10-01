@@ -178,7 +178,7 @@ async def _activity_counts(conn, window_start: datetime, window_end: datetime):
 
     The read/write split is NOT re-derived here. `tool_calls.is_write` is
     written at the MCP dispatch chokepoint from the tool's required scope
-    (``mcp_server/server.py``: ``_required_scope(name, arguments) ==
+    (``mcp_server/server.py``: ``_required_scope(name) ==
     _WRITE_SCOPE``), which is the same classification that decides whether the
     call is allowed to mutate anything. A second opinion — a list of tool names
     kept here — would drift from it silently the first time a tool is added.

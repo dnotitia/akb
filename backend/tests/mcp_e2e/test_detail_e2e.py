@@ -668,7 +668,7 @@ async def test_unicode_graph_grep_and_ownership(
     budget = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
+        "akb_grep_replace",
         {
             "pattern": "OLD_PLACEHOLDER",
             "vault": vault,
@@ -685,7 +685,7 @@ async def test_unicode_graph_grep_and_ownership(
     replacement = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
+        "akb_grep_replace",
         {
             "pattern": "OLD_PLACEHOLDER",
             "vault": vault,
@@ -730,7 +730,7 @@ async def test_unicode_graph_grep_and_ownership(
     regex_replacement = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_grep",
+        "akb_grep_replace",
         {
             "pattern": r"v(\d+)\.(\d+)\.(\d+)",
             "regex": True,
