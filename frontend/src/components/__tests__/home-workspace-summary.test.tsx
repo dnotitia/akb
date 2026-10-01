@@ -13,8 +13,8 @@ const clients: QueryClient[] = [];
 function setup() {
   const client = new QueryClient();
   clients.push(client);
-  const tree = (userId = "user-a", vaultCount: number | undefined = 20, directoryLoading = false) => <QueryClientProvider client={client}>
-    <HomeWorkspaceSummary userId={userId} directoryKey={userId} vaultCount={vaultCount} directoryLoading={directoryLoading} />
+  const tree = (userId = "user-a", vaultCount: number | undefined = 20, directoryLoading = false, accessChecking = false, accessKey = "0") => <QueryClientProvider client={client}>
+    <HomeWorkspaceSummary userId={userId} accessKey={accessKey} accessChecking={accessChecking} vaultCount={vaultCount} directoryLoading={directoryLoading} />
   </QueryClientProvider>;
   return { client, tree };
 }
@@ -58,16 +58,57 @@ describe("Home cardless workspace summary", () => {
     expect(screen.getAllByRole("definition")).toHaveLength(1);
     expect(screen.queryByText("Totals unavailable")).not.toBeInTheDocument();
   });
-  it("does not read summary or claim zero while directory scope is unknown", async () => {
+  it("does not read summary or claim zero before identity verification", async () => {
     const { tree } = setup();
-    const view = render(tree("user-a", undefined, true));
+    const view = render(tree("user-a", undefined, true, true));
     expect(screen.getByRole("status", { name: "Loading workspace totals" })).toBeInTheDocument();
     expect(getWorkspaceSummary).not.toHaveBeenCalled();
     // Explicit undefined through props, bypassing the helper's default argument.
-    view.rerender(<QueryClientProvider client={clients[0]}><HomeWorkspaceSummary userId="user-a" directoryKey="none" vaultCount={undefined} directoryLoading={false} /></QueryClientProvider>);
+    view.rerender(<QueryClientProvider client={clients[0]}><HomeWorkspaceSummary userId="" accessKey="none" accessChecking={false} vaultCount={undefined} directoryLoading={false} /></QueryClientProvider>);
     expect(screen.getByText("Totals unavailable")).toBeInTheDocument();
     expect(screen.getAllByLabelText("Unavailable")).toHaveLength(4);
     expect(getWorkspaceSummary).not.toHaveBeenCalled();
+  });
+  it("reads the independently scoped summary before the directory and never restarts on its completion", async () => {
+    const { tree } = setup();
+    const view = render(tree("user-a", undefined, true));
+    expect(await screen.findByText("8,001")).toBeInTheDocument();
+    expect(screen.getAllByRole("definition")).toHaveLength(4);
+    expect(screen.queryByRole("status", { name: "Loading workspace totals" })).not.toBeInTheDocument();
+    view.rerender(tree("user-a", 20, false));
+    expect(getWorkspaceSummary).toHaveBeenCalledTimes(1);
+  });
+  it("exposes the verified Vault count to assistive technology while the resource counts are pending", async () => {
+    let finish!: (value: WorkspaceSummary) => void;
+    vi.mocked(getWorkspaceSummary).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const { tree } = setup();
+    render(tree());
+    expect(screen.getByText("20")).toBeInTheDocument();
+    expect(screen.getAllByRole("definition")).toHaveLength(4);
+    expect(screen.getAllByLabelText("Loading")).toHaveLength(3);
+    expect(screen.getByRole("status", { name: "Loading workspace totals" })).toBeInTheDocument();
+    expect(screen.queryByText("0")).not.toBeInTheDocument();
+    expect(screen.queryByText("Totals unavailable")).not.toBeInTheDocument();
+    await waitFor(() => expect(getWorkspaceSummary).toHaveBeenCalledTimes(1));
+    await act(async () => finish(sample));
+    expect(await screen.findByText("8,001")).toBeInTheDocument();
+  });
+  it("clears previous totals during foreground proof and uses a new access epoch for an unchanged account", async () => {
+    let finish!: (value: WorkspaceSummary) => void;
+    const { tree } = setup();
+    const view = render(tree());
+    await screen.findByText("8,001");
+    view.rerender(tree("user-a", 20, false, true));
+    expect(screen.queryByText("8,001")).not.toBeInTheDocument();
+    expect(screen.queryByText("20")).not.toBeInTheDocument();
+    expect(getWorkspaceSummary).toHaveBeenCalledTimes(1);
+    vi.mocked(getWorkspaceSummary).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    view.rerender(tree("user-a", 20, true, false, "1"));
+    await waitFor(() => expect(getWorkspaceSummary).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("8,001")).not.toBeInTheDocument();
+    await act(async () => finish({ ...sample, vault_count: 2, document_count: 7 }));
+    expect(await screen.findByText("7")).toBeInTheDocument();
+    expect(screen.queryByText("8,001")).not.toBeInTheDocument();
   });
   it("does not use directory fallback after an explicit access denial", async () => {
     vi.mocked(getWorkspaceSummary).mockRejectedValue(new WorkspaceSummaryAccessDenied());

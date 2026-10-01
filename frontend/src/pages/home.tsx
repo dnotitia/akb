@@ -41,6 +41,7 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [directoryRevision, setDirectoryRevision] = useState(-1);
+  const [summaryRevision, setSummaryRevision] = useState(0);
   const [metrics, setMetrics] = useState<Record<string, VaultMetrics>>({});
   const [metricsDone, setMetricsDone] = useState<Set<string>>(new Set());
   const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
@@ -68,6 +69,13 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       if (request === generation.current) setLoading(false);
     }
   }, [accessRevision]);
+
+  function refreshVaults() {
+    // Explicit retries/mutations refresh both independently scoped snapshots.
+    // Initial directory completion must not restart the already running total.
+    setSummaryRevision(revision => revision + 1);
+    void loadVaults();
+  }
 
   useEffect(() => {
     const requests = generation;
@@ -147,11 +155,10 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
   }
 
   const noVaults = !loading && !error && vaults.length === 0;
-  const directoryKey = `${accessRevision}:${JSON.stringify(vaults.map(vault => vault.id).sort())}`;
   const verifyingDirectory = accessChecking || loading || (!error && directoryRevision !== accessRevision);
 
   return <><h1 className="sr-only">Home</h1>
-    <HomeWorkspaceSummary userId={userId} directoryKey={directoryKey} vaultCount={!verifyingDirectory && !error ? vaults.length : undefined} directoryLoading={verifyingDirectory} />
+    <HomeWorkspaceSummary userId={userId} accessKey={`${accessRevision}:${summaryRevision}`} accessChecking={accessChecking} vaultCount={!verifyingDirectory && !error ? vaults.length : undefined} directoryLoading={verifyingDirectory} />
     <div className="w-full space-y-7 pb-[calc(5rem+env(safe-area-inset-bottom))] lg:space-y-8">
 
     {recentlyViewed.length > 0 && <section aria-labelledby="home-viewed-heading">
@@ -167,14 +174,14 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       </Link></div>} />
       {loading && vaults.length === 0 ? <LoadingState label="Loading your vaults"><div className={cardGrid}>
         {Array.from({ length: 4 }, (_, i) => <Panel key={i} className="min-h-36 space-y-4 p-4"><div className="h-5 w-2/3 rounded bg-surface-2" /><div className="h-9 rounded bg-surface-2" /><div className="h-4 w-1/2 rounded bg-surface-2" /></Panel>)}
-      </div></LoadingState> : error && vaults.length === 0 ? <Alert><p>Could not load your vaults.</p><Button variant="link" onClick={loadVaults}>Retry</Button></Alert> : noVaults ? <Panel className="p-6 sm:p-8">
+      </div></LoadingState> : error && vaults.length === 0 ? <Alert><p>Could not load your vaults.</p><Button variant="link" onClick={refreshVaults}>Retry</Button></Alert> : noVaults ? <Panel className="p-6 sm:p-8">
         <FolderPlus className="mb-4 h-6 w-6 text-link" aria-hidden />
         <h3 className="text-lg font-semibold">Create your first vault</h3>
         <p className="mt-2 max-w-xl text-sm leading-relaxed text-foreground-muted">A vault keeps related documents, tables, and files together. You can invite your team after creating it.</p>
         <Button ref={createTrigger} variant="accent" className="mt-5" onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" aria-hidden />Create a vault</Button>
         <p className="mt-4 text-sm text-foreground-muted">Joining an existing team? Ask a vault owner to invite you.</p>
       </Panel> : <>
-        {error && <Alert className="mb-4">Could not refresh your vaults. <Button variant="link" onClick={loadVaults}>Retry</Button></Alert>}
+        {error && <Alert className="mb-4">Could not refresh your vaults. <Button variant="link" onClick={refreshVaults}>Retry</Button></Alert>}
         <ul className={cardGrid}>{previewVaults.map(vault => <li key={vault.id} className="min-w-0">
           <HomeVaultCard vault={vault} metrics={metrics[vault.name]} metricsReady={metricsDone.has(vault.name)} favorite={isFavorite(vault.id)} onToggleFavorite={() => toggleVaultFavorite(vault)} />
         </li>)}</ul>

@@ -30,7 +30,7 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
   }
   return <>
     <Dialog open={open} onOpenChange={requestClose}>
-      <DialogContent className="max-w-2xl" onCloseAutoFocus={event => {
+      <DialogContent className="flex max-w-3xl flex-col gap-0 overflow-hidden p-0" onCloseAutoFocus={event => {
         if (!returnFocusRef) return;
         event.preventDefault();
         // The floating trigger becomes visible after the last modal releases
@@ -40,12 +40,12 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
           if (target?.isConnected && !isModalOpen()) target.focus({ preventScroll: true });
         });
       }}>
-        <DialogHeader>
+        <DialogHeader className="shrink-0 border-b border-border px-5 py-5 pr-12 sm:px-7 sm:pr-12">
           <DialogTitle>Connect an agent</DialogTitle>
-          <DialogDescription>Choose your AI tool, add AKB, then try a read-only request.</DialogDescription>
+          <DialogDescription>Choose your tool. Follow the three steps below.</DialogDescription>
         </DialogHeader>
-        {open && <ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} />}
-        <DialogFooter><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
+        {open && <div className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7"><ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} /></div>}
+        <DialogFooter className="shrink-0 border-t border-border px-5 py-3 sm:px-7"><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
       </DialogContent>
     </Dialog>
     <ConfirmDialog open={confirmClose} onOpenChange={setConfirmClose} title="Have you saved your token?" description="Unsaved token options will be discarded. Any new token cannot be shown again after closing; save it or its configuration somewhere private first. Closing does not revoke it." confirmLabel="I've saved it — close" cancelLabel="Keep setup open" onConfirm={close} />

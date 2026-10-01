@@ -108,20 +108,16 @@ it.each(["saved token", "OAuth"])("preserves the draft and uncertain result acro
   render(<ConnectionSetup mcpOauthEnabled={mode === "OAuth"} onDirtyChange={dirty}
     initialDraft={{ ...defaultPatDraft(), name: "limited", permissions: "read", expiration: "30", restricted: true, prefixes: ["team-"] }} />);
   if (mode === "OAuth") {
-    await user.click(screen.getByLabelText("Sign-in method"));
-    await user.click(screen.getByRole("menuitemradio", { name: "Access token" }));
+    await user.click(screen.getByRole("radio", { name: "Create a new token" }));
   }
   await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({}, 503) : String(url).endsWith("/vaults") ? json({ vaults: [] }) : json(caps)));
   await user.click(screen.getByRole("button", { name: "Create token" }));
   await screen.findByText(/Creation result needs checking/);
-  const switchLabel = mode === "OAuth" ? "Sign-in method" : "Access token";
-  await user.click(screen.getByLabelText(switchLabel, { exact: true }));
-  await user.click(screen.getByRole("menuitemradio", { name: mode === "OAuth" ? "Browser sign-in (OAuth)" : "Use a saved token" }));
+  await user.click(screen.getByRole("radio", { name: mode === "OAuth" ? "Browser sign-in" : "Use a saved token" }));
   expect(dirty).toHaveBeenLastCalledWith(true);
   expect(screen.queryByRole("button", { name: "I've checked — review another creation" })).not.toBeInTheDocument();
-  await user.click(screen.getByLabelText(switchLabel, { exact: true }));
-  await user.click(screen.getByRole("menuitemradio", { name: mode === "OAuth" ? "Access token" : "Create a new token" }));
+  await user.click(screen.getByRole("radio", { name: "Create a new token" }));
   expect(screen.getByText(/Creation result needs checking/)).toBeVisible();
   expect(screen.getByLabelText("Token name")).toHaveValue("limited");
   expect(screen.getByText(/Expires 30 × 24 hours after issuance · Read only · Writes: prefix team-/)).toBeVisible();
