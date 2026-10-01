@@ -342,6 +342,21 @@ async def test_stdio_local_file_and_image_operations_use_real_proxy_and_state(
     assert isinstance(image_url, str) and image_url.startswith("/api/assets/")
     assert isinstance(image.get("markdown"), str)
 
+    asset_url = urljoin(
+        f"{runtime_session.descriptor.app_origin}/",
+        image_url.lstrip("/"),
+    )
+    asset_headers = {"Authorization": f"Bearer {runtime_session.pat}"}
+    with httpx.Client(timeout=30.0, trust_env=False) as client:
+        asset_response = client.get(
+            asset_url,
+            headers=asset_headers,
+            params={"vault": vault},
+        )
+    assert asset_response.status_code == 200
+    assert asset_response.headers.get("content-type") == "image/png"
+    assert asset_response.content == image_path.read_bytes()
+
     discard_image, discarded = await _local_write(
         stdio_mcp_client,
         runtime_session,
@@ -352,8 +367,9 @@ async def test_stdio_local_file_and_image_operations_use_real_proxy_and_state(
     assert discard_image.is_error is False
     assert discarded.get("discarded") is True
     with httpx.Client(timeout=30.0, trust_env=False) as client:
-        asset_response = client.get(
-            urljoin(f"{runtime_session.descriptor.app_origin}/", image_url.lstrip("/")),
-            headers={"Authorization": f"Bearer {runtime_session.pat}"},
+        deleted_asset_response = client.get(
+            asset_url,
+            headers=asset_headers,
+            params={"vault": vault},
         )
-    assert asset_response.status_code == 404
+    assert deleted_asset_response.status_code == 404
