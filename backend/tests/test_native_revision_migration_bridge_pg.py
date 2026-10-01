@@ -102,6 +102,7 @@ async def _fresh_schema(tmp_path: Path):
         await conn.execute(_INIT_SQL)
         for filename in (
             "010_external_git_mirror.py",
+            "015_events_outbox.py",
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "060_native_revision_migration_bridge.py",

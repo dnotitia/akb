@@ -61,7 +61,7 @@ def access_notification(kind, payload):
 
 
 async def enqueue_domain_event(conn, event_id, kind, *, vault_id, actor_id, payload):
-    if kind in {"document.update", "document.move", "document.delete"}:
+    if kind in {"document.update", "document.move", "document.delete", "document.restore"}:
         if payload.get("resource_id"):
             await enqueue_document_change(
                 conn, kind, source_key=f"event:{event_id}", vault_id=vault_id,
