@@ -71,7 +71,7 @@ async def _fresh_database():
         # never added would fail the boot schema). Without it this fixture
         # builds an `edges` no deployment has. 113 is the vocabulary epoch the
         # embed worker's write reads under the term-id fence (akb#687).
-        for number in (5, 6, 48, 53, 54, 55, 56, 57, 59, 89, 112, 113):
+        for number in (5, 6, 15, 48, 53, 54, 55, 56, 57, 59, 89, 112, 113):
             path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
             spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
             assert spec is not None and spec.loader is not None

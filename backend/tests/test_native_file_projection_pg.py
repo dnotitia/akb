@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -13,7 +14,10 @@ import asyncpg
 import pytest
 
 from app.config import settings
+from app.services import file_service as files
 from app.services import native_file_projection as projection
+from app.services import publication_service
+from app.services.uri_service import file_uri
 
 
 pytestmark = pytest.mark.asyncio
@@ -59,10 +63,13 @@ async def _fresh_schema():
         conn = await asyncpg.connect(dsn)
         await conn.execute(_INIT_SQL)
         for filename in (
+            "015_events_outbox.py",
+            "019_s3_delete_outbox.py",
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "055_native_revision_m1_file_storage.py",
             "057_native_revision_m1_payload_placement.py",
+            "079_worker_claim_lifecycle.py",
             "089_native_file_projection_outbox.py",
         ):
             await _load(filename).migrate(conn=conn)
@@ -155,11 +162,95 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             )
         file_id = uuid.uuid4()
         worker = projection.NativeFileProjectionWorker(pool)
+        monkeypatch.setattr(settings, "native_revision_m1_file_driver", "s3_current")
 
-        await _publish_source(
-            pool, file_id=file_id, vault_id=vault_id,
-            payload=payloads["fixture/v1"], mime_type="text/plain", s3_key="fixture/v1",
-        )
+        async def local_pool():
+            return pool
+
+        async def skip_secondary_index(*_args, **_kwargs):
+            # This fixture has no publication or metadata/vector-index rows.
+            return None
+
+        monkeypatch.setattr(files, "get_pool", local_pool)
+        monkeypatch.setattr(files, "index_file_metadata", skip_secondary_index)
+        monkeypatch.setattr(files, "delete_file_chunks", skip_secondary_index)
+        monkeypatch.setattr(publication_service, "delete_publications_for_file", skip_secondary_index)
+        monkeypatch.setattr(files.s3_adapter, "head", lambda key: {"ContentLength": len(payloads[key])})
+        service = files.FileService()
+        expected_events = []
+        canonical_uri = file_uri(vault_name, str(file_id))
+
+        async def event_rows():
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, kind, vault_id, resource_uri, actor_id, payload "
+                    "FROM events WHERE vault_id = $1 ORDER BY id", vault_id,
+                )
+            return [dict(row) for row in rows]
+
+        async def check_public_event(kind, *, content=None, mime_type=None):
+            rows = await event_rows()
+            assert len(rows) == len(expected_events) + 1
+            event = rows[-1]
+            assert event["kind"] == kind
+            assert event["vault_id"] == vault_id
+            assert event["resource_uri"] == canonical_uri
+            assert event["actor_id"] == "fixture-owner"
+            payload = json.loads(event["payload"])
+            assert payload["vault"] == vault_name
+            assert payload["collection"] is None
+            assert payload["name"] == "fixture.txt"
+            if content is not None:
+                assert payload["content_hash"] == _sha(content)
+                assert payload["size_bytes"] == len(content)
+                assert payload["mime_type"] == mime_type
+            expected_events.append(event)
+            assert rows == expected_events
+
+        async def check_projection_replay():
+            # A retry of the same durable intent must not publish a second
+            # public File mutation (including projection-only delete/restore).
+            assert await event_rows() == expected_events
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE native_file_projection_outbox "
+                    "SET completed_at = NULL, outcome = NULL, claimed_at = NULL, "
+                    "retry_count = 0, next_attempt_at = NOW(), last_error = NULL "
+                    "WHERE file_id = $1 AND completed_at IS NOT NULL", file_id,
+                )
+            assert await worker.process_once() == 1
+            assert await worker.process_once() == 0
+            assert await event_rows() == expected_events
+
+        async def replace_file(key, mime_type):
+            replacement_id = uuid.uuid4()
+            staging_key = files._replacement_staging_key(vault_name, file_id, replacement_id)
+            payloads[staging_key] = payloads[key]
+
+            def copy(source, destination):
+                payloads[destination] = payloads[source]
+                return {"ContentLength": len(payloads[source]), "ContentType": mime_type}
+
+            monkeypatch.setattr(files.s3_adapter, "copy", copy)
+            result = await service.confirm_replace(
+                vault_name, vault_id, str(file_id), str(replacement_id),
+                actor_id="fixture-owner", content_hash=_sha(payloads[key]),
+            )
+            assert result["uri"] == canonical_uri
+            await check_public_event("file.update", content=payloads[key], mime_type=mime_type)
+
+        # Seed only the upload reservation; the real public service confirms
+        # it and atomically writes both the domain event and projection intent.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vault_files (id, vault_id, kind, upload_state, name, "
+                "s3_key, mime_type, created_by) "
+                "VALUES ($1, $2, 'file', 'pending', 'fixture.txt', 'fixture/v1', "
+                "'text/plain', 'fixture-owner')", file_id, vault_id,
+            )
+        confirmed = await service.confirm_upload(vault_id, str(file_id), actor_id="fixture-owner")
+        assert confirmed["uri"] == canonical_uri
+        await check_public_event("file.put", content=payloads["fixture/v1"], mime_type="text/plain")
         assert await worker.process_once() == 1
         async with pool.acquire() as conn:
             created = await conn.fetchrow(
@@ -180,10 +271,8 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             _sha(payloads["fixture/v1"]), "created",
         )
 
-        await _publish_source(
-            pool, file_id=file_id, vault_id=vault_id,
-            payload=payloads["fixture/v2"], mime_type="text/plain", s3_key="fixture/v2",
-        )
+        await check_projection_replay()
+        await replace_file("fixture/v2", "text/plain")
         assert await worker.process_once() == 1
         async with pool.acquire() as conn:
             replaced = await conn.fetchrow(
@@ -201,11 +290,8 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             )
         assert tuple(replaced) == ("live", _sha(payloads["fixture/v2"]), "replaced", 2)
 
-        await _publish_source(
-            pool, file_id=file_id, vault_id=vault_id,
-            payload=payloads["fixture/bin"],
-            mime_type="application/octet-stream", s3_key="fixture/bin",
-        )
+        await check_projection_replay()
+        await replace_file("fixture/bin", "application/octet-stream")
         assert await worker.process_once() == 1
         async with pool.acquire() as conn:
             binary = await conn.fetchrow(
@@ -220,10 +306,11 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             )
         assert tuple(binary) == ("deleted", "deleted", 3)
 
-        await _publish_source(
-            pool, file_id=file_id, vault_id=vault_id,
-            payload=payloads["fixture/v3"], mime_type="text/plain", s3_key="fixture/v3",
-        )
+        await check_projection_replay()
+        # The public File still exists when its searchable projection is gone.
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT COUNT(*) FROM vault_files WHERE id = $1", file_id) == 1
+        await replace_file("fixture/v3", "text/plain")
         assert await worker.process_once() == 1
         async with pool.acquire() as conn:
             restored = await conn.fetchrow(
@@ -243,17 +330,10 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
             file_id, "live", _sha(payloads["fixture/v3"]), "restored", 4,
         )
 
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM vault_files WHERE id = $1", file_id)
-                await projection.enqueue_native_file_projection_delete(
-                    conn,
-                    file_id=file_id,
-                    namespace_id=vault_id,
-                    collection=None,
-                    name="fixture.txt",
-                    actor="fixture-owner",
-                )
+        await check_projection_replay()
+        deleted_file = await service.delete(vault_id, str(file_id), actor_id="fixture-owner")
+        assert deleted_file["uri"] == canonical_uri
+        await check_public_event("file.delete")
         assert await worker.process_once() == 1
         assert await worker.process_once() == 0
         async with pool.acquire() as conn:
@@ -268,6 +348,10 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
                 file_id,
             )
         assert tuple(deleted) == (file_id, "deleted", "deleted", 5)
+        await check_projection_replay()
+        assert [event["kind"] for event in expected_events] == [
+            "file.put", "file.update", "file.update", "file.update", "file.delete",
+        ]
 
 
 async def test_final_projection_claim_is_visible_as_exhausted_until_its_lease_closes(

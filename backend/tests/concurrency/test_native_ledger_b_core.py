@@ -115,6 +115,7 @@ async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8)
     pool = None
     try:
         await conn.execute(_INIT_SQL)
+        await _load_migration(_MIGRATION.with_name("015_events_outbox.py")).migrate(conn=conn)
         migration = _load_migration()
         await migration.migrate(conn=conn)
         await migration.migrate(conn=conn)  # idempotent startup/retry

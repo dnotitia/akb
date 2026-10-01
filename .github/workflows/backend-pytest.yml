@@ -64,6 +64,15 @@ jobs:
     name: pgvector e2e (live DB)
     runs-on: ubuntu-latest
     services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
       postgres:
         image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
         env:
@@ -176,6 +185,8 @@ jobs:
           # Native-ledger correctness must fail if this live-PG gate is
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
+          AKB_TEST_REDIS_URL: redis://localhost:16379/0
+          REQUIRE_REAL_REDIS: "1"
           # The vchord server started above. The sparse-shape tests create and drop
           # their own database on it, so it is a separate server, not a
           # separate database on the one above.
@@ -338,6 +349,7 @@ jobs:
             tests/test_table_column_reserved_words_postgres.py
             tests/test_notifications_postgres.py
             tests/test_notification_native_postgres.py
+            tests/test_native_document_events_postgres.py
             tests/test_notification_unwatch_postgres.py
             tests/test_recent_watching_postgres.py
             tests/test_search_update_status_pg.py
