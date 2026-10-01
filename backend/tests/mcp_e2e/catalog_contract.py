@@ -219,8 +219,9 @@ def call_target(
     """Resolve one canonical operation through the observed public catalog."""
 
     names = {tool.name for tool in tools}
+    is_mixed = bool(names & set(GROUP_ACTIONS))
     if operation in names:
-        assert operation not in _GROUPED_OPERATIONS, (
+        assert not is_mixed or operation not in _GROUPED_OPERATIONS, (
             f"mixed catalog unexpectedly exposes {operation} directly"
         )
         return operation, arguments

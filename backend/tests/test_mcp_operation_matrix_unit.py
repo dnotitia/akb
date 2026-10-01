@@ -4,11 +4,40 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
-from tests.mcp_e2e.catalog_contract import LIVE_OPERATION_CASES, LOGICAL_OPERATIONS
+from tests.mcp_e2e.catalog_contract import (
+    GROUP_ACTIONS,
+    LIVE_OPERATION_CASES,
+    LOGICAL_OPERATIONS,
+    call_target,
+)
 
 
 _E2E_DIR = Path(__file__).parent / "mcp_e2e"
+
+
+def test_flat_catalog_keeps_standalone_read_call_target() -> None:
+    flat_tools = [SimpleNamespace(name=name) for name in LOGICAL_OPERATIONS]
+    arguments = {"uri": "akb://probe/doc/a.md"}
+
+    assert call_target(flat_tools, "akb_get", arguments) == ("akb_get", arguments)
+
+
+def test_mixed_catalog_maps_read_call_target_to_group_action() -> None:
+    grouped_operations = {
+        operation
+        for actions in GROUP_ACTIONS.values()
+        for operation in actions.values()
+    }
+    mixed_names = (set(LOGICAL_OPERATIONS) - grouped_operations) | set(GROUP_ACTIONS)
+    mixed_tools = [SimpleNamespace(name=name) for name in mixed_names]
+    arguments = {"uri": "akb://probe/doc/a.md"}
+
+    assert call_target(mixed_tools, "akb_get", arguments) == (
+        "akb_document_read",
+        {"action": "get", **arguments},
+    )
 
 
 def _function(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
