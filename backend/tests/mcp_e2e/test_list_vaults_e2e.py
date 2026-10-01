@@ -25,11 +25,19 @@ def _fail(operation: str, detail: str) -> NoReturn:
 def _assert_connection(
     protocol_version: str,
     server_info: mcp_types.Implementation | None,
+    transport: str,
 ) -> None:
     if protocol_version not in SUPPORTED_PROTOCOLS:
         _fail("connect", f"unsupported negotiated protocol {protocol_version!r}")
-    if server_info is None or server_info.name != "akb" or not isinstance(server_info.version, str):
-        _fail("connect", "connected server is not the expected AKB server")
+    expected_name = {"http": "akb", "stdio": "akb-mcp"}.get(transport)
+    if expected_name is None:
+        _fail("connect", f"unsupported transport {transport!r}")
+    if (
+        server_info is None
+        or server_info.name != expected_name
+        or not isinstance(server_info.version, str)
+    ):
+        _fail("connect", f"connected server is not the expected {expected_name!r} server")
 
 
 def _assert_tool_catalog(tools: mcp_types.ListToolsResult) -> None:
@@ -68,9 +76,10 @@ def _assert_list_vaults_shape(public: Mapping[str, object]) -> None:
 
 async def test_akb_list_vaults_mcp_e2e(
     mcp_client: Client,
+    mcp_transport: str,
     runtime_session: RuntimeContext,
 ) -> None:
-    _assert_connection(mcp_client.protocol_version, mcp_client.server_info)
+    _assert_connection(mcp_client.protocol_version, mcp_client.server_info, mcp_transport)
 
     try:
         tools = await mcp_client.list_tools(cache_mode="bypass")

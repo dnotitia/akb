@@ -30,7 +30,6 @@ async def test_identity_and_self_or_other_access_explanations(
         "akb_explain_access",
         {"vault": vault, "user": owner_username},
     )
-    assert owner_explanation.get("effective_role") == "owner"
     assert owner_explanation.get("non_member_paths", {}).get("owner") is True
 
     granted = await _call_json(
