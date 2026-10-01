@@ -14,9 +14,9 @@ settings.git_storage_path = tempfile.mkdtemp(prefix="akb-mcp-grep-file-test-vaul
 
 
 def test_akb_grep_schemas_keep_read_and_write_fields_separate():
-    from mcp_server.tools import TOOLS
+    from mcp_server.tools import OPERATIONS
 
-    by_name = {tool.name: tool for tool in TOOLS}
+    by_name = {tool.name: tool for tool in OPERATIONS}
     grep = by_name["akb_grep"]
     argument = grep.input_schema["properties"]["measurement_include_text_files"]
     replace = by_name["akb_grep_replace"]

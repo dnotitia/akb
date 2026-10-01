@@ -68,6 +68,72 @@ const RICH_BACKEND_TOOLS = [
   },
 ];
 
+const CANDIDATE_GROUP_SCHEMA = {
+  type: "object",
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        action: { type: "string", const: "search" },
+        query: { type: "string" },
+      },
+      required: ["action", "query"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        action: { type: "string", const: "grep" },
+        pattern: { type: "string" },
+      },
+      required: ["action", "pattern"],
+      additionalProperties: false,
+    },
+  ],
+};
+const CANDIDATE_BACKEND_NAMES = [
+  "akb_discover",
+  "akb_create_vault",
+  "akb_put",
+  "akb_document_read",
+  "akb_update",
+  "akb_edit",
+  "akb_move",
+  "akb_delete",
+  "akb_grep_replace",
+  "akb_relationships",
+  "akb_link",
+  "akb_unlink",
+  "akb_create_table",
+  "akb_sql",
+  "akb_drop_table",
+  "akb_alter_table",
+  "akb_publish",
+  "akb_unpublish",
+  "akb_publications",
+  "akb_publication_snapshot",
+  "akb_vault_access",
+  "akb_grant",
+  "akb_revoke",
+  "akb_identity",
+  "akb_transfer_ownership",
+  "akb_archive_vault",
+  "akb_delete_vault",
+  "akb_create_collection",
+  "akb_delete_collection",
+  "akb_set_public",
+  "akb_help",
+  "akb_export",
+  "akb_import",
+];
+const CANDIDATE_BACKEND_TOOLS = CANDIDATE_BACKEND_NAMES.map((name) => ({
+  name,
+  description: name === "akb_discover" ? "Discover content" : name,
+  inputSchema: name === "akb_discover"
+    ? CANDIDATE_GROUP_SCHEMA
+    : { type: "object", properties: {} },
+}));
+
 function waitForLine(lines, id, timeoutMs = 3000) {
   const existing = lines.find((line) => line?.id === id);
   if (existing) return Promise.resolve(existing);
@@ -281,6 +347,29 @@ async function testModernProcess() {
   }
 }
 
+async function testMixedCatalogProcess() {
+  const backend = await fakeBackend({ tools: CANDIDATE_BACKEND_TOOLS });
+  try {
+    const { responses } = await runProxy(backend.url, [
+      { jsonrpc: "2.0", id: 30, method: "tools/list", params: { _meta: MODERN_META } },
+    ]);
+    const tools = responses[0].result.tools;
+    assert.equal(CANDIDATE_BACKEND_TOOLS.length, 33, "candidate HTTP catalog has 33 tools");
+    assert.equal(tools.length, 39, "stdio catalog adds six proxy-local tools");
+    assert.deepEqual(
+      tools.find((tool) => tool.name === "akb_discover").inputSchema,
+      CANDIDATE_GROUP_SCHEMA,
+      "proxy preserves the composite oneOf schema unchanged",
+    );
+    assert.ok(tools.some((tool) => tool.name === "akb_grep_replace"));
+    assert.ok(tools.some((tool) => tool.name === "akb_put_file"));
+    assert.ok(!tools.some((tool) => tool.name === "akb_search"));
+    assert.ok(!tools.some((tool) => tool.name === "akb_browse"));
+  } finally {
+    await backend.close();
+  }
+}
+
 async function testLegacyProcess() {
   const backend = await fakeBackend();
   try {
@@ -427,6 +516,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
 await testModernDegradedProcessWithExternalParser();
 await testModernReachableProcessWithExternalParser();
 await testModernProcess();
+await testMixedCatalogProcess();
 await testLegacyProcess();
 await testLegacyBackendFallback();
 await testGenerationMixingIsFailClosed();

@@ -1466,14 +1466,117 @@ def _split_grep_operation(source_tools: list[Tool]) -> list[Tool]:
 
 
 OPERATIONS = _split_grep_operation(_SOURCE_TOOLS)
-TOOLS = OPERATIONS
+
+TOOL_GROUPS = {
+    "akb_discover": {
+        "list_vaults": "akb_list_vaults",
+        "vault_info": "akb_vault_info",
+        "browse": "akb_browse",
+        "search": "akb_search",
+        "grep": "akb_grep",
+    },
+    "akb_document_read": {
+        "get": "akb_get",
+        "section": "akb_drill_down",
+        "activity": "akb_activity",
+        "history": "akb_history",
+        "diff": "akb_diff",
+        "provenance": "akb_provenance",
+    },
+    "akb_relationships": {
+        "relations": "akb_relations",
+        "graph": "akb_graph",
+    },
+    "akb_identity": {
+        "whoami": "akb_whoami",
+        "search_users": "akb_search_users",
+    },
+    "akb_vault_access": {
+        "members": "akb_vault_members",
+        "explain": "akb_explain_access",
+    },
+}
+
+_GROUP_DESCRIPTIONS = {
+    "akb_discover": (
+        "Discover accessible vaults and content. Choose list_vaults, vault_info, "
+        "browse, search, or grep with the action field; pass that action's "
+        "arguments alongside it."
+    ),
+    "akb_document_read": (
+        "Read full documents, selected sections, activity, revisions, or provenance. "
+        "Choose an action and pass its arguments alongside it."
+    ),
+    "akb_relationships": (
+        "Read explicit and implicit document relationships or traverse the "
+        "same-vault graph. Choose relations or graph and pass its arguments "
+        "alongside it."
+    ),
+    "akb_identity": (
+        "Read the caller identity or search users visible to the caller. "
+        "Choose whoami or search_users and pass its arguments alongside it."
+    ),
+    "akb_vault_access": (
+        "Read vault membership or explain an access decision. Choose members "
+        "or explain and pass its arguments alongside it."
+    ),
+}
+
+
+def _group_tool(name: str, operation_tools: dict[str, Tool]) -> Tool:
+    actions = TOOL_GROUPS[name]
+    branches = []
+    for action, operation_name in actions.items():
+        operation = operation_tools[operation_name]
+        schema = deepcopy(operation.input_schema)
+        properties = schema.get("properties", {})
+        schema["properties"] = {
+            "action": {
+                "type": "string",
+                "const": action,
+                "description": f"Select the {action} operation.",
+            },
+            **properties,
+        }
+        schema["required"] = ["action", *schema.get("required", [])]
+        schema["additionalProperties"] = False
+        branches.append(schema)
+
+    return Tool(
+        name=name,
+        description=_GROUP_DESCRIPTIONS[name],
+        input_schema={"type": "object", "oneOf": branches},
+    )
+
+
+def _candidate_tools(operation_tools: list[Tool]) -> list[Tool]:
+    by_name = {tool.name: tool for tool in operation_tools}
+    group_for_operation = {
+        operation: group
+        for group, actions in TOOL_GROUPS.items()
+        for operation in actions.values()
+    }
+    grouped: list[Tool] = []
+    emitted: set[str] = set()
+    for operation in operation_tools:
+        group = group_for_operation.get(operation.name)
+        if group is None:
+            grouped.append(operation)
+        elif group not in emitted:
+            grouped.append(_group_tool(group, by_name))
+            emitted.add(group)
+    return grouped
+
+
+TOOLS = _candidate_tools(OPERATIONS)
 
 
 def available_tools() -> list[Tool]:
     """Advertise only supported creation options without mutating validation.
 
-    TOOLS remains the accepted argument catalog for older clients, whose
-    explicit unsupported requests must reach the service's stable error.
+    OPERATIONS remains the canonical handler schema source. The public TOOLS
+    catalog may omit unavailable creation options while dispatch preserves
+    the service's stable unsupported-option errors.
     """
     capabilities = get_vault_creation_capabilities()
     if capabilities.templates and capabilities.external_git:

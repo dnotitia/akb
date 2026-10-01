@@ -74,7 +74,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import OPERATIONS, available_tools
+from mcp_server.tools import OPERATIONS, TOOL_GROUPS, available_tools
 from mcp_server.input_validation import validate_tool_arguments
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
@@ -302,6 +302,13 @@ _HANDLERS: dict[str, Any] = {}
 _READ_SCOPE = "akb:vault:read"
 _WRITE_SCOPE = "akb:vault:write"
 _TOOL_SCOPES: dict[str, str] = {
+    # The five public composite tools only expose read operations. Individual
+    # actions are normalized to their canonical operation name before dispatch.
+    "akb_discover": _READ_SCOPE,
+    "akb_document_read": _READ_SCOPE,
+    "akb_relationships": _READ_SCOPE,
+    "akb_identity": _READ_SCOPE,
+    "akb_vault_access": _READ_SCOPE,
     # --- read ---
     "akb_help": _READ_SCOPE,
     "akb_whoami": _READ_SCOPE,
@@ -390,6 +397,43 @@ def _required_scope(name: str) -> str:
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
     t.name: set((t.input_schema or {}).get("properties", {}).keys()) for t in OPERATIONS
 }
+_GROUPED_OPERATION_NAMES = frozenset(
+    operation for actions in TOOL_GROUPS.values() for operation in actions.values()
+)
+
+
+def _resolve_catalog_call(name: str, args: dict) -> tuple[str, dict, dict | None]:
+    """Flatten a composite call to the existing canonical operation contract."""
+    actions = TOOL_GROUPS.get(name)
+    if actions is None:
+        if name in _GROUPED_OPERATION_NAMES:
+            return name, args, err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+        return name, args, None
+
+    action = args.get("action")
+    if not isinstance(action, str) or action not in actions:
+        return name, args, err(
+            f"Invalid action for {name}",
+            code=INVALID_ARGUMENT,
+            field="action",
+            allowed_values=list(actions),
+            hint=f"Choose one action: {', '.join(actions)}.",
+        )
+
+    operation = actions[action]
+    operation_args = {key: value for key, value in args.items() if key != "action"}
+    allowed = _TOOL_ARG_NAMES[operation]
+    unknown = [key for key in operation_args if key not in allowed]
+    if unknown:
+        bad = unknown[0]
+        return operation, operation_args, err(
+            f"Unknown argument '{bad}' for {operation}",
+            code=UNKNOWN_ARGUMENT,
+            hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
+            field=bad,
+            available_arguments=sorted(allowed),
+        )
+    return operation, operation_args, None
 
 
 def _h(name: str):
@@ -1761,8 +1805,12 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
+        logical_name, logical_arguments, resolution_error = _resolve_catalog_call(
+            name, arguments
+        )
+        name, arguments = logical_name, logical_arguments
         is_write = _required_scope(name) == _WRITE_SCOPE
-        result: dict | None = validate_tool_arguments(name, arguments)
+        result: dict | None = resolution_error or validate_tool_arguments(name, arguments)
 
         # A guide cannot influence a write that has already committed.  For a
         # reader-authorized caller's first write (or the first write after the

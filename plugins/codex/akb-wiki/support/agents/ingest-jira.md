@@ -66,7 +66,7 @@ Compose `canonical_url = "{issue.tenant_base_url}/browse/{issue.issue_key}"` (fa
 
 ### Step 3 — Dedup check
 
-Always upsert; the check tells Step 5 whether to create or replace. `akb_search(vault={vault_name}, collection=atlassian-issues, type=reference, tags=["issue-key:{issue_key}"], limit=5)`. Single-tag filter narrows to exact-membership (AKB's `tags` filter has OR semantics, so multi-tag would broaden); Jira issue keys are tenant-unique, so `issue-key:{issue_key}` + collection is sufficient. On hit, capture `existing_doc_id`.
+Always upsert; the check tells Step 5 whether to create or replace. `akb_discover(action="search", vault={vault_name}, collection=atlassian-issues, type=reference, tags=["issue-key:{issue_key}"], limit=5)`. Single-tag filter narrows to exact-membership (AKB's `tags` filter has OR semantics, so multi-tag would broaden); Jira issue keys are tenant-unique, so `issue-key:{issue_key}` + collection is sufficient. On hit, capture `existing_doc_id`.
 
 No version field maps cleanly to a monotonic counter (`updated_at` can replay); compiled-truth is rewritten every invocation, and the timeline records each re-ingest — same pattern as `ingest-pr`.
 
@@ -255,7 +255,7 @@ Branch by Step 3 result.
 
 **Update** (`existing_doc_id` from Step 3):
 
-1. `akb_get(vault={vault_name}, doc_id={existing_doc_id}) → existing_content`.
+1. `akb_document_read(action="get", vault={vault_name}, doc_id={existing_doc_id}) → existing_content`.
 2. Compose `draft_body` = full new body (compiled-truth + Source + `---` + `## Timeline` + the single new entry).
 3. Apply **timeline merge — Mode A (full-body merge)** against `existing_content`.
 4. `akb_update(vault={vault_name}, doc_id={existing_doc_id}, title="{issue_key}: {issue.title}", tags={tags}, content={merged_body}, summary={issue.title}, message="Re-ingested at status {status}, {N} comments")`.

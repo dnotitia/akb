@@ -106,13 +106,13 @@ Compute `new_hash = sha256(extracted_text)` once up front — used as both the p
 
 #### Stage 1 — Deterministic match
 
-Build a `lookup_key`: canonical URL (strip tracking params like `utm_*`, `ref`, `fbclid`) for URL sources, `new_hash` for path sources. Query `akb_search(vault="{vault_name}", query={lookup_key}, collection="corpus-summaries", type="reference", limit=5)`.
+Build a `lookup_key`: canonical URL (strip tracking params like `utm_*`, `ref`, `fbclid`) for URL sources, `new_hash` for path sources. Query `akb_discover(action="search", vault="{vault_name}", query={lookup_key}, collection="corpus-summaries", type="reference", limit=5)`.
 
-For each hit, `akb_get(vault="{vault_name}", doc_id={hit.doc_id})` and inspect the `## Source` block. Match on either a `Location:` line containing the canonical URL **or** a `Content-SHA256:` line matching `new_hash` (only present when a plaintext path was previously ingested). On match, set `dedup_hit = doc_id`, parse `existing_hash` from the existing doc's `Content-SHA256:` (may be absent if the prior ingest had no raw upload), set `dedup_kind = "deterministic"`, and skip Stage 2.
+For each hit, `akb_document_read(action="get", vault="{vault_name}", doc_id={hit.doc_id})` and inspect the `## Source` block. Match on either a `Location:` line containing the canonical URL **or** a `Content-SHA256:` line matching `new_hash` (only present when a plaintext path was previously ingested). On match, set `dedup_hit = doc_id`, parse `existing_hash` from the existing doc's `Content-SHA256:` (may be absent if the prior ingest had no raw upload), set `dedup_kind = "deterministic"`, and skip Stage 2.
 
 #### Stage 2 — Semantic fallback
 
-Runs only when Stage 1 produced no hit. Produce a provisional title (URL `<title>` tag, PDF metadata, markdown `# heading`, or filename stem — whichever is available). Query `akb_search(vault="{vault_name}", query={provisional_title}, collection="corpus-summaries", type="reference", limit=5)`. Any hit with `score > 0.85` counts as fuzzy: set `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`. The hit is a **candidate**, not a confirmed identity match.
+Runs only when Stage 1 produced no hit. Produce a provisional title (URL `<title>` tag, PDF metadata, markdown `# heading`, or filename stem — whichever is available). Query `akb_discover(action="search", vault="{vault_name}", query={provisional_title}, collection="corpus-summaries", type="reference", limit=5)`. Any hit with `score > 0.85` counts as fuzzy: set `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`. The hit is a **candidate**, not a confirmed identity match.
 
 #### Decision
 
@@ -197,7 +197,7 @@ Branch by Step 4 decision.
 
 **Replace** (deterministic hit with hash differing / absent):
 
-1. `akb_get(vault="{vault_name}", doc_id={dedup_hit}) → existing_content`.
+1. `akb_document_read(action="get", vault="{vault_name}", doc_id={dedup_hit}) → existing_content`.
 2. Apply timeline merge **Mode B** with `new_entry = "- **{today}** | Re-ingested from {source}. [Source: ingest-doc, {today}]"` and `existing_content` as-is.
 3. Build the final `content`: everything from the newly composed body **above** the `---` + `## Timeline` line, then the merged timeline from Mode B. This replaces the compiled-truth zone (TL;DR / Key Points / Content / Source) while preserving all historical timeline entries.
 4. `akb_update(vault="{vault_name}", doc_id={dedup_hit}, content={merged_content}, message="Re-ingested from {source}")`.
@@ -206,7 +206,7 @@ Branch by Step 4 decision.
 
 When `raw_upload == true` and a doc was created or replaced, materialize the lineage edge: `akb_link(vault="{vault_name}", source="akb://{vault_name}/doc/{doc_path}", target="akb://{vault_name}/file/{file_id}", relation="derived_from")`.
 
-On the `replace` path, first check `akb_relations(vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{doc_path}", type="derived_from", direction="outgoing")` — the raw `file_id` may have changed or the prior ingest may have used `--no-raw`. Skip `akb_link` idempotently when the edge to the new `file_id` already exists. If a `derived_from` edge points to a *different* `file/{id}`, the prior raw is orphaned — do not delete it (other docs may reference it); leave it and emit a warning in the output.
+On the `replace` path, first check `akb_relationships(action="relations", vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{doc_path}", type="derived_from", direction="outgoing")` — the raw `file_id` may have changed or the prior ingest may have used `--no-raw`. Skip `akb_link` idempotently when the edge to the new `file_id` already exists. If a `derived_from` edge points to a *different* `file/{id}`, the prior raw is orphaned — do not delete it (other docs may reference it); leave it and emit a warning in the output.
 
 ### Step 7 — Report
 

@@ -39,12 +39,52 @@ def audit_sinks(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "arguments", "field", "expected_type"),
+    (
+        "name",
+        "arguments",
+        "field",
+        "expected_type",
+        "handler_name",
+        "audit_name",
+        "audit_arguments",
+    ),
     [
-        ("akb_create_table", {"name": "items", "columns": "[]"}, "columns", "array"),
-        ("akb_import", {"vault": "v", "files": []}, "files", "object"),
-        ("akb_get", {}, "uri", "string"),
-        ("akb_get", {"uri": 42}, "uri", "string"),
+        (
+            "akb_create_table",
+            {"name": "items", "columns": "[]"},
+            "columns",
+            "array",
+            "akb_create_table",
+            "akb_create_table",
+            {"name": "items", "columns": "[]"},
+        ),
+        (
+            "akb_import",
+            {"vault": "v", "files": []},
+            "files",
+            "object",
+            "akb_import",
+            "akb_import",
+            {"vault": "v", "files": []},
+        ),
+        (
+            "akb_document_read",
+            {"action": "get"},
+            "uri",
+            "string",
+            "akb_get",
+            "akb_get",
+            {},
+        ),
+        (
+            "akb_document_read",
+            {"action": "get", "uri": 42},
+            "uri",
+            "string",
+            "akb_get",
+            "akb_get",
+            {"uri": 42},
+        ),
     ],
 )
 async def test_sdk_tool_request_rejects_invalid_schema_before_handler(
@@ -54,6 +94,9 @@ async def test_sdk_tool_request_rejects_invalid_schema_before_handler(
     arguments,
     field,
     expected_type,
+    handler_name,
+    audit_name,
+    audit_arguments,
 ):
     audit, usage = audit_sinks
     dispatches = []
@@ -66,7 +109,7 @@ async def test_sdk_tool_request_rejects_invalid_schema_before_handler(
         return {"accepted": True}
 
     monkeypatch.setattr(mcp_server, "_get_user", current_user)
-    monkeypatch.setitem(mcp_server._HANDLERS, name, handler)
+    monkeypatch.setitem(mcp_server._HANDLERS, handler_name, handler)
 
     response = await mcp_server._call_tool_request(
         None,
@@ -80,5 +123,5 @@ async def test_sdk_tool_request_rejects_invalid_schema_before_handler(
     assert payload["details"]["expected_type"] == expected_type
     assert payload.get("hint")
     assert dispatches == []
-    assert audit[0][0:2] == (name, arguments)
-    assert usage[0][0:2] == (name, arguments)
+    assert audit[0][0:2] == (audit_name, audit_arguments)
+    assert usage[0][0:2] == (audit_name, audit_arguments)

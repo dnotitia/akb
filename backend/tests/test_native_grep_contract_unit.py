@@ -154,8 +154,8 @@ async def test_mcp_multiple_read_vaults_and_limit(monkeypatch):
 
 def test_mcp_schema_accepts_vault_lists_and_exposes_filters():
     from jsonschema import validate
-    from mcp_server.tools import TOOLS
-    tool = next(tool for tool in TOOLS if tool.name == "akb_grep")
+    from mcp_server.tools import OPERATIONS
+    tool = next(tool for tool in OPERATIONS if tool.name == "akb_grep")
     validate({"pattern": "x", "vault": ["a", "b"], "include_text_files": True,
               "doc_types": ["note"], "tags": ["todo"], "archive_scope": "archived"}, tool.input_schema)
     assert tool.input_schema["properties"]["include_archived"]["default"] is True

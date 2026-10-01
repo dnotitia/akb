@@ -2,7 +2,7 @@
 name: ingest-pr
 description: Record a single GitHub PR merge event as a git-pr document in an AKB vault — PR title/body quoted verbatim, commit summaries pulled from pre-ingested git-commit docs. Fetched live via gh pr view.
 model: sonnet
-tools: Bash(git *), Bash(gh *), Read, mcp__akb__akb_search, mcp__akb__akb_get, mcp__akb__akb_put, mcp__akb__akb_update
+tools: Bash(git *), Bash(gh *), Read, mcp__akb__akb_discover, mcp__akb__akb_document_read, mcp__akb__akb_put, mcp__akb__akb_update
 ---
 
 # AKB Git PR Ingest
@@ -77,17 +77,16 @@ Call the resulting ordered list `sha_list` (chronologically ascending). If `sha_
 
 ### Step 3 — Dedup check
 
-`akb_search(query="PR #{pr_number} {repo_name}", vault={vault_name}, collection=git-prs, type=reference, tags=["git", "kind:pr", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter has `repo == repo_name AND pr_number == pr_number`; on match capture `existing_doc_id` (update path), else create path.
+`akb_discover(action="search", query="PR #{pr_number} {repo_name}", vault={vault_name}, collection=git-prs, type=reference, tags=["git", "kind:pr", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter has `repo == repo_name AND pr_number == pr_number`; on match capture `existing_doc_id` (update path), else create path.
 
 ### Step 4 — Fetch commit documents
 
 Given a chronologically-ordered list `sha_list`, resolve each SHA to its commit document (`type=reference, kind:commit`) in the vault.
 
-**Concurrency is required.** Issue all searches in a single parallel tool-use block, then issue any required `akb_get` calls in a second parallel block. Sequential per-SHA loops are forbidden — a 30-commit input is two batched round trips, not 30 or 60.
+**Concurrency is required.** Issue all searches in a single parallel tool-use block, then issue any required `akb_document_read` calls in a second parallel block. Sequential per-SHA loops are forbidden — a 30-commit input is two batched round trips, not 30 or 60.
 
 ```text
-mcp__akb__akb_search(
-  query="{sha}",
+mcp__akb__akb_discover(action="search", query="{sha}",
   vault="{vault_name}",
   collection="git-commits",
   type="reference",
@@ -96,17 +95,17 @@ mcp__akb__akb_search(
 )
 ```
 
-For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_search` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_search` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_get` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
+For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_discover` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_discover` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_document_read` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
 
 For each `commit_records[i]`, populate the downstream-needed fields from the AKB primitives that durably persist them:
 
-- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_search`).
+- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_discover`).
 - `short_sha` — first 7 chars of the full SHA (already known from the search query); also recoverable from the title prefix.
 - `author` — parse from the row's `tags` array as `tag[len("author:"):]` for the first `author:*` tag emitted by `/ingest-commit` Step 6. Single-author commits emit one such tag; merge commits emit either the merging committer or whichever name `.mailmap` resolved. `null` if no `author:*` tag is present (defensive — the commit ingest always emits one).
 - `conv_type` — parse from the row's `tags` array as `tag[len("type:"):]` for the first `type:*` tag. `null` when the commit subject did not match the conventional-commit pattern.
 - `scope` — parse `tag[len("scope:"):]` for the first `scope:*` tag. Drives PR-level `pr_scope` aggregation downstream without re-deriving from a `paths` list.
 
-Skip the secondary `akb_get` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_search`. A 30-commit PR is one batched `akb_search` round trip, not 30+30.
+Skip the secondary `akb_document_read` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_discover`. A 30-commit PR is one batched `akb_discover` round trip, not 30+30.
 
 The full file list, per-commit stats, and diff scope are not aggregated across commits — the per-commit body's `### Paths` and `## Stats` sections are the audit surface, reachable via the PR's `depends_on` graph edge.
 
@@ -162,7 +161,7 @@ summary: "{pr.title}"
 related_to: []
 ```
 
-PR commit membership lives on the `depends_on` graph edge passed as a top-level arg in Step 7 — not frontmatter. Outgoing `depends_on` is queryable via `akb_relations`; the release skill consumes it through `akb_search` + `set(pr.depends_on)`.
+PR commit membership lives on the `depends_on` graph edge passed as a top-level arg in Step 7 — not frontmatter. Outgoing `depends_on` is queryable via `akb_relationships`; the release skill consumes it through `akb_discover` + `set(pr.depends_on)`.
 
 `scope:{pr_scope}` omitted when Step 5 produced null. `kind:pr` is the cross-plugin discriminator (read by the external maintenance layer and `/ingest-release` Step 7); `project:{repo_name}` is the rollup namespace and repo-identifier SSOT. Per-commit author / paths / stats / conv-type / diff-scope live on each commit doc's tags + `## Source`, not aggregated here.
 
@@ -201,7 +200,7 @@ Assembly rules: quote the PR body as a single block-quote (no paraphrase / trunc
 
 **Update** — `akb_update(doc_id={existing_doc_id}, vault={vault_name}, title="PR #{pr.number}: {pr.title}", tags={tags}, content={assembled_body}, summary={pr.title}, depends_on={commit_uris})`.
 
-`depends_on` passes as a top-level arg so AKB stores graph edges (queryable via `akb_relations`), not opaque frontmatter. PR-to-commits lives entirely on this edge — no commit-side backlink. Re-ingest rewrites the edge set idempotently. Capture `pr_doc_id` / `pr_doc_path`.
+`depends_on` passes as a top-level arg so AKB stores graph edges (queryable via `akb_relationships`), not opaque frontmatter. PR-to-commits lives entirely on this edge — no commit-side backlink. Re-ingest rewrites the edge set idempotently. Capture `pr_doc_id` / `pr_doc_path`.
 
 ### Step 8 — Return
 

@@ -20,24 +20,24 @@ All connected via a unified knowledge graph with AKB URI scheme.
 
 ## Quick Start (3 steps)
 
-1. `akb_list_vaults` → see what vaults you have access to
-2. `akb_browse(vault="...")` → explore ALL vault content (documents, tables, files)
-3. `akb_search(query="...")` → find documents by meaning
+1. `akb_discover(action="list_vaults")` → see what vaults you have access to
+2. `akb_discover(action="browse", vault="...")` → explore ALL vault content (documents, tables, files)
+3. `akb_discover(action="search", query="...")` → find documents by meaning
 
 ## Tool Categories — drill down with `akb_help(topic="...")`
 
 | Topic | Tools | What it does |
 |-------|-------|--------------|
 | `quickstart` | — | Step-by-step first session guide |
-| `documents` | put, get, update, delete, browse, drill_down | Create and manage documents |
-| `search` | search, browse, drill_down | Find and read documents |
+| `documents` | document_read, put, update, delete, discover | Create and read documents |
+| `search` | discover, document_read | Find and read documents |
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `images` | put_image, discard_image | Inline images for Markdown documents |
-| `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
-| `history` | activity, diff, history | Vault activity + git-based change history |
+| `access` | vault_access, grant, revoke, discover, identity | Permissions and vault management |
+| `history` | document_read | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
-| `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
+| `relations` | link, unlink, relationships, document_read | Knowledge graph — cross-type connections |
 
 ## AKB URI Scheme (for cross-type linking)
 
@@ -46,7 +46,7 @@ Every resource has a URI: `akb://{vault}/{type}/{id}`
 - `akb://eng/table/experiments` → table
 - `akb://eng/file/abc123-def456` → file
 
-Use these URIs with `akb_link` and `akb_relations` to connect resources within
+Use these URIs with `akb_link` and `akb_relationships (action: relations)` to connect resources within
 the same vault. Cross-vault citations stay ordinary Markdown links.
 
 ## Workflows — drill down with `akb_help(topic="...")`
@@ -67,32 +67,32 @@ the same vault. Cross-vault citations stay ordinary Markdown links.
 
 ### Step 1: Discover
 ```
-akb_list_vaults()
+akb_discover(action="list_vaults")
 → [{"name": "engineering", "description": "Engineering docs", ...}]
 ```
 
 ### Step 2: Explore
 ```
-akb_browse(vault="engineering")
+akb_discover(action="browse", vault="engineering")
 → collections: ["api-specs", "decisions", "meeting-notes"]
 
-akb_browse(vault="engineering", collection="decisions")
+akb_discover(action="browse", vault="engineering", collection="decisions")
 → items: [{name: "use-grpc.md", path: "decisions/use-grpc.md", type: "document", ...}]
 ```
 
 ### Step 3: Read
 ```
-akb_get(uri="akb://engineering/doc/decisions/use-grpc.md")
+akb_document_read(action="get", uri="akb://engineering/doc/decisions/use-grpc.md")
 → full document with metadata
 
-akb_drill_down(uri="akb://engineering/doc/decisions/use-grpc.md", section="Background")
+akb_document_read(action="section", uri="akb://engineering/doc/decisions/use-grpc.md", section="Background")
 → just the Background section
 ```
 The `uri` is an AKB URI of the form `akb://{vault}/{type}/{identifier}`.
 
 ### Step 4: Search
 ```
-akb_search(query="authentication flow")
+akb_discover(action="search", query="authentication flow")
 → ranked results (documents + tables + files) with source_type, uri, score
 ```
 
@@ -122,12 +122,12 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | Tool | Use when... |
 |------|-------------|
 | `akb_put` | Creating a new document |
-| `akb_get` | Reading a document by ID or path |
+| `akb_document_read (action: get)` | Reading a document by ID or path |
 | `akb_update` | Changing content, title, status, or tags |
 | `akb_edit` | Applying a partial edit via exact string replacement (saves tokens) |
 | `akb_delete` | Removing a document |
-| `akb_browse` | Exploring what exists (tree view) |
-| `akb_drill_down` | Reading specific sections of a long document |
+| `akb_discover (action: browse)` | Exploring what exists (tree view) |
+| `akb_document_read (action: section)` | Reading specific sections of a long document |
 | `akb_put_image` | Uploading a local image to embed in Markdown |
 | `akb_create_collection` | Creating an empty collection (folder) in a vault |
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
@@ -153,10 +153,10 @@ akb_put(..., related_to=["akb://v/doc/path/to/related.md"], depends_on=["akb://v
 
 **Partial read (save tokens):**
 ```
-akb_browse(vault="v")            # default depth=1 — root + first level of collection contents
-akb_browse(vault="v", depth=0)   # narrowest — root contents only, no descent
-akb_browse(vault="v", depth=-1)  # heaviest — entire subtree of the vault
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="API")  # one section
+akb_discover(action="browse", vault="v")            # default depth=1 — root + first level of collection contents
+akb_discover(action="browse", vault="v", depth=0)   # narrowest — root contents only, no descent
+akb_discover(action="browse", vault="v", depth=-1)  # heaviest — entire subtree of the vault
+akb_document_read(action="section", uri="akb://v/doc/path/to/file.md", section="API")  # one section
 ```
 
 **Update only what changed:**
@@ -169,32 +169,32 @@ akb_update(uri="akb://v/doc/path/to/file.md", tags=["urgent"], message="Mark as 
 akb_edit(uri="akb://v/doc/path/to/file.md", old_string="old text", new_string="new text")
 ```
 
-💡 Details: `akb_help(topic="akb_put")`, `akb_help(topic="akb_edit")`, `akb_help(topic="akb_browse")`""",
+💡 Details: `akb_help(topic="akb_put")`, `akb_help(topic="akb_edit")`, `akb_help(topic="akb_discover")`""",
 
     "search": """# Search & Discovery
 
-## akb_grep — Exact Text Search
+## akb_discover (action: grep) — Exact Text Search
 Find exact strings or regex patterns across documents. Use when you need precision, not meaning.
 For bulk replacement, use the separate writer operation `akb_grep_replace`.
 `limit` controls only the returned preview; `max_replacements` on the writer
 operation is a separate budget checked before any document changes.
 
 ```
-akb_grep(pattern="PostgreSQL 14")                                      # Find exact string
-akb_grep(pattern="api/v1/.*users", regex=true, vault="eng")           # Regex search
-akb_grep(pattern="TODO", collection="specs")                           # Search in collection
+akb_discover(action="grep", pattern="PostgreSQL 14")                                      # Find exact string
+akb_discover(action="grep", pattern="api/v1/.*users", regex=true, vault="eng")           # Regex search
+akb_discover(action="grep", pattern="TODO", collection="specs")                           # Search in collection
 akb_grep_replace(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16") # Find & replace
 ```
 
-## akb_search — Hybrid Search
+## akb_discover (action: search) — Hybrid Search
 Combines **vector similarity** (semantic meaning) with **keyword matching**.
 
 ```
-akb_search(query="how does authentication work")
-akb_search(query="gRPC vs REST", vault="engineering", type="decision")
-akb_search(query="invoice", tags=["finance"])
+akb_discover(action="search", query="how does authentication work")
+akb_discover(action="search", query="gRPC vs REST", vault="engineering", type="decision")
+akb_discover(action="search", query="invoice", tags=["finance"])
 # restrict to a known set of resources (hybrid retrieval runs only inside them):
-akb_search(query="auth flow", source_uris=[
+akb_discover(action="search", query="auth flow", source_uris=[
     "akb://engineering/coll/specs/doc/auth.md",
     "akb://engineering/coll/decisions/doc/oauth.md",
 ])
@@ -205,40 +205,40 @@ akb_search(query="auth flow", source_uris=[
 - `title`, `summary`: overview
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"` — **dispatch follow-up tool accordingly**
-- `uri`: pass to `akb_get` / `akb_drill_down` for documents,
+- `uri`: pass to `akb_document_read (action: get)` / `akb_document_read (action: section)` for documents,
         `akb_sql` for tables, `akb_get_file` for files
 - `vault`, `path`, `tags`, `doc_type`: metadata
 
-`akb_search` surfaces documents **and** tables **and** files in one
+`akb_discover (action: search)` surfaces documents **and** tables **and** files in one
 ranked list. Filter by `type="document"|"table"|"file"` to narrow.
 
-## akb_browse — Tree Navigation
+## akb_discover (action: browse) — Tree Navigation
 When you want to **see everything** rather than search:
 
 ```
-akb_browse(vault="v")                        # Root + first collection level (default depth=1)
-akb_browse(vault="v", collection="specs")    # Drill into specs/, direct children only
-akb_browse(vault="v", depth=-1)              # Entire vault subtree in one call
+akb_discover(action="browse", vault="v")                        # Root + first collection level (default depth=1)
+akb_discover(action="browse", vault="v", collection="specs")    # Drill into specs/, direct children only
+akb_discover(action="browse", vault="v", depth=-1)              # Entire vault subtree in one call
 ```
 
-## akb_drill_down — Section Reader
+## akb_document_read (action: section) — Section Reader
 When a document is long and you only need one part:
 
 ```
-akb_drill_down(uri="akb://v/doc/path/to/file.md")                    # All sections
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
+akb_document_read(action="section", uri="akb://v/doc/path/to/file.md")                    # All sections
+akb_document_read(action="section", uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
 ```
 
 ## Search → Read Pattern
 ```
-results = akb_search(query="deployment process")
+results = akb_discover(action="search", query="deployment process")
 r = results[0]
 
 # Dispatch by source_type — documents, tables, and files share the search
 # surface but need different read tools.
 if r.source_type == "document":
-    doc = akb_get(uri=r.uri)
-    section = akb_drill_down(uri=r.uri, section="Steps")
+    doc = akb_document_read(action="get", uri=r.uri)
+    section = akb_document_read(action="section", uri=r.uri, section="Steps")
 elif r.source_type == "table":
     rows = akb_sql(vault=r.vault, sql=f"SELECT * FROM {r.title}")
 elif r.source_type == "file":
@@ -251,14 +251,14 @@ elif r.source_type == "file":
 
 Tables are **real PostgreSQL tables** — full SQL support including
 GROUP BY, JOIN, subqueries, window functions, proper type sorting.
-Tables appear in `akb_browse` alongside documents and files.
+Tables appear in `akb_discover (action: browse)` alongside documents and files.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `akb_create_table` | Create table (DDL) |
-| `akb_browse(content_type="tables")` | List tables in a vault |
+| `akb_discover(action="browse", content_type="tables")` | List tables in a vault |
 | `akb_sql` | Execute any SQL (SELECT/INSERT/UPDATE/DELETE) |
 | `akb_alter_table` | Add/remove/rename columns (DDL) |
 | `akb_drop_table` | Delete table (DDL) |
@@ -302,11 +302,11 @@ akb_sql(vault="finance",
 ## Tools
 
 ```
-akb_search_users(query="kim")           # Find a user
+akb_identity(action="search_users", query="kim")           # Find a user
 akb_grant(vault="v", user="kim", role="writer")  # Grant access
 akb_revoke(vault="v", user="kim")       # Remove access
-akb_vault_members(vault="v")            # See who has access
-akb_vault_info(vault="v")               # Vault stats
+akb_vault_access(action="members", vault="v")            # See who has access
+akb_discover(action="vault_info", vault="v")               # Vault stats
 akb_transfer_ownership(vault="v", new_owner="kim")
 akb_archive_vault(vault="v")            # Make read-only
 ```
@@ -319,20 +319,20 @@ Templates: `engineering`, `qa`, `hr`, `finance`, `management`, `issue-tracking`,
 
     "history": """# Activity & Diff — Vault History
 
-Audit who changed what and when via Git history. Use `akb_diff` to
+Audit who changed what and when via Git history. Use `akb_document_read (action: diff)` to
 inspect the actual content change for a specific commit.
 
 ## Activity History (Git-based)
 ```
-akb_activity(vault="eng")                              # What happened in this vault?
-akb_activity(vault="eng", collection="specs")          # Only specs/ changes
-akb_activity(vault="eng", author="김영로")              # What did 김영로 do?
-akb_activity(vault="eng", since="2026-04-01", limit=5) # Recent 5 since April
+akb_document_read(action="activity", vault="eng")                              # What happened in this vault?
+akb_document_read(action="activity", vault="eng", collection="specs")          # Only specs/ changes
+akb_document_read(action="activity", vault="eng", author="김영로")              # What did 김영로 do?
+akb_document_read(action="activity", vault="eng", since="2026-04-01", limit=5) # Recent 5 since April
 ```
 
 ## Content Diff
 ```
-akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123")  # What changed in this commit?
+akb_document_read(action="diff", uri="akb://eng/doc/specs/api.md", commit="abc123")  # What changed in this commit?
 ```""",
 
     "publishing": """# Public Sharing — Documents, Tables, and Files
@@ -478,8 +478,8 @@ akb_unlink(
 
 ## Querying Relations
 ```
-akb_relations(uri="akb://eng/doc/specs/api.md")
-akb_relations(uri="akb://eng/table/experiments", direction="incoming")
+akb_relationships(action="relations", uri="akb://eng/doc/specs/api.md")
+akb_relationships(action="relations", uri="akb://eng/table/experiments", direction="incoming")
 ```
 Each returned row has `kind="explicit"` for an `akb_link` edge or
 `kind="implicit"` when it is managed by document metadata/body content.
@@ -488,13 +488,13 @@ implicit row.
 
 ## Graph View
 ```
-akb_graph(vault="eng")                           # Full vault graph (all types)
-akb_graph(uri="akb://eng/doc/specs/api.md", hops=2)
+akb_relationships(action="graph", vault="eng")                           # Full vault graph (all types)
+akb_relationships(action="graph", uri="akb://eng/doc/specs/api.md", hops=2)
 ```
 
 ## Provenance
 ```
-akb_provenance(uri="akb://eng/doc/specs/api.md")
+akb_document_read(action="provenance", uri="akb://eng/doc/specs/api.md")
 → who created it, when, and visible same-vault relations (including cross-type)
 ```""",
 
@@ -508,7 +508,7 @@ Use `akb_help(topic="link-resources")` for the updated cross-type linking guide.
 
 ### Step 1: Browse to find resources and their URIs
 ```
-akb_browse(vault="eng")
+akb_discover(action="browse", vault="eng")
 → collections, tables, files — each with a `uri` field
 ```
 
@@ -543,8 +543,8 @@ result = akb_put(vault="eng", collection="decisions", title="API Redesign",
 
 ### Step 4: Verify the graph
 ```
-akb_relations(uri="akb://eng/doc/specs/experiment-design.md")
-akb_graph(uri="akb://eng/doc/specs/experiment-design.md", hops=2)
+akb_relationships(action="relations", uri="akb://eng/doc/specs/experiment-design.md")
+akb_relationships(action="graph", uri="akb://eng/doc/specs/experiment-design.md", hops=2)
 ```
 
 ### Step 5: Remove a link if needed
@@ -563,19 +563,19 @@ akb_unlink(
 
 ### Step 1: Broad search
 ```
-results = akb_search(query="authentication")
+results = akb_discover(action="search", query="authentication")
 # Each result has a `uri` field — pass that to follow-up tools.
 ```
 
 ### Step 2: Read the top results
 ```
-akb_get(uri="akb://eng/doc/specs/top1.md")
-akb_drill_down(uri="akb://eng/doc/specs/top2.md", section="Implementation")
+akb_document_read(action="get", uri="akb://eng/doc/specs/top1.md")
+akb_document_read(action="section", uri="akb://eng/doc/specs/top2.md", section="Implementation")
 ```
 
 ### Step 3: Check related documents
 ```
-akb_relations(uri="akb://eng/doc/specs/top1.md")
+akb_relationships(action="relations", uri="akb://eng/doc/specs/top1.md")
 # Follow the links for more context
 ```
 
@@ -587,7 +587,7 @@ summary = akb_put(vault="eng", collection="reports",
   content="## Summary\\n\\nBased on ...",
   related_to=["akb://eng/doc/specs/top1.md", "akb://eng/doc/specs/top2.md"],
   tags=["auth", "research"])
-# summary["uri"] → use with akb_link, akb_relations, akb_publish, etc.
+# summary["uri"] → use with akb_link, akb_relationships (action: relations), akb_publish, etc.
 ```""",
 
     "onboarding": """# Workflow: Set Up a New Project Vault
@@ -600,12 +600,12 @@ Templates pre-create useful collections (specs, decisions, guides, etc.)
 
 ### Step 2: Browse the template structure
 ```
-akb_browse(vault="my-project", depth=-1)  # see the entire template subtree
+akb_discover(action="browse", vault="my-project", depth=-1)  # see the entire template subtree
 ```
 
 ### Step 3: Invite team members
 ```
-akb_search_users(query="kim")
+akb_identity(action="search_users", query="kim")
 akb_grant(vault="my-project", user="kim-dev", role="writer")
 akb_grant(vault="my-project", user="pm-lee", role="reader")
 ```
@@ -709,7 +709,7 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 {"uri": "akb://eng/doc/decisions/adopt-grpc.md", "path": "decisions/adopt-grpc.md", "chunks_indexed": 5}
 ```""",
 
-    "akb_get": """# akb_get — Retrieve a Document
+    "akb_get": """# akb_document_read (action: get) — Retrieve a Document
 
 ## Parameters
 | Param | Required | Description |
@@ -721,10 +721,10 @@ Full document: title, content, metadata (type, tags, status, created_by, dates),
 
 ## Examples
 ```
-akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md")
+akb_document_read(action="get", uri="akb://eng/doc/decisions/adopt-grpc.md")
 ```
 
-💡 For large documents, use `akb_drill_down` to read specific sections.""",
+💡 For large documents, use `akb_document_read (action: section)` to read specific sections.""",
 
     "akb_update": """# akb_update — Update a Document
 
@@ -782,13 +782,13 @@ If it appears multiple times, include more surrounding context to make it unique
 or set `replace_all=true` to replace every occurrence.
 
 ## Workflow
-1. `akb_get(uri)` → read current content
+1. `akb_document_read(action="get", uri)` → read current content
 2. Pick a distinctive piece of text you want to change
 3. `akb_edit(uri, old_string="...", new_string="...")` → apply
 
 For an inline image, upload it first with `akb_put_image`, then use the exact
 returned `markdown` as part of `new_string`. Pass the `current_commit` returned
-by `akb_get` as `base_commit` when concurrent writers are possible.
+by `akb_document_read (action: get)` as `base_commit` when concurrent writers are possible.
 
 ## Error Handling
 Errors return `error: "edit_failed"` with a message explaining:
@@ -825,10 +825,10 @@ akb_edit(uri="akb://eng/doc/notes/notes.md",
 
 💡 Tip: for whole-document rewrites use akb_update; for find-and-replace across many documents use akb_grep_replace.""",
 
-    "akb_browse": """# akb_browse — Browse ALL Vault Content
+    "akb_browse": """# akb_discover (action: browse) — Browse ALL Vault Content
 
 Shows documents (by collection), tables, and files in one unified view.
-Each item includes its `uri` for use with akb_link, akb_relations, etc.
+Each item includes its `uri` for use with akb_link, akb_relationships (action: relations), etc.
 
 ## Parameters
 | Param | Required | Description |
@@ -840,16 +840,16 @@ Each item includes its `uri` for use with akb_link, akb_relations, etc.
 
 ## Examples
 ```
-akb_browse(vault="eng")                         # Default: root + 1 collection level (depth=1)
-akb_browse(vault="eng", content_type="tables")  # Only tables (collections suppressed)
-akb_browse(vault="eng", collection="specs")     # Drill into specs/, direct children
-akb_browse(vault="eng", depth=-1)               # Entire vault subtree (unbounded)
-akb_browse(vault="eng", depth=0)                # Strict: vault root contents only
+akb_discover(action="browse", vault="eng")                         # Default: root + 1 collection level (depth=1)
+akb_discover(action="browse", vault="eng", content_type="tables")  # Only tables (collections suppressed)
+akb_discover(action="browse", vault="eng", collection="specs")     # Drill into specs/, direct children
+akb_discover(action="browse", vault="eng", depth=-1)               # Entire vault subtree (unbounded)
+akb_discover(action="browse", vault="eng", depth=0)                # Strict: vault root contents only
 ```
 
 💡 Use content_type to filter when you only need one data type.""",
 
-    "akb_search": """# akb_search — Hybrid Search
+    "akb_search": """# akb_discover (action: search) — Hybrid Search
 
 Combines vector similarity (meaning) with keyword matching.
 
@@ -865,23 +865,23 @@ Combines vector similarity (meaning) with keyword matching.
 
 ## Examples
 ```
-akb_search(query="deployment process")
-akb_search(query="인증 흐름", vault="eng", type="spec")
-akb_search(query="budget", tags=["finance"], limit=5)
+akb_discover(action="search", query="deployment process")
+akb_discover(action="search", query="인증 흐름", vault="eng", type="spec")
+akb_discover(action="search", query="budget", tags=["finance"], limit=5)
 ```
 
 ## Result Fields
-- `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)
+- `uri`: AKB URI — pass to akb_document_read (action: get) / akb_document_read (action: section) (docs), akb_get_file (files), akb_sql (tables)
 - `title`, `summary`: overview
 - `score`: relevance (0.0-1.0)
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"`
 - `vault`, `collection`, `type`, `tags`: metadata""",
 
-    "akb_grep": """# akb_grep — Exact Text / Regex Search
+    "akb_grep": """# akb_discover (action: grep) — Exact Text / Regex Search
 
 Find exact strings or regex patterns across document content.
-Unlike akb_search (semantic), this finds **exact matches** — use it for
+Unlike akb_discover (action: search) (semantic), this finds **exact matches** — use it for
 specific terms, URLs, code snippets, version numbers, error codes, etc.
 
 For bulk replacement, use the separate writer operation `akb_grep_replace`.
@@ -898,21 +898,21 @@ For bulk replacement, use the separate writer operation `akb_grep_replace`.
 | count_only | | Return exact per-resource counts without snippets |
 | measurement_include_text_files | | Native mode: include admitted searchable text Files; binary Files stay excluded |
 
-## When to use akb_grep vs akb_search
+## When to use akb_discover (action: grep) vs akb_discover (action: search)
 | Need | Tool |
 |------|------|
-| Find docs about "authentication" (concept) | `akb_search` |
-| Find docs containing "JWT_SECRET" (exact string) | `akb_grep` |
-| Find all references to a URL or API path | `akb_grep` |
-| Find docs related to a topic | `akb_search` |
-| Find docs with a specific version number | `akb_grep` |
+| Find docs about "authentication" (concept) | `akb_discover (action: search)` |
+| Find docs containing "JWT_SECRET" (exact string) | `akb_discover (action: grep)` |
+| Find all references to a URL or API path | `akb_discover (action: grep)` |
+| Find docs related to a topic | `akb_discover (action: search)` |
+| Find docs with a specific version number | `akb_discover (action: grep)` |
 
 ## Search Examples
 ```
-akb_grep(pattern="PostgreSQL")
-akb_grep(pattern="api/v1/users", vault="eng")
-akb_grep(pattern="TODO|FIXME", regex=true)
-akb_grep(pattern="Bearer", case_sensitive=true)
+akb_discover(action="grep", pattern="PostgreSQL")
+akb_discover(action="grep", pattern="api/v1/users", vault="eng")
+akb_discover(action="grep", pattern="TODO|FIXME", regex=true)
+akb_discover(action="grep", pattern="Bearer", case_sensitive=true)
 ```
 
 ## Replace Examples
@@ -924,7 +924,7 @@ akb_grep_replace(pattern="PostgreSQL 14", vault="eng", replace="PostgreSQL 16")
 akb_grep_replace(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 ```
 
-`akb_grep_replace` requires one explicit vault and writer access. Run `akb_grep`
+`akb_grep_replace` requires one explicit vault and writer access. Run `akb_discover (action: grep)`
 first to preview matches, then set `max_replacements` high enough for the intended scope.
 Each replaced document gets its own git commit and is re-indexed for search.
 
@@ -943,9 +943,9 @@ The replacement operation also includes `replaced_docs` count and a `replacement
 
 Replace exact strings or regex matches in documents from exactly one vault. Requires writer access.
 The full match set is checked against `max_replacements` before any document changes.
-See `akb_help(topic="akb_grep")` for search behavior and replacement examples.""",
+See `akb_help(topic="akb_discover")` for search behavior and replacement examples.""",
 
-    "akb_drill_down": """# akb_drill_down — Section-Level Reader
+    "akb_drill_down": """# akb_document_read (action: section) — Section-Level Reader
 
 Read specific sections of a document without loading everything.
 
@@ -957,9 +957,9 @@ Read specific sections of a document without loading everything.
 
 ## Examples
 ```
-akb_drill_down(uri="akb://eng/doc/specs/api.md")                    # All section headings
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
+akb_document_read(action="section", uri="akb://eng/doc/specs/api.md")                    # All section headings
+akb_document_read(action="section", uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
+akb_document_read(action="section", uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
 ```
 
 💡 Token-efficient: read summaries via browse, then drill into the section you need.""",
@@ -1040,12 +1040,12 @@ akb_create_table(vault="finance", name="invoices",
   indexes=[{"columns": ["status", {"name": "due_date", "order": "desc"}]}])
 ```""",
 
-    "akb_list_vaults": """# akb_list_vaults — List Accessible Vaults
+    "akb_list_vaults": """# akb_discover (action: list_vaults) — List Accessible Vaults
 
 No parameters. Returns all vaults you have access to.
 
 ```
-akb_list_vaults()
+akb_discover(action="list_vaults")
 → {"vaults": [{"name": "eng", "description": "...", "role": "writer"}, ...]}
 ```""",
 
@@ -1136,26 +1136,26 @@ akb_delete(uri="akb://eng/doc/specs/api.md")
 
 Requires writer role. All edges referencing this document are automatically cleaned up.""",
 
-    "akb_relations": """# akb_relations — Resource Relations (Cross-Type)
+    "akb_relations": """# akb_relationships (action: relations) — Resource Relations (Cross-Type)
 
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | Resource AKB URI (from akb_browse results) |
+| uri | ✓ | Resource AKB URI (from akb_discover (action: browse) results) |
 | direction | | incoming, outgoing, both (default) |
 | type | | depends_on, related_to, implements, references, attached_to, derived_from |
 
 ## Examples
 ```
-akb_relations(uri="akb://eng/doc/specs/api.md")
-akb_relations(uri="akb://eng/table/experiments", direction="incoming")
+akb_relationships(action="relations", uri="akb://eng/doc/specs/api.md")
+akb_relationships(action="relations", uri="akb://eng/table/experiments", direction="incoming")
 ```
 
 Every returned row includes `kind`: `explicit` rows are removable with
 `akb_unlink`; `implicit` rows must be removed by editing the document metadata
 or Markdown link that generated them. Relations never cross vaults.""",
 
-    "akb_graph": """# akb_graph — Knowledge Graph (Cross-Type)
+    "akb_graph": """# akb_relationships (action: graph) — Knowledge Graph (Cross-Type)
 
 Shows nodes (documents, tables, files) and edges (all relation types).
 
@@ -1171,12 +1171,12 @@ Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource)
 
 ## Examples
 ```
-akb_graph(vault="eng")                                            # Full vault graph
-akb_graph(uri="akb://eng/table/experiments", hops=2)              # From a table
-akb_graph(uri="akb://eng/doc/specs/api.md", hops=3)               # 3-hop from doc
+akb_relationships(action="graph", vault="eng")                                            # Full vault graph
+akb_relationships(action="graph", uri="akb://eng/table/experiments", hops=2)              # From a table
+akb_relationships(action="graph", uri="akb://eng/doc/specs/api.md", hops=3)               # 3-hop from doc
 ```""",
 
-    "akb_provenance": """# akb_provenance — Document Provenance
+    "akb_provenance": """# akb_document_read (action: provenance) — Document Provenance
 
 Shows who created a document, when, and its visible same-vault relations
 (including cross-type).
@@ -1188,49 +1188,49 @@ Shows who created a document, when, and its visible same-vault relations
 
 ## Example
 ```
-akb_provenance(uri="akb://eng/doc/specs/api.md")
+akb_document_read(action="provenance", uri="akb://eng/doc/specs/api.md")
 → {title, path, vault, uri, created_by, created_at, updated_at, relations: [...]}
 ```""",
 
-    "akb_history": """# akb_history — Document Version History
+    "akb_history": """# akb_document_read (action: history) — Document Version History
 
 ```
-akb_history(uri="akb://eng/doc/specs/api.md")
+akb_document_read(action="history", uri="akb://eng/doc/specs/api.md")
 → [{"hash": "abc123def456", "date": "2026-04-03T12:00:00", "author": "admin", "message": "Update specs"}]
 
-akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
+akb_document_read(action="get", uri="akb://eng/doc/specs/api.md", version="abc123def456")
 → content at that specific version
 ```
 
-Each document change creates a Git commit. Use akb_history to see all versions, then akb_get with version= to read any past version.""",
+Each document change creates a Git commit. Use akb_document_read (action: history) to see all versions, then akb_document_read (action: get) with version= to read any past version.""",
 
-    "akb_activity": """# akb_activity — Vault Activity History (Git-based)
+    "akb_activity": """# akb_document_read (action: activity) — Vault Activity History (Git-based)
 
 Shows who changed what, when, and why. Each entry is a Git commit.
 
 ```
-akb_activity(vault="eng")                              # All activity
-akb_activity(vault="eng", collection="specs")          # Only specs/ changes
-akb_activity(vault="eng", author="김영로")              # By author
-akb_activity(vault="eng", since="2026-04-01", limit=5) # Since date
+akb_document_read(action="activity", vault="eng")                              # All activity
+akb_document_read(action="activity", vault="eng", collection="specs")          # Only specs/ changes
+akb_document_read(action="activity", vault="eng", author="김영로")              # By author
+akb_document_read(action="activity", vault="eng", since="2026-04-01", limit=5) # Since date
 ```
 
 Each entry includes:
-- hash: commit hash (use with akb_diff)
+- hash: commit hash (use with akb_document_read (action: diff))
 - subject: commit message
 - author/agent: who made the change
 - action: create/update/delete
 - summary: change description
 - files: [{path, change: added/modified/deleted}]
 
-Use `akb_diff(uri, commit=hash)` to see the actual content diff.""",
+Use `akb_document_read(action="diff", uri, commit=hash)` to see the actual content diff.""",
 
-    "akb_diff": """# akb_diff — Document Content Diff
+    "akb_diff": """# akb_document_read (action: diff) — Document Content Diff
 
 Shows what was added/removed in a specific commit.
 
 ```
-akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123def456")
+akb_document_read(action="diff", uri="akb://eng/doc/specs/api.md", commit="abc123def456")
 ```
 
 Returns:
@@ -1239,8 +1239,8 @@ Returns:
 - diff: unified diff (+ for additions, - for removals)
 
 Find commit hashes via:
-- akb_history(uri) → per-document versions
-- akb_activity(vault) → vault-wide activity""",
+- akb_document_read(action="history", uri) → per-document versions
+- akb_document_read(action="activity", vault) → vault-wide activity""",
 
     "akb_publish": """# akb_publish — Create a Public Share
 
@@ -1352,27 +1352,27 @@ akb_revoke(vault="v", user="kim")
 
 Requires owner or admin role. Cannot revoke the owner.""",
 
-    "akb_vault_info": """# akb_vault_info — Vault Statistics
+    "akb_vault_info": """# akb_discover (action: vault_info) — Vault Statistics
 
 ```
-akb_vault_info(vault="v")
+akb_discover(action="vault_info", vault="v")
 → {name, description, owner, member_count, document_count, table_count, file_count, edge_count, last_activity, created_at}
 ```""",
 
-    "akb_vault_members": """# akb_vault_members — List Members
+    "akb_vault_members": """# akb_vault_access (action: members) — List Members
 
 ```
-akb_vault_members(vault="v")
+akb_vault_access(action="members", vault="v")
 → [{username, display_name, role, granted_at}, ...]
 ```
 
 Roles: owner, admin, writer, reader.""",
 
-    "akb_search_users": """# akb_search_users — Find Users
+    "akb_search_users": """# akb_identity (action: search_users) — Find Users
 
 ```
-akb_search_users(query="kim")
-akb_search_users(query="kim", limit=5)
+akb_identity(action="search_users", query="kim")
+akb_identity(action="search_users", query="kim", limit=5)
 ```
 
 Search by username, display name, or email. Use before `akb_grant`.""",
@@ -1406,10 +1406,10 @@ Levels:
 
 Owner only.""",
 
-    "akb_whoami": """# akb_whoami — Check Your Identity
+    "akb_whoami": """# akb_identity (action: whoami) — Check Your Identity
 
 ```
-akb_whoami()
+akb_identity(action="whoami")
 ```
 
 Returns your current profile: username, display name, email, admin status, account creation date.
@@ -1480,7 +1480,7 @@ Downloads from S3 to a local path. Handled by akb-mcp stdio proxy.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| uri | ✓ | File AKB URI (`akb://{vault}/file/{id}`, from akb_browse) |
+| uri | ✓ | File AKB URI (`akb://{vault}/file/{id}`, from akb_discover (action: browse)) |
 | save_to | ✓ | Local directory or file path |
 
 ## Example
@@ -1583,7 +1583,7 @@ targeted edit. Do not send an image fragment to `akb_update(content=...)`; that
 field replaces the complete document body.
 
 ```
-doc = akb_get(uri="akb://eng/coll/specs/doc/request-processing.md")
+doc = akb_document_read(action="get", uri="akb://eng/coll/specs/doc/request-processing.md")
 image = akb_put_image(
   parent="akb://eng/coll/specs",
   file_path="/workspace/architecture.png",
@@ -1682,7 +1682,7 @@ akb_put(parent="akb://eng/coll/specs", title="Authentication",
 Read the document first so the edit can be pinned to the observed commit:
 
 ```
-doc = akb_get(uri="akb://eng/coll/specs/doc/auth.md")
+doc = akb_document_read(action="get", uri="akb://eng/coll/specs/doc/auth.md")
 akb_edit(uri=doc.uri,
   old_string="## Architecture",
   new_string="## Architecture\n\n" + image.markdown,
@@ -1716,7 +1716,7 @@ after 24 hours by default even if this cleanup call is missed.""",
     "files": """# File Storage (S3-backed)
 
 Binary files (images, PDFs, exports) stored in S3 with metadata in PostgreSQL.
-Files appear in `akb_browse` alongside documents and tables.
+Files appear in `akb_discover (action: browse)` alongside documents and tables.
 
 For an image that should render *inside* Markdown, use `akb_put_image` instead.
 That path creates a hidden document attachment and returns the Markdown to embed.
@@ -1732,7 +1732,7 @@ they are handled by the akb-mcp stdio proxy which streams files directly to/from
 | `akb_get_file` | Download a file to a local path |
 | `akb_update_file` | Replace a file with optional hash/version preconditions |
 | `akb_delete_file` | Delete a file |
-| `akb_browse` | Files appear in unified browse |
+| `akb_discover (action: browse)` | Files appear in unified browse |
 | `akb_link` | Connect file to documents or tables |
 
 ## Upload
@@ -1782,7 +1782,7 @@ akb_put_file(vault="eng", file_path="/path/to/report.pdf", collection="reports",
 → {"uri": "akb://eng/file/abc123", "name": "report.pdf", "collection": "reports", "size_bytes": 128000}
 ```
 
-After upload, the file appears in `akb_browse` and can be linked with `akb_link` (use the returned `uri`).""",
+After upload, the file appears in `akb_discover (action: browse)` and can be linked with `akb_link` (use the returned `uri`).""",
 
     "akb_link": """# akb_link — Connect Any Two Resources
 
@@ -1853,6 +1853,51 @@ akb_unlink(
     "vault-skill": "",  # populated after VAULT_SKILL_TOPIC_BODY is defined below
 
 }
+
+_GROUPED_ACTION_HELP_TOPICS = frozenset({
+    "akb_list_vaults", "akb_vault_info", "akb_browse", "akb_search", "akb_grep",
+    "akb_get", "akb_drill_down", "akb_activity", "akb_history", "akb_diff",
+    "akb_provenance", "akb_relations", "akb_graph", "akb_whoami",
+    "akb_search_users", "akb_vault_members",
+})
+
+HELP.update({
+    "akb_discover": """# akb_discover — Vault and Content Discovery
+
+Choose an action and pass its arguments alongside it:
+- `list_vaults`: list accessible vaults
+- `vault_info`: read vault statistics
+- `browse`: inspect collections, documents, tables, and files
+- `search`: hybrid semantic and keyword search
+- `grep`: exact text or regex search
+
+Examples: `akb_discover(action="browse", vault="eng")` and
+`akb_discover(action="search", query="authentication flow").`""",
+    "akb_document_read": """# akb_document_read — Document Readers
+
+Choose `get`, `section`, `activity`, `history`, `diff`, or `provenance`.
+Pass the selected action's arguments alongside `action`; the action schema
+rejects fields that belong to another action.
+
+Examples: `akb_document_read(action="get", uri="akb://eng/doc/notes/a.md")`
+and `akb_document_read(action="history", uri="akb://eng/doc/notes/a.md").`""",
+    "akb_relationships": """# akb_relationships — Relationship Readers
+
+Choose `relations` to inspect links around one resource, or `graph` to
+traverse relationships in one vault. Pass the action's fields alongside
+`action`.
+
+Examples: `akb_relationships(action="relations", uri="akb://eng/doc/notes/a.md")`
+and `akb_relationships(action="graph", vault="eng", hops=2).`""",
+    "akb_identity": """# akb_identity — Identity Readers
+
+Choose `whoami` to inspect the current caller or `search_users` to find users
+visible to the caller. Pass the action's fields alongside `action`.""",
+    "akb_vault_access": """# akb_vault_access — Vault Access Readers
+
+Choose `members` to list vault membership or `explain` to see why a
+caller has a role. Pass the action's fields alongside `action`.""",
+})
 
 
 
@@ -1935,7 +1980,10 @@ def _resolve_help(topic: str | None) -> str:
     # List all available topics
     categories = [k for k in HELP if k and not k.startswith("akb_") and "-" not in k]
     workflows = [k for k in HELP if k and "-" in k and not k.startswith("akb_")]
-    tools = [k for k in HELP if k and k.startswith("akb_")]
+    tools = [
+        k for k in HELP
+        if k and k.startswith("akb_") and k not in _GROUPED_ACTION_HELP_TOPICS
+    ]
 
     return f"""# No help found for "{topic}"
 
@@ -1981,8 +2029,8 @@ For the full text (the payload may be truncated) call:
     akb_help(topic="vault-skill", vault="<vault>")
 
 When a vault has no skill, agents follow these fallback rules:
-- akb_browse before writing to learn the existing collection layout
-- akb_search / akb_grep before writing to avoid duplicates
+- akb_discover (action: browse) before writing to learn the existing collection layout
+- akb_discover (action: search) / akb_discover (action: grep) before writing to avoid duplicates
 - Never inline secrets; use ${{secrets.X}} placeholders
 """
 
@@ -1998,9 +2046,9 @@ git mirror vault, which has no skill by design — follow the generic rules
 below and the mirrored repository's own conventions.
 
 First steps when writing into an unfamiliar vault:
-1. akb_browse(vault="{vault}") — see top-level collections, tables, files
-2. akb_browse(vault="{vault}", collection="<collection>") — look inside a target collection
-3. akb_search(query="<keyword>", vault="{vault}") — find similar prior writes
+1. akb_discover(action="browse", vault="{vault}") — see top-level collections, tables, files
+2. akb_discover(action="browse", vault="{vault}", collection="<collection>") — look inside a target collection
+3. akb_discover(action="search", query="<keyword>", vault="{vault}") — find similar prior writes
 4. Compose your doc with a title + collection + type that match the patterns above
 
 When writing:

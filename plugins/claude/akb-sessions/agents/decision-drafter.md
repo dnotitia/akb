@@ -2,7 +2,7 @@
 name: decision-drafter
 description: Identify long-lived decisions made during the session and compose ADR-style Decision drafts with Alternatives Considered as the canonical home for anti-pattern memory.
 model: sonnet
-tools: Read, Glob, Grep, mcp__akb__akb_search, mcp__akb__akb_get
+tools: Read, Glob, Grep, mcp__akb__akb_discover, mcp__akb__akb_document_read
 ---
 
 # Decision Drafter
@@ -81,8 +81,7 @@ After composing drafts, check each one against the AKB vault before returning.
 For each draft:
 
 ```text
-mcp__akb__akb_search(
-  query="{draft title + key terms}",
+mcp__akb__akb_discover(action="search", query="{draft title + key terms}",
   vault="{vault_name from session context}",
   collection="{draft collection}",
   limit=5
@@ -90,8 +89,8 @@ mcp__akb__akb_search(
 ```
 
 **Determine disposition** — for each search result with relevance > 0.8:
-- If the search result already provides a `summary` and tags adequate to judge overlap, skip `akb_get` and decide from the search payload
-- Otherwise read the existing document: `mcp__akb__akb_get(vault, doc_id)` and compare content overlap
+- If the search result already provides a `summary` and tags adequate to judge overlap, skip `akb_document_read` and decide from the search payload
+- Otherwise read the existing document: `mcp__akb__akb_document_read(action="get", vault, doc_id)` and compare content overlap
 - Decide:
   - **skip**: Content already exists (>80% overlap). Do not include this draft — report the skip instead.
   - **append**: Same topic but new content adds value. Include draft with `disposition: append` and `append_target: {existing_doc_id}`. The draft body should express the **combined** compiled truth (existing Context / Decision / Consequences / Alternatives Considered merged with new refinement, conflicts resolved in favor of the newer understanding). The ingest skill will read the existing doc, adopt your merged compiled truth, and prepend a new timeline entry — so write the draft body as if it were the new canonical state of the decision.
@@ -101,11 +100,11 @@ If no result has relevance > 0.8: `disposition: create`.
 
 When in doubt between create and append, prefer create.
 
-**Collect related documents** — from the same search results, collect matches with relevance >= 0.7 as `related_to` candidates. Include if the topic genuinely connects to the draft, exclude if the keyword match is superficial. Documents already marked as skip or append targets are excluded. Render each candidate as a full `akb://{vault_name}/doc/{path}` URI (always-URI cross-ref convention) — `path` is provided by the `akb_search` payload alongside `doc_id`.
+**Collect related documents** — from the same search results, collect matches with relevance >= 0.7 as `related_to` candidates. Include if the topic genuinely connects to the draft, exclude if the keyword match is superficial. Documents already marked as skip or append targets are excluded. Render each candidate as a full `akb://{vault_name}/doc/{path}` URI (always-URI cross-ref convention) — `path` is provided by the `akb_discover` payload alongside `doc_id`.
 
 **Update mode** — matches against notes from the same `session:{session_id}` created in a prior ingest are expected. Only skip if content is truly redundant, not merely because it shares session origin. Prior ingest notes are strong `related_to` candidates.
 
-If `akb_search` fails or is unavailable, skip validation and set all drafts to `disposition: create` with empty `related_to`.
+If `akb_discover` fails or is unavailable, skip validation and set all drafts to `disposition: create` with empty `related_to`.
 
 ## Output Format
 

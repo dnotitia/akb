@@ -23,11 +23,11 @@ import asyncio
 import pytest
 
 from mcp_server import server as mcp_server
-from mcp_server.tools import TOOLS
+from mcp_server.tools import OPERATIONS, TOOLS
 
 
 def _schema(name: str) -> dict:
-    for tool in TOOLS:
+    for tool in OPERATIONS:
         if tool.name == name:
             return tool.input_schema
     raise AssertionError(f"{name} is not advertised at all")
@@ -46,7 +46,13 @@ def test_basis_arguments_are_advertised(tool):
 
 
 def test_explanation_is_reachable_over_mcp():
-    props = _schema("akb_explain_access")["properties"]
+    access = next(tool for tool in TOOLS if tool.name == "akb_vault_access")
+    branch = next(
+        branch
+        for branch in access.input_schema["oneOf"]
+        if branch["properties"]["action"]["const"] == "explain"
+    )
+    props = branch["properties"]
     assert {"vault", "user"} <= set(props)
 
 

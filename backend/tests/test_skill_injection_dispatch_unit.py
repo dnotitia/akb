@@ -91,6 +91,17 @@ def wired(monkeypatch):
 
 
 async def _run(name: str, args: dict) -> dict:
+    from mcp_server.tools import TOOL_GROUPS
+
+    for group, actions in TOOL_GROUPS.items():
+        for action, operation in actions.items():
+            if operation == name:
+                name = group
+                args = {"action": action, **args}
+                break
+        else:
+            continue
+        break
     out = await call_tool(name, args)
     return json.loads(out.content[0].text)
 
@@ -304,11 +315,13 @@ async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
         by_name["akb_grep_replace"].input_schema["properties"]
     )
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_grep"].input_schema["properties"]
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_discover"].input_schema["oneOf"]
     )
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_get"].input_schema["properties"]
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_document_read"].input_schema["oneOf"]
     )
 
 

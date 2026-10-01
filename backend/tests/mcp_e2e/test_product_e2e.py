@@ -12,6 +12,7 @@ import pytest
 from mcp import Client
 from mcp import types as mcp_types
 
+from mcp_server.tools import TOOL_GROUPS
 from .conftest import SecondaryMcpSession
 from .runtime import RuntimeContext, redact_error
 
@@ -39,6 +40,15 @@ async def _call_json(
     expect_error: bool = False,
 ) -> dict[str, Any]:
     operation = f"tools/call {name}"
+    for group, actions in TOOL_GROUPS.items():
+        for action, operation_name in actions.items():
+            if operation_name == name:
+                name = group
+                arguments = {"action": action, **arguments}
+                break
+        else:
+            continue
+        break
     try:
         result = await client.call_tool(name, arguments)
     except Exception as exc:
