@@ -20,6 +20,7 @@ from typing import Final, Protocol, runtime_checkable
 import asyncpg
 
 from app.exceptions import ConflictError, NotFoundError, ValidationError
+from app.repositories.events_repo import emit_event
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.m1_reference_payload_store import (
     M1ReferencePayloadStore,
@@ -27,7 +28,7 @@ from app.services.m1_reference_payload_store import (
     ReferencePayloadIntegrityError,
 )
 from app.services.native_payload_verification import payload_store_for_placement
-from app.services.notification_producer import enqueue_document_change
+from app.services.uri_service import doc_uri
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
@@ -308,6 +309,40 @@ class NativeRevisionService:
         async with self.pool.acquire() as acquired:
             async with acquired.transaction():
                 yield acquired
+
+    async def _emit_document_change(
+        self, conn: asyncpg.Connection, kind: str, *, surface: str,
+        namespace_id: uuid.UUID, resource_id: uuid.UUID, path: str,
+        revision_id: str, parent_revision_id: str | None, actor: str,
+        old_path: str | None = None, previous_status: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        """Publish at the authority boundary, including caller-owned TXs.
+
+        File resources here can be searchable projections of catalog Files.
+        Their public events belong to FileService, not projection rebuilds.
+        A mutation replay returns before this hook; a rollback drops its event.
+        """
+        if surface != "document":
+            return
+        vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", namespace_id)
+        payload = {
+            "vault": vault, "path": path,
+            "collection": path.rpartition("/")[0],
+            "resource_id": str(resource_id), "revision_id": revision_id,
+            "commit_hash": revision_id, "previous_commit": parent_revision_id,
+        }
+        if old_path is not None:
+            payload.update(
+                old_path=old_path, old_uri=doc_uri(vault, old_path),
+                old_collection=old_path.rpartition("/")[0],
+            )
+        if kind == "document.update":
+            payload.update(previous_status=previous_status, status=status)
+        await emit_event(
+            conn, kind, vault_id=namespace_id, resource_uri=doc_uri(vault, path),
+            actor_id=actor, payload=payload,
+        )
 
     async def _lock_live_reference(
         self,
@@ -612,6 +647,11 @@ class NativeRevisionService:
                     path_to=path,
                     occurred_at=occurred_at,
                 )
+                await self._emit_document_change(
+                    conn, "document.put", surface=surface, namespace_id=namespace_id,
+                    resource_id=resource_id, path=path, revision_id=revision_id,
+                    parent_revision_id=None, actor=actor,
+                )
                 await self._hit("authority.after_activity")
                 await self.repository.insert_invalidation_intent(
                     conn,
@@ -803,12 +843,12 @@ class NativeRevisionService:
                     path_to=None,
                     occurred_at=occurred_at,
                 )
-                if surface == "document":
-                    await enqueue_document_change(
-                        conn, "document.update", source_key=f"native:{activity_id}",
-                        vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
-                        previous_status=notification_previous_status, status=notification_status,
-                    )
+                await self._emit_document_change(
+                    conn, "document.update", surface=surface, namespace_id=namespace_id,
+                    resource_id=resource_id, path=current_path, revision_id=revision_id,
+                    parent_revision_id=parent_revision_id, actor=actor,
+                    previous_status=notification_previous_status, status=notification_status,
+                )
                 await self._hit("authority.after_activity")
                 await self.repository.insert_invalidation_intent(
                     conn,
@@ -1030,11 +1070,11 @@ class NativeRevisionService:
                         path_to=None,
                         occurred_at=occurred_at,
                     )
-                    if surface == "document":
-                        await enqueue_document_change(
-                            conn, "document.restore", source_key=f"native:{activity_id}",
-                            vault_id=namespace_id, resource_id=expected_resource_id, actor_username=actor,
-                        )
+                    await self._emit_document_change(
+                        conn, "document.restore", surface=surface, namespace_id=namespace_id,
+                        resource_id=expected_resource_id, path=path, revision_id=revision_id,
+                        parent_revision_id=parent_revision_id, actor=actor,
+                    )
                     await self._hit("authority.after_activity")
                     await self.repository.insert_invalidation_intent(
                         conn,
@@ -1262,11 +1302,11 @@ class NativeRevisionService:
                         path_to=path_to,
                         occurred_at=occurred_at,
                     )
-                    if surface == "document":
-                        await enqueue_document_change(
-                            conn, "document.move", source_key=f"native:{activity_id}",
-                            vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
-                        )
+                    await self._emit_document_change(
+                        conn, "document.move", surface=surface, namespace_id=namespace_id,
+                        resource_id=resource_id, path=path_to, revision_id=revision_id,
+                        parent_revision_id=parent_revision_id, actor=actor, old_path=old_path,
+                    )
                     await self._hit("authority.after_activity")
                     await self.repository.insert_invalidation_intent(
                         conn,
@@ -1444,11 +1484,11 @@ class NativeRevisionService:
                     path_to=None,
                     occurred_at=occurred_at,
                 )
-                if surface == "document":
-                    await enqueue_document_change(
-                        conn, "document.delete", source_key=f"native:{activity_id}",
-                        vault_id=namespace_id, resource_id=resource_id, actor_username=actor,
-                    )
+                await self._emit_document_change(
+                    conn, "document.delete", surface=surface, namespace_id=namespace_id,
+                    resource_id=resource_id, path=current_path, revision_id=revision_id,
+                    parent_revision_id=parent_revision_id, actor=actor,
+                )
                 await self._hit("authority.after_activity")
                 await self.repository.insert_invalidation_intent(
                     conn,

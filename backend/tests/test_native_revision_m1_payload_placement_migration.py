@@ -55,6 +55,7 @@ async def _create_database(admin: asyncpg.Connection, name: str) -> str:
     conn = await asyncpg.connect(dsn)
     try:
         await conn.execute(INIT_SQL)
+        await _migration("015_events_outbox.py").migrate(conn=conn)
         await _migration("048_native_revision_core.py").migrate(conn=conn)
         await _migration("053_native_revision_m1_pg_body.py").migrate(conn=conn)
     finally:
