@@ -658,7 +658,10 @@ def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
 
 @_h("akb_get")
 async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    try:
+        vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    except ValueError as exc:
+        return err(str(exc), code=INVALID_URI)
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")

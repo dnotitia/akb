@@ -125,3 +125,33 @@ async def test_sdk_tool_request_rejects_invalid_schema_before_handler(
     assert dispatches == []
     assert audit[0][0:2] == (audit_name, audit_arguments)
     assert usage[0][0:2] == (audit_name, audit_arguments)
+
+
+@pytest.mark.asyncio
+async def test_get_maps_malformed_uri_to_invalid_uri(monkeypatch, audit_sinks):
+    audit, usage = audit_sinks
+
+    async def current_user():
+        return mcp_server._MCPUser(
+            user_id="user-1", token_scopes=frozenset({"read", "write"}),
+        )
+
+    monkeypatch.setattr(mcp_server, "_get_user", current_user)
+
+    response = await mcp_server._call_tool_request(
+        None,
+        CallToolRequestParams(
+            name="akb_document_read",
+            arguments={"action": "get", "uri": "not-a-canonical-uri"},
+        ),
+    )
+    payload = json.loads(response.content[0].text)
+
+    assert response.is_error is True
+    assert payload["code"] == "invalid_uri"
+    assert audit[0][0:2] == (
+        "akb_get", {"uri": "not-a-canonical-uri"},
+    )
+    assert usage[0][0:2] == (
+        "akb_get", {"uri": "not-a-canonical-uri"},
+    )
