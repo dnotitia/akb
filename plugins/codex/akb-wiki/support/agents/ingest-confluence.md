@@ -146,11 +146,11 @@ Two deterministic signals + optional semantic, with version monotonicity short-c
 
 #### Stage 1 — Deterministic match by `(space_key, page_id)`
 
-`akb_search(vault={vault_name}, collection=atlassian-pages, type=reference, tags=["page-id:{page_id}"], limit=5)`. Single-tag filter narrows to the exact page-id cell — AKB's `tags` filter has OR semantics, so multi-tag would broaden instead of narrow; one tag reduces to exact-membership. Confluence page ids are tenant-unique, so `page-id:{page_id}` + collection scope is sufficient. On hit, capture `dedup_hit = doc_id` and `dedup_existing_version = int(version_tag.split(":", 1)[1])` from the `version:{N}` tag; set `dedup_kind = "deterministic"`. Skip Stage 2.
+`akb_discover(action="search", vault={vault_name}, collection=atlassian-pages, type=reference, tags=["page-id:{page_id}"], limit=5)`. Single-tag filter narrows to the exact page-id cell — AKB's `tags` filter has OR semantics, so multi-tag would broaden instead of narrow; one tag reduces to exact-membership. Confluence page ids are tenant-unique, so `page-id:{page_id}` + collection scope is sufficient. On hit, capture `dedup_hit = doc_id` and `dedup_existing_version = int(version_tag.split(":", 1)[1])` from the `version:{N}` tag; set `dedup_kind = "deterministic"`. Skip Stage 2.
 
 #### Stage 2 — Semantic fallback
 
-Only runs when Stage 1 produced no hit. `akb_search(query={title}, vault={vault_name}, collection=atlassian-pages, type=reference, limit=5)`. Any hit with `score > 0.85` is a fuzzy match — capture `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`.
+Only runs when Stage 1 produced no hit. `akb_discover(action="search", query={title}, vault={vault_name}, collection=atlassian-pages, type=reference, limit=5)`. Any hit with `score > 0.85` is a fuzzy match — capture `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`.
 
 #### Decision
 
@@ -250,7 +250,7 @@ Branch by Step 4 resolution.
 
 **Replace** (deterministic newer, or fuzzy resolved to replace):
 
-1. `akb_get(vault={vault_name}, doc_id={dedup_hit}) → existing_content`.
+1. `akb_document_read(action="get", vault={vault_name}, doc_id={dedup_hit}) → existing_content`.
 2. Apply **timeline merge — Mode B (entry-only append)** with `new_entry = "- **{today}** | Re-ingested page version {page.version} (was version {dedup_existing_version}). [Source: ingest-confluence, {today}]"`.
 3. Build final `content`: everything from the new body **above** `---` + `## Timeline` (compiled-truth refresh) + Mode B's merged timeline section.
 4. `akb_update(vault={vault_name}, doc_id={dedup_hit}, tags={tags}, content={merged_content}, summary={one_sentence_summary}, message="Re-ingested page version {page.version}")` — bumped `version:{page.version}` tag enables next-run dedup.

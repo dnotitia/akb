@@ -201,6 +201,58 @@ async def test_product_error_envelope_does_not_require_sdk_is_error(
     assert result == {"error": "denied", "code": "forbidden"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_payload", "retry_count"),
+    [
+        (
+            {
+                "error": "Apply the guide, then retry.",
+                "code": "vault_skill_required",
+                "retryable": True,
+                "vault_skill": {
+                    "body": "Use the vault's conventions.",
+                    "ack_token": "one-use-token",
+                },
+            },
+            2,
+        ),
+        ({"error": "temporary failure", "code": "internal"}, 1),
+    ],
+)
+async def test_product_helper_retries_only_an_evidenced_vault_skill_challenge(
+    first_payload: dict[str, Any],
+    retry_count: int,
+) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any],
+        ) -> mcp_types.CallToolResult:
+            self.calls.append((name, copy.deepcopy(arguments)))
+            payload = first_payload if len(self.calls) == 1 else {"ok": True}
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(text=json.dumps(payload))],
+                isError="error" in payload,
+            )
+
+    client = RecordingClient()
+    result = await product_call_json(
+        client,  # type: ignore[arg-type]
+        _runtime_context(),
+        "akb_browse",
+        {"vault": "fixture-vault"},
+        expect_error=retry_count == 1,
+    )
+
+    assert len(client.calls) == retry_count
+    if retry_count == 2:
+        assert result == {"ok": True}
+        assert client.calls[0] == client.calls[1]
+
+
 class _RecordingHttpClient:
     def __init__(self, **_kwargs: Any) -> None:
         self.closed = False
@@ -250,7 +302,7 @@ async def test_mcp_fixture_owns_sdk_enter_exit_in_one_task_and_reopens(
             await generator.__anext__()
 
     async def run_once() -> None:
-        generator = mcp_client_fixture.__wrapped__(_runtime_context())
+        generator = mcp_client_fixture.__wrapped__(_runtime_context(), "http")
         await asyncio.create_task(generator.__anext__())
         try:
             if outcome == "failure":
@@ -261,7 +313,7 @@ async def test_mcp_fixture_owns_sdk_enter_exit_in_one_task_and_reopens(
             await asyncio.create_task(finish(generator))
 
     async def reopen_once() -> None:
-        generator = mcp_client_fixture.__wrapped__(_runtime_context())
+        generator = mcp_client_fixture.__wrapped__(_runtime_context(), "http")
         await asyncio.create_task(generator.__anext__())
         await asyncio.create_task(finish(generator))
 
@@ -296,7 +348,7 @@ async def test_mcp_fixture_reports_connection_failure_and_redacts_it(
     monkeypatch.setattr(mcp_conftest.httpx2, "AsyncClient", lambda **_kwargs: http_client)
     monkeypatch.setattr(mcp_conftest, "streamable_http_client", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(mcp_conftest, "Client", FailingSdkClient)
-    generator = mcp_client_fixture.__wrapped__(_runtime_context())
+    generator = mcp_client_fixture.__wrapped__(_runtime_context(), "http")
 
     with pytest.raises(pytest.fail.Exception) as captured:
         await generator.__anext__()

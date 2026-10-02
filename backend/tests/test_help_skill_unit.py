@@ -50,7 +50,7 @@ def test_render_with_vault_missing():
     out = asyncio.run(render_vault_skill_response(vault="empty-vault", fetch_fn=fake_fetch))
     assert "# Vault skill for empty-vault" in out
     assert "overview/vault-skill.md" in out
-    assert "akb_browse" in out  # fallback onboarding steps
+    assert 'akb_discover(action="browse"' in out  # fallback onboarding steps
     assert "${{secrets.X}}" in out  # secrets fallback
 
 

@@ -12,6 +12,7 @@ import pytest
 from mcp import Client
 from mcp import types as mcp_types
 
+from mcp_server.tools import TOOL_GROUPS
 from .conftest import SecondaryMcpSession
 from .runtime import RuntimeContext, redact_error
 
@@ -39,8 +40,19 @@ async def _call_json(
     expect_error: bool = False,
 ) -> dict[str, Any]:
     operation = f"tools/call {name}"
+    for group, actions in TOOL_GROUPS.items():
+        for action, operation_name in actions.items():
+            if operation_name == name:
+                name = group
+                arguments = {"action": action, **arguments}
+                break
+        else:
+            continue
+        break
+    request_name = name
+    request_arguments = arguments
     try:
-        result = await client.call_tool(name, arguments)
+        result = await client.call_tool(request_name, request_arguments)
     except Exception as exc:
         pytest.fail(f"scenario={SCENARIO} operation={operation}: {redact_error(exc, runtime_session.secrets)}")
 
@@ -50,6 +62,48 @@ async def _call_json(
         pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned invalid public JSON: {exc}")
     if not isinstance(public, dict):
         pytest.fail(f"scenario={SCENARIO} operation={operation}: public result is not an object")
+
+    if public.get("code") == "vault_skill_required":
+        skill = public.get("vault_skill")
+        if (
+            result.is_error is not True
+            or not isinstance(skill, dict)
+            or not isinstance(skill.get("body"), str)
+            or not skill["body"].strip()
+            or not isinstance(skill.get("ack_token"), str)
+            or not skill["ack_token"]
+        ):
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "vault-skill challenge omitted its error, guide, or acknowledgement"
+            )
+        # The proxy binds its acknowledgement to this exact tool name and
+        # argument set. Retrying these unchanged inputs lets that bridge add
+        # its one-use acknowledgement without changing the operation or scope.
+        try:
+            result = await client.call_tool(request_name, request_arguments)
+        except Exception as exc:
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                f"{redact_error(exc, runtime_session.secrets)}"
+            )
+        try:
+            public = json.loads(_text_content(result, operation))
+        except (TypeError, ValueError) as exc:
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                f"retry returned invalid public JSON: {exc}"
+            )
+        if not isinstance(public, dict):
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "retry public result is not an object"
+            )
+        if public.get("code") == "vault_skill_required":
+            pytest.fail(
+                f"scenario={SCENARIO} operation={operation}: "
+                "unchanged retry repeated the vault-skill challenge"
+            )
 
     # The HTTP MCP backend returns product failures as a JSON error envelope;
     # the SDK's is_error flag is not guaranteed to mirror that application
@@ -62,7 +116,22 @@ async def _call_json(
                 f"scenario={SCENARIO} operation={operation}: expected an error envelope, got {state}"
             )
     elif result.is_error:
-        pytest.fail(f"scenario={SCENARIO} operation={operation}: tool returned an SDK error")
+        public_error = {
+            key: public[key]
+            for key in ("code", "error")
+            if isinstance(public.get(key), str)
+        }
+        if "error" not in public_error and isinstance(public.get("message"), str):
+            public_error["error"] = public["message"]
+        if public_error:
+            diagnostic = redact_error(
+                RuntimeError(json.dumps(public_error, ensure_ascii=False)),
+                runtime_session.secrets,
+            )[:400]
+            failure = f"tool returned an SDK error: {diagnostic}"
+        else:
+            failure = "tool returned an SDK error"
+        pytest.fail(f"scenario={SCENARIO} operation={operation}: {failure}")
     return public
 
 

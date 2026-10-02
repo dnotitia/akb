@@ -11,6 +11,7 @@ from mcp import Client
 from mcp import types as mcp_types
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
+from .catalog_contract import assert_catalog_contract, call_target
 from .runtime import RuntimeContext, redact_error
 
 
@@ -25,17 +26,19 @@ def _fail(operation: str, detail: str) -> NoReturn:
 def _assert_connection(
     protocol_version: str,
     server_info: mcp_types.Implementation | None,
+    transport: str,
 ) -> None:
     if protocol_version not in SUPPORTED_PROTOCOLS:
         _fail("connect", f"unsupported negotiated protocol {protocol_version!r}")
-    if server_info is None or server_info.name != "akb" or not isinstance(server_info.version, str):
-        _fail("connect", "connected server is not the expected AKB server")
-
-
-def _assert_tool_catalog(tools: mcp_types.ListToolsResult) -> None:
-    list_vaults = next((tool for tool in tools.tools if tool.name == "akb_list_vaults"), None)
-    if list_vaults is None or not isinstance(list_vaults.input_schema, Mapping):
-        _fail("tools/list", "akb_list_vaults is missing from the typed tool catalog")
+    expected_name = {"http": "akb", "stdio": "akb-mcp"}.get(transport)
+    if expected_name is None:
+        _fail("connect", f"unsupported transport {transport!r}")
+    if (
+        server_info is None
+        or server_info.name != expected_name
+        or not isinstance(server_info.version, str)
+    ):
+        _fail("connect", f"connected server is not the expected {expected_name!r} server")
 
 
 def _list_vaults_payload(result: mcp_types.CallToolResult) -> Mapping[str, object]:
@@ -68,18 +71,20 @@ def _assert_list_vaults_shape(public: Mapping[str, object]) -> None:
 
 async def test_akb_list_vaults_mcp_e2e(
     mcp_client: Client,
+    mcp_transport: str,
     runtime_session: RuntimeContext,
 ) -> None:
-    _assert_connection(mcp_client.protocol_version, mcp_client.server_info)
+    _assert_connection(mcp_client.protocol_version, mcp_client.server_info, mcp_transport)
 
     try:
         tools = await mcp_client.list_tools(cache_mode="bypass")
     except Exception as exc:
         _fail("tools/list", redact_error(exc, runtime_session.secrets))
-    _assert_tool_catalog(tools)
+    assert_catalog_contract(tools.tools, transport=mcp_transport)
 
     try:
-        result = await mcp_client.call_tool("akb_list_vaults", {})
+        name, arguments = call_target(tools.tools, "akb_list_vaults", {})
+        result = await mcp_client.call_tool(name, arguments)
     except Exception as exc:
         _fail("tools/call akb_list_vaults", redact_error(exc, runtime_session.secrets))
     _assert_list_vaults_shape(_list_vaults_payload(result))

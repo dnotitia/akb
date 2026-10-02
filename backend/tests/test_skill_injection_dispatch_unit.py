@@ -91,6 +91,17 @@ def wired(monkeypatch):
 
 
 async def _run(name: str, args: dict) -> dict:
+    from mcp_server.tools import TOOL_GROUPS
+
+    for group, actions in TOOL_GROUPS.items():
+        for action, operation in actions.items():
+            if operation == name:
+                name = group
+                args = {"action": action, **args}
+                break
+        else:
+            continue
+        break
     out = await call_tool(name, args)
     return json.loads(out.content[0].text)
 
@@ -247,15 +258,18 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     acknowledgements = []
     token = "opaque-session-vault-challenge"
 
-    async def can_read(user, uid, vault):
-        access_service._authorized_vault.set(vault)
-        access_service._authorized_vault_id.set("immutable-v1")
-        return True
-
     async def strict_payload(
-        session_id, vault, vault_id=None, *, acknowledgement=None
+        session_id,
+        vault,
+        vault_id=None,
+        *,
+        request_binding,
+        permission_binding,
+        acknowledgement=None,
     ):
         acknowledgements.append(acknowledgement)
+        assert request_binding
+        assert permission_binding == "current-permissions"
         if acknowledgement == token:
             return None
         return {**_SENTINEL, "ack_token": token}
@@ -270,7 +284,14 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
         return {"updated": True}
 
     monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
+    async def permission_binding(_user, _name, vault):
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return "current-permissions"
+
+    monkeypatch.setattr(
+        server_mod, "_vault_skill_permission_binding", permission_binding
+    )
     monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
     monkeypatch.setattr(
         vault_skill_service, "injection_payload", no_additive_payload
@@ -300,13 +321,17 @@ async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
         by_name["akb_update"].input_schema["properties"]
     )
-    # akb_grep is normally read-only but becomes a writer when `replace` is
-    # present, so its schema must carry the acknowledgement too.
+    # Bulk replacement has an independent writer schema and acknowledgement.
     assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
-        by_name["akb_grep"].input_schema["properties"]
+        by_name["akb_grep_replace"].input_schema["properties"]
     )
-    assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in (
-        by_name["akb_get"].input_schema["properties"]
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_discover"].input_schema["oneOf"]
+    )
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_document_read"].input_schema["oneOf"]
     )
 
 

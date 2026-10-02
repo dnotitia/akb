@@ -463,9 +463,11 @@ export class AKBProxy {
     // Exact-operation acknowledgement cache for backend and proxy-local
     // writes. A challenge never authorizes a different queued mutation.
     this._vaultSkillRetryAcks = new Map();
-    // Local file/image tools bypass backend call_tool. Keep their vault-level
-    // challenge pending until an exact retry carries its opaque token.
+    // Local file/image tools bypass backend call_tool. Keep challenges bound to
+    // the exact operation and proxy credential until the guide is applied.
     this._localVaultSkillPending = new Map();
+    this._localVaultSkillGuides = new Map();
+    this._localVaultSkillAccepted = new Map();
     // Opt-in usage record. Read once, here, so the disabled path costs
     // nothing per call — not even a clock read. Set to null when the
     // variable is unset or the sink turns out to be unwritable, so a bad
@@ -609,7 +611,7 @@ export class AKBProxy {
     try {
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
-          ? await this._handleFileTool(id, msg.params)
+          ? await this._handleFileTool(id, msg.params, callKey)
           : await this._forward(msg);
       if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
       return response;
@@ -948,13 +950,12 @@ export class AKBProxy {
 
   // ── File tool handlers ──────────────────────────────────
 
-  async _handleFileTool(id, params) {
+  async _handleFileTool(id, params, callKey = this._vaultSkillCallKey(params)) {
     const { name, arguments: args } = params;
     try {
       const vault = this._fileToolVault(name, args);
       const vaultSkill = await this._fileToolSkillPreflight(
-        vault,
-        args?.[VAULT_SKILL_ACK_ARGUMENT],
+        vault, params, callKey,
       );
       if (vaultSkill && FILE_WRITE_TOOL_NAMES.has(name)) {
         return {
@@ -1009,12 +1010,41 @@ export class AKBProxy {
         }),
       };
     } catch (err) {
+      const publicError = { error: err.message };
+      if (
+        Number.isInteger(err?.statusCode)
+        && err.statusCode >= 400
+        && err.statusCode < 500
+        && typeof err.body === "string"
+      ) {
+        try {
+          const payload = JSON.parse(err.body);
+          const message = typeof payload?.error === "string" ? payload.error : payload?.message;
+          if (
+            payload
+            && typeof payload === "object"
+            && !Array.isArray(payload)
+            && typeof payload.code === "string"
+            && typeof message === "string"
+          ) {
+            publicError.error = message;
+            publicError.code = payload.code;
+            for (const key of ["details", "hint"]) {
+              if (Object.prototype.hasOwnProperty.call(payload, key)) {
+                publicError[key] = payload[key];
+              }
+            }
+          }
+        } catch {
+          // Preserve the original HTTP error if the response is not a REST error envelope.
+        }
+      }
       return {
         jsonrpc: "2.0",
         id,
         result: this._clientResult({
           content: [
-            { type: "text", text: JSON.stringify({ error: err.message }) },
+            { type: "text", text: JSON.stringify(publicError) },
           ],
           isError: true,
         }),
@@ -1038,7 +1068,7 @@ export class AKBProxy {
    * and therefore reuses the same version/session gate as every native tool.
    * A write-only credential receives no payload and remains usable.
    */
-  async _fileToolSkillPreflight(vault, acknowledgement = null) {
+  async _fileToolSkillPreflight(vault, params, callKey) {
     if (!vault) return null;
     const ok = await this._ensureBackend();
     if (!ok) throw new Error("backend unreachable");
@@ -1047,37 +1077,81 @@ export class AKBProxy {
       arguments: { topic: "vault-skill", vault },
     });
     const text = response.content?.find((item) => item?.type === "text")?.text;
+    let envelope = null;
     let projected = null;
     try {
-      const envelope = JSON.parse(text);
+      envelope = JSON.parse(text);
       projected = envelope?.vault_skill || null;
     } catch {
       projected = null;
     }
+    const helpAuthorized = response?.isError !== true
+      && envelope
+      && typeof envelope === "object"
+      && !Array.isArray(envelope)
+      && typeof envelope.error !== "string";
 
-    let pending = this._localVaultSkillPending.get(vault) || null;
-    if (projected) {
-      if (!pending || pending.guide.version !== projected.version) {
-        pending = {
-          token: randomBytes(24).toString("base64url"),
-          guide: null,
-        };
-        pending.guide = { ...projected, ack_token: pending.token };
-        this._localVaultSkillPending.set(vault, pending);
-        while (this._localVaultSkillPending.size > 256) {
-          this._localVaultSkillPending.delete(
-            this._localVaultSkillPending.keys().next().value,
-          );
-        }
-      } else {
-        this._localVaultSkillPending.delete(vault);
-        this._localVaultSkillPending.set(vault, pending);
+    const args = params?.arguments || {};
+    const acknowledgement = args[VAULT_SKILL_ACK_ARGUMENT];
+    const credentialBinding = createHash("sha256")
+      .update(String(this.pat))
+      .digest("base64url");
+    const permissionKey = JSON.stringify([vault, credentialBinding]);
+    const requestKey = JSON.stringify([permissionKey, callKey]);
+
+    if (helpAuthorized && projected) {
+      const guide = { ...projected };
+      delete guide.ack_token;
+      this._localVaultSkillGuides.set(vault, guide);
+      while (this._localVaultSkillGuides.size > 256) {
+        this._localVaultSkillGuides.delete(
+          this._localVaultSkillGuides.keys().next().value,
+        );
+      }
+    }
+
+    let pending = this._localVaultSkillPending.get(requestKey) || null;
+    const guide = helpAuthorized
+      ? this._localVaultSkillGuides.get(vault) || null
+      : null;
+    if (pending && guide && pending.guide.version !== guide.version) {
+      this._localVaultSkillPending.delete(requestKey);
+      pending = null;
+    }
+    if (
+      !pending
+      && guide
+      && this._localVaultSkillAccepted.get(permissionKey) !== guide.version
+    ) {
+      pending = {
+        vault,
+        permissionKey,
+        token: randomBytes(24).toString("base64url"),
+        guide: { ...guide },
+      };
+      pending.guide.ack_token = pending.token;
+      this._localVaultSkillPending.set(requestKey, pending);
+      while (this._localVaultSkillPending.size > 256) {
+        this._localVaultSkillPending.delete(
+          this._localVaultSkillPending.keys().next().value,
+        );
       }
     }
 
     if (!pending) return null;
     if (typeof acknowledgement === "string" && acknowledgement === pending.token) {
-      this._localVaultSkillPending.delete(vault);
+      this._localVaultSkillPending.delete(requestKey);
+      this._localVaultSkillAccepted.set(permissionKey, pending.guide.version);
+      while (this._localVaultSkillAccepted.size > 256) {
+        this._localVaultSkillAccepted.delete(
+          this._localVaultSkillAccepted.keys().next().value,
+        );
+      }
+      for (const [key, value] of this._localVaultSkillPending) {
+        if (value.permissionKey === permissionKey) {
+          this._localVaultSkillPending.delete(key);
+        }
+      }
       return null;
     }
     return pending.guide;

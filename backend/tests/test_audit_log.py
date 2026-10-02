@@ -115,12 +115,8 @@ def test_reads_skipped_when_disabled_but_writes_kept(audit_dir, monkeypatch):
     assert "akb_some_new_write" in actions
 
 
-def test_read_tool_invoked_as_a_write_is_still_audited(audit_dir, monkeypatch):
-    """`akb_grep` is in `_READ_ONLY_TOOLS`, but its `replace` argument
-    rewrites every matching document. With `log_reads` off, the tool-level
-    classification alone dropped that mass rewrite from the audit trail
-    entirely — contradicting this module's own "fail toward logging"
-    rule. The dispatcher passes `is_write`, which must override."""
+def test_grep_replace_is_still_audited_when_read_logging_is_disabled(audit_dir, monkeypatch):
+    """The explicit writer remains audited while ordinary reads are skipped."""
     monkeypatch.setattr(settings.audit, "log_reads", False)
 
     class _U:
@@ -128,12 +124,15 @@ def test_read_tool_invoked_as_a_write_is_still_audited(audit_dir, monkeypatch):
 
     audit_log.record_tool("akb_grep", {"vault": "v", "pattern": "x"}, _U(), {"ok": 1})
     audit_log.record_tool(
-        "akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, _U(), {"ok": 1},
+        "akb_grep_replace",
+        {"vault": "v", "pattern": "x", "replace": "y"},
+        _U(),
+        {"ok": 1},
         is_write=True,
     )
 
     lines = _read_lines(audit_dir / f"akb-audit-{_today()}.jsonl")
-    assert [json.loads(ln)["action"] for ln in lines] == ["akb_grep"], (
+    assert [json.loads(ln)["action"] for ln in lines] == ["akb_grep_replace"], (
         "the plain read must be skipped and the replace must be recorded"
     )
 
@@ -143,7 +142,7 @@ def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
         username, user_id = "bob", "u2"
 
     audit_log.record_tool(
-        "akb_grep",
+        "akb_grep_replace",
         {"vault": "v", "pattern": "x", "replace": "y", "max_replacements": 2},
         _U(),
         {
@@ -174,7 +173,7 @@ def test_grep_replace_audit_records_commit_recovery_receipts(audit_dir):
         json.loads(line)
         for line in _read_lines(audit_dir / f"akb-audit-{_today()}.jsonl")
     ]
-    assert [row["action"] for row in rows] == ["akb_grep.replace", "akb_grep"]
+    assert [row["action"] for row in rows] == ["akb_grep.replace", "akb_grep_replace"]
     assert rows[0]["target"] == "uri=akb://v/doc/a.md"
     assert rows[0]["meta"] == {
         "protocol_generation": "legacy",

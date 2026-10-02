@@ -114,16 +114,18 @@ for t in d["result"]["tools"]:
 ' 2>/dev/null)
 [ "$UPDATE_HAS_FILE" = "True" ] && pass "akb_update has file param" || fail "akb_update schema" "file param missing"
 
-# Check akb_search does NOT have file param (control)
+# Check the grouped search action does NOT have file param (control)
 SEARCH_HAS_FILE=$(echo "$TOOLS" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 for t in d["result"]["tools"]:
-    if t["name"] == "akb_search":
-        print("file" in t["inputSchema"].get("properties",{}))
+    if t["name"] == "akb_discover":
+        branch = next(b for b in t["inputSchema"]["oneOf"]
+                      if b["properties"]["action"].get("const") == "search")
+        print("file" in branch["properties"])
         break
 ' 2>/dev/null)
-[ "$SEARCH_HAS_FILE" = "False" ] && pass "akb_search has no file param (control)" || fail "akb_search schema" "unexpected file param"
+[ "$SEARCH_HAS_FILE" = "False" ] && pass "search action has no file param (control)" || fail "akb_discover schema" "unexpected file param"
 
 # ── 3. Create vault ──────────────────────────────────────────
 echo ""

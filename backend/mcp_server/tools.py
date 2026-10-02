@@ -32,6 +32,8 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
+from copy import deepcopy
+
 from mcp.types import Tool
 
 from app.services import template_registry
@@ -69,7 +71,7 @@ _COLUMN_DESCRIPTION_FIELD = {
 }
 
 
-TOOLS = [
+_SOURCE_TOOLS = [
     Tool(
         name="akb_list_vaults",
         description=(
@@ -254,7 +256,7 @@ TOOLS = [
             "If old_string is not found or appears multiple times, the call fails with a clear error. "
             "Use this for inserting, replacing, or removing an inline image without "
             "resending the complete document body. For find-and-replace across many "
-            "documents, use akb_grep with replace instead."
+            "documents, use akb_grep_replace instead."
         ),
         input_schema={
             "type": "object",
@@ -1416,11 +1418,165 @@ TOOLS = [
 ]
 
 
+def _split_grep_operation(source_tools: list[Tool]) -> list[Tool]:
+    """Expose exact search and bulk replacement as separate operations."""
+    result: list[Tool] = []
+    for tool in source_tools:
+        if tool.name != "akb_grep":
+            result.append(tool)
+            continue
+
+        read_schema = deepcopy(tool.input_schema)
+        read_properties = read_schema["properties"]
+        read_properties.pop("replace")
+        read_properties.pop("max_replacements")
+        result.append(
+            Tool(
+                name="akb_grep",
+                description=(
+                    "Read-only exact text or regex search across accessible documents. "
+                    "Returns canonical resource URIs, matched text, and revision details. "
+                    "For replacements, use the separate writer operation `akb_grep_replace`."
+                ),
+                input_schema=read_schema,
+            )
+        )
+
+        write_schema = deepcopy(tool.input_schema)
+        write_properties = write_schema["properties"]
+        write_properties["vault"] = {
+            "type": "string",
+            "minLength": 1,
+            "description": "One explicit vault to search and update. Required.",
+        }
+        write_schema["required"] = ["pattern", "replace", "vault"]
+        result.append(
+            Tool(
+                name="akb_grep_replace",
+                description=(
+                    "Replace exact text or regex matches in documents in one explicit vault. "
+                    "Requires writer access. The full match set is checked against "
+                    "`max_replacements` before any document changes; results include each "
+                    "canonical URI and its new and previous revision."
+                ),
+                input_schema=write_schema,
+            )
+        )
+    return result
+
+
+OPERATIONS = _split_grep_operation(_SOURCE_TOOLS)
+
+TOOL_GROUPS = {
+    "akb_discover": {
+        "list_vaults": "akb_list_vaults",
+        "vault_info": "akb_vault_info",
+        "browse": "akb_browse",
+        "search": "akb_search",
+        "grep": "akb_grep",
+    },
+    "akb_document_read": {
+        "get": "akb_get",
+        "section": "akb_drill_down",
+        "activity": "akb_activity",
+        "history": "akb_history",
+        "diff": "akb_diff",
+        "provenance": "akb_provenance",
+    },
+    "akb_relationships": {
+        "relations": "akb_relations",
+        "graph": "akb_graph",
+    },
+    "akb_identity": {
+        "whoami": "akb_whoami",
+        "search_users": "akb_search_users",
+    },
+    "akb_vault_access": {
+        "members": "akb_vault_members",
+        "explain": "akb_explain_access",
+    },
+}
+
+_GROUP_DESCRIPTIONS = {
+    "akb_discover": (
+        "Discover accessible vaults and content. Choose list_vaults, vault_info, "
+        "browse, search, or grep with the action field; pass that action's "
+        "arguments alongside it."
+    ),
+    "akb_document_read": (
+        "Read full documents, selected sections, activity, revisions, or provenance. "
+        "Choose an action and pass its arguments alongside it."
+    ),
+    "akb_relationships": (
+        "Read explicit and implicit document relationships or traverse the "
+        "same-vault graph. Choose relations or graph and pass its arguments "
+        "alongside it."
+    ),
+    "akb_identity": (
+        "Read the caller identity or search users visible to the caller. "
+        "Choose whoami or search_users and pass its arguments alongside it."
+    ),
+    "akb_vault_access": (
+        "Read vault membership or explain an access decision. Choose members "
+        "or explain and pass its arguments alongside it."
+    ),
+}
+
+
+def _group_tool(name: str, operation_tools: dict[str, Tool]) -> Tool:
+    actions = TOOL_GROUPS[name]
+    branches = []
+    for action, operation_name in actions.items():
+        operation = operation_tools[operation_name]
+        schema = deepcopy(operation.input_schema)
+        properties = schema.get("properties", {})
+        schema["properties"] = {
+            "action": {
+                "type": "string",
+                "const": action,
+                "description": f"Select the {action} operation.",
+            },
+            **properties,
+        }
+        schema["required"] = ["action", *schema.get("required", [])]
+        schema["additionalProperties"] = False
+        branches.append(schema)
+
+    return Tool(
+        name=name,
+        description=_GROUP_DESCRIPTIONS[name],
+        input_schema={"type": "object", "oneOf": branches},
+    )
+
+
+def _candidate_tools(operation_tools: list[Tool]) -> list[Tool]:
+    by_name = {tool.name: tool for tool in operation_tools}
+    group_for_operation = {
+        operation: group
+        for group, actions in TOOL_GROUPS.items()
+        for operation in actions.values()
+    }
+    grouped: list[Tool] = []
+    emitted: set[str] = set()
+    for operation in operation_tools:
+        group = group_for_operation.get(operation.name)
+        if group is None:
+            grouped.append(operation)
+        elif group not in emitted:
+            grouped.append(_group_tool(group, by_name))
+            emitted.add(group)
+    return grouped
+
+
+TOOLS = _candidate_tools(OPERATIONS)
+
+
 def available_tools() -> list[Tool]:
     """Advertise only supported creation options without mutating validation.
 
-    TOOLS remains the accepted argument catalog for older clients, whose
-    explicit unsupported requests must reach the service's stable error.
+    OPERATIONS remains the canonical handler schema source. The public TOOLS
+    catalog may omit unavailable creation options while dispatch preserves
+    the service's stable unsupported-option errors.
     """
     capabilities = get_vault_creation_capabilities()
     if capabilities.templates and capabilities.external_git:

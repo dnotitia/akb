@@ -21,13 +21,13 @@ class _AmbiguousNativeBackend:
 
 
 @pytest.mark.parametrize(
-    ("tool", "selector_key"),
-    (("akb_get", "version"), ("akb_diff", "commit")),
+    ("action", "selector_key"),
+    (("get", "version"), ("diff", "commit")),
 )
 async def test_native_selector_ambiguity_survives_mcp_wire_envelope(
     monkeypatch,
     tmp_path,
-    tool: str,
+    action: str,
     selector_key: str,
 ):
     from app.config import settings
@@ -50,8 +50,8 @@ async def test_native_selector_ambiguity_survives_mcp_wire_envelope(
     monkeypatch.setattr(server.tool_usage, "record", lambda *_args, **_kwargs: None)
 
     response = await server.call_tool(
-        tool,
-        {"uri": "akb://v/doc/doc.md", selector_key: "abcdef0"},
+        "akb_document_read",
+        {"action": action, "uri": "akb://v/doc/doc.md", selector_key: "abcdef0"},
     )
 
     envelope = json.loads(response.content[0].text)

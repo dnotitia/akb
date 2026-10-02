@@ -147,8 +147,8 @@ if [ -z "$good_token" ]; then fail "mint scoped token" "Keycloak returned no acc
   case "$init_resp" in *'"jsonrpc"'*) pass "initialize accepted" ;;
                             *) fail "initialize accepted" "got '${init_resp:0:200}'" ;; esac
   list_resp=$(mcp_tool_call "$good_token" "tools/list" "{}")
-  case "$list_resp" in *"akb_list_vaults"*) pass "tools/list includes akb_list_vaults" ;;
-                            *) fail "tools/list includes akb_list_vaults" "got '${list_resp:0:200}'" ;; esac
+  case "$list_resp" in *"akb_discover"*) pass "tools/list includes akb_discover" ;;
+                            *) fail "tools/list includes akb_discover" "got '${list_resp:0:200}'" ;; esac
 fi
 
 # ── 5. Local session rejected; actual PAT works ─────────────────

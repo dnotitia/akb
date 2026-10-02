@@ -13,19 +13,25 @@ from app.config import settings
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-mcp-grep-file-test-vaults-")
 
 
-def test_akb_grep_schema_exposes_guarded_text_file_measurement_argument():
-    from mcp_server.tools import TOOLS
+def test_akb_grep_schemas_keep_read_and_write_fields_separate():
+    from mcp_server.tools import OPERATIONS
 
-    grep = next(tool for tool in TOOLS if tool.name == "akb_grep")
+    by_name = {tool.name: tool for tool in OPERATIONS}
+    grep = by_name["akb_grep"]
     argument = grep.input_schema["properties"]["measurement_include_text_files"]
+    replace = by_name["akb_grep_replace"]
 
     assert grep.input_schema["properties"]["pattern"]["minLength"] == 1
-    replacement_budget = grep.input_schema["properties"]["max_replacements"]
+    assert "replace" not in grep.input_schema["properties"]
+    assert "max_replacements" not in grep.input_schema["properties"]
+    assert replace.input_schema["properties"]["vault"]["type"] == "string"
+    assert replace.input_schema["properties"]["pattern"]["minLength"] == 1
+    replacement_budget = replace.input_schema["properties"]["max_replacements"]
     assert replacement_budget["default"] == 50
     assert replacement_budget["maximum"] == 1000
     assert (
         "treated literally"
-        in grep.input_schema["properties"]["replace"]["description"].lower()
+        in replace.input_schema["properties"]["replace"]["description"].lower()
     )
     assert "does not limit replacement writes" in grep.input_schema["properties"]["limit"]["description"]
     assert argument["type"] == "boolean"
@@ -86,7 +92,6 @@ async def test_mcp_grep_passes_explicit_text_file_measurement_argument(monkeypat
         {
             "pattern": "needle",
             "vault": "measurement",
-            "max_replacements": 17,
             "measurement_include_text_files": True,
         },
         user.user_id,
@@ -94,7 +99,7 @@ async def test_mcp_grep_passes_explicit_text_file_measurement_argument(monkeypat
     )
 
     assert grep_calls[0]["measurement_include_text_files"] is True
-    assert grep_calls[0]["max_replacements"] == 17
+    assert grep_calls[0]["max_replacements"] == 50
 
 
 @pytest.mark.asyncio

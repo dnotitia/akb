@@ -1371,7 +1371,7 @@ class FileService:
             grant = await conn.fetchrow(
                 """
                 SELECT i.file_id, i.vault_id, i.object_key, i.mime_type,
-                       f.upload_state
+                       f.upload_state, f.s3_key AS file_s3_key
                   FROM m1_file_transfer_intents AS i
                   JOIN vault_files AS f
                     ON f.id = i.file_id AND f.vault_id = i.vault_id
@@ -1390,10 +1390,14 @@ class FileService:
             # one AKB normalized when the capability was issued, not one the
             # uploading client restates at PUT time.
             "mime_type": _normalize_content_type(grant["mime_type"]),
-            # Whether this reservation adopted a File that is already
-            # confirmed. It changes what the route may do with the body —
-            # see `upload_by_capability`.
-            "already_confirmed": grant["upload_state"] == "confirmed",
+            # A deduplicated upload capability can point at bytes that are
+            # already final, so the route must discard its body. Replacement
+            # capabilities share a confirmed File row but point at a separate
+            # staging key; those bytes still need to be stored before confirm.
+            "already_confirmed": (
+                grant["upload_state"] == "confirmed"
+                and grant["object_key"] == grant["file_s3_key"]
+            ),
         }
 
     async def list_files(

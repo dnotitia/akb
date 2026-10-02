@@ -859,6 +859,7 @@ async def test_the_resolver_reports_whether_the_file_is_already_final(monkeypatc
         "file_id": uuid.uuid4(),
         "vault_id": uuid.uuid4(),
         "object_key": _KEY,
+        "file_s3_key": _KEY,
         "mime_type": "application/pdf",
         "upload_state": "confirmed",
     }
@@ -869,3 +870,21 @@ async def test_the_resolver_reports_whether_the_file_is_already_final(monkeypatc
 
     sql, _params = pool.conn.queries[0]
     assert "f.upload_state" in sql, "the state must come from the File row"
+    assert "f.s3_key AS file_s3_key" in sql
+
+
+async def test_a_replacement_capability_for_a_confirmed_file_still_stores_bytes(monkeypatch):
+    row = {
+        "file_id": uuid.uuid4(),
+        "vault_id": uuid.uuid4(),
+        "object_key": "__akb_file_replacements__/team/file/replacement",
+        "file_s3_key": _KEY,
+        "mime_type": "application/pdf",
+        "upload_state": "confirmed",
+    }
+    service, _pool = await _service(monkeypatch, row=row)
+
+    grant = await service.resolve_write_capability("A" * 43)
+
+    assert grant["already_confirmed"] is False
+    assert grant["object_key"] == row["object_key"]

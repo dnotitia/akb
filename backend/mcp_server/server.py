@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import sys
@@ -74,7 +75,8 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import TOOLS, available_tools
+from mcp_server.tools import OPERATIONS, TOOL_GROUPS, available_tools
+from mcp_server.input_validation import validate_tool_arguments
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -165,6 +167,8 @@ class _MCPUser:
         oauth_scopes: list[str] | None = None,
         token_scopes: frozenset[str] | None = None,
         key_class: str | None = None,
+        token_id: str | None = None,
+        vault_scope: Any | None = None,
     ):
         self.user_id = user_id
         self.username = username
@@ -178,6 +182,8 @@ class _MCPUser:
         self.oauth_scopes = oauth_scopes
         self.token_scopes = token_scopes
         self.key_class = key_class
+        self.token_id = token_id
+        self.vault_scope = vault_scope
 
 _FALLBACK_USER = _MCPUser()
 
@@ -207,6 +213,8 @@ async def _get_user() -> _MCPUser:
                     oauth_scopes=scoped_user.oauth_scopes,
                     token_scopes=scoped_user.token_scopes,
                     key_class=scoped_user.key_class,
+                    token_id=scoped_user.token_id,
+                    vault_scope=scoped_user.vault_scope,
                 )
             auth_header = request.headers.get("authorization", "")
             if auth_header:
@@ -220,6 +228,8 @@ async def _get_user() -> _MCPUser:
                         oauth_scopes=user.oauth_scopes,
                         token_scopes=user.token_scopes,
                         key_class=user.key_class,
+                        token_id=user.token_id,
+                        vault_scope=user.vault_scope,
                     )
                 # A credential was presented and rejected — that's a
                 # security-relevant event, so audit the denial. No token material
@@ -301,6 +311,13 @@ _HANDLERS: dict[str, Any] = {}
 _READ_SCOPE = "akb:vault:read"
 _WRITE_SCOPE = "akb:vault:write"
 _TOOL_SCOPES: dict[str, str] = {
+    # The five public composite tools only expose read operations. Individual
+    # actions are normalized to their canonical operation name before dispatch.
+    "akb_discover": _READ_SCOPE,
+    "akb_document_read": _READ_SCOPE,
+    "akb_relationships": _READ_SCOPE,
+    "akb_identity": _READ_SCOPE,
+    "akb_vault_access": _READ_SCOPE,
     # --- read ---
     "akb_help": _READ_SCOPE,
     "akb_whoami": _READ_SCOPE,
@@ -315,6 +332,7 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_get": _READ_SCOPE,
     "akb_search": _READ_SCOPE,
     "akb_grep": _READ_SCOPE,
+    "akb_grep_replace": _WRITE_SCOPE,
     "akb_drill_down": _READ_SCOPE,
     "akb_activity": _READ_SCOPE,
     "akb_diff": _READ_SCOPE,
@@ -351,29 +369,6 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_import": _WRITE_SCOPE,
 }
 
-# Arguments that promote an otherwise read-grade tool to write-grade.
-#
-# `_TOOL_SCOPES` classifies a tool as a whole, which cannot express a
-# read tool that carries an optional mutating argument. `akb_grep` is
-# exactly that: a search tool whose `replace` rewrites EVERY matching
-# document across the scope (git commit + re-index per doc). Mapped flat
-# as read, a read-scoped token passed the gate and reached the rewrite.
-#
-# That was never privilege escalation — `_handle_grep` still requires
-# `check_vault_access(required_role="writer")` — but it defeated the
-# reason read-only tokens exist: handing an agent a read PAT is supposed
-# to mean it cannot change anything, and for a caller who *is* a vault
-# writer it did not.
-#
-# Declared here rather than branched inside `_dispatch` so the next tool
-# that grows a mutating argument has one obvious place to say so, and so
-# a test can assert every trigger names a real argument of that tool (a
-# typo would silently un-promote it — the exact failure this prevents).
-_ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
-    "akb_grep": ("replace",),
-}
-
-
 async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     """Does this credential have READ authority on `vault`?
 
@@ -400,28 +395,113 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     return True
 
 
-def _required_scope(name: str, args: dict) -> str:
-    """Scope a call needs: the tool's mapping, promoted to write when the
-    call carries a mutating argument.
-
-    Unmapped tools fail CLOSED to write (see `_dispatch`). A trigger
-    counts only when the argument is actually present and not None —
-    `replace=""` IS a rewrite (it deletes every match), so emptiness must
-    not be mistaken for absence.
-    """
-    if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
-        return _WRITE_SCOPE
+def _required_scope(name: str) -> str:
+    """Return the explicit tool scope; unmapped calls fail closed to write."""
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
 
 
-# Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
-# to reject unknown arguments with a fuzzy hint. Built once at import
-# time from the same TOOLS list returned via list_tools, so the
-# "what the agent saw" and "what we accept" can't drift.
+def _vault_skill_request_binding(name: str, args: dict) -> str:
+    """Hash the canonical operation and validated business arguments."""
+    payload = json.dumps(
+        {"tool": name, "arguments": args},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _vault_skill_permission_binding(
+    user: _MCPUser, name: str, vault: str
+) -> str | None:
+    """Hash current actor, credential, scopes, and vault-reader permissions."""
+    if user.oauth_scopes is not None and _READ_SCOPE not in user.oauth_scopes:
+        return None
+    if user.token_scopes is not None and not token_has_scope(
+        user.token_scopes, "read"
+    ):
+        return None
+    try:
+        access = await check_vault_access(
+            user.user_id, vault, required_role="reader"
+        )
+    except Exception:  # noqa: BLE001 — permission context is fail-closed
+        return None
+
+    vault_scope = user.vault_scope
+    if vault_scope is not None:
+        vault_scope = vault_scope.to_db_json()
+    payload = json.dumps(
+        {
+            "actor": user.user_id,
+            "auth_method": user.auth_method,
+            "is_admin": user.is_admin,
+            "credential_id": user.token_id,
+            "key_class": user.key_class,
+            "oauth_scopes": (
+                sorted(user.oauth_scopes) if user.oauth_scopes is not None else None
+            ),
+            "token_scopes": (
+                sorted(user.token_scopes) if user.token_scopes is not None else None
+            ),
+            "vault_scope": vault_scope,
+            "vault_role": access["role"],
+            "vault_role_source": access["role_source"],
+            "vault_status": access["status"],
+            "required_scope": _required_scope(name),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# Operation schemas are the source of accepted argument names. The public
+# catalog is projected from these operations, so exposed and accepted fields
+# stay in sync.
 _TOOL_ARG_NAMES: dict[str, set[str]] = {
-    t.name: set((t.input_schema or {}).get("properties", {}).keys())
-    for t in TOOLS
+    t.name: set((t.input_schema or {}).get("properties", {}).keys()) for t in OPERATIONS
 }
+_GROUPED_OPERATION_NAMES = frozenset(
+    operation for actions in TOOL_GROUPS.values() for operation in actions.values()
+)
+
+
+def _resolve_catalog_call(name: str, args: dict) -> tuple[str, dict, dict | None]:
+    """Flatten a composite call to the existing canonical operation contract."""
+    actions = TOOL_GROUPS.get(name)
+    if actions is None:
+        if name in _GROUPED_OPERATION_NAMES:
+            return name, args, err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+        return name, args, None
+
+    action = args.get("action")
+    if not isinstance(action, str) or action not in actions:
+        return name, args, err(
+            f"Invalid action for {name}",
+            code=INVALID_ARGUMENT,
+            field="action",
+            allowed_values=list(actions),
+            hint=f"Choose one action: {', '.join(actions)}.",
+        )
+
+    operation = actions[action]
+    operation_args = {key: value for key, value in args.items() if key != "action"}
+    allowed = _TOOL_ARG_NAMES[operation]
+    unknown = [key for key in operation_args if key not in allowed]
+    if unknown:
+        bad = unknown[0]
+        return operation, operation_args, err(
+            f"Unknown argument '{bad}' for {operation}",
+            code=UNKNOWN_ARGUMENT,
+            hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
+            field=bad,
+            available_arguments=sorted(allowed),
+        )
+    return operation, operation_args, None
 
 
 def _h(name: str):
@@ -646,7 +726,10 @@ def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
 
 @_h("akb_get")
 async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    try:
+        vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    except ValueError as exc:
+        return err(str(exc), code=INVALID_URI)
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
     version = args.get("version")
@@ -873,20 +956,31 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
     return result.model_dump()
 
 
-@_h("akb_grep")
-async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
+async def _run_grep(
+    args: dict,
+    uid: str,
+    user: _MCPUser,
+    *,
+    replacement: str | None,
+) -> dict:
     from app.services.search_service import _normalize_vault_scope
 
     vaults = _normalize_vault_scope(args.get("vault"))
-    replace = args.get("replace")
-    if replace is not None and not vaults:
-        return err("vault is required when using replace", code=INVALID_ARGUMENT)
+    is_write = replacement is not None
+    if is_write and (not isinstance(args.get("vault"), str) or not vaults):
+        return err(
+            "vault must name one vault when using akb_grep_replace",
+            code=INVALID_ARGUMENT,
+            field="vault",
+            expected_type="string",
+            hint="Provide one explicit vault name.",
+        )
     limit = args.get("limit", 20)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
         return err("limit must be between 1 and 50", code=INVALID_ARGUMENT)
     for vault in dict.fromkeys(vaults or []):
         await check_vault_access(
-            uid, vault, required_role="writer" if replace is not None else "reader",
+            uid, vault, required_role="writer" if is_write else "reader",
         )
     result = await search_service.grep(
         pattern=args["pattern"],
@@ -894,9 +988,9 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         collection=args.get("collection"),
         regex=args.get("regex", False),
         case_sensitive=args.get("case_sensitive", False),
-        replace=replace,
-        doc_service=doc_service if replace is not None else None,
-        agent_id=user.username if replace is not None else None,
+        replace=replacement,
+        doc_service=doc_service if is_write else None,
+        agent_id=user.username if is_write else None,
         user_id=uid,
         limit=limit,
         max_replacements=args.get("max_replacements", DEFAULT_MAX_REPLACEMENTS),
@@ -912,6 +1006,24 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
         archive_scope=args.get("archive_scope"),
     )
     return result
+
+
+@_h("akb_grep")
+async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
+    return await _run_grep(args, uid, user, replacement=None)
+
+
+@_h("akb_grep_replace")
+async def _handle_grep_replace(args: dict, uid: str, user: _MCPUser) -> dict:
+    replacement = args.get("replace")
+    if not isinstance(replacement, str):
+        return err(
+            "replace must be a string",
+            code=INVALID_ARGUMENT,
+            field="replace",
+            expected_type="string",
+        )
+    return await _run_grep(args, uid, user, replacement=replacement)
 
 
 @_h("akb_drill_down")
@@ -1670,10 +1782,7 @@ async def list_tools():
     # clients keep the byte-for-byte schemas they already understand.
     decorated = []
     for tool in tools:
-        may_write = (
-            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
-            or tool.name in _ARG_WRITE_TRIGGERS
-        )
+        may_write = _required_scope(tool.name) == _WRITE_SCOPE
         if not may_write:
             decorated.append(tool)
             continue
@@ -1767,8 +1876,12 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
-        result: dict | None = None
+        logical_name, logical_arguments, resolution_error = _resolve_catalog_call(
+            name, arguments
+        )
+        name, arguments = logical_name, logical_arguments
+        is_write = _required_scope(name) == _WRITE_SCOPE
+        result: dict | None = resolution_error or validate_tool_arguments(name, arguments)
 
         # A guide cannot influence a write that has already committed.  For a
         # reader-authorized caller's first write (or the first write after the
@@ -1776,30 +1889,42 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
         preflight_version = _vault_skill_preflight_version()
-        if is_write and preflight_version is not None:
+        if result is None and is_write and preflight_version is not None:
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service
 
                 target_vault = vault_of_call(name, arguments)
-                if target_vault and await _can_read_vault(
-                    user, user.user_id, target_vault
-                ):
+                if target_vault:
                     if preflight_version == 2:
-                        payload = await vault_skill_service.preflight_payload(
-                            _session_id(),
-                            target_vault,
-                            authorized_vault_id(),
-                            acknowledgement=(
-                                vault_skill_ack
-                                if isinstance(vault_skill_ack, str)
-                                else None
-                            ),
+                        permission_binding = await _vault_skill_permission_binding(
+                            user, name, target_vault
                         )
-                    else:
+                        if permission_binding is None:
+                            payload = None
+                        else:
+                            payload = await vault_skill_service.preflight_payload(
+                                _session_id(),
+                                target_vault,
+                                authorized_vault_id(),
+                                request_binding=_vault_skill_request_binding(
+                                    name, arguments
+                                ),
+                                permission_binding=permission_binding,
+                                acknowledgement=(
+                                    vault_skill_ack
+                                    if isinstance(vault_skill_ack, str)
+                                    else None
+                                ),
+                            )
+                    elif await _can_read_vault(
+                        user, user.user_id, target_vault
+                    ):
                         payload = await vault_skill_service.injection_payload(
                             _session_id(), target_vault, authorized_vault_id(),
                         )
+                    else:
+                        payload = None
                     if payload:
                         result = err(
                             (
@@ -1903,7 +2028,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # success path did not already record this invocation (a response-encode
         # failure lands here after a handler that actually succeeded).
         if not recorded:
-            is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+            is_write = _required_scope(name) == _WRITE_SCOPE
             audit_log.record_tool(
                 name, arguments, user, envelope, is_write=is_write, protocol=protocol
             )
@@ -1977,7 +2102,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # A test in `test_mcp_oauth_unit` asserts every registered handler
     # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _required_scope(name, args)
+        required = _required_scope(name)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -1986,7 +2111,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _required_scope(name, args)
+        required = _required_scope(name)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(
@@ -2010,6 +2135,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 f"Unknown argument '{bad}' for {name}",
                 code=UNKNOWN_ARGUMENT,
                 hint=fuzzy_hint(bad, sorted(allowed), label="arguments"),
+                field=bad,
                 available_arguments=sorted(allowed),
             )
 

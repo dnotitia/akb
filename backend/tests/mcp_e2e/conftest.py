@@ -16,6 +16,7 @@ import httpx
 import httpx2
 import pytest
 from mcp import Client
+from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
 from .runtime import RuntimeContext, RuntimeDescriptor, RuntimeSetupError, redact_error
@@ -270,13 +271,113 @@ async def _open_mcp_client(
         await task
 
 
+@asynccontextmanager
+async def _open_stdio_mcp_client(
+    runtime_session: RuntimeContext,
+    *,
+    pat: str,
+    secrets: tuple[str, ...],
+    scenario: str,
+) -> AsyncIterator[Client]:
+    """Run the repository proxy under the official SDK stdio consumer."""
+
+    repo_root = Path(__file__).resolve().parents[3]
+    proxy_entry = repo_root / "packages" / "akb-mcp-client" / "bin" / "akb-mcp.mjs"
+    if not proxy_entry.is_file():
+        raise RuntimeSetupError("repository akb-mcp stdio entrypoint is missing")
+
+    child_env = {
+        "AKB_PAT": pat,
+        runtime_session.descriptor.username_env: "",
+        runtime_session.descriptor.password_env: "",
+    }
+    server_params = StdioServerParameters(
+        command="node",
+        args=[str(proxy_entry), "--url", runtime_session.descriptor.mcp_url, "--insecure"],
+        env=child_env,
+    )
+    client = Client(
+        server_params,
+        mode="auto",
+        read_timeout_seconds=30.0,
+        cache=None,
+    )
+
+    close_requested = asyncio.Event()
+    ready = asyncio.Event()
+    finished = asyncio.Event()
+    lifecycle_error: BaseException | None = None
+
+    async def run_client() -> None:
+        nonlocal lifecycle_error
+        try:
+            async with client:
+                ready.set()
+                await close_requested.wait()
+        except BaseException as exc:
+            lifecycle_error = exc
+            ready.set()
+        finally:
+            finished.set()
+
+    async def wait_for_finish() -> None:
+        cancelled = False
+        while not finished.is_set():
+            try:
+                await asyncio.shield(finished.wait())
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    task = asyncio.create_task(run_client(), name=f"mcp-stdio-sdk-client-{scenario}")
+    reported_startup_error = False
+    try:
+        await ready.wait()
+        if lifecycle_error is not None:
+            reported_startup_error = True
+            pytest.fail(
+                f"scenario={scenario} stdio SDK connection: "
+                + redact_error(lifecycle_error, secrets)
+            )
+        yield client
+    finally:
+        close_requested.set()
+        await wait_for_finish()
+        if lifecycle_error is not None and not reported_startup_error:
+            raise lifecycle_error
+        await task
+
+
+@pytest.fixture(params=("http", "stdio"), ids=("http", "stdio"))
+def mcp_transport(request: pytest.FixtureRequest) -> str:
+    """Run the same SDK behavior cases through both supported MCP transports."""
+
+    return str(request.param)
+
+
 @pytest.fixture
-async def mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
-    async with _open_mcp_client(
+async def mcp_client(
+    runtime_session: RuntimeContext,
+    mcp_transport: str,
+) -> AsyncIterator[Client]:
+    open_client = _open_stdio_mcp_client if mcp_transport == "stdio" else _open_mcp_client
+    async with open_client(
         runtime_session,
         pat=runtime_session.pat,
         secrets=runtime_session.secrets,
         scenario="akb_list_vaults",
+    ) as client:
+        yield client
+
+
+@pytest.fixture
+async def stdio_mcp_client(runtime_session: RuntimeContext) -> AsyncIterator[Client]:
+    async with _open_stdio_mcp_client(
+        runtime_session,
+        pat=runtime_session.pat,
+        secrets=runtime_session.secrets,
+        scenario="akb_stdio_local_operations",
     ) as client:
         yield client
 
@@ -337,6 +438,7 @@ def _prepare_secondary_user(runtime_session: RuntimeContext) -> tuple[str, str, 
 @pytest.fixture
 async def secondary_mcp_client(
     runtime_session: RuntimeContext,
+    mcp_transport: str,
 ) -> AsyncIterator[SecondaryMcpSession]:
     try:
         username, pat, secrets = _prepare_secondary_user(runtime_session)
@@ -345,7 +447,8 @@ async def secondary_mcp_client(
             "scenario=mcp_product_e2e secondary user preparation: "
             + redact_error(exc, runtime_session.secrets)
         )
-    async with _open_mcp_client(
+    open_client = _open_stdio_mcp_client if mcp_transport == "stdio" else _open_mcp_client
+    async with open_client(
         runtime_session,
         pat=pat,
         secrets=(*runtime_session.secrets, *secrets),

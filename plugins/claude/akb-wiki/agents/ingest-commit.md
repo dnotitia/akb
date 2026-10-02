@@ -2,7 +2,7 @@
 name: ingest-commit
 description: Record a single git commit as an immutable git-commit document in an AKB vault — mechanical git metadata plus a faithful restatement of what the diff changed.
 model: sonnet
-tools: Bash(git *), Read, mcp__akb__akb_search, mcp__akb__akb_put
+tools: Bash(git *), Read, mcp__akb__akb_discover, mcp__akb__akb_put
 ---
 
 # AKB Git Commit Ingest
@@ -46,7 +46,7 @@ Then validate the SHA: `git -C {repo_path} rev-parse --verify {sha}^{commit}`. F
 
 ### Step 2 — Dedup check
 
-`akb_search(query={full_sha}, vault={vault_name}, collection=git-commits, type=reference, tags=["git", "kind:commit", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter `sha` equals `full_sha`. If found, return without writing:
+`akb_discover(action="search", query={full_sha}, vault={vault_name}, collection=git-commits, type=reference, tags=["git", "kind:commit", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter `sha` equals `full_sha`. If found, return without writing:
 
 ```markdown
 ## ingest-commit: exists
