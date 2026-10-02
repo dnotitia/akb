@@ -258,15 +258,18 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     acknowledgements = []
     token = "opaque-session-vault-challenge"
 
-    async def can_read(user, uid, vault):
-        access_service._authorized_vault.set(vault)
-        access_service._authorized_vault_id.set("immutable-v1")
-        return True
-
     async def strict_payload(
-        session_id, vault, vault_id=None, *, acknowledgement=None
+        session_id,
+        vault,
+        vault_id=None,
+        *,
+        request_binding,
+        permission_binding,
+        acknowledgement=None,
     ):
         acknowledgements.append(acknowledgement)
+        assert request_binding
+        assert permission_binding == "current-permissions"
         if acknowledgement == token:
             return None
         return {**_SENTINEL, "ack_token": token}
@@ -281,7 +284,14 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
         return {"updated": True}
 
     monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
+    async def permission_binding(_user, _name, vault):
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return "current-permissions"
+
+    monkeypatch.setattr(
+        server_mod, "_vault_skill_permission_binding", permission_binding
+    )
     monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
     monkeypatch.setattr(
         vault_skill_service, "injection_payload", no_additive_payload

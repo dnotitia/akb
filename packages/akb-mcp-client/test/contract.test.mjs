@@ -447,7 +447,7 @@ itAsync("proxy-local first write returns the vault guide before side effects", a
   assert.deepEqual(body.vault_skill, guide);
 });
 
-itAsync("proxy-local exact retry acknowledges the guide before writing", async () => {
+itAsync("proxy-local acknowledgements bind the exact write and credential", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
   const guide = {
     vault: "myvault", version: "abc123", reason: "first_touch",
@@ -463,9 +463,9 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
       ),
     }],
   });
-  let writes = 0;
-  proxy._putImage = async () => {
-    writes++;
+  const writes = [];
+  proxy._putImage = async (args) => {
+    writes.push(args.file_path);
     return { kind: "document_image", url: "/api/assets/test" };
   };
   const params = {
@@ -479,14 +479,106 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
   const firstBody = JSON.parse(first.result.content[0].text);
   assert.equal(firstBody.code, "vault_skill_required");
   assert.equal(typeof firstBody.vault_skill.ack_token, "string");
-  assert.equal(writes, 0);
+  const acknowledgementA = firstBody.vault_skill.ack_token;
+  assert.deepEqual(writes, []);
 
-  const second = await proxy._handle({
-    jsonrpc: "2.0", id: 2, method: "tools/call", params,
+  const mismatch = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "akb_put_image",
+      arguments: {
+        vault: "myvault",
+        file_path: "/tmp/different.png",
+        _vault_skill_ack: acknowledgementA,
+      },
+    },
   });
-  const secondBody = JSON.parse(second.result.content[0].text);
-  assert.equal(secondBody.kind, "document_image");
-  assert.equal(writes, 1);
+  const mismatchBody = JSON.parse(mismatch.result.content[0].text);
+  assert.equal(mismatchBody.code, "vault_skill_required");
+  assert.notEqual(mismatchBody.vault_skill.ack_token, acknowledgementA);
+  assert.deepEqual(writes, []);
+
+  proxy.pat = "rotated-credential";
+  const changedCredential = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      ...params,
+      arguments: { ...params.arguments, _vault_skill_ack: acknowledgementA },
+    },
+  });
+  const changedCredentialBody = JSON.parse(changedCredential.result.content[0].text);
+  assert.equal(changedCredentialBody.code, "vault_skill_required");
+  assert.notEqual(changedCredentialBody.vault_skill.ack_token, acknowledgementA);
+  assert.deepEqual(writes, []);
+
+  proxy.pat = "test";
+  const exactRetry = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      ...params,
+      arguments: { ...params.arguments, _vault_skill_ack: acknowledgementA },
+    },
+  });
+  const exactRetryBody = JSON.parse(exactRetry.result.content[0].text);
+  assert.equal(exactRetryBody.kind, "document_image");
+  assert.equal("ack_token" in exactRetryBody, false);
+  assert.deepEqual(writes, ["/tmp/example.png"]);
+});
+
+itAsync("proxy-local file uploads reject another operation's acknowledgement", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const guide = {
+    vault: "myvault", version: "abc123", reason: "first_touch",
+    body: "# Owner guide", truncated: false,
+  };
+  let helpCalls = 0;
+  proxy._ensureBackend = async () => true;
+  proxy._rpc = async () => ({
+    content: [{
+      type: "text",
+      text: JSON.stringify(
+        helpCalls++ === 0 ? { help: "guide", vault_skill: guide } : { help: "guide" },
+      ),
+    }],
+  });
+  const writes = [];
+  proxy._putFile = async (args) => {
+    writes.push(args.file_path);
+    return { kind: "file", uri: "akb://myvault/file/test" };
+  };
+  const call = (id, filePath, acknowledgement) => proxy._handle({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: {
+      name: "akb_put_file",
+      arguments: {
+        vault: "myvault",
+        file_path: filePath,
+        ...(acknowledgement ? { _vault_skill_ack: acknowledgement } : {}),
+      },
+    },
+  });
+
+  const first = await call(1, "/tmp/a.pdf");
+  const tokenA = JSON.parse(first.result.content[0].text).vault_skill.ack_token;
+  const mismatch = await call(2, "/tmp/b.pdf", tokenA);
+  const mismatchBody = JSON.parse(mismatch.result.content[0].text);
+  assert.equal(mismatchBody.code, "vault_skill_required");
+  assert.notEqual(mismatchBody.vault_skill.ack_token, tokenA);
+  assert.deepEqual(writes, []);
+
+  const retry = await call(3, "/tmp/a.pdf", tokenA);
+  const retryBody = JSON.parse(retry.result.content[0].text);
+  assert.equal(retryBody.kind, "file");
+  assert.equal("ack_token" in retryBody, false);
+  assert.deepEqual(writes, ["/tmp/a.pdf"]);
 });
 
 itAsync("proxy-local read attaches the guide to the successful result", async () => {

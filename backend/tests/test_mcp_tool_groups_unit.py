@@ -8,6 +8,7 @@ import tempfile
 import pytest
 
 from app.config import settings
+from app.services import vault_skill_service as vss
 
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-mcp-groups-vaults-")
 
@@ -39,6 +40,125 @@ def quiet_sinks(monkeypatch):
 
 async def _deny_skill_projection(*_args, **_kwargs):
     return False
+
+
+def test_vault_skill_request_binding_tracks_the_canonical_tool_and_arguments():
+    args = {"vault": "v1", "name": "table_a", "columns": []}
+    binding = mcp_server._vault_skill_request_binding
+
+    assert binding("akb_create_table", args) == binding(
+        "akb_create_table", {"columns": [], "name": "table_a", "vault": "v1"}
+    )
+    assert binding("akb_create_table", args) != binding(
+        "akb_alter_table", args
+    )
+    assert binding("akb_create_table", args) != binding(
+        "akb_create_table", {**args, "name": "table_b"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_vault_skill_ack_does_not_authorize_a_different_write(
+    monkeypatch, quiet_sinks
+):
+    """An ACK for A cannot let a different same-vault write B dispatch first."""
+    audit, usage = quiet_sinks
+    vss.reset()
+
+    async def fetch_skill(_vault, _vault_id=None):
+        return {"content": "# Vault instructions", "version": "v1"}
+
+    permissions = {"oauth_scopes": ["akb:vault:read", "akb:vault:write"]}
+
+    async def current_user():
+        return mcp_server._MCPUser(
+            user_id="user-1",
+            username="writer",
+            auth_method="oauth",
+            oauth_scopes=permissions["oauth_scopes"],
+            token_scopes=frozenset({"read", "write"}),
+        )
+
+    async def check_access(_uid, _vault, required_role="reader"):
+        assert required_role == "reader"
+        role = "writer" if "akb:vault:write" in permissions["oauth_scopes"] else "reader"
+        return {
+            "vault_id": "vault-uuid",
+            "role": role,
+            "role_source": "member",
+            "status": "active",
+        }
+
+    created = []
+
+    async def create_table(args, _uid, _user):
+        created.append(args["name"])
+        return {"created": True, "name": args["name"]}
+
+    monkeypatch.setattr(vss, "_fetch_skill", fetch_skill)
+    monkeypatch.setattr(mcp_server, "_get_user", current_user)
+    monkeypatch.setattr(mcp_server, "_session_id", lambda: "session-1")
+    monkeypatch.setattr(mcp_server, "_vault_skill_preflight_version", lambda: 2)
+    monkeypatch.setattr(mcp_server, "check_vault_access", check_access)
+    monkeypatch.setattr(mcp_server, "authorized_vault_id", lambda: "vault-uuid")
+    monkeypatch.setattr(mcp_server, "authorized_vault", lambda: "vault-1")
+    monkeypatch.setitem(mcp_server._HANDLERS, "akb_create_table", create_table)
+
+    request_a = {
+        "vault": "vault-1",
+        "name": "t_ac6_a",
+        "columns": [{"name": "title", "type": "text"}],
+    }
+    request_b = {**request_a, "name": "t_ac6_b"}
+
+    try:
+        first = await mcp_server.call_tool("akb_create_table", request_a)
+        first_result = json.loads(first.content[0].text)
+        assert first_result["code"] == "vault_skill_required"
+        acknowledgement_a = first_result["vault_skill"]["ack_token"]
+
+        # Send B with A's valid token before the exact A retry, matching the
+        # observed exploit order. Neither the challenged A nor B may dispatch.
+        mismatched = await mcp_server.call_tool(
+            "akb_create_table",
+            {**request_b, mcp_server.VAULT_SKILL_ACK_ARGUMENT: acknowledgement_a},
+        )
+        mismatched_result = json.loads(mismatched.content[0].text)
+        assert mismatched_result["vault_skill"]["ack_token"] != acknowledgement_a
+
+        # The credential permission snapshot also participates in the binding.
+        permissions["oauth_scopes"] = ["akb:vault:read"]
+        changed_permission = await mcp_server.call_tool(
+            "akb_create_table",
+            {**request_a, mcp_server.VAULT_SKILL_ACK_ARGUMENT: acknowledgement_a},
+        )
+        changed_permission_result = json.loads(changed_permission.content[0].text)
+        assert changed_permission_result["code"] == "vault_skill_required"
+        assert changed_permission_result["vault_skill"]["ack_token"] != acknowledgement_a
+
+        permissions["oauth_scopes"] = ["akb:vault:read", "akb:vault:write"]
+        retry_a = await mcp_server.call_tool(
+            "akb_create_table",
+            {**request_a, mcp_server.VAULT_SKILL_ACK_ARGUMENT: acknowledgement_a},
+        )
+        retry_a_result = json.loads(retry_a.content[0].text)
+
+        assert (
+            mismatched_result.get("code"),
+            created,
+            retry_a_result.get("name"),
+        ) == ("vault_skill_required", ["t_ac6_a"], "t_ac6_a")
+        assert mcp_server.VAULT_SKILL_ACK_ARGUMENT not in retry_a_result
+        assert all(
+            mcp_server.VAULT_SKILL_ACK_ARGUMENT not in args
+            for _, args, _, _ in audit
+        )
+        assert all(
+            mcp_server.VAULT_SKILL_ACK_ARGUMENT not in args
+            for _, args, _, _ in usage
+        )
+    finally:
+        vss.reset()
 
 
 @pytest.mark.asyncio
