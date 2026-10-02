@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import sys
@@ -166,6 +167,8 @@ class _MCPUser:
         oauth_scopes: list[str] | None = None,
         token_scopes: frozenset[str] | None = None,
         key_class: str | None = None,
+        token_id: str | None = None,
+        vault_scope: Any | None = None,
     ):
         self.user_id = user_id
         self.username = username
@@ -179,6 +182,8 @@ class _MCPUser:
         self.oauth_scopes = oauth_scopes
         self.token_scopes = token_scopes
         self.key_class = key_class
+        self.token_id = token_id
+        self.vault_scope = vault_scope
 
 _FALLBACK_USER = _MCPUser()
 
@@ -208,6 +213,8 @@ async def _get_user() -> _MCPUser:
                     oauth_scopes=scoped_user.oauth_scopes,
                     token_scopes=scoped_user.token_scopes,
                     key_class=scoped_user.key_class,
+                    token_id=scoped_user.token_id,
+                    vault_scope=scoped_user.vault_scope,
                 )
             auth_header = request.headers.get("authorization", "")
             if auth_header:
@@ -221,6 +228,8 @@ async def _get_user() -> _MCPUser:
                         oauth_scopes=user.oauth_scopes,
                         token_scopes=user.token_scopes,
                         key_class=user.key_class,
+                        token_id=user.token_id,
+                        vault_scope=user.vault_scope,
                     )
                 # A credential was presented and rejected — that's a
                 # security-relevant event, so audit the denial. No token material
@@ -382,6 +391,65 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
 def _required_scope(name: str) -> str:
     """Return the explicit tool scope; unmapped calls fail closed to write."""
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+
+
+def _vault_skill_request_binding(name: str, args: dict) -> str:
+    """Hash the canonical operation and validated business arguments."""
+    payload = json.dumps(
+        {"tool": name, "arguments": args},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _vault_skill_permission_binding(
+    user: _MCPUser, name: str, vault: str
+) -> str | None:
+    """Hash current actor, credential, scopes, and vault-reader permissions."""
+    if user.oauth_scopes is not None and _READ_SCOPE not in user.oauth_scopes:
+        return None
+    if user.token_scopes is not None and not token_has_scope(
+        user.token_scopes, "read"
+    ):
+        return None
+    try:
+        access = await check_vault_access(
+            user.user_id, vault, required_role="reader"
+        )
+    except Exception:  # noqa: BLE001 — permission context is fail-closed
+        return None
+
+    vault_scope = user.vault_scope
+    if vault_scope is not None:
+        vault_scope = vault_scope.to_db_json()
+    payload = json.dumps(
+        {
+            "actor": user.user_id,
+            "auth_method": user.auth_method,
+            "is_admin": user.is_admin,
+            "credential_id": user.token_id,
+            "key_class": user.key_class,
+            "oauth_scopes": (
+                sorted(user.oauth_scopes) if user.oauth_scopes is not None else None
+            ),
+            "token_scopes": (
+                sorted(user.token_scopes) if user.token_scopes is not None else None
+            ),
+            "vault_scope": vault_scope,
+            "vault_role": access["role"],
+            "vault_role_source": access["role_source"],
+            "vault_status": access["status"],
+            "required_scope": _required_scope(name),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # Operation schemas are the source of accepted argument names. The public
@@ -1779,24 +1847,36 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 from app.services import vault_skill_service
 
                 target_vault = vault_of_call(name, arguments)
-                if target_vault and await _can_read_vault(
-                    user, user.user_id, target_vault
-                ):
+                if target_vault:
                     if preflight_version == 2:
-                        payload = await vault_skill_service.preflight_payload(
-                            _session_id(),
-                            target_vault,
-                            authorized_vault_id(),
-                            acknowledgement=(
-                                vault_skill_ack
-                                if isinstance(vault_skill_ack, str)
-                                else None
-                            ),
+                        permission_binding = await _vault_skill_permission_binding(
+                            user, name, target_vault
                         )
-                    else:
+                        if permission_binding is None:
+                            payload = None
+                        else:
+                            payload = await vault_skill_service.preflight_payload(
+                                _session_id(),
+                                target_vault,
+                                authorized_vault_id(),
+                                request_binding=_vault_skill_request_binding(
+                                    name, arguments
+                                ),
+                                permission_binding=permission_binding,
+                                acknowledgement=(
+                                    vault_skill_ack
+                                    if isinstance(vault_skill_ack, str)
+                                    else None
+                                ),
+                            )
+                    elif await _can_read_vault(
+                        user, user.user_id, target_vault
+                    ):
                         payload = await vault_skill_service.injection_payload(
                             _session_id(), target_vault, authorized_vault_id(),
                         )
+                    else:
+                        payload = None
                     if payload:
                         result = err(
                             (

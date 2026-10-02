@@ -86,17 +86,17 @@ _vault_cache: OrderedDict[_CacheKey, tuple[float, str | None, str | None]] = Ord
 # OrderedDict as LRU.  This is intentionally separate from strict write
 # acknowledgement: putting a guide in a read response does not prove that the
 # client applied it before a concurrently submitted write.
-_session_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
-# Strict preflight state.  Acknowledgement is explicit in capability v2, so all
-# concurrent writes that arrived without the challenge token remain
-# non-mutating.  Challenges are opaque and bound by their map key to the MCP
-# session, vault name, and immutable vault id.
-_acknowledged_map: OrderedDict[tuple[str, str, str | None], str] = OrderedDict()
+_SessionKey = tuple[str, str, str | None]
+_PermissionKey = tuple[str, str, str | None, str]
+_ChallengeKey = tuple[str, str, str | None, str, str]
+_session_map: OrderedDict[_SessionKey, str] = OrderedDict()
+# Strict preflight state. Once one exact request/permission challenge is
+# acknowledged, the guide is considered applied for that session permission
+# context. Pending tokens themselves remain bound to one request.
+_acknowledged_map: OrderedDict[_PermissionKey, str] = OrderedDict()
 # Only the unsigned fallback below stores anything here; the signed challenge
 # is derived, so no replica has to have seen a token to verify it.
-_challenge_map: OrderedDict[
-    tuple[str, str, str | None], tuple[str, str]
-] = OrderedDict()
+_challenge_map: OrderedDict[_ChallengeKey, tuple[str, str]] = OrderedDict()
 # vault → in-flight fetch. Single-flight: a cache miss costs several DB round
 # trips plus a git read, so N concurrent first-touches of one vault must not
 # become N stampeding fetches. Entries are removed in the leader's `finally`,
@@ -149,8 +149,8 @@ def invalidate(vault: str) -> None:
 
 
 def _remember(
-    mapping: OrderedDict[tuple[str, str, str | None], str],
-    key: tuple[str, str, str | None],
+    mapping: OrderedDict[tuple, str],
+    key: tuple,
     value: str,
 ) -> None:
     """Store one per-session value and preserve the configured LRU bound."""
@@ -161,7 +161,7 @@ def _remember(
 
 
 def _remember_challenge(
-    key: tuple[str, str, str | None], version: str, token: str
+    key: _ChallengeKey, version: str, token: str
 ) -> None:
     _challenge_map[key] = (version, token)
     _challenge_map.move_to_end(key)
@@ -171,7 +171,7 @@ def _remember_challenge(
 
 # Domain separator: the same secret signs capability URLs and event-tail
 # cursors, so a vault-skill challenge must not share their message space.
-_ACK_TOKEN_DOMAIN = "akb-vault-skill-ack-v1"
+_ACK_TOKEN_DOMAIN = "akb-vault-skill-ack-v2"
 # `secrets.token_urlsafe(24)` is 32 characters, and a client may already treat
 # that as the token's shape. 192 bits of a SHA-256 HMAC is far more than a
 # challenge needs.
@@ -189,7 +189,7 @@ _warned_unsigned_challenge = False
 # acknowledgements in a loop can force at most one guide read per key per
 # interval, and `_pending` already collapses concurrent reads for one key.
 _FORCED_REFRESH_MIN_INTERVAL = 5.0
-_last_forced_refresh: OrderedDict[tuple[str, str, str | None], float] = OrderedDict()
+_last_forced_refresh: OrderedDict[_PermissionKey, float] = OrderedDict()
 
 
 def _bind(*parts: str) -> bytes:
@@ -207,7 +207,7 @@ def _bind(*parts: str) -> bytes:
     return bytes(out)
 
 
-def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
+def _challenge_token(key: _ChallengeKey, version: str) -> str:
     """The challenge every replica derives, rather than one replica remembers.
 
     This was `secrets.token_urlsafe(24)` held in `_challenge_map` — process
@@ -218,10 +218,9 @@ def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
     could ever be acknowledged, so none could ever commit.
 
     Deriving the token from the shared HMAC secret makes it a pure function of
-    what it is already bound to — session, vault, vault id, guide version — so
-    any replica verifies a token any other replica issued. Nothing is weakened
-    by the change: the token was already stable for that key until the guide
-    version changed, and without the secret it stays unguessable.
+    what it is already bound to — session, vault, vault id, request, permission
+    context, and guide version — so any replica verifies a token another
+    replica issued. Without the secret it stays unguessable.
     """
     secret = settings.system_hmac_secret_effective
     if not secret:
@@ -245,7 +244,7 @@ def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
 
     digest = hmac.new(
         secret.encode("utf-8"),
-        _bind(_ACK_TOKEN_DOMAIN, key[0], key[1], key[2] or "", version),
+        _bind(_ACK_TOKEN_DOMAIN, *(part or "" for part in key), version),
         hashlib.sha256,
     ).digest()
     encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
@@ -261,7 +260,7 @@ def _token_matches(acknowledgement: str | None, token: str) -> bool:
     )
 
 
-def _may_force_refresh(key: tuple[str, str, str | None]) -> bool:
+def _may_force_refresh(key: _PermissionKey) -> bool:
     now = time.monotonic()
     last = _last_forced_refresh.get(key)
     if last is not None and now - last < _FORCED_REFRESH_MIN_INTERVAL:
@@ -481,6 +480,8 @@ async def preflight_payload(
     vault: str,
     vault_id: str | None = None,
     *,
+    request_binding: str,
+    permission_binding: str,
     acknowledgement: str | None = None,
 ) -> dict | None:
     """Return a strict write challenge until the current guide is acknowledged.
@@ -488,7 +489,8 @@ async def preflight_payload(
     No state is advanced merely because a response was constructed.  That is
     the concurrency invariant: every parallel first write without the opaque
     token remains non-mutating.  A token is valid only for the session/vault/id
-    key that issued it and for the guide version that is still current.
+    exact request and permission context that issued it, within the session,
+    vault identity, and guide version that are still current.
 
     ``None`` means the session already acknowledged this version, or that the
     optional guide could not be projected.  Like additive injection, this
@@ -499,22 +501,25 @@ async def preflight_payload(
             return None
         if len(vault) > _VAULT_NAME_MAX:
             return None
-        key = (session_id or "no-session", vault, vault_id)
+        permission_key = (
+            session_id or "no-session", vault, vault_id, permission_binding
+        )
+        challenge_key = (*permission_key, request_binding)
         version, body = await _current(vault, vault_id)
         if version is None or body is None:
             return None
 
-        acknowledged = _acknowledged_map.get(key)
+        acknowledged = _acknowledged_map.get(permission_key)
         if acknowledged == version:
-            _acknowledged_map.move_to_end(key)
+            _acknowledged_map.move_to_end(permission_key)
             return None
 
-        token = _challenge_token(key, version)
+        token = _challenge_token(challenge_key, version)
 
         if (
             acknowledgement
             and not _token_matches(acknowledgement, token)
-            and _may_force_refresh(key)
+            and _may_force_refresh(permission_key)
         ):
             # Drop this replica's cached guide and read it again: if another
             # replica has already moved to a newer version, the token the
@@ -524,12 +529,16 @@ async def preflight_payload(
             refreshed_version, refreshed_body = await _current(vault, vault_id)
             if refreshed_version is not None and refreshed_body is not None:
                 version, body = refreshed_version, refreshed_body
-                token = _challenge_token(key, version)
+                token = _challenge_token(challenge_key, version)
 
         if _token_matches(acknowledgement, token):
-            _remember(_acknowledged_map, key, version)
-            _remember(_session_map, key, version)
-            _challenge_map.pop(key, None)
+            _remember(_acknowledged_map, permission_key, version)
+            _remember(
+                _session_map,
+                (permission_key[0], permission_key[1], permission_key[2]),
+                version,
+            )
+            _challenge_map.pop(challenge_key, None)
             return None
 
         return _format_payload(

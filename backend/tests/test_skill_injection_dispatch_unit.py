@@ -56,6 +56,19 @@ def test_vault_of_call_public_name():
     assert vault_of_call("akb_sql", {"vaults": ["a", "b"]}) is None
 
 
+def test_vault_skill_request_binding_tracks_tool_and_arguments():
+    bind = server_mod._vault_skill_request_binding
+    args = {"vault": "v1", "name": "table_a"}
+
+    assert bind("akb_create_table", args) == bind(
+        "akb_create_table", {"name": "table_a", "vault": "v1"}
+    )
+    assert bind("akb_create_table", args) != bind("akb_drop_table", args)
+    assert bind("akb_create_table", args) != bind(
+        "akb_create_table", {**args, "name": "table_b"}
+    )
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """Stub the chokepoint's collaborators and record injector calls.
@@ -247,15 +260,18 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     acknowledgements = []
     token = "opaque-session-vault-challenge"
 
-    async def can_read(user, uid, vault):
-        access_service._authorized_vault.set(vault)
-        access_service._authorized_vault_id.set("immutable-v1")
-        return True
-
     async def strict_payload(
-        session_id, vault, vault_id=None, *, acknowledgement=None
+        session_id,
+        vault,
+        vault_id=None,
+        *,
+        request_binding,
+        permission_binding,
+        acknowledgement=None,
     ):
         acknowledgements.append(acknowledgement)
+        assert request_binding
+        assert permission_binding == "current-permissions"
         if acknowledgement == token:
             return None
         return {**_SENTINEL, "ack_token": token}
@@ -270,7 +286,14 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
         return {"updated": True}
 
     monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
+    async def permission_binding(_user, _name, vault):
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return "current-permissions"
+
+    monkeypatch.setattr(
+        server_mod, "_vault_skill_permission_binding", permission_binding
+    )
     monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
     monkeypatch.setattr(
         vault_skill_service, "injection_payload", no_additive_payload
@@ -290,6 +313,111 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     assert successful == {"updated": True}
     assert dispatched == 1
     assert acknowledgements == [None, None, token]
+
+
+@pytest.mark.asyncio
+async def test_v2_ack_rejects_different_request_and_changed_permissions(
+    monkeypatch, wired
+):
+    vault_skill_service.reset()
+    created = []
+    audit_args = []
+    usage_args = []
+    permissions = {"oauth_scopes": ["akb:vault:read", "akb:vault:write"]}
+
+    async def fetch_skill(_vault, _vault_id=None):
+        return {"content": "# Vault instructions", "version": "v1"}
+
+    async def current_user():
+        return server_mod._MCPUser(
+            user_id="user-1",
+            username="writer",
+            auth_method="oauth",
+            oauth_scopes=permissions["oauth_scopes"],
+            token_scopes=frozenset({"read", "write"}),
+        )
+
+    async def check_access(uid, vault, required_role="reader"):
+        assert required_role == "reader"
+        role = "writer" if "akb:vault:write" in permissions["oauth_scopes"] else "reader"
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return {
+            "vault_id": "immutable-v1",
+            "role": role,
+            "role_source": "member",
+            "status": "active",
+        }
+
+    async def dispatch(name, args, user):
+        created.append(args["name"])
+        assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in args
+        return {"created": True, "name": args["name"]}
+
+    async def no_payload(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(vault_skill_service, "_fetch_skill", fetch_skill)
+    monkeypatch.setattr(server_mod, "_get_user", current_user)
+    monkeypatch.setattr(server_mod, "check_vault_access", check_access)
+    monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
+    monkeypatch.setattr(
+        server_mod.tool_usage,
+        "record",
+        lambda name, args, *_a, **_k: usage_args.append(args),
+    )
+    monkeypatch.setattr(
+        server_mod.audit_log,
+        "record_tool",
+        lambda name, args, *_a, **_k: audit_args.append(args),
+    )
+    monkeypatch.setattr(
+        vault_skill_service,
+        "injection_payload",
+        no_payload,
+    )
+    wired["dispatch"](dispatch)
+
+    request_a = {
+        "vault": "v1",
+        "name": "t_ac6_a",
+        "columns": [{"name": "title", "type": "text"}],
+    }
+    request_b = {**request_a, "name": "t_ac6_b"}
+    try:
+        first = await _run("akb_create_table", request_a)
+        token_a = first["vault_skill"]["ack_token"]
+
+        mismatch = await _run(
+            "akb_create_table",
+            {**request_b, server_mod.VAULT_SKILL_ACK_ARGUMENT: token_a},
+        )
+        assert mismatch["code"] == "vault_skill_required"
+        assert mismatch["vault_skill"]["ack_token"] != token_a
+
+        permissions["oauth_scopes"] = ["akb:vault:read"]
+        changed = await _run(
+            "akb_create_table",
+            {**request_a, server_mod.VAULT_SKILL_ACK_ARGUMENT: token_a},
+        )
+        assert changed["code"] == "vault_skill_required"
+        assert changed["vault_skill"]["ack_token"] != token_a
+
+        permissions["oauth_scopes"] = ["akb:vault:read", "akb:vault:write"]
+        retry = await _run(
+            "akb_create_table",
+            {**request_a, server_mod.VAULT_SKILL_ACK_ARGUMENT: token_a},
+        )
+        assert retry == {"created": True, "name": "t_ac6_a"}
+        assert created == ["t_ac6_a"]
+        assert all(
+            server_mod.VAULT_SKILL_ACK_ARGUMENT not in args for args in audit_args
+        )
+        assert all(
+            server_mod.VAULT_SKILL_ACK_ARGUMENT not in args for args in usage_args
+        )
+    finally:
+        vault_skill_service.reset()
 
 
 async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):

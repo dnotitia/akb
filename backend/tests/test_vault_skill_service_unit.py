@@ -23,6 +23,25 @@ def _fake_fetch(content="# skill body", version="abc12345"):
     return fetch
 
 
+async def _preflight(
+    session_id,
+    vault,
+    vault_id=None,
+    *,
+    request_binding="operation-a",
+    permission_binding="actor-a",
+    acknowledgement=None,
+):
+    return await vss.preflight_payload(
+        session_id,
+        vault,
+        vault_id,
+        request_binding=request_binding,
+        permission_binding=permission_binding,
+        acknowledgement=acknowledgement,
+    )
+
+
 @pytest.mark.asyncio
 async def test_first_touch_injects(monkeypatch):
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
@@ -73,7 +92,7 @@ async def test_strict_preflight_blocks_parallel_writes_until_matching_ack(monkey
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
 
     challenges = await asyncio.gather(*[
-        vss.preflight_payload("same-session", "v1", "vault-id")
+        _preflight("same-session", "v1", "vault-id")
         for _ in range(12)
     ])
 
@@ -82,41 +101,74 @@ async def test_strict_preflight_blocks_parallel_writes_until_matching_ack(monkey
     token = challenges[0]["ack_token"]
 
     # Missing, malformed, and unrelated acknowledgements remain fail-closed.
-    assert await vss.preflight_payload("same-session", "v1", "vault-id") is not None
-    assert await vss.preflight_payload(
+    assert await _preflight("same-session", "v1", "vault-id") is not None
+    assert await _preflight(
         "same-session", "v1", "vault-id", acknowledgement="wrong"
     ) is not None
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "same-session", "v1", "vault-id", acknowledgement=object()  # type: ignore[arg-type]
     ) is not None
 
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "same-session", "v1", "vault-id", acknowledgement=token
     ) is None
-    assert await vss.preflight_payload("same-session", "v1", "vault-id") is None
+    assert await _preflight("same-session", "v1", "vault-id") is None
 
 
 @pytest.mark.asyncio
 async def test_strict_ack_is_bound_to_session_vault_identity_and_version(monkeypatch):
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-old"))
-    challenge = await vss.preflight_payload("s", "v1", "id-1")
+    challenge = await _preflight("s", "v1", "id-1")
     token = challenge["ack_token"]
 
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "other-session", "v1", "id-1", acknowledgement=token
     ) is not None
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "s", "v1", "id-2", acknowledgement=token
     ) is not None
 
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-new"))
     vss.invalidate("v1")
-    updated = await vss.preflight_payload(
+    updated = await _preflight(
         "s", "v1", "id-1", acknowledgement=token
     )
     assert updated is not None
     assert updated["version"] == "v-new"
     assert updated["ack_token"] != token
+
+
+@pytest.mark.asyncio
+async def test_strict_ack_is_bound_to_request_and_permission_context(monkeypatch):
+    monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
+    challenge_a = await _preflight("s", "v1", "id-1")
+    token_a = challenge_a["ack_token"]
+
+    different_request = await _preflight(
+        "s", "v1", "id-1", request_binding="operation-b", acknowledgement=token_a
+    )
+    changed_permission = await _preflight(
+        "s", "v1", "id-1", permission_binding="actor-a-read-only",
+        acknowledgement=token_a,
+    )
+    different_vault = await _preflight(
+        "s", "v2", "id-2", acknowledgement=token_a
+    )
+
+    assert different_request is not None
+    assert different_request["ack_token"] != token_a
+    assert changed_permission is not None
+    assert changed_permission["ack_token"] != token_a
+    assert different_vault is not None
+
+    assert await _preflight(
+        "s", "v1", "id-1", acknowledgement=token_a
+    ) is None
+    # Applying the exact challenge keeps session-level guide reuse for later
+    # operations under the same permission context.
+    assert await _preflight(
+        "s", "v1", "id-1", request_binding="operation-b"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -131,14 +183,14 @@ async def test_an_acknowledgement_verifies_on_a_replica_that_never_issued_it(mon
     """
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
 
-    challenge = await vss.preflight_payload("sess", "v1", "vault-id")
+    challenge = await _preflight("sess", "v1", "vault-id")
     token = challenge["ack_token"]
     # A signed challenge is derived, so there is nothing to have remembered.
     assert not vss._challenge_map
 
     vss.reset()  # a different replica
 
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "sess", "v1", "vault-id", acknowledgement=token
     ) is None
 
@@ -148,9 +200,9 @@ async def test_replicas_issue_one_challenge_for_one_key_and_version(monkeypatch)
     """Two pods must hand the same client the same token, not two tokens."""
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
 
-    first = await vss.preflight_payload("sess", "v1", "vault-id")
+    first = await _preflight("sess", "v1", "vault-id")
     vss.reset()
-    second = await vss.preflight_payload("sess", "v1", "vault-id")
+    second = await _preflight("sess", "v1", "vault-id")
 
     assert first["ack_token"] == second["ack_token"]
     # Still opaque: a different secret is a different challenge.
@@ -158,7 +210,7 @@ async def test_replicas_issue_one_challenge_for_one_key_and_version(monkeypatch)
         vss.settings, "system_hmac_secret", "other-deployment"  # pragma: allowlist secret
     )
     vss.reset()
-    assert (await vss.preflight_payload("sess", "v1", "vault-id"))["ack_token"] != first[
+    assert (await _preflight("sess", "v1", "vault-id"))["ack_token"] != first[
         "ack_token"
     ]
 
@@ -174,8 +226,8 @@ def test_signed_fields_are_length_prefixed_so_two_bindings_cannot_collide():
     today; length-prefixing makes it unrepresentable, which is the property
     worth pinning rather than the reachability.
     """
-    assert vss._challenge_token(("a", "b", "c\x1fd"), "e") != vss._challenge_token(
-        ("a", "b", "c"), "d\x1fe"
+    assert vss._challenge_token(("a", "b", "c\x1fd", "req", "perm"), "e") != vss._challenge_token(
+        ("a", "b", "c", "d\x1fe", "req"), "perm"
     )
 
 
@@ -186,10 +238,10 @@ async def test_without_a_shared_secret_the_challenge_is_still_issued(monkeypatch
     monkeypatch.setattr(vss.settings, "jwt_secret", "")
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
 
-    challenge = await vss.preflight_payload("sess", "v1", "vault-id")
+    challenge = await _preflight("sess", "v1", "vault-id")
     assert challenge is not None
     assert vss._challenge_map  # this one IS remembered — per process
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "sess", "v1", "vault-id", acknowledgement=challenge["ack_token"]
     ) is None
 
@@ -209,7 +261,7 @@ async def test_a_replica_behind_on_the_guide_still_accepts_the_newer_token(monke
     service sees the new guide, then putting the service back on the old one.
     """
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch(version="v-new"))
-    issued = await vss.preflight_payload("s", "v1", "id")
+    issued = await _preflight("s", "v1", "id")
     token = issued["ack_token"]
 
     # This replica is behind: its cache holds the previous version.
@@ -227,7 +279,7 @@ async def test_a_replica_behind_on_the_guide_still_accepts_the_newer_token(monke
 
     monkeypatch.setattr(vss, "_fetch_skill", drifting)
 
-    assert await vss.preflight_payload(
+    assert await _preflight(
         "s", "v1", "id", acknowledgement=token
     ) is None, "a replica behind on the guide rejected a valid acknowledgement"
     assert fetched["n"] == 2, "the mismatch did not force a re-read"
@@ -244,7 +296,7 @@ async def test_wrong_acknowledgements_cannot_force_a_read_per_call(monkeypatch):
 
     monkeypatch.setattr(vss, "_fetch_skill", counting)
     for _ in range(8):
-        assert await vss.preflight_payload(
+        assert await _preflight(
             "s", "v1", "id", acknowledgement="x" * 32
         ) is not None
     # One initial resolve plus at most one forced re-read inside the interval.
@@ -261,7 +313,7 @@ async def test_a_first_touch_does_not_force_a_read(monkeypatch):
         return {"content": "# skill body", "version": "v1"}
 
     monkeypatch.setattr(vss, "_fetch_skill", counting)
-    assert await vss.preflight_payload("s", "v1", "id") is not None
+    assert await _preflight("s", "v1", "id") is not None
     assert fetched["n"] == 1
 
 
