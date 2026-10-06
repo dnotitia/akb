@@ -123,6 +123,13 @@ export default function AuthPage() {
   const [pendingFocus, setPendingFocus] = useState<string | null>(null);
   const focusField = (id: string) => setPendingFocus(id);
 
+  // Fixing either side of a shown mismatch clears it right away. Kept out of
+  // the change handler so autofill filling several fields in one tick cannot
+  // write back a stale draft.
+  useEffect(() => {
+    setFieldErrors((current) => (current.confirm ? { ...current, confirm: confirmError(register) } : current));
+  }, [register.password, register.confirm]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function switchMode(next: Mode) {
     setMode(next);
     setFieldErrors({});
@@ -277,14 +284,7 @@ export default function AuthPage() {
                     <AuthForm
                       mode="register" values={register}
                       focusId={mode === "register" ? pendingFocus : null} onFocused={() => setPendingFocus(null)}
-                      onChange={(field, value) => {
-                        const draft = { ...register, [field]: value };
-                        setRegister(draft);
-                        // Fixing either side of a shown mismatch clears it right away.
-                        if (fieldErrors.confirm && (field === "password" || field === "confirm")) {
-                          setFieldErrors((current) => ({ ...current, confirm: confirmError(draft) }));
-                        }
-                      }}
+                      onChange={(field, value) => setRegister((draft) => ({ ...draft, [field]: value }))}
                       onBlurConfirm={() => setFieldErrors((current) => ({ ...current, confirm: confirmError(register) }))}
                       fieldErrors={fieldErrors} message={message} loading={loading} onSubmit={handleSubmit}
                     />
