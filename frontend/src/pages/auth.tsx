@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ArrowRight, Database, Boxes, GitBranch } from "lucide-react";
+import { ArrowRight, Database, Boxes, Eye, EyeOff, GitBranch } from "lucide-react";
 import {
   authLogin,
   authRegister,
@@ -37,11 +37,13 @@ function safeNext(raw: string | null): string {
 export default function AuthPage() {
   const navigate = useNavigate();
   const [mode, setMode] = useState<Mode>("login");
-  const [username, setUsername] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [error, setError] = useState("");
+  // Each tab keeps its own draft: a half-typed registration password must not
+  // become the sign-in password.
+  const [login, setLogin] = useState<LoginDraft>(EMPTY_LOGIN);
+  const [register, setRegister] = useState<RegisterDraft>(EMPTY_REGISTER);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+  const [message, setMessage] = useState<FormMessage | null>(null);
+  const formRef = useRef<HTMLFormElement | null>(null);
   // The SSO callback is reached by a browser following a redirect, so it cannot
   // answer with an error body — whatever it returns IS the page. It sends the
   // person back here with a reason instead, and this is where that reason
@@ -117,22 +119,38 @@ export default function AuthPage() {
     window.location.href = `${loginUrl}?redirect=${encodeURIComponent(next)}`;
   }
 
+  function focusField(id: string) {
+    requestAnimationFrame(() => {
+      const field = formRef.current?.querySelector<HTMLInputElement>(`#${id}`);
+      field?.focus();
+    });
+  }
+
+  function switchMode(next: Mode) {
+    setMode(next);
+    setFieldErrors({});
+    setMessage(null);
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (localAuthEnabled !== true) return;
-    setError("");
-    // Backend change_password() enforces 8 chars but register() does not —
-    // catch it here so a user can't create a password they can never change.
-    if (mode === "register" && password.length < 8) {
-      setError("Password must be at least 8 characters.");
+    setMessage(null);
+    const errors = mode === "login" ? validateLogin(login) : validateRegister(register);
+    setFieldErrors(errors);
+    const firstInvalid = FIELD_ORDER.find((field) => errors[field]);
+    if (firstInvalid) {
+      focusField(FIELD_IDS[firstInvalid]);
       return;
     }
+    const username = mode === "login" ? login.username : register.username;
+    const password = mode === "login" ? login.password : register.password;
     setLoading(true);
     try {
       if (mode === "register") {
-        const reg = await authRegister(username, email, password, displayName || undefined);
+        const reg = await authRegister(username, register.email, password, register.displayName || undefined);
         if (reg.error) {
-          setError(reg.error);
+          setMessage({ kind: "error", text: reg.error });
           return;
         }
       }
@@ -142,11 +160,15 @@ export default function AuthPage() {
         // after a successful register, an auto-login failure would strand the
         // user on the register tab (a retry hits the duplicate-account guard).
         if (mode === "register") {
+          setRegister(EMPTY_REGISTER);
+          setLogin({ username, password: "" });
           setMode("login");
-          setError("Account created — please sign in.");
+          setMessage({ kind: "info", text: "Account created. Sign in to continue." });
         } else {
-          setError(r.error || "Login failed — no token returned.");
+          setLogin((draft) => ({ ...draft, password: "" }));
+          setMessage({ kind: "error", text: r.error || "Sign-in failed. No session was returned." });
         }
+        focusField(FIELD_IDS.password);
         return;
       }
       setToken(r.token);
@@ -161,24 +183,24 @@ export default function AuthPage() {
       }
       navigate(next);
     } catch (err: any) {
-      setError(err?.message || "Something went wrong. Please try again.");
+      setMessage({ kind: "error", text: err?.message || "Something went wrong. Please try again." });
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
+    <div className="relative flex min-h-screen justify-center overflow-clip bg-background text-foreground px-4 pb-6 pt-16 sm:p-6 sm:pt-[12vh]">
       <div className="absolute right-4 top-4 z-10">
         <ThemeToggle />
       </div>
 
-      <main className="relative w-full max-w-5xl grid lg:grid-cols-2 gap-10 lg:gap-16 items-center fade-up">
+      <main className="relative w-full max-w-5xl grid lg:grid-cols-2 gap-10 lg:gap-16 items-start fade-up">
         {/* Page heading for small screens, where the visual hero (and its h1)
             is display:none — keeps every breakpoint with exactly one h1. */}
         <h1 className="sr-only lg:hidden">AKB — the base your agents remember</h1>
         {/* LEFT — brand hero */}
-        <section className="hidden lg:flex flex-col gap-8 pr-4">
+        <section className="hidden lg:flex flex-col gap-8 pr-4 lg:pt-8">
           <Logo size={42} subtitle />
           <div>
             <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground">
@@ -211,6 +233,15 @@ export default function AuthPage() {
             <Logo size={40} subtitle />
           </div>
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface shadow-lg p-7 sm:p-8">
+            {lifecycleNotice && <Alert variant="info" className="mb-5">{lifecycleNotice}</Alert>}
+            {ssoError && (
+              <Alert variant="destructive" id="auth-sso-error" className="mb-5">
+                {ssoError === "membership_required"
+                  ? "You signed in, but you are not a member of this workspace yet. An administrator has to admit you — they can see that you arrived."
+                  : "Sign-in through your identity provider did not complete. Try again, and tell your administrator if it keeps happening."}
+              </Alert>
+            )}
+
             {authConfig === null && !configError && <AuthCardLoading label="Loading sign-in options" />}
 
             {configError && (
@@ -225,51 +256,36 @@ export default function AuthPage() {
             )}
 
             {localAuthEnabled && (
-              <Tabs
-                value={mode}
-                onValueChange={(v) => {
-                  setMode(v as Mode);
-                  setError("");
-                }}
-              >
-                <TabsList className="mb-6 grid w-full grid-cols-2">
-                  <TabsTrigger value="login" className="justify-center">Log in</TabsTrigger>
-                  <TabsTrigger value="register" className="justify-center">Register</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="login">
-                  <AuthForm
-                    mode="login"
-                    username={username} setUsername={setUsername}
-                    password={password} setPassword={setPassword}
-                    error={error} loading={loading} onSubmit={handleSubmit}
-                  />
-                </TabsContent>
-                <TabsContent value="register">
-                  <AuthForm
-                    mode="register"
-                    username={username} setUsername={setUsername}
-                    email={email} setEmail={setEmail}
-                    displayName={displayName} setDisplayName={setDisplayName}
-                    password={password} setPassword={setPassword}
-                    error={error} loading={loading} onSubmit={handleSubmit}
-                  />
-                </TabsContent>
-              </Tabs>
+              <>
+                <h2 className="font-display text-xl font-semibold tracking-tight text-foreground">Welcome to AKB</h2>
+                <p className="mt-1 mb-5 text-sm text-foreground-muted">Sign in or create an account to continue.</p>
+                <Tabs value={mode} onValueChange={(v) => switchMode(v as Mode)}>
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="login" className="min-h-11 justify-center sm:min-h-9">Sign in</TabsTrigger>
+                    <TabsTrigger value="register" className="min-h-11 justify-center sm:min-h-9">Create account</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="login" className="pt-5">
+                    <AuthForm
+                      mode="login" formRef={formRef} values={login}
+                      onChange={(field, value) => setLogin((draft) => ({ ...draft, [field]: value }))}
+                      fieldErrors={fieldErrors} message={message} loading={loading} onSubmit={handleSubmit}
+                    />
+                  </TabsContent>
+                  <TabsContent value="register" className="pt-5">
+                    <AuthForm
+                      mode="register" formRef={formRef} values={register}
+                      onChange={(field, value) => setRegister((draft) => ({ ...draft, [field]: value }))}
+                      onBlurConfirm={() => setFieldErrors((current) => ({ ...current, confirm: confirmError(register) }))}
+                      fieldErrors={fieldErrors} message={message} loading={loading} onSubmit={handleSubmit}
+                    />
+                  </TabsContent>
+                </Tabs>
+              </>
             )}
 
             {authConfig !== null && !localAuthEnabled && authConfig.available !== true && (
               <Alert variant="destructive">
                 Sign-in is unavailable because authentication configuration could not be verified.
-              </Alert>
-            )}
-
-            {lifecycleNotice && <Alert variant="info">{lifecycleNotice}</Alert>}
-            {ssoError && (
-              <Alert variant="destructive" id="auth-sso-error">
-                {ssoError === "membership_required"
-                  ? "You signed in, but you are not a member of this workspace yet. An administrator has to admit you — they can see that you arrived."
-                  : "Sign-in through your identity provider did not complete. Try again, and tell your administrator if it keeps happening."}
               </Alert>
             )}
 
@@ -315,57 +331,121 @@ export default function AuthPage() {
   );
 }
 
+type LoginDraft = { username: string; password: string };
+type RegisterDraft = LoginDraft & { email: string; displayName: string; confirm: string };
+type FieldName = "username" | "email" | "displayName" | "password" | "confirm";
+type FieldErrors = Partial<Record<FieldName, string>>;
+type FormMessage = { kind: "error" | "info"; text: string };
+
+const EMPTY_LOGIN: LoginDraft = { username: "", password: "" };
+const EMPTY_REGISTER: RegisterDraft = { username: "", email: "", displayName: "", password: "", confirm: "" };
+const FIELD_ORDER: FieldName[] = ["username", "email", "displayName", "password", "confirm"];
+const FIELD_IDS: Record<FieldName, string> = {
+  username: "auth-username",
+  email: "auth-email",
+  displayName: "auth-display-name",
+  password: "auth-password",
+  confirm: "auth-confirm-password",
+};
+const MIN_PASSWORD_LENGTH = 8;
+
+function confirmError(draft: RegisterDraft): string | undefined {
+  if (!draft.confirm) return undefined;
+  return draft.confirm === draft.password ? undefined : "Doesn't match the password.";
+}
+
+function validateLogin(draft: LoginDraft): FieldErrors {
+  return {
+    username: draft.username.trim() ? undefined : "Enter your username.",
+    password: draft.password ? undefined : "Enter your password.",
+  };
+}
+
+function validateRegister(draft: RegisterDraft): FieldErrors {
+  return {
+    username: draft.username.trim() ? undefined : "Enter a username.",
+    email: !draft.email.trim()
+      ? "Enter your email address."
+      : /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(draft.email.trim()) ? undefined : "Enter a valid email address.",
+    password: draft.password.length >= MIN_PASSWORD_LENGTH ? undefined : `Use at least ${MIN_PASSWORD_LENGTH} characters.`,
+    confirm: draft.confirm ? confirmError(draft) : "Re-enter your password.",
+  };
+}
+
 interface AuthFormProps {
   mode: Mode;
-  username: string;
-  setUsername: (v: string) => void;
-  email?: string;
-  setEmail?: (v: string) => void;
-  displayName?: string;
-  setDisplayName?: (v: string) => void;
-  password: string;
-  setPassword: (v: string) => void;
-  error: string;
+  formRef: React.RefObject<HTMLFormElement | null>;
+  values: LoginDraft | RegisterDraft;
+  onChange: (field: FieldName, value: string) => void;
+  onBlurConfirm?: () => void;
+  fieldErrors: FieldErrors;
+  message: FormMessage | null;
   loading: boolean;
   onSubmit: (e: React.FormEvent) => void;
 }
 
-function AuthForm({
-  mode,
-  username, setUsername,
-  email = "", setEmail,
-  displayName = "", setDisplayName,
-  password, setPassword,
-  error, loading, onSubmit,
-}: AuthFormProps) {
+function AuthForm({ mode, formRef, values, onChange, onBlurConfirm, fieldErrors, message, loading, onSubmit }: AuthFormProps) {
+  const [showPassword, setShowPassword] = useState(false);
+  const register = mode === "register" ? (values as RegisterDraft) : null;
+  const passwordType = showPassword ? "text" : "password";
+  const field = (name: FieldName) => ({
+    id: FIELD_IDS[name],
+    value: (values as Record<string, string>)[name] ?? "",
+    onChange: (value: string) => onChange(name, value),
+    error: fieldErrors[name],
+  });
   return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <Field label="Username" id="auth-username" value={username} onChange={setUsername} autoComplete="username" name="username" required autoFocus invalid={!!error} describedBy={error ? "auth-error" : undefined} />
+    <form ref={formRef} onSubmit={onSubmit} noValidate className="space-y-4">
+      {message?.kind === "info" && <Alert variant="info" id="auth-message">{message.text}</Alert>}
 
-      {mode === "register" && (
+      <Field label="Username" {...field("username")} autoComplete="username" name="username" autoFocus />
+
+      {register && (
         <>
-          <Field label="Email" id="auth-email" type="email" value={email} onChange={(v) => setEmail?.(v)} autoComplete="email" name="email" required />
-          <Field label="Display name" id="auth-display-name" value={displayName} onChange={(v) => setDisplayName?.(v)} autoComplete="name" name="display_name" optional />
+          <Field label="Email" {...field("email")} type="email" autoComplete="email" name="email" />
+          <Field label="Display name" {...field("displayName")} autoComplete="name" name="display_name" optional />
         </>
       )}
 
-      <Field label="Password" id="auth-password" type="password" value={password} onChange={setPassword} autoComplete={mode === "login" ? "current-password" : "new-password"} name="password" required minLength={mode === "register" ? 8 : undefined} invalid={!!error} describedBy={error ? "auth-error" : undefined} />
+      <Field
+        label="Password" {...field("password")} type={passwordType} name="password"
+        autoComplete={register ? "new-password" : "current-password"}
+        hint={register ? `Use at least ${MIN_PASSWORD_LENGTH} characters.` : undefined}
+        trailing={
+          <button
+            type="button"
+            onClick={() => setShowPassword((shown) => !shown)}
+            aria-label={showPassword ? "Hide password" : "Show password"}
+            aria-pressed={showPassword}
+            className="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-r-[var(--radius-md)] text-foreground-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {showPassword ? <EyeOff className="h-4 w-4" aria-hidden /> : <Eye className="h-4 w-4" aria-hidden />}
+          </button>
+        }
+      />
 
-      {error && (
-        <Alert variant="destructive" id="auth-error">
-          {error}
+      {register && (
+        <Field
+          label="Confirm password" {...field("confirm")} type={passwordType} name="confirm_password"
+          autoComplete="new-password" onBlur={onBlurConfirm}
+        />
+      )}
+
+      {message?.kind === "error" && (
+        <Alert variant="destructive" id="auth-message">
+          {message.text}
         </Alert>
       )}
 
       <Button type="submit" loading={loading} size="lg" className="w-full mt-1">
         {loading ? (
-          <span>{mode === "login" ? "Signing in…" : "Creating account…"}</span>
+          <span>{register ? "Creating account…" : "Signing in…"}</span>
         ) : (
-          <><span>{mode === "login" ? "Sign in" : "Create account"}</span><ArrowRight className="h-4 w-4" aria-hidden /></>
+          <><span>{register ? "Create account" : "Sign in"}</span><ArrowRight className="h-4 w-4" aria-hidden /></>
         )}
       </Button>
 
-      {mode === "login" && (
+      {!register && (
         <div className="text-center pt-1">
           <Link to="/auth/forgot" className="text-sm text-link hover:text-link-hover hover:underline transition-token">Forgot password?</Link>
         </div>
@@ -375,8 +455,8 @@ function AuthForm({
 }
 
 function Field({
-  label, id, value, onChange, type = "text", autoComplete, name, required, optional,
-  minLength, autoFocus, invalid, describedBy,
+  label, id, value, onChange, type = "text", autoComplete, name, optional,
+  autoFocus, error, hint, trailing, onBlur,
 }: {
   label: string;
   id: string;
@@ -385,32 +465,43 @@ function Field({
   type?: string;
   autoComplete?: string;
   name?: string;
-  required?: boolean;
   optional?: boolean;
-  minLength?: number;
   autoFocus?: boolean;
-  invalid?: boolean;
-  describedBy?: string;
+  error?: string;
+  hint?: string;
+  trailing?: React.ReactNode;
+  onBlur?: () => void;
 }) {
+  const noteId = `${id}-note`;
+  const note = error ?? hint;
   return (
     <div>
       <label htmlFor={id} className="mb-1.5 flex items-center gap-2 text-sm font-medium text-foreground">
         {label}
         {optional && <span className="text-xs font-normal text-foreground-muted">optional</span>}
       </label>
-      <Input
-        id={id}
-        name={name}
-        type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        required={required}
-        minLength={minLength}
-        autoComplete={autoComplete}
-        autoFocus={autoFocus}
-        aria-invalid={invalid || undefined}
-        aria-describedby={describedBy}
-      />
+      <div className="relative">
+        <Input
+          id={id}
+          name={name}
+          type={type}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={onBlur}
+          autoComplete={autoComplete}
+          autoFocus={autoFocus}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={note ? noteId : undefined}
+          // 16px on phones keeps iOS from zooming the page on focus.
+          className={cn("h-11 text-base sm:h-10 sm:text-sm", trailing && "pr-11")}
+        />
+        {trailing}
+      </div>
+      {note && (
+        <p id={noteId} className={cn("mt-1.5 text-xs", error ? "text-destructive" : "text-foreground-muted")}>
+          {note}
+        </p>
+      )}
     </div>
   );
 }

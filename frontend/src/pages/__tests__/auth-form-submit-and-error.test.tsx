@@ -108,15 +108,13 @@ describe("AuthPage · register flow", () => {
     mockedLogin.mockResolvedValue({ token: "tok-new" });
     const u = userEvent.setup();
     renderAuth();
-    // Radix TabsTrigger renders as a button — getByText is the
-    // narrowest selector that works in jsdom (Radix's tab role
-    // assignment doesn't surface here consistently).
-    await u.click(await screen.findByText("Register"));
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
     await u.type(screen.getByLabelText("Username"), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
-    // 8+ chars — register now enforces a client-side minimum (matching the
+    // 8+ chars — register enforces a client-side minimum (matching the
     // backend change_password rule) so accounts can't get an unchangeable pw.
     await u.type(screen.getByLabelText("Password"), "pw-12345");
+    await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
     await u.click(screen.getByRole("button", { name: /create account/i }));
     await waitFor(() =>
       expect(mockedRegister).toHaveBeenCalledWith(
@@ -155,10 +153,7 @@ describe("AuthPage · error surface", () => {
     await u.type(screen.getByLabelText("Password"), "wrong");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await screen.findByRole("alert");
-    // Radix TabsTrigger renders as a button — getByText is the
-    // narrowest selector that works in jsdom (Radix's tab role
-    // assignment doesn't surface here consistently).
-    await u.click(screen.getByText("Register"));
+    await u.click(screen.getByRole("tab", { name: "Create account" }));
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });
@@ -172,17 +167,74 @@ describe("AuthPage · guards & validation", () => {
     );
   });
 
-  it("rejects a register password under 8 chars without calling the API", async () => {
+  it("shows field-level errors instead of browser bubbles and focuses the first one", async () => {
     const u = userEvent.setup();
     renderAuth();
-    await u.click(await screen.findByText("Register"));
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
+    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText("Email"), "not-an-email");
+    await u.type(screen.getByLabelText("Password"), "short");
+    await u.type(screen.getByLabelText("Confirm password"), "shorter");
+    await u.click(screen.getByRole("button", { name: /create account/i }));
+    const email = screen.getByLabelText("Email");
+    expect(email).toHaveAttribute("aria-invalid", "true");
+    expect(email).toHaveAccessibleDescription("Enter a valid email address.");
+    expect(screen.getByLabelText("Password")).toHaveAccessibleDescription(/at least 8 characters/i);
+    expect(screen.getByLabelText("Confirm password")).toHaveAccessibleDescription("Doesn't match the password.");
+    expect(screen.getByLabelText("Username")).not.toHaveAttribute("aria-invalid");
+    await waitFor(() => expect(email).toHaveFocus());
+    expect(mockedRegister).not.toHaveBeenCalled();
+  });
+
+  it("keeps each tab's draft separate", async () => {
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
+    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText("Password"), "half");
+    await u.click(screen.getByRole("tab", { name: "Sign in" }));
+    expect(screen.getByLabelText("Username")).toHaveValue("");
+    expect(screen.getByLabelText("Password")).toHaveValue("");
+  });
+
+  it("clears and refocuses the password after a failed sign-in", async () => {
+    mockedLogin.mockResolvedValue({ error: "Invalid credentials" });
+    const u = userEvent.setup();
+    renderAuth();
+    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(screen.getByLabelText("Password"), "wrong-pw");
+    await u.click(screen.getByRole("button", { name: /sign in/i }));
+    await screen.findByRole("alert");
+    expect(screen.getByLabelText("Username")).toHaveValue("alice");
+    expect(screen.getByLabelText("Password")).toHaveValue("");
+    await waitFor(() => expect(screen.getByLabelText("Password")).toHaveFocus());
+  });
+
+  it("moves to sign-in with an info notice when auto-login after registration fails", async () => {
+    mockedRegister.mockResolvedValue({});
+    mockedLogin.mockResolvedValue({ error: "temporarily unavailable" });
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
     await u.type(screen.getByLabelText("Username"), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
-    await u.type(screen.getByLabelText("Password"), "short");
+    await u.type(screen.getByLabelText("Password"), "pw-12345");
+    await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
     await u.click(screen.getByRole("button", { name: /create account/i }));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/at least 8 characters/i);
-    expect(mockedRegister).not.toHaveBeenCalled();
+    expect(await screen.findByText("Account created. Sign in to continue.")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Sign in" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Username")).toHaveValue("bob");
+    expect(screen.getByLabelText("Username")).not.toHaveAttribute("aria-invalid");
+  });
+
+  it("toggles password visibility", async () => {
+    const u = userEvent.setup();
+    renderAuth();
+    const password = await screen.findByLabelText("Password");
+    expect(password).toHaveAttribute("type", "password");
+    await u.click(screen.getByRole("button", { name: "Show password" }));
+    expect(password).toHaveAttribute("type", "text");
+    expect(screen.getByRole("button", { name: "Hide password" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("treats a token-less 200 login as an error (no token, no navigate)", async () => {
@@ -193,7 +245,7 @@ describe("AuthPage · guards & validation", () => {
     await u.type(screen.getByLabelText("Password"), "pw-1234");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/no token/i);
+    expect(alert.textContent).toMatch(/no session/i);
     expect(mockedSetToken).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });

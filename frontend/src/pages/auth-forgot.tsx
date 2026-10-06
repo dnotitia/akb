@@ -52,7 +52,7 @@ export default function AuthForgotPage() {
   }, [configAttempt, navigate]);
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background text-foreground p-6">
+    <div className="relative flex min-h-screen items-center justify-center overflow-clip bg-background text-foreground p-6">
       <div className="absolute right-4 top-4 z-10">
         <ThemeToggle />
       </div>

@@ -1454,6 +1454,7 @@ with the full identity available in its labelled account menu.
 | **Focus ring**                | every interactive element keeps the `focus-visible:ring-2 ring-ring ring-offset-2` pattern (icon buttons included). Never remove it. |
 | **Icon-only button**          | `aria-label` required + `<Icon aria-hidden />`.                                                                                      |
 | **Labels**                    | every input has a visible `<Label>` or an `sr-only` label; placeholder is not a label.                                               |
+| **Form validation**           | `noValidate` forms with the app's own copy, never browser bubbles. Each invalid field gets `aria-invalid` and a message under it via `aria-describedby`; focus the first invalid field on submit. A new password shows its rule up front and has a confirm field. Form-level server results use one `Alert` (info for success, destructive for failure). |
 | **Async / loading**           | Use one `LoadingState` per async boundary (`role=status aria-live=polite`); preserve successful content during refresh, mark its owner `aria-busy`, and surface errors with `Alert`. |
 | **Destructive action**        | `ConfirmDialog`, never `window.confirm()`.                                                                                           |
 | **Reduced motion**            | respected globally — don't override.                                                                                                 |

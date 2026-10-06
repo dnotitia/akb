@@ -107,7 +107,7 @@ describe("AuthPage mode gate", () => {
     renderAuth();
 
     expect(await screen.findByLabelText(/Username/i)).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Register/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Create account/i })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Forgot password/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /SSO/i })).toBeNull();
   });
@@ -118,7 +118,7 @@ describe("AuthPage mode gate", () => {
     renderAuth();
 
     expect(await screen.findByLabelText(/Username/i)).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Register/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Create account/i })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /^Sign in with SSO$/i }),
     ).toBeInTheDocument();
@@ -131,7 +131,7 @@ describe("AuthPage mode gate", () => {
 
     expect(await screen.findByText(/SSO browser sign-in is not available yet/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/Username/i)).toBeNull();
-    expect(screen.queryByRole("tab", { name: /Register/i })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /Create account/i })).toBeNull();
     expect(screen.queryByRole("link", { name: /Forgot password/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /Company SSO/i })).toBeNull();
   });
