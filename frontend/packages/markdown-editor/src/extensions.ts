@@ -12,7 +12,6 @@ import { Mathematics } from '@tiptap/extension-mathematics'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
-import type { CodeBlockLowlightOptions } from '@tiptap/extension-code-block-lowlight'
 import { Table } from '@tiptap/extension-table'
 import TableCell from '@tiptap/extension-table-cell'
 import TableHeader from '@tiptap/extension-table-header'
@@ -20,15 +19,15 @@ import TableRow from '@tiptap/extension-table-row'
 import TaskItem from '@tiptap/extension-task-item'
 import TaskList from '@tiptap/extension-task-list'
 import { common, createLowlight } from 'lowlight'
+import { createMarkdownParser } from './markdown-parser.js'
 
 import type {
-  MarkdownCodeLabels,
-  MarkdownCodeOptions,
   MarkdownImageOptions,
   MarkdownInlineReferenceKind,
   MarkdownProfile,
   MarkdownReferenceToken,
 } from './types.js'
+import { getMarkdownMessages } from './react/markdown-locale.js'
 
 type RawMarkdownKind = 'html' | 'mdx'
 
@@ -44,27 +43,19 @@ interface MarkdownImageToken extends MarkdownToken {
 
 const MARKDOWN_REFERENCE_MARK = 'markdownReference'
 
-export const DEFAULT_MARKDOWN_CODE_LABELS: MarkdownCodeLabels = {
-  region: (language?: string) =>
-    language ? `Scrollable ${language} code block` : 'Scrollable code block',
+function markdownTaskItemText(node: ProseMirrorNode): string {
+  let text = ''
+  node.forEach(child => {
+    if (child.type.name !== 'taskList') text += child.textContent
+  })
+  return text.trim()
 }
 
 // Keep one registry for every editor instance. CodeBlockLowlight decorates the
 // rendered code without changing the ProseMirror document or its Markdown.
 const markdownLowlight = createLowlight(common)
 
-interface MarkdownCodeBlockOptions extends Partial<CodeBlockLowlightOptions> {
-  labels: MarkdownCodeLabels
-}
-
-const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
-  addOptions() {
-    return {
-      ...this.parent?.(),
-      labels: DEFAULT_MARKDOWN_CODE_LABELS,
-    }
-  },
-
+const MarkdownCodeBlock = CodeBlockLowlight.extend({
   renderHTML({ node, HTMLAttributes }) {
     const parent = this.parent?.({ node, HTMLAttributes })
     if (!parent || !Array.isArray(parent) || typeof parent[0] !== 'string') {
@@ -88,7 +79,7 @@ const MarkdownCodeBlock = CodeBlockLowlight.extend<MarkdownCodeBlockOptions>({
         'data-markdown-code-language': language,
         role: 'region',
         tabindex: '0',
-        'aria-label': this.options.labels.region(language),
+        'aria-label': getMarkdownMessages('en').codeRegion(language),
       }),
       ...children,
     ]
@@ -108,10 +99,11 @@ const MarkdownTaskItem = TaskItem.extend({
         'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0'
 
       const updateA11y = (currentNode: ProseMirrorNode) => {
+        const taskText = markdownTaskItemText(currentNode)
         const label = this.options.a11y?.checkboxLabel?.(
           currentNode,
           currentNode.attrs.checked,
-        ) || `Task item checkbox for ${currentNode.textContent || 'empty task item'}`
+        ) || getMarkdownMessages('en').taskCheckbox(taskText)
 
         checkbox.setAttribute('aria-label', label)
         checkboxStyler.textContent = label
@@ -203,6 +195,10 @@ const MarkdownTaskItem = TaskItem.extend({
 
           return true
         },
+        ignoreMutation: mutation =>
+          mutation.type === 'attributes' &&
+          mutation.target === checkbox &&
+          mutation.attributeName === 'aria-label',
         destroy() {
           checkbox.removeEventListener('change', handleCheckboxChange, true)
         },
@@ -216,13 +212,14 @@ const RUNTIME_REFERENCE_ATTRIBUTES = new Set([
   'aria-label',
   'data-markdown-reference-id',
   'data-markdown-reference-kind',
-  'data-markdown-reference-label',
   'data-markdown-reference-resolution',
   'data-markdown-reference-runtime-url',
   'data-markdown-reference-title',
   'data-markdown-reference-value',
   'href',
   'rel',
+  'role',
+  'tabindex',
   'target',
   'title',
 ])
@@ -410,15 +407,34 @@ export const MarkdownReference = Mark.create({
 
   addAttributes() {
     return {
-      kind: { default: 'person' },
-      id: { default: '' },
-      value: { default: '' },
-      escaped: { default: false },
+      kind: {
+        default: 'person',
+        parseHTML: element => element.getAttribute('data-markdown-reference-kind') ?? 'person',
+      },
+      id: {
+        default: '',
+        parseHTML: element => element.getAttribute('data-markdown-reference-id') ?? '',
+      },
+      value: {
+        default: '',
+        parseHTML: element => element.getAttribute('data-markdown-reference-value') ?? '',
+      },
+      escaped: {
+        default: false,
+        parseHTML: element => element.getAttribute('data-markdown-reference-escaped') === 'true',
+      },
     }
   },
 
   parseHTML() {
-    return [{ tag: 'a[data-markdown-reference]' }]
+    return [
+      {
+        tag: 'a[data-markdown-reference]',
+        getAttrs: element =>
+          element.querySelector('[data-markdown-reference-token]') ? false : null,
+      },
+      { tag: 'span[data-markdown-reference-token]' },
+    ]
   },
 
   addMarkView() {
@@ -431,6 +447,10 @@ export const MarkdownReference = Mark.create({
       dom.dataset.markdownReferenceValue = String(HTMLAttributes.value ?? '')
       dom.dataset.markdownReferenceEscaped = String(HTMLAttributes.escaped ?? false)
       token.dataset.markdownReferenceToken = 'true'
+      token.dataset.markdownReferenceKind = String(HTMLAttributes.kind ?? '')
+      token.dataset.markdownReferenceId = String(HTMLAttributes.id ?? '')
+      token.dataset.markdownReferenceValue = String(HTMLAttributes.value ?? '')
+      token.dataset.markdownReferenceEscaped = String(HTMLAttributes.escaped ?? false)
       dom.append(token)
       for (const [name, value] of Object.entries(HTMLAttributes)) {
         if (value === null || value === undefined || value === false) continue
@@ -481,7 +501,19 @@ export const MarkdownReference = Mark.create({
 })
 
 function escapeImageLabel(value: string): string {
-  return value.replace(/([\\\]])/g, '\\$1')
+  return value.replace(/([\\[\]])/g, '\\$1')
+}
+
+function unescapeImageLabel(value: string): string {
+  return value.replace(/\\([\s\S])/g, (escape, character: string) => {
+    const code = character.codePointAt(0) ?? 0
+    const isMarkdownPunctuation =
+      (code >= 0x21 && code <= 0x2f) ||
+      (code >= 0x3a && code <= 0x40) ||
+      (code >= 0x5b && code <= 0x60) ||
+      (code >= 0x7b && code <= 0x7e)
+    return isMarkdownPunctuation ? character : escape
+  })
 }
 
 function imageDestination(target: string): string {
@@ -553,7 +585,7 @@ export const MarkdownImage = Node.create<{ referrerPolicy?: string }>({
   parseMarkdown: (token: MarkdownImageToken, helpers) =>
     helpers.createNode('image', {
       target: token.href ?? '',
-      alt: token.text ?? '',
+      alt: unescapeImageLabel(token.text ?? ''),
       title: token.title ?? null,
     }),
 
@@ -575,6 +607,7 @@ const RUNTIME_LINK_ATTRIBUTES = new Set([
   'data-markdown-resolution',
   'data-markdown-target',
   'href',
+  'tabindex',
   'title',
 ])
 
@@ -584,6 +617,14 @@ const RUNTIME_LINK_ATTRIBUTES = new Set([
  * Markdown continue to own the canonical href.
  */
 const MarkdownLink = Link.extend({
+  parseHTML() {
+    return this.parent?.()?.map(rule =>
+      rule.tag === 'a[href]'
+        ? { ...rule, tag: 'a[href]:not([data-markdown-reference])' }
+        : rule,
+    ) ?? []
+  },
+
   addMarkView() {
     return ({ HTMLAttributes }) => {
       const dom = document.createElement('a')
@@ -778,14 +819,14 @@ const RawMarkdownInline = Node.create({
 
 export interface MarkdownExtensionsOptions {
   profile?: MarkdownProfile
-  code?: MarkdownCodeOptions
   image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
+  taskCheckboxLabel?: (text: string) => string
 }
 
 export function createMarkdownExtensions({
   profile = 'preserve',
-  code,
   image,
+  taskCheckboxLabel,
 }: MarkdownExtensionsOptions = {}): AnyExtension[] {
   const extensions: AnyExtension[] = [
     StarterKit.configure({
@@ -795,10 +836,7 @@ export function createMarkdownExtensions({
       link: false,
       codeBlock: false,
     }),
-    MarkdownCodeBlock.configure({
-      lowlight: markdownLowlight,
-      labels: { ...DEFAULT_MARKDOWN_CODE_LABELS, ...code?.labels },
-    }),
+    MarkdownCodeBlock.configure({ lowlight: markdownLowlight }),
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
     MarkdownImage.configure({ referrerPolicy: image?.referrerPolicy }),
@@ -809,11 +847,10 @@ export function createMarkdownExtensions({
     TaskList,
     MarkdownTaskItem.configure({
       nested: true,
+      a11y: taskCheckboxLabel
+        ? { checkboxLabel: node => taskCheckboxLabel(markdownTaskItemText(node)) }
+        : undefined,
       HTMLAttributes: { 'data-markdown-task-item': 'true' },
-      a11y: {
-        checkboxLabel: node =>
-          `Task item checkbox for ${node.firstChild?.textContent || 'empty task item'}`,
-      },
     }),
     Mathematics.configure({
       katexOptions: { throwOnError: false },
@@ -826,6 +863,7 @@ export function createMarkdownExtensions({
 
   extensions.push(
     Markdown.configure({
+      marked: createMarkdownParser(),
       markedOptions: {
         gfm: true,
         breaks: false,

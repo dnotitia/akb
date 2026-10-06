@@ -16,13 +16,17 @@ import asyncpg
 import httpx
 import pytest
 import yaml
+from mcp import types as mcp_types
 
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _CI = _BACKEND.parent / "scripts" / "ci"
 sys.path.insert(0, str(_CI))
+sys.path.insert(0, str(_BACKEND / "tests"))
 
 from e2e_runtime import CredentialNames, E2ERuntime, RuntimeConfig  # noqa: E402
+from mcp_e2e.conftest import _open_mcp_client  # noqa: E402
+from mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor, redact_error  # noqa: E402
 
 
 pytestmark = [
@@ -38,20 +42,6 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def _rpc_payload(response: httpx.Response) -> dict[str, Any]:
-    response.raise_for_status()
-    if "text/event-stream" not in response.headers.get("content-type", ""):
-        value = response.json()
-        assert isinstance(value, dict)
-        return value
-    for line in response.text.splitlines():
-        if line.startswith("data:"):
-            value = json.loads(line.removeprefix("data:").strip())
-            assert isinstance(value, dict)
-            return value
-    raise AssertionError("MCP response carried no JSON-RPC data")
 
 
 async def _register_and_pat(
@@ -84,74 +74,43 @@ async def _register_and_pat(
     return str(response.json()["token"])
 
 
-async def _mcp_session(client: httpx.AsyncClient, token: str) -> str:
-    response = await client.post(
-        "/mcp/",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json, text/event-stream",
-        },
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "native-cutover-f2", "version": "1"},
-            },
-        },
-    )
-    _rpc_payload(response)
-    session_id = response.headers.get("mcp-session-id")
-    assert session_id
-    response = await client.post(
-        "/mcp/",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "mcp-session-id": session_id,
-            "Accept": "application/json, text/event-stream",
-        },
-        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-    )
-    assert response.status_code in {200, 202}
-    return session_id
-
-
 async def _mcp_call(
-    client: httpx.AsyncClient,
+    runtime: E2ERuntime,
     *,
     token: str,
-    session_id: str,
-    request_id: int,
     tool: str,
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], Any]:
-    response = await client.post(
-        "/mcp/",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "mcp-session-id": session_id,
-            "Accept": "application/json, text/event-stream",
-        },
-        json={
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        },
+    secrets = (token,)
+    runtime_session = RuntimeContext(
+        descriptor=RuntimeDescriptor.from_json(json.dumps(runtime.descriptor())),
+        pat=token,
+        secrets=secrets,
     )
-    payload = _rpc_payload(response)
-    result = payload["result"]
-    assert isinstance(result, dict)
-    content = result.get("content")
-    assert isinstance(content, list) and content
-    text = content[0].get("text")
+    try:
+        async with _open_mcp_client(
+            runtime_session,
+            pat=token,
+            secrets=secrets,
+            scenario=f"native_revision_cutover_f2_{tool}",
+        ) as client:
+            result = await client.call_tool(tool, arguments)
+    except Exception as exc:
+        pytest.fail(
+            "scenario=native_revision_cutover_f2 "
+            f"operation=tools/call {tool}: {redact_error(exc, secrets)}"
+        )
+
+    text = next(
+        (item.text for item in result.content if isinstance(item, mcp_types.TextContent)),
+        None,
+    )
+    assert isinstance(text, str) and text
     try:
         decoded = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
+    except json.JSONDecodeError:
         decoded = text
-    return result, decoded
+    return {"isError": result.is_error}, decoded
 
 
 async def _legacy_snapshot(
@@ -271,6 +230,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             app_port=_free_port(),
             embed_port=_free_port(),
             fixture_port=_free_port(),
+            postgres_port=_free_port(),
+            minio_port=_free_port(),
             credentials=CredentialNames(
                 username_env=username_env,
                 password_env=password_env,
@@ -306,8 +267,6 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             )
             owner_headers = {"Authorization": f"Bearer {owner_pat}"}
             reader_headers = {"Authorization": f"Bearer {reader_pat}"}
-            session_id = await _mcp_session(client, owner_pat)
-
             response = await client.post(
                 "/api/v1/vaults",
                 headers=owner_headers,
@@ -315,10 +274,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             )
             response.raise_for_status()
             result, created_vault = await _mcp_call(
-                client,
+                runtime,
                 token=owner_pat,
-                session_id=session_id,
-                request_id=2,
                 tool="akb_create_vault",
                 arguments={"name": vault_two, "description": "F2 MCP vault"},
             )
@@ -393,10 +350,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             response.raise_for_status()
 
             result, mcp_document = await _mcp_call(
-                client,
+                runtime,
                 token=owner_pat,
-                session_id=session_id,
-                request_id=3,
                 tool="akb_put",
                 arguments={
                     "vault": vault_two,
@@ -516,10 +471,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
             response.raise_for_status()
 
             external_result, external_payload = await _mcp_call(
-                client,
+                runtime,
                 token=owner_pat,
-                session_id=session_id,
-                request_id=4,
                 tool="akb_create_vault",
                 arguments={
                     "name": external_name,
@@ -534,7 +487,7 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
 
         conn = await asyncpg.connect(
             host="127.0.0.1",
-            port=15432,
+            port=runtime.config.postgres_port,
             user="akb",
             password="akb",  # pragma: allowlist secret
             database="akb",
@@ -581,7 +534,7 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
 
         pool = await asyncpg.create_pool(
             host="127.0.0.1",
-            port=15432,
+            port=runtime.config.postgres_port,
             user="akb",
             password="akb",  # pragma: allowlist secret
             database="akb",
@@ -879,12 +832,9 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 item["uri"] == binary_upload["uri"]
                 for item in files_native.json()["items"]
             )
-            native_session = await _mcp_session(native_client, owner_pat)
             mcp_result, mcp_read = await _mcp_call(
-                native_client,
+                runtime,
                 token=owner_pat,
-                session_id=native_session,
-                request_id=5,
                 tool="akb_document_read",
                 arguments={"action": "get", "uri": mcp_document["uri"]},
             )

@@ -69,6 +69,7 @@ def get_vector_store() -> VectorStore:
             schema=settings.vector_store_schema,
             dense_dim=settings.embed_dimensions,
             sparse_shape=shape,
+            retrieval_timeout_secs=settings.search_retrieval_timeout_secs,
             get_main_pool=get_pool,
             posting_weights=posting_weights,
         )

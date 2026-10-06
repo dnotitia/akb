@@ -87,7 +87,7 @@ agent, sign up with any email (a throwaway address is fine) and point the
 Most knowledge tools are built for humans clicking through a UI. Agents need a
 different shape: structured documents, semantic + keyword search in one call,
 explicit relations, and full version history. AKB gives agents a single set of
-tools (`akb_put`, `akb_search`, `akb_browse`, `akb_relations`, …) over a
+tools (`akb_put`, `akb_discover`, `akb_document_read`, `akb_relationships`, …) over a
 PostgreSQL-native revision store and hybrid index. Explicit Bare Git installations
 remain supported for existing deployments.
 
@@ -169,16 +169,18 @@ letting the indexing worker re-populate.
 
 | Tool | Description |
 |------|-------------|
-| `akb_list_vaults` / `akb_create_vault` | Vault management |
-| `akb_put` / `akb_get` / `akb_update` / `akb_delete` | Document CRUD (revision + indexing) |
+| `akb_discover` | `list_vaults`, `vault_info`, `browse`, `search`, and exact-text `grep` actions |
+| `akb_document_read` | `get`, `section`, `activity`, `history`, `diff`, and `provenance` actions |
+| `akb_relationships` / `akb_link` / `akb_unlink` | Knowledge graph reads and writes |
+| `akb_identity` | `whoami` and `search_users` actions |
+| `akb_vault_access` | `members` and `explain` actions |
+| `akb_create_vault` / `akb_transfer_ownership` / `akb_archive_vault` / `akb_delete_vault` | Vault management |
+| `akb_put` / `akb_update` / `akb_delete` | Document CRUD (revision + indexing) |
 | `akb_put_file` / `akb_get_file` / `akb_update_file` / `akb_delete_file` | File attachments — proxy-side (requires local filesystem) |
 | `akb_put_image` / `akb_discard_image` | Validated inline Markdown images — proxy-side in `akb-mcp` 2.2+ |
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
-| `akb_browse` | Tree traversal (collection → docs) |
-| `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
-| `akb_drill_down` | Section-level retrieval |
-| `akb_relations` / `akb_link` / `akb_unlink` / `akb_graph` | Knowledge graph |
-| `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, revision history |
+| `akb_grep_replace` | Bulk exact-text replacement — separate writer operation |
+| `akb_edit` | In-place document edit |
 | `akb_grant` / `akb_revoke` / `akb_set_public` | Permission boundaries — per-user, per-org, public |
 | `akb_publish` / `akb_unpublish` | Public publication |
 
@@ -187,7 +189,8 @@ the dedicated `/api/v1/agent-sessions` REST surface, driven by AKB
 lifecycle plugins (`akb-claude-code`, `akb-cursor`, …) that hook into
 the agent's own SessionStart / PreCompact / SessionEnd events. As an
 agent, your own memory vault (`agent-memory-{username}`) is browsable
-through the standard `akb_search` / `akb_browse` / `akb_get` tools
+through `akb_discover(action="search")` or `akb_discover(action="browse")` and
+`akb_document_read(action="get")` tools
 exactly like any other vault.
 
 The full tool catalogue is exposed via `akb_help()` from any MCP client.
@@ -210,7 +213,7 @@ akb_put(
   content="# Architecture\n\n" + image.markdown)
 ```
 
-For an existing document, use `akb_get` followed by a targeted
+For an existing document, use `akb_document_read(action="get")` followed by a targeted
 `akb_edit(base_commit=...)`. Do not pass only the image fragment to
 `akb_update(content=...)`, which replaces the complete body. Image bytes are
 immutable: replacing an image means uploading a new one and editing the
@@ -237,7 +240,7 @@ akb://{vault}[/coll/{coll_path}]/file/{uuid}           file
 
 The `/coll/{coll_path}` segment is omitted for resources at the vault
 root. Walking up a URI to its parent collection is a pure string
-operation — paste the parent into `akb_browse(uri=...)` to list
+operation — paste the parent into `akb_discover(action="browse", uri=...)` to list
 siblings without an extra lookup.
 
 ```yaml
@@ -591,8 +594,11 @@ Gateway policy or budget denials are never fanned out into per-item retries.
 The PG `events` outbox is always written. Set `redis_url` in `app.yaml` to
 have the `events_publisher` worker drain the outbox to a Redis Stream
 (`akb:events`) so external services can subscribe via `XREAD` / consumer
-groups. Leave blank to disable; events still accumulate in PG and you can
-build an SSE endpoint on top of the LISTEN/NOTIFY trigger without Redis.
+groups. Leave blank to disable Redis fanout; the authenticated
+`GET /api/v1/events/{vault}` SSE tail reads the same PG outbox. Native document
+writes participate in this outbox at the authority transaction boundary.
+See the [change-event contract](docs/operations/change-events.md) for supported
+File/document actions, move identity, retry semantics and consumer recovery.
 
 ### Audit log (optional)
 

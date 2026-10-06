@@ -2,7 +2,7 @@
 name: ingest-release
 description: Record a single release tag as a git-release document in an AKB vault — release notes from the matching GitHub Release (annotated tag message fallback), commits bucketed by conv_type. Requires range commits pre-ingested.
 model: sonnet
-tools: Bash(git *), Bash(gh *), Read, mcp__akb__akb_search, mcp__akb__akb_get, mcp__akb__akb_relations, mcp__akb__akb_put, mcp__akb__akb_update
+tools: Bash(git *), Bash(gh *), Read, mcp__akb__akb_discover, mcp__akb__akb_document_read, mcp__akb__akb_relationships, mcp__akb__akb_put, mcp__akb__akb_update
 ---
 
 # AKB Git Release Ingest
@@ -117,8 +117,7 @@ Call the resulting ordered list `sha_list` (chronologically ascending). If `sha_
 ### Step 5 — Dedup check
 
 ```text
-mcp__akb__akb_search(
-  query="release {tag} {repo_name}",
+mcp__akb__akb_discover(action="search", query="release {tag} {repo_name}",
   vault="{vault_name}",
   collection="git-releases",
   type="reference",
@@ -133,11 +132,10 @@ Among the hits, find the one whose frontmatter has `repo == repo_name AND tag ==
 
 Given a chronologically-ordered list `sha_list`, resolve each SHA to its commit document (`type=reference, kind:commit`) in the vault.
 
-**Concurrency is required.** Issue all searches in a single parallel tool-use block, then issue any required `akb_get` calls in a second parallel block. Sequential per-SHA loops are forbidden — a 30-commit input is two batched round trips, not 30 or 60.
+**Concurrency is required.** Issue all searches in a single parallel tool-use block, then issue any required `akb_document_read` calls in a second parallel block. Sequential per-SHA loops are forbidden — a 30-commit input is two batched round trips, not 30 or 60.
 
 ```text
-mcp__akb__akb_search(
-  query="{sha}",
+mcp__akb__akb_discover(action="search", query="{sha}",
   vault="{vault_name}",
   collection="git-commits",
   type="reference",
@@ -146,17 +144,17 @@ mcp__akb__akb_search(
 )
 ```
 
-For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_search` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_search` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_get` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
+For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_discover` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_discover` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_document_read` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
 
 For each `commit_records[i]`, populate the downstream-needed fields from the AKB primitives that durably persist them:
 
-- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_search`).
+- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_discover`).
 - `short_sha` — first 7 chars of the full SHA (already known from the search query); also recoverable from the title prefix.
 - `author` — parse from the row's `tags` array as `tag[len("author:"):]` for the first `author:*` tag emitted by `/ingest-commit` Step 6. Single-author commits emit one such tag; merge commits emit either the merging committer or whichever name `.mailmap` resolved. `null` if no `author:*` tag is present (defensive — the commit ingest always emits one).
 - `conv_type` — parse from the row's `tags` array as `tag[len("type:"):]` for the first `type:*` tag. `null` when the commit subject did not match the conventional-commit pattern.
 - `scope` — parse `tag[len("scope:"):]` for the first `scope:*` tag. Drives PR-level `pr_scope` aggregation downstream without re-deriving from a `paths` list.
 
-Skip the secondary `akb_get` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_search`. A 30-commit PR is one batched `akb_search` round trip, not 30+30.
+Skip the secondary `akb_document_read` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_discover`. A 30-commit PR is one batched `akb_discover` round trip, not 30+30.
 
 The full file list, per-commit stats, and diff scope are not aggregated across commits — the per-commit body's `### Paths` and `## Stats` sections are the audit surface, reachable via the PR's `depends_on` graph edge.
 
@@ -175,10 +173,10 @@ Collect the results into `commit_records`, aligned with `sha_list`.
 
 There is no commit-side backlink to read — PR-to-commit linkage lives on each PR document's outgoing `depends_on` graph edge (set by `ingest-pr` Step 7). Discover candidate PRs by searching the vault, then intersect each PR's `depends_on` with the release's commit set: `range_commit_uris = { "akb://{vault_name}/doc/{record.path}" for record in commit_records }`.
 
-Search for PRs: `akb_search(vault="{vault_name}", query="pr {repo_name}", collection="git-prs", type="reference", tags=["git", "kind:pr", "project:{repo_name}"], limit=500)`. Hits return summaries (`path`, `title`, `summary`, `tags`, fusion score) but no frontmatter or graph edges — hydrate separately:
+Search for PRs: `akb_discover(action="search", vault="{vault_name}", query="pr {repo_name}", collection="git-prs", type="reference", tags=["git", "kind:pr", "project:{repo_name}"], limit=500)`. Hits return summaries (`path`, `title`, `summary`, `tags`, fusion score) but no frontmatter or graph edges — hydrate separately:
 
-1. **Hydration block** (one parallel tool-use block) — `akb_get(vault="{vault_name}", doc_id={hit.path})` for every hit. Capture `path`, frontmatter `repo` / `pr_number` / `merged_at`, and `title`. Filter to rows whose `repo == repo_name`.
-2. **Outgoing-edge block** (second parallel tool-use block) — `akb_relations(vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{pr.path}", direction="outgoing", type="depends_on")` for each surviving PR. Sequential per-PR fetches are forbidden.
+1. **Hydration block** (one parallel tool-use block) — `akb_document_read(action="get", vault="{vault_name}", doc_id={hit.path})` for every hit. Capture `path`, frontmatter `repo` / `pr_number` / `merged_at`, and `title`. Filter to rows whose `repo == repo_name`.
+2. **Outgoing-edge block** (second parallel tool-use block) — `akb_relationships(action="relations", vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{pr.path}", direction="outgoing", type="depends_on")` for each surviving PR. Sequential per-PR fetches are forbidden.
 
 For each PR, set `pr.commit_uris` to the outgoing edges and compute `pr.commit_uris ∩ range_commit_uris`. Drop PRs with empty intersection (out of range) and PRs with empty `depends_on` (their commits surface as orphans in the body). Order survivors by `merged_at` ascending into `pr_records` with `doc_id` / `path` / `pr_number` / `title` / `merged_at` / `covered_commit_uris`.
 
@@ -226,7 +224,7 @@ tags: ["git", "project:{repo_name}", "kind:release"]
 summary: "{tag} ({len(commit_records)} commits, {len(pr_records)} PRs)"
 ```
 
-Commit and PR membership lives entirely on the `depends_on` graph edge passed to `akb_put` / `akb_update` in Step 10 (PR-covered commits transitively, orphans directly) — not in frontmatter. `akb_relations` traverses both layers.
+Commit and PR membership lives entirely on the `depends_on` graph edge passed to `akb_put` / `akb_update` in Step 10 (PR-covered commits transitively, orphans directly) — not in frontmatter. `akb_relationships` traverses both layers.
 
 Body (bucket by `conv_type`):
 

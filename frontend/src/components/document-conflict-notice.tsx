@@ -3,12 +3,14 @@ import { Check, Copy, GitCompareArrows } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import type { DocumentDetailsValues } from "@/lib/document-details";
 
 export interface DocumentConflictSnapshot {
   label: string;
   commit: string | null;
   title: string;
   body: string;
+  details?: DocumentDetailsValues;
 }
 
 interface DocumentConflictNoticeProps {
@@ -71,6 +73,15 @@ function Snapshot({ snapshot }: { snapshot: DocumentConflictSnapshot }) {
       <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-sm)] bg-surface-2 p-2 font-mono text-xs leading-relaxed text-foreground">
         {snapshot.body || "(empty)"}
       </pre>
+      {snapshot.details && <details className="mt-2 text-xs">
+        <summary className="cursor-pointer font-medium text-link focus-ring-instant">Document details</summary>
+        <dl className="mt-2 space-y-1.5 break-words text-foreground-muted">
+          {Object.entries(snapshot.details).map(([key, value]) => <div key={key}>
+            <dt className="font-medium capitalize">{key}</dt>
+            <dd>{(Array.isArray(value) ? value.join(", ") : value) || "Not set"}</dd>
+          </div>)}
+        </dl>
+      </details>}
     </div>
   );
 }

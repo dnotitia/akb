@@ -76,6 +76,42 @@ describe("stripFrontmatter", () => {
     const md = "intro\n\n---\ntype: x\n---\n";
     expect(stripFrontmatter(md)).toBe(md);
   });
+  it("keeps an unclosed YAML block when a body separator follows Markdown content", () => {
+    const md = [
+      "---",
+      "type: reference",
+      'title: "Metadata title"',
+      "",
+      "# Body title",
+      "",
+      "Body paragraph before the separator.",
+      "",
+      "---",
+      "",
+      "## Timeline",
+    ].join("\n");
+
+    expect(stripFrontmatter(md)).toBe(md);
+    expect(parseHeadings(md).map(({ text }) => text)).toEqual(["Body title", "Timeline"]);
+  });
+  it("keeps closed but invalid YAML untouched", () => {
+    const md = "---\ntags: [one,\n---\n# Body title\n";
+    expect(stripFrontmatter(md)).toBe(md);
+    expect(parseHeadings(md).map(({ text }) => text)).toContain("Body title");
+  });
+  it("keeps valid YAML that is not a mapping untouched", () => {
+    const md = "---\n- reference\n---\n# Body title\n";
+    expect(stripFrontmatter(md)).toBe(md);
+  });
+  it("keeps an unclosed block when there is no later delimiter", () => {
+    const md = "---\ntype: note\n# Body title\nBody paragraph.";
+    expect(stripFrontmatter(md)).toBe(md);
+    expect(parseHeadings(md).map(({ text }) => text)).toEqual(["Body title"]);
+  });
+  it("strips valid YAML frontmatter with a BOM and CRLF line endings", () => {
+    const md = "\uFEFF---\r\ntype: note\r\ntags:\r\n  - one\r\n---\r\n# Body\r\n";
+    expect(stripFrontmatter(md)).toBe("# Body\r\n");
+  });
 });
 
 describe("parseHeadings — embedded frontmatter", () => {

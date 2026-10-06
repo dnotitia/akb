@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import uuid
+import traceback
 from datetime import datetime, timezone
 
+import asyncpg
 import pytest
 
-from app.api.control_plane_models import InstallationProjection
-from app.exceptions import ValidationError
+from app.api.control_plane_models import InstallationActiveStatus, InstallationProjection
+from app.exceptions import AKBError, ForbiddenError, ValidationError
 from app.services import app_installation_service as installation
 from app.services import app_resource_service as resources
+from app.services.auth_service import AuthenticatedUser
 
 
 def _row() -> dict:
@@ -116,3 +119,100 @@ def test_projection_keeps_truthful_state_and_redacts_payloads():
     assert "private-worker-payload" not in serialized
     assert "provenance" not in serialized
     assert "issuer" not in serialized
+
+
+def test_member_installation_active_status_is_an_allowlisted_boolean():
+    assert InstallationActiveStatus.model_validate({"active": True}).model_dump() == {
+        "active": True
+    }
+    with pytest.raises(ValueError):
+        InstallationActiveStatus.model_validate(
+            {"active": True, "lifecycle": "active", "recent_error": "private"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_member_installation_status_rejects_app_credentials_before_database(monkeypatch):
+    async def unexpected_pool():
+        raise AssertionError("application credentials must be rejected before database access")
+
+    monkeypatch.setattr(installation, "get_pool", unexpected_pool)
+    app_user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="app-principal",
+        email="app@example.invalid",
+        display_name=None,
+        is_admin=False,
+        auth_method="pat",
+        account_kind="app",
+    )
+
+    with pytest.raises(ForbiddenError, match="Installation request denied"):
+        await installation.get_member_installation_active_status(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            user=app_user,
+            correlation_id="test",
+        )
+
+
+@pytest.mark.asyncio
+async def test_member_installation_unavailable_is_not_reported_as_inactive(monkeypatch):
+    user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="member",
+        email="member@example.invalid",
+        display_name=None,
+        is_admin=False,
+        auth_method="jwt",
+    )
+    vault_id = uuid.uuid4()
+    raw_error_marker = "RAW_MEMBER_INSTALLATION_QUERY_ERROR"
+    raw_credential = "synthetic-fault-credential-abcdef"
+    raw_error = f"{raw_error_marker}; Authorization: Bearer {raw_credential}"
+
+    class FakeConnection:
+        async def fetchrow(self, _query, requested_vault_id):
+            assert requested_vault_id == vault_id
+            return {
+                "id": vault_id,
+                "name": "member-status-vault",
+                "owner_id": uuid.UUID(user.user_id),
+            }
+
+        async def fetchval(self, query, *_args):
+            assert "FROM vault_app_installations" in query
+            raise asyncpg.exceptions.UndefinedTableError(raw_error)
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    async def fake_get_pool():
+        return FakePool()
+
+    async def allow_owner_access(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(installation, "get_pool", fake_get_pool)
+    monkeypatch.setattr(installation, "check_vault_access", allow_owner_access)
+
+    with pytest.raises(AKBError) as unavailable:
+        await installation.get_member_installation_active_status(
+            uuid.uuid4(), vault_id, user=user, correlation_id="test"
+        )
+
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.code == "member_installation_status_unavailable"
+    assert unavailable.value.message == "Installation status is temporarily unavailable"
+    assert raw_error_marker not in str(unavailable.value)
+    assert raw_credential not in str(unavailable.value)
+    assert raw_error_marker not in "".join(traceback.format_exception(unavailable.value))
+    assert unavailable.value.__suppress_context__

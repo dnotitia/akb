@@ -146,7 +146,7 @@ export function FilePreviewBody({ mime, directUrl, rawUrl, name }: FileBodyProps
     return <JsonFileBody url={rawUrl} />;
   }
 
-  if (mime.startsWith("text/")) {
+  if (filePreviewKind(mime) === "text") {
     return <TextFileBody url={rawUrl} />;
   }
 

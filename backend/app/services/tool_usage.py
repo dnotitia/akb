@@ -240,7 +240,6 @@ def record(
     session_id: str | None = None,
     duration_ms: int | None = None,
     is_write: bool = False,
-    logical_operation: str | None = None,
 ) -> None:
     """Enqueue one MCP tool call. Synchronous, allocation-only, never raises.
 
@@ -275,11 +274,11 @@ def record(
                 )
         _queue.append(_Row(
             occurred_at=datetime.now(timezone.utc),
-            tool=_clip(logical_operation or name) or "",
+            tool=_clip(name) or "",
             actor_id=_clip(getattr(user, "user_id", None)),
             actor=_clip(getattr(user, "username", None)),
             session_id=_session_ref(session_id),
-            vault=_clip(vault_of_call(name, args, logical_operation=logical_operation)),
+            vault=_clip(vault_of_call(name, args)),
             outcome=outcome,
             code=_clip(code),
             duration_ms=duration_ms,
@@ -374,9 +373,7 @@ def _scalar_vault(args: dict) -> str | None:
     return v if isinstance(v, str) and v else None
 
 
-def vault_of_call(
-    name: str, args: Any, *, logical_operation: str | None = None
-) -> str | None:
+def vault_of_call(name: str, args: Any) -> str | None:
     """The vault the handler will actually operate on.
 
     Public because the vault-skill injector in `mcp_server/server.py` needs the
@@ -400,9 +397,7 @@ def vault_of_call(
     if not isinstance(args, dict):
         return None
 
-    operation = logical_operation or name
-
-    if operation == "akb_sql":
+    if name == "akb_sql":
         many = [v for v in (args.get("vaults") or []) if isinstance(v, str) and v]
         if len(many) == 1:
             return many[0]
@@ -410,20 +405,10 @@ def vault_of_call(
             return None
         return _scalar_vault(args)
 
-    if operation == "akb_grep_replace":
-        targets = args.get("vault")
-        if isinstance(targets, list):
-            many = [v for v in targets if isinstance(v, str) and v]
-            if len(many) == 1:
-                return many[0]
-            if many:
-                return None
+    if name == "akb_publish" and args.get("resource_type") == "table_query":
         return _scalar_vault(args)
 
-    if operation == "akb_publish" and args.get("resource_type") == "table_query":
-        return _scalar_vault(args)
-
-    if operation == "akb_unpublish" and args.get("slug"):
+    if name == "akb_unpublish" and args.get("slug"):
         # `_handle_unpublish` resolves the vault from the publication row when
         # a slug is given and never looks at `uri`, though the schema accepts
         # both. The vault is only knowable by a DB lookup, which this path must

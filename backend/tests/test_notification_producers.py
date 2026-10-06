@@ -1,4 +1,5 @@
 """Notification eligibility and identity at the transactional source seam."""
+import json
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -110,6 +111,9 @@ async def test_unrelated_and_create_events_do_not_queue(monkeypatch):
 async def test_native_publication_enqueues_before_commit_on_authority_connection(monkeypatch, surface, operation):
     from app.services import native_revision_service as native
     in_transaction = False
+    phases, public_events, observed = [], [], []
+    resource_id, vault_id, actual_actor = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
     @asynccontextmanager
     async def transaction():
         nonlocal in_transaction
@@ -118,11 +122,28 @@ async def test_native_publication_enqueues_before_commit_on_authority_connection
             yield
         finally:
             in_transaction = False
-    conn = SimpleNamespace(transaction=transaction)
+            phases.append("transaction_exit")
+
+    async def fetchval(query, *args):
+        assert in_transaction
+        if query == "SELECT name FROM vaults WHERE id = $1":
+            assert args == (vault_id,)
+            return "native-notifications"
+        if "INSERT INTO events" in query:
+            public_events.append(args)
+            phases.append("domain_event")
+            return 123
+        if query == "SELECT id FROM users WHERE username = $1":
+            assert args == ("writer",)
+            return actual_actor
+        raise AssertionError(f"Unexpected query: {query}")
+
+    conn = SimpleNamespace(transaction=transaction, fetchval=AsyncMock(side_effect=fetchval))
+
     @asynccontextmanager
     async def acquire():
         yield conn
-    resource_id, vault_id = uuid.uuid4(), uuid.uuid4()
+
     repository = AsyncMock()
     repository.find_mutation.return_value = None
     service = native.NativeRevisionService(SimpleNamespace(acquire=acquire), repository=repository, payload_store=object())
@@ -130,11 +151,23 @@ async def test_native_publication_enqueues_before_commit_on_authority_connection
     monkeypatch.setattr(service, "_lock_live_reference", AsyncMock(return_value={
         "current_path": "renamed.md", "head_revision_id": "r-old", "resource_id": resource_id,
     }))
-    observed = []
+
     async def enqueue(connection, kind, **kwargs):
         assert connection is conn and in_transaction
         observed.append((kind, kwargs))
-    monkeypatch.setattr(native, "enqueue_document_change", enqueue)
+        phases.append("notification")
+
+    # Keep the real native helper, domain outbox and notification adapter in
+    # the path; only replace the final notification persistence boundary.
+    monkeypatch.setattr(producer, "enqueue_notification_event", enqueue)
+
+    def boundary(name):
+        if name == "authority.before_commit":
+            assert in_transaction
+            assert len(observed) == (1 if surface == "document" else 0)
+            phases.append("before_commit")
+
+    service.failpoint = boundary
     kwargs = dict(namespace_id=vault_id, surface=surface, path="old.md", actor="writer",
                   mutation_id=uuid.uuid4(), expected_revision_id="r-old", expected_resource_id=resource_id,
                   message=None, subject=None, summary=None, fingerprint="fingerprint")
@@ -144,10 +177,28 @@ async def test_native_publication_enqueues_before_commit_on_authority_connection
     assert not in_transaction
     if surface == "file":
         assert observed == []
+        assert public_events == []
+        conn.fetchval.assert_not_awaited()
+        assert phases == ["before_commit", "transaction_exit"]
     else:
-        kind, sent = observed[0]
-        assert kind == ("document.update" if operation == "replace" else "document.delete")
-        assert sent["resource_id"] == resource_id
-        assert sent["vault_id"] == vault_id
+        assert len(public_events) == len(observed) == 1
+        assert phases == ["domain_event", "notification", "before_commit", "transaction_exit"]
+        event_vault, event_kind, event_uri, event_actor, event_json = public_events[0]
+        assert event_vault == vault_id
+        assert event_kind == ("document.update" if operation == "replace" else "document.delete")
+        assert event_uri == "akb://native-notifications/doc/renamed.md"
+        assert event_actor == "writer"
+        payload = json.loads(event_json)
+        assert payload["resource_id"] == str(resource_id)
+        assert payload["path"] == "renamed.md"
+        assert payload["revision_id"] == "r-new"
+        assert payload["previous_commit"] == "r-old"
         if operation == "replace":
-            assert sent["previous_status"] == "active" and sent["status"] == "archived"
+            assert payload["previous_status"] == "active" and payload["status"] == "archived"
+        kind, sent = observed[0]
+        assert kind == ("document.archive" if operation == "replace" else "document.delete")
+        assert sent["resource_id"] == str(resource_id)
+        assert sent["vault_id"] == vault_id
+        assert sent["actor_id"] == str(actual_actor)
+        assert sent["source_key"] == "event:123"
+        assert "payload" not in sent

@@ -16,7 +16,7 @@ from app.services.native_document_service import (
 )
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from mcp_server.help import HELP, _resolve_help
-from mcp_server.tools import TOOLS, available_tools, candidate_tools
+from mcp_server.tools import TOOLS, available_tools
 
 
 @pytest.mark.parametrize("backend", ["bare_git", "bare_git_current", "postgres_native", "native_ledger_m1"])
@@ -31,14 +31,6 @@ def test_backend_catalog_preserves_bare_git_and_filters_native(monkeypatch, back
     for argument in ("template", "external_git"):
         assert (argument in create.input_schema["properties"]) is legacy
     assert create.input_schema["required"] == ["name"]
-    candidate = next(tool for tool in candidate_tools() if tool.name == "akb_vault_manage")
-    create_action = next(
-        branch
-        for branch in candidate.input_schema["oneOf"]
-        if branch["properties"]["action"].get("const") == "create"
-    )
-    for argument in ("template", "external_git"):
-        assert (argument in create_action["properties"]) is legacy
     assert [tool.model_dump() for tool in TOOLS] == before
     if legacy:
         assert create is next(tool for tool in TOOLS if tool.name == "akb_create_vault")
@@ -101,13 +93,8 @@ async def test_mcp_discovery_keeps_backend_filter_when_decorating_ack(monkeypatc
     monkeypatch.setattr(settings, "document_revision_backend", backend)
     monkeypatch.setattr(server, "_vault_skill_preflight_version", lambda: ack_version)
     tools = await server.list_tools()
-    create = next(tool for tool in tools if tool.name == "akb_vault_manage")
-    create_action = next(
-        branch
-        for branch in create.input_schema["oneOf"]
-        if branch["properties"]["action"].get("const") == "create"
-    )
-    properties = create_action["properties"]
+    create = next(tool for tool in tools if tool.name == "akb_create_vault")
+    properties = create.input_schema["properties"]
     assert ("template" in properties) is (backend == "bare_git")
     assert ("external_git" in properties) is (backend == "bare_git")
     assert (server.VAULT_SKILL_ACK_ARGUMENT in properties) is (ack_version == 2)
@@ -115,19 +102,17 @@ async def test_mcp_discovery_keeps_backend_filter_when_decorating_ack(monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("option", [{"template": "engineering"}, {"external_git": {"url": "https://example.com/repo.git"}}])
-async def test_native_candidate_create_rejects_unavailable_options(monkeypatch, surfaces, option):
+async def test_native_explicit_unsupported_mcp_request_retains_stable_error(monkeypatch, surfaces, option):
     _, server = surfaces
     monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
-    await server.list_tools()
     service = NativeDocumentService(pool=MagicMock())
     monkeypatch.setattr(service, "_pool", AsyncMock(side_effect=AssertionError("must not reach storage")))
     monkeypatch.setattr(server, "doc_service", service)
-    result = await server.call_tool(
-        "akb_vault_manage",
-        {"action": "create", "name": "new-vault", **option},
-    )
+    result = await server.call_tool("akb_create_vault", {"name": "new-vault", **option})
     body = json.loads(result.content[0].text)
-    assert body["code"] == "unknown_argument"
+    assert body["code"] == "native_revision_surface_unsupported"
+    assert "PostgreSQL Native" in body["error"]
+    assert "M1" not in body["error"]
     service._pool.assert_not_awaited()
 
 
@@ -155,14 +140,10 @@ async def test_bare_git_rest_and_mcp_still_forward_creation_options(monkeypatch,
     service = SimpleNamespace(create_vault=AsyncMock(return_value="vault-id"))
     monkeypatch.setattr(documents, "doc_service", service)
     monkeypatch.setattr(server, "doc_service", service)
-    await server.list_tools()
     await documents.create_vault(name="new-vault", template="engineering", user=SimpleNamespace(user_id="user"))
     assert service.create_vault.await_args.kwargs["template"] == "engineering"
     external = {"url": "https://example.com/repo.git"}
     monkeypatch.setattr(server, "_external_git_view", AsyncMock(return_value=external))
-    result = await server.call_tool(
-        "akb_vault_manage",
-        {"action": "create", "name": "mirror", "external_git": external},
-    )
+    result = await server.call_tool("akb_create_vault", {"name": "mirror", "external_git": external})
     assert service.create_vault.await_args.kwargs["external_git"] == external
     assert json.loads(result.content[0].text)["external_git"] == external

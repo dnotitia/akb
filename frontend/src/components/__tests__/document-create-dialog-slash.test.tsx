@@ -42,7 +42,9 @@ describe("document create slash menu", () => {
       />,
     );
 
-    await screen.findByTestId("markdown-editor");
+    // The shared editor is lazy-loaded. Allow its cold module import to finish
+    // under the full-suite workload before exercising slash-menu behavior.
+    await screen.findByTestId("markdown-editor", {}, { timeout: 5_000 });
     const editor = await waitFor(() => {
       const element = document.querySelector<HTMLElement>(
         '#document-create-body [contenteditable="true"]',

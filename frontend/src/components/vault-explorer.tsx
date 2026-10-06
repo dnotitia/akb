@@ -3,12 +3,14 @@ import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ChevronDown,
+  Check,
   Archive,
   ChevronRight,
   FilePlus,
   FileText,
   Folder,
   FolderPlus,
+  FolderSearch,
   Info,
   Lock,
   MoreHorizontal,
@@ -21,6 +23,7 @@ import {
   Table,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { RailCollapseButton, RailFilterField, RailFilterToggle, RailIdentity, RailManagement } from "@/components/navigation-rail-controls";
@@ -34,6 +37,7 @@ import {
   activePathFromRoute,
   filterTree,
   filterTreeByKind,
+  findResourceGroup,
   flattenVisible,
   kindGroupKey,
   leafHref,
@@ -61,6 +65,8 @@ import { DeleteCollectionDialog } from "@/components/delete-collection-dialog";
 import { FileUploadDialog } from "@/components/file-upload-dialog";
 import { TableCreateDialog } from "@/components/table-create-dialog";
 import { SelectMenu } from "@/components/ui/select-menu";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { parseFileUri } from "@/lib/uri";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import {
@@ -113,6 +119,8 @@ export function VaultExplorer({
   onRefetchReady,
   onCollapse,
 }: VaultExplorerProps) {
+  const user = useCurrentUser();
+  const filterOwner = JSON.stringify([vault, user?.user_id ?? null]);
   const [scopeSelection, setScopeSelection] = useState<{ vault: string; scope: ArchiveScope }>({ vault, scope: "unarchived" });
   const archiveScope = scopeSelection.vault === vault ? scopeSelection.scope : "unarchived";
   const { tree, loading, refreshing, showingPreviousScope, unsupported, error, refetch } = useVaultTree(vault, archiveScope);
@@ -135,11 +143,29 @@ export function VaultExplorer({
   const requestedCollection = pathname === `/vault/${encodeURIComponent(vault)}`
     ? new URLSearchParams(search).get("collection") : null;
   const navigate = useNavigate();
-  const [filter, setFilter] = useState("");
+  const [resourceFilter, setResourceFilter] = useState({ owner: filterOwner, query: "", collection: "" });
+  // Scope is temporary explorer state, never inherited by another Vault/account.
+  if (resourceFilter.owner !== filterOwner) {
+    setResourceFilter({ owner: filterOwner, query: "", collection: "" });
+  }
+  const filter = resourceFilter.owner === filterOwner ? resourceFilter.query : "";
+  const collectionScope = resourceFilter.owner === filterOwner ? resourceFilter.collection : "";
+  const setFilter = useCallback((query: string) => {
+    setResourceFilter(current => ({ ...current, owner: filterOwner, query }));
+  }, [filterOwner]);
+  const filterRowRef = useRef<HTMLDivElement>(null);
+  const filterHelpId = useId();
+  const focusResourceFilter = useCallback(() => {
+    filterRowRef.current?.querySelector<HTMLInputElement>('input[type="search"]')?.focus();
+  }, []);
+  const changeCollectionScope = useCallback((collection: string) => {
+    setResourceFilter(current => ({ ...current, owner: filterOwner, collection }));
+    if (collection) revealAncestorsOf(`${collection}/_`);
+  }, [filterOwner, revealAncestorsOf]);
   const [kindFilter, setKindFilter] = useState<ResourceKind | "all">("all");
   const [filtersOpen, setFiltersOpen] = useState(false);
   const filtersId = useId();
-  const activeFilterCount = Number(archiveScope !== "unarchived") + Number(archiveScope !== "archived" && kindFilter !== "all");
+  const activeFilterCount = Number(Boolean(collectionScope)) + Number(archiveScope !== "unarchived") + Number(archiveScope !== "archived" && kindFilter !== "all");
   function changeArchiveScope(value: string) {
     setScopeSelection({ vault, scope: value as ArchiveScope });
     if (value === "archived") setKindFilter("all");
@@ -240,29 +266,77 @@ export function VaultExplorer({
 
   const activeSig = useMemo(() => requestedCollection ? `collection:${requestedCollection}` : activePathFromRoute(pathname, tree), [pathname, tree, requestedCollection]);
   const activeResourcePath = activeSig?.split(":").slice(1).join(":") ?? "";
-  const collectionContext = requestedCollection || (activeResourcePath.includes("/")
-    ? activeResourcePath.slice(0, activeResourcePath.lastIndexOf("/"))
-    : "");
+  const activeResourceGroup = useMemo(
+    () => tree && activeSig ? findResourceGroup(tree, activeSig) : null,
+    [tree, activeSig],
+  );
+  const collectionContext = requestedCollection || activeResourceGroup?.parentPath || "";
 
   useEffect(() => {
     if (!requestedCollection) return;
     setFilter("");
+    changeCollectionScope("");
     setKindFilter("all");
     setScopeSelection({ vault, scope: "unarchived" });
     revealAncestorsOf(`${requestedCollection}/_`);
-  }, [requestedCollection, vault, locationKey, revealAncestorsOf]);
+  }, [requestedCollection, vault, locationKey, revealAncestorsOf, setFilter, changeCollectionScope]);
 
+  const activeGroupKey = activeResourceGroup
+    ? kindGroupKey(activeResourceGroup.parentPath, activeResourceGroup.kind)
+    : null;
+  const activeRevealPath = activeResourceGroup
+    ? activeResourceGroup.parentPath ? `${activeResourceGroup.parentPath}/_` : ""
+    : activeResourcePath;
+
+  // Reveal on resource navigation. Stable scalar dependencies let subsequent
+  // manual collapses survive re-renders and refreshed tree objects.
   useEffect(() => {
-    if (activeSig) {
-      const path = activeSig.split(":").slice(1).join(":");
-      revealAncestorsOf(path);
+    if (!activeSig) return;
+    if (activeRevealPath) revealAncestorsOf(activeRevealPath);
+    if (activeGroupKey) {
+      setCollapsedKindGroups((current) => {
+        if (!current.has(activeGroupKey)) return current;
+        const next = new Set(current);
+        next.delete(activeGroupKey);
+        return next;
+      });
     }
-  }, [activeSig, revealAncestorsOf]);
+  }, [activeSig, activeGroupKey, activeRevealPath, revealAncestorsOf]);
+
+  const collectionOptions = useMemo(() => {
+    const options = [{ value: "", label: "All collections" }];
+    const visit = (nodes: TreeNode[]) => nodes.forEach(node => {
+      if (node.kind !== "collection") return;
+      options.push({ value: node.path, label: node.path });
+      visit(node.children ?? []);
+    });
+    visit(tree ?? []);
+    // A changed archive view may omit an empty Collection. Keep the chosen
+    // boundary visible instead of implying the query broadened to the Vault.
+    if (collectionScope && !options.some(option => option.value === collectionScope)) {
+      options.push({ value: collectionScope, label: collectionScope });
+    }
+    return options;
+  }, [tree, collectionScope]);
+
+  const scopedTree = useMemo(() => {
+    if (!tree || !collectionScope) return tree;
+    const find = (nodes: TreeNode[]): TreeNode | undefined => {
+      for (const node of nodes) {
+        if (node.kind !== "collection") continue;
+        if (node.path === collectionScope) return node;
+        const child = find(node.children ?? []);
+        if (child) return child;
+      }
+    };
+    const collection = find(tree);
+    return collection ? [collection] : [];
+  }, [tree, collectionScope]);
 
   const kindFiltered = useMemo(() => {
-    if (!tree) return tree;
-    return filterTreeByKind(tree, archiveScope === "archived" ? "document" : kindFilter);
-  }, [tree, kindFilter, archiveScope]);
+    if (!scopedTree) return scopedTree;
+    return filterTreeByKind(scopedTree, archiveScope === "archived" ? "document" : kindFilter);
+  }, [scopedTree, kindFilter, archiveScope]);
 
   const filtered = useMemo(() => {
     if (!kindFiltered) return kindFiltered;
@@ -278,8 +352,8 @@ export function VaultExplorer({
   }, [tree]);
 
   const resourceCounts = useMemo(
-    () => countResourceKinds(tree ?? []),
-    [tree],
+    () => countResourceKinds(scopedTree ?? []),
+    [scopedTree],
   );
   const duplicateDocumentPaths = useMemo(
     () => findDuplicateDocumentPaths(tree ?? []),
@@ -336,7 +410,7 @@ export function VaultExplorer({
   useEffect(() => {
     setRenderLimit(TREE_RENDER_PAGE);
     setKindLimits(new Map());
-  }, [filter, kindFilter, vault]);
+  }, [filter, kindFilter, vault, collectionScope]);
 
   useEffect(() => {
     setCollapsedKindGroups(new Set());
@@ -487,9 +561,23 @@ export function VaultExplorer({
           )}
       </RailManagement>
 
-      <div data-slot="collection-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-2 border-b border-border px-2 py-1">
+      <div ref={filterRowRef} data-slot="collection-filter-row" className="flex min-h-10 shrink-0 flex-col justify-center gap-1.5 border-b border-border px-2 py-1">
         <RailFilterField label="Filter resources" value={filter} onChange={setFilter} />
         <div id={filtersId} hidden={!filtersOpen} className="space-y-2 pb-1">
+        <div className="space-y-1">
+        <span className="text-xs text-foreground-muted">Collection scope</span>
+        <div className="flex min-w-0 items-center gap-1">
+          <CollectionScopePicker
+            key={filterOwner}
+            value={collectionScope}
+            onValueChange={changeCollectionScope}
+            options={collectionOptions}
+            describedBy={filterHelpId}
+          />
+          {collectionScope && <button type="button" aria-label="Clear collection scope" title="Search all collections" className={headBtn} onClick={() => { changeCollectionScope(""); focusResourceFilter(); }}><X className="h-3.5 w-3.5" aria-hidden /></button>}
+        </div>
+        <p id={filterHelpId} className={collectionScope ? "px-1 text-xs leading-relaxed text-foreground-muted" : "sr-only"}>Filter names{collectionScope ? " · Includes sub-collections" : " in all collections"}</p>
+        </div>
         <label className="block space-y-1 text-xs text-foreground-muted"><span>Document state</span>
         <SelectMenu
           value={archiveScope}
@@ -516,7 +604,7 @@ export function VaultExplorer({
             />
         </label>
         </div>
-        {activeFilterCount > 0 && <div className="flex items-center justify-between gap-2 pb-1 text-xs text-foreground-muted"><span>{activeFilterCount} active {activeFilterCount === 1 ? "filter" : "filters"}</span><button type="button" onClick={event => { changeArchiveScope("unarchived"); setKindFilter("all"); event.currentTarget.closest('[data-slot="collection-filter-row"]')?.querySelector("input")?.focus(); }} className="rounded-[var(--radius-sm)] text-link focus-visible:ring-2 focus-visible:ring-ring">Reset filters</button></div>}
+        {activeFilterCount > 0 && <div className="flex items-center justify-between gap-2 pb-1 text-xs text-foreground-muted"><span>{activeFilterCount} active {activeFilterCount === 1 ? "filter" : "filters"}</span><button type="button" onClick={() => { changeArchiveScope("unarchived"); setKindFilter("all"); changeCollectionScope(""); focusResourceFilter(); }} className="rounded-[var(--radius-sm)] text-link focus-visible:ring-2 focus-visible:ring-ring">Reset filters</button></div>}
       </div>
 
       <div
@@ -540,12 +628,13 @@ export function VaultExplorer({
         )}
         {!loading && !refreshing && !error && !unsupported && (total === 0 || (archiveScope === "archived" && resourceCounts.document === 0)) && (
           <div className="px-3 py-4 text-xs leading-relaxed text-foreground-muted" role="status">
-            {archiveScope === "archived" ? "No archived documents in this Vault." : "No collections yet — the tree fills in with your first document."}
+            {archiveScope === "archived" ? `No archived documents in this ${collectionScope ? "Collection" : "Vault"}.` : "No collections yet — the tree fills in with your first document."}
           </div>
         )}
         {!loading && !refreshing && !unsupported && total > 0 && visibleRows.length === 0 && !(archiveScope === "archived" && resourceCounts.document === 0) && (
           <div className="coord px-3 py-2" role="status">
             No resources match these filters.
+            {collectionScope && <button type="button" onClick={() => { changeCollectionScope(""); focusResourceFilter(); }} className="mt-2 block text-link underline focus-visible:ring-2 focus-visible:ring-ring">Search all collections</button>}
           </div>
         )}
 
@@ -579,6 +668,7 @@ export function VaultExplorer({
                 isActive={row.sig === activeSig}
                 vault={vault}
                 onToggle={toggle}
+                onSearchCollection={(node) => { changeCollectionScope(node.path); setFiltersOpen(true); focusResourceFilter(); }}
                 canWrite={canWrite}
                 canAdmin={canAdmin}
                 showDocumentDisambiguator={duplicateDocumentPaths.has(row.node.path)}
@@ -738,6 +828,55 @@ export function VaultExplorer({
   );
 }
 
+function CollectionScopePicker({ value, options, onValueChange, describedBy }: {
+  value: string;
+  options: { value: string; label: string }[];
+  onValueChange: (value: string) => void;
+  describedBy: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const matches = options.filter(option => option.label.toLowerCase().includes(query.trim().toLowerCase()));
+  const select = (next: string) => { onValueChange(next); setOpen(false); };
+  useEffect(() => {
+    listRef.current?.querySelector<HTMLElement>(`[data-option-index="${active}"]`)?.scrollIntoView?.({ block: "nearest" });
+  }, [active]);
+  return <Popover open={open} onOpenChange={next => { setOpen(next); setQuery(""); setActive(-1); }}>
+    <PopoverTrigger asChild><button type="button" aria-label="Collection search scope" aria-describedby={describedBy} title={value || "All collections"}
+      className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-surface px-2 text-left text-xs text-foreground hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+      <FolderSearch className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
+      <span className="min-w-0 flex-1 truncate">{value || "All collections"}</span>
+      <ChevronDown className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
+    </button></PopoverTrigger>
+    <PopoverContent align="start" aria-label="Choose a collection" className="w-72 p-1.5" onOpenAutoFocus={event => { event.preventDefault(); inputRef.current?.focus(); }}>
+      <Input ref={inputRef} role="combobox" aria-label="Find a collection" aria-expanded={open} aria-controls={id} aria-autocomplete="list" aria-activedescendant={active >= 0 && matches[active] ? `${id}-${active}` : undefined}
+        value={query} placeholder="Find a collection…" className="h-8 text-sm" onChange={event => { setQuery(event.target.value); setActive(-1); }}
+        onKeyDown={event => {
+          if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            setActive(current => matches.length ? event.key === "ArrowDown" ? (current + 1) % matches.length : current <= 0 ? matches.length - 1 : current - 1 : -1);
+          } else if (event.key === "Enter") {
+            event.preventDefault();
+            const option = matches[active < 0 ? 0 : active];
+            if (option) select(option.value);
+          }
+        }} />
+      <div ref={listRef} id={id} role="listbox" aria-label="Collection scopes" className="mt-1 max-h-60 overflow-y-auto rail-scroll">
+        {matches.map((option, index) => <button key={option.value} type="button" role="option" id={`${id}-${index}`} data-option-index={index} aria-selected={option.value === value} onClick={() => select(option.value)}
+          className={`flex min-h-9 w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-2 text-left text-sm hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset ${index === active ? "bg-surface-hover" : ""} ${option.value === value ? "text-link" : "text-foreground"}`}>
+          <span className="min-w-0 flex-1 break-words">{option.label}</span>{option.value === value && <Check className="h-4 w-4 shrink-0" aria-hidden />}
+        </button>)}
+      </div>
+      {matches.length === 0 && <p role="status" className="px-2 py-3 text-xs text-foreground-muted">No collections match. Try another name.</p>}
+    </PopoverContent>
+  </Popover>;
+}
+
 function VaultExplorerLoading() {
   return (
     <LoadingState label="Loading collections" className="space-y-1 px-2 py-2">
@@ -761,6 +900,7 @@ interface RowProps {
   isActive: boolean;
   vault: string;
   onToggle: (path: string) => void;
+  onSearchCollection: (node: TreeNode) => void;
   /** Writer+ unlocks per-row destructive affordances (collection rows
    *  only for now). Readers see the row unchanged. */
   canWrite?: boolean;
@@ -789,7 +929,7 @@ interface RowProps {
 }
 
 const TreeRow = memo(function TreeRow({
-  node, depth, sig, isOpen, isActive, vault, onToggle, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
+  node, depth, sig, isOpen, isActive, vault, onToggle, onSearchCollection, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + 12}px` };
 
@@ -847,6 +987,7 @@ const TreeRow = memo(function TreeRow({
             vault={vault}
             node={node}
             editable={Boolean(canWrite && !isReserved)}
+            onSearch={() => onSearchCollection(node)}
             onOpenDetails={() => onOpenDetails(node)}
             onCreateDoc={
               !isReserved && canWrite && onCreateDoc
@@ -1139,6 +1280,7 @@ function CollectionActionsMenu({
   vault,
   node,
   editable,
+  onSearch,
   onOpenDetails,
   onCreateDoc,
   onUploadFile,
@@ -1149,6 +1291,7 @@ function CollectionActionsMenu({
   vault: string;
   node: TreeNode;
   editable: boolean;
+  onSearch: () => void;
   onOpenDetails: () => void;
   onCreateDoc?: () => void;
   onUploadFile?: () => void;
@@ -1157,6 +1300,8 @@ function CollectionActionsMenu({
   onDelete?: () => void;
 }) {
   const user = useCurrentUser();
+  const triggerId = useId();
+  const searchRequested = useRef(false);
   const shortcuts = useWorkspaceShortcuts(user?.user_id);
   const shortcut = { kind: "collection" as const, vault, path: node.path, title: node.name };
   const pinned = shortcuts.some(item => workspaceShortcutKey(item) === workspaceShortcutKey(shortcut));
@@ -1172,6 +1317,7 @@ function CollectionActionsMenu({
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <button
+          id={triggerId}
           type="button"
           title={`Collection actions for ${node.path}`}
           aria-label={`Collection actions for ${node.path}`}
@@ -1185,8 +1331,19 @@ function CollectionActionsMenu({
           align="start"
           side="right"
           sideOffset={4}
+          onCloseAutoFocus={event => {
+            if (!searchRequested.current) return;
+            event.preventDefault();
+            searchRequested.current = false;
+            onSearch();
+          }}
           className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
+          <DropdownMenu.Item onSelect={() => { searchRequested.current = true; }} className={itemClass}>
+            <FolderSearch className="h-4 w-4 text-foreground-muted" aria-hidden />
+            Search in collection
+          </DropdownMenu.Item>
+          <DropdownMenu.Separator className="my-1 h-px bg-border" />
           {hasWriteActions && (
             <DropdownMenu.Label className="px-2.5 pb-1 pt-1 text-xs font-medium text-foreground-muted">
               Add to collection

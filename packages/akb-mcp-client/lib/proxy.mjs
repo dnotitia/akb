@@ -29,7 +29,7 @@ const httpsKeepAlive = new httpsAgent({ keepAlive: true });
 
 // ── MIME type inference ────────────────────────────────────
 // Covers common file types. Unknown extensions fall back to octet-stream.
-// Callers can override via akb_file_write action=put_file's `mime_type` parameter.
+// Callers can override via the `mime_type` parameter of akb_put_file.
 
 const MIME_TABLE = {
   ".html": "text/html", ".htm": "text/html",
@@ -167,129 +167,169 @@ function _resolveParent(args) {
   return { vault: args.vault, collection: args.collection || "" };
 }
 
-// ── Proxy-local Candidate capabilities ─────────────────────
+// ── File tool definitions (injected into tools/list) ────────
 
 const FILE_TOOLS = [
   {
-    name: "akb_file_read",
+    name: "akb_put_file",
     description:
-      "Read a vault file to a local path. Use action=read with the canonical file URI returned by AKB browse or akb_file_write/action=put_file.",
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_update_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
     inputSchema: {
       type: "object",
-      oneOf: [
-        {
-          type: "object",
-          description: "Download a vault file to a local path.",
-          properties: {
-            action: { const: "read" },
-            uri: { type: "string", description: "File URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)." },
-            save_to: { type: "string", description: "Local directory or file path to save to." },
-          },
-          required: ["action", "uri", "save_to"],
-          additionalProperties: false,
+      properties: {
+        parent: {
+          type: "string",
+          description:
+            "Parent location as a canonical URI — `akb://{vault}` for the vault root, " +
+            "`akb://{vault}/coll/{path}` for a collection. When given, the file is " +
+            "uploaded there and `vault`/`collection` are derived from the URI.",
         },
-      ],
+        vault: { type: "string", description: "Vault name. Required unless `parent` is given." },
+        file_path: {
+          type: "string",
+          description: "Absolute path to the local file to upload",
+        },
+        collection: {
+          type: "string",
+          description: "Logical grouping (like document collections). Ignored when `parent` is given.",
+          default: "",
+        },
+        description: {
+          type: "string",
+          description: "Brief description of the file",
+        },
+        mime_type: {
+          type: "string",
+          description:
+            "MIME type of the file (e.g. 'text/html', 'application/pdf', 'image/png'). " +
+            "Optional — if omitted, it is auto-detected from the filename extension. " +
+            "Override only when the extension is missing, ambiguous, or wrong.",
+        },
+      },
+      required: ["file_path"],
     },
   },
   {
-    name: "akb_file_write",
+    name: "akb_put_image",
     description:
-      "Perform one local-file operation. Choose put_file, update_file, or delete_file for vault files; choose put_image or discard_image for an inline document image attachment.",
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: false,
-      openWorldHint: false,
-    },
+      "Upload a local PNG, JPEG, GIF, or WebP (maximum 10 MiB) for inline use in an AKB Markdown document. Returns a stable `/api/assets/{uuid}` URL and a ready-to-paste `markdown` image expression. For a new document, place it with akb_put. For an existing document, prefer a targeted akb_edit; akb_update(content=...) replaces the entire body and must never receive only an image fragment. Images are immutable: upload a replacement and edit the Markdown reference. This creates a hidden document attachment, not a standalone File; use akb_put_file when the binary should appear in browse/search. If the document write fails, call akb_discard_image with the returned URL.",
     inputSchema: {
       type: "object",
-      oneOf: [
-        {
-          type: "object",
-          description: "Upload a local file into vault file storage.",
-          properties: {
-            action: { const: "put_file" },
-            parent: {
-              type: "string",
-              description: "Vault root (`akb://{vault}`) or collection URI (`akb://{vault}/coll/{path}`).",
-            },
-            vault: { type: "string", description: "Vault name. Required unless parent is given." },
-            file_path: { type: "string", description: "Absolute path to the local file to upload." },
-            collection: { type: "string", description: "Logical grouping. Ignored when parent is given.", default: "" },
-            description: { type: "string", description: "Brief description of the file." },
-            mime_type: { type: "string", description: "Optional MIME type override; otherwise inferred from the filename." },
-          },
-          required: ["action", "file_path"],
-          anyOf: [{ required: ["parent"] }, { required: ["vault"] }],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          description: "Replace the bytes of an existing vault file, preserving its URI and honoring supplied version preconditions.",
-          properties: {
-            action: { const: "update_file" },
-            uri: { type: "string", description: "Existing file URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)." },
-            file_path: { type: "string", description: "Absolute path to the local replacement file." },
-            expected_content_hash: { type: "string", description: "Optional sha256 from akb_file_read; stale values are rejected with 409." },
-            expected_version: { type: "string", description: "Optional opaque version from akb_file_read; stale values are rejected with 409." },
-            mime_type: { type: "string", description: "Optional replacement MIME type." },
-          },
-          required: ["action", "uri", "file_path"],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          description: "Delete a file from vault storage by its URI.",
-          properties: {
-            action: { const: "delete_file" },
-            uri: { type: "string", description: "File URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)." },
-          },
-          required: ["action", "uri"],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
+      properties: {
+        parent: {
+          type: "string",
           description:
-            "Upload a local PNG, JPEG, GIF, or WebP (maximum 10 MiB) for inline use in an AKB Markdown document. Returns a stable asset URL and ready-to-paste Markdown. Use akb_document_write action=put for a new document or akb_document_write action=edit for an existing document. action=update replaces the entire body. This is a hidden attachment, not a standalone file; use akb_file_write action=put_file for files that should appear in browse/search. If the document write fails, clean up with akb_file_write action=discard_image.",
-          properties: {
-            action: { const: "put_image" },
-            parent: {
-              type: "string",
-              description: "Vault root (`akb://{vault}`) or collection URI; the image is owned by that vault.",
-            },
-            vault: { type: "string", description: "Vault name. Required unless parent is given." },
-            file_path: { type: "string", description: "Absolute path to a PNG, JPEG, GIF, or WebP image (maximum 10 MiB)." },
-            alt_text: { type: "string", description: "Accessible Markdown alt text; defaults to the filename." },
-            mime_type: {
-              type: "string",
-              enum: ["image/png", "image/jpeg", "image/gif", "image/webp"],
-              description: "Optional MIME override for an extensionless or unusually named file.",
-            },
-          },
-          required: ["action", "file_path"],
-          anyOf: [{ required: ["parent"] }, { required: ["vault"] }],
-          additionalProperties: false,
+            "Vault or collection URI (`akb://{vault}` or `akb://{vault}/coll/{path}`). " +
+            "The image is owned by that vault; the collection portion only identifies the vault.",
         },
-        {
-          type: "object",
-          description: "Discard an uncommitted document image upload after a failed or abandoned document write.",
-          properties: {
-            action: { const: "discard_image" },
-            parent: { type: "string", description: "Vault or collection URI used for the upload." },
-            vault: { type: "string", description: "Vault name. Required unless parent is given." },
-            url: { type: "string", description: "Stable `/api/assets/{uuid}` URL returned by action=put_image." },
-          },
-          required: ["action", "url"],
-          anyOf: [{ required: ["parent"] }, { required: ["vault"] }],
-          additionalProperties: false,
+        vault: {
+          type: "string",
+          description: "Vault name. Required unless `parent` is given.",
         },
-      ],
+        file_path: {
+          type: "string",
+          description: "Absolute path to the local image file (maximum 10 MiB).",
+        },
+        alt_text: {
+          type: "string",
+          description:
+            "Accessible Markdown alt text. Defaults to the filename without its extension.",
+        },
+        mime_type: {
+          type: "string",
+          enum: ["image/png", "image/jpeg", "image/gif", "image/webp"],
+          description:
+            "Optional MIME override for extensionless or unusually named files. The server verifies it against decoded bytes.",
+        },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
+    name: "akb_discard_image",
+    description:
+      "Discard a document image upload that was never committed in an AKB document. Use this only to clean up after a failed or abandoned akb_put/akb_update. Images already claimed by a document or retained Git revision cannot be discarded through this tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent: {
+          type: "string",
+          description:
+            "Vault or collection URI used for the upload. The vault is derived from it.",
+        },
+        vault: {
+          type: "string",
+          description: "Vault name. Required unless `parent` is given.",
+        },
+        url: {
+          type: "string",
+          description: "Stable `/api/assets/{uuid}` URL returned by akb_put_image.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "akb_get_file",
+    description: "Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from akb_browse or akb_put_file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uri: {
+          type: "string",
+          description: "File URI (akb://{vault}/file/{id})",
+        },
+        save_to: {
+          type: "string",
+          description: "Local directory or file path to save to",
+        },
+      },
+      required: ["uri", "save_to"],
+    },
+  },
+  {
+    name: "akb_update_file",
+    description:
+      "Replace the bytes of an existing vault file while preserving its URI. The local file is hashed before transfer; identical content is skipped. Pass expected_content_hash and/or expected_version from akb_get_file to reject stale writes with HTTP 409 instead of overwriting a concurrent change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uri: {
+          type: "string",
+          description: "Existing file URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)",
+        },
+        file_path: {
+          type: "string",
+          description: "Absolute path to the local replacement file",
+        },
+        expected_content_hash: {
+          type: "string",
+          description: "Optional sha256 returned by akb_get_file; stale values are rejected with 409",
+        },
+        expected_version: {
+          type: "string",
+          description: "Optional opaque `version` returned by akb_get_file; stale values are rejected with 409",
+        },
+        mime_type: {
+          type: "string",
+          description: "Optional replacement MIME type. The existing file type is preserved when omitted.",
+        },
+      },
+      required: ["uri", "file_path"],
+    },
+  },
+  {
+    name: "akb_delete_file",
+    description: "Delete a file from vault storage by its URI.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uri: {
+          type: "string",
+          description: "File URI (akb://{vault}/file/{id})",
+        },
+      },
+      required: ["uri"],
     },
   },
 ];
@@ -315,10 +355,16 @@ function parseFileUri(uri) {
 }
 
 const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
-const FILE_WRITE_TOOL_NAMES = new Set(["akb_file_write"]);
+const FILE_WRITE_TOOL_NAMES = new Set([
+  "akb_put_file",
+  "akb_put_image",
+  "akb_discard_image",
+  "akb_update_file",
+  "akb_delete_file",
+]);
 
-// Candidate document writes where a local `file` path becomes `content`.
-const FILE_CONTENT_TOOL = "akb_document_write";
+// Tools where proxy injects a `file` param as alternative to `content`
+const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION = "2025-06-18";
@@ -343,58 +389,14 @@ const PROXY_INSTRUCTIONS =
   "A first write may return vault_skill_required before any mutation; apply its " +
   "vault_skill payload and retry the same call. The proxy binds the returned " +
   "acknowledgement to that exact retry, so unrelated queued writes remain blocked. " +
-  "For an inline document image, call akb_file_write with action=put_image and place its returned `markdown` " +
-  "with akb_document_write action=put for a new document or akb_document_write action=edit for an existing one. " +
-  "Never pass only an image fragment to akb_document_write action=update, because it replaces " +
+  "For an inline document image, call akb_put_image and place its returned `markdown` " +
+  "with akb_put for a new document or a targeted akb_edit for an existing one. " +
+  "Never pass only an image fragment to akb_update(content=...), because it replaces " +
   "the entire document body. If the document write fails, clean up the uncommitted " +
-  "upload with akb_file_write action=discard_image.";
+  "upload with akb_discard_image.";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function validateFileToolArguments(name, args) {
-  if (!isObject(args)) throw new Error("arguments must be an object");
-  const tool = FILE_TOOLS.find((candidate) => candidate.name === name);
-  const branch = tool?.inputSchema.oneOf.find(
-    (candidate) => candidate.properties.action.const === args.action,
-  );
-  if (!branch) throw new Error("Unknown local file action.");
-
-  const properties = { ...(branch.properties || {}) };
-  if (FILE_WRITE_TOOL_NAMES.has(name)) {
-    properties[VAULT_SKILL_ACK_ARGUMENT] = vaultSkillAckProperty();
-  }
-  for (const key of Object.keys(args)) {
-    if (!Object.prototype.hasOwnProperty.call(properties, key)) {
-      throw new Error(`Unknown argument: ${key}`);
-    }
-  }
-  for (const key of branch.required || []) {
-    if (!Object.prototype.hasOwnProperty.call(args, key)) {
-      throw new Error(`Missing required argument: ${key}`);
-    }
-  }
-  for (const [key, value] of Object.entries(args)) {
-    const property = properties[key];
-    if (property.type === "string" && typeof value !== "string") {
-      throw new Error(`Argument '${key}' must be a string.`);
-    }
-    if (property.const !== undefined && value !== property.const) {
-      throw new Error(`Argument '${key}' must be '${property.const}'.`);
-    }
-    if (property.enum && !property.enum.includes(value)) {
-      throw new Error(`Argument '${key}' must be one of: ${property.enum.join(", ")}.`);
-    }
-    if (property.maxLength !== undefined && value.length > property.maxLength) {
-      throw new Error(`Argument '${key}' exceeds the maximum length of ${property.maxLength}.`);
-    }
-  }
-  const alternatives = branch.anyOf || [];
-  if (alternatives.length && !alternatives.some((rule) =>
-    (rule.required || []).some((key) => Object.prototype.hasOwnProperty.call(args, key)))) {
-    throw new Error("Either 'parent' or 'vault' is required.");
-  }
 }
 
 function hasModernEnvelope(params) {
@@ -461,9 +463,11 @@ export class AKBProxy {
     // Exact-operation acknowledgement cache for backend and proxy-local
     // writes. A challenge never authorizes a different queued mutation.
     this._vaultSkillRetryAcks = new Map();
-    // Local file/image tools bypass backend call_tool. Keep their vault-level
-    // challenge pending until an exact retry carries its opaque token.
+    // Local file/image tools bypass backend call_tool. Keep challenges bound to
+    // the exact operation and proxy credential until the guide is applied.
     this._localVaultSkillPending = new Map();
+    this._localVaultSkillGuides = new Map();
+    this._localVaultSkillAccepted = new Map();
     // Opt-in usage record. Read once, here, so the disabled path costs
     // nothing per call — not even a clock read. Set to null when the
     // variable is unset or the sink turns out to be unwritable, so a bad
@@ -571,28 +575,28 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
-    // Resolve the proxy-only local path on document put/update before forwarding.
-    if (method === "tools/call" && params?.name === FILE_CONTENT_TOOL) {
-      try {
-        const args = params.arguments;
-        if (isObject(args) && Object.prototype.hasOwnProperty.call(args, "file")) {
+    // Resolve `file` → `content` for akb_put / akb_update before forwarding
+    if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
+      const args = params.arguments;
+      if (args?.file) {
+        try {
           msg = {
             ...msg,
             params: {
               ...params,
-              arguments: this._resolveFileToContent(args, args.action),
+              arguments: this._resolveFileToContent(args),
             },
           };
+        } catch (err) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: this._clientResult({
+              content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
+              isError: true,
+            }),
+          };
         }
-      } catch (err) {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: this._clientResult({
-            content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-            isError: true,
-          }),
-        };
       }
     }
 
@@ -607,7 +611,7 @@ export class AKBProxy {
     try {
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
-          ? await this._handleFileTool(id, msg.params)
+          ? await this._handleFileTool(id, msg.params, callKey)
           : await this._forward(msg);
       if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
       return response;
@@ -838,28 +842,17 @@ export class AKBProxy {
     return { jsonrpc: "2.0", id, result };
   }
 
-  // Decorate Candidate document-write branches with the proxy-local file
-  // parameter and append local capabilities. Never mutates the cached result.
+  // Decorate a raw backend tools/list result with the proxy-local file
+  // tools and the injected `file` param. Never mutates the cached result.
   _decorateTools(resp) {
     const tools = (resp.tools || []).map((t) => {
-      if (t.name === FILE_CONTENT_TOOL && Array.isArray(t.inputSchema?.oneOf)) {
-        const oneOf = t.inputSchema.oneOf.map((branch) => {
-          const action = branch.properties?.action?.const;
-          if (action !== "put" && action !== "update") return branch;
-
-          const allOf = [...(branch.allOf || [])];
-          if (action === "put") {
-            allOf.push({ oneOf: [{ required: ["file"] }, { required: ["content"] }] });
-          } else {
-            allOf.push({ not: { required: ["file", "content"] } });
-          }
-          return {
-            ...branch,
-            required: action === "put"
-              ? (branch.required || []).filter((name) => name !== "content")
-              : [...(branch.required || [])],
+      if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
+        return {
+          ...t,
+          inputSchema: {
+            ...t.inputSchema,
             properties: {
-              ...(branch.properties || {}),
+              ...t.inputSchema.properties,
               file: {
                 type: "string",
                 description:
@@ -867,14 +860,6 @@ export class AKBProxy {
                   "Provide either file or content, not both.",
               },
             },
-            allOf,
-          };
-        });
-        return {
-          ...t,
-          inputSchema: {
-            ...t.inputSchema,
-            oneOf,
           },
         };
       }
@@ -891,13 +876,10 @@ export class AKBProxy {
         ...tool,
         inputSchema: {
           ...tool.inputSchema,
-          oneOf: tool.inputSchema.oneOf.map((branch) => ({
-            ...branch,
-            properties: {
-              ...(branch.properties || {}),
-              [VAULT_SKILL_ACK_ARGUMENT]: vaultSkillAckProperty(),
-            },
-          })),
+          properties: {
+            ...(tool.inputSchema?.properties || {}),
+            [VAULT_SKILL_ACK_ARGUMENT]: vaultSkillAckProperty(),
+          },
         },
       };
     });
@@ -905,7 +887,7 @@ export class AKBProxy {
 
   async _toolsList(id, params) {
     // Serve a live or cached backend tool list. If the backend is
-    // unreachable and nothing is cached, degrade to the local capabilities
+    // unreachable and nothing is cached, degrade to the local file tools
     // only — a valid (partial) response the client can register — and mark
     // the list stale so the monitor re-lists it on recovery. Never error
     // the whole tools/list on backend unreachability.
@@ -925,7 +907,7 @@ export class AKBProxy {
       this._servedDegraded = true;
       this._startBackendMonitor();
       process.stderr.write(
-        "[akb-mcp] backend unreachable — serving proxy-local capabilities only; will re-list on recovery\n",
+        "[akb-mcp] backend unreachable — serving file tools only; will re-list on recovery\n",
       );
       return {
         jsonrpc: "2.0",
@@ -940,19 +922,16 @@ export class AKBProxy {
   // ── File-to-content resolution ─────────────────────────
 
   /**
-   * Read a local file and replace `file` with `content` on document put/update.
-   * Throws if both are provided, the action cannot accept a file, or the path fails.
+   * Read a local file and replace `file` with `content` in tool arguments.
+   * Throws if both `file` and `content` are provided, or file is unreadable.
    */
-  _resolveFileToContent(args, action) {
-    const { file, ...rest } = args;
-    if (action !== "put" && action !== "update") {
-      throw new Error("'file' is only supported for akb_document_write action=put or action=update.");
+  _resolveFileToContent(args) {
+    const { file, content, ...rest } = args;
+    if (!file) {
+      throw new Error("'file' parameter is empty.");
     }
-    if (Object.prototype.hasOwnProperty.call(args, "content")) {
+    if (content) {
       throw new Error("Cannot provide both 'file' and 'content'. Use one or the other.");
-    }
-    if (typeof file !== "string" || file.length === 0) {
-      throw new Error("'file' parameter must be a non-empty path.");
     }
 
     const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -963,7 +942,7 @@ export class AKBProxy {
       throw new Error(`Cannot read file: ${file} (${err.message})`);
     }
     if (fileSize > MAX_FILE_SIZE) {
-      throw new Error(`File too large: ${(fileSize / 1024 / 1024).toFixed(1)}MB (max ${MAX_FILE_SIZE / 1024 / 1024}MB). Use akb_file_write action=put_file for binary/large files.`);
+      throw new Error(`File too large: ${(fileSize / 1024 / 1024).toFixed(1)}MB (max ${MAX_FILE_SIZE / 1024 / 1024}MB). Use akb_put_file for binary/large files.`);
     }
 
     return { ...rest, content: readFileSync(file, "utf-8") };
@@ -971,15 +950,12 @@ export class AKBProxy {
 
   // ── File tool handlers ──────────────────────────────────
 
-  async _handleFileTool(id, params) {
+  async _handleFileTool(id, params, callKey = this._vaultSkillCallKey(params)) {
     const { name, arguments: args } = params;
     try {
-      validateFileToolArguments(name, args);
-      const action = args.action;
-      const vault = this._fileToolVault(action, args);
+      const vault = this._fileToolVault(name, args);
       const vaultSkill = await this._fileToolSkillPreflight(
-        vault,
-        args?.[VAULT_SKILL_ACK_ARGUMENT],
+        vault, params, callKey,
       );
       if (vaultSkill && FILE_WRITE_TOOL_NAMES.has(name)) {
         return {
@@ -1000,23 +976,23 @@ export class AKBProxy {
         };
       }
       let result;
-      switch (action) {
-        case "put_file":
+      switch (name) {
+        case "akb_put_file":
           result = await this._putFile(args);
           break;
-        case "put_image":
+        case "akb_put_image":
           result = await this._putImage(args);
           break;
-        case "discard_image":
+        case "akb_discard_image":
           result = await this._discardImage(args);
           break;
-        case "read":
+        case "akb_get_file":
           result = await this._getFile(args);
           break;
-        case "update_file":
+        case "akb_update_file":
           result = await this._updateFile(args);
           break;
-        case "delete_file":
+        case "akb_delete_file":
           result = await this._deleteFile(args);
           break;
       }
@@ -1034,12 +1010,41 @@ export class AKBProxy {
         }),
       };
     } catch (err) {
+      const publicError = { error: err.message };
+      if (
+        Number.isInteger(err?.statusCode)
+        && err.statusCode >= 400
+        && err.statusCode < 500
+        && typeof err.body === "string"
+      ) {
+        try {
+          const payload = JSON.parse(err.body);
+          const message = typeof payload?.error === "string" ? payload.error : payload?.message;
+          if (
+            payload
+            && typeof payload === "object"
+            && !Array.isArray(payload)
+            && typeof payload.code === "string"
+            && typeof message === "string"
+          ) {
+            publicError.error = message;
+            publicError.code = payload.code;
+            for (const key of ["details", "hint"]) {
+              if (Object.prototype.hasOwnProperty.call(payload, key)) {
+                publicError[key] = payload[key];
+              }
+            }
+          }
+        } catch {
+          // Preserve the original HTTP error if the response is not a REST error envelope.
+        }
+      }
       return {
         jsonrpc: "2.0",
         id,
         result: this._clientResult({
           content: [
-            { type: "text", text: JSON.stringify({ error: err.message }) },
+            { type: "text", text: JSON.stringify(publicError) },
           ],
           isError: true,
         }),
@@ -1047,8 +1052,8 @@ export class AKBProxy {
     }
   }
 
-  _fileToolVault(action, args) {
-    if (action === "put_file" || action === "put_image" || action === "discard_image") {
+  _fileToolVault(name, args) {
+    if (name === "akb_put_file" || name === "akb_put_image" || name === "akb_discard_image") {
       return _resolveParent(args).vault;
     }
     return parseFileUri(args.uri).vault;
@@ -1063,7 +1068,7 @@ export class AKBProxy {
    * and therefore reuses the same version/session gate as every native tool.
    * A write-only credential receives no payload and remains usable.
    */
-  async _fileToolSkillPreflight(vault, acknowledgement = null) {
+  async _fileToolSkillPreflight(vault, params, callKey) {
     if (!vault) return null;
     const ok = await this._ensureBackend();
     if (!ok) throw new Error("backend unreachable");
@@ -1072,37 +1077,81 @@ export class AKBProxy {
       arguments: { topic: "vault-skill", vault },
     });
     const text = response.content?.find((item) => item?.type === "text")?.text;
+    let envelope = null;
     let projected = null;
     try {
-      const envelope = JSON.parse(text);
+      envelope = JSON.parse(text);
       projected = envelope?.vault_skill || null;
     } catch {
       projected = null;
     }
+    const helpAuthorized = response?.isError !== true
+      && envelope
+      && typeof envelope === "object"
+      && !Array.isArray(envelope)
+      && typeof envelope.error !== "string";
 
-    let pending = this._localVaultSkillPending.get(vault) || null;
-    if (projected) {
-      if (!pending || pending.guide.version !== projected.version) {
-        pending = {
-          token: randomBytes(24).toString("base64url"),
-          guide: null,
-        };
-        pending.guide = { ...projected, ack_token: pending.token };
-        this._localVaultSkillPending.set(vault, pending);
-        while (this._localVaultSkillPending.size > 256) {
-          this._localVaultSkillPending.delete(
-            this._localVaultSkillPending.keys().next().value,
-          );
-        }
-      } else {
-        this._localVaultSkillPending.delete(vault);
-        this._localVaultSkillPending.set(vault, pending);
+    const args = params?.arguments || {};
+    const acknowledgement = args[VAULT_SKILL_ACK_ARGUMENT];
+    const credentialBinding = createHash("sha256")
+      .update(String(this.pat))
+      .digest("base64url");
+    const permissionKey = JSON.stringify([vault, credentialBinding]);
+    const requestKey = JSON.stringify([permissionKey, callKey]);
+
+    if (helpAuthorized && projected) {
+      const guide = { ...projected };
+      delete guide.ack_token;
+      this._localVaultSkillGuides.set(vault, guide);
+      while (this._localVaultSkillGuides.size > 256) {
+        this._localVaultSkillGuides.delete(
+          this._localVaultSkillGuides.keys().next().value,
+        );
+      }
+    }
+
+    let pending = this._localVaultSkillPending.get(requestKey) || null;
+    const guide = helpAuthorized
+      ? this._localVaultSkillGuides.get(vault) || null
+      : null;
+    if (pending && guide && pending.guide.version !== guide.version) {
+      this._localVaultSkillPending.delete(requestKey);
+      pending = null;
+    }
+    if (
+      !pending
+      && guide
+      && this._localVaultSkillAccepted.get(permissionKey) !== guide.version
+    ) {
+      pending = {
+        vault,
+        permissionKey,
+        token: randomBytes(24).toString("base64url"),
+        guide: { ...guide },
+      };
+      pending.guide.ack_token = pending.token;
+      this._localVaultSkillPending.set(requestKey, pending);
+      while (this._localVaultSkillPending.size > 256) {
+        this._localVaultSkillPending.delete(
+          this._localVaultSkillPending.keys().next().value,
+        );
       }
     }
 
     if (!pending) return null;
     if (typeof acknowledgement === "string" && acknowledgement === pending.token) {
-      this._localVaultSkillPending.delete(vault);
+      this._localVaultSkillPending.delete(requestKey);
+      this._localVaultSkillAccepted.set(permissionKey, pending.guide.version);
+      while (this._localVaultSkillAccepted.size > 256) {
+        this._localVaultSkillAccepted.delete(
+          this._localVaultSkillAccepted.keys().next().value,
+        );
+      }
+      for (const [key, value] of this._localVaultSkillPending) {
+        if (value.permissionKey === permissionKey) {
+          this._localVaultSkillPending.delete(key);
+        }
+      }
       return null;
     }
     return pending.guide;
@@ -1110,8 +1159,10 @@ export class AKBProxy {
 
   async _putFile(args) {
     const { file_path, description = "" } = args;
-    // Resolve placement from the Candidate document-write coordinate shape:
-    // `parent` URI or `vault` plus optional `collection`.
+    // Resolve placement: either `parent` URI (vault root or coll URI)
+    // or legacy `vault` + `collection`. Mirrors the backend's
+    // `_resolve_parent` helper for akb_put / akb_create_table so the
+    // three write tools accept the same shape.
     const { vault, collection } = _resolveParent(args);
     if (!file_path) throw new Error("file_path required");
     if (!vault) throw new Error(
@@ -1198,7 +1249,7 @@ export class AKBProxy {
 
     // The backend intentionally receives the complete bounded byte string: it
     // decodes the image, verifies MIME/dimensions/frame limits, and writes a
-    // hidden vault attachment. Unlike akb_file_write action=put_file, no presigned S3 URL is
+    // hidden vault attachment. Unlike akb_put_file, no presigned S3 URL is
     // exposed and no unverified object can become a Markdown image.
     const response = await this._http(
       "POST",

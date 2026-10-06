@@ -148,49 +148,6 @@ def test_raw_args_are_not_stored(enabled):
     assert "PATIENT RECORD" not in flat and "salary" not in flat
 
 
-def test_candidate_action_usage_keeps_logical_operation_and_parent_vault(enabled):
-    tool_usage.record(
-        "akb_document_write",
-        {
-            "action": "put",
-            "parent": "akb://candidate-v/coll/specs",
-            "title": "A title",
-            "content": "A body",
-        },
-        _User(),
-        {"uri": "akb://candidate-v/coll/specs/a.md"},
-        is_write=True,
-        logical_operation="akb_put",
-    )
-    row = tool_usage.drain(1)[0]
-    assert row.tool == "akb_put"
-    assert row.vault == "candidate-v"
-    assert row.is_write is True
-
-
-def test_candidate_grep_usage_keeps_action_and_only_single_vault_attribution(enabled):
-    tool_usage.record(
-        "akb_document_write",
-        {"action": "grep_replace", "vault": ["v1"], "pattern": "x", "replace": ""},
-        _User(),
-        {"replaced_docs": 1},
-        is_write=True,
-        logical_operation="akb_grep_replace",
-    )
-    tool_usage.record(
-        "akb_document_write",
-        {"action": "grep_replace", "vault": ["v1", "v2"], "pattern": "x", "replace": ""},
-        _User(),
-        {"replaced_docs": 2},
-        is_write=True,
-        logical_operation="akb_grep_replace",
-    )
-    single, many = tool_usage.drain(2)
-    assert single.tool == many.tool == "akb_grep_replace"
-    assert single.vault == "v1"
-    assert many.vault is None
-
-
 @pytest.mark.parametrize("args,expected", [
     ({"vault": "v"}, "v"),
     ({"uri": "akb://eng/coll/specs/doc/api.md"}, "eng"),
@@ -1038,8 +995,8 @@ def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_pa
 
     out = asyncio.run(
         srv.call_tool(
-            "akb_document_write",
-            {"action": "put", "vault": "v", "title": "t", "content": "c"},
+            "akb_put",
+            {"vault": "v", "title": "t", "content": "c"},
         )
     )
 

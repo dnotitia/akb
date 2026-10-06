@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import SettingsPage from "../settings";
+import SettingsDialog from "../settings/settings-dialog";
 import * as api from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({
@@ -35,7 +35,7 @@ function wrap() {
   return (
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/settings?tab=admin"]}>
-        <SettingsPage />
+        <SettingsDialog initialTab="admin" onClose={vi.fn()} />
       </MemoryRouter>
     </QueryClientProvider>
   );

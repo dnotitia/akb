@@ -703,6 +703,15 @@ async def test_exact_scan_timeout_restores_connection_and_stricter_server_budget
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
+            # Warm the extension and prepared statements before applying the
+            # tiny server budget. Over a forwarded connection, preparing an
+            # earlier statement can itself exceed 20ms before the probe runs.
+            await store._search_sparse(
+                conn, terms=[_UNKNOWN_TERM], weights=[1.0],
+                filter_uuids=None, filter_col="vault_id", limit=65_536,
+            )
+            await conn.fetchval("SHOW statement_timeout")
+            await conn.fetchval("SELECT 1")
             original = type(conn).fetch
             observed_timeouts = []
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { FileText } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -9,11 +9,13 @@ import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
 import { InlineLoadingState } from "@/components/ui/loading-state";
 
-export function NotificationsSection() {
+export function NotificationsSection({ onBusyChange }: { onBusyChange?: (busy: boolean) => void }) {
   const user = useCurrentUser();
   const client = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => { onBusyChange?.(busy !== null); }, [busy, onBusyChange]);
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
   const query = useQuery({ queryKey: ["notification-subscriptions", user?.user_id, "list"], queryFn: ({ signal }) => notificationSubscriptions(signal), enabled: !!user, retry: false });
   async function unwatch(uri: string) {
     setBusy(uri); setError(null);

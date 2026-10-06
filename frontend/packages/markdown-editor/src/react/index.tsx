@@ -43,16 +43,12 @@ import type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 export type { MarkdownLinkSearchLabels } from './markdown-link-search.js'
 import { MarkdownImageMenuControls } from './markdown-image-menu.js'
 import type { MarkdownImageMenuOptions } from './markdown-image-menu.js'
-export type { MarkdownImageMenuClassNames, MarkdownImageMenuLabels, MarkdownImageMenuOptions } from './markdown-image-menu.js'
-import { MarkdownTableControls, DEFAULT_MARKDOWN_TABLE_LABELS } from './markdown-table.js'
-import type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
-export type { MarkdownTableLabels, MarkdownTableOptions } from './markdown-table.js'
+export type { MarkdownImageMenuClassNames, MarkdownImageMenuOptions } from './markdown-image-menu.js'
+import { MarkdownTableControls } from './markdown-table.js'
+import type { MarkdownTableOptions } from './markdown-table.js'
+export type { MarkdownTableOptions } from './markdown-table.js'
 import {
   createMarkdownSlashCommandExtension,
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
-} from './markdown-slash-command.js'
-export {
-  DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
 } from './markdown-slash-command.js'
 export type {
   MarkdownSlashCommandOptions,
@@ -60,16 +56,12 @@ export type {
 import {
   createLiveMarkdownReferenceExtension,
 } from './markdown-reference-menu.js'
-export {
-  DEFAULT_MARKDOWN_REFERENCE_LABELS,
-  normalizeMarkdownReferenceCandidates,
-} from './markdown-reference-menu.js'
+export { normalizeMarkdownReferenceCandidates } from './markdown-reference-menu.js'
 export type {
   MarkdownReferenceAdapter,
   MarkdownReferenceCandidate,
   MarkdownReferenceContext,
   MarkdownReferenceKind,
-  MarkdownReferenceLabels,
   MarkdownReferenceOptions,
 } from './markdown-reference-menu.js'
 export type {
@@ -87,12 +79,10 @@ export type {
   MarkdownImageUploadClassNames,
   MarkdownImageUploadController,
   MarkdownImageUploadFailure,
-  MarkdownImageUploadLabels,
   MarkdownImageUploadOptions,
   MarkdownImageUploadState,
 } from './markdown-image-upload.js'
 export {
-  DEFAULT_MARKDOWN_IMAGE_UPLOAD_LABELS,
   MarkdownImageUploadProvider,
   MarkdownImageUploadStatus,
   MarkdownImageUploadInput,
@@ -106,7 +96,6 @@ import {
 } from './editor-handle.js'
 import type {
   MarkdownAdapters,
-  MarkdownCodeOptions,
   MarkdownCommands,
   MarkdownEditorConfig,
   MarkdownContentAttributes,
@@ -114,7 +103,6 @@ import type {
   MarkdownHeadingLevel,
   MarkdownHeadingOptions,
   MarkdownImageOptions,
-  MarkdownLinkLabels,
   MarkdownLinkUrlNormalizer,
   MarkdownProfile,
   MarkdownReferenceAdapter,
@@ -132,20 +120,31 @@ import type {
 import type { MarkdownImageUploadOptions } from './markdown-image-upload.js'
 export type {
   MarkdownEditorHandle,
-  MarkdownCodeLabels,
-  MarkdownCodeOptions,
   MarkdownContentAttributes,
   MarkdownImageClassNames,
-  MarkdownImageLabels,
   MarkdownImageOptions,
   MarkdownHeadingOptions,
   MarkdownTableLayoutOptions,
 } from '../types.js'
+import {
+  getMarkdownMessages,
+  useMarkdownLocaleSource,
+  useMarkdownMessages,
+} from './markdown-locale.js'
+export { MarkdownLocaleProvider } from './markdown-locale.js'
+export type { MarkdownLocale } from './markdown-locale.js'
 
 const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map()
 const EMPTY_REFERENCE_RESOLUTIONS: ReadonlyMap<string, MarkdownReferenceResolution> = new Map()
-const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {
-  messages: DEFAULT_MARKDOWN_SLASH_COMMAND_MESSAGES,
+const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {}
+const MARKDOWN_REFERENCE_LABEL_STYLE_ID = 'akb-markdown-reference-label-style'
+
+function ensureMarkdownReferenceLabelStyle(document: Document): void {
+  if (document.getElementById(MARKDOWN_REFERENCE_LABEL_STYLE_ID)) return
+  const style = document.createElement('style')
+  style.id = MARKDOWN_REFERENCE_LABEL_STYLE_ID
+  style.textContent = '[data-markdown-reference-title]::after { content: attr(data-markdown-reference-title); }'
+  document.head?.append(style)
 }
 
 function releaseMarkdownResolutions(
@@ -203,7 +202,6 @@ export interface UseMarkdownEditorOptions {
   initialMarkdown?: string
   profile?: MarkdownProfile
   editable?: boolean
-  code?: MarkdownCodeOptions
   image?: Pick<MarkdownImageOptions, 'referrerPolicy'>
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
@@ -214,12 +212,12 @@ export function useMarkdownEditor({
   initialMarkdown = '',
   profile = 'preserve',
   editable = true,
-  code,
   image,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
 }: UseMarkdownEditorOptions = {}): MarkdownEditorHandle | null {
+  const localeSource = useMarkdownLocaleSource()
   const [referenceSource] = useState(() => new MarkdownReferenceOptionSource(reference))
   useEffect(() => {
     referenceSource.set(reference)
@@ -229,16 +227,21 @@ export function useMarkdownEditor({
       createLiveMarkdownReferenceExtension(() => {
         const current = referenceSource.get()
         return current || undefined
-      }, listener => referenceSource.subscribe(listener)),
-    [referenceSource],
+      }, listener => referenceSource.subscribe(listener), localeSource),
+    [localeSource, referenceSource],
   )
   const extensions = useMemo(
     () => [
-      ...createMarkdownExtensions({ profile, code, image }),
-      ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash)]),
+      ...createMarkdownExtensions({
+        profile,
+        image,
+        taskCheckboxLabel: text =>
+          getMarkdownMessages(localeSource?.getLocale() ?? 'en').taskCheckbox(text),
+      }),
+      ...(slash === false ? [] : [createMarkdownSlashCommandExtension(slash, localeSource)]),
       referenceExtension,
     ],
-    [code, image, profile, referenceExtension, slash],
+    [image, localeSource, profile, referenceExtension, slash],
   )
 
   const editor = useEditor({
@@ -247,6 +250,7 @@ export function useMarkdownEditor({
     contentType: 'markdown',
     editable,
     immediatelyRender: false,
+    shouldRerenderOnTransaction: false,
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
@@ -300,9 +304,17 @@ export function useMarkdownCommands(handle: MarkdownEditorHandle | null): Markdo
   )
 }
 
+const stateMarkdown = new WeakMap<Editor['state']['doc'], string>()
+
 function readState(editor: Editor): MarkdownState {
+  const doc = editor.state.doc
+  let markdown = stateMarkdown.get(doc)
+  if (markdown === undefined) {
+    markdown = editor.getMarkdown()
+    stateMarkdown.set(doc, markdown)
+  }
   return {
-    markdown: editor.getMarkdown(),
+    markdown,
     isEmpty: editor.isEmpty,
     isEditable: editor.isEditable,
     table: markdownTableState(editor),
@@ -347,11 +359,9 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
     const update = () => setState(readState(editor))
     update()
     editor.on('transaction', update)
-    editor.on('selectionUpdate', update)
 
     return () => {
       editor.off('transaction', update)
-      editor.off('selectionUpdate', update)
     }
   }, [editor])
 
@@ -368,7 +378,8 @@ export function useMarkdownTargetResolutions(
   context: MarkdownTargetResolverContext = {},
 ): ReadonlyMap<string, MarkdownTargetResolution> {
   const { commit, document, vault } = context
-  const targets = useMemo(() => extractMarkdownTargets(markdown), [markdown])
+  const targetKey = useMemo(() => JSON.stringify(extractMarkdownTargets(markdown)), [markdown])
+  const targets = useMemo<ReturnType<typeof extractMarkdownTargets>>(() => JSON.parse(targetKey), [targetKey])
   const resolutionKey = useMemo(
     () => [vault ?? '', document ?? '', commit ?? '', ...targets.map(target => target.target)].join('\u0000'),
     [commit, document, targets, vault],
@@ -456,7 +467,8 @@ export function useMarkdownReferenceResolutions(
   context: MarkdownReferenceContext = {},
 ): ReadonlyMap<string, MarkdownReferenceResolution> {
   const { commit, document, vault } = context
-  const references = useMemo(() => extractMarkdownReferences(markdown), [markdown])
+  const referenceKey = useMemo(() => JSON.stringify(extractMarkdownReferences(markdown)), [markdown])
+  const references = useMemo<ReturnType<typeof extractMarkdownReferences>>(() => JSON.parse(referenceKey), [referenceKey])
   const resolutionKey = useMemo(
     () => [
       vault ?? '',
@@ -517,11 +529,6 @@ export interface MarkdownSurfaceProps extends Omit<ComponentPropsWithoutRef<'div
   children?: ReactNode
 }
 
-const DEFAULT_MARKDOWN_IMAGE_LABELS = {
-  loading: (alt: string) => (alt ? `Loading image: ${alt}` : 'Loading image'),
-  unavailable: (alt: string) => (alt ? `Image unavailable: ${alt}` : 'Image unavailable'),
-}
-
 const DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES = {
   frame: 'my-2 block max-w-full align-top',
   image: 'block h-auto max-w-full',
@@ -542,9 +549,22 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
 function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
   return Array.from(
     root.querySelectorAll<HTMLElement>(
-      'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+      'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
     ),
   )
+}
+
+function markdownTaskText(task: HTMLElement): string {
+  const content = task.querySelector<HTMLElement>(':scope > div')
+  if (!content) return ''
+
+  const copy = content.cloneNode(true) as HTMLElement
+  copy.querySelectorAll('li[data-checked]').forEach(nestedTask => nestedTask.remove())
+  return copy.textContent?.trim() ?? ''
+}
+
+function setAttributeIfChanged(element: Element, name: string, value: string): void {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value)
 }
 
 export function MarkdownSurface({
@@ -563,6 +583,11 @@ export function MarkdownSurface({
   ...props
 }: MarkdownSurfaceProps) {
   const editor = getMarkdownEditor(editorHandle)
+  const messages = useMarkdownMessages()
+  const messagesRef = useRef(messages)
+  useLayoutEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
   }, [editor])
@@ -709,7 +734,7 @@ export function MarkdownSurface({
         wrapper.classList.add(...managed.addedClasses)
         wrapper.tabIndex = 0
         wrapper.setAttribute('role', 'region')
-        wrapper.setAttribute('aria-label', tableLayout.ariaLabel ?? 'Scrollable table')
+        wrapper.setAttribute('aria-label', messagesRef.current.table.scrollable)
       }
     }
 
@@ -741,6 +766,86 @@ export function MarkdownSurface({
 
   useLayoutEffect(() => {
     const root = editor?.view.dom
+    if (!root || !editor) return
+
+    const applyLocaleNames = () => {
+      root.querySelectorAll<HTMLElement>('pre[data-markdown-code]').forEach(code => {
+        const language = code.dataset.markdownCodeLanguage || undefined
+        setAttributeIfChanged(code, 'aria-label', messages.codeRegion(language))
+      })
+      root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(task => {
+        const checkbox = task.querySelector<HTMLInputElement>('input[type="checkbox"]')
+        if (!checkbox) return
+        const text = markdownTaskText(task)
+        const label = messages.taskCheckbox(text)
+        setAttributeIfChanged(checkbox, 'aria-label', label)
+      })
+      root.querySelectorAll<HTMLTableElement>('table').forEach(table => {
+        setAttributeIfChanged(
+          table,
+          'aria-label',
+          editable ? messages.table.editableTable : messages.table.readOnlyTable,
+        )
+      })
+      root.querySelectorAll<HTMLElement>('div[data-markdown-table-wrapper="true"]').forEach(wrapper => {
+        setAttributeIfChanged(wrapper, 'role', 'region')
+        setAttributeIfChanged(wrapper, 'aria-label', messages.table.scrollable)
+      })
+      root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]').forEach(frame => {
+        const state = frame.dataset.markdownImageState
+        if (state === 'available') return
+        const image = frame.querySelector<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]')
+        if (!image) return
+        const alt = image.getAttribute('alt') ?? ''
+        const label = state === 'loading'
+          ? messages.image.loading(alt)
+          : messages.image.unavailable(alt)
+        setAttributeIfChanged(frame, 'aria-label', label)
+        const message = frame.querySelector<HTMLElement>('[data-markdown-image-message]')
+        if (message && message.textContent !== label) message.textContent = label
+      })
+      root.querySelectorAll<HTMLElement>('[data-markdown-resolution="unavailable"]').forEach(element => {
+        const target = element.dataset.markdownTarget
+        const resolution = target ? resolutions.get(target) : undefined
+        if (resolution?.status === 'unavailable' && resolution.label) return
+        if (element instanceof HTMLAnchorElement) {
+          setAttributeIfChanged(element, 'title', messages.reference.unavailable)
+          element.removeAttribute('aria-label')
+        } else if (element instanceof HTMLImageElement) {
+          setAttributeIfChanged(element, 'aria-label', messages.reference.unavailable)
+        }
+      })
+      root.querySelectorAll<HTMLElement>('[data-markdown-reference="true"]').forEach(element => {
+        const status = element.dataset.markdownReferenceResolution
+        if (status === 'pending') {
+          setAttributeIfChanged(element, 'title', messages.reference.resolving)
+          return
+        }
+        if (status !== 'unavailable') return
+        const kind = element.dataset.markdownReferenceKind
+        const id = element.dataset.markdownReferenceId
+        const resolution = kind && id
+          ? referenceResolutions.get(`${kind}:${id}`)
+          : undefined
+        setAttributeIfChanged(
+          element,
+          'title',
+          resolution?.status === 'unavailable' && resolution.title
+            ? resolution.title
+            : messages.reference.unavailable,
+        )
+      })
+    }
+
+    applyLocaleNames()
+    editor.on('transaction', applyLocaleNames)
+    return () => {
+      editor.off('transaction', applyLocaleNames)
+    }
+  }, [editable, editor, messages, referenceResolutions, resolutions])
+
+  useLayoutEffect(() => {
+    const root = editor?.view.dom
     if (!root) return
 
     root.querySelectorAll<HTMLImageElement>('img[data-markdown-image], img[data-markdown-target]').forEach(
@@ -755,7 +860,6 @@ export function MarkdownSurface({
     const root = editor?.view.dom
     if (!root) return
 
-    const labels = { ...DEFAULT_MARKDOWN_IMAGE_LABELS, ...image?.labels }
     const classNames = { ...DEFAULT_MARKDOWN_IMAGE_CLASS_NAMES, ...image?.classNames }
     const imageOverrides = new Map<HTMLImageElement, MarkdownTargetResolution>()
     const imageControllers = new Map<HTMLImageElement, AbortController>()
@@ -825,7 +929,9 @@ export function MarkdownSurface({
       element.removeAttribute('src')
       element.hidden = true
       element.setAttribute('aria-hidden', 'true')
-      const label = state === 'loading' ? labels.loading(alt) : labels.unavailable(alt)
+      const label = state === 'loading'
+        ? messagesRef.current.image.loading(alt)
+        : messagesRef.current.image.unavailable(alt)
       frame.setAttribute('role', state === 'loading' ? 'status' : 'img')
       frame.setAttribute('aria-label', label)
       if (state === 'loading') frame.setAttribute('aria-live', 'polite')
@@ -887,7 +993,7 @@ export function MarkdownSurface({
 
     const applyResolutions = () => {
       const managedTargets = new Set(
-        extractMarkdownTargets(editor.getMarkdown()).map(({ target }) => target),
+        extractMarkdownTargets(serializeEditorMarkdown(editor)).map(({ target }) => target),
       )
       const frames = [...root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]')]
       const framedImages = new Set<HTMLImageElement>()
@@ -945,10 +1051,10 @@ export function MarkdownSurface({
 
         element.dataset.markdownResolution = 'unavailable'
         if (element.tagName === 'A') {
-          element.setAttribute('title', resolution.label ?? 'Reference unavailable')
+          element.setAttribute('title', resolution.label ?? messagesRef.current.reference.unavailable)
           element.removeAttribute('aria-label')
         } else {
-          element.setAttribute('aria-label', resolution.label ?? 'Reference unavailable')
+          element.setAttribute('aria-label', resolution.label ?? messagesRef.current.reference.unavailable)
         }
         element.setAttribute('href', '#')
         element.setAttribute('aria-disabled', 'true')
@@ -979,6 +1085,14 @@ export function MarkdownSurface({
     if (!root) return
 
     const applyTaskSemantics = () => {
+      if (editable) {
+        root
+          .querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])')
+          .forEach(link => {
+            if (!link.hasAttribute('tabindex')) link.tabIndex = 0
+          })
+      }
+
       root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(taskItem => {
         const checkbox = taskItem.querySelector<HTMLInputElement>('input[type="checkbox"]')
         if (!checkbox) return
@@ -1009,7 +1123,7 @@ export function MarkdownSurface({
       editor.off('transaction', handleTransaction)
       if (delayedApply !== undefined) clearTimeout(delayedApply)
     }
-  }, [editable, editor])
+  }, [editable, editor, resolutions])
 
   useLayoutEffect(() => {
     const root = editor?.view.dom
@@ -1026,6 +1140,7 @@ export function MarkdownSurface({
     const focusEditorAfterTab = () => {
       pendingTabFocus = { kind: 'editor' }
       editor.commands.focus()
+      root.focus()
     }
 
     const handleKeyboardNavigation = (event: KeyboardEvent) => {
@@ -1044,7 +1159,7 @@ export function MarkdownSurface({
       if (!controls.length) return
 
       const controlTarget = editorTarget?.closest<HTMLElement>(
-        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+        'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
       )
       const currentIndex = controlTarget ? controls.indexOf(controlTarget) : -1
       if (currentIndex >= 0) {
@@ -1098,7 +1213,7 @@ export function MarkdownSurface({
 
       const target = event.target instanceof HTMLElement ? event.target : null
       const controlTarget = target?.closest<HTMLElement>(
-        'input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
+        'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
       )
       if (!controlTarget) return
 
@@ -1123,25 +1238,22 @@ export function MarkdownSurface({
     const root = editor?.view.dom
     if (!root) return
 
-    const removeReferenceLabel = (element: HTMLElement) => {
-      element.querySelector<HTMLElement>('[data-markdown-reference-label]')?.remove()
-    }
-
     const applyReference = (element: HTMLElement) => {
       const tokenElement = element.querySelector<HTMLElement>('[data-markdown-reference-token]')
       const value = tokenElement?.textContent ?? ''
       const reference = parseMarkdownReferenceToken(value)
-      const clearRuntime = (removeLabel = true) => {
+      const clearRuntime = () => {
         element.removeAttribute('href')
         element.removeAttribute('target')
         element.removeAttribute('rel')
         element.removeAttribute('title')
         element.removeAttribute('aria-label')
         element.removeAttribute('aria-disabled')
+        element.removeAttribute('role')
+        element.removeAttribute('tabindex')
         delete element.dataset.markdownReferenceResolution
         delete element.dataset.markdownReferenceRuntimeUrl
         delete element.dataset.markdownReferenceTitle
-        if (removeLabel) removeReferenceLabel(element)
       }
 
       if (element.dataset.markdownReferenceEscaped === 'true') {
@@ -1166,40 +1278,37 @@ export function MarkdownSurface({
         element.dataset.markdownReferenceResolution = resolvingReferences ? 'pending' : 'unresolved'
         if (resolvingReferences) {
           element.setAttribute('aria-disabled', 'true')
-          element.setAttribute('title', 'Resolving reference')
+          element.setAttribute('title', messagesRef.current.reference.resolving)
         }
         return
       }
 
-      clearRuntime(false)
+      clearRuntime()
       if (resolution.status === 'available') {
         element.dataset.markdownReferenceResolution = 'available'
-        element.dataset.markdownReferenceTitle = resolution.title
         element.setAttribute('title', `${reference.value} — ${resolution.title}`)
         element.setAttribute('aria-label', `${reference.value} ${resolution.title}`)
         if (resolution.runtimeUrl) {
-          element.setAttribute('href', resolution.runtimeUrl)
-          element.setAttribute('target', '_blank')
-          element.setAttribute('rel', 'noreferrer')
           element.dataset.markdownReferenceRuntimeUrl = resolution.runtimeUrl
+          if (editable) {
+            element.setAttribute('role', 'link')
+            element.tabIndex = 0
+          } else {
+            element.setAttribute('href', resolution.runtimeUrl)
+            element.setAttribute('target', '_blank')
+            element.setAttribute('rel', 'noreferrer')
+          }
         }
         if (resolution.title !== reference.value) {
-          const label =
-            element.querySelector<HTMLElement>('[data-markdown-reference-label]') ??
-            document.createElement('span')
-          label.dataset.markdownReferenceLabel = 'true'
-          label.setAttribute('aria-hidden', 'true')
-          label.setAttribute('contenteditable', 'false')
-          if (label.textContent !== resolution.title) label.textContent = resolution.title
-          if (!label.parentElement) element.append(label)
-        } else removeReferenceLabel(element)
+          element.dataset.markdownReferenceTitle = resolution.title
+          ensureMarkdownReferenceLabelStyle(root.ownerDocument)
+        }
         return
       }
 
-      removeReferenceLabel(element)
       element.dataset.markdownReferenceResolution = 'unavailable'
       element.setAttribute('aria-disabled', 'true')
-      element.setAttribute('title', resolution.title ?? 'Reference unavailable')
+      element.setAttribute('title', resolution.title ?? messagesRef.current.reference.unavailable)
     }
 
     const applyReferences = () => {
@@ -1243,13 +1352,6 @@ export function MarkdownSurface({
 
 export type MarkdownEditorMode = 'wysiwyg' | 'source'
 
-export interface MarkdownEditingSurfaceLabels {
-  group: string
-  wysiwyg: string
-  source: string
-  sourceField: string
-}
-
 function normalizeEditorBody(editor: Editor): void {
   const document = editor.getJSON()
   if (document.content?.some(node => node.type === 'image')) {
@@ -1265,13 +1367,6 @@ function normalizeEditorBody(editor: Editor): void {
   }
 }
 
-const DEFAULT_EDITING_SURFACE_LABELS: MarkdownEditingSurfaceLabels = {
-  group: 'Editor mode',
-  wysiwyg: 'WYSIWYG',
-  source: 'Source',
-  sourceField: 'Markdown source',
-}
-
 export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: MarkdownEditorHandle | null
   markdown: string
@@ -1282,6 +1377,13 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   autoFocus?: boolean
   modeSwitchDisabled?: boolean
   toolbar?: ReactNode
+  /** Optional product header. The surface still owns the draft and mode lifecycle. */
+  renderHeader?: (controls: {
+    mode: MarkdownEditorMode
+    onModeChange: (mode: MarkdownEditorMode) => void
+    disabled: boolean
+    toolbar: ReactNode
+  }) => ReactNode
   table?: MarkdownTableOptions
   imageMenu?: MarkdownImageMenuOptions
   imageUpload?: MarkdownImageUploadOptions
@@ -1291,10 +1393,15 @@ export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutR
   sourceAriaLabelledby?: string
   sourceRequired?: boolean
   sourceClassName?: string
-  modeLabels?: Partial<MarkdownEditingSurfaceLabels>
   onWysiwygDragOverCapture?: DragEventHandler<HTMLDivElement>
   onWysiwygDropCapture?: DragEventHandler<HTMLDivElement>
   children?: ReactNode
+}
+
+function MarkdownEditingHeader({ renderHeader, ...controls }: Parameters<NonNullable<MarkdownEditingSurfaceProps['renderHeader']>>[0] & {
+  renderHeader: NonNullable<MarkdownEditingSurfaceProps['renderHeader']>
+}) {
+  return renderHeader(controls)
 }
 
 /**
@@ -1312,16 +1419,16 @@ export function MarkdownEditingSurface({
   autoFocus = false,
   modeSwitchDisabled = false,
   toolbar,
+  renderHeader,
   table,
   imageMenu,
   imageUpload,
-  sourcePlaceholder = 'Write Markdown source…',
+  sourcePlaceholder,
   sourceLabel,
   sourceAriaLabel,
   sourceAriaLabelledby,
   sourceRequired = false,
   sourceClassName,
-  modeLabels,
   onWysiwygDragOverCapture,
   onWysiwygDropCapture,
   children,
@@ -1329,8 +1436,8 @@ export function MarkdownEditingSurface({
   ...props
 }: MarkdownEditingSurfaceProps) {
   const editor = getMarkdownEditor(editorHandle)
+  const copy = useMarkdownMessages().editing
   const imageUploadController = useMarkdownImageUpload(editorHandle, imageUpload, readOnly)
-  const labels = { ...DEFAULT_EDITING_SURFACE_LABELS, ...modeLabels }
   const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
   const [source, setSource] = useState(markdown)
   const sourceRef = useRef(markdown)
@@ -1341,7 +1448,8 @@ export function MarkdownEditingSurface({
   const sourceInputId = useId()
   const sourceInputLabelId = `${sourceInputId}-label`
   const surfaceRef = useRef<HTMLDivElement>(null)
-  const resolvedSourceLabel = sourceLabel ?? labels.sourceField
+  const resolvedSourceLabel = sourceLabel ?? copy.sourceField
+  const resolvedSourcePlaceholder = sourcePlaceholder ?? copy.sourcePlaceholder
   const effectiveImageMenu = imageUploadController && imageMenu
     ? {
         ...imageMenu,
@@ -1367,7 +1475,7 @@ export function MarkdownEditingSurface({
       onDropCapture={handleWysiwygDropCapture}
       onPasteCapture={event => imageUploadController?.handlePaste(event)}
     >
-      {mode === 'wysiwyg' ? toolbar : null}
+      {mode === 'wysiwyg' && !renderHeader ? toolbar : null}
       {imageUploadController ? (
         <MarkdownImageUploadStatus options={imageUpload} />
       ) : null}
@@ -1427,7 +1535,7 @@ export function MarkdownEditingSurface({
   }, [editor, mode])
 
   const selectMode = (nextMode: MarkdownEditorMode) => {
-    if (!editor || nextMode === mode) return
+    if (!editor || effectiveModeSwitchDisabled || nextMode === mode) return
 
     if (nextMode === 'source') {
       const editorMarkdown = serializeEditorMarkdown(editor, { profile })
@@ -1470,6 +1578,34 @@ export function MarkdownEditingSurface({
     </button>
   )
 
+  const header = renderHeader ? (
+    <div
+      className="sticky top-0 z-10"
+      onDragOverCapture={mode === 'wysiwyg' ? handleWysiwygDragOverCapture : undefined}
+      onDropCapture={mode === 'wysiwyg' ? handleWysiwygDropCapture : undefined}
+    >
+      <MarkdownEditingHeader
+        renderHeader={renderHeader}
+        mode={mode}
+        onModeChange={selectMode}
+        disabled={!editor || effectiveModeSwitchDisabled}
+        toolbar={mode === 'wysiwyg' ? toolbar : null}
+      />
+    </div>
+  ) : (
+      <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
+        <div
+          role="group"
+          aria-label={copy.modeGroup}
+          className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-0.5"
+          data-markdown-mode-toggle
+        >
+          {modeButton('wysiwyg', copy.wysiwyg)}
+          {modeButton('source', copy.source)}
+        </div>
+      </div>
+  )
+
   return (
     <div
       {...props}
@@ -1477,23 +1613,12 @@ export function MarkdownEditingSurface({
       className={joinClasses('relative min-w-0', className)}
       data-markdown-mode={mode}
     >
-      <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
-        <div
-          role="group"
-          aria-label={labels.group}
-          className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-0.5"
-          data-markdown-mode-toggle
-        >
-          {modeButton('wysiwyg', labels.wysiwyg)}
-          {modeButton('source', labels.source)}
-        </div>
-      </div>
-
       {imageUploadController ? (
         <MarkdownImageUploadProvider controller={imageUploadController}>
+          {header}
           {wysiwygPanel}
         </MarkdownImageUploadProvider>
-      ) : wysiwygPanel}
+      ) : <>{header}{wysiwygPanel}</>}
 
       <div hidden={mode !== 'source'} data-markdown-mode-panel="source">
         <label id={sourceInputLabelId} htmlFor={sourceInputId} className="sr-only">
@@ -1511,7 +1636,7 @@ export function MarkdownEditingSurface({
           aria-required={sourceRequired || undefined}
           readOnly={readOnly}
           spellCheck={false}
-          placeholder={sourcePlaceholder}
+          placeholder={resolvedSourcePlaceholder}
           value={source}
           onChange={event => {
             const next = event.currentTarget.value
@@ -1541,7 +1666,6 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
   markdown: string
   profile?: MarkdownProfile
   readOnly?: boolean
-  code?: MarkdownCodeOptions
   onChange?: MarkdownEditorConfig['onChange']
   slash?: MarkdownSlashCommandOptions | false
   reference?: MarkdownReferenceOptions | false
@@ -1555,7 +1679,6 @@ export function MarkdownEditor({
   markdown,
   profile = 'preserve',
   readOnly = false,
-  code,
   onChange,
   slash = DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS,
   reference,
@@ -1574,7 +1697,6 @@ export function MarkdownEditor({
     initialMarkdown: markdown,
     profile,
     editable: !readOnly,
-    code,
     image,
     onChange,
     slash,
@@ -1625,7 +1747,6 @@ export function MarkdownEditor({
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
   profile?: MarkdownProfile
-  code?: MarkdownCodeOptions
   adapters?: MarkdownAdapters
   reference?: MarkdownReferenceOptions | false
   resolverContext?: MarkdownTargetResolverContext
@@ -1634,7 +1755,6 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
 export function MarkdownViewer({
   markdown,
   profile = 'preserve',
-  code,
   adapters,
   reference,
   resolverContext,
@@ -1645,7 +1765,6 @@ export function MarkdownViewer({
     initialMarkdown: markdown,
     profile,
     editable: false,
-    code,
     image,
     slash: false,
   })
@@ -1694,23 +1813,6 @@ function joinClasses(...classes: Array<string | undefined>): string {
   return classes.filter(Boolean).join(' ')
 }
 
-const DEFAULT_MARKDOWN_LINK_LABELS: MarkdownLinkLabels = {
-  insertButton: 'Insert link',
-  editButton: 'Edit link',
-  saveButton: 'Save link',
-  insertTitle: 'Insert link',
-  editTitle: 'Edit link',
-  description: 'Add a safe destination and choose the text readers will see.',
-  url: 'URL',
-  text: 'Text',
-  textPlaceholder: 'Link text',
-  textHint: 'Leave blank to use the destination as the visible text.',
-  cancel: 'Cancel',
-  remove: 'Remove link',
-  close: 'Close dialog',
-  invalidUrl: 'Enter an http(s), email, phone, anchor, or relative URL.',
-}
-
 const linkInputClass =
   'flex h-10 w-full rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-foreground-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface aria-[invalid=true]:border-destructive aria-[invalid=true]:focus-visible:ring-destructive'
 
@@ -1736,7 +1838,6 @@ export interface MarkdownLinkPopupProps {
   searchContext?: Omit<MarkdownSearchContext, 'signal'>
   searchLabels?: Partial<MarkdownLinkSearchLabels>
   searchClassName?: string
-  labels?: Partial<MarkdownLinkLabels>
   className?: string
 }
 
@@ -1755,11 +1856,10 @@ export function MarkdownLinkPopup({
   searchContext,
   searchLabels,
   searchClassName,
-  labels,
   className,
 }: MarkdownLinkPopupProps) {
   const editor = getMarkdownEditor(editorHandle)
-  const copy = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...labels }
+  const copy = useMarkdownMessages().link
   const commands = useMarkdownCommands(editorHandle)
   const urlInputRef = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -1769,7 +1869,7 @@ export function MarkdownLinkPopup({
   const [snapshot, setSnapshot] = useState<MarkdownLinkSelectionSnapshot | null>(null)
   const [linkUrl, setLinkUrl] = useState('')
   const [linkText, setLinkText] = useState('')
-  const [linkError, setLinkError] = useState('')
+  const [linkError, setLinkError] = useState(false)
   const linkUrlId = useId()
   const linkTextId = useId()
 
@@ -1799,7 +1899,7 @@ export function MarkdownLinkPopup({
       closeReasonRef.current = 'cancel'
       setLinkUrl(snapshot.href)
       setLinkText(snapshot.text)
-      setLinkError('')
+      setLinkError(false)
       requestAnimationFrame(focusPopupInput)
     }
 
@@ -1828,7 +1928,7 @@ export function MarkdownLinkPopup({
 
     const normalizedUrl = normalizeUrl(linkUrl)
     if (!normalizedUrl) {
-      setLinkError(copy.invalidUrl)
+      setLinkError(true)
       requestAnimationFrame(() => urlInputRef.current?.focus())
       return
     }
@@ -1916,7 +2016,7 @@ export function MarkdownLinkPopup({
                 value={linkUrl}
                 onChange={event => {
                   setLinkUrl(event.target.value)
-                  if (linkError) setLinkError('')
+                  if (linkError) setLinkError(false)
                 }}
                 placeholder="https://example.com"
                 inputMode="url"
@@ -1928,7 +2028,7 @@ export function MarkdownLinkPopup({
               />
               {linkError && (
                 <p id={`${linkUrlId}-error`} role="alert" className="text-xs text-destructive">
-                  {linkError}
+                  {copy.invalidUrl}
                 </p>
               )}
             </div>
@@ -2055,7 +2155,6 @@ export interface MarkdownToolbarProps {
   className?: string
   'aria-label'?: string
   link?: MarkdownToolbarLinkOptions
-  table?: MarkdownTableOptions
 }
 
 export interface MarkdownToolbarLinkOptions {
@@ -2065,7 +2164,6 @@ export interface MarkdownToolbarLinkOptions {
   searchContext?: Omit<MarkdownSearchContext, 'signal'>
   searchLabels?: Partial<MarkdownLinkSearchLabels>
   searchClassName?: string
-  labels?: Partial<MarkdownLinkLabels>
   popupClassName?: string
 }
 
@@ -2078,10 +2176,11 @@ export function MarkdownToolbar({
   editor: editorHandle,
   children,
   className,
-  'aria-label': ariaLabel = 'Text formatting',
+  'aria-label': ariaLabel,
   link,
-  table,
 }: MarkdownToolbarProps) {
+  const messages = useMarkdownMessages()
+  const labels = messages.toolbar
   const state = useMarkdownState(editorHandle)
   const commands = useMarkdownCommands(editorHandle)
   const toolbarRef = useRef<HTMLDivElement>(null)
@@ -2089,8 +2188,6 @@ export function MarkdownToolbar({
   const imageUpload = useMarkdownImageUploadContext()
   const editable = Boolean(editorHandle && state?.isEditable)
   const active = state?.active
-  const linkLabels = { ...DEFAULT_MARKDOWN_LINK_LABELS, ...link?.labels }
-  const tableLabels: MarkdownTableLabels = { ...DEFAULT_MARKDOWN_TABLE_LABELS, ...table?.labels }
   const linkDisabled = !editable || link?.disabled === true
 
   useLayoutEffect(() => {
@@ -2151,7 +2248,7 @@ export function MarkdownToolbar({
       ref={toolbarRef}
       contentEditable={false}
       role="toolbar"
-      aria-label={ariaLabel}
+      aria-label={ariaLabel ?? labels.ariaLabel}
       aria-orientation="horizontal"
       onFocusCapture={event => {
         const target = event.target
@@ -2168,9 +2265,9 @@ export function MarkdownToolbar({
         className ?? 'rounded-t-[var(--radius-sm)] bg-surface px-2 py-1.5',
       )}
     >
-      <MarkdownToolbarGroup label="Block type">
+      <MarkdownToolbarGroup label={labels.blockType}>
         <MarkdownToolbarButton
-          label="Paragraph"
+          label={labels.paragraph}
           active={Boolean(active?.paragraph)}
           disabled={!editable}
           onClick={() => commands.setParagraph()}
@@ -2178,7 +2275,7 @@ export function MarkdownToolbar({
           <Pilcrow className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Heading 1"
+          label={labels.heading1}
           active={Boolean(active?.heading1)}
           disabled={!editable}
           onClick={() => toggleHeading(1, Boolean(active?.heading1))}
@@ -2186,7 +2283,7 @@ export function MarkdownToolbar({
           <Heading1 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Heading 2"
+          label={labels.heading2}
           active={Boolean(active?.heading2)}
           disabled={!editable}
           onClick={() => toggleHeading(2, Boolean(active?.heading2))}
@@ -2194,7 +2291,7 @@ export function MarkdownToolbar({
           <Heading2 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Heading 3"
+          label={labels.heading3}
           active={Boolean(active?.heading3)}
           disabled={!editable}
           onClick={() => toggleHeading(3, Boolean(active?.heading3))}
@@ -2202,9 +2299,9 @@ export function MarkdownToolbar({
           <Heading3 className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
-      <MarkdownToolbarGroup label="Marks">
+      <MarkdownToolbarGroup label={labels.marks}>
         <MarkdownToolbarButton
-          label="Bold"
+          label={labels.bold}
           active={Boolean(active?.bold)}
           disabled={!editable}
           onClick={() => commands.toggleBold()}
@@ -2212,7 +2309,7 @@ export function MarkdownToolbar({
           <Bold className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Italic"
+          label={labels.italic}
           active={Boolean(active?.italic)}
           disabled={!editable}
           onClick={() => commands.toggleItalic()}
@@ -2220,7 +2317,7 @@ export function MarkdownToolbar({
           <Italic className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Strikethrough"
+          label={labels.strikethrough}
           active={Boolean(active?.strike)}
           disabled={!editable}
           onClick={() => commands.toggleStrike()}
@@ -2228,7 +2325,7 @@ export function MarkdownToolbar({
           <Strikethrough className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Inline code"
+          label={labels.inlineCode}
           active={Boolean(active?.code)}
           disabled={!editable}
           onClick={() => commands.toggleCode()}
@@ -2236,9 +2333,9 @@ export function MarkdownToolbar({
           <Code className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
-      <MarkdownToolbarGroup label="Lists">
+      <MarkdownToolbarGroup label={labels.lists}>
         <MarkdownToolbarButton
-          label="Bulleted list"
+          label={labels.bulletList}
           active={Boolean(active?.bulletList)}
           disabled={!editable}
           onClick={() => commands.toggleBulletList()}
@@ -2246,7 +2343,7 @@ export function MarkdownToolbar({
           <List className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Numbered list"
+          label={labels.numberedList}
           active={Boolean(active?.orderedList)}
           disabled={!editable}
           onClick={() => commands.toggleOrderedList()}
@@ -2254,7 +2351,7 @@ export function MarkdownToolbar({
           <ListOrdered className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Task list"
+          label={labels.taskList}
           active={Boolean(active?.taskList)}
           disabled={!editable}
           onClick={() => commands.toggleTaskList()}
@@ -2262,9 +2359,9 @@ export function MarkdownToolbar({
           <CheckSquare className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
-      <MarkdownToolbarGroup label="Blocks">
+      <MarkdownToolbarGroup label={labels.blocks}>
         <MarkdownToolbarButton
-          label="Blockquote"
+          label={labels.blockquote}
           active={Boolean(active?.blockquote)}
           disabled={!editable}
           onClick={() => commands.toggleBlockquote()}
@@ -2272,7 +2369,7 @@ export function MarkdownToolbar({
           <Quote className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Code block"
+          label={labels.codeBlock}
           active={Boolean(active?.codeBlock)}
           disabled={!editable}
           onClick={() => commands.toggleCodeBlock()}
@@ -2280,23 +2377,23 @@ export function MarkdownToolbar({
           <Code2 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Horizontal rule"
+          label={labels.horizontalRule}
           disabled={!editable}
           onClick={() => commands.setHorizontalRule()}
         >
           <Minus className="h-4 w-4" />
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
-      <MarkdownToolbarGroup label="Insert">
+      <MarkdownToolbarGroup label={labels.insert}>
         <MarkdownToolbarButton
-          label={tableLabels.insertTable}
+          label={messages.table.insertTable}
           disabled={!editable || !state?.table.canInsert}
           onClick={() => commands.insertTable()}
         >
           <Table className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label={active?.link ? linkLabels.editButton : linkLabels.insertButton}
+          label={active?.link ? labels.editLink : labels.insertLink}
           active={Boolean(active?.link)}
           disabled={linkDisabled}
           onClick={() => setLinkOpen(true)}
@@ -2305,9 +2402,9 @@ export function MarkdownToolbar({
         </MarkdownToolbarButton>
       </MarkdownToolbarGroup>
       {imageUpload && (
-        <MarkdownToolbarGroup label={imageUpload.labels.group}>
+        <MarkdownToolbarGroup label={messages.imageUpload.group}>
           <MarkdownToolbarButton
-            label={imageUpload.state.uploading ? imageUpload.labels.uploading : imageUpload.labels.insert}
+            label={imageUpload.state.uploading ? messages.imageUpload.uploading : messages.imageUpload.insert}
             disabled={!editable || imageUpload.state.uploading}
             onClick={imageUpload.openPicker}
           >
@@ -2319,16 +2416,16 @@ export function MarkdownToolbar({
           </MarkdownToolbarButton>
         </MarkdownToolbarGroup>
       )}
-      <MarkdownToolbarGroup label="History">
+      <MarkdownToolbarGroup label={labels.history}>
         <MarkdownToolbarButton
-          label="Undo"
+          label={labels.undo}
           disabled={!editable || !state?.canUndo}
           onClick={() => commands.undo()}
         >
           <Undo2 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
-          label="Redo"
+          label={labels.redo}
           disabled={!editable || !state?.canRedo}
           onClick={() => commands.redo()}
         >
@@ -2345,7 +2442,6 @@ export function MarkdownToolbar({
         searchContext={link?.searchContext}
         searchLabels={link?.searchLabels}
         searchClassName={link?.searchClassName}
-        labels={link?.labels}
         className={link?.popupClassName}
       />
     </div>

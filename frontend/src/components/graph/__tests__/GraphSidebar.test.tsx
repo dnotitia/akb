@@ -1,11 +1,16 @@
 // frontend/src/components/graph/__tests__/GraphSidebar.test.tsx
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
+import { render as renderBase, screen, fireEvent, cleanup, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { GraphSidebar } from "../GraphSidebar";
 import { DEFAULT_VIEW, type GraphView } from "../graph-types";
 import { searchDocs } from "@/lib/api";
+import { CurrentUserProvider } from "@/contexts/current-user-context";
+
+function render(ui: ReactNode) {
+  return renderBase(ui, { wrapper: ({ children }) => <CurrentUserProvider user={{ user_id: "sidebar-test", username: "reader", email: "reader@example.com", is_admin: false, display_name: null, auth_method: "local", key_class: null }}>{children}</CurrentUserProvider> });
+}
 
 // ---------- API mock (hoisted by Vitest) ----------
 vi.mock("@/lib/api", () => ({
@@ -137,7 +142,7 @@ describe("GraphSidebar · saved + recent", () => {
 
   it("renders recent entries from localStorage", () => {
     localStorage.setItem(
-      "akb-graph-recent:akb",
+      "akb-graph-recent:v2:sidebar-test:akb",
       JSON.stringify([{ doc_id: "d-9", title: "Niner" }]),
     );
     setup();
@@ -181,7 +186,7 @@ describe("GraphSidebar · entry search", () => {
     expect(onChange).toHaveBeenCalled();
     const lastArg = onChange.mock.calls.at(-1)?.[0];
     expect(lastArg?.entry).toBe("specs/roadmap.md");
-    const stored = localStorage.getItem("akb-graph-recent:akb");
+    const stored = localStorage.getItem("akb-graph-recent:v2:sidebar-test:akb");
     expect(stored).toContain("specs/roadmap.md");
     vi.useRealTimers();
   });
@@ -213,7 +218,7 @@ describe("GraphSidebar · entry search", () => {
     expect(mockedSearchDocs).toHaveBeenCalledWith("road", "akb", 8);
     const lastArg = onChange.mock.calls.at(-1)?.[0];
     expect(lastArg?.entry).toBe("specs/roadmap.md");
-    const stored = localStorage.getItem("akb-graph-recent:akb");
+    const stored = localStorage.getItem("akb-graph-recent:v2:sidebar-test:akb");
     expect(stored).toContain("specs/roadmap.md");
   });
 

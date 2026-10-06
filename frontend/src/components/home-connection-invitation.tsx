@@ -74,8 +74,19 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
 
   useLayoutEffect(() => {
     let frame = 0;
+    const footer = document.getElementById("app-footer");
+    const main = document.getElementById("main");
     const check = () => {
       const region = regionRef.current;
+      // Follow the footer edge only when it enters the viewport. Apply before
+      // focus collision checks so they use the floating control's new position.
+      if (region) {
+        const clearance = footer ? Math.max(0, window.innerHeight - footer.getBoundingClientRect().top) : 0;
+        const offset = `${clearance}px`;
+        if (region.style.getPropertyValue("--home-footer-clearance") !== offset) {
+          region.style.setProperty("--home-footer-clearance", offset);
+        }
+      }
       const active = document.activeElement;
       const viewport = window.visualViewport;
       setViewportConstrained(Boolean(viewport && (viewport.scale > 1 || viewport.height < window.innerHeight * 0.7)));
@@ -109,6 +120,8 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
     window.visualViewport?.addEventListener("scroll", schedule);
     const observer = new ResizeObserver(schedule);
     if (regionRef.current) observer.observe(regionRef.current);
+    if (footer) observer.observe(footer);
+    if (main) observer.observe(main);
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener("focusin", check);
@@ -140,7 +153,7 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
       data-testid="home-connection-invitation" data-expanded={expanded}
       // Visibility is an accessibility boundary, not an animation. Even a 1ms
       // reduced-motion transition can swallow focus restoration on dialog close.
-      className="fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] right-[calc(1rem+env(safe-area-inset-right))] z-[var(--z-sticky)] max-w-[calc(100vw-2rem)] transition-none sm:bottom-[calc(1.5rem+env(safe-area-inset-bottom))] sm:right-[calc(1.5rem+env(safe-area-inset-right))]"
+      className="fixed bottom-[calc(1rem+env(safe-area-inset-bottom)+var(--home-footer-clearance,0px))] right-[calc(1rem+env(safe-area-inset-right))] z-[var(--z-sticky)] max-w-[calc(100vw-2rem)] transition-none sm:bottom-[calc(1.5rem+env(safe-area-inset-bottom)+var(--home-footer-clearance,0px))] sm:right-[calc(1.5rem+env(safe-area-inset-right))]"
       style={{ visibility: suspended ? "hidden" : undefined }}>
       {expanded ? <div className="w-76 max-w-full rounded-[var(--radius-md)] border border-border-strong bg-surface p-4 text-foreground shadow-md">
         <div className="flex items-start gap-2">

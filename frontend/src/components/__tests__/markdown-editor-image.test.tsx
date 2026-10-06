@@ -127,6 +127,24 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.uploadAsset).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the combined toolbar connected to uploads and locks mode changes until complete", async () => {
+    let finishUpload!: (asset: { id: string; url: string; name: string; mime_type: string; size_bytes: number }) => void;
+    apiMocks.uploadAsset.mockImplementation(() => new Promise((resolve) => { finishUpload = resolve; }));
+    const user = userEvent.setup();
+    const { container } = render(<MarkdownEditor value="Draft" vault="team" onChange={vi.fn()} />);
+    const picker = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const openPicker = vi.spyOn(picker, "click");
+    await user.click(screen.getByRole("button", { name: "Insert image" }));
+    expect(openPicker).toHaveBeenCalledOnce();
+    fireEvent.change(picker, { target: { files: [new File(["image"], "diagram.png", { type: "image/png" })] } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Editor mode: Visual" })).toBeDisabled());
+    finishUpload({ id: ASSET_ID, url: `/api/assets/${ASSET_ID}`, name: "diagram.png", mime_type: "image/png", size_bytes: 5 });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Editor mode: Visual" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Editor mode: Visual" }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
+    expect((screen.getByRole("textbox", { name: "Markdown source" }) as HTMLTextAreaElement).value).toContain(`/api/assets/${ASSET_ID}`);
+  });
+
   it("uploads a picked image and serializes its private asset URL", async () => {
     apiMocks.uploadAsset.mockResolvedValue({
       id: ASSET_ID,

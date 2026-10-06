@@ -1,34 +1,21 @@
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
-  ArrowDownLeft,
-  ArrowUpRight,
-  ChevronDown,
-  ChevronRight,
-  Crosshair,
-  ExternalLink,
-  File,
-  FileText,
-  Network,
-  Pin,
-  Table2,
-  X,
+  ArrowDownLeft, ArrowUpRight, ChevronRight, Copy, Crosshair, ExternalLink,
+  Eye, EyeOff, FileText, MoreHorizontal, Network, Paperclip, Pin, PinOff, Table2, X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Alert } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { CopyButton } from "@/components/ui/copy-button";
+import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
-import { drillDown, getDocument, getProvenance, getRelations } from "@/lib/api";
+import { TonalIcon } from "@/components/ui/tonal-icon";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { getDocument, getRelations, type RelationRow } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import {
-  ALL_NODE_KINDS,
-  ALL_RELATIONS,
-  RELATION_LABEL,
-  kindToSegment,
-  type NodeKind,
-  type RelatedRef,
-  type RelationKind,
+  ALL_NODE_KINDS, ALL_RELATIONS, RELATION_LABEL, kindToSegment,
+  type NodeKind, type RelatedRef, type RelationKind,
 } from "./graph-types";
 
 interface Props {
@@ -43,390 +30,230 @@ interface Props {
   onTogglePin?: () => void;
   pinned?: boolean;
   onFocus?: () => void;
-}
-
-interface ResourceResponse {
-  doc_id: string;
-  title?: string;
-  summary?: string;
-  tags?: string[];
-  content?: string;
-  type?: string;
-  columns?: string[];
-  mime_type?: string;
-  size_bytes?: number;
-  author?: string;
-  created_at?: string;
-  updated_at?: string;
-}
-
-interface GroupedRelation {
-  relation: RelationKind;
-  rows: Array<{ uri: string; name: string; kind: NodeKind }>;
+  onOpen?: () => void;
+  onPreview?: () => void;
+  onExpand?: () => void;
+  expanding?: boolean;
+  expansionError?: string;
+  onHide?: () => void;
 }
 
 const RELATION_SET = new Set<string>(ALL_RELATIONS);
 const KIND_SET = new Set<string>(ALL_NODE_KINDS);
-const PREVIEW_LINES = 24;
+const RELATION_PAGE_SIZE = 25;
+const controlClass = "h-11 w-11 shrink-0 @min-[48rem]/graph:h-9 @min-[48rem]/graph:w-9";
+const actionClass = "min-h-11 h-auto whitespace-normal py-2 text-xs @min-[48rem]/graph:min-h-9";
+const menuItemClass = "flex min-h-11 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover data-[highlighted]:text-link";
 
 function iconForKind(kind: NodeKind) {
-  if (kind === "table") return Table2;
-  if (kind === "file") return File;
-  return FileText;
+  return kind === "table" ? Table2 : kind === "file" ? Paperclip : FileText;
 }
 
 export function GraphDetailPanel({
-  vault,
-  docId,
-  name,
-  kind,
-  uri,
-  onSelectRelated,
-  onFitToNode,
-  onClose,
-  onTogglePin,
-  pinned,
-  onFocus,
+  vault, docId, name, kind, uri, onSelectRelated, onFitToNode, onClose,
+  onTogglePin, pinned, onFocus, onOpen, onPreview, onExpand, expanding = false,
+  expansionError, onHide,
 }: Props) {
-  const [metadataOpen, setMetadataOpen] = useState(false);
-  const [outlineOpen, setOutlineOpen] = useState(false);
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
+  const canQuery = !!user?.user_id && !checking;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<"copied" | "failed" | null>(null);
+  const panelRef = useRef<HTMLElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const titleId = useId();
   const Icon = iconForKind(kind);
   const parsedUri = parseUri(uri);
-  const location = parsedUri?.collection
-    ? `${parsedUri.collection} · ${parsedUri.vault}`
-    : parsedUri?.vault || vault;
+  const collection = parsedUri?.collection;
 
   useEffect(() => {
-    titleRef.current?.focus();
-  }, [docId]);
-
-  useEffect(() => {
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body && !panelRef.current?.contains(active)) {
+      triggerRef.current = active;
     }
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
+    titleRef.current?.focus({ preventScroll: true });
+  }, [uri]);
 
-  const resourceQuery = useQuery<ResourceResponse>({
-    queryKey: ["graph-resource", vault, docId],
-    queryFn: () => getDocument(vault, docId) as Promise<ResourceResponse>,
-    enabled: kind === "document",
+  // Optional description enrichment must never gate navigation or relationships.
+  const resourceQuery = useQuery({
+    queryKey: ["graph-resource", user?.user_id, revision, vault, docId],
+    queryFn: () => getDocument(vault, docId),
+    enabled: canQuery && kind === "document",
+    retry: false,
   });
   const relationsQuery = useQuery({
-    queryKey: ["relations", vault, uri],
+    queryKey: ["relations", user?.user_id, revision, vault, uri],
     queryFn: () => getRelations(vault, uri),
+    enabled: canQuery,
+    retry: false,
   });
-  const provenanceQuery = useQuery({
-    queryKey: ["provenance", vault, docId],
-    queryFn: () => getProvenance(vault, docId),
-    enabled: metadataOpen && kind === "document",
-  });
-  const outlineQuery = useQuery({
-    queryKey: ["drill", vault, docId],
-    queryFn: () => drillDown(vault, docId),
-    enabled: outlineOpen && kind === "document",
-  });
+  const relations = useMemo(() => normalizeRelations(relationsQuery.data?.relations ?? []), [relationsQuery.data]);
+  const title = (kind === "document" && resourceQuery.data?.title) || name;
+  const summary = kind === "document" ? resourceQuery.data?.summary : undefined;
+  const relationCount = relations.outgoing.length + relations.incoming.length;
 
-  const resource = resourceQuery.data;
-  const relations = groupRelations(relationsQuery.data?.relations || []);
-  const relationCount =
-    relations.outgoing.reduce((count, group) => count + group.rows.length, 0) +
-    relations.incoming.reduce((count, group) => count + group.rows.length, 0);
-  const preview = (resource?.content || "").split("\n").slice(0, PREVIEW_LINES).join("\n");
-  const outlineSections = (outlineQuery.data?.sections || []) as Array<{
-    heading?: string;
-    title?: string;
-  }>;
+  function closeInspector() {
+    if (triggerRef.current?.isConnected) triggerRef.current.focus({ preventScroll: true });
+    onClose();
+  }
 
   function openResource() {
-    window.location.assign(`/vault/${vault}/${kindToSegment(kind)}/${encodeURIComponent(docId)}`);
+    if (onOpen) return onOpen();
+    window.location.assign(`/vault/${encodeURIComponent(vault)}/${kindToSegment(kind)}/${encodeURIComponent(docId)}`);
+  }
+
+  async function copyUri() {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(uri);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
+    }
   }
 
   return (
     <aside
-      aria-label={`Inspector for ${resource?.title || name}`}
-      className="absolute inset-y-3 right-3 z-[var(--z-overlay)] flex w-[min(23rem,calc(100%-1.5rem))] flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border-strong bg-surface shadow-lg max-sm:inset-x-2 max-sm:w-auto"
+      ref={panelRef}
+      aria-label={`Inspector for ${title}`}
+      onKeyDown={(event) => {
+        // Radix portals bubble through React; only this inspector's own DOM
+        // handles Escape. A preview or menu owns its own dismissal.
+        if (!event.currentTarget.contains(event.target as Node)) return;
+        event.stopPropagation();
+        if (event.key === "Escape" && !event.defaultPrevented && !menuOpen) {
+          event.preventDefault();
+          closeInspector();
+        }
+      }}
+      className="absolute inset-x-2 bottom-14 z-[var(--z-overlay)] flex max-h-[min(68%,32rem,calc(100%-var(--graph-tools-bottom,0px)-4rem))] flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border-strong bg-surface shadow-md @min-[48rem]/graph:inset-x-auto @min-[48rem]/graph:bottom-auto @min-[48rem]/graph:right-3 @min-[48rem]/graph:top-[var(--graph-tools-bottom,0.75rem)] @min-[48rem]/graph:max-h-[calc(100%-var(--graph-tools-bottom,0px)-3rem)] @min-[48rem]/graph:w-[22rem]"
     >
-      <header className="shrink-0 border-b border-border bg-surface-2 px-3 py-3">
-        <div className="flex items-start gap-3">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface text-primary">
-            <Icon className="h-4 w-4" aria-hidden />
-          </span>
-          <div className="min-w-0 flex-1">
-            <p className="text-xs font-medium capitalize text-foreground-muted">{kind}</p>
-            <h2
-              ref={titleRef}
-              tabIndex={-1}
-              className="mt-0.5 truncate font-display text-lg font-semibold tracking-tight text-foreground focus:outline-none"
-              title={resource?.title || name}
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
+        <TonalIcon tone={kind === "table" ? "data" : kind === "file" ? "file" : "knowledge"} size="sm"><Icon aria-hidden /></TonalIcon>
+        <div className="min-w-0 flex-1 text-xs text-foreground-muted">
+          <span className="capitalize">{kind}</span>
+          {collection && <><span className="mx-1.5" aria-hidden>·</span><span className="break-words">{collection}</span></>}
+        </div>
+        <DropdownMenu.Root modal={false} open={menuOpen} onOpenChange={(open) => { setMenuOpen(open); if (open) setCopyStatus(null); }}>
+          <DropdownMenu.Trigger asChild>
+            <Button type="button" variant="ghost" size="icon" aria-label="Resource actions" className={controlClass}><MoreHorizontal className="h-4 w-4" aria-hidden /></Button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="end" sideOffset={4}
+              onEscapeKeyDown={(event) => event.stopPropagation()}
+              className="z-[var(--z-popover)] max-w-[min(20rem,calc(100vw-2rem))] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
             >
-              {resource?.title || name}
-            </h2>
+              {onTogglePin && <DropdownMenu.Item className={menuItemClass} onSelect={onTogglePin}>
+                {pinned ? <PinOff className="h-4 w-4" aria-hidden /> : <Pin className="h-4 w-4" aria-hidden />}
+                {pinned ? "Unpin position" : "Pin position"}
+              </DropdownMenu.Item>}
+              <DropdownMenu.Item className={menuItemClass} onSelect={() => onFitToNode(uri)}><Crosshair className="h-4 w-4" aria-hidden />Center on resource</DropdownMenu.Item>
+              {onHide && <DropdownMenu.Item className={menuItemClass} onSelect={onHide}><EyeOff className="h-4 w-4" aria-hidden />Hide from this view</DropdownMenu.Item>}
+              <DropdownMenu.Separator className="my-1 h-px bg-border" />
+              <DropdownMenu.Item className={menuItemClass} onSelect={(event) => { event.preventDefault(); void copyUri(); }}><Copy className="h-4 w-4" aria-hidden />Copy URI</DropdownMenu.Item>
+              {copyStatus && <p role="status" className="px-3 py-2 text-xs text-foreground-muted">{copyStatus === "copied" ? "URI copied" : "Couldn't copy. Select the URI below."}</p>}
+              {copyStatus === "failed" && <code className="block select-all break-all px-3 pb-2 text-xs text-foreground">{uri}</code>}
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+        <Button type="button" variant="ghost" size="icon" onClick={closeInspector} aria-label="Close inspector" className={controlClass}><X className="h-4 w-4" aria-hidden /></Button>
+      </div>
+
+      <div className="min-h-0 overflow-y-auto overscroll-contain rail-scroll">
+        <header className="p-4 pb-3">
+          <h2 ref={titleRef} id={titleId} tabIndex={-1} className="break-words font-display text-lg font-semibold leading-snug tracking-tight text-foreground focus:outline-none">{title}</h2>
+          {summary && <p className="mt-2 line-clamp-3 break-words text-sm leading-relaxed text-foreground-muted">{summary}</p>}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {kind === "document" && onPreview && <Button id="graph-preview-trigger" type="button" size="sm" onClick={onPreview} className={`flex-1 ${actionClass}`}><Eye className="h-3.5 w-3.5 shrink-0" aria-hidden />Preview</Button>}
+            <Button type="button" size="sm" variant={kind === "document" && onPreview ? "outline" : "default"} onClick={openResource} className={`flex-1 ${actionClass}`}><ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />Open in vault</Button>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close inspector"
-            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <X className="h-4 w-4" aria-hidden />
-          </button>
-        </div>
-        <p className="mt-2 truncate text-xs text-foreground-muted" title={location}>{location}</p>
-      </header>
+          {(onFocus || onExpand) && <div className="mt-2 flex flex-col gap-1">
+            {onFocus && <Button type="button" variant="ghost" size="sm" onClick={onFocus} className={`justify-start text-link ${actionClass}`}><Network className="h-3.5 w-3.5 shrink-0" aria-hidden />Explore connections</Button>}
+            {onExpand && <Button type="button" variant="ghost" size="sm" onClick={onExpand} loading={expanding} className={`justify-start text-link ${actionClass}`}>
+              {expanding ? "Loading connections…" : expansionError ? "Retry loading connections" : "Load connections"}
+            </Button>}
+          </div>}
+          {expansionError && <Alert variant="destructive" className="mt-2 text-xs">{expansionError}</Alert>}
+        </header>
 
-      {kind === "document" && resourceQuery.isLoading ? (
-        <div className="flex flex-col gap-3 p-4" role="status" aria-label="Loading resource details">
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-32 w-full" />
-        </div>
-      ) : kind === "document" && resourceQuery.isError ? (
-        <div className="p-3">
-          <Alert variant="destructive">
-            <div>
-              <p className="font-medium">Couldn't load this resource.</p>
-              <p className="mt-1 text-xs">
-                {resourceQuery.error instanceof Error
-                  ? resourceQuery.error.message
-                  : String(resourceQuery.error)}
-              </p>
-              <Button type="button" size="sm" variant="outline" className="mt-2" onClick={() => resourceQuery.refetch()}>
-                Retry
-              </Button>
-            </div>
-          </Alert>
-        </div>
-      ) : (
-        <>
-          <div className="shrink-0 border-b border-border p-3">
-            <div className="grid grid-cols-2 gap-2">
-              <Button type="button" size="sm" onClick={openResource}>
-                <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-                Open resource
-              </Button>
-              {onFocus ? (
-                <Button type="button" size="sm" variant="outline" onClick={onFocus}>
-                  <Crosshair className="h-3.5 w-3.5" aria-hidden />
-                  Focus here
-                </Button>
-              ) : (
-                <Button type="button" size="sm" variant="outline" onClick={() => onFitToNode(uri)}>
-                  <Crosshair className="h-3.5 w-3.5" aria-hidden />
-                  Center
-                </Button>
-              )}
-            </div>
-            <div className="mt-2 flex gap-2">
-              <CopyButton value={uri} label="Copy URI" />
-              {onTogglePin && (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={onTogglePin}
-                  aria-pressed={!!pinned}
-                  className={pinned ? "border-primary bg-surface-selected text-surface-selected-foreground" : undefined}
-                >
-                  <Pin className="h-3.5 w-3.5" aria-hidden />
-                  {pinned ? "Pinned" : "Pin node"}
-                </Button>
-              )}
-            </div>
+        <section aria-label="Connections" className="border-t border-border px-4 py-3">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-foreground">Connections</h3>
+            {relationsQuery.isSuccess && <span className="text-xs tabular-nums text-foreground-muted">{relationCount}</span>}
           </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto rail-scroll">
-            <InspectorSection
-              title="Relationships"
-              description={`${relationCount} direct connection${relationCount === 1 ? "" : "s"}`}
-              icon={<Network className="h-4 w-4" aria-hidden />}
-            >
-              {relationsQuery.isLoading ? (
-                <div className="space-y-2" role="status" aria-label="Loading relationships">
-                  <Skeleton className="h-9 w-full" />
-                  <Skeleton className="h-9 w-full" />
-                </div>
-              ) : relationCount === 0 ? (
-                <div className="rounded-[var(--radius-md)] border border-dashed border-border bg-background px-3 py-4 text-center">
-                  <p className="text-sm font-medium text-foreground">No direct relationships</p>
-                  <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                    This resource can still be opened, but there is nothing else to traverse from here yet.
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {relations.outgoing.map((group) => (
-                    <RelationGroup key={`out:${group.relation}`} group={group} direction="outgoing" onSelect={onSelectRelated} onFit={onFitToNode} />
-                  ))}
-                  {relations.incoming.map((group) => (
-                    <RelationGroup key={`in:${group.relation}`} group={group} direction="incoming" onSelect={onSelectRelated} onFit={onFitToNode} />
-                  ))}
-                </div>
-              )}
-            </InspectorSection>
-
-            {(resource?.summary || resource?.tags?.length) && (
-              <InspectorSection title="About">
-                {resource.summary && <p className="text-sm leading-relaxed text-foreground">{resource.summary}</p>}
-                {!!resource.tags?.length && (
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    {resource.tags.map((tag) => <Badge key={tag} variant="outline">{tag}</Badge>)}
-                  </div>
-                )}
-              </InspectorSection>
-            )}
-
-            {kind === "table" && !!resource?.columns?.length && (
-              <InspectorSection title="Columns" description={`${resource.columns.length} fields`}>
-                <div className="flex flex-wrap gap-1.5">
-                  {resource.columns.map((column) => <Badge key={column} variant="secondary">{column}</Badge>)}
-                </div>
-              </InspectorSection>
-            )}
-
-            {kind === "file" && (
-              <InspectorSection title="File details">
-                <dl className="grid grid-cols-[5rem_1fr] gap-x-3 gap-y-2 text-xs">
-                  <dt className="text-foreground-muted">Type</dt>
-                  <dd className="truncate text-foreground">{resource?.mime_type || "Not provided"}</dd>
-                  <dt className="text-foreground-muted">Size</dt>
-                  <dd className="tabular-nums text-foreground">
-                    {resource?.size_bytes != null ? `${resource.size_bytes.toLocaleString()} bytes` : "Not provided"}
-                  </dd>
-                </dl>
-              </InspectorSection>
-            )}
-
-            {kind === "document" && (
-              <InspectorSection title="Document preview">
-                <button
-                  type="button"
-                  onClick={() => setOutlineOpen((open) => !open)}
-                  aria-expanded={outlineOpen}
-                  className="mb-2 inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  {outlineOpen ? <ChevronDown className="h-3.5 w-3.5" aria-hidden /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden />}
-                  {outlineOpen ? "Hide outline" : "Show outline"}
-                </button>
-                {outlineOpen && (
-                  <ul className="mb-3 space-y-1 border-l border-border pl-3 text-xs text-foreground-muted">
-                    {outlineSections.map((section, index) => (
-                      <li key={`${section.heading || section.title || "section"}:${index}`} className="truncate">
-                        {section.heading || section.title || `Section ${index + 1}`}
-                      </li>
-                    ))}
-                    {!outlineQuery.isLoading && !outlineSections.length && <li>No headings found.</li>}
-                  </ul>
-                )}
-                <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-[var(--radius-md)] border border-border bg-background p-3 font-mono text-xs leading-relaxed text-foreground rail-scroll">
-                  {preview || "This document has no previewable text."}
-                </pre>
-              </InspectorSection>
-            )}
-
-            <section className="border-t border-border p-3">
-              <button
-                type="button"
-                onClick={() => setMetadataOpen((open) => !open)}
-                aria-expanded={metadataOpen}
-                aria-label="Toggle metadata"
-                className="flex min-h-9 w-full items-center justify-between gap-3 rounded-[var(--radius-sm)] px-2 text-left text-sm font-medium text-foreground transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Metadata
-                {metadataOpen ? <ChevronDown className="h-4 w-4 text-foreground-muted" aria-hidden /> : <ChevronRight className="h-4 w-4 text-foreground-muted" aria-hidden />}
-              </button>
-              {metadataOpen && (
-                <dl className="mt-2 grid grid-cols-[5rem_1fr] gap-x-3 gap-y-2 px-2 text-xs">
-                  <dt className="text-foreground-muted">Author</dt>
-                  <dd className="text-foreground">{resource?.author || "Not provided"}</dd>
-                  <dt className="text-foreground-muted">Created</dt>
-                  <dd className="text-foreground">{resource?.created_at || "Not provided"}</dd>
-                  <dt className="text-foreground-muted">Updated</dt>
-                  <dd className="text-foreground">{resource?.updated_at || "Not provided"}</dd>
-                  <dt className="text-foreground-muted">Provenance</dt>
-                  <dd className="break-all text-foreground">
-                    {kind !== "document"
-                      ? "Available for documents"
-                      : provenanceQuery.isLoading
-                      ? "Loading…"
-                      : provenanceQuery.data?.provenance
-                        ? JSON.stringify(provenanceQuery.data.provenance)
-                        : "Not provided"}
-                  </dd>
-                </dl>
-              )}
-            </section>
-          </div>
-        </>
-      )}
+          {relationsQuery.isLoading ? (
+            <LoadingState label="Loading connections" className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="mt-2 h-10 w-full" /></LoadingState>
+          ) : relationsQuery.isError ? (
+            <Alert variant="destructive"><div>
+              <p className="font-medium">Couldn't load connections.</p>
+              <p className="mt-1 break-words text-xs">{relationsQuery.error instanceof Error ? relationsQuery.error.message : "Please try again."}</p>
+              <Button type="button" size="sm" variant="outline" className="mt-2" onClick={() => relationsQuery.refetch()}>Retry connections</Button>
+            </div></Alert>
+          ) : relationCount === 0 ? (
+            <p className="py-2 text-sm text-foreground-muted">No direct connections</p>
+          ) : (
+            <div className="space-y-4" key={uri}>
+              {!!relations.outgoing.length && <RelationList rows={relations.outgoing} direction="outgoing" onSelect={onSelectRelated} onFit={onFitToNode} />}
+              {!!relations.incoming.length && <RelationList rows={relations.incoming} direction="incoming" onSelect={onSelectRelated} onFit={onFitToNode} />}
+            </div>
+          )}
+        </section>
+      </div>
     </aside>
   );
 }
 
-function InspectorSection({ title, description, icon, children }: { title: string; description?: string; icon?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="border-b border-border p-3">
-      <div className="mb-3 flex items-start gap-2">
-        {icon && <span className="mt-0.5 text-primary">{icon}</span>}
-        <div>
-          <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-          {description && <p className="mt-0.5 text-xs text-foreground-muted">{description}</p>}
-        </div>
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function groupRelations(rows: Array<{ direction: "outgoing" | "incoming"; relation: string; uri: string; name?: string; resource_type?: string }>): { incoming: GroupedRelation[]; outgoing: GroupedRelation[] } {
-  const incoming = new Map<RelationKind, GroupedRelation>();
-  const outgoing = new Map<RelationKind, GroupedRelation>();
-
+function normalizeRelations(rows: RelationRow[]): { incoming: RelatedRef[]; outgoing: RelatedRef[] } {
+  const groups: { incoming: RelatedRef[]; outgoing: RelatedRef[] } = { incoming: [], outgoing: [] };
   for (const row of rows) {
     if (!RELATION_SET.has(row.relation)) continue;
-    const relation = row.relation as RelationKind;
-    const target = row.direction === "outgoing" ? outgoing : incoming;
-    if (!target.has(relation)) target.set(relation, { relation, rows: [] });
-    target.get(relation)!.rows.push({
-      uri: row.uri,
-      name: row.name || "Untitled resource",
-      kind: KIND_SET.has(row.resource_type || "") ? (row.resource_type as NodeKind) : "document",
+    const parsedKind = parseUri(row.uri)?.kind;
+    const inferredKind = parsedKind === "file" || parsedKind === "table" ? parsedKind : "document";
+    groups[row.direction].push({
+      uri: row.uri, name: row.name || "Untitled resource",
+      kind: KIND_SET.has(row.resource_type || "") ? row.resource_type as NodeKind : inferredKind,
+      relation: row.relation as RelationKind, direction: row.direction,
+      source: row.kind,
     });
   }
-
-  return { incoming: [...incoming.values()], outgoing: [...outgoing.values()] };
+  return groups;
 }
 
-function RelationGroup({ group, direction, onSelect, onFit }: { group: GroupedRelation; direction: "incoming" | "outgoing"; onSelect: (relation: RelatedRef) => void; onFit: (uri: string) => void }) {
+function RelationList({ rows, direction, onSelect, onFit }: {
+  rows: RelatedRef[];
+  direction: "incoming" | "outgoing";
+  onSelect: (relation: RelatedRef) => void;
+  onFit: (uri: string) => void;
+}) {
+  const [visibleCount, setVisibleCount] = useState(RELATION_PAGE_SIZE);
+  const headingId = useId();
   const DirectionIcon = direction === "outgoing" ? ArrowUpRight : ArrowDownLeft;
+  const label = direction === "outgoing" ? "Outgoing connections" : "Incoming connections";
   return (
-    <div>
-      <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-foreground-muted">
-        <DirectionIcon className="h-3.5 w-3.5" aria-hidden />
-        <span>{RELATION_LABEL[group.relation]}</span>
-        <span className="tabular-nums">{group.rows.length}</span>
-      </div>
-      <ul className="overflow-hidden rounded-[var(--radius-md)] border border-border divide-y divide-border">
-        {group.rows.map((row) => (
-          <li key={row.uri}>
+    <section aria-label={label}>
+      <h4 id={headingId} className="mb-1 flex items-center gap-1.5 text-xs font-medium text-foreground-muted"><DirectionIcon className="h-3.5 w-3.5" aria-hidden />{direction === "outgoing" ? "Outgoing" : "Incoming"}<span className="ml-auto tabular-nums">{rows.length}</span></h4>
+      <ul aria-labelledby={headingId} className="divide-y divide-border">
+        {rows.slice(0, visibleCount).map((row, index) => {
+          const Icon = iconForKind(row.kind);
+          return <li key={`${row.uri}:${row.relation}:${row.source}:${index}`}>
             <button
-              type="button"
-              aria-label={row.name}
+              type="button" aria-label={row.name}
               onClick={() => {
-                onSelect({ uri: row.uri, name: row.name, kind: row.kind, relation: group.relation, direction });
+                onSelect(row);
                 onFit(row.uri);
               }}
-              className="flex min-h-10 w-full items-center gap-2 px-2.5 py-2 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              className="flex min-h-11 w-full items-center gap-2 rounded-[var(--radius-sm)] px-1 py-2 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
             >
-              <span className="min-w-0 flex-1 truncate text-sm text-foreground">{row.name}</span>
-              <span className="text-xs capitalize text-foreground-muted">{row.kind}</span>
+              <Icon className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
+              <span className="min-w-0 flex-1"><span className="block line-clamp-2 break-words text-sm text-foreground">{row.name}</span><span className="mt-0.5 block text-xs text-foreground-muted"><span className="capitalize">{RELATION_LABEL[row.relation]}</span>{row.source && <span> · {row.source === "implicit" ? "Body link" : "Explicit relation"}</span>}</span></span>
               <ChevronRight className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
             </button>
-          </li>
-        ))}
+          </li>;
+        })}
       </ul>
-    </div>
+      {visibleCount < rows.length && <Button type="button" variant="ghost" size="sm" className={`mt-1 w-full text-link ${actionClass}`} onClick={() => setVisibleCount((count) => count + RELATION_PAGE_SIZE)}>Show more ({rows.length - visibleCount} remaining)</Button>}
+    </section>
   );
 }

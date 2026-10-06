@@ -20,8 +20,7 @@ const MODERN_META = {
   "io.modelcontextprotocol/clientCapabilities": {},
   "io.modelcontextprotocol/clientInfo": { name: "modern-test", version: "1" },
 };
-const FILE_TOOL_NAMES = ["akb_file_read", "akb_file_write"];
-const LEGACY_FILE_TOOL_NAMES = [
+const FILE_TOOL_NAMES = [
   "akb_put_file",
   "akb_put_image",
   "akb_discard_image",
@@ -69,72 +68,71 @@ const RICH_BACKEND_TOOLS = [
   },
 ];
 
-function candidateDocumentWriteTool() {
-  return {
-    name: "akb_document_write",
-    description: "Candidate document write capability",
-    inputSchema: {
+const CANDIDATE_GROUP_SCHEMA = {
+  type: "object",
+  oneOf: [
+    {
       type: "object",
-      oneOf: [
-        {
-          type: "object",
-          properties: {
-            action: { const: "put" },
-            parent: { type: "string" },
-            vault: { type: "string" },
-            title: { type: "string" },
-            content: { type: "string" },
-          },
-          required: ["action", "title", "content"],
-          anyOf: [{ required: ["parent"] }, { required: ["vault"] }],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          properties: {
-            action: { const: "update" },
-            uri: { type: "string" },
-            content: { type: "string" },
-            expected_commit: { type: "string" },
-          },
-          required: ["action", "uri"],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          properties: {
-            action: { const: "edit" },
-            uri: { type: "string" },
-            old_string: { type: "string" },
-            new_string: { type: "string" },
-          },
-          required: ["action", "uri", "old_string", "new_string"],
-          additionalProperties: false,
-        },
-      ],
+      properties: {
+        action: { type: "string", const: "search" },
+        query: { type: "string" },
+      },
+      required: ["action", "query"],
+      additionalProperties: false,
     },
-  };
-}
-
-function testCandidateDocumentFileParameter() {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
-  const [tool] = proxy._decorateTools({ tools: [candidateDocumentWriteTool()] }).tools;
-  const branches = Object.fromEntries(
-    tool.inputSchema.oneOf.map((branch) => [branch.properties.action.const, branch]),
-  );
-  const put = branches.put;
-  const update = branches.update;
-  const edit = branches.edit;
-
-  assert.ok(put.properties.file);
-  assert.ok(update.properties.file);
-  assert.equal(edit.properties.file, undefined);
-  assert.equal(put.required.includes("content"), false);
-  assert.equal(put.required.includes("title"), true);
-  assert.ok(put.allOf.some((rule) => JSON.stringify(rule).includes("content") && JSON.stringify(rule).includes("file")));
-  assert.ok(update.allOf.some((rule) => JSON.stringify(rule).includes("content") && JSON.stringify(rule).includes("file")));
-  assert.deepEqual(tool.inputSchema.oneOf[0].anyOf, [{ required: ["parent"] }, { required: ["vault"] }]);
-}
+    {
+      type: "object",
+      properties: {
+        action: { type: "string", const: "grep" },
+        pattern: { type: "string" },
+      },
+      required: ["action", "pattern"],
+      additionalProperties: false,
+    },
+  ],
+};
+const CANDIDATE_BACKEND_NAMES = [
+  "akb_discover",
+  "akb_create_vault",
+  "akb_put",
+  "akb_document_read",
+  "akb_update",
+  "akb_edit",
+  "akb_move",
+  "akb_delete",
+  "akb_grep_replace",
+  "akb_relationships",
+  "akb_link",
+  "akb_unlink",
+  "akb_create_table",
+  "akb_sql",
+  "akb_drop_table",
+  "akb_alter_table",
+  "akb_publish",
+  "akb_unpublish",
+  "akb_publications",
+  "akb_publication_snapshot",
+  "akb_vault_access",
+  "akb_grant",
+  "akb_revoke",
+  "akb_identity",
+  "akb_transfer_ownership",
+  "akb_archive_vault",
+  "akb_delete_vault",
+  "akb_create_collection",
+  "akb_delete_collection",
+  "akb_set_public",
+  "akb_help",
+  "akb_export",
+  "akb_import",
+];
+const CANDIDATE_BACKEND_TOOLS = CANDIDATE_BACKEND_NAMES.map((name) => ({
+  name,
+  description: name === "akb_discover" ? "Discover content" : name,
+  inputSchema: name === "akb_discover"
+    ? CANDIDATE_GROUP_SCHEMA
+    : { type: "object", properties: {} },
+}));
 
 function waitForLine(lines, id, timeoutMs = 3000) {
   const existing = lines.find((line) => line?.id === id);
@@ -279,23 +277,7 @@ async function testModernDegradedProcessWithExternalParser() {
     assert.deepEqual(
       result.tools.map((tool) => tool.name),
       FILE_TOOL_NAMES,
-      "degraded catalog still exposes only proxy-local candidate capabilities",
-    );
-    assert.equal(result.tools[0].annotations.readOnlyHint, true);
-    assert.equal(result.tools[1].annotations.readOnlyHint, false);
-    assert.equal(result.tools[1].annotations.destructiveHint, true);
-    assert.deepEqual(
-      result.tools[0].inputSchema.oneOf.map((branch) => branch.properties.action.const),
-      ["read"],
-    );
-    assert.deepEqual(
-      result.tools[1].inputSchema.oneOf.map((branch) => branch.properties.action.const),
-      ["put_file", "update_file", "delete_file", "put_image", "discard_image"],
-    );
-    assert.equal(
-      result.tools.some((tool) => LEGACY_FILE_TOOL_NAMES.includes(tool.name)),
-      false,
-      "legacy local operation names are not exposed as aliases",
+      "degraded catalog still exposes only proxy-local file tools",
     );
   });
 }
@@ -317,11 +299,6 @@ async function testModernReachableProcessWithExternalParser() {
         result.tools.map((tool) => tool.name),
         [...RICH_BACKEND_TOOLS.map((tool) => tool.name), ...FILE_TOOL_NAMES],
         "proxy-local tools remain appended to the backend catalog",
-      );
-      assert.equal(
-        result.tools.some((tool) => LEGACY_FILE_TOOL_NAMES.includes(tool.name)),
-        false,
-        "legacy local operation names are not exposed as aliases",
       );
       assert.ok(backend.requests.some((request) => request.body.method === "tools/list"));
       for (const request of backend.requests) {
@@ -351,8 +328,7 @@ async function testModernProcess() {
     assert.equal(responses[1].result.resultType, "complete");
     assert.equal(responses[1].result.ttlMs, 0);
     assert.equal(responses[1].result.cacheScope, "private");
-    assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_file_write"));
-    assert.equal(responses[1].result.tools.some((tool) => tool.name === "akb_put_file"), false);
+    assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_put_file"));
     assert.ok(responses[1].result._meta["io.modelcontextprotocol/serverInfo"]);
 
     assert.ok(backend.requests.some((request) => request.body.method === "server/discover"));
@@ -366,6 +342,29 @@ async function testModernProcess() {
         "2026-07-28",
       );
     }
+  } finally {
+    await backend.close();
+  }
+}
+
+async function testMixedCatalogProcess() {
+  const backend = await fakeBackend({ tools: CANDIDATE_BACKEND_TOOLS });
+  try {
+    const { responses } = await runProxy(backend.url, [
+      { jsonrpc: "2.0", id: 30, method: "tools/list", params: { _meta: MODERN_META } },
+    ]);
+    const tools = responses[0].result.tools;
+    assert.equal(CANDIDATE_BACKEND_TOOLS.length, 33, "candidate HTTP catalog has 33 tools");
+    assert.equal(tools.length, 39, "stdio catalog adds six proxy-local tools");
+    assert.deepEqual(
+      tools.find((tool) => tool.name === "akb_discover").inputSchema,
+      CANDIDATE_GROUP_SCHEMA,
+      "proxy preserves the composite oneOf schema unchanged",
+    );
+    assert.ok(tools.some((tool) => tool.name === "akb_grep_replace"));
+    assert.ok(tools.some((tool) => tool.name === "akb_put_file"));
+    assert.ok(!tools.some((tool) => tool.name === "akb_search"));
+    assert.ok(!tools.some((tool) => tool.name === "akb_browse"));
   } finally {
     await backend.close();
   }
@@ -455,7 +454,7 @@ async function testGenerationMixingIsFailClosed() {
     jsonrpc: "2.0",
     id: 2,
     method: "tools/call",
-    params: { name: "akb_file_write", arguments: { action: "put_file", vault: "v", file_path: "/tmp/nope" }, _meta: MODERN_META },
+    params: { name: "akb_put_file", arguments: { vault: "v", file_path: "/tmp/nope" }, _meta: MODERN_META },
   });
   assert.equal(mixed.error.code, -32600);
   assert.equal(forwarded, false);
@@ -494,7 +493,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
     jsonrpc: "2.0",
     id,
     method: "tools/call",
-    params: { name: "akb_file_write", arguments: { action: "put_file", vault: "v", file_path: "/nonexistent/akb-proxy-test.bin" } },
+    params: { name: "akb_put_file", arguments: { vault: "v", file_path: "/nonexistent/akb-proxy-test.bin" } },
   });
 
   const failing = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
@@ -515,9 +514,9 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
 }
 
 await testModernDegradedProcessWithExternalParser();
-testCandidateDocumentFileParameter();
 await testModernReachableProcessWithExternalParser();
 await testModernProcess();
+await testMixedCatalogProcess();
 await testLegacyProcess();
 await testLegacyBackendFallback();
 await testGenerationMixingIsFailClosed();

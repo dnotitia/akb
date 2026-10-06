@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urljoin
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -101,10 +102,22 @@ async def _scoped_client(
 @pytest.mark.asyncio
 async def test_table_constraints_and_permission_contract(
     mcp_client: Client,
+    mcp_transport: str,
     secondary_mcp_client: SecondaryMcpSession,
     runtime_session: RuntimeContext,
 ) -> None:
     """Exercise declarative constraints, DDL atomicity, and stable permissions."""
+
+    name_suffix = f"{mcp_transport}_{uuid4().hex[:8]}"
+    events_principal_key = f"events_principal_key_{name_suffix}"
+    events_seq_idx = f"events_seq_idx_{name_suffix}"
+    dups_email_key = f"dups_email_key_{name_suffix}"
+    nul_email_key = f"nul_email_key_{name_suffix}"
+    mc_principal_key = f"mc_principal_key_{name_suffix}"
+    rn_key = f"rn_key_{name_suffix}"
+    dpc_key = f"dpc_key_{name_suffix}"
+    atom_x_idx = f"atom_x_idx_{name_suffix}"
+    atom_x_key = f"atom_x_key_{name_suffix}"
 
     vault = await _create_vault(mcp_client, runtime_session, "constraints")
     events = await _call_json(
@@ -173,32 +186,32 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {
             "uri": events_uri,
-            "add_unique_keys": [{"name": "events_principal_key", "columns": ["principal_id"]}],
+            "add_unique_keys": [{"name": events_principal_key, "columns": ["principal_id"]}],
         },
     )
-    assert any(item.get("name") == "events_principal_key" for item in added_key["unique_keys"])
+    assert any(item.get("name") == events_principal_key for item in added_key["unique_keys"])
     dropped_key = await _call_json(
         mcp_client,
         runtime_session,
         "akb_alter_table",
-        {"uri": events_uri, "drop_unique_keys": ["events_principal_key"]},
+        {"uri": events_uri, "drop_unique_keys": [events_principal_key]},
     )
-    assert not any(item.get("name") == "events_principal_key" for item in dropped_key["unique_keys"])
+    assert not any(item.get("name") == events_principal_key for item in dropped_key["unique_keys"])
 
     added_index = await _call_json(
         mcp_client,
         runtime_session,
         "akb_alter_table",
-        {"uri": events_uri, "add_indexes": [{"name": "events_seq_idx", "columns": ["seq"]}]},
+        {"uri": events_uri, "add_indexes": [{"name": events_seq_idx, "columns": ["seq"]}]},
     )
-    assert any(item.get("name") == "events_seq_idx" for item in added_index["indexes"])
+    assert any(item.get("name") == events_seq_idx for item in added_index["indexes"])
     dropped_index = await _call_json(
         mcp_client,
         runtime_session,
         "akb_alter_table",
-        {"uri": events_uri, "drop_indexes": ["events_seq_idx"]},
+        {"uri": events_uri, "drop_indexes": [events_seq_idx]},
     )
-    assert not any(item.get("name") == "events_seq_idx" for item in dropped_index["indexes"])
+    assert not any(item.get("name") == events_seq_idx for item in dropped_index["indexes"])
 
     duplicates = await _call_json(
         mcp_client,
@@ -219,7 +232,7 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {
             "uri": duplicates["uri"],
-            "add_unique_keys": [{"name": "dups_email_key", "columns": ["email"]}],
+            "add_unique_keys": [{"name": dups_email_key, "columns": ["email"]}],
         },
         expect_error=True,
     )
@@ -313,10 +326,10 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {
             "uri": nulls["uri"],
-            "add_unique_keys": [{"name": "nul_email_key", "columns": ["email"]}],
+            "add_unique_keys": [{"name": nul_email_key, "columns": ["email"]}],
         },
     )
-    assert any(item.get("name") == "nul_email_key" for item in null_key["unique_keys"])
+    assert any(item.get("name") == nul_email_key for item in null_key["unique_keys"])
     await _call_json(
         mcp_client,
         runtime_session,
@@ -365,7 +378,7 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {
             "uri": mixed["uri"],
-            "add_unique_keys": [{"name": "mc_principal_key", "columns": ["PRINCIPAL"]}],
+            "add_unique_keys": [{"name": mc_principal_key, "columns": ["PRINCIPAL"]}],
         },
         expect_error=True,
     )
@@ -391,7 +404,7 @@ async def test_table_constraints_and_permission_contract(
             "vault": vault,
             "name": "rn",
             "columns": [{"name": "old_c", "type": "text"}],
-            "unique_keys": [{"name": "rn_key", "columns": ["old_c"]}],
+            "unique_keys": [{"name": rn_key, "columns": ["old_c"]}],
         },
     )
     await _call_json(
@@ -417,7 +430,7 @@ async def test_table_constraints_and_permission_contract(
             "vault": vault,
             "name": "dpc",
             "columns": [{"name": "keep", "type": "text"}, {"name": "gone", "type": "text"}],
-            "unique_keys": [{"name": "dpc_key", "columns": ["gone"]}],
+            "unique_keys": [{"name": dpc_key, "columns": ["gone"]}],
         },
     )
     await _call_json(
@@ -453,8 +466,8 @@ async def test_table_constraints_and_permission_contract(
         "akb_alter_table",
         {
             "uri": atomic["uri"],
-            "add_indexes": [{"name": "atom_x_idx", "columns": ["x"]}],
-            "add_unique_keys": [{"name": "atom_x_key", "columns": ["x"]}],
+            "add_indexes": [{"name": atom_x_idx, "columns": ["x"]}],
+            "add_unique_keys": [{"name": atom_x_key, "columns": ["x"]}],
         },
         expect_error=True,
     )
@@ -472,7 +485,7 @@ async def test_table_constraints_and_permission_contract(
         mcp_client,
         runtime_session,
         "akb_alter_table",
-        {"uri": nulls["uri"], "drop_unique_keys": ["nul_email_key"]},
+        {"uri": nulls["uri"], "drop_unique_keys": [nul_email_key]},
     )
     await _call_json(
         mcp_client,

@@ -18,6 +18,7 @@ import {
 import { useColumnResize } from "@/hooks/use-column-resize";
 import { cn } from "@/lib/utils";
 import { VaultSectionNavigation } from "@/components/vault-navigation-menu";
+import { VaultHeaderActionsProvider } from "@/components/vault-header-actions";
 
 const TREE_VISIBLE_KEY = "akb.treeVisible";
 const VAULT_COLLAPSED_KEY = "akb.vaultRailCollapsed";
@@ -295,6 +296,7 @@ export function VaultShell() {
     : "calc(100vw - 10rem)";
 
   return (
+    <VaultHeaderActionsProvider>
     <VaultCreateDialogProvider openCreateVault={openCreateVault}>
       <DocumentCreateDialogProvider openCreateDocument={openCreateDocument}>
         <VaultRefreshProvider
@@ -471,5 +473,6 @@ export function VaultShell() {
         </VaultRefreshProvider>
       </DocumentCreateDialogProvider>
     </VaultCreateDialogProvider>
+    </VaultHeaderActionsProvider>
   );
 }

@@ -100,7 +100,7 @@ export function DocumentCreateDialog({
       <Dialog open={open} onOpenChange={handleOpenChange}>
         <DialogContent
           hideClose
-          className="flex h-dvh max-h-none w-full max-w-none flex-col gap-0 !overflow-hidden rounded-none border-0 p-0 sm:h-[calc(100dvh-1rem)] sm:w-[calc(100%-1rem)] sm:rounded-[var(--radius-xl)] sm:border lg:left-[min(var(--document-dialog-left),calc(100vw-57rem))] lg:right-4 lg:h-[calc(100dvh-2rem)] lg:w-auto lg:translate-x-0"
+          className="flex h-dvh max-h-none w-full max-w-none flex-col gap-0 !overflow-hidden rounded-none border-0 p-0 sm:h-[calc(100dvh-1rem)] sm:w-[calc(100%-1rem)] sm:rounded-[var(--radius-md)] sm:border lg:left-[min(var(--document-dialog-left),calc(100vw-57rem))] lg:right-4 lg:h-[calc(100dvh-2rem)] lg:w-auto lg:translate-x-0"
           style={
             {
               "--document-dialog-left": `${desktopLeftOffset}px`,

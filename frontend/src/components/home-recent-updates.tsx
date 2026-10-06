@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
+import { SettingsLink } from "@/contexts/settings-dialog-context";
 import { ArrowUpRight } from "lucide-react";
 import { ApiError, getRecent } from "@/lib/api";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
@@ -113,7 +114,7 @@ function RecentUpdates({ userId, fixedScope }: { userId: string; fixedScope?: Sc
   return <>
     <header className="flex min-h-10 flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
       <h2 id={`home-updates-heading-${scope}`} tabIndex={-1} className="text-base font-semibold tracking-tight">{fixedScope === "watching" ? "Watched documents" : "Recent updates"}</h2>
-      {scope === "watching" && <Link className="text-sm text-link hover:underline focus-visible:ring-2 focus-visible:ring-ring" to="/settings?tab=notifications">Manage watches</Link>}
+      {scope === "watching" && <SettingsLink className="text-sm text-link hover:underline focus-visible:ring-2 focus-visible:ring-ring" to="/settings?tab=notifications">Manage watches</SettingsLink>}
     </header>
     <Tabs value={scope} onValueChange={select} activationMode="manual" className="mt-3">
       {!fixedScope && <TabsList aria-label="Recent updates scope" className="bg-transparent p-0">

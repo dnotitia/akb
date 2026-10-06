@@ -102,7 +102,7 @@ mcp_result() {
 echo ""
 echo "▸ 2. Vault setup"
 
-R=$(mcp_call akb_vault_manage "{\"action\":\"create\",\"name\":\"$VAULT\",\"description\":\"collection lifecycle E2E\"}" | mcp_result)
+R=$(mcp_call akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"collection lifecycle E2E\"}" | mcp_result)
 VAULT_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['vault_id'])" 2>/dev/null)
 [ -n "$VAULT_ID" ] && pass "vault created ($VAULT)" || { fail "create_vault" "no vault_id"; exit 1; }
 
@@ -133,7 +133,7 @@ REST_REPEAT=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("
   && pass "REST idempotent create preserves stored summary and created=false" \
   || fail "REST idempotent create" "http=$REST_HTTP values=$REST_REPEAT; body=$(cat "$REST_BODY")"
 
-R=$(mcp_call akb_document_write "{\"action\":\"put\",\"vault\":\"$VAULT\",\"collection\":\"rest-contract\",\"title\":\"RestContractDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
+R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"rest-contract\",\"title\":\"RestContractDoc\",\"content\":\"## body\",\"type\":\"note\",\"tags\":[]}" | mcp_result)
 REST_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['uri'])" 2>/dev/null)
 [ -n "$REST_DOC_URI" ] && pass "seeded REST contract collection" \
   || fail "REST contract seed" "no uri; raw=$R"
@@ -163,7 +163,7 @@ REST_HTTP=$(curl -sk -o "$REST_BODY" -w "%{http_code}" \
 # The REST ACL checks below need a live collection to target. Keep this MCP
 # setup call as preparation; the lifecycle assertions themselves run through
 # the REST surface or the SDK pytest suite.
-mcp_call akb_collection_manage "{\"action\":\"create\",\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" | mcp_result >/dev/null
+mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"keepempty\"}" | mcp_result >/dev/null
 
 # ── 1. REST ACL — reader cannot create or delete ─────────────
 echo ""
@@ -179,7 +179,7 @@ HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
   || fail "REST POST 403" "got HTTP $HTTP_CODE (expected 403)"
 
 # Grant reader role to user2 (still insufficient for write — should still 403)
-R=$(mcp_call akb_vault_access_manage "{\"action\":\"grant\",\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"reader\"}" | mcp_result)
+R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"reader\"}" | mcp_result)
 GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
 [ "$GRANTED" = "True" ] && pass "granted reader role to $READER_USER" \
   || fail "grant reader" "granted=$GRANTED; raw=$R"
@@ -206,12 +206,12 @@ echo "▸ 1b. Table deletion permission boundary"
 # Promote the second account to Writer, then create a table inside a
 # collection as the owner. Writer must be denied both by the dedicated table
 # endpoint and by recursive collection deletion; the table must survive both.
-R=$(mcp_call akb_vault_access_manage "{\"action\":\"grant\",\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"writer\"}" | mcp_result)
+R=$(mcp_call akb_grant "{\"vault\":\"$VAULT\",\"user\":\"$READER_USER\",\"role\":\"writer\"}" | mcp_result)
 WRITER_GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('granted',False))" 2>/dev/null)
 [ "$WRITER_GRANTED" = "True" ] && pass "promoted second account to writer" \
   || fail "grant writer" "granted=$WRITER_GRANTED; raw=$R"
 
-R=$(mcp_call akb_table_schema_manage "{\"action\":\"create\",\"vault\":\"$VAULT\",\"collection\":\"writer-guard\",\"name\":\"writer_guard_table\",\"columns\":[{\"name\":\"value\",\"type\":\"text\"}]}" | mcp_result)
+R=$(mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"collection\":\"writer-guard\",\"name\":\"writer_guard_table\",\"columns\":[{\"name\":\"value\",\"type\":\"text\"}]}" | mcp_result)
 GUARD_TABLE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name',''))" 2>/dev/null)
 [ "$GUARD_TABLE" = "writer_guard_table" ] && pass "seeded table inside writer-guard collection" \
   || fail "seed guard table" "name=$GUARD_TABLE; raw=$R"
@@ -249,7 +249,7 @@ echo "▸ 2. Nested parent delete"
 # Create only "nested/inner" — no row at "nested" itself. This is the
 # bug reproducer: the client tree synthesizes a parent that has no
 # backing row.
-R=$(mcp_call akb_collection_manage "{\"action\":\"create\",\"vault\":\"$VAULT\",\"path\":\"nested/inner\"}" | mcp_result)
+R=$(mcp_call akb_create_collection "{\"vault\":\"$VAULT\",\"path\":\"nested/inner\"}" | mcp_result)
 NP_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
 [ "$NP_OK" = "True" ] && pass "created 'nested/inner' (parent has no row)" \
   || fail "create nested/inner" "ok=$NP_OK; raw=$R"
@@ -281,8 +281,8 @@ NP_HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
 
 # Clean up the ephemeral Vault even when an earlier assertion failed. The
 # generated test users are intentionally left to the auth lifecycle suites.
-R=$(mcp_call akb_vault_manage "{\"action\":\"archive\",\"vault\":\"$VAULT\"}" | mcp_result)
-R=$(mcp_call akb_vault_manage "{\"action\":\"delete\",\"vault\":\"$VAULT\"}" | mcp_result)
+R=$(mcp_call akb_archive_vault "{\"vault\":\"$VAULT\"}" | mcp_result)
+R=$(mcp_call akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_result)
 CLEANED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
 [ "$CLEANED" = "True" ] && pass "ephemeral vault cleaned up" \
   || fail "cleanup vault" "deleted=$CLEANED; raw=$R"

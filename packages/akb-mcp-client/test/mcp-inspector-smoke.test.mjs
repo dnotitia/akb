@@ -13,6 +13,24 @@ import {
 } from "../scripts/mcp-inspector-smoke.mjs";
 
 const marker = "akb_synthetic_inspector_marker";
+const listVaultsTool = {
+  name: "akb_discover",
+  inputSchema: {
+    type: "object",
+    oneOf: [{
+      type: "object",
+      properties: {
+        action: { type: "string", const: "list_vaults" },
+        filter: { type: "string" },
+        limit: { type: "integer" },
+        offset: { type: "integer" },
+        include_archived: { type: "boolean" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    }],
+  },
+};
 
 function descriptor(consumerRoot) {
   return {
@@ -44,21 +62,6 @@ function discovery() {
     scenario: "empty",
     access: { login: { path: "/api/v1/auth/login" } },
     runtime: { pat: { mint: { path: "/api/v1/auth/tokens" } } },
-  };
-}
-
-function candidateDiscoverTool() {
-  return {
-    name: "akb_discover",
-    inputSchema: {
-      type: "object",
-      oneOf: [{
-        type: "object",
-        properties: { action: { const: "list_vaults" } },
-        required: ["action"],
-        additionalProperties: false,
-      }],
-    },
   };
 }
 
@@ -120,7 +123,7 @@ test("smoke runs both transports, redacts the marker, and removes config state",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [candidateDiscoverTool()] }
+          ? { tools: [listVaultsTool] }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
       child.emit("close", 0);
@@ -143,6 +146,16 @@ test("smoke runs both transports, redacts the marker, and removes config state",
     assert.equal(output.comparison.status, "passed");
     assert.equal(JSON.stringify(output).includes(marker), false);
     assert.equal(captured.length, 6);
+    const readCalls = captured.filter(
+      ({ args }) => args[args.indexOf("--method") + 1] === "tools/call",
+    );
+    assert.equal(readCalls.length, 2);
+    for (const { args } of readCalls) {
+      const toolIndex = args.indexOf("--tool-name");
+      const argumentsIndex = args.indexOf("--tool-args-json");
+      assert.equal(args[toolIndex + 1], "akb_discover");
+      assert.deepEqual(JSON.parse(args[argumentsIndex + 1]), { action: "list_vaults" });
+    }
     assert.equal(captured.every(({ args }) => !args.includes(marker) && !args.includes("/dev/stdin")), true);
     assert.equal(captured.every(({ options }) => options.env.AKB_TEST_PASSWORD === undefined), true);
     assert.equal(captured.every(({ options }) => Object.keys(oldInspectorEnv).every((name) => options.env[name] === undefined)), true);
@@ -183,7 +196,7 @@ test("strict catalog errors fail while warnings remain in the operation result",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [candidateDiscoverTool()] }
+          ? { tools: [listVaultsTool] }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       const envelope = { result };
       if (method === "tools/list") envelope.schemaFindings = schemaFindings;
@@ -246,7 +259,7 @@ test("missing credentials and read-call errors cannot pass", async () => {
         const result = method === "initialize"
           ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
           : method === "tools/list"
-            ? { tools: [candidateDiscoverTool()] }
+            ? { tools: [listVaultsTool] }
             : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: true };
         child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
         child.emit("close", 0);

@@ -91,13 +91,15 @@ describe("AKB markdown editor @ references", () => {
       <MarkdownEditor value="" vault="team" onChange={vi.fn()} />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Source" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
     const source = screen.getByRole("textbox", { name: "Markdown source" });
     await user.type(source, "@");
     expect(screen.queryByTestId("markdown-reference-menu")).not.toBeInTheDocument();
 
     rerender(<MarkdownEditor value="" vault="team" readOnly onChange={vi.fn()} />);
-    await user.click(screen.getByRole("button", { name: "WYSIWYG" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Visual" }));
     const readOnlyEditor = screen.getByRole("textbox");
     readOnlyEditor.focus();
     await user.keyboard("@");

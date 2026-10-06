@@ -72,11 +72,9 @@ _GENESIS = "0" * 64
 # was listed here while mapped write-grade, so with `log_reads` off it
 # wrote an S3 snapshot and flipped a publication's mode with no audit line.
 #
-# Tool-level membership is not sufficient on its own: `akb_grep` is a read
-# tool whose `replace` argument rewrites every matching document. The
-# caller therefore passes `is_write`, computed by the same
-# `_required_scope` that gates the call, so an argument-driven write is
-# recorded even though the tool name sits in this set.
+# Exact search is read-only; replacement has its own write-scoped operation.
+# The caller still passes `is_write` from the same scope map that gates the
+# operation, so a newly added write can never be hidden by `log_reads=false`.
 _READ_ONLY_TOOLS = frozenset({
     "akb_get", "akb_search", "akb_browse", "akb_drill_down", "akb_grep",
     "akb_graph", "akb_relations", "akb_history", "akb_diff", "akb_activity",
@@ -345,7 +343,7 @@ def _target_of(args: dict) -> str | None:
 
 
 def _grep_replace_meta(args: dict, result) -> dict | None:
-    """Bounded summary for the argument-driven ``akb_grep`` write mode."""
+    """Bounded summary for the explicit ``akb_grep_replace`` operation."""
     if args.get("replace") is None or not isinstance(result, dict):
         return None
     return {
@@ -406,7 +404,6 @@ def record_tool(
     *,
     is_write: bool = False,
     protocol: dict[str, str] | None = None,
-    logical_operation: str | None = None,
 ) -> None:
     """Audit a canonical API operation from MCP dispatch or REST access routes.
     ``user`` is the resolved principal; ``result`` is the handler's return envelope (or the
@@ -418,46 +415,38 @@ def record_tool(
     canonical `resource_uri` built by `uri_service`) for operational Redis
     fanout; this audit stream records the *tool actually invoked* at the
     API surface (`action="akb_put"`), including reads and failures, for a
-    compliance SIEM. Bounded candidate tools pass ``logical_operation`` so
-    the recorded action remains the underlying operation (for example,
-    ``akb_get`` rather than only ``akb_document_read``). A canonical
-    `resource_uri` can't be formed reliably from raw dispatch args (e.g.
-    `akb_search` has no resource), so we keep an honest, lossy `target` rather
-    than fake a URI. The divergence is intentional; do not try to unify the
-    two."""
+    compliance SIEM. A canonical `resource_uri` can't be formed reliably
+    from raw dispatch args (e.g. `akb_search` has no resource), so we keep
+    an honest, lossy `target` rather than fake a URI. The divergence is
+    intentional; do not try to unify the two."""
     if not settings.audit.enabled:
         return
-    operation_name = logical_operation or name
     # Skip reads only when the operator opted out of read logging; unknown
     # (i.e. state-changing) tools are always kept. `is_write` overrides the
     # tool-level classification for a read tool invoked with a mutating
     # argument — see the note on `_READ_ONLY_TOOLS`.
-    if not settings.audit.log_reads and operation_name in _READ_ONLY_TOOLS and not is_write:
+    if not settings.audit.log_reads and name in _READ_ONLY_TOOLS and not is_write:
         return
     outcome, code = "ok", None
     if isinstance(result, dict) and (result.get("error") is not None or result.get("code")):
         outcome = "error"
         code = result.get("code")
-    if operation_name in {"akb_grep", "akb_grep_replace"} and is_write:
+    if name == "akb_grep_replace" and is_write:
         _record_grep_replace_receipts(args, user, result, protocol)
     audit_meta: dict[str, Any] = dict(protocol or {})
-    if logical_operation and logical_operation != name:
-        audit_meta["public_tool"] = name
-        if isinstance(args, dict) and isinstance(args.get("action"), str):
-            audit_meta["action"] = args["action"]
-    if operation_name in {"akb_grant", "akb_revoke"}:
+    if name in {"akb_grant", "akb_revoke"}:
         # Bounded metadata identifies the recipient and basis, including a
         # failed attempt. A revoke with no key means all bases; a grant with no
         # key means direct. Never serialize the request or exception wholesale.
         source_key = args.get("source_key")
-        if operation_name == "akb_grant" and source_key is None:
+        if name == "akb_grant" and source_key is None:
             source_key = "direct"
         access_meta: dict[str, Any] = {
             "user": str(args.get("user", ""))[:_TARGET_MAX],
             "source_key": str(source_key)[:_TARGET_MAX] if source_key is not None else None,
             "revision": args.get("revision") if type(args.get("revision")) is int else None,
         }
-        if operation_name == "akb_grant":
+        if name == "akb_grant":
             access_meta["role"] = str(args.get("role", ""))[:_TARGET_MAX]
         if outcome == "ok" and isinstance(result, dict):
             access_meta.update({
@@ -465,10 +454,10 @@ def record_tool(
                 "applied": result.get("applied"),
             })
         audit_meta["access"] = access_meta
-    if operation_name in {"akb_grep", "akb_grep_replace"} and is_write:
+    if name == "akb_grep_replace" and is_write:
         audit_meta.update(_grep_replace_meta(args, result) or {})
     record(
-        action=operation_name,
+        action=name,
         actor=getattr(user, "username", None),
         actor_id=getattr(user, "user_id", None),
         vault=(args.get("vault") if isinstance(args, dict) else None),

@@ -11,7 +11,7 @@ Answer **one question** from the target AKB vault. Decompose the question, searc
 
 Scope boundaries:
 
-- **Read-only.** Every tool call reads. The skill answers from vault content and cites it; it does not modify the vault. (It deliberately does **not** use `akb_grep` — that verb's `replace=` mode rewrites matching documents, so it is not read-only; exact-term lookup goes through `akb_search`, whose hybrid index already includes a keyword/BM25 component.)
+- **Read-only.** Every tool call reads. The skill answers from vault content and cites it; it does not modify the vault. Exact-term lookup uses `akb_discover(action="search")`, whose hybrid index already includes a keyword/BM25 component; bulk replacement is a separate writer operation and is outside this skill.
 - **Brain-first, grounded.** Answer from the vault, never from general knowledge when the vault has relevant content. If the vault lacks the answer, say so — do not fill the gap with a guess.
 - **Citations are document-scoped.** AKB exposes provenance at the document level, not per claim, so a claim cites `[doc-uri, section]` — not a sentence-level source.
 
@@ -44,18 +44,18 @@ Classify the question into one or more search strategies — a single question m
 
 | Question shape | Strategy | Verb |
 |---|---|---|
-| Conceptual / open-ended ("how does…", "tell me about…", "why…") **or** exact terms (names, versions, IDs, error strings, code) | hybrid | `akb_search` |
-| Relational ("what depends on X", "what implements Y", "how is A connected to B") | graph | `akb_relations` / `akb_graph` |
+| Conceptual / open-ended ("how does…", "tell me about…", "why…") **or** exact terms (names, versions, IDs, error strings, code) | hybrid | `akb_discover(action="search")` |
+| Relational ("what depends on X", "what implements Y", "how is A connected to B") | graph | `akb_relationships(action="relations")` / `akb_relationships(action="graph")` |
 
-Pick the minimum set that covers the question. Most questions are hybrid — `akb_search` is vector + keyword/BM25, so it handles both conceptual phrasing and exact tokens; pass the exact token as the query when the question pins one. Reach for graph only when the question asks about links between documents.
+Pick the minimum set that covers the question. Most questions are hybrid — `akb_discover` is vector + keyword/BM25, so it handles both conceptual phrasing and exact tokens; pass the exact token as the query when the question pins one. Reach for graph only when the question asks about links between documents.
 
 ### Phase 2 — Search
 
-Issue every selected strategy in a **single parallel tool-use block** — they are independent. Run only the strategies Phase 1 chose. **Exception:** when the relational strategy is selected but no anchor URI is known yet, that strategy is *not* independent — run the hybrid search first to find the anchor, then issue `akb_relations` / `akb_graph` in a follow-up block. Never call them with a guessed URI.
+Issue every selected strategy in a **single parallel tool-use block** — they are independent. Run only the strategies Phase 1 chose. **Exception:** when the relational strategy is selected but no anchor URI is known yet, that strategy is *not* independent — run the hybrid search first to find the anchor, then issue `akb_relationships(action="relations")` or `akb_relationships(action="graph")` in a follow-up block. Never call them with a guessed URI.
 
-- **Hybrid** — `akb_search(query="{question}", vault="{vault_name}", limit=10)`. For an exact token, pass the token itself as the query — the hybrid index matches it on the keyword/BM25 side. Add `collection=` / `type=` from the flags or when the question clearly implies one. Add `tags=[…]` only if the question names specific tags.
-- **Relational** — when an anchor document is known, `akb_relations(uri="{anchor_uri}", direction=…, type=…)` for direction- and type-filtered edges (single-hop). For a multi-hop neighborhood, `akb_graph(uri="{anchor_uri}", depth=…)` (BFS; no direction filter — it returns all edges at each level). If the anchor is not yet known, find it with a hybrid search first.
-- **Freshness (conditional)** — only when `--since` / `--period` was given: `akb_activity(vault="{vault_name}", since="{start_date}", limit=20)`. For `--period D1~D2`, pass `since=D1` and drop entries after `D2` in Phase 3.
+- **Hybrid** — `akb_discover(action="search", query="{question}", vault="{vault_name}", limit=10)`. For an exact token, pass the token itself as the query — the hybrid index matches it on the keyword/BM25 side. Add `collection=` / `type=` from the flags or when the question clearly implies one. Add `tags=[…]` only if the question names specific tags.
+- **Relational** — when an anchor document is known, `akb_relationships(action="relations", uri="{anchor_uri}", direction=…, type=…)` for direction- and type-filtered edges (single-hop). For a multi-hop neighborhood, `akb_relationships(action="graph", uri="{anchor_uri}", depth=…)` (BFS; no direction filter — it returns all edges at each level). If the anchor is not yet known, find it with a hybrid search first.
+- **Freshness (conditional)** — only when `--since` / `--period` was given: `akb_document_read(action="activity", vault="{vault_name}", since="{start_date}", limit=20)`. For `--period D1~D2`, pass `since=D1` and drop entries after `D2` in Phase 3.
 
 Dedup the combined hits by document URI before Phase 3.
 
@@ -63,10 +63,10 @@ Dedup the combined hits by document URI before Phase 3.
 
 For the top 3–5 deduped hits, read enough to answer — cheapest read first:
 
-1. `akb_drill_down(uri="{uri}", mode="outline")` to see the document's structure.
-2. Read the **compiled-truth (top) sections first** via `akb_drill_down(uri, section="…")` — that is the document's current best understanding. Treat the **timeline (bottom) section** as supporting evidence, not the headline.
-3. `akb_get(uri)` only when you need the full document.
-4. `akb_provenance(uri)` when the question is about authorship or recency ("who decided…", "when was…") — document-level who/when.
+1. `akb_document_read(action="section", uri="{uri}", mode="outline")` to see the document's structure.
+2. Read the **compiled-truth (top) sections first** via `akb_document_read(action="section", uri, section="…")` — that is the document's current best understanding. Treat the **timeline (bottom) section** as supporting evidence, not the headline.
+3. `akb_document_read(action="get", uri)` only when you need the full document.
+4. `akb_document_read(action="provenance", uri)` when the question is about authorship or recency ("who decided…", "when was…") — document-level who/when.
 
 **Source precedence when documents conflict** (highest authority first):
 
@@ -75,7 +75,7 @@ For the top 3–5 deduped hits, read enough to answer — cheapest read first:
 3. Timeline entries (bottom of a document).
 4. External / general knowledge (lowest — and only when the vault is silent).
 
-**Staleness** — if a freshness axis was requested, cross-check each hit against `akb_activity`: mark a hit `[stale]` when it has not changed within the window, and drop activity entries past a `--period` upper bound.
+**Staleness** — if a freshness axis was requested, cross-check each hit against `akb_document_read(action="activity")`: mark a hit `[stale]` when it has not changed within the window, and drop activity entries past a `--period` upper bound.
 
 ### Phase 4 — Synthesize & answer
 
@@ -116,9 +116,9 @@ Render `{period label}` as `since YYYY-MM-DD` or `YYYY-MM-DD~YYYY-MM-DD`.
 | AKB MCP not accessible | `AKB MCP server not accessible. Check your MCP configuration.` |
 | `--vault` not passed | `--vault {name} required.` |
 | Vault not found | `Vault "{vault_name}" not found. Create with mcp__akb__akb_create_vault first.` |
-| No hits across every strategy | Flag the gap explicitly, then offer to broaden terms, drop `--collection`/`--type`, or browse with `akb_browse`. |
+| No hits across every strategy | Flag the gap explicitly, then offer to broaden terms, drop `--collection`/`--type`, or browse with `akb_discover`. |
 | Relational anchor URI unknown | Find the anchor with a hybrid search first; if none is found, answer from hybrid hits and note the missing anchor. |
-| `akb_activity` fails | Drop the freshness axis only; answer from the search hits and note the skipped staleness check. |
+| `akb_document_read(action="activity")` fails | Drop the freshness axis only; answer from the search hits and note the skipped staleness check. |
 | `--since` / `--period` value is not ISO | Ask the user to restate the date (`YYYY-MM-DD`) before running. |
 
 ## Tips
@@ -126,5 +126,5 @@ Render `{period label}` as `since YYYY-MM-DD` or `YYYY-MM-DD~YYYY-MM-DD`.
 - Natural-language questions beat keyword strings — "why did we drop the per-plugin config" beats "config".
 - Compiled truth (top of a document) is the answer; the timeline (bottom) is the evidence. Lead with the former.
 - For relational questions, name the anchor document — graph traversal needs a starting URI.
-- Use `akb_browse` to explore vault structure when a search returns nothing and you are unsure what exists.
+- Use `akb_discover` to explore vault structure when a search returns nothing and you are unsure what exists.
 - A temporal cue ("what changed since the release", "recent decisions") is what `--since` / `--period` is for — it adds the staleness axis hybrid search alone misses.

@@ -31,13 +31,15 @@ describe("AKB markdown editor slash menu", () => {
       <MarkdownEditor value="" vault="team" onChange={onChange} />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Source" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
     const source = screen.getByRole("textbox", { name: "Markdown source" });
     await user.type(source, "/");
     expect(screen.queryByTestId("slash-command-menu")).not.toBeInTheDocument();
 
     rerender(<MarkdownEditor value="" vault="team" readOnly onChange={onChange} />);
-    await user.click(screen.getByRole("button", { name: "WYSIWYG" }));
+    await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: "Visual" }));
     const readOnlyEditor = screen.getByRole("textbox");
     readOnlyEditor.focus();
     fireEvent.keyDown(readOnlyEditor, { key: "/" });

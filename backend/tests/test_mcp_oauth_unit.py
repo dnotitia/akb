@@ -502,40 +502,45 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
             _HANDLERS.pop("akb_search", None)
 
 
-# ── grep read and replacement actions have separate contracts ──────
+# ── akb_grep and akb_grep_replace have separate scopes ────────────
+
+
+@pytest.mark.asyncio
+async def test_grep_rejects_replacement_arguments():
+    from mcp_server.server import _dispatch, _MCPUser
+
+    user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
+    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x", "replace": "y"}, user)
+    assert result.get("code") == "unknown_argument"
+    assert "replace" not in result.get("details", {}).get("available_arguments", [])
 
 
 @pytest.mark.asyncio
 async def test_grep_replace_is_refused_for_read_only_oauth_caller():
     from mcp_server.server import _dispatch, _MCPUser
 
-    user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
-    result = await _dispatch(
-        "akb_document_write",
-        {"action": "grep_replace", "vault": "v", "pattern": "x", "replace": "y"},
-        user,
-    )
-    assert result.get("code") == "insufficient_scope"
-    assert result.get("details", {}).get("required_scope") == "akb:vault:write"
-
-
-@pytest.mark.asyncio
-async def test_grep_replace_is_refused_for_read_only_pat():
-    from mcp_server.server import _dispatch, _MCPUser
-
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-    result = await _dispatch(
-        "akb_document_write",
-        {"action": "grep_replace", "vault": "v", "pattern": "x", "replace": "y"},
-        user,
-    )
+    result = await _dispatch("akb_grep_replace", {"vault": "v", "pattern": "x", "replace": "y"}, user)
     assert result.get("code") == "insufficient_scope"
     assert result.get("details", {}).get("required_scope") == "write"
 
 
 @pytest.mark.asyncio
-async def test_discover_grep_stays_readable_for_read_only_pat(monkeypatch):
-    from mcp_server.server import CANDIDATE_REGISTRY, _dispatch, _MCPUser
+async def test_grep_replace_is_refused_for_read_only_oauth_token():
+    from mcp_server.server import _dispatch, _MCPUser
+
+    user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
+    result = await _dispatch("akb_grep_replace", {"vault": "v", "pattern": "x", "replace": "y"}, user)
+    assert result.get("code") == "insufficient_scope"
+    assert result.get("details", {}).get("required_scope") == "akb:vault:write"
+
+
+@pytest.mark.asyncio
+async def test_grep_without_replace_stays_readable_for_read_only_pat(monkeypatch):
+    """Non-regression: plain grep must remain available to read-only
+    tokens — promoting the whole tool to write-grade would have been the
+    blunt fix and would take literal search away from every read agent."""
+    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
     called = []
 
@@ -543,28 +548,16 @@ async def test_discover_grep_stays_readable_for_read_only_pat(monkeypatch):
         called.append(args)
         return {"ok": True}
 
-    key = ("akb_discover", "grep")
-    original = CANDIDATE_REGISTRY._handlers[key]
-    CANDIDATE_REGISTRY._handlers[key] = _stub
-
-    async def allow(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr("mcp_server.server.check_vault_access", allow)
+    monkeypatch.setitem(_HANDLERS, "akb_grep", _stub)
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
-    try:
-        result = await _dispatch(
-            "akb_discover", {"action": "grep", "vault": "v", "pattern": "x"}, user
-        )
-    finally:
-        CANDIDATE_REGISTRY._handlers[key] = original
+    result = await _dispatch("akb_grep", {"vault": "v", "pattern": "x"}, user)
     assert result == {"ok": True}
     assert called == [{"vault": "v", "pattern": "x"}]
 
 
 @pytest.mark.asyncio
-async def test_grep_replace_empty_string_is_a_write_and_uses_writer_rbac(monkeypatch):
-    from mcp_server.server import CANDIDATE_REGISTRY, _dispatch, _MCPUser, _required_scope
+async def test_grep_with_replace_passes_when_write_scope_present(monkeypatch):
+    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
     called = []
 
@@ -572,21 +565,79 @@ async def test_grep_replace_empty_string_is_a_write_and_uses_writer_rbac(monkeyp
         called.append(args)
         return {"ok": True}
 
-    async def allow(*_args, **_kwargs):
-        return None
-
-    key = ("akb_document_write", "grep_replace")
-    original = CANDIDATE_REGISTRY._handlers[key]
-    CANDIDATE_REGISTRY._handlers[key] = _stub
-    monkeypatch.setattr("mcp_server.server.check_vault_access", allow)
-    args = {"action": "grep_replace", "vault": "v", "pattern": "x", "replace": ""}
+    monkeypatch.setitem(_HANDLERS, "akb_grep_replace", _stub)
     user = _MCPUser(user_id="u-1", token_scopes=frozenset({"read", "write"}))
-    try:
-        assert _required_scope("akb_document_write", args) == "akb:vault:write"
-        assert await _dispatch("akb_document_write", args, user) == {"ok": True}
-    finally:
-        CANDIDATE_REGISTRY._handlers[key] = original
-    assert called == [{"vault": "v", "pattern": "x", "replace": ""}]
+    args = {"vault": "v", "pattern": "x", "replace": "y"}
+    assert await _dispatch("akb_grep_replace", args, user) == {"ok": True}
+    assert called == [args]
+
+
+def test_grep_scope_is_static_and_operation_specific():
+    from mcp_server.server import _READ_SCOPE, _WRITE_SCOPE, _required_scope
+
+    assert _required_scope("akb_grep") == _READ_SCOPE
+    assert _required_scope("akb_grep_replace") == _WRITE_SCOPE
+
+
+def _handler_can_write(handler) -> bool:
+    """True when the handler reaches a writer-gated access check.
+
+    AST rather than a substring scan: `'required_role="writer"' in source`
+    is defeated by single quotes, a module constant, or an enum — none of
+    which this repo lints against — so the guard below would have gone
+    green on exactly the regression it exists to catch. A non-literal
+    `required_role` is treated as a write (fail closed).
+
+    Still source-level, so a handler that delegates its access check to a
+    helper is a false negative. Tripwire, not proof.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if fname != "check_vault_access":
+            continue
+        for kw in node.keywords:
+            if kw.arg != "required_role":
+                continue
+            if not isinstance(kw.value, ast.Constant):
+                return True  # non-literal role — cannot prove it is read-only
+            if kw.value.value != "reader":
+                return True
+    return False
+
+
+def test_the_omission_guard_itself_is_not_vacuous():
+    """`_handler_can_write` is the whole force of the guard below, and a
+    silently-broken predicate would make it pass forever. Pin it against
+    the shared implementation that contains the writer gate."""
+    from mcp_server.server import _HANDLERS, _run_grep
+
+    assert _handler_can_write(_run_grep) is True
+    assert _handler_can_write(_HANDLERS["akb_grep_replace"]) is False
+    assert _handler_can_write(_HANDLERS["akb_grep"]) is False
+    assert _handler_can_write(_HANDLERS["akb_search"]) is False
+
+
+def test_read_scoped_operations_do_not_call_writer_gates():
+    """A write handler must use a write-scoped operation name."""
+    from mcp_server.server import _HANDLERS, _READ_SCOPE, _TOOL_SCOPES
+
+    offenders = sorted(
+        name
+        for name, handler in _HANDLERS.items()
+        if _TOOL_SCOPES.get(name) == _READ_SCOPE and _handler_can_write(handler)
+    )
+    assert offenders == [], (
+        f"Read-scoped tools with a writer-gated handler: {offenders}. "
+        "Move each write to its own write-scoped operation."
+    )
 
 
 # ── /.well-known/oauth-protected-resource ──────────────────────────

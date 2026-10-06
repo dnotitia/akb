@@ -1162,6 +1162,124 @@ async def get_admin_installation_status(
     return projection
 
 
+async def get_member_installation_active_status(
+    app_id: uuid.UUID | str,
+    vault_id: uuid.UUID | str,
+    *,
+    user: AuthenticatedUser,
+    correlation_id: str,
+) -> dict[str, bool]:
+    """Read only whether the canonical installation is active for a Vault member."""
+
+    app_id = _as_uuid(app_id, field="app_id")
+    vault_id = _as_uuid(vault_id, field="vault_id")
+
+    if user.account_kind != "human" or user.is_admin:
+        record_app_audit(
+            "app.installation.member_active_status",
+            correlation_id=correlation_id,
+            outcome="error",
+            reason="member_access_required",
+            actor=user.username,
+            actor_id=user.user_id,
+            app_id=app_id,
+            vault_id=vault_id,
+        )
+        raise ForbiddenError("Installation request denied")
+
+    user_id = uuid.UUID(user.user_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vault = await conn.fetchrow(
+            "SELECT id, name, owner_id FROM vaults WHERE id = $1",
+            vault_id,
+        )
+        is_member = vault is not None and vault["owner_id"] == user_id
+        if vault is not None and not is_member:
+            is_member = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM vault_access
+                         WHERE vault_id = $1
+                           AND user_id = $2
+                           AND role = ANY($3::text[])
+                    )
+                    """,
+                    vault_id,
+                    user_id,
+                    ["reader", "writer", "admin"],
+                )
+            )
+
+        if not is_member:
+            record_app_audit(
+                "app.installation.member_active_status",
+                correlation_id=correlation_id,
+                outcome="error",
+                reason="member_access_required",
+                actor=user.username,
+                actor_id=user.user_id,
+                app_id=app_id,
+                vault_id=vault_id,
+            )
+            raise ForbiddenError("Installation request denied")
+
+        try:
+            await check_vault_access(
+                user.user_id,
+                vault["name"],
+                required_role="reader",
+                _conn=conn,
+            )
+        except (ForbiddenError, NotFoundError):
+            record_app_audit(
+                "app.installation.member_active_status",
+                correlation_id=correlation_id,
+                outcome="error",
+                reason="member_access_required",
+                actor=user.username,
+                actor_id=user.user_id,
+                app_id=app_id,
+                vault_id=vault_id,
+            )
+            raise ForbiddenError("Installation request denied") from None
+
+        try:
+            active = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM vault_app_installations
+                     WHERE app_id = $1
+                       AND vault_id = $2
+                       AND lifecycle = 'active'
+                )
+                """,
+                app_id,
+                vault_id,
+            )
+        except asyncpg.PostgresError:
+            raise AKBError(
+                "Installation status is temporarily unavailable",
+                status_code=503,
+                code="member_installation_status_unavailable",
+            ) from None
+
+    record_app_audit(
+        "app.installation.member_active_status",
+        correlation_id=correlation_id,
+        outcome="ok",
+        reason="read",
+        actor=user.username,
+        actor_id=user.user_id,
+        app_id=app_id,
+        vault_id=vault_id,
+    )
+    return {"active": bool(active)}
+
+
 async def get_app_installation_status(
     principal: AppPrincipal,
     vault_id: uuid.UUID | str,

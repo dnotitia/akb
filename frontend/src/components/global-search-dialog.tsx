@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { flushSync } from "react-dom";
 import { matchRoutes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
@@ -23,10 +24,12 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { SearchVaultPicker } from "@/components/search-vault-picker";
+import { SearchVaultPicker, VaultQuerySuggestions } from "@/components/search-vault-picker";
+import { Alert } from "@/components/ui/alert";
 import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
-import { documentPreviewState } from "@/lib/document-preview-navigation";
+import { DOCUMENT_PREVIEW_CLOSED_EVENT, documentPreviewBackground, documentPreviewState } from "@/lib/document-preview-navigation";
+import { isModalOpen } from "@/lib/modal-visibility";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import {
@@ -85,9 +88,9 @@ const SUGGESTIONS = [
   "onboarding checklist",
 ] as const;
 
-function matchesSearchScope(search: RecentSearch, vault?: string) {
+function matchesSearchScope(search: RecentSearch, vaults: string[]) {
   return search.surface === "global"
-    && (vault ? search.vaults.length === 1 && search.vaults[0] === vault : search.vaults.length === 0);
+    && search.vaults.length === vaults.length && search.vaults.every(vault => vaults.includes(vault));
 }
 
 function resultHref(result: GlobalSearchResult): string {
@@ -105,7 +108,8 @@ function resultHref(result: GlobalSearchResult): string {
 /** One stable entry point; named Vault routes supply the initial search scope. */
 export function GlobalSearchDialog() {
   const currentUser = useCurrentUser();
-  const { pathname } = useLocation();
+  const location = useLocation();
+  const { pathname } = documentPreviewBackground(location) ?? location;
   const match = matchRoutes([...appRouteContract], pathname)?.at(-1);
   const vault = match?.route.boundary === "vault-shell" ? match.params.name : undefined;
   return <KnowledgeSearchDialog key={JSON.stringify([currentUser?.user_id, vault])} contextVault={vault} />;
@@ -116,14 +120,20 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const currentUserId = currentUser?.user_id;
   const navigate = useNavigate();
   const location = useLocation();
+  const backgroundLocation = documentPreviewBackground(location) ?? location;
+  const searchSessionId = useId();
+  const previewSequence = useRef(0);
+  const previewReturn = useRef<{ token: string; backgroundKey: string; scrollTop: number } | null>(null);
+  const resumingPreview = useRef(false);
+  const restoredScrollTop = useRef<number | null>(null);
   const { requestNavigation } = useResourceNavigation();
-  const [vault, setVault] = useState<string | undefined>(contextVault);
+  const [vaults, setVaults] = useState<string[]>(contextVault ? [contextVault] : []);
   const [availableVaults, setAvailableVaults] = useState<string[] | null>(null);
   const [vaultsError, setVaultsError] = useState(false);
   const [vaultsRetry, setVaultsRetry] = useState(0);
   const id = "global";
   const triggerId = `${id}-search-trigger`;
-  const scopeLabel = vault ? `Search in ${vault}` : "Search all accessible vaults";
+  const scopeLabel = vaults.length ? `Search in ${vaults.join(", ")}` : "Search all accessible vaults";
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsScrollRef = useRef<HTMLDivElement>(null);
   const requestId = useRef(0);
@@ -151,12 +161,29 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
 
-  function changeScope(next?: string) {
-    if (vault === next) return;
+  useEffect(() => {
+    function restoreSearch(event: Event) {
+      const session = previewReturn.current;
+      if (
+        !session || session.token !== (event as CustomEvent<{ token?: unknown }>).detail?.token ||
+        session.backgroundKey !== backgroundLocation.key || isModalOpen()
+      ) return;
+      event.preventDefault();
+      previewReturn.current = null;
+      resumingPreview.current = true;
+      restoredScrollTop.current = session.scrollTop;
+      setOpen(true);
+    }
+    window.addEventListener(DOCUMENT_PREVIEW_CLOSED_EVENT, restoreSearch);
+    return () => window.removeEventListener(DOCUMENT_PREVIEW_CLOSED_EVENT, restoreSearch);
+  }, [backgroundLocation.key]);
+
+  function changeScope(next: string[]) {
+    if (vaults.length === next.length && vaults.every(vault => next.includes(vault))) return;
     // Invalidate immediately: an old response must never be actionable under a
     // newly selected scope, including before the request effect is re-run.
     ++requestId.current;
-    setVault(next);
+    setVaults(next);
     setResults([]);
     setError(null);
     setIncomplete(false);
@@ -193,17 +220,24 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     }
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter(search => matchesSearchScope(search, vault))
+        .filter(search => matchesSearchScope(search, vaults))
         .slice(0, 6),
     );
     const accessible = new Set(availableVaults || []);
     setRecentDocuments(readRecentDocumentViews(currentUserId)
-      .filter(document => (!vault || document.vault === vault) && accessible.has(document.vault))
+      .filter(document => (!vaults.length || vaults.includes(document.vault)) && accessible.has(document.vault))
       .slice(0, 4));
-  }, [currentUserId, open, vault, availableVaults]);
+  }, [currentUserId, open, vaults, availableVaults]);
 
   useEffect(() => {
     const currentRequest = ++requestId.current;
+    // The preview temporarily owns the modal focus scope. Keep the Search
+    // ledger intact, and resume it without a fetch resetting its selection.
+    if (!open && previewReturn.current) return;
+    if (open && resumingPreview.current) {
+      resumingPreview.current = false;
+      return;
+    }
     if (!open || !normalizedQuery) {
       setResults([]);
       setLoading(false);
@@ -219,16 +253,13 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     setActiveIndex(-1);
     setLoading(true);
     const timer = window.setTimeout(() => {
-      void searchDocs(normalizedQuery, vault ? [vault] : [], 12, { source_type: activeSource === "all" ? undefined : activeSource })
+      void searchDocs(normalizedQuery, vaults, 12, { source_type: activeSource === "all" ? undefined : activeSource })
         .then((response) => {
           if (currentRequest !== requestId.current) return;
           const nextResults = (response.results || []) as GlobalSearchResult[];
           setResults(nextResults);
           setActiveIndex(nextResults.length > 0 ? 0 : -1);
-          if (response.degraded) {
-            if (nextResults.length > 0) setIncomplete(true);
-            else setError("Search is incomplete; the retrieval service is temporarily unavailable. Please retry.");
-          }
+          setIncomplete(Boolean(response.degraded));
         })
         .catch((caught: unknown) => {
           if (currentRequest !== requestId.current) return;
@@ -242,42 +273,55 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     }, 220);
 
     return () => { window.clearTimeout(timer); ++requestId.current; };
-  }, [normalizedQuery, open, retryKey, activeSource, vault]);
+  }, [normalizedQuery, open, retryKey, activeSource, vaults]);
 
   function rememberGlobalSearch() {
     if (!currentUserId || !normalizedQuery) return;
     recordRecentSearch(currentUserId, {
       query: normalizedQuery,
       mode: "semantic",
-      vaults: vault ? [vault] : [],
+      vaults,
       surface: "global",
     });
     setRecentSearches(
       readRecentSearches(currentUserId)
-        .filter(search => matchesSearchScope(search, vault))
+        .filter(search => matchesSearchScope(search, vaults))
         .slice(0, 6),
     );
   }
 
   function openResult(result: GlobalSearchResult) {
     rememberGlobalSearch();
-    setOpen(false);
     const href = resultHref(result);
     const source = result.source_type || "document";
+    const returnToken = source === "document" ? suspendSearchForPreview() : undefined;
+    setActiveIndex(results.findIndex(candidate => candidate.uri === result.uri));
+    flushSync(() => setOpen(false));
     const options = {
       state:
         source === "document"
-          ? documentPreviewState(location, triggerId)
+          ? documentPreviewState(backgroundLocation, triggerId, undefined, returnToken)
           : undefined,
     };
     if (requestNavigation(href, options)) navigate(href, options);
   }
 
   function openRecentDocument(document: RecentDocumentView) {
-    setOpen(false);
+    const returnToken = suspendSearchForPreview();
+    flushSync(() => setOpen(false));
     const href = `/vault/${encodeURIComponent(document.vault)}/doc/${encodeURIComponent(document.path)}`;
-    const options = { state: documentPreviewState(location, triggerId) };
+    const options = { state: documentPreviewState(backgroundLocation, triggerId, undefined, returnToken) };
     if (requestNavigation(href, options)) navigate(href, options);
+  }
+
+  function suspendSearchForPreview(): string {
+    const token = `${searchSessionId}:${++previewSequence.current}`;
+    previewReturn.current = {
+      token,
+      backgroundKey: backgroundLocation.key,
+      scrollTop: resultsScrollRef.current?.scrollTop ?? 0,
+    };
+    return token;
   }
 
   function selectResultWithKeyboard(index: number) {
@@ -316,14 +360,19 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     ? "Searching knowledge…"
     : error
       ? "Search failed"
-      : normalizedQuery
-        ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}${incomplete ? "; search is incomplete" : ""}`
-        : "";
+      : incomplete
+        ? visibleResults.length > 0
+          ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"} shown; search is incomplete`
+          : "Search is incomplete; no results are available yet"
+        : normalizedQuery
+          ? `${visibleResults.length} result${visibleResults.length === 1 ? "" : "s"}`
+          : "";
 
   return (
     <Dialog open={open} onOpenChange={next => {
       if (next) {
-        changeScope(contextVault);
+        previewReturn.current = null;
+        changeScope(contextVault ? [contextVault] : []);
         setAvailableVaults(null);
         setVaultsError(false);
       }
@@ -349,18 +398,25 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           inputRef.current?.focus();
+          if (restoredScrollTop.current !== null && resultsScrollRef.current) {
+            resultsScrollRef.current.scrollTop = restoredScrollTop.current;
+            restoredScrollTop.current = null;
+          }
+        }}
+        onCloseAutoFocus={event => {
+          if (previewReturn.current) event.preventDefault();
         }}
       >
-        <DialogTitle className="sr-only">{vault ? scopeLabel : "Search knowledge"}</DialogTitle>
+        <DialogTitle className="sr-only">{vaults.length ? scopeLabel : "Search knowledge"}</DialogTitle>
         <DialogDescription className="sr-only">
-          {vault ? `Search documents, tables, and files in ${vault}.` : "Search documents, tables, and files across every accessible vault."}
+          {vaults.length ? `Search documents, tables, and files in any selected vault: ${vaults.join(", ")}.` : "Search documents, tables, and files across every accessible vault."}
         </DialogDescription>
 
         <div className="flex shrink-0 items-start gap-2 border-b border-border-strong bg-surface p-2.5 sm:items-center sm:p-3">
-          <div className="flex min-w-0 flex-1 flex-col items-start gap-1 rounded-[var(--radius-md)] border border-border-strong bg-background p-1.5 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring sm:flex-row sm:items-center sm:gap-2.5">
-            <SearchVaultPicker value={vault} contextVault={contextVault} vaults={availableVaults}
+          <div className="@container/scope-query flex min-w-0 flex-1 flex-wrap items-center gap-1.5 rounded-[var(--radius-md)] border border-border-strong bg-background p-1.5 transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring">
+            <SearchVaultPicker selected={vaults} contextVault={contextVault} vaults={availableVaults}
               error={vaultsError} onRetry={() => setVaultsRetry(key => key + 1)} onChange={changeScope} />
-            <div className="flex h-9 w-full min-w-0 flex-1 items-center gap-2.5 px-1.5 sm:w-auto">
+            <div className="flex h-9 min-w-0 flex-[1_0_100%] items-center gap-2.5 px-1.5 @min-[30rem]/scope-query:flex-[1_1_12rem]">
             <Search className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
             <label htmlFor={`${id}-search-input`} className="sr-only">
               {scopeLabel}
@@ -392,7 +448,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             {query && !loading && (
               <button
                 type="button"
-                aria-label={vault ? "Clear vault search" : "Clear global search"}
+                aria-label={vaults.length ? "Clear vault search" : "Clear global search"}
                 onClick={() => setQuery("")}
                 className="inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -412,15 +468,21 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           </DialogClose>
         </div>
 
-        <p role="status" aria-live="polite" className="sr-only">
+        <VaultQuerySuggestions query={query} selected={vaults} vaults={availableVaults} onSelect={name => {
+          changeScope([...vaults, name]);
+          setQuery("");
+          inputRef.current?.focus();
+        }} />
+
+        <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
           {resultStatus}
         </p>
 
-        <div className="flex min-h-11 shrink-0 items-center border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
+        <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-surface-2/60 px-3 py-1.5 sm:px-4">
           <div
             role="group"
             aria-label={`Limit ${id} search by content kind`}
-            className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5"
+            className="flex min-w-0 flex-[1_0_100%] flex-wrap items-center gap-1.5 md:flex-[1_0_20rem]"
           >
             {SOURCE_FILTERS.map(({ key, label, icon: FilterIcon }) => {
               const selected = activeSource === key;
@@ -431,7 +493,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                   type="button"
                   aria-pressed={selected}
                   aria-label={
-                    normalizedQuery && !loading && !error
+                    normalizedQuery && !loading && !error && !incomplete
                       ? `${label}, ${count} result${count === 1 ? "" : "s"}`
                       : label
                   }
@@ -456,7 +518,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                 >
                   <FilterIcon className="h-3.5 w-3.5" aria-hidden />
                   {label}
-                  {normalizedQuery && !loading && !error && (
+                  {normalizedQuery && !loading && !error && !incomplete && (
                     <span className="tabular-nums text-foreground-muted">
                       {count}
                     </span>
@@ -498,7 +560,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                       type="button"
                       onClick={() => {
                         if (!currentUserId) return;
-                        clearRecentSearches(currentUserId, { surface: "global", vaults: vault ? [vault] : [] });
+                        clearRecentSearches(currentUserId, { surface: "global", vaults });
                         setRecentSearches([]);
                       }}
                       className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -642,25 +704,41 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             </div>
           )}
 
-          {normalizedQuery && !loading && incomplete && (
-            <div className="flex items-center justify-between gap-3 border-b border-border bg-warning-soft px-4 py-3 text-warning-soft-foreground sm:px-5">
-              <p className="text-xs leading-relaxed">Search is incomplete. Available matches are shown; retry to search all retrieval methods.</p>
-              <Button type="button" variant="outline" size="sm" onClick={() => setRetryKey((current) => current + 1)}>
+          {normalizedQuery && !loading && !error && incomplete && (
+            <Alert
+              variant="warning"
+              role="note"
+              aria-label="Incomplete search results"
+              title="Search is incomplete"
+              className="m-3 sm:m-4"
+            >
+              <p>
+                {results.length > 0
+                  ? "Some matches may be missing. You can open the results below or retry."
+                  : "No results are available yet. Retry to check for matches."}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                onClick={() => setRetryKey((current) => current + 1)}
+              >
                 Retry
               </Button>
-            </div>
+            </Alert>
           )}
 
-          {normalizedQuery && !loading && !error && results.length === 0 && (
+          {normalizedQuery && !loading && !error && !incomplete && results.length === 0 && (
             <div className="flex min-h-56 flex-col items-center justify-center px-5 text-center">
               <Search className="h-5 w-5 text-foreground-muted" aria-hidden />
               <p className="mt-3 text-sm font-semibold text-foreground">
                 No results for “{normalizedQuery}”
               </p>
               <p className="mt-1 text-xs text-foreground-muted">
-                {vault ? `No matches in ${vault}. Try fewer words or expand your search.` : "Try fewer words or continue in the search page for exact matching."}
+                {vaults.length ? `No matches in ${vaults.join(", ")}. Try fewer words or expand your search.` : "Try fewer words or continue in the search page for exact matching."}
               </p>
-              {vault && <Button type="button" variant="outline" className="mt-3" onClick={() => { changeScope(undefined); inputRef.current?.focus(); }}>Search all vaults instead</Button>}
+              {vaults.length > 0 && <Button type="button" variant="outline" className="mt-3" onClick={() => { changeScope([]); inputRef.current?.focus(); }}>Search all vaults instead</Button>}
               {activeSource !== "all" && <Button type="button" variant="outline" className="mt-3" onClick={() => setActiveSource("all")}>Show all results</Button>}
             </div>
           )}
@@ -675,9 +753,11 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                   Top matches
                 </h2>
                 <span className="text-xs tabular-nums text-foreground-muted">
-                  {activeSource === "all"
-                    ? `${results.length} result${results.length === 1 ? "" : "s"}`
-                    : `${visibleResults.length} of ${results.length}`}
+                  {incomplete
+                    ? `${visibleResults.length} shown`
+                    : activeSource === "all"
+                      ? `${results.length} result${results.length === 1 ? "" : "s"}`
+                      : `${visibleResults.length} of ${results.length}`}
                 </span>
               </div>
               <ul id={`${id}-search-results`} role="listbox" aria-label="Knowledge search results">
@@ -757,7 +837,8 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
               const params = new URLSearchParams();
               if (normalizedQuery) params.set("q", normalizedQuery);
               if (activeSource !== "all") params.set("source", activeSource);
-              const href = `${vault ? `/vault/${encodeURIComponent(vault)}/search` : "/search"}?${params}`;
+              if (vaults.length > 1) params.set("v", vaults.join(","));
+              const href = `${vaults.length === 1 ? `/vault/${encodeURIComponent(vaults[0])}/search` : "/search"}?${params}`;
               if (requestNavigation(href)) navigate(href);
             }}
             className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"

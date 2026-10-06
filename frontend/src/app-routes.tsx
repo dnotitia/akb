@@ -1,4 +1,4 @@
-import type { ComponentType } from "react";
+import { useEffect, useRef, type ComponentType } from "react";
 import {
   Navigate,
   Route,
@@ -36,7 +36,8 @@ import {
   type AppRouteBoundary,
   type AppRouteComponentName,
 } from "@/app-route-contract";
-import { documentPreviewBackground } from "@/lib/document-preview-navigation";
+import { documentPreviewBackground, documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId, notifyDocumentPreviewClosed } from "@/lib/document-preview-navigation";
+import { isModalOpen } from "@/lib/modal-visibility";
 
 // Old /vault/:name/skill URLs redirect to the guide editor in vault settings —
 // the vault guide is system-managed and has no plain-viewer surface.
@@ -72,12 +73,12 @@ const routeComponents = {
   NotFoundPage,
 } satisfies Record<AppRouteComponentName, ComponentType>;
 
-function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
+function renderRoutes(boundaries: readonly AppRouteBoundary[], documentActive = true) {
   return appRouteContract
     .filter((route) => boundaries.includes(route.boundary))
     .map((route) => {
       const Component = routeComponents[route.component];
-      return <Route key={`${route.boundary}:${route.path}`} path={route.path} element={<Component />} />;
+      return <Route key={`${route.boundary}:${route.path}`} path={route.path} element={route.component === "DocumentPage" ? <DocumentPage active={documentActive} /> : <Component />} />;
     });
 }
 
@@ -85,6 +86,25 @@ function renderRoutes(boundaries: readonly AppRouteBoundary[]) {
 export function AppRoutes() {
   const location = useLocation();
   const backgroundLocation = documentPreviewBackground(location);
+  const previousPreview = useRef<typeof location | null>(null);
+
+  useEffect(() => {
+    const previous = previousPreview.current;
+    previousPreview.current = documentPreviewBackground(location) ? location : null;
+    const background = previous && documentPreviewBackground(previous);
+    // Restore only after the router committed a return to the exact launching
+    // entry. This handles X and native Back without relying on window URLs
+    // (MemoryRouter/embedded hosts), and excludes explicit page promotion.
+    if (!previous || !background || documentPreviewBackground(location) || background.key !== location.key) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (isModalOpen() || notifyDocumentPreviewClosed(previous)) return;
+      const focusId = documentPreviewReturnFocusId(previous);
+      const fallbackId = documentPreviewReturnFocusFallbackId(previous);
+      ((focusId ? document.getElementById(focusId) : null) ??
+        (fallbackId ? document.getElementById(fallbackId) : null))?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [location]);
 
   return (
     <>
@@ -93,7 +113,7 @@ export function AppRoutes() {
         <Route element={<Layout />}>
           {renderRoutes(["app-layout"])}
           <Route element={<VaultShell />}>
-            {renderRoutes(["vault-shell"])}
+            {renderRoutes(["vault-shell"], !backgroundLocation)}
           </Route>
         </Route>
       </Routes>

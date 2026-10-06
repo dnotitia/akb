@@ -18,10 +18,8 @@ import {
   Check,
   ChevronDown,
   Clock3,
-  ExternalLink,
   File,
   FileText,
-  FolderSearch,
   Layers3,
   Search as SearchIcon,
   SlidersHorizontal,
@@ -36,7 +34,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
-import { VaultScopePicker } from "@/components/vault-scope-picker";
+import {
+  SearchVaultPicker,
+  VaultQuerySuggestions,
+} from "@/components/search-vault-picker";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import {
   clearRecentSearches,
@@ -148,16 +149,16 @@ export default function SearchPage() {
   const q = searchParams.get("q") || "";
   const mode: Mode =
     searchParams.get("mode") === "literal" ? "literal" : "dense";
-  const vaultParam = searchParams.get("v") || "";
+  const vaultParam = searchParams.get("v");
   const options = useMemo(
     () => readSearchOptions(searchParams),
     [searchParams],
   );
   const scopeVaults = useMemo(
     () =>
-      scopedVault
+      vaultParam === null && scopedVault
         ? [scopedVault]
-        : vaultParam
+        : (vaultParam ?? "")
             .split(",")
             .map((vault) => vault.trim())
             .filter(Boolean),
@@ -178,7 +179,9 @@ export default function SearchPage() {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [vaults, setVaults] = useState<{ name: string }[]>([]);
+  const [vaults, setVaults] = useState<string[] | null>(null);
+  const [vaultsError, setVaultsError] = useState(false);
+  const [vaultsRetry, setVaultsRetry] = useState(0);
   const activeTypes = new Set(options.doc_types);
   const activeSource: SourceFilter = options.source_type || "all";
   const activeTags = new Set(options.tags);
@@ -195,6 +198,7 @@ export default function SearchPage() {
     [],
   );
   const reqId = useRef(0);
+  const queryInputRef = useRef<HTMLInputElement>(null);
 
   const doSearch = useCallback(
     async (searchQuery: string, searchMode: Mode, selectedVaults: string[]) => {
@@ -261,7 +265,9 @@ export default function SearchPage() {
           setTruncated(Boolean(response.truncated));
           setDegraded(false);
         }
-        if (id === reqId.current && currentUserId) {
+        // Legacy history cannot replay a Collection predicate. Do not turn a
+        // scoped search into an unfiltered Vault query on a later visit.
+        if (id === reqId.current && currentUserId && !options.collection) {
           recordRecentSearch(currentUserId, {
             query: searchQuery,
             mode: searchMode === "dense" ? "semantic" : "literal",
@@ -317,14 +323,23 @@ export default function SearchPage() {
   );
 
   useEffect(() => {
-    if (!scopedVault) {
-      listVaults()
-        .then((response) => setVaults(response.vaults || []))
-        .catch((caught) => {
-          console.error("Failed to load vaults for the scope picker", caught);
-        });
-    }
-  }, [scopedVault]);
+    let cancelled = false;
+    setVaults(null);
+    setVaultsError(false);
+    listVaults()
+      .then((response) => {
+        if (cancelled) return;
+        setVaults([...new Set((response.vaults || [])
+          .map((vault) => vault?.name)
+          .filter((name): name is string => typeof name === "string" && name.length > 0))]);
+      })
+      .catch(() => {
+        if (!cancelled) setVaultsError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUserId, vaultsRetry]);
 
   useEffect(() => {
     if (q) {
@@ -359,11 +374,17 @@ export default function SearchPage() {
     setSearchParams(next);
   }
 
-  function setScopeVaults(selectedVaults: string[]) {
+  function setScopeVaults(selectedVaults: string[], consumeQuery = false) {
     const next = new URLSearchParams(searchParams);
     const trimmed = draft.trim();
-    if (trimmed) next.set("q", trimmed);
-    if (selectedVaults.length) next.set("v", selectedVaults.join(","));
+    if (consumeQuery) {
+      next.delete("q");
+      setDraft("");
+    } else if (trimmed) next.set("q", trimmed);
+    else next.delete("q");
+    // An explicit empty value overrides the route's initial Vault default.
+    if (selectedVaults.length || scopedVault)
+      next.set("v", selectedVaults.join(","));
     else next.delete("v");
     setSearchParams(next);
   }
@@ -424,10 +445,8 @@ export default function SearchPage() {
     next.set("q", item.query);
     if (item.mode === "literal") next.set("mode", "literal");
     else next.delete("mode");
-    if (!scopedVault) {
-      if (item.vaults.length) next.set("v", item.vaults.join(","));
-      else next.delete("v");
-    }
+    if (item.vaults.length || scopedVault) next.set("v", item.vaults.join(","));
+    else next.delete("v");
     setDraft(item.query);
     setSearchParams(next);
   }
@@ -475,10 +494,6 @@ export default function SearchPage() {
     returnedDocs !== total || returnedMatches !== totalMatches
       ? `${returnedDocs} of ${total} ${literalUnit} · ${returnedMatches} of ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`
       : `${total} ${literalUnit} · ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`;
-  const allVaultParams = new URLSearchParams(searchParams);
-  allVaultParams.delete("v");
-  const allVaultsHref = `/search?${allVaultParams}`;
-
   const activeFilterCount =
     (activeSource === "all" ? 0 : 1) +
     (allTypesActive ? 0 : 1) +
@@ -488,15 +503,17 @@ export default function SearchPage() {
     Number(options.regex) +
     Number(options.case_sensitive) +
     Number(mode === "literal" && options.include_text_files);
-  const accessibleVaultNames = new Set(
-    scopedVault ? [scopedVault] : vaults.map((vault) => vault.name),
-  );
+  const accessibleVaultNames = new Set(vaults ?? []);
   const visibleRecentDocuments = recentDocuments
-    .filter((document) => accessibleVaultNames.has(document.vault))
+    .filter((document) => accessibleVaultNames.has(document.vault) &&
+      (scopeVaults.length === 0 || scopeVaults.includes(document.vault)))
     .slice(0, 4);
-  const visibleRecentSearches = scopedVault
-    ? recentSearches.filter((search) => search.vaults.includes(scopedVault))
-    : recentSearches;
+  const visibleRecentSearches = recentSearches.filter((search) =>
+    search.vaults.every((vault) => accessibleVaultNames.has(vault)) &&
+    (scopeVaults.length === 0 || (search.vaults.length === scopeVaults.length &&
+      search.vaults.every((vault) => scopeVaults.includes(vault)))),
+  );
+  const scopeLabel = scopeVaults.length ? scopeVaults.join(", ") : "All vaults";
   const resultStatus = loading
     ? "Searching…"
     : error
@@ -576,55 +593,61 @@ export default function SearchPage() {
   const queryForm = (
     <form
       data-testid="search-command-header"
-      className="flex w-full min-w-0 items-center gap-2.5"
+      className="flex w-full min-w-0 items-start gap-2.5"
       onSubmit={(event) => {
         event.preventDefault();
         commitQuery(draft);
       }}
       role="search"
-      aria-label={
-        scopedVault ? `Search within ${scopedVault}` : "Search all vaults"
-      }
+      aria-label={`Search in ${scopeLabel}`}
     >
       <span id="search-query-help" className="sr-only">
         {mode === "dense"
           ? "Semantic search matches meaning and keywords."
           : "Literal search matches exact text or a regular expression."}
       </span>
-      <div className="flex h-10 min-w-0 flex-1 items-center rounded-[var(--radius-md)] border border-border-strong bg-surface px-3 shadow-xs transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-surface">
-        <SearchIcon
-          className="mr-2.5 h-4 w-4 shrink-0 text-foreground-muted"
-          aria-hidden
+      <div className="@container/scope-query flex min-h-10 min-w-0 flex-1 flex-wrap items-center gap-2 rounded-[var(--radius-md)] border border-border-strong bg-surface px-2 py-1 shadow-xs transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-surface">
+        <SearchVaultPicker
+          selected={scopeVaults}
+          contextVault={scopedVault}
+          vaults={vaults}
+          error={vaultsError}
+          onRetry={() => setVaultsRetry((retry) => retry + 1)}
+          onChange={setScopeVaults}
         />
-        <label htmlFor="vault-search" className="sr-only">
-          Search query
-        </label>
-        <input
-          id="vault-search"
-          type="search"
-          enterKeyHint="search"
-          aria-describedby="search-query-help"
-          placeholder="Search documents, tables, and files…"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape" && draft) {
-              event.preventDefault();
-              commitQuery("");
-            }
-          }}
-          className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
-        />
-        {draft && !loading && (
-          <button
-            type="button"
-            aria-label="Clear search query"
-            onClick={() => commitQuery("")}
-            className="ml-1 inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-1 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <X className="h-3.5 w-3.5" aria-hidden />
-          </button>
-        )}
+        <div className="flex min-h-8 min-w-0 flex-[1_0_100%] items-center gap-2 px-1 @min-[30rem]/scope-query:flex-[1_1_12rem]">
+          <SearchIcon className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
+          <label htmlFor="vault-search" className="sr-only">
+            Search query
+          </label>
+          <input
+            ref={queryInputRef}
+            id="vault-search"
+            type="search"
+            enterKeyHint="search"
+            aria-describedby="search-query-help"
+            placeholder="Search documents, tables, and files…"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && draft) {
+                event.preventDefault();
+                commitQuery("");
+              }
+            }}
+            className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+          />
+          {draft && !loading && (
+            <button
+              type="button"
+              aria-label="Clear search query"
+              onClick={() => commitQuery("")}
+              className="ml-1 inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-1 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden />
+            </button>
+          )}
+        </div>
       </div>
       <Button
         type="submit"
@@ -667,6 +690,15 @@ export default function SearchPage() {
           className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6"
         >
           {queryForm}
+          <VaultQuerySuggestions
+            query={draft}
+            selected={scopeVaults}
+            vaults={vaults}
+            onSelect={(vault) => {
+              setScopeVaults([...scopeVaults, vault], true);
+              queryInputRef.current?.focus({ preventScroll: true });
+            }}
+          />
         </header>
         <div className="flex min-h-0 flex-1 flex-col @min-[56rem]/search:flex-row">
           <aside
@@ -981,47 +1013,12 @@ export default function SearchPage() {
               <p className="text-sm font-semibold tabular-nums text-foreground">
                 {resultStatus}
               </p>
-              <div
+              <p
                 data-testid="search-scope-row"
-                className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-foreground-muted"
+                className="min-w-0 break-words text-foreground-muted"
               >
-                <span className="shrink-0 font-medium text-foreground">
-                  Search in
-                </span>
-                {scopedVault ? (
-                  <>
-                    <div
-                      aria-label={`Search scope: ${scopedVault}`}
-                      className="inline-flex h-8 min-w-0 items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-surface px-2.5 text-xs text-foreground"
-                    >
-                      <FolderSearch
-                        className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
-                        aria-hidden
-                      />
-                      <span className="truncate">{scopedVault}</span>
-                    </div>
-                    <Link
-                      to={allVaultsHref}
-                      className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      All vaults
-                      <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-                    </Link>
-                  </>
-                ) : vaults.length > 0 ? (
-                  <VaultScopePicker
-                    vaults={vaults}
-                    selected={scopeVaults}
-                    onChange={setScopeVaults}
-                    className="min-w-0 [&_button[aria-label^='Search_scope']]:h-8 [&_button[aria-label^='Search_scope']]:rounded-[var(--radius-sm)] [&_button[aria-label^='Search_scope']]:text-xs"
-                  />
-                ) : (
-                  <div className="inline-flex h-8 items-center gap-2 rounded-[var(--radius-sm)] border border-border bg-background px-2.5 text-xs text-foreground-muted">
-                    <FolderSearch className="h-3.5 w-3.5" aria-hidden />
-                    All accessible vaults
-                  </div>
-                )}
-              </div>
+                {scopeVaults.length === 0 ? "Across all accessible vaults" : `Across ${scopeVaults.length} ${scopeVaults.length === 1 ? "vault" : "vaults"}`}
+              </p>
             </div>
 
             <div

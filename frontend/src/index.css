@@ -15,6 +15,11 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Read by the WebGL renderer at runtime, not by a Tailwind utility. */
+@theme static {
+  --color-graph-edge: #526675;
+}
+
 @theme {
   /* ── dnotitia brand ─────────────────────────────────────────────── */
   --color-teal: #004059;
@@ -128,6 +133,11 @@
   --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
   --font-display: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
 
+  /* Reader spacing is distinct from its optional prose measure. Dialog edges
+     follow the viewport; body gutters follow the actual reading container. */
+  --spacing-document-preview-edge: clamp(1rem, 2vw, 3rem);
+  --spacing-document-reading-gutter: clamp(1rem, 2cqi, 2rem);
+
   /* ── Radius — soft, rounded family look (12px controls, 14px cards,
      16px modals/hero — mirrors seahorse/akb-platform) ─────────────── */
   --radius: 0.875rem;
@@ -187,6 +197,7 @@
   --color-subtle: #828c98;            /* was #6b7682 (3.85:1) → 4.52:1 as text */
   --color-border: #26303c;
   --color-border-strong: #36424f;
+  --color-graph-edge: #748493;
 
   --color-accent: #e55e2c;
   --color-accent-foreground: #ffffff;
@@ -386,8 +397,8 @@ h1, h2, h3, h4, h5, h6 {
   border-color: var(--glass-border);
 }
 
-/* Quiet, opaque application chrome. Vault section links share this surface;
-   the document's white/slate reading surface begins below their boundary. */
+/* Quiet, opaque application chrome. Paper routes (including Vault workspaces)
+   connect header, section links and reader through the same white/slate surface. */
 .app-header {
   background-color: var(--color-background);
   border-bottom: 1px solid var(--color-border);
@@ -812,16 +823,15 @@ body::before {
 .akb-md .katex-display > .katex { white-space: nowrap; }
 
 /* The document file frame may grow into space reclaimed from either rail.
-   Keep prose and ordinary tables aligned on one scannable measure. Tables may
-   still overflow horizontally inside their own wrapper when their columns need
-   more room; code blocks and media continue to use the wider workspace. */
+   Keep prose, code blocks and ordinary tables aligned on one scannable measure.
+   Long code and wide tables scroll inside their own bounds; only media may use
+   the wider workspace independently of the reading measure. */
 /* Reader commands use the available workspace width, not the viewport. Keep
    modes/actions on one metric even when the navigation rails are expanded. */
 .document-command-inner { --reader-control-size: 2.75rem; }
-.document-metadata-row { border-bottom: 0; padding-block: .25rem; }
-.document-metadata-row .document-command-inner { padding-inline: 0; padding-block: 0; min-height: 2.25rem; }
-.document-metadata-row [data-slot="resource-command-meta"] { flex-wrap: nowrap; }
-.document-metadata-row [data-slot="resource-command-actions"] { flex-shrink: 0; }
+.document-unified-toolbar .document-command-inner { padding-block: .5rem; }
+.document-unified-toolbar [data-slot="resource-command-meta"] { flex-wrap: nowrap; }
+.document-unified-toolbar [data-slot="resource-command-actions"] { flex-shrink: 0; }
 .document-command-inner [data-reader-control] {
   height: var(--reader-control-size);
   min-height: var(--reader-control-size);
@@ -860,20 +870,60 @@ body::before {
 }
 @container resource-commands (min-width: 48rem) {
   .document-command-inner { --reader-control-size: 2rem; }
+  .document-unified-toolbar .document-command-inner { flex-wrap: nowrap; }
+}
+@container resource-commands (max-width: 47.999rem) {
+  .document-unified-toolbar [data-slot="resource-command-meta"] { flex-basis: 100%; min-height: 1.25rem; }
+  .document-unified-toolbar [data-slot="resource-command-actions"] { width: 100%; justify-content: flex-start; row-gap: .5rem; }
 }
 @container resource-commands (max-width: 32rem) {
-  .document-command-inner:has(.document-read-modes) > [data-slot="resource-command-meta"] { display: none; }
   .document-command-inner [data-slot="resource-command-actions"] { gap: .25rem; }
   .document-read-modes [role="tab"] { padding-inline: .5rem; }
 }
 
-.document-reading-flow {
+.document-preview-surface {
+  width: 100%;
+  height: 100dvh;
+}
+
+@media (min-width: 40rem) {
+  .document-preview-surface {
+    width: calc(100% - 2 * var(--spacing-document-preview-edge));
+    height: calc(100dvh - 2 * var(--spacing-document-preview-edge));
+  }
+}
+
+.document-reading-container {
+  container-type: inline-size;
+}
+
+.document-reading-inset {
+  padding-inline: var(--spacing-document-reading-gutter);
+  padding-block: 1.25rem;
+}
+
+.document-reading-flow,
+.document-reading-source {
   --document-reading-measure: 64rem;
+}
+
+.document-reading-flow {
   font-size: 1rem;
   line-height: 1.65;
 }
-.document-reading-flow.document-reading-wide { --document-reading-measure: none; }
+.document-reading-flow.document-reading-wide,
+.document-reading-source.document-reading-wide { --document-reading-measure: none; }
+
+.document-reading-source {
+  width: 100%;
+  max-width: var(--document-reading-measure);
+  margin-inline: auto;
+}
 .document-reading-flow .ProseMirror { min-width: 0; }
+/* Nested blocks stay within their parent; top-level blocks share the measure. */
+.document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
+/* Explicit pre specificity also overrides .prose pre[data-markdown-code]. */
+.document-reading-flow .ProseMirror > pre,
 .document-reading-flow .ProseMirror > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote, .akb-md-table, .tableWrapper) {
   width: 100%;
   max-width: var(--document-reading-measure);
@@ -882,8 +932,6 @@ body::before {
 .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
 .document-reading-flow .ProseMirror > p:has(img) { max-width: none; }
 .document-reading-flow .ProseMirror img { max-width: 100%; height: auto; }
-.document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
-.document-reading-flow .ProseMirror > .akb-md-table { max-width: var(--document-reading-measure); }
 .document-reading-flow .ProseMirror table {
   display: table;
   width: 100%;

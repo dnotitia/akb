@@ -313,6 +313,6 @@ claude > "list my AKB vaults"
                                   verify_access_token (JWKS, aud, iss, exp)
                                   resolve_or_provision_keycloak_user
                                   scope check (akb:vault:read)
-                                  dispatch akb_list_vaults
+                                  dispatch akb_discover(action=list_vaults)
                               ←──── { vaults: [...] } ────
 ```

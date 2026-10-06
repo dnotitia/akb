@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { flushSync } from "react-dom";
 import {
@@ -14,7 +14,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   CheckCircle2,
-  ChevronRight,
   GitCompareArrows,
   History,
   Maximize2,
@@ -46,10 +45,13 @@ import { DocumentView } from "@/components/document-view";
 import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentSummary, DocumentTimestamp } from "@/components/document-reading-controls";
 import { DocumentContextPanel } from "@/components/document-context-panel";
 import { DocumentPublicationControl } from "@/components/document-publication-control";
+import { VaultHeaderAction } from "@/components/vault-header-actions";
 import { ResourceCommandRow } from "@/components/resource-command-row";
 import { ResourceBreadcrumb } from "@/components/resource-breadcrumb";
 import { usePublishResourceLocation } from "@/contexts/resource-location-context";
 import { useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
+import { usePreviewEditorSession } from "@/contexts/document-preview-editor-context";
+import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
 import { SummaryFold } from "@/components/summary-fold";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -57,7 +59,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { HistoryList } from "@/components/history-list";
-import { FrontmatterEditDialog } from "@/components/frontmatter-edit-dialog";
+import { DocumentAuthoringLayout } from "@/components/document-authoring-layout";
+import { DocumentDetailsFields } from "@/components/document-details-fields";
+import { changedDocumentDetails, documentDetailsEqual, documentDetailsFrom, type DocumentDetailsValues } from "@/lib/document-details";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { TooltipText } from "@/components/ui/tooltip-text";
@@ -142,6 +146,8 @@ function isRevisionConflict(error: unknown): error is ApiError {
 interface DocumentPageProps {
   /** Search-launched previews are read-first and keep the search route behind them. */
   presentation?: "page" | "preview";
+  /** A background editor cannot intercept the foreground preview's history. */
+  active?: boolean;
 }
 
 export default function DocumentPage(props: DocumentPageProps) {
@@ -152,13 +158,18 @@ export default function DocumentPage(props: DocumentPageProps) {
 
 function DocumentPageContent({
   presentation = "page",
+  active = true,
 }: DocumentPageProps) {
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
   const { checking: accessChecking, revision: accessRevision } = useAccessVerification();
   const resourceScope = JSON.stringify([name, id, currentUser?.user_id, accessRevision]);
   const viewId = useId();
-  const [readingWidth, setReadingWidth] = useState<"standard" | "wide">("standard");
+  // The preview already bounds the reading canvas. Avoid nesting the full-page
+  // reading measure inside it, which creates large empty columns on desktop.
+  const [readingWidth, setReadingWidth] = useState<"standard" | "wide">(
+    presentation === "preview" ? "wide" : "standard",
+  );
   const navigate = useNavigate();
   const routeLocation = useLocation();
   const queryClient = useQueryClient();
@@ -183,14 +194,20 @@ function DocumentPageContent({
   const [relations, setRelations] = useState<RelationRow[]>([]);
   const [relationsError, setRelationsError] = useState(false);
   const [pendingView, setPendingView] = useState<DocView | null>(null);
-  const [pendingNavigation, setPendingNavigation] = useState<{ href: string; options?: NavigateOptions } | null>(null);
+  const [pendingNavigation, setPendingNavigation] = useState<{ href: string; options?: NavigateOptions } | { proceed: () => void; history?: boolean } | null>(null);
+  const [leavingEditor, setLeavingEditor] = useState(false);
+  useLayoutEffect(() => {
+    // A confirmed transition is not permanent permission to leave. The same
+    // editor may remain mounted behind a preview or be reused by another route.
+    setLeavingEditor(false);
+  }, [active, routeLocation.key]);
+  const editorMenuDismissRef = useRef<(() => void) | null>(null);
   const navigationFocusRef = useRef<HTMLElement | null>(null);
   const [pendingExistingPath, setPendingExistingPath] = useState<string | null>(null);
   const [override, setOverride] = useState<{ scope: string; value: any } | null>(null);
   const docOverride = override?.scope === resourceScope ? override.value : null;
   const setDocOverride = (value: any) => setOverride(value ? { scope: resourceScope, value } : null);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
-  const [editOpen, setEditOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
@@ -202,6 +219,15 @@ function DocumentPageContent({
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
   const editTitleRef = useRef<HTMLInputElement | null>(null);
+  const mountEditTitle = useCallback((input: HTMLInputElement | null) => {
+    editTitleRef.current = input;
+    if (!input) return;
+    // Start the document form at its title. Body autofocus can scroll this
+    // field behind the command row, especially in a short viewport.
+    const canvas = input.closest("main");
+    if (canvas) canvas.scrollTop = 0;
+    input.focus({ preventScroll: true });
+  }, []);
   const titleConflictRef = useRef<HTMLDivElement | null>(null);
   const diffOriginHashRef = useRef<string | null>(null);
   const wasDiffModeRef = useRef(false);
@@ -215,6 +241,12 @@ function DocumentPageContent({
   const [unclaimedAssetIds, setUnclaimedAssetIds] = useState<readonly string[]>([]);
   const [originalContent, setOriginalContent] = useState("");
   const [originalTitle, setOriginalTitle] = useState("");
+  const [originalDetails, setOriginalDetails] = useState(() => documentDetailsFrom({}));
+  const [editingDetails, setEditingDetails] = useState(() => documentDetailsFrom({}));
+  const summaryFieldRef = useRef<HTMLTextAreaElement>(null);
+  const focusDetailsRef = useRef(false);
+  const readingScrollRef = useRef(0);
+  const returnReadModeRef = useRef<DocView>("rendered");
   const [titleTouched, setTitleTouched] = useState(false);
   const [serverTitleConflict, setServerTitleConflict] = useState<DocumentTitleConflict | null>(null);
   const [editorKey, setEditorKey] = useState(0);
@@ -259,20 +291,40 @@ function DocumentPageContent({
   const editingSnapshotRef = useRef({
     title: "",
     content: "",
+    details: documentDetailsFrom({}),
     assetIds: [] as readonly string[],
     assetExpirations: {} as Readonly<Record<string, string>>,
   });
   const contentChanged = editingContent !== originalContent;
   const normalizedEditingTitle = documentTitleKey(editingTitle);
   const titleChanged = normalizedEditingTitle !== documentTitleKey(originalTitle);
-  const isDirty = contentChanged || titleChanged;
+  const isDirty = contentChanged || titleChanged || !documentDetailsEqual(editingDetails, originalDetails);
   const hasUnsavedWork = isDirty || uploadingImage || unclaimedAssetIds.length > 0;
+  const requestEditorExit = useCallback((proceed: () => void) => {
+    if (view === "edit" && (hasUnsavedWork || savingBody)) setPendingNavigation({ proceed });
+    else proceed();
+  }, [hasUnsavedWork, savingBody, view]);
+  useDocumentHistoryGuard(active && !leavingEditor && view === "edit" && (hasUnsavedWork || savingBody),
+    (proceed) => setPendingNavigation({ proceed, history: true }));
+  usePreviewEditorSession(view === "edit" ? {
+    requestExit: requestEditorExit,
+    dismissMenu: () => {
+      const dismiss = editorMenuDismissRef.current;
+      if (!dismiss) return false;
+      editorMenuDismissRef.current = null;
+      dismiss();
+      return true;
+    },
+  } : null);
+  const handleEditorMenuChange = useCallback((open: boolean, dismiss?: () => void) => {
+    editorMenuDismissRef.current = open ? dismiss ?? null : null;
+  }, []);
   const confirmResourceNavigation = useCallback((href: string, options?: NavigateOptions) => {
     setPendingNavigation({ href, options });
     return false;
   }, []);
   useResourceNavigationGuard(
-    presentation === "page" && view === "edit" && (hasUnsavedWork || savingBody)
+    view === "edit" && (hasUnsavedWork || savingBody)
       ? confirmResourceNavigation
       : null,
   );
@@ -281,10 +333,11 @@ function DocumentPageContent({
     editingSnapshotRef.current = {
       title: editingTitle,
       content: editingContent,
+      details: editingDetails,
       assetIds: editingAssetIds,
       assetExpirations: editingAssetExpirations,
     };
-  }, [editingAssetExpirations, editingAssetIds, editingContent, editingTitle]);
+  }, [editingAssetExpirations, editingAssetIds, editingContent, editingTitle, editingDetails]);
 
   useEffect(() => {
     // A real editor can emit one canonicalization event while mounting. The
@@ -311,6 +364,8 @@ function DocumentPageContent({
       baseCommit: string;
       baseTitle: string;
       baseBody: string;
+      baseDetails: DocumentDetailsValues;
+      details: DocumentDetailsValues;
       title: string;
       body: string;
       assetIds: readonly string[];
@@ -330,6 +385,8 @@ function DocumentPageContent({
         baseCommit: editBaseCommitRef.current,
         baseTitle: originalTitle,
         baseBody: originalContent,
+        baseDetails: originalDetails,
+        details: editingDetails,
         title: editingTitle,
         body: editingContent,
         assetIds: [...editingAssetIds],
@@ -349,6 +406,8 @@ function DocumentPageContent({
       baseCommit: overrides.baseCommit ?? editBaseCommitRef.current,
       baseTitle: overrides.baseTitle ?? originalTitle,
       baseBody: overrides.baseBody ?? originalContent,
+      baseDetails: overrides.baseDetails ?? originalDetails,
+      details: overrides.details ?? editingDetails,
       title: overrides.title ?? editingTitle,
       body: overrides.body ?? editingContent,
       assetIds: [...(overrides.assetIds ?? editingAssetIds)],
@@ -421,20 +480,20 @@ function DocumentPageContent({
     if (nextView === "rendered") p.delete("view");
     else p.set("view", nextView);
     const search = p.toString();
-    navigate(
+    requestEditorExit(() => navigate(
       {
         pathname: routeLocation.pathname,
         search: search ? `?${search}` : "",
       },
       { replace: true, state: null },
-    );
+    ));
   }
 
-  function requestEdit() {
-    if (presentation === "preview") {
-      openFullPage("edit");
-      return;
-    }
+  function requestEdit(details = false) {
+    readingScrollRef.current = navigationFocusRef.current?.scrollTop ?? 0;
+    returnReadModeRef.current = view === "raw" ? "raw" : "rendered";
+    focusDetailsRef.current = details;
+    setDetailsOpen(false);
     setView("edit");
   }
 
@@ -452,7 +511,10 @@ function DocumentPageContent({
   useEffect(() => {
     if (view === "edit" || !restoreEditFocusRef.current) return;
     restoreEditFocusRef.current = false;
-    const frame = window.requestAnimationFrame(() => editButtonRef.current?.focus());
+    const frame = window.requestAnimationFrame(() => {
+      if (navigationFocusRef.current) navigationFocusRef.current.scrollTop = readingScrollRef.current;
+      editButtonRef.current?.focus({ preventScroll: true });
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [view]);
 
@@ -542,7 +604,6 @@ function DocumentPageContent({
   const titleError =
     titleTouched && !normalizedEditingTitle ? "Enter a document title." : "";
   const titleDescriptionIds = [
-    "document-edit-title-help",
     titleError ? "document-edit-title-error" : "",
     titleConflict ? "document-edit-title-conflict" : "",
   ]
@@ -683,6 +744,8 @@ function DocumentPageContent({
       setEditingContent(d.content || "");
       setOriginalTitle(d.title || "");
       setEditingTitle(d.title || "");
+      setOriginalDetails(documentDetailsFrom(d));
+      setEditingDetails(documentDetailsFrom(d));
       setEditingAssetIds([]);
       setEditingAssetExpirations({});
       setUnclaimedAssetIds([]);
@@ -706,6 +769,8 @@ function DocumentPageContent({
       setEditingContent(d.content || "");
       setOriginalTitle(d.title || "");
       setEditingTitle(d.title || "");
+      setOriginalDetails(documentDetailsFrom(d));
+      setEditingDetails(documentDetailsFrom(d));
       setEditingAssetIds([]);
       setEditingAssetExpirations({});
       setUnclaimedAssetIds([]);
@@ -763,6 +828,8 @@ function DocumentPageContent({
       restoredDraftRevisionRef.current = draftRevisionRef.current;
       setOriginalContent(stored.baseBody);
       setOriginalTitle(stored.baseTitle);
+      setOriginalDetails(stored.baseDetails ?? documentDetailsFrom(d));
+      setEditingDetails(stored.details ?? documentDetailsFrom(d));
       setEditingContent(stored.body);
       setEditingTitle(stored.title);
       setEditingAssetIds(stored.assetIds);
@@ -866,6 +933,8 @@ function DocumentPageContent({
     editingAssetIds,
     editingContent,
     editingTitle,
+    editingDetails,
+    originalDetails,
     isDirty,
     name,
     originalContent,
@@ -895,6 +964,8 @@ function DocumentPageContent({
     editingAssetIds,
     editingContent,
     editingTitle,
+    editingDetails,
+    originalDetails,
     isDirty,
     name,
     originalContent,
@@ -957,8 +1028,9 @@ function DocumentPageContent({
     commit: string | null,
     title: string,
     body: string,
+    details?: DocumentDetailsValues,
   ): DocumentConflictSnapshot {
-    return { label, commit, title, body };
+    return { label, commit, title, body, details };
   }
 
   async function readLatestForConflict(): Promise<any | null> {
@@ -982,6 +1054,19 @@ function DocumentPageContent({
     try {
       const baseBody = typeof latest.content === "string" ? latest.content : "";
       const baseTitle = typeof latest.title === "string" ? latest.title : "";
+      const nextBody = contentChanged ? editingContent : baseBody;
+      const nextTitle = titleChanged ? editingTitle : baseTitle;
+      setEditingTitle(nextTitle);
+      if (!contentChanged) {
+        setEditingContent(nextBody);
+        setEditorInitialContent(nextBody);
+        editorHydrationModeRef.current = "draft";
+        setEditorKey((key) => key + 1);
+      }
+      const baseDetails = documentDetailsFrom(latest);
+      const rebasedDetails = documentDetailsFrom({ ...baseDetails, ...changedDocumentDetails(editingDetails, originalDetails) });
+      setOriginalDetails(baseDetails);
+      setEditingDetails(rebasedDetails);
       setOriginalContent(baseBody);
       setOriginalTitle(baseTitle);
       setBaseCommit(latest.current_commit);
@@ -997,8 +1082,10 @@ function DocumentPageContent({
         baseCommit: latest.current_commit,
         baseTitle,
         baseBody,
-        title: editingTitle,
-        body: editingContent,
+        baseDetails,
+        details: rebasedDetails,
+        title: nextTitle,
+        body: nextBody,
         assetIds: editingAssetIds,
         assetExpiresAt: editingAssetExpirations,
       });
@@ -1037,7 +1124,7 @@ function DocumentPageContent({
 
     const contentToSave = editingContent;
     const assetIdsToClaim = editingAssetIds;
-    const payload: DocumentUpdateInput = {};
+    const payload: DocumentUpdateInput = changedDocumentDetails(editingDetails, originalDetails);
     if (contentChanged) payload.content = contentToSave;
     if (titleChanged) {
       payload.title = normalizedEditingTitle;
@@ -1069,6 +1156,7 @@ function DocumentPageContent({
       // DocumentView consumes this same query key independently.
       const nextDoc = {
         ...(doc || {}),
+        ...changedDocumentDetails(editingDetails, originalDetails),
         content: contentToSave,
         title: titleToSave,
         updated_at: typeof saved.updated_at === "string" ? saved.updated_at : undefined,
@@ -1085,6 +1173,10 @@ function DocumentPageContent({
       );
       setOriginalContent(contentToSave);
       setOriginalTitle(titleToSave);
+      const savedDetails = documentDetailsFrom(nextDoc);
+      setOriginalDetails(savedDetails);
+      if (!hasFollowupEdits) setEditingDetails(savedDetails);
+      if (nextDoc.status !== doc.status) window.dispatchEvent(new CustomEvent("akb:document-status-changed", { detail: { vault: name, path: nextDoc.path, status: nextDoc.status } }));
       if (!hasFollowupEdits) setEditingTitle(titleToSave);
       setTitleTouched(false);
       setServerTitleConflict(null);
@@ -1097,6 +1189,8 @@ function DocumentPageContent({
           baseCommit: savedCommit,
           baseTitle: titleToSave,
           baseBody: contentToSave,
+          baseDetails: savedDetails,
+          details: followup.details,
           title: followup.title,
           body: followup.content,
           assetIds: followup.assetIds,
@@ -1130,7 +1224,8 @@ function DocumentPageContent({
         setClaimedAssetIds(assetIdsToClaim);
       });
       const p = new URLSearchParams(searchParams);
-      p.delete("view");
+      if (returnReadModeRef.current === "raw") p.set("view", "raw");
+      else p.delete("view");
       // A commit pin equal to HEAD is editable, but this save just created a
       // newer HEAD. Return to the live document instead of leaving the URL on
       // the now-historical revision while showing the new body.
@@ -1153,12 +1248,14 @@ function DocumentPageContent({
             baseCommit,
             originalTitle,
             originalContent,
+            originalDetails,
           ),
           local: makeConflictSnapshot(
             "Your draft",
             baseCommit,
             normalizedEditingTitle,
             contentToSave,
+            editingDetails,
           ),
           latest: latest
             ? makeConflictSnapshot(
@@ -1166,6 +1263,7 @@ function DocumentPageContent({
                 validRevision(latest.current_commit) ? latest.current_commit : null,
                 latest.title || "",
                 latest.content || "",
+                documentDetailsFrom(latest),
               )
             : null,
           latestError: latest ? undefined : latestServerErrorRef.current,
@@ -1214,7 +1312,7 @@ function DocumentPageContent({
 
   function handleCancelBody() {
     setBodyError("");
-    setView("rendered");
+    setView(returnReadModeRef.current);
   }
 
   function protectedDraftAssetIds(excludeDraftId?: string): Set<string> {
@@ -1235,6 +1333,8 @@ function DocumentPageContent({
   }
 
   async function discardEditDraft() {
+    if (storageSaveTimerRef.current !== null) window.clearTimeout(storageSaveTimerRef.current);
+    storageSaveTimerRef.current = null;
     const draft = draftSessionRef.current;
     const protectedAssets = protectedDraftAssetIds(draft?.draftId);
     latestDraftInputRef.current = null;
@@ -1292,7 +1392,14 @@ function DocumentPageContent({
         setPendingNavigation(null);
         // The existing unmount handler attempts draft persistence. Leaving is
         // not a discard: do not clear local drafts or delete uploaded assets.
-        if (destination) navigate(destination.href, destination.options);
+        if (hasUnsavedWork) persistEditDraft();
+        if (destination) {
+          // Direct close also uses Back. Once explicitly confirmed, let that
+          // traversal pass; a guarded POP already owns its single-use replay.
+          if (!("history" in destination && destination.history)) flushSync(() => setLeavingEditor(true));
+          if ("proceed" in destination) destination.proceed();
+          else navigate(destination.href, destination.options);
+        }
       }}
     />
   );
@@ -1393,6 +1500,16 @@ function DocumentPageContent({
     updateRouteParams(params, { replace: false });
   };
 
+  const publication = !inEditMode && (
+    <div role="group" aria-label="Document publishing" className="flex shrink-0 items-center">
+      <DocumentPublicationControl key={resourceScope} vault={name!} docId={docId}
+        publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
+        disabledReason={publishDisabledReason}
+        onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
+        onUnpublish={handleUnpublish} />
+    </div>
+  );
+
   return (
     <>
       <section
@@ -1404,27 +1521,32 @@ function DocumentPageContent({
         {presentation === "preview" && (
           <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border bg-surface py-1 pl-4 pr-12 sm:pr-14">
             {resolvedLocation ? <ResourceBreadcrumb className="flex-1" location={resolvedLocation} /> : <span className="flex-1 text-sm text-foreground-muted">Document</span>}
+            {publication}
             <Button type="button" variant="ghost" size="sm" className="h-11 shrink-0 gap-2 text-link sm:h-9"
               onClick={() => openFullPage(view)} aria-label="Open document in vault">
               <span>Open in vault</span><Maximize2 className="h-4 w-4" aria-hidden />
             </Button>
           </div>
         )}
-        <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
+        {presentation === "page" && publication && <VaultHeaderAction>{publication}</VaultHeaderAction>}
+        <div data-slot="document-viewer-frame" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
+        <div role="group" aria-label={inEditMode ? "Document editing tools" : "Document reading tools"}
+          data-slot="document-reading-toolbar" className="shrink-0 bg-surface">
         <ResourceCommandRow
           appearance="reader"
-          className="document-metadata-row"
+          className="document-unified-toolbar"
           meta={inEditMode ? (
             <span role="status" aria-live="polite" className="text-xs text-foreground-muted">
               {accessChecking || vaultInfoQuery.isPending ? "Checking access…" : !canEdit ? "Read-only · Draft preserved" : uploadingImage ? "Uploading image…" : isDirty ? "Unsaved changes" : draftStatus === "saving" ? "Saving draft locally…" : draftStatus === "saved" ? "Draft saved locally" : "No changes"}
             </span>
           ) : (
-            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
               {doc.status === "draft" && !isHistorical && !isDiffMode && <Badge variant="draft">Draft</Badge>}
               {savedAt && <span role="status" className="inline-flex shrink-0 items-center gap-1 text-xs text-success"><CheckCircle2 className="h-3.5 w-3.5" aria-hidden />Saved</span>}
               <DocumentTimestamp value={isHistorical || isDiffMode ? selectedHistoryEntry?.date : lastEditedAt}
                 label={isHistorical || isDiffMode ? "Version saved" : "Last edited"} compact />
-              <span className="hidden min-w-0 @[48rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
+              <span className="hidden @min-[32rem]/resource-commands:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
+              <span className="hidden min-w-0 flex-1 @[48rem]/reader:block"><DocumentSummary summary={doc.summary} /></span>
             </div>
           )}
         >
@@ -1435,12 +1557,14 @@ function DocumentPageContent({
               {savingBody ? "Saving…" : "Save changes"}
             </Button>
           </> : <>
-            <div role="group" aria-label="Publishing and more options" className="document-command-group">
-            <DocumentPublicationControl key={resourceScope} vault={name!} docId={docId}
-              publicSlug={!isHistorical && !isDiffMode && doc.is_public ? doc.public_slug : undefined}
-              disabledReason={publishDisabledReason}
-              onPublished={(slug) => setDocOverride({ ...doc, is_public: true, public_slug: slug })}
-              onUnpublish={handleUnpublish} />
+            {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
+            <div role="group" aria-label="Document actions" className="document-command-group">
+              <DocumentCopyButton content={doc.content || ""} />
+              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={() => requestEdit()}>
+                <Pencil className="h-4 w-4" aria-hidden />
+              </DocumentIconButton>}
+            </div>
+            <div role="group" aria-label="More document options" className="document-command-group">
             <ResourceActionsMenu
               triggerRef={actionsTriggerRef}
               resourceName={doc.title || fileName}
@@ -1469,23 +1593,7 @@ function DocumentPageContent({
             </div>
           </>}
         </ResourceCommandRow>
-
-        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
-        {!inEditMode && (
-          <div role="group" aria-label="Document reading tools" data-slot="document-reading-toolbar"
-            className="document-command-inner flex min-h-10 shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
-            <div className="flex min-w-0 items-center gap-3">
-              {!isDiffMode && <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} />}
-              <span className="hidden @min-[32rem]/resource-commands:inline-flex"><DocumentStatistics content={doc.content || ""} /></span>
-            </div>
-            <div role="group" aria-label="Document actions" className="document-command-group">
-              <DocumentCopyButton content={doc.content || ""} />
-              {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" onClick={requestEdit}>
-                <Pencil className="h-4 w-4" aria-hidden />
-              </DocumentIconButton>}
-            </div>
-          </div>
-        )}
+        </div>
 
         {archiveNotice && <Alert variant="success" className="shrink-0">{archiveNotice}<Button variant="ghost" size="sm" onClick={() => setArchiveNotice("")}>Dismiss</Button></Alert>}
         {doc.status === "archived" && !isHistorical && !isDiffMode && view !== "edit" && (
@@ -1559,7 +1667,7 @@ function DocumentPageContent({
             tabIndex={-1}
             className={cn(
               "h-full min-w-0 flex-1 bg-surface rail-scroll rail-scroll-auto",
-              isDiffMode ? "overflow-hidden" : "overflow-y-auto",
+              isDiffMode || inEditMode ? "overflow-hidden" : "overflow-y-auto",
             )}
           >
             <article
@@ -1568,7 +1676,7 @@ function DocumentPageContent({
               className={cn(
                 "w-full",
                 inEditMode
-                  ? "px-3 py-4 sm:px-4 sm:py-5 lg:px-5 xl:px-6 2xl:px-8"
+                  ? "flex h-full min-h-0 flex-col"
                   : isDiffMode
                     ? "flex h-full min-h-0 flex-col"
                     : "min-h-full",
@@ -1576,64 +1684,83 @@ function DocumentPageContent({
             >
 
               {inEditMode ? (
-                <section className="min-w-0 bg-surface">
-                  <div
-                    className="p-4 sm:p-6"
-                  >
-                    <div className="mb-5 space-y-2 border-b border-border pb-5">
-                      <Label htmlFor="document-edit-title">Document title</Label>
-                      <Input
-                        ref={editTitleRef}
-                        id="document-edit-title"
-                        value={editingTitle}
-                        onChange={(event) => {
-                          setEditingTitle(event.currentTarget.value);
-                          draftRevisionRef.current += 1;
-                          setServerTitleConflict(null);
-                          setBodyError("");
-                        }}
-                        onBlur={() => setTitleTouched(true)}
-                        disabled={savingBody}
-                        aria-invalid={Boolean(titleError || titleConflict) || undefined}
-                        aria-describedby={titleDescriptionIds}
-                        className="font-display text-base font-semibold"
-                      />
-                      <p
-                        id="document-edit-title-help"
-                        className="text-xs leading-relaxed text-foreground-muted"
-                      >
-                        This is the visible title. Editing it keeps the document path,
-                        links, and version history unchanged.
-                      </p>
-                      {titleError && (
-                        <p
-                          id="document-edit-title-error"
-                          role="alert"
-                          className="text-xs font-medium text-destructive"
-                        >
-                          {titleError}
-                        </p>
-                      )}
-                      {titleConflict && (
-                        <div
-                          id="document-edit-title-conflict"
-                          ref={titleConflictRef}
-                          tabIndex={-1}
-                          className="pt-1 focus:outline-none"
-                        >
-                          <DocumentTitleConflictNotice
-                            conflict={titleConflict}
-                            onOpenExisting={() =>
-                              setPendingExistingPath(titleConflict.existingPath)
-                            }
-                            onChooseAlternative={() => editTitleRef.current?.focus()}
-                            chooseAlternativeLabel="Choose another title"
-                            onKeepBoth={() => void handleSaveDocument("allow")}
-                            keepBothLabel="Save duplicate title"
-                            keepingBoth={savingBody}
-                          />
-                        </div>
-                      )}
+                <DocumentAuthoringLayout
+                  detailsId="document-edit-details"
+                  detailsHeadingId="document-edit-details-heading"
+                  details={<div className="space-y-5 p-4 sm:p-5">
+                    <h2 id="document-edit-details-heading" className="text-sm font-semibold">Document details</h2>
+                    <div className="space-y-1.5 text-sm">
+                      <p className="text-xs font-medium text-foreground-muted">Collection</p>
+                      <p className="break-words">{documentCollection(doc.path) || "Vault root"}</p>
+                      <p className="text-xs leading-relaxed text-foreground-muted">Use Move in the document menu to change its location.</p>
+                    </div>
+                    <DocumentDetailsFields
+                      idPrefix="document-edit"
+                      value={editingDetails}
+                      onChange={(next) => { setEditingDetails(next); draftRevisionRef.current += 1; }}
+                      disabled={savingBody || !canEdit}
+                      showStatus
+                      firstFieldRef={(node) => {
+                        summaryFieldRef.current = node;
+                        if (node && focusDetailsRef.current) {
+                          focusDetailsRef.current = false;
+                          window.requestAnimationFrame(() => node.focus());
+                        }
+                      }}
+                    />
+                  </div>}
+                >
+                  <div>
+                    <div className="border-b border-border">
+                      <div className="space-y-1.5 px-4 py-4 sm:px-6">
+                        <Button type="button" variant="ghost" size="sm" className="float-right @[52rem]/authoring:hidden" onClick={() => summaryFieldRef.current?.focus()}>Document details</Button>
+                        <Label htmlFor="document-edit-title" className="text-xs text-foreground-muted">Document title</Label>
+                        <Input
+                          ref={mountEditTitle}
+                          id="document-edit-title"
+                          value={editingTitle}
+                          onChange={(event) => {
+                            setEditingTitle(event.currentTarget.value);
+                            draftRevisionRef.current += 1;
+                            setServerTitleConflict(null);
+                            setBodyError("");
+                          }}
+                          onBlur={() => setTitleTouched(true)}
+                          disabled={savingBody}
+                          aria-invalid={Boolean(titleError || titleConflict) || undefined}
+                          aria-describedby={titleDescriptionIds || undefined}
+                          className="h-11 rounded-[var(--radius-sm)] border-0 bg-transparent px-0 font-display text-xl font-semibold shadow-none sm:text-2xl"
+                        />
+                        {titleError && (
+                          <p
+                            id="document-edit-title-error"
+                            role="alert"
+                            className="text-xs font-medium text-destructive"
+                          >
+                            {titleError}
+                          </p>
+                        )}
+                        {titleConflict && (
+                          <div
+                            id="document-edit-title-conflict"
+                            ref={titleConflictRef}
+                            tabIndex={-1}
+                            className="pt-1 focus:outline-none"
+                          >
+                            <DocumentTitleConflictNotice
+                              conflict={titleConflict}
+                              onOpenExisting={() =>
+                                setPendingExistingPath(titleConflict.existingPath)
+                              }
+                              onChooseAlternative={() => editTitleRef.current?.focus()}
+                              chooseAlternativeLabel="Choose another title"
+                              onKeepBoth={() => void handleSaveDocument("allow")}
+                              keepBothLabel="Save duplicate title"
+                              keepingBoth={savingBody}
+                            />
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <Suspense fallback={<MarkdownEditorFallback />}>
                       <MarkdownEditor
@@ -1645,6 +1772,7 @@ function DocumentPageContent({
                           editingSnapshotRef.current = {
                             title: editingTitle,
                             content: markdown,
+                            details: editingDetails,
                             assetIds: nextAssetIds,
                             assetExpirations: editingAssetExpirations,
                           };
@@ -1667,16 +1795,18 @@ function DocumentPageContent({
                         }}
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
                         ariaLabel="Document body (markdown)"
-                        autoFocus
                         readOnly={savingBody || !canEdit}
                         vault={name!}
                         document={doc?.path}
                         commit={editBaseCommit ?? undefined}
                         appearance="workspace"
+                        className="!max-w-none !px-4 !text-base sm:!px-6"
+                        sourceClassName="block !max-w-none !px-4 sm:!px-6"
                         onUploadingChange={(uploading) => {
                           setUploadingImage(uploading);
                           if (uploading) setClaimedAssetIds(null);
                         }}
+                        onSlashOpenChange={handleEditorMenuChange}
                         preserveUploadsOnUnmount={
                           pendingNavigation !== null ||
                           savingBody ||
@@ -1691,7 +1821,7 @@ function DocumentPageContent({
                       />
                     </Suspense>
                     {draftNotice && (draftStatus === "restored" || draftStatus === "saved" || draftStatus === "error" || draftStatus === "unavailable") && (
-                      <p className="mt-3 text-xs text-foreground-muted" role="status" aria-live="polite">
+                      <p className="border-t border-border px-4 py-3 text-xs leading-relaxed text-foreground-muted sm:px-6" role="status" aria-live="polite">
                         {draftNotice}
                       </p>
                     )}
@@ -1740,7 +1870,7 @@ function DocumentPageContent({
                     )}
                     {bodyError && <Alert variant="destructive" className="mt-4">{bodyError}</Alert>}
                   </div>
-                </section>
+                </DocumentAuthoringLayout>
               ) : isDiffMode && commitHash ? (
                 <Suspense fallback={<DocumentDiffModuleLoading />}>
                   <DocumentDiffView
@@ -1776,7 +1906,7 @@ function DocumentPageContent({
               <section aria-labelledby="document-properties-heading">
                 <h3 id="document-properties-heading" className="sr-only">Document properties</h3>
                   {canEdit && (
-                    <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => setEditOpen(true)}>
+                    <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => requestEdit(true)}>
                       <Pencil className="h-3.5 w-3.5" aria-hidden />
                       Edit properties
                     </Button>
@@ -1838,37 +1968,6 @@ function DocumentPageContent({
                   </PropertyRow>
                 </dl>
 
-                <details className="group mt-4 border-t border-border pt-3">
-                  <summary className="flex min-h-8 cursor-pointer list-none items-center gap-2 rounded-[var(--radius-md)] px-1 text-xs font-medium text-foreground transition-token hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                    <ChevronRight
-                      className="h-3.5 w-3.5 shrink-0 text-foreground-muted transition-transform group-open:rotate-90"
-                      aria-hidden
-                    />
-                    Technical details
-                  </summary>
-                  <dl className="mt-2 space-y-2.5 rounded-[var(--radius-md)] bg-surface-2 px-3 py-2.5 text-xs">
-                    <PropertyRow label="File name">
-                      <TooltipText as="span" tip={fileName} className="block truncate font-mono text-foreground">
-                        {fileName}
-                      </TooltipText>
-                    </PropertyRow>
-                    <PropertyRow label="Path">
-                      <TooltipText as="span" tip={doc.path} className="block truncate font-mono text-foreground">
-                        {doc.path}
-                      </TooltipText>
-                    </PropertyRow>
-                    <PropertyRow label="URI">
-                      <TooltipText
-                        as="span"
-                        tip={docUri(name!, doc.path)}
-                        className="block truncate font-mono text-foreground"
-                      >
-                        {docUri(name!, doc.path)}
-                      </TooltipText>
-                    </PropertyRow>
-                  </dl>
-                </details>
-
               </section>
 
                 </>}
@@ -1929,22 +2028,7 @@ function DocumentPageContent({
           )}
         </div>
         </div>
-        </div>
       </section>
-
-      <FrontmatterEditDialog
-        open={editOpen}
-        onOpenChange={setEditOpen}
-        vault={name!}
-        docId={docId}
-        doc={doc}
-        onSaved={(next) => {
-          setDocOverride({ ...doc, ...next });
-          void queryClient.invalidateQueries({ queryKey: ["document", name] });
-          if (next.status !== doc.status) window.dispatchEvent(new CustomEvent("akb:document-status-changed", { detail: { vault: name, path: next.path, status: next.status } }));
-          refetchTree();
-        }}
-      />
 
       <DocumentMoveDialog
         open={moveOpen}
@@ -2068,7 +2152,7 @@ function DocumentPageContent({
         description={
           uploadingImage
             ? "The image upload will be cancelled and your unsaved document changes will be lost."
-            : "Your unsaved title or body changes will be lost."
+            : "Your unsaved title, body and detail changes will be lost."
         }
         confirmLabel="Discard changes"
         variant="destructive"
@@ -2079,6 +2163,7 @@ function DocumentPageContent({
           setEditingContent(originalContent);
           setEditorInitialContent(originalContent);
           setEditingTitle(originalTitle);
+          setEditingDetails(originalDetails);
           setEditingAssetIds([]);
           setUnclaimedAssetIds([]);
           setEditorKey((k) => k + 1);
@@ -2196,16 +2281,12 @@ function DocumentPageLoading({ presentation }: { presentation: "page" | "preview
   return (
     <LoadingState label="Loading document" className="@container/reader flex h-full min-h-0 flex-col overflow-hidden bg-surface [&>div]:contents">
       {presentation === "preview" && <div className="flex h-14 items-center gap-3 border-b border-border px-4"><Skeleton className="h-4 w-2/3" /></div>}
-      <div className="flex min-h-0 flex-1 flex-col px-2 pb-2 pt-1 sm:px-3 sm:pb-3">
-        <ResourceCommandRow appearance="reader" className="document-metadata-row" meta={<Skeleton className="h-3 w-28" />}>
+      <div data-slot="document-viewer-frame" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
+        <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={<Skeleton className="h-3 w-40" />}>
+          <Skeleton data-reader-control className="w-28" />
+          <Skeleton data-reader-control className="w-16" />
           <Skeleton data-reader-control className="w-28" />
         </ResourceCommandRow>
-        <div data-slot="document-viewer-frame" className="@container/resource-commands flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-sm)] border border-border bg-surface">
-          <div className="document-command-inner flex min-h-10 shrink-0 items-center gap-3 border-b border-border bg-background px-2 py-1 sm:px-3">
-            <Skeleton data-reader-control className="w-28" />
-            <Skeleton className="hidden h-3 w-24 @min-[32rem]/resource-commands:block" />
-            <Skeleton data-reader-control className="ml-auto w-20" />
-          </div>
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="mx-auto min-w-0 flex-1 max-w-5xl space-y-4 px-4 py-5 sm:px-6">
               <Skeleton className="h-8 w-3/5" />
@@ -2217,7 +2298,6 @@ function DocumentPageLoading({ presentation }: { presentation: "page" | "preview
               {[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-5 w-4" />)}
             </div>
           </div>
-        </div>
       </div>
     </LoadingState>
   );

@@ -128,6 +128,12 @@ rerank_timeout_seconds: 3.0
 # 0 keeps legacy behavior: only rerank-enabled searches use rerank_prefetch.
 # Set >limit to give rerank-off searches more dedup headroom.
 search_prefetch: 0
+
+# pgvector retrieval budget, including pool wait, dense/sparse legs and vector
+# payload loading. Completed legs survive a peer timeout. Range: >0 through 30s.
+# Excludes query embedding, schema initialization and canonical hydration/rerank;
+# it is not an end-to-end HTTP timeout. Other drivers use their own timeouts.
+search_retrieval_timeout_secs: 30
 # Hard server-side ceiling on a search/grep `limit`. The MCP tool schema
 # advertises max 50, but that is client-side only — a direct REST call or a
 # non-validating client could otherwise pass an arbitrary limit that propagates

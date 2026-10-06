@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import re
 import time
 import uuid
@@ -50,6 +51,7 @@ from app.services import sparse_encoder
 from app.services.sparse_shapes import SparseShape
 
 from .base import ChunkUpsert, VectorHit, VectorSearchDegraded, VectorStoreUnavailable, has_dense
+from .posting_search import MAX_POINT_CHUNKS, MAX_POINT_PROBES, estimate_scope_strategy
 from .sparse_shape_state import record_sparse_shape
 
 
@@ -79,16 +81,110 @@ _VCHORD_MAX_CANDIDATES = 65_535
 # (akb#626). All SQL retains the existing caller/pool budgets.
 _VCHORD_MAX_MATERIALISED_ROWS = 10_000
 
+# Search gets its own budget; writes and maintenance keep the pool's timeout.
+# Reserves scale down with short budgets used by isolated serving experiments.
+_SEARCH_CLEANUP_RESERVE_SECS = 0.1
+_SEARCH_PAYLOAD_RESERVE_SECS = 0.2
+_SEARCH_TERMINATE_GRACE_SECS = 0.01
 
-def _leg_unavailable(error: Exception) -> bool:
+
+def _terminate_search_connection(conn) -> None:
+    try:
+        conn.terminate()
+    except asyncpg.InterfaceError:
+        # A simultaneous release may already have detached the pool proxy.
+        pass
+
+
+async def _stop_search_tasks(tasks, connections, *, cleanup_deadline: float, terminated: set[str]) -> None:
+    """Wait for cancellation/reset, then discard connections that cannot settle.
+
+    asyncpg transactions may await ROLLBACK while unwinding cancellation. The
+    supervisor, rather than that same cancelled task, owns the hard cleanup
+    bound and can terminate its connection even if the network has stalled.
+    """
+    pending = {task for task in tasks.values() if not task.done()}
+    for task in pending:
+        task.cancel()
+    if pending:
+        _, pending = await asyncio.wait(
+            pending, timeout=max(0.0, cleanup_deadline - asyncio.get_running_loop().time()),
+        )
+    if pending:
+        for name, task in tasks.items():
+            if task in pending:
+                if (conn := connections.get(name)) is not None:
+                    terminated.add(name)
+                    _terminate_search_connection(conn)
+                task.cancel()
+        # Termination wakes asyncpg's protocol waiters; give their finally
+        # blocks a bounded turn. This is the only grace beyond the budget.
+        _, pending = await asyncio.wait(pending, timeout=_SEARCH_TERMINATE_GRACE_SECS)
+    for task in tasks.values():
+        if task in pending:
+            # No live connection is retained. A custom/corrupt coroutine that
+            # ignores cancellation must not make the request wait forever.
+            logger.error("search cleanup task resisted cancellation")
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        elif not task.cancelled():
+            task.exception()  # Retrieve exceptions from cancelled peers too.
+
+
+async def _wait_search_tasks(
+    tasks, connections, *, deadline: float, cleanup_deadline: float, cleanup_timeout: float,
+    cleanup_deadlines: dict[str, float], terminated: set[str],
+) -> set[str]:
+    """Return timed-out names; unexpected errors/caller cancellation propagate."""
+    failed = False
+    try:
+        done, pending = await asyncio.wait(
+            tasks.values(), timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        for task in done:
+            if task.cancelled():
+                raise asyncio.CancelledError
+            if (error := task.exception()) is not None:
+                raise error
+        return {name for name, task in tasks.items() if task in pending}
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        effective_deadline = min(cleanup_deadline, asyncio.get_running_loop().time() + cleanup_timeout)
+        for name in tasks:
+            cleanup_deadlines[name] = effective_deadline
+        cleanup = asyncio.create_task(_stop_search_tasks(
+            tasks, connections, cleanup_deadline=effective_deadline, terminated=terminated,
+        ))
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # A disconnect may race the leg timeout or another cancellation.
+                # The supervisor keeps its bounded cleanup ownership in both cases.
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        if not failed:
+            # A deadline can race a completed task, or expose a bug while
+            # unwinding a query. Neither becomes a successful empty search.
+            for task in tasks.values():
+                if task.done() and not task.cancelled() and (error := task.exception()) is not None:
+                    raise error
+
+
+def _leg_unavailable(error: BaseException) -> bool:
     """Only availability failures permit a healthy-leg fallback.
 
     Permission, schema, vocabulary-fence and programming errors must refuse
     the whole request; rescuing hits would hide a broken security boundary.
     PostgreSQL statement cancellation includes the server's query timeout.
-    Caller cancellation is a BaseException and never reaches this predicate.
+    Caller cancellation is a BaseException and is never classified as unavailable.
     """
-    return isinstance(error, (TimeoutError, OSError, asyncpg.PostgresConnectionError)) or (
+    return isinstance(error, (TimeoutError, OSError, asyncpg.PostgresConnectionError, VectorStoreUnavailable)) or (
         isinstance(error, asyncpg.PostgresError)
         and error.sqlstate in {"57014", "57P01", "57P02", "57P03", "53300", "53400", "53200"}
     )
@@ -291,6 +387,7 @@ class PgvectorStore:
         dense_dim: int,
         sparse_shape: SparseShape,
         get_main_pool=None,  # callable returning the main PG pool, used when dsn is None
+        retrieval_timeout_secs: float = 30.0,
         # Raw term frequencies -> the weights `posting` stores. Handed over
         # only while the way back to `posting` is retained (akb#615); see
         # `_keeps_posting` below.
@@ -305,6 +402,9 @@ class PgvectorStore:
         self._schema = schema
         self._dense_dim = dense_dim
         self._sparse_shape = sparse_shape
+        if not math.isfinite(retrieval_timeout_secs) or not 0 < retrieval_timeout_secs <= 30:
+            raise ValueError("retrieval_timeout_secs must be finite and in (0, 30]")
+        self._retrieval_timeout_secs = retrieval_timeout_secs
         self._get_main_pool = get_main_pool
         self._posting_weights = posting_weights
         # Decided in `_do_ensure`: the vchord shape keeps `posting` current
@@ -1035,97 +1135,204 @@ class PgvectorStore:
             if unknown:
                 raise ValueError(f"unknown source_type filter: {unknown!r}")
             source_type_values = list(source_types)
-        pool = await self._pool()
+        loop = asyncio.get_running_loop()
+        budget = self._retrieval_timeout_secs
+        deadline = loop.time() + budget
+        cleanup_reserve = min(_SEARCH_CLEANUP_RESERVE_SECS, budget * 0.1)
+        payload_reserve = min(_SEARCH_PAYLOAD_RESERVE_SECS, budget * 0.2)
+        leg_deadline = deadline - cleanup_reserve - payload_reserve
+        leg_cleanup_deadline = deadline - payload_reserve
         timings: dict[str, float] = {}
+        statuses = {"dense": "skipped", "sparse": "skipped"}
+        connections: dict[str, asyncpg.Connection] = {}
+        cleanup_deadlines: dict[str, float] = {}
+        terminated: set[str] = set()
 
-        async def _dense_leg() -> list[str]:
-            assert query_dense is not None  # gated by has_dense in caller; for mypy
-            begin = time.perf_counter()
-            try:
-                async with pool.acquire() as c:
-                    timings["dense_wait"] = time.perf_counter() - begin
-                    await self._ensure_codec(c)
-                    return await self._search_dense(
-                        c, query_dense=query_dense,
-                        filter_uuids=filter_uuids, filter_col=filter_col,
-                        source_type_values=source_type_values,
-                        limit=prefetch_per_leg,
-                    )
-            finally:
-                timings["dense"] = time.perf_counter() - begin
+        def closed_transaction_error(error: BaseException) -> bool:
+            return (isinstance(error, asyncpg.InterfaceError)
+                    and str(error) == "cannot call Transaction.__aexit__(): the underlying connection is closed")
 
-        async def _sparse_leg() -> list[str]:
+        def cancelled_rollback(error: BaseException) -> bool:
+            if not isinstance(error, asyncio.CancelledError) or error.__context__ is None:
+                return False
+            # Cancellation during a nested ROLLBACK can replace the query error
+            # before search_connection sees it. Recover only the exception that
+            # asyncpg was unwinding, not unrelated handled exception context on
+            # a cancelled query or successful COMMIT/RELEASE SAVEPOINT.
+            traceback = error.__traceback__
+            while traceback is not None:
+                frame = traceback.tb_frame
+                if (frame.f_code is asyncpg.transaction.Transaction.__aexit__.__code__
+                        and frame.f_locals.get("ex") is error.__context__):
+                    return True
+                traceback = traceback.tb_next
+            return False
+
+        @asynccontextmanager
+        async def search_connection(name: str, *, query_deadline: float, release_deadline: float):
+            """Own this connection through bounded cancellation and pool reset."""
             begin = time.perf_counter()
+            conn = None
+            body_error: BaseException | None = None
             try:
-                async with pool.acquire() as c:
-                    timings["sparse_wait"] = time.perf_counter() - begin
-                    await self._ensure_codec(c)
-                    async with c.transaction():
-                        if self.query_epoch_supported:
-                            # First lock in this transaction, before touching
-                            # the vector table. Old bare IDs are safe only
-                            # while no renumbering has ever committed.
-                            await sparse_encoder.hold_vocabulary_epoch(
-                                c, query_sparse_epoch if query_sparse_epoch is not None else 0,
-                            )
-                        return await self._search_sparse(
-                            c, terms=list(query_sparse_indices),
-                            weights=list(query_sparse_values),
-                            filter_uuids=filter_uuids, filter_col=filter_col,
-                            source_type_values=source_type_values,
-                            limit=prefetch_per_leg,
+                remaining = query_deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+                conn = await pool.acquire(timeout=remaining)
+                connections[name] = conn
+                timings[f"{name}_wait"] = time.perf_counter() - begin
+                await self._ensure_codec(conn)
+                async with conn.transaction():
+                    try:
+                        # Capture setup failures too: a lost connection here can
+                        # also be masked by asyncpg's transaction-exit wrapper.
+                        # Server cancellation precedes the client deadline. Each
+                        # statement is bounded; the supervisor also bounds their
+                        # aggregate, codec registration, pool wait and rollback.
+                        millis = int((query_deadline - loop.time()) * 1000) - 1
+                        if millis <= 0:
+                            raise TimeoutError
+                        # pg_settings reports this setting in milliseconds. Respect
+                        # an operator's stricter nonzero server/session timeout.
+                        await conn.execute(
+                            "SELECT set_config('statement_timeout', "
+                            "LEAST(NULLIF(setting::bigint, 0), $1::bigint)::text, true) "
+                            "FROM pg_settings WHERE name='statement_timeout'", millis,
                         )
+                        if loop.time() >= query_deadline:
+                            raise TimeoutError
+                        yield conn
+                    except BaseException as exc:
+                        body_error = exc
+                        # Inner savepoint cleanup can hide a lost connection or
+                        # the query's original error before the outer tx exits.
+                        # Peel only validated asyncpg cleanup exceptions.
+                        seen = {id(body_error)}
+                        while closed_transaction_error(body_error) or cancelled_rollback(body_error):
+                            previous = body_error.__context__
+                            if previous is None or id(previous) in seen:
+                                break
+                            seen.add(id(previous))
+                            body_error = previous
+                        raise
+            except BaseException as exc:
+                forced_close = name in terminated and closed_transaction_error(exc)
+                if (body_error is not None and body_error is not exc
+                        and (_leg_unavailable(exc) or closed_transaction_error(exc)
+                             or isinstance(exc, asyncio.CancelledError))
+                        and not (name in terminated and closed_transaction_error(body_error))):
+                    # A failed ROLLBACK must not relabel the query's auth or
+                    # programming error as an operational degradation.
+                    raise body_error from exc
+                if forced_close:
+                    body_error = asyncio.CancelledError()
+                    raise body_error from exc
+                body_error = exc
+                raise
             finally:
-                timings["sparse"] = time.perf_counter() - begin
+                if conn is not None:
+                    # Transfer ownership before asyncpg starts reset. Terminating
+                    # a pool-owned connection concurrently corrupts its holder.
+                    connections.pop(name, None)
+                    try:
+                        effective_deadline = min(release_deadline, cleanup_deadlines.get(name, release_deadline))
+                        remaining = min(cleanup_reserve, effective_deadline - loop.time())
+                        if remaining <= 0:
+                            _terminate_search_connection(conn)
+                        else:
+                            # asyncpg waits its protocol cancellation and reset
+                            # here, terminating the connection if either fails.
+                            release = asyncio.create_task(pool.release(conn, timeout=remaining))
+                            cancelled = False
+                            while not release.done():
+                                try:
+                                    await asyncio.shield(release)
+                                except asyncio.CancelledError:
+                                    # Repeated cancellation must not abandon the
+                                    # pool's own shielded cancellation/reset task.
+                                    cancelled = True
+                            release.result()
+                            if cancelled and body_error is None:
+                                raise asyncio.CancelledError
+                    except Exception as exc:
+                        if body_error is None or not _leg_unavailable(exc):
+                            raise
+                timings.setdefault(f"{name}_wait", time.perf_counter() - begin)
+                timings[name] = time.perf_counter() - begin
 
-        failed_legs: list[str] = []
-
-        async def _available_leg(name: str, run: Callable[[], Awaitable[list[str]]]) -> list[str] | None:
+        async def run_leg(name: str) -> list[str]:
+            statuses[name] = "running"
             try:
-                return await run()
-            except Exception as error:
-                if not _leg_unavailable(error):
+                async with search_connection(
+                    name, query_deadline=leg_deadline, release_deadline=leg_cleanup_deadline,
+                ) as conn:
+                    if name == "dense":
+                        assert query_dense is not None
+                        ids = await self._search_dense(
+                            conn, query_dense=query_dense,
+                            filter_uuids=filter_uuids, filter_col=filter_col,
+                            source_type_values=source_type_values, limit=prefetch_per_leg,
+                        )
+                    else:
+                        if self.query_epoch_supported:
+                            # Fence before vector-table access, on this same
+                            # bounded connection and transaction. Refusals
+                            # propagate and cancel the concurrent dense leg.
+                            await sparse_encoder.hold_vocabulary_epoch(
+                                conn, query_sparse_epoch if query_sparse_epoch is not None else 0,
+                            )
+                        ids = await self._search_sparse(
+                            conn, terms=list(query_sparse_indices), weights=list(query_sparse_values),
+                            filter_uuids=filter_uuids, filter_col=filter_col,
+                            source_type_values=source_type_values, limit=prefetch_per_leg,
+                        )
+                statuses[name] = "complete"
+                return ids
+            except (TimeoutError, asyncpg.QueryCanceledError):
+                statuses[name] = "timeout"
+                return []
+            except Exception as exc:
+                if not _leg_unavailable(exc):
                     raise
-                failed_legs.append(name)
-                logger.warning("hybrid leg unavailable: leg=%s type=%s", name, type(error).__name__)
-                return None
+                statuses[name] = "unavailable"
+                logger.warning("hybrid leg unavailable: leg=%s type=%s", name, type(exc).__name__)
+                return []
+
+        def degradation_reason() -> str | None:
+            unavailable = [name for name, status in statuses.items() if status == "unavailable"]
+            if unavailable:
+                if not any(status == "complete" for status in statuses.values()):
+                    return "retrieval_unavailable"
+                return f"{unavailable[0]}_leg_failed"
+            timed_out = [name for name, status in statuses.items() if status == "timeout"]
+            if len(timed_out) == 2:
+                return "retrieval_timeout"
+            if timed_out:
+                return f"{timed_out[0]}_leg_timeout"
+            return None
 
         succeeded = False
         try:
-            # Two legs run in parallel — same PG, different conns. asyncpg
-            # serialises queries on a single conn, so the two legs need
-            # two conns. The pool max (default 8) accommodates this even
-            # under burst.
-            if has_dense and has_sparse:
-                legs = [
-                    asyncio.create_task(_available_leg("dense", _dense_leg)),
-                    asyncio.create_task(_available_leg("sparse", _sparse_leg)),
-                ]
-                try:
-                    dense_ids, sparse_ids = await asyncio.gather(*legs)
-                except BaseException:
-                    # A refused sparse encoding must not leave the dense leg
-                    # queued on the rewritten table, holding a pool slot.
-                    for leg in legs:
-                        leg.cancel()
-                    await asyncio.gather(*legs, return_exceptions=True)
-                    raise
-            elif has_dense:
-                dense_ids = await _available_leg("dense", _dense_leg)
-                sparse_ids = []
-            else:
-                dense_ids = []
-                sparse_ids = await _available_leg("sparse", _sparse_leg)
+            async with asyncio.timeout_at(leg_deadline):
+                pool = await self._pool()
+            # The same absolute deadline includes pool acquisition on both
+            # legs. Expected operational failures become request-local
+            # outcomes; an unexpected error cancels and drains its peer.
+            tasks = {
+                name: asyncio.create_task(run_leg(name), name=f"pgvector-search-{name}")
+                for name, enabled in (("dense", has_dense), ("sparse", has_sparse)) if enabled
+            }
+            timed_out = await _wait_search_tasks(
+                tasks, connections, deadline=leg_deadline, cleanup_deadline=leg_cleanup_deadline,
+                cleanup_timeout=cleanup_reserve, cleanup_deadlines=cleanup_deadlines, terminated=terminated,
+            )
+            for name in timed_out:
+                statuses[name] = "timeout"
+            dense_ids = tasks["dense"].result() if "dense" in tasks and "dense" not in timed_out else []
+            sparse_ids = tasks["sparse"].result() if "sparse" in tasks and "sparse" not in timed_out else []
 
-            if (dense_ids is None and sparse_ids is None) or (
-                dense_ids is None and not has_sparse
-            ) or (sparse_ids is None and not has_dense):
-                raise VectorStoreUnavailable("no retrieval leg available")
-            dense_available = has_dense and dense_ids is not None
-            sparse_available = has_sparse and sparse_ids is not None
-            dense_ids = dense_ids or []
-            sparse_ids = sparse_ids or []
-
+            dense_available = has_dense and statuses["dense"] == "complete"
+            sparse_available = has_sparse and statuses["sparse"] == "complete"
             # Single-leg paths skip RRF.
             if dense_available and not sparse_available:
                 top_ids = dense_ids[:limit]
@@ -1138,30 +1345,47 @@ class PgvectorStore:
                 scoring = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:limit]
                 top_ids = [cid for cid, _ in scoring]
 
-            payload_started = time.perf_counter()
-            async with pool.acquire() as c:
-                await self._ensure_codec(c)
-                rows = await self._fetch_payloads(c, top_ids)
-            timings["payload"] = time.perf_counter() - payload_started
+            rows = []
+            if top_ids:
+                async def fetch_payloads():
+                    async with search_connection(
+                        "payload", query_deadline=deadline - cleanup_reserve, release_deadline=deadline,
+                    ) as conn:
+                        return await self._fetch_payloads(conn, top_ids)
+
+                payload_task = asyncio.create_task(fetch_payloads(), name="pgvector-search-payload")
+                if await _wait_search_tasks(
+                    {"payload": payload_task}, connections,
+                    deadline=deadline - cleanup_reserve, cleanup_deadline=deadline,
+                    cleanup_timeout=cleanup_reserve, cleanup_deadlines=cleanup_deadlines, terminated=terminated,
+                ):
+                    raise VectorSearchDegraded(hits=[], reason="retrieval_timeout")
+                rows = payload_task.result()
             by_id = {r["chunk_id"]: r for r in rows}
             hits = [
                 _row_to_hit(by_id[cid], score=score)
                 for cid, score in scoring
                 if cid in by_id
             ]
-            if failed_legs:
-                raise VectorSearchDegraded(hits=hits, reason=f"{failed_legs[0]}_leg_failed")
+            if reason := degradation_reason():
+                raise VectorSearchDegraded(hits=hits, reason=reason)
             succeeded = True
             return hits
-        except asyncpg.PostgresError as e:
-            raise VectorStoreUnavailable(f"search failed: {e}") from e
+        except VectorSearchDegraded:
+            raise
+        except (TimeoutError, asyncpg.QueryCanceledError) as exc:
+            raise VectorSearchDegraded(hits=[], reason="retrieval_timeout") from exc
+        except Exception as exc:
+            if not _leg_unavailable(exc):
+                raise
+            raise VectorSearchDegraded(hits=[], reason="retrieval_unavailable") from exc
         finally:
             # No query text, source IDs, content, or credentials in diagnostics.
             # Legs overlap; their durations include pool wait and are not additive.
             logger.info(
                 "hybrid_timing ok=%s filter=%s filter_count=%d terms=%d "
                 "dense_ms=%.2f dense_wait_ms=%.2f sparse_ms=%.2f sparse_wait_ms=%.2f "
-                "payload_ms=%.2f total_ms=%.2f",
+                "payload_ms=%.2f total_ms=%.2f dense_status=%s sparse_status=%s",
                 succeeded, filter_col if filter_uuids is not None else "none",
                 len(filter_uuids) if filter_uuids is not None else 0,
                 len(query_sparse_indices),
@@ -1169,6 +1393,7 @@ class PgvectorStore:
                     "dense", "dense_wait", "sparse", "sparse_wait", "payload",
                 )),
                 (time.perf_counter() - started) * 1000,
+                statuses["dense"], statuses["sparse"],
             )
 
     async def _search_dense(
@@ -1181,60 +1406,35 @@ class PgvectorStore:
         source_type_values: list[str] | None = None,
         limit: int,
     ) -> list[str]:
-        # Binary codec → list[float] passes through directly.
-        # `WHERE dense IS NOT NULL` mirrors the partial HNSW index above —
-        # sparse-only points (embed API was down when they were indexed)
-        # contribute only to the sparse leg, never to the dense KNN.
-        # `filter_col` is "source_id" or "vault_id" (literal — see hybrid_search).
-        # `source_type_values`, when present, ANDs an additional
-        # `source_type = ANY(...)` predicate (workbench #1069). The bind slot
-        # is always $4 in the filtered branch and $3 in the unfiltered branch
-        # (params: dense, [uuids,] limit, types) so planner shapes stay stable.
-        type_suffix_filtered = (
-            " AND source_type = ANY($4::text[])" if source_type_values else ""
-        )
-        type_suffix_unfiltered = (
-            " AND source_type = ANY($3::text[])" if source_type_values else ""
-        )
+        # RRF consumes rank, so relaxed HNSW output must be sorted by actual
+        # distance first. A materialized candidate set preserves the ANN index
+        # ORDER BY; the outer +0 also keeps the explicit sort on PostgreSQL 17+.
+        params: list[object] = [list(query_dense)]
+        predicates = ["dense IS NOT NULL"]
         if filter_uuids:
-            # HNSW post-filters: it walks the graph for ~`ef_search` GLOBAL
-            # nearest, THEN drops the ones failing the WHERE. With a selective
-            # filter (one user's vaults/docs out of the whole corpus) most of
-            # the global top-ef live in OTHER vaults, so a plain query returns
-            # only the handful that survive — severe under-retrieval (a query
-            # whose global-nearest sit in other vaults came back with ~1 hit
-            # while the corpus held dozens). `hnsw.iterative_scan` (pgvector
-            # >= 0.8) makes the index keep scanning until `limit` filtered rows
-            # are found, bounded by `hnsw.max_scan_tuples`. relaxed_order is
-            # fine — the dense leg is re-ranked by RRF + cross-encoder anyway.
-            # SET LOCAL scopes it to this transaction so the pooled conn resets.
-            async with conn.transaction():
-                await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
-                # ef_search bumped from the default 40 so iterative scan has a
-                # wider beam before it starts re-scanning (fewer scan rounds).
-                await conn.execute("SET LOCAL hnsw.ef_search = 200")
-                rows = await conn.fetch(
-                    f"""
-                    SELECT chunk_id::text AS chunk_id
-                    FROM "{self._schema}".chunks
-                    WHERE {filter_col} = ANY($2::uuid[]) AND dense IS NOT NULL{type_suffix_filtered}
-                    ORDER BY dense <=> $1
-                    LIMIT $3
-                    """,
-                    list(query_dense), filter_uuids, int(limit),
-                    *([source_type_values] if source_type_values else []),
-                )
-        else:
+            params.append(filter_uuids)
+            predicates.append(f"{filter_col} = ANY(${len(params)}::uuid[])")
+        if source_type_values:
+            params.append(source_type_values)
+            predicates.append(f"source_type = ANY(${len(params)}::text[])")
+        params.append(int(limit))
+        async with conn.transaction():
+            await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+            await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+            await conn.execute("SET LOCAL hnsw.ef_search = 200")
             rows = await conn.fetch(
                 f"""
-                SELECT chunk_id::text AS chunk_id
-                FROM "{self._schema}".chunks
-                WHERE dense IS NOT NULL{type_suffix_unfiltered}
-                ORDER BY dense <=> $1
-                LIMIT $2
+                WITH nearest AS MATERIALIZED (
+                  SELECT chunk_id, dense <=> $1 AS distance
+                  FROM "{self._schema}".chunks
+                  WHERE {" AND ".join(predicates)}
+                  ORDER BY dense <=> $1
+                  LIMIT ${len(params)}
+                )
+                SELECT chunk_id::text AS chunk_id FROM nearest
+                ORDER BY distance + 0, chunk_id
                 """,
-                list(query_dense), int(limit),
-                *([source_type_values] if source_type_values else []),
+                *params,
             )
         return [r["chunk_id"] for r in rows]
 
@@ -1355,94 +1555,10 @@ class PgvectorStore:
                     sql, list(terms), [float(w) for w in weights], int(limit),
                 )
         elif self._sparse_shape == "posting":
-            if filter_uuids:
-                if filter_col == "source_id":
-                    # Source lists can contain thousands of IDs while a common
-                    # term can match almost the whole corpus. Bound the join by
-                    # materializing the authorized chunk IDs first. This only
-                    # changes join order; terms, weights and scores are intact.
-                    sql = f"""
-                        WITH q AS (
-                          SELECT unnest($1::bigint[]) AS tid,
-                                 unnest($2::real[])   AS w
-                        ),
-                        candidate_chunks AS MATERIALIZED (
-                          SELECT chunk_id
-                          FROM "{self._schema}".chunks
-                          WHERE source_id = ANY($3::uuid[])
-                            {"AND source_type = ANY($5::text[])" if source_type_values else ""}
-                        )
-                        SELECT p.chunk_id::text AS chunk_id,
-                               SUM(q.w * p.weight) AS score
-                        FROM candidate_chunks c
-                        JOIN "{self._schema}".posting p ON p.chunk_id = c.chunk_id
-                        JOIN q ON q.tid = p.term_id
-                        GROUP BY p.chunk_id
-                        ORDER BY score DESC
-                        LIMIT $4
-                    """
-                else:
-                    # A vault filter can cover most of the corpus. Forcing that
-                    # large set into a materialized CTE would increase memory and
-                    # temporary-I/O pressure, so leave its direct join intact.
-                    sql = f"""
-                        WITH q AS (
-                          SELECT unnest($1::bigint[]) AS tid,
-                                 unnest($2::real[])   AS w
-                        )
-                        SELECT p.chunk_id::text AS chunk_id,
-                               SUM(q.w * p.weight) AS score
-                        FROM "{self._schema}".posting p
-                        JOIN q ON q.tid = p.term_id
-                        JOIN "{self._schema}".chunks c ON c.chunk_id = p.chunk_id
-                        WHERE c.{filter_col} = ANY($3::uuid[])
-                          {"AND c.source_type = ANY($5::text[])" if source_type_values else ""}
-                        GROUP BY p.chunk_id
-                        ORDER BY score DESC
-                        LIMIT $4
-                    """
-                rows = await conn.fetch(
-                    sql, list(terms), [float(w) for w in weights],
-                    filter_uuids, int(limit),
-                    *([source_type_values] if source_type_values else []),
-                )
-            elif source_type_values:
-                sql = f"""
-                    WITH q AS (
-                      SELECT unnest($1::bigint[]) AS tid,
-                             unnest($2::real[])   AS w
-                    )
-                    SELECT p.chunk_id::text AS chunk_id,
-                           SUM(q.w * p.weight) AS score
-                    FROM "{self._schema}".posting p
-                    JOIN q ON q.tid = p.term_id
-                    JOIN "{self._schema}".chunks c ON c.chunk_id = p.chunk_id
-                    WHERE c.source_type = ANY($4::text[])
-                    GROUP BY p.chunk_id
-                    ORDER BY score DESC
-                    LIMIT $3
-                """
-                rows = await conn.fetch(
-                    sql, list(terms), [float(w) for w in weights], int(limit),
-                    source_type_values,
-                )
-            else:
-                sql = f"""
-                    WITH q AS (
-                      SELECT unnest($1::bigint[]) AS tid,
-                             unnest($2::real[])   AS w
-                    )
-                    SELECT p.chunk_id::text AS chunk_id,
-                           SUM(q.w * p.weight) AS score
-                    FROM "{self._schema}".posting p
-                    JOIN q ON q.tid = p.term_id
-                    GROUP BY p.chunk_id
-                    ORDER BY score DESC
-                    LIMIT $3
-                """
-                rows = await conn.fetch(
-                    sql, list(terms), [float(w) for w in weights], int(limit),
-                )
+            return await self._search_posting(
+                conn, terms=terms, weights=weights, filter_uuids=filter_uuids,
+                filter_col=filter_col, source_type_values=source_type_values, limit=limit,
+            )
 
         elif self._sparse_shape == "vchord":
             # Every shape below wraps its ORDER BY ... LIMIT and drops rows whose
@@ -1500,13 +1616,9 @@ class PgvectorStore:
             query_vector = _bm25query_literal(list(terms))
             if query_vector is None:
                 return []
-            # Read the statistics BEFORE the transaction opens. Inside it, a
-            # server-side error aborts the transaction, and catching the
-            # exception in Python does not un-abort it — the next statement
-            # fails with InFailedSQLTransactionError, which is a PostgresError,
-            # which `hybrid_search` turns into VectorStoreUnavailable and takes
-            # the dense leg down with it. "A statistics read that throws must
-            # not take a search with it" is only true out here.
+            # The statistics helper uses a savepoint: catalog failures can
+            # fall back without aborting the enclosing retrieval transaction.
+            # Server deadline cancellation propagates to the leg collector.
             selective = (
                 await self._filter_is_selective(conn, filter_col, filter_uuids)
                 if filter_uuids else False
@@ -1609,6 +1721,72 @@ class PgvectorStore:
     # to materialise under the row cap — it is index-led, not refused.
     _SELECTIVE_FRACTION = 0.01
 
+    async def _search_posting(
+        self, conn: asyncpg.Connection, *, terms: list[int], weights: list[float],
+        filter_uuids: list[uuid.UUID] | None, filter_col: str,
+        source_type_values: list[str] | None, limit: int,
+    ) -> list[str]:
+        strategy = "term"
+        params: list[object] = [list(terms), [float(w) for w in weights]]
+        predicates = []
+        if filter_uuids:
+            params.append(filter_uuids)
+            predicates.append(f"c.{filter_col} = ANY(${len(params)}::uuid[])")
+            strategy = await estimate_scope_strategy(
+                conn, schema=self._schema, filter_col=filter_col,
+                filter_uuids=filter_uuids, terms=terms,
+            )
+        if source_type_values:
+            params.append(source_type_values)
+            predicates.append(f"c.source_type = ANY(${len(params)}::text[])")
+        where = " WHERE " + " AND ".join(predicates) if predicates else ""
+        async with conn.transaction():
+            # Repeated prepared calls must retain the current term/scope costs.
+            await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+            if strategy == "point":
+                # Statistics can be stale. Bound the actual number of point
+                # probes before selecting that plan; no result rows are capped.
+                # Scope SQL uses the same parameter numbering as the search.
+                scope_params = params[2:]
+                scope_where = where
+                for index in range(3, len(params) + 1):
+                    scope_where = scope_where.replace(f"${index}::", f"${index - 2}::")
+                actual = await conn.fetchval(
+                    f'WITH scoped AS (SELECT 1 FROM "{self._schema}".chunks c'
+                    f'{scope_where} LIMIT {MAX_POINT_CHUNKS + 1}) SELECT count(*) FROM scoped',
+                    *scope_params,
+                )
+                if actual > MAX_POINT_CHUNKS or actual * len(terms) > MAX_POINT_PROBES:
+                    strategy = "term"
+            params.append(int(limit))
+            query_terms = "SELECT unnest($1::bigint[]) AS tid, unnest($2::real[]) AS w"
+            if strategy in {"point", "scope"}:
+                cte = f"""WITH q AS ({query_terms}), selected AS MATERIALIZED (
+                    SELECT c.chunk_id FROM "{self._schema}".chunks c{where})"""
+                if strategy == "point":
+                    joined = f"""FROM selected c CROSS JOIN q CROSS JOIN LATERAL (
+                        SELECT p.weight FROM "{self._schema}".posting p
+                        WHERE p.term_id=q.tid AND p.chunk_id=c.chunk_id OFFSET 0
+                    ) p"""
+                else:
+                    joined = f"""FROM selected c
+                        JOIN "{self._schema}".posting p ON p.chunk_id=c.chunk_id
+                        JOIN q ON q.tid=p.term_id"""
+                select_id = "c.chunk_id"
+            else:
+                cte = f"WITH q AS ({query_terms})"
+                joined = f'FROM "{self._schema}".posting p JOIN q ON q.tid=p.term_id'
+                if predicates:
+                    joined += f' JOIN "{self._schema}".chunks c ON c.chunk_id=p.chunk_id{where}'
+                select_id = "p.chunk_id"
+            rows = await conn.fetch(
+                f"""{cte} SELECT {select_id}::text AS chunk_id, SUM(q.w*p.weight) AS score
+                    {joined} GROUP BY {select_id}
+                    ORDER BY score DESC, {select_id} LIMIT ${len(params)}""", *params,
+            )
+        logger.debug("posting_scope_strategy=%s terms=%d", strategy, len(terms))
+        return [row["chunk_id"] for row in rows]
+
     async def _filter_is_selective(
         self,
         conn: asyncpg.Connection,
@@ -1628,22 +1806,28 @@ class PgvectorStore:
         band. A statistics read that throws must not take a search with it.
         """
         try:
-            row = await conn.fetchrow(
-                """
-                SELECT c.reltuples::float8                     AS total,
-                       s.n_distinct                            AS n_distinct,
-                       s.most_common_vals::text::uuid[]        AS mcv,
-                       s.most_common_freqs                     AS freqs
-                  FROM pg_class c
-                  JOIN pg_namespace n ON n.oid = c.relnamespace
-                  LEFT JOIN pg_stats s
-                         ON s.schemaname = n.nspname
-                        AND s.tablename  = c.relname
-                        AND s.attname    = $2
-                 WHERE n.nspname = $1 AND c.relname = 'chunks'
-                """,
-                self._schema, filter_col,
-            )
+            # hybrid_search owns an outer transaction for statement_timeout.
+            # Isolate this best-effort catalog read so a failed statement does
+            # not leave that transaction aborted before the actual search.
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT c.reltuples::float8                     AS total,
+                           s.n_distinct                            AS n_distinct,
+                           s.most_common_vals::text::uuid[]        AS mcv,
+                           s.most_common_freqs                     AS freqs
+                      FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                      LEFT JOIN pg_stats s
+                             ON s.schemaname = n.nspname
+                            AND s.tablename  = c.relname
+                            AND s.attname    = $2
+                     WHERE n.nspname = $1 AND c.relname = 'chunks'
+                    """,
+                    self._schema, filter_col,
+                )
+        except asyncpg.QueryCanceledError:
+            raise  # The retrieval deadline must remain a timeout outcome.
         except asyncpg.PostgresError:
             return False
         if not row or not row["total"] or row["total"] <= 0:

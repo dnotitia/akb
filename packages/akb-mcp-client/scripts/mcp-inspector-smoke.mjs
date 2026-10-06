@@ -334,34 +334,37 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
     const findings = Array.isArray(parsed.schemaFindings) ? parsed.schemaFindings : [];
     const errors = findings.filter((finding) => finding?.severity === "error");
     const schema = readTool?.inputSchema;
-    const schemaValid = schema !== null
-      && typeof schema === "object"
-      && !Array.isArray(schema)
-      && Array.isArray(schema.oneOf)
-      && schema.oneOf.some(
-        (branch) => branch?.properties?.action?.const === "list_vaults",
-      );
+    const schemaValid = schema !== null && typeof schema === "object" && !Array.isArray(schema);
     result.schema_findings = redact(findings, secrets);
     result.schema_warning_count = findings.length - errors.length;
     result.schema_error_count = errors.length;
-    if (!readTool || !schemaValid || errors.length > 0) {
+    const supportsListVaults = Array.isArray(schema?.oneOf) && schema.oneOf.some(
+      (branch) => branch?.properties?.action?.const === "list_vaults",
+    );
+    if (!readTool || !schemaValid || !supportsListVaults || errors.length > 0) {
       result.status = "failed";
-      result.error = !readTool ? "akb_discover is missing from tools/list" : !schemaValid ? "akb_discover/list_vaults has no action schema" : "tools/list contains schema errors";
+      result.error = !readTool
+        ? "akb_discover is missing from tools/list"
+        : !schemaValid
+          ? "akb_discover has no input schema"
+          : !supportsListVaults
+            ? "akb_discover has no list_vaults action schema"
+            : "tools/list contains schema errors";
     }
     return { result, parsed, readSchema: schemaValid ? schema : null, publicResult: null };
   } else {
     const text = Array.isArray(payload.content) ? payload.content.find((item) => item?.type === "text")?.text : null;
     let publicResult;
     try {
-      publicResult = object(JSON.parse(text), "akb_discover/list_vaults result");
+      publicResult = object(JSON.parse(text), "akb_discover list_vaults result");
     } catch {
       result.status = "failed";
-      result.error = "akb_discover/list_vaults did not return a JSON object";
+      result.error = "akb_discover list_vaults did not return a JSON object";
       return { result, parsed, readSchema: null, publicResult: null };
     }
     if (payload.isError !== false || !Array.isArray(publicResult.vaults) || !Number.isInteger(publicResult.total) || !Number.isInteger(publicResult.returned) || publicResult.returned !== publicResult.vaults.length || publicResult.total < publicResult.returned) {
       result.status = "failed";
-      result.error = "akb_discover/list_vaults returned an invalid or error result";
+      result.error = "akb_discover list_vaults returned an invalid or error result";
     }
     return { result, parsed, readSchema: null, publicResult };
   }

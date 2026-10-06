@@ -382,6 +382,66 @@ describe("vault page guide chip", () => {
 
 describe("vault overview content hierarchy", () => {
   it.each([
+    ["LF", "---\ntitle: Synthetic metadata\n---\n# Overview\n\nA synthetic vault purpose.\n\nA later paragraph."],
+    ["CRLF", "---\r\ntitle: Synthetic metadata\r\n---\r\n# Overview\r\n\r\nA synthetic vault purpose.\r\n\r\nA later paragraph."],
+    ["BOM", "\uFEFF---\ntitle: Synthetic metadata\n---\n# Overview\n\nA synthetic vault purpose.\n\nA later paragraph."],
+  ])("hides valid %s YAML frontmatter from the excerpt", async (_lineEnding, content) => {
+    getDocumentMock.mockResolvedValue({ content });
+    renderVault();
+
+    const guide = await screen.findByRole("region", { name: "Vault guide" });
+    await waitFor(() => expect(guide).toHaveTextContent("A synthetic vault purpose."));
+    expect(guide).not.toHaveTextContent("Synthetic metadata");
+    expect(guide).not.toHaveTextContent("A later paragraph.");
+  });
+
+  it.each([
+    [
+      "invalid YAML",
+      "---\ntags: [broken\n---\n\n# Synthetic body heading\n\nEarly body paragraph.\n\n---\n\nLater paragraph.",
+      "--- tags: [broken ---",
+    ],
+    [
+      "an unclosed block before a body separator",
+      "---\ntitle: Synthetic metadata\nFirst body paragraph before separator.\n\n---\n\nLater body paragraph.",
+      "--- title: Synthetic metadata First body paragraph before separator.",
+    ],
+    [
+      "a YAML sequence instead of a mapping",
+      "---\n- synthetic\n---\n\n# Synthetic body heading\n\nEarly body paragraph.\n\n---\n\nLater paragraph.",
+      "--- - synthetic ---",
+    ],
+  ])("preserves the prefix of %s instead of selecting a later paragraph", async (_kind, content, prefix) => {
+    getDocumentMock.mockResolvedValue({ content });
+    renderVault();
+
+    const guide = await screen.findByRole("region", { name: "Vault guide" });
+    await waitFor(() => expect(guide).toHaveTextContent(prefix));
+    expect(guide).not.toHaveTextContent("Later body paragraph.");
+    expect(guide).not.toHaveTextContent("Later paragraph.");
+  });
+
+  it("keeps the existing first-paragraph behavior without frontmatter", async () => {
+    getDocumentMock.mockResolvedValue({
+      content: "An ordinary synthetic purpose.\n\nA later paragraph.",
+    });
+    renderVault();
+
+    const guide = await screen.findByRole("region", { name: "Vault guide" });
+    await waitFor(() => expect(guide).toHaveTextContent("An ordinary synthetic purpose."));
+    expect(guide).not.toHaveTextContent("A later paragraph.");
+  });
+
+  it("keeps the existing empty-guide behavior", async () => {
+    getDocumentMock.mockResolvedValue({ content: "" });
+    renderVault();
+    const emptyGuide = await screen.findByRole("region", { name: "Vault guide" });
+    await waitFor(() => expect(emptyGuide).toHaveTextContent(
+      "Add purpose, scope, and agent instructions when you are ready to customize this guide.",
+    ));
+  });
+
+  it.each([
     ["none", "Private", "Only people with access can open this vault."],
     ["reader", "Public read", "Any signed-in person can read this vault."],
     ["writer", "Public write", "Signed-in users can read, and write when vault policies allow."],

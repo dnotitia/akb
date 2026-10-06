@@ -44,8 +44,8 @@ runner, so there is no second suite array to keep synchronized.
 ### MCP pytest behavior suite
 
 The authenticated MCP behavior suite runs through the official Python SDK.
-`test_list_vaults_e2e.py` remains the small typed `akb_list_vaults({})`
-canary, while `test_product_e2e.py` covers the baseline product scenarios and
+`test_list_vaults_e2e.py` remains the small typed
+`akb_discover(action="list_vaults")` canary, while `test_product_e2e.py` covers the baseline product scenarios and
 `test_detail_e2e.py` covers the migrated detailed regressions: exact-text edit,
 body hash/OCC, collection boundaries, Unicode search, graph link/unlink, grep
 replacement, and ownership transfer. `test_publication_okf_e2e.py` covers
@@ -57,8 +57,14 @@ and public levels, tables/SQL/DDL, basic publication, help, and deletion.
 Each pytest test receives the existing fixture's reset/login/SDK lifecycle;
 scenarios that need role boundaries add a second user through the same
 authenticated endpoint and client lifecycle.
-The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
-pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
+The fixture uses the SDK's public `Client` over both Streamable HTTP and stdio.
+For stdio, it starts this checkout's `akb-mcp` entrypoint and attaches the
+official SDK client; every shared behavior test runs on both transports. The
+catalog contract reads the live `tools/list`, verifies the exact flat or mixed
+backend surface plus the six stdio-local tools, then maps each logical
+operation through that observed surface. The same suite therefore runs against
+either sequential source snapshot without filtering tests or hardcoding one
+catalog shape.
 
 The detailed security suite also covers declarative table constraints and
 indexes, stable permission envelopes, private-document and graph boundaries,
@@ -243,7 +249,7 @@ npm --prefix packages/akb-mcp-client run --silent inspect -- \
 The smoke uses Node.js `>=22.19.0` and the exact-pinned
 `@modelcontextprotocol/inspector@2.4.0` public executable. For each selected
 transport it runs `initialize`, `tools/list --strict --format json`, and
-`akb_list_vaults({})` through the actual Inspector child process. It reports
+`akb_discover(action="list_vaults")` through the actual Inspector child process. It reports
 HTTP and stdio independently, retains Inspector diagnostics and warnings,
 and exits non-zero when either transport or the representative schema/result
 check fails.
@@ -412,3 +418,50 @@ When changing this area, preserve all of the following:
 
 Run the focused runtime tests and the static checks described in the
 repository contribution guide before committing runtime changes.
+
+## CI checks and packaging coverage
+
+Every PR retains the five existing checks: static analysis/package tests,
+backend unit tests, live PostgreSQL tests, the repository runtime E2E gate,
+and frontend mock E2E. Application packaging is one additional **Docker
+images** check, rather than four independent image jobs.
+
+The PostgreSQL image is built and exercised by both the live-DB job and the
+repository runtime. It needs no third build in the packaging workflow.
+Backend, frontend and all-in-one packaging remain checked because running
+the source tests alone does not prove that their Dockerfiles build.
+
+On PRs, `image_scope.py` compares the complete PR diff against its merge base:
+
+| Changed input | Application images built |
+| --- | --- |
+| Backend source, dependencies or Docker inputs | Backend + all-in-one |
+| Frontend workspace or Docker inputs | Frontend + all-in-one |
+| `deploy/all-in-one/` | All-in-one |
+| Backend tests/changelog, human documentation, agent settings, standalone packages, deployment configuration | None; existing test/static checks still run |
+| Image workflow/selector, root Docker ignore rules, or unclassified input | All three |
+| Main push, manual run, or unavailable PR diff | All three |
+
+The selector keeps deleted paths and both sides of renames. A new shared build
+input must be assigned to its consumers when changing a Dockerfile; currently
+standalone `packages/`, `config/`, `eval/`, and non-image deployment manifests
+are outside the application build inputs. Unclassified paths conservatively
+select all three application images. PostgreSQL changes remain covered by the
+unchanged live-DB and runtime jobs.
+
+Workflow triggers stay unconditional: a PR with no image changes completes the
+packaging check without installing a builder, instead of leaving a required
+workflow pending. Selected builds share one runner and use separate GitHub
+Actions layer-cache scopes. Nothing is published. A failed build still fails
+the job, while the other selected builds continue unless the run is cancelled.
+
+The consolidated status is named `Docker images`; repositories with required
+checks configured should replace the old `Docker image (...)` contexts with
+that name. The five test/static status names are unchanged.
+
+Validate the selector locally without Docker or registry access:
+
+```bash
+uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/test_ci_image_scope_unit.py -q
+```

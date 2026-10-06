@@ -84,22 +84,26 @@ describe("DocumentContextPanel", () => {
     expect(relations).toHaveAttribute("aria-expanded", "false");
   });
 
-  it.each([600, 1200])("focuses the local heading without changing route history at %ipx", async width => {
+  it.each([600, 1200])("keeps the outline and its focus available for repeated navigation at %ipx", async width => {
     const user = userEvent.setup();
     measureReader(width);
     render(<ContextHarness />);
-    const heading = screen.getByRole("heading", { name: "Article heading" });
     const originalUrl = window.location.href;
     const originalHistory = window.history.state;
     await user.click(screen.getByRole("button", { name: "Table of contents" }));
     const panel = screen.getByRole(width >= 768 ? "complementary" : "dialog", { name: "On this page" });
-    await user.click(within(panel).getByRole("link", { name: "Jump to article heading" }));
-    expect(panel).not.toBeInTheDocument();
-    await waitFor(() => expect(heading).toHaveFocus());
+    const link = within(panel).getByRole("link", { name: "Jump to article heading" });
+    await user.click(link);
+    expect(panel).toBeInTheDocument();
+    expect(link).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(panel).toBeInTheDocument();
+    expect(link).toHaveFocus();
     expect(window.location.href).toBe(originalUrl);
     expect(window.history.state).toEqual(originalHistory);
-    await user.click(screen.getByRole("button", { name: "Article action" }));
-    expect(heading).not.toHaveAttribute("tabindex");
+    await user.keyboard("{Escape}");
+    expect(panel).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Table of contents" })).toHaveFocus());
   });
 
   it("dismisses on outside click without swallowing the article action or stealing its focus", async () => {

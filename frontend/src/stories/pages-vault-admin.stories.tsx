@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import { delay, http, HttpResponse } from "msw";
 import {
   API,
@@ -239,8 +239,10 @@ export const VaultSettingsOwner: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await expect((await canvas.findAllByText("Danger zone")).length).toBeGreaterThan(0);
+    await userEvent.click(await canvas.findByRole("tab", { name: "Advanced" }));
+    await expect(await canvas.findByRole("heading", { name: "Danger zone" })).toBeVisible();
     // Active vault + write role → the guide is editable here.
+    await userEvent.click(canvas.getByRole("tab", { name: "Vault guide" }));
     await expect(
       await canvas.findByRole("button", { name: /reset to template/i }),
     ).toBeInTheDocument();
@@ -285,11 +287,14 @@ export const VaultSettingsArchived: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("archived", { exact: true })).toBeInTheDocument();
+    await expect(await canvas.findByRole("complementary", { name: "Vault details" })).toBeVisible();
+    await expect(await canvas.findByText("archived", { exact: true })).toBeVisible();
+    await userEvent.click(canvas.getByRole("tab", { name: "Advanced" }));
     await expect(await canvas.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
     // Owner, but the vault is server-side read-only: the guide section renders
     // its read surfaces (await one so the negatives below aren't just "not
     // loaded yet") without the Edit tab or Reset button.
+    await userEvent.click(canvas.getByRole("tab", { name: "Vault guide" }));
     await expect(await canvas.findByRole("tab", { name: /agent view/i })).toBeInTheDocument();
     await expect(canvas.queryByRole("tab", { name: /^edit$/i })).not.toBeInTheDocument();
     await expect(

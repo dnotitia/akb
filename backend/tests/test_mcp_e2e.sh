@@ -86,27 +86,28 @@ import json, sys
 
 tools = json.load(sys.stdin)["result"]["tools"]
 by_name = {tool["name"]: tool for tool in tools}
-expected = {
+expected_groups = {
     "akb_discover": {"list_vaults", "vault_info", "browse", "search", "grep"},
     "akb_document_read": {"get", "section", "activity", "history", "diff", "provenance"},
     "akb_relationships": {"relations", "graph"},
     "akb_vault_access": {"members", "explain"},
     "akb_identity": {"whoami", "search_users"},
-    "akb_publication_read": {"list"},
-    "akb_export_read": {"export"},
-    "akb_document_write": {"put", "update", "edit", "move", "delete", "grep_replace"},
-    "akb_collection_manage": {"create", "delete"},
-    "akb_relationship_manage": {"link", "unlink"},
-    "akb_vault_access_manage": {"grant", "revoke", "transfer_ownership", "set_public"},
-    "akb_publication_manage": {"publish", "snapshot", "unpublish"},
-    "akb_vault_manage": {"create", "archive", "delete"},
-    "akb_table_schema_manage": {"create", "alter", "drop"},
-    "akb_bundle_manage": {"import"},
 }
-expected_names = set(expected) | {"akb_help", "akb_sql"}
+expected_standalone = {
+    "akb_publications", "akb_export",
+    "akb_put", "akb_update", "akb_edit", "akb_move", "akb_delete", "akb_grep_replace",
+    "akb_create_collection", "akb_delete_collection",
+    "akb_link", "akb_unlink",
+    "akb_grant", "akb_revoke", "akb_transfer_ownership", "akb_set_public",
+    "akb_publish", "akb_publication_snapshot", "akb_unpublish",
+    "akb_create_vault", "akb_archive_vault", "akb_delete_vault",
+    "akb_create_table", "akb_alter_table", "akb_drop_table",
+    "akb_import",
+}
+expected_names = set(expected_groups) | expected_standalone | {"akb_help", "akb_sql"}
 actual_names = set(by_name)
 action_diff = {}
-for name, wanted in expected.items():
+for name, wanted in expected_groups.items():
     schema = by_name.get(name, {}).get("inputSchema", {})
     actual = {
         branch.get("properties", {}).get("action", {}).get("const")

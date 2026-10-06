@@ -5,6 +5,7 @@ import { closeHistory } from '@tiptap/pm/history'
 import { createMarkdownExtensions, parseMarkdownReferenceToken } from './extensions.js'
 import { createMarkdownEditorHandle } from './react/editor-handle.js'
 import { markdownTableCommands } from './table.js'
+import { createMarkdownParser } from './markdown-parser.js'
 import type {
   MarkdownCommands,
   MarkdownDocument,
@@ -19,10 +20,60 @@ import type {
 
 export { parseMarkdownReferenceToken }
 
+const managers = new Map<NonNullable<MarkdownParseOptions['profile']>, MarkdownManager>()
+
 function managerFor(options: MarkdownParseOptions = {}): MarkdownManager {
-  return new MarkdownManager({
-    extensions: createMarkdownExtensions({ profile: options.profile }),
+  const profile = options.profile ?? 'preserve'
+  let manager = managers.get(profile)
+  if (!manager) {
+    manager = new MarkdownManager({
+      marked: createMarkdownParser(),
+      extensions: createMarkdownExtensions({ profile }),
+    })
+    managers.set(profile, manager)
+  }
+  return manager
+}
+
+const serializedDocuments = new WeakMap<Editor, {
+  doc: Editor['state']['doc']
+  profile: MarkdownParseOptions['profile']
+  markdown: string
+}>()
+
+// Metadata consumers often inspect the exact string just emitted by an editor.
+// Reuse that semantic tree instead of Markdown -> JSON parsing it three times
+// per keystroke. Bounded to avoid retaining a history of large/private drafts.
+type MetadataDocument = { document: MarkdownDocument; references?: () => MarkdownReferenceToken[] }
+const metadataDocuments = new Map<string, MetadataDocument>()
+const blockReferences = new WeakMap<Editor['state']['doc'], MarkdownReferenceToken[]>()
+
+function rememberMetadataDocument(markdown: string, metadata: MetadataDocument): MetadataDocument {
+  metadataDocuments.delete(markdown)
+  metadataDocuments.set(markdown, metadata)
+  if (metadataDocuments.size > 4) metadataDocuments.delete(metadataDocuments.keys().next().value!)
+  return metadata
+}
+
+function metadataDocument(markdown: string): MetadataDocument {
+  return metadataDocuments.get(markdown) ?? rememberMetadataDocument(markdown, { document: parseMarkdown(markdown) })
+}
+
+function editorReferences(doc: Editor['state']['doc']): MarkdownReferenceToken[] {
+  const unique = new Map<string, MarkdownReferenceToken>()
+  doc.forEach(block => {
+    let references = blockReferences.get(block)
+    if (!references) {
+      // Typed/picker-inserted mentions can be plain text until parsed. Preserve
+      // Markdown semantics (escapes, code, links), but parse only changed blocks.
+      const markdown = serializeMarkdown({ type: 'doc', content: [block.toJSON()] })
+      references = /@|[A-Za-z][A-Za-z0-9_]*-\d/u.test(markdown)
+        ? referencesInDocument(parseMarkdown(markdown)) : []
+      blockReferences.set(block, references)
+    }
+    for (const reference of references) unique.set(markdownReferenceKey(reference), reference)
   })
+  return [...unique.values()]
 }
 
 export function parseMarkdown(
@@ -49,6 +100,9 @@ export function serializeEditorMarkdown(
   editor: Editor,
   options: MarkdownParseOptions = {},
 ): string {
+  const profile = options.profile ?? 'preserve'
+  const cached = serializedDocuments.get(editor)
+  if (cached?.doc === editor.state.doc && cached.profile === profile) return cached.markdown
   const document = editor.getJSON()
   const content = document.content
   const last = content?.at(-1)
@@ -60,7 +114,15 @@ export function serializeEditorMarkdown(
   ) {
     document.content = content.slice(0, -1)
   }
-  return serializeMarkdown(document, options)
+  const markdown = serializeMarkdown(document, options)
+  const doc = editor.state.doc
+  let references: MarkdownReferenceToken[] | undefined
+  rememberMetadataDocument(markdown, {
+    document,
+    references: () => (references ??= editorReferences(doc)),
+  })
+  serializedDocuments.set(editor, { doc: editor.state.doc, profile, markdown })
+  return markdown
 }
 
 export function canonicalizeMarkdown(
@@ -95,11 +157,17 @@ function stripExcludedMarkdownReferences(document: MarkdownDocument): void {
  * asks a product adapter to resolve a link label or code sample.
  */
 export function extractMarkdownReferences(markdown: string): MarkdownReferenceToken[] {
-  const document = parseMarkdown(markdown)
+  const metadata = metadataDocument(markdown)
+  return metadata.references?.() ?? referencesInDocument(metadata.document)
+}
+
+function referencesInDocument(document: MarkdownDocument): MarkdownReferenceToken[] {
   const references: MarkdownReferenceToken[] = []
   const seen = new Set<string>()
 
   const visit = (node: MarkdownNode) => {
+    if (node.type === 'codeBlock' || node.type === 'rawMarkdownBlock' ||
+      node.marks?.some(mark => mark.type === 'link' || mark.type === 'code')) return
     if (node.type === 'text') {
       const referenceMark = node.marks?.find(mark => mark.type === 'markdownReference')
       if (referenceMark && referenceMark.attrs?.escaped !== true) {
@@ -143,7 +211,7 @@ function inferTargetKind(target: string, nodeType: string): MarkdownTargetKind |
  * cannot accidentally become runtime fetches.
  */
 export function extractMarkdownTargets(markdown: string): MarkdownTarget[] {
-  const document = parseMarkdown(markdown)
+  const { document } = metadataDocument(markdown)
   const targets: MarkdownTarget[] = []
   const seen = new Set<string>()
 

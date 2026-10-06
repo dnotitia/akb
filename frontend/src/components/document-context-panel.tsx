@@ -16,11 +16,7 @@ const views = [
 
 type ContextView = typeof views[number]["id"];
 
-function focusHeading(heading: HTMLElement) {
-  if (!heading.hasAttribute("tabindex")) {
-    heading.tabIndex = -1;
-    heading.addEventListener("blur", () => heading.removeAttribute("tabindex"), { once: true });
-  }
+function scrollToHeading(heading: HTMLElement) {
   // scrollIntoView also scrolls overflow:hidden ancestors. A tall collection
   // tree can give the app shell hidden overflow even when this article is
   // short, pulling both sidebars under the header and leaving a bottom gap.
@@ -29,7 +25,6 @@ function focusHeading(heading: HTMLElement) {
   if (canvas) {
     canvas.scrollTop += heading.getBoundingClientRect().top - canvas.getBoundingClientRect().top - canvas.clientTop;
   }
-  heading.focus({ preventScroll: true });
 }
 
 /** Context floats above the article without changing its measure. Small or
@@ -44,7 +39,6 @@ export function DocumentContextPanel({ open, onOpenChange, view, onViewChange, c
   const id = useId();
   const railRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const headingFocusRef = useRef<HTMLElement | null>(null);
   const triggerRefs = useRef<Partial<Record<ContextView, HTMLButtonElement | null>>>({});
   const [floating, setFloating] = useState(false);
   const previousFloatingOpen = useRef(false);
@@ -62,10 +56,7 @@ export function DocumentContextPanel({ open, onOpenChange, view, onViewChange, c
   }, [id]);
 
   const restoreFocus = useCallback(() => {
-    const heading = headingFocusRef.current;
-    headingFocusRef.current = null;
-    if (heading) focusHeading(heading);
-    else if (restoreTriggerFocus.current) triggerRefs.current[view]?.focus({ preventScroll: true });
+    if (restoreTriggerFocus.current) triggerRefs.current[view]?.focus({ preventScroll: true });
   }, [view]);
 
   useLayoutEffect(() => {
@@ -150,8 +141,10 @@ export function DocumentContextPanel({ open, onOpenChange, view, onViewChange, c
     // Native hash navigation discards the route-backed preview's history
     // state. Navigate within this article without closing its parent preview.
     event.preventDefault();
-    headingFocusRef.current = heading;
-    onOpenChange(false);
+    // Keep focus on the outline link for repeated pointer/keyboard navigation.
+    // Focusing the article would dismiss the floating panel or escape the
+    // narrow overlay's focus scope. Only the document's scroll position changes.
+    scrollToHeading(heading);
   };
   const closePanel = () => {
     restoreTriggerFocus.current = true;

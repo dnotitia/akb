@@ -2,23 +2,17 @@ import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   AlertCircle,
-  ArrowRight,
+  Box,
   Check,
-  FilePlus2,
-  FileText,
+  ChevronRight,
+  Folder,
   FolderPlus,
-  FolderTree,
   Info,
   Loader2,
-  MapPin,
-  PanelRightClose,
-  PanelRightOpen,
-  Shapes,
-  Tags,
   X,
 } from "lucide-react";
 import { ApiError, getDocument, putDocument } from "@/lib/api";
-import { DOC_TYPES, type DocType } from "@/lib/doc-constants";
+import type { DocType } from "@/lib/doc-constants";
 import {
   clearDocumentDraft,
   loadDocumentDraft,
@@ -29,16 +23,14 @@ import { useVaultTree, type TreeNode } from "@/hooks/use-vault-tree";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { MarkdownEditorFallback } from "@/components/markdown-editor-fallback";
+import { DocumentAuthoringLayout } from "@/components/document-authoring-layout";
+import { DocumentDetailsFields } from "@/components/document-details-fields";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SelectMenu } from "@/components/ui/select-menu";
-import { TagInput } from "@/components/ui/tag-input";
-import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
   documentTitleConflictFromError,
@@ -149,11 +141,6 @@ export function DocumentCreateForm({
     "idle" | "restored" | "saving" | "saved" | "error" | "expired"
   >(restoredDraftExpired ? "expired" : restoredDraft ? "restored" : "idle");
   const skipInitialDraftSaveRef = useRef(Boolean(restoredDraft));
-  const [detailsOpen, setDetailsOpen] = useState(() =>
-    typeof window === "undefined"
-      ? true
-      : window.matchMedia("(min-width: 1024px)").matches,
-  );
   const titleRef = useRef<HTMLInputElement>(null);
   const collectionRef = useRef<HTMLInputElement>(null);
   const conflictRef = useRef<HTMLDivElement>(null);
@@ -164,13 +151,6 @@ export function DocumentCreateForm({
   const isCollectionSyntaxValid =
     collectionTrimmed === "" ||
     /^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/.test(collectionTrimmed);
-  const matchingCollections = collectionOptions
-    .filter(
-      (path) =>
-        path !== collectionTrimmed &&
-        path.toLowerCase().includes(collectionTrimmed.toLowerCase()),
-    )
-    .slice(0, 6);
   const documents = useMemo(() => collectDocuments(tree ?? []), [tree]);
   const localConflict = useMemo(
     () => findDocumentTitleConflict(documents, title, collectionTrimmed),
@@ -227,13 +207,6 @@ export function DocumentCreateForm({
     }, 300);
     return () => window.clearTimeout(timer);
   }, [body, bodyAssetExpirations, bodyAssetIds, collection, creating, domain, isDirty, summary, tags, title, type, userId, vault]);
-
-  useEffect(() => {
-    const media = window.matchMedia("(min-width: 1024px)");
-    const sync = () => setDetailsOpen(media.matches);
-    media.addEventListener("change", sync);
-    return () => media.removeEventListener("change", sync);
-  }, []);
 
   useEffect(() => {
     if (!hasUnsavedWork || creating) return;
@@ -390,76 +363,16 @@ export function DocumentCreateForm({
           : "New collection — created with the document";
 
   return (
-    <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col bg-background">
-      <header className="relative z-[var(--z-sticky)] flex h-16 shrink-0 items-center gap-3 border-b border-border bg-surface px-3 sm:px-4 lg:px-5">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-primary/20 bg-surface-selected text-surface-selected-foreground sm:flex">
-            <FilePlus2 className="h-4 w-4" aria-hidden />
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <DialogTitle className="truncate font-display text-base sm:text-lg">
-                New document
-              </DialogTitle>
-              <Badge variant="draft" className="hidden sm:inline-flex">Draft</Badge>
-            </div>
-            <DialogDescription className="truncate text-xs">
-              Writing in <span className="font-medium text-foreground">{vault}</span>
-            </DialogDescription>
-          </div>
+    <form onSubmit={handleSubmit} className="@container flex min-h-0 flex-1 flex-col bg-surface" data-testid="document-composer">
+      <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 sm:px-5">
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <Box className="hidden size-4 shrink-0 text-foreground-muted sm:block" aria-hidden />
+          <span className="truncate text-foreground-muted" title={vault}>{vault}</span>
+          <span className="text-subtle" aria-hidden>/</span>
+          <DialogTitle className="shrink-0 text-sm font-semibold">New document</DialogTitle>
+          <DialogDescription className="sr-only">Write a document in {vault}. Choose its collection, add a title and content, then create it.</DialogDescription>
         </div>
-
-        <div className="mx-auto hidden min-w-0 max-w-md items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-xs md:flex">
-          <MapPin className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-          <span className="truncate font-mono text-foreground-muted">
-            akb://{vault}/{collectionTrimmed || "select-collection"}
-          </span>
-        </div>
-
-        <div className="ml-auto flex shrink-0 items-center gap-2">
-          <div className="mr-1 hidden items-center gap-2 text-xs text-foreground-muted xl:flex" role="status" aria-live="polite">
-            {uploadingImage ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-link" aria-hidden />
-            ) : (
-              <span
-                className={cn("h-2 w-2 rounded-full", canSubmit ? "bg-success" : "bg-foreground-muted")}
-                aria-hidden
-              />
-            )}
-            <span>
-              {uploadingImage
-                ? "Uploading image…"
-                : draftStatus === "restored"
-                  ? "Local draft restored"
-                  : draftStatus === "expired"
-                    ? "Draft expired — review attachments"
-                  : draftStatus === "saving"
-                    ? "Saving draft…"
-                    : draftStatus === "saved"
-                      ? "Draft saved locally"
-                      : draftStatus === "error"
-                        ? "Draft storage unavailable"
-                        : canSubmit
-                          ? "Ready to create"
-                          : "Unsaved draft"}
-            </span>
-          </div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            aria-controls="document-properties"
-            aria-expanded={detailsOpen}
-            aria-label={detailsOpen ? "Hide document details" : "Show document details"}
-            onClick={() => setDetailsOpen((open) => !open)}
-          >
-            {detailsOpen ? (
-              <PanelRightClose className="h-4 w-4" aria-hidden />
-            ) : (
-              <PanelRightOpen className="h-4 w-4" aria-hidden />
-            )}
-            <span className="hidden sm:inline">Details</span>
-          </Button>
+        <div className="flex shrink-0 items-center gap-2">
           <Button
             type="submit"
             variant="accent"
@@ -469,9 +382,7 @@ export function DocumentCreateForm({
             aria-label="Create document"
           >
             <span>{creating ? "Creating…" : "Create"}</span>
-            {!creating && <ArrowRight className="h-4 w-4" aria-hidden />}
           </Button>
-          <div className="mx-0.5 h-6 w-px bg-border" aria-hidden />
           <Button
             type="button"
             variant="ghost"
@@ -485,6 +396,19 @@ export function DocumentCreateForm({
           </Button>
         </div>
       </header>
+      <button
+        type="button"
+        aria-label={`Edit collection: ${collectionTrimmed || "Choose a collection"}`}
+        aria-controls="document-properties"
+        onClick={() => collectionRef.current?.focus()}
+        disabled={creating}
+        className="flex min-h-10 shrink-0 items-center gap-2 border-b border-border px-4 text-left text-xs text-foreground-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring @[52rem]:hidden"
+      >
+        <Folder className="size-3.5 shrink-0" aria-hidden />
+        <span>Collection</span>
+        <span className={cn("min-w-0 flex-1 truncate font-medium text-foreground", !collectionTrimmed && "text-link")}>{collectionTrimmed || "Choose a collection (required)"}</span>
+        <ChevronRight className="size-3.5 shrink-0" aria-hidden />
+      </button>
 
       {error && (
         <div className="relative z-[var(--z-raised)] shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6">
@@ -514,267 +438,141 @@ export function DocumentCreateForm({
         </div>
       )}
 
-      <div className="relative min-h-0 flex-1 overflow-hidden">
-        <main
-          className={cn(
-            "h-full overflow-y-auto bg-surface transition-[padding] duration-200",
-            detailsOpen && "lg:pr-96",
-          )}
-        >
-          <div className="flex min-h-full w-full flex-col gap-6 px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
-            <div className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted md:hidden">
-              <MapPin className="h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-              <span className="truncate font-mono">
-                akb://{vault}/{collectionTrimmed || "select-collection"}
-              </span>
+      <DocumentAuthoringLayout
+        writingAs="main"
+        writingProps={{
+          className: cn(invalidField === "body" && "ring-1 ring-inset ring-destructive"),
+          "aria-label": "Document composition",
+          "data-testid": "composer-writing-surface",
+        }}
+        detailsId="document-properties"
+        detailsHeadingId="document-details-heading"
+        details={(
+          <>
+            <div className="border-b border-border px-4 py-3">
+              <h2 id="document-details-heading" className="text-sm font-semibold">Document details</h2>
             </div>
-
-            <section className="space-y-2">
-              <Label htmlFor="doc-title">
-                Title <span className="text-destructive">*</span>
-              </Label>
-              <Input
-                id="doc-title"
-                ref={titleRef}
-                value={title}
-                onChange={(event) => {
-                  setTitle(event.target.value);
-                  setServerConflict(null);
-                  if (invalidField === "title") setInvalidField(null);
-                }}
-                placeholder="Document title"
-                maxLength={256}
-                required
-                aria-required="true"
-                aria-invalid={invalidField === "title" || undefined}
-                aria-describedby={error ? "document-create-error" : undefined}
-                autoFocus
-              />
-            </section>
-
-            <section id="document-create-body" className="group space-y-2">
-              <div className="flex items-center justify-between gap-4">
-                <Label id="doc-body-label" className="flex items-center gap-2">
-                  <FileText
-                    className={cn(
-                      "h-4 w-4 text-foreground-muted transition-colors group-focus-within:text-link",
-                      invalidField === "body" && "text-destructive",
-                    )}
-                    aria-hidden
-                  />
-                  Content <span className="text-destructive">*</span>
-                </Label>
-                <span className="shrink-0 text-xs tabular-nums text-foreground-muted">
-                  {(hasMeaningfulMarkdown(body) ? body.length : 0).toLocaleString()}
-                  <span className="hidden sm:inline"> characters</span>
-                </span>
-              </div>
-              <div
-                className={cn(
-                  "overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface transition-colors focus-within:border-primary",
-                  invalidField === "body" && "border-destructive",
-                )}
-              >
-                <Suspense fallback={<MarkdownEditorFallback />}>
-                  <MarkdownEditor
-                    value={body}
-                    onChange={(markdown, assetIds) => {
-                      setBody(markdown);
-                      setBodyAssetIds(assetIds);
-                      setServerConflict(null);
-                      if (invalidField === "body") setInvalidField(null);
-                    }}
-                    onAssetExpirationsChange={(expirations) => {
-                      setBodyAssetExpirations(expirations);
-                      onAssetExpirationsChange?.(expirations);
-                    }}
-                    onUnclaimedAssetIdsChange={(assetIds) => {
-                      setUnclaimedAssetIds(assetIds);
-                    }}
-                    placeholder="Start with the idea, decision, or context worth keeping…"
-                    ariaLabelledby="doc-body-label"
-                    required
-                    readOnly={creating}
-                    vault={vault}
-                    appearance="workspace"
-                    onUploadingChange={(uploading) => {
-                      setUploadingImage(uploading);
-                      if (uploading) setClaimedAssetIds(null);
-                    }}
-                    onSlashOpenChange={onSlashOpenChange}
-                    initialUnclaimedAssetIds={restoredDraft?.assetIds}
-                    initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
-                    preserveUploadsOnUnmount
-                    claimedAssetIds={claimedAssetIds}
-                  />
-                </Suspense>
-              </div>
-              <div className="flex flex-col gap-1 text-xs text-foreground-muted sm:flex-row sm:items-center sm:justify-between">
-                <span>Paste or drop images directly into the document.</span>
-                <span>Markdown · saved to Git when created</span>
-              </div>
-            </section>
-          </div>
-        </main>
-
-        <aside
-          id="document-properties"
-          aria-label="Document details"
-          className={cn(
-            "absolute inset-y-0 right-0 z-[var(--z-raised)] w-full max-w-md overflow-y-auto border-l border-border bg-surface shadow-lg lg:w-96 lg:shadow-sm",
-            !detailsOpen && "hidden",
-          )}
-        >
-          <div className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-surface px-5">
-            <div>
-              <h2 className="text-sm font-semibold text-foreground">Document details</h2>
-              <p className="text-xs text-foreground-muted">Location and retrieval context</p>
-            </div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Hide document details"
-              onClick={() => setDetailsOpen(false)}
-            >
-              <X className="h-4 w-4" aria-hidden />
-            </Button>
-          </div>
-
-          <section aria-labelledby="document-location-heading" className="border-b border-border px-5 py-6">
-            <div className="mb-4">
-              <h3 id="document-location-heading" className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                <FolderTree className="h-4 w-4 text-link" aria-hidden />
-                Destination
-              </h3>
-              <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                Choose an existing collection or create a nested path.
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="doc-collection">
-                Collection <span className="text-destructive">*</span>
-              </Label>
-              <Input
-                id="doc-collection"
-                ref={collectionRef}
-                value={collection}
-                onChange={(event) => {
-                  setCollection(event.target.value);
-                  setServerConflict(null);
-                  if (invalidField === "collection") setInvalidField(null);
-                }}
-                placeholder="engineering/specs"
-                className="font-mono"
-                maxLength={120}
-                required
-                aria-required="true"
-                aria-invalid={
-                  invalidField === "collection" ||
-                  isReservedCollectionPath ||
-                  (!isCollectionSyntaxValid && collectionTrimmed !== "") ||
-                  undefined
-                }
-                aria-describedby="doc-collection-status"
-                autoComplete="off"
-              />
-              <p
-                id="doc-collection-status"
-                className={cn(
-                  "flex items-start gap-1.5 text-xs leading-relaxed text-foreground-muted",
-                  (isReservedCollectionPath || !isCollectionSyntaxValid) && "text-destructive",
-                )}
-                aria-live="polite"
-              >
-                {isReservedCollectionPath || !isCollectionSyntaxValid ? (
-                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-                ) : isExistingCollection ? (
-                  <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
-                ) : collectionTrimmed ? (
-                  <FolderPlus className="mt-0.5 h-3.5 w-3.5 shrink-0 text-link" aria-hidden />
-                ) : (
-                  <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-                )}
-                <span>{locationState}</span>
-              </p>
-            </div>
-            {matchingCollections.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-1.5" aria-label="Collection suggestions">
-                {matchingCollections.map((path) => (
-                  <button
-                    key={path}
-                    type="button"
-                    onClick={() => {
-                      setCollection(path);
-                      setServerConflict(null);
-                      if (invalidField === "collection") setInvalidField(null);
-                      collectionRef.current?.focus();
-                    }}
-                    className="inline-flex min-h-9 max-w-full cursor-pointer items-center rounded-[var(--radius-md)] border border-border bg-surface px-2.5 py-1 font-mono text-[11px] text-foreground-muted transition-token hover:border-border-strong hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <span className="truncate">{path}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-
-          <section aria-labelledby="document-details-heading" className="px-5 py-6">
-            <div className="mb-5">
-              <h3 id="document-details-heading" className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                <Shapes className="h-4 w-4 text-link" aria-hidden />
-                Retrieval context
-              </h3>
-              <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                Optional details help search and agents find the right context.
-              </p>
-            </div>
-            <div className="space-y-5">
-              <div className="space-y-1.5">
-                <Label htmlFor="doc-summary">
-                  Summary <span className="font-normal text-foreground-muted">Optional</span>
-                </Label>
-                <Textarea
-                  id="doc-summary"
-                  value={summary}
-                  onChange={(event) => setSummary(event.target.value)}
-                  rows={4}
-                  maxLength={500}
-                  placeholder="Describe what this document contains."
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="doc-type">Document type</Label>
-                <SelectMenu
-                  id="doc-type"
-                  aria-label="Document type"
-                  value={type}
-                  onValueChange={(value) => setType(value as DocType)}
-                  options={DOC_TYPES.map((item) => ({ value: item, label: item }))}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="doc-domain">
-                  Domain <span className="font-normal text-foreground-muted">Optional</span>
-                </Label>
+            <fieldset disabled={creating} className="min-w-0 space-y-5 p-4">
+              <legend className="sr-only">Document location and details</legend>
+              <div className="space-y-2">
+                <Label htmlFor="doc-collection" className="text-xs text-foreground-muted">Collection <span className="text-destructive">*</span></Label>
                 <Input
-                  id="doc-domain"
-                  value={domain}
-                  onChange={(event) => setDomain(event.target.value)}
-                  placeholder="engineering, product, ops…"
+                  id="doc-collection" ref={collectionRef} value={collection}
+                  onChange={(event) => { setCollection(event.target.value); setServerConflict(null); if (invalidField === "collection") setInvalidField(null); }}
+                  placeholder="Choose or create a collection"
+                  className="h-9 rounded-[var(--radius-sm)]"
+                  list="document-collection-options" maxLength={120} required aria-required="true"
+                  aria-invalid={invalidField === "collection" || isReservedCollectionPath || (!isCollectionSyntaxValid && collectionTrimmed !== "") || undefined}
+                  aria-describedby="doc-collection-status" autoComplete="off"
+                />
+                <datalist id="document-collection-options">{collectionOptions.map(path => <option key={path} value={path} />)}</datalist>
+                <p id="doc-collection-status" className={cn("flex items-start gap-1.5 text-xs leading-relaxed text-foreground-muted", (isReservedCollectionPath || !isCollectionSyntaxValid) && "text-destructive")} aria-live="polite">
+                  {isReservedCollectionPath || !isCollectionSyntaxValid ? <AlertCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                    : isExistingCollection ? <Check className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                      : collectionTrimmed ? <FolderPlus className="mt-0.5 size-3.5 shrink-0" aria-hidden /> : <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />}
+                  <span>{locationState}</span>
+                </p>
+              </div>
+              <div className="space-y-4 border-t border-border pt-4">
+                <p className="text-xs text-foreground-muted">Optional context for search and agents.</p>
+                <DocumentDetailsFields
+                  value={{ summary, type, domain, tags, status: "active" }}
+                  onChange={(details) => {
+                    setSummary(details.summary);
+                    setType(details.type as DocType);
+                    setDomain(details.domain);
+                    setTags(details.tags);
+                  }}
+                  idPrefix="doc"
+                  disabled={creating}
                 />
               </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="doc-tags" className="flex items-center gap-1.5">
-                  <Tags className="h-3.5 w-3.5 text-foreground-muted" aria-hidden />
-                  Tags <span className="font-normal text-foreground-muted">Optional</span>
-                </Label>
-                <TagInput id="doc-tags" value={tags} onChange={setTags} />
-              </div>
-            </div>
-          </section>
-        </aside>
-      </div>
+            </fieldset>
+          </>
+        )}
+      >
+        <div className="border-b border-border">
+          <div className="space-y-1.5 px-4 py-4 sm:px-6">
+            <Label htmlFor="doc-title" className="text-xs text-foreground-muted">
+              Title <span className="text-destructive">*</span>
+            </Label>
+            <Input
+              id="doc-title"
+              ref={titleRef}
+              value={title}
+              onChange={(event) => {
+                setTitle(event.target.value);
+                setServerConflict(null);
+                if (invalidField === "title") setInvalidField(null);
+              }}
+              placeholder="Document title"
+              className="h-11 rounded-[var(--radius-sm)] border-0 bg-transparent px-0 text-xl font-semibold shadow-none sm:text-2xl"
+              maxLength={256}
+              required
+              aria-required="true"
+              aria-invalid={invalidField === "title" || undefined}
+              aria-describedby={error ? "document-create-error" : undefined}
+              disabled={creating}
+              autoFocus
+            />
+          </div>
+        </div>
+        <section id="document-create-body">
+          <Label id="doc-body-label" className="sr-only">Content (required)</Label>
+          <Suspense fallback={<MarkdownEditorFallback />}>
+            <MarkdownEditor
+              value={body}
+              onChange={(markdown, assetIds) => {
+                setBody(markdown);
+                setBodyAssetIds(assetIds);
+                setServerConflict(null);
+                if (invalidField === "body") setInvalidField(null);
+              }}
+              onAssetExpirationsChange={(expirations) => {
+                setBodyAssetExpirations(expirations);
+                onAssetExpirationsChange?.(expirations);
+              }}
+              onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
+              placeholder="Write something worth keeping…"
+              ariaLabelledby="doc-body-label"
+              required
+              readOnly={creating}
+              vault={vault}
+              appearance="workspace"
+              className="!px-4 !text-base sm:!px-6"
+              sourceClassName="block !px-4 sm:!px-6"
+              onUploadingChange={(uploading) => {
+                setUploadingImage(uploading);
+                if (uploading) setClaimedAssetIds(null);
+              }}
+              onSlashOpenChange={onSlashOpenChange}
+              initialUnclaimedAssetIds={restoredDraft?.assetIds}
+              initialUnclaimedAssetExpirations={restoredDraft?.assetExpiresAt}
+              preserveUploadsOnUnmount
+              claimedAssetIds={claimedAssetIds}
+            />
+          </Suspense>
+        </section>
+      </DocumentAuthoringLayout>
+      <footer className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-border bg-surface px-4 py-2 text-xs text-foreground-muted">
+        <span className="flex min-w-0 items-center gap-1.5" role="status" aria-live="polite">
+          {uploadingImage && <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden />}
+          {uploadingImage
+            ? "Uploading image…"
+            : draftStatus === "restored"
+              ? "Local draft restored"
+              : draftStatus === "expired"
+                ? "Draft expired — review attachments"
+                : draftStatus === "saving"
+                  ? "Saving draft…"
+                  : draftStatus === "saved"
+                    ? "Draft saved locally"
+                    : draftStatus === "error"
+                      ? "Draft storage unavailable"
+                      : "Unsaved draft"}
+        </span>
+        <span className="tabular-nums">{(hasMeaningfulMarkdown(body) ? body.length : 0).toLocaleString()} characters</span>
+      </footer>
     </form>
   );
 }

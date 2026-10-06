@@ -88,8 +88,35 @@ def _tool_names() -> set[str]:
     return names
 
 
+def _tool_groups() -> dict[str, set[str]]:
+    """Static composite catalog as {group_name: canonical operation names}."""
+    for node in ast.walk(_module_tree("tools.py")):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "TOOL_GROUPS" for target in node.targets):
+            continue
+        assert isinstance(node.value, ast.Dict), "TOOL_GROUPS must stay a literal mapping"
+        groups: dict[str, set[str]] = {}
+        for group_node, actions_node in zip(node.value.keys, node.value.values):
+            if not (
+                isinstance(group_node, ast.Constant)
+                and isinstance(group_node.value, str)
+                and isinstance(actions_node, ast.Dict)
+            ):
+                continue
+            groups[group_node.value] = {
+                operation.value
+                for operation in actions_node.values
+                if isinstance(operation, ast.Constant) and isinstance(operation.value, str)
+            }
+        return groups
+    raise AssertionError("TOOL_GROUPS assignment not found in tools.py")
+
+
 def _known_tools() -> set[str]:
-    return _tool_names() | set(_PROXY_ONLY_TOOLS)
+    groups = _tool_groups()
+    grouped_operations = set().union(*groups.values())
+    return (_tool_names() - grouped_operations) | set(groups) | set(_PROXY_ONLY_TOOLS)
 
 
 def _help_topics() -> dict[str | None, str]:

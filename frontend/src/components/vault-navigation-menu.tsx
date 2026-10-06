@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import { visibleNavigationItems } from "@/lib/navigation-overflow";
 import { cn } from "@/lib/utils";
+import { VaultHeaderActionsSlot } from "@/components/vault-header-actions";
 
 const sectionPaths = {
   overview: "/vault/:name",
@@ -121,7 +122,7 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
   };
 
   return (
-    <div className={cn("@container/vault-navigation relative flex h-11 min-w-0 shrink-0 items-center gap-2 px-3 lg:h-10", route === sectionPaths.search ? "bg-surface" : "bg-background")}>
+    <div className="@container/vault-navigation relative flex h-11 min-w-0 shrink-0 items-center gap-2 bg-surface px-3 lg:h-10">
     <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 border-b border-border" />
     <nav
       ref={navRef}
@@ -154,6 +155,7 @@ function VaultNavigationLinks({ vault, route }: { vault: string; route: string }
       </div>
       </div>
     </nav>
+    <VaultHeaderActionsSlot />
     </div>
   );
 }

@@ -39,6 +39,7 @@ async def native_publications(monkeypatch):
         conn = await asyncpg.connect(dsn)
         await conn.execute((_BACKEND / "app/db/init.sql").read_text())
         for filename in (
+            "015_events_outbox.py",
             "048_native_revision_core.py",
             "053_native_revision_m1_pg_body.py",
             "055_native_revision_m1_file_storage.py",

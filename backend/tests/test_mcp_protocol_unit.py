@@ -62,17 +62,8 @@ async def test_modern_and_all_legacy_revisions_share_one_authenticated_endpoint(
     monkeypatch.setattr(settings, "document_revision_backend", backend)
 
     def assert_creation_catalog(response):
-        manage = next(
-            tool
-            for tool in response.json()["result"]["tools"]
-            if tool["name"] == "akb_vault_manage"
-        )
-        create = next(
-            branch
-            for branch in manage["inputSchema"]["oneOf"]
-            if branch["properties"]["action"].get("const") == "create"
-        )
-        properties = create["properties"]
+        create = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "akb_create_vault")
+        properties = create["inputSchema"]["properties"]
         assert ("template" in properties) is (backend == "bare_git")
         assert ("external_git" in properties) is (backend == "bare_git")
 
@@ -294,7 +285,7 @@ async def test_protocol_conflicts_fail_before_dispatch_or_session_creation(monke
             response = await _post(
                 client,
                 modern_call,
-                **{**base_headers, "mcp-name": "akb_discover"},
+                **{**base_headers, "mcp-name": "akb_search"},
             )
             assert response.status_code == 400
             assert response.json()["error"]["code"] == -32020

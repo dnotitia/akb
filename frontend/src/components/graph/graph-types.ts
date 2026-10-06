@@ -25,6 +25,10 @@ export interface GraphNode {
   kind: NodeKind;
   doc_id?: string;
   doc_type?: string;
+  /** Server-confirmed global incident-edge count; absent is unknown. */
+  degree?: number;
+  /** Distance from the requested root in a server neighborhood response. */
+  depth?: number;
   /** Cluster id (top-level collection) for grouping/coloring/hulls.
    *  Derived from the URI at render time; null = ungrouped. See cluster.ts. */
   group?: string | null;
@@ -36,10 +40,12 @@ export interface GraphEdge {
   source: string;
   target: string;
   relation: RelationKind;
+  /** Server-reported provenance. Never infer it from the relation label. */
+  kind?: "implicit" | "explicit";
 }
 
 /** A related-resource reference from the detail panel's RELATIONS list —
- *  carries enough (name, kind, relation, direction) to materialize the node
+ *  carries enough (name, kind, relation, direction, source) to materialize the node
  *  AND its edge in the graph when the relation isn't currently rendered. */
 export interface RelatedRef {
   uri: string;
@@ -47,6 +53,8 @@ export interface RelatedRef {
   kind: NodeKind;
   relation: RelationKind;
   direction: "incoming" | "outgoing";
+  /** Relation provenance, distinct from the related resource's kind. */
+  source?: GraphEdge["kind"];
 }
 
 export interface GraphView {
@@ -64,7 +72,7 @@ export interface GraphView {
 }
 
 export const DEFAULT_VIEW: GraphView = {
-  hops: 2,
+  hops: 1,
   types: new Set(ALL_NODE_KINDS),
   relations: new Set(ALL_RELATIONS),
 };

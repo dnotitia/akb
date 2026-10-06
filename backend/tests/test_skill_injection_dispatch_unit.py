@@ -51,12 +51,8 @@ _SENTINEL = {
 
 
 def test_vault_of_call_public_name():
-    assert vault_of_call(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    ) == "v1"
-    assert vault_of_call(
-        "akb_discover", {"action": "search", "vault": "v2", "query": "x"}
-    ) == "v2"
+    assert vault_of_call("akb_get", {"uri": "akb://v1/doc/notes/a.md"}) == "v1"
+    assert vault_of_call("akb_search", {"vault": "v2", "query": "x"}) == "v2"
     assert vault_of_call("akb_sql", {"vaults": ["a", "b"]}) is None
 
 
@@ -95,6 +91,17 @@ def wired(monkeypatch):
 
 
 async def _run(name: str, args: dict) -> dict:
+    from mcp_server.tools import TOOL_GROUPS
+
+    for group, actions in TOOL_GROUPS.items():
+        for action, operation in actions.items():
+            if operation == name:
+                name = group
+                args = {"action": action, **args}
+                break
+        else:
+            continue
+        break
     out = await call_tool(name, args)
     return json.loads(out.content[0].text)
 
@@ -116,9 +123,7 @@ def _authorizing(vault: str | None, result: dict | None = None):
 async def test_success_path_attaches_payload(wired):
     wired["dispatch"](_authorizing("v1"))
 
-    body = await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    )
+    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body["ok"] == 1
     assert body["vault_skill"] == _SENTINEL
@@ -143,9 +148,7 @@ async def test_authorized_vault_mismatch_blocks_injection(wired):
     """Fail-closed: the args name v2, the completed check covered v1."""
     wired["dispatch"](_authorizing("v1"))
 
-    body = await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v2/doc/notes/a.md"}
-    )
+    body = await _run("akb_get", {"uri": "akb://v2/doc/notes/a.md"})
 
     assert "vault_skill" not in body
     assert wired["calls"] == []
@@ -154,9 +157,7 @@ async def test_authorized_vault_mismatch_blocks_injection(wired):
 async def test_stale_authorization_does_not_leak_into_the_next_call(wired):
     """A reused task context must not carry a previous call's authorization."""
     wired["dispatch"](_authorizing("v1"))
-    await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    )
+    await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     wired["dispatch"](_authorizing(None, {"help": "..."}))
     body = await _run("akb_help", {"topic": "quickstart", "vault": "v1"})
@@ -171,9 +172,7 @@ async def test_raised_exception_gets_envelope_without_injection(wired):
 
     wired["dispatch"](boom)
 
-    body = await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    )
+    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body.get("error")
     assert "vault_skill" not in body
@@ -187,9 +186,7 @@ async def test_handler_error_dict_gets_no_injection(wired):
 
     wired["dispatch"](denied)
 
-    body = await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    )
+    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body["code"] == "FORBIDDEN"
     assert "vault_skill" not in body
@@ -216,9 +213,7 @@ async def test_injector_failure_never_fails_the_call(monkeypatch, wired):
     wired["dispatch"](_authorizing("v1"))
     monkeypatch.setattr(vault_skill_service, "injection_payload", exploding)
 
-    body = await _run(
-        "akb_document_read", {"action": "get", "uri": "akb://v1/doc/notes/a.md"}
-    )
+    body = await _run("akb_get", {"uri": "akb://v1/doc/notes/a.md"})
 
     assert body == {"ok": 1}
 
@@ -244,14 +239,14 @@ async def test_first_write_returns_guide_before_dispatch(monkeypatch, wired):
     monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
     monkeypatch.setattr(vault_skill_service, "injection_payload", payload)
     wired["dispatch"](dispatch)
-    args = {"action": "update", "uri": "akb://v1/doc/notes/a.md", "content": "new"}
+    args = {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
 
-    first = await _run("akb_document_write", args)
+    first = await _run("akb_update", args)
     assert first["code"] == "vault_skill_required"
     assert first["vault_skill"] == _SENTINEL
     assert dispatched == 0
 
-    second = await _run("akb_document_write", args)
+    second = await _run("akb_update", args)
     assert second == {"updated": True}
     assert dispatched == 1
 
@@ -263,15 +258,18 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
     acknowledgements = []
     token = "opaque-session-vault-challenge"
 
-    async def can_read(user, uid, vault):
-        access_service._authorized_vault.set(vault)
-        access_service._authorized_vault_id.set("immutable-v1")
-        return True
-
     async def strict_payload(
-        session_id, vault, vault_id=None, *, acknowledgement=None
+        session_id,
+        vault,
+        vault_id=None,
+        *,
+        request_binding,
+        permission_binding,
+        acknowledgement=None,
     ):
         acknowledgements.append(acknowledgement)
+        assert request_binding
+        assert permission_binding == "current-permissions"
         if acknowledgement == token:
             return None
         return {**_SENTINEL, "ack_token": token}
@@ -286,119 +284,33 @@ async def test_v2_write_requires_explicit_matching_ack_and_strips_it(
         return {"updated": True}
 
     monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
+    async def permission_binding(_user, _name, vault):
+        access_service._authorized_vault.set(vault)
+        access_service._authorized_vault_id.set("immutable-v1")
+        return "current-permissions"
+
+    monkeypatch.setattr(
+        server_mod, "_vault_skill_permission_binding", permission_binding
+    )
     monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
     monkeypatch.setattr(
         vault_skill_service, "injection_payload", no_additive_payload
     )
     wired["dispatch"](dispatch)
-    args = {"action": "update", "uri": "akb://v1/doc/notes/a.md", "content": "new"}
+    args = {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
 
-    first = await _run("akb_document_write", args)
-    second = await _run("akb_document_write", args)
+    first = await _run("akb_update", args)
+    second = await _run("akb_update", args)
     assert first["code"] == second["code"] == "vault_skill_required"
     assert first["vault_skill"]["ack_token"] == token
     assert dispatched == 0
 
     successful = await _run(
-        "akb_document_write", {**args, server_mod.VAULT_SKILL_ACK_ARGUMENT: token}
+        "akb_update", {**args, server_mod.VAULT_SKILL_ACK_ARGUMENT: token}
     )
     assert successful == {"updated": True}
     assert dispatched == 1
     assert acknowledgements == [None, None, token]
-
-
-async def test_v2_write_validates_action_before_vault_skill_preflight(
-    monkeypatch, wired
-):
-    preflight_calls = []
-
-    async def strict_payload(*args, **kwargs):
-        preflight_calls.append((args, kwargs))
-        return {**_SENTINEL, "ack_token": "challenge"}
-
-    monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
-    wired["dispatch"](
-        lambda *_args: pytest.fail("invalid candidate input reached dispatch")
-    )
-
-    body = await _run(
-        "akb_document_write",
-        {"action": "put", "parent": "akb://v1", "title": "missing body"},
-    )
-
-    assert body["code"] == "invalid_argument"
-    assert "Missing required argument 'content'" in body["error"]
-    assert preflight_calls == []
-
-
-async def test_v2_multi_vault_write_uses_one_ack_for_every_guide(
-    monkeypatch, wired
-):
-    dispatched = 0
-    acknowledgements = []
-    tokens = {"v1": "guide-token-v1", "v2": "guide-token-v2"}
-
-    async def can_read(user, uid, vault):
-        access_service._authorized_vault.set(vault)
-        access_service._authorized_vault_id.set(f"id-{vault}")
-        return True
-
-    async def strict_payload(
-        session_id, vault, vault_id=None, *, acknowledgement=None
-    ):
-        acknowledgements.append((vault, acknowledgement))
-        if acknowledgement == tokens[vault]:
-            return None
-        return {
-            "vault": vault,
-            "version": "v1",
-            "reason": "first_touch",
-            "body": f"# {vault} conventions",
-            "truncated": False,
-            "ack_token": tokens[vault],
-        }
-
-    async def dispatch(name, args, user):
-        nonlocal dispatched
-        dispatched += 1
-        assert server_mod.VAULT_SKILL_ACK_ARGUMENT not in args
-        return {"replaced": True}
-
-    monkeypatch.setattr(server_mod, "_vault_skill_preflight_version", lambda: 2)
-    monkeypatch.setattr(server_mod, "_can_read_vault", can_read)
-    monkeypatch.setattr(vault_skill_service, "preflight_payload", strict_payload)
-    wired["dispatch"](dispatch)
-    args = {
-        "action": "grep_replace",
-        "vault": ["v1", "v2"],
-        "pattern": "needle",
-        "replace": "",
-    }
-
-    first = await _run("akb_document_write", args)
-    assert first["code"] == "vault_skill_required"
-    assert first["vault_skill"]["vault"] == "v1"
-    assert [item["vault"] for item in first["vault_skill"]["additional_vaults"]] == ["v2"]
-    token = first["vault_skill"]["ack_token"]
-    assert token.startswith("batch1.")
-    assert dispatched == 0
-
-    second = await _run(
-        "akb_document_write",
-        {**args, server_mod.VAULT_SKILL_ACK_ARGUMENT: token},
-    )
-    assert second == {"replaced": True}
-    assert dispatched == 1
-    assert acknowledgements == [
-        ("v1", None),
-        ("v2", None),
-        ("v1", None),
-        ("v2", None),
-        ("v1", tokens["v1"]),
-        ("v2", tokens["v2"]),
-    ]
 
 
 async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
@@ -406,20 +318,21 @@ async def test_v2_tool_list_advertises_ack_only_on_possible_writes(monkeypatch):
     tools = await server_mod.list_tools()
     by_name = {tool.name: tool for tool in tools}
 
-    def has_ack(tool_name: str) -> bool:
-        schema = by_name[tool_name].input_schema
-        if server_mod.VAULT_SKILL_ACK_ARGUMENT in schema.get("properties", {}):
-            return True
-        return any(
-            server_mod.VAULT_SKILL_ACK_ARGUMENT in branch.get("properties", {})
-            for branch in schema.get("oneOf", [])
-        )
-
-    assert has_ack("akb_document_write")
-    # Candidate discovery and document-read capabilities are strictly
-    # read-only and do not carry the acknowledgement argument.
-    assert not has_ack("akb_discover")
-    assert not has_ack("akb_document_read")
+    assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
+        by_name["akb_update"].input_schema["properties"]
+    )
+    # Bulk replacement has an independent writer schema and acknowledgement.
+    assert server_mod.VAULT_SKILL_ACK_ARGUMENT in (
+        by_name["akb_grep_replace"].input_schema["properties"]
+    )
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_discover"].input_schema["oneOf"]
+    )
+    assert all(
+        server_mod.VAULT_SKILL_ACK_ARGUMENT not in branch["properties"]
+        for branch in by_name["akb_document_read"].input_schema["oneOf"]
+    )
 
 
 async def test_legacy_client_write_succeeds_and_gets_additive_guide(
@@ -439,8 +352,7 @@ async def test_legacy_client_write_succeeds_and_gets_additive_guide(
     wired["dispatch"](dispatch)
 
     body = await _run(
-        "akb_document_write",
-        {"action": "update", "uri": "akb://v1/doc/notes/a.md", "content": "new"},
+        "akb_update", {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
     )
 
     assert body == {"updated": True, "vault_skill": _SENTINEL}
@@ -458,7 +370,6 @@ async def test_write_only_caller_executes_without_skill_disclosure(monkeypatch, 
     monkeypatch.setattr(server_mod, "_can_read_vault", cannot_read)
     wired["dispatch"](_authorizing("v1", {"updated": True}))
     body = await _run(
-        "akb_document_write",
-        {"action": "update", "uri": "akb://v1/doc/notes/a.md", "content": "new"},
+        "akb_update", {"uri": "akb://v1/doc/notes/a.md", "content": "new"}
     )
     assert body == {"updated": True}

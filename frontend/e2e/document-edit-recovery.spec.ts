@@ -102,7 +102,8 @@ test.describe("document edit recovery mock contract", () => {
     await expect(
       wysiwyg.getByRole("heading", { level: 1, name: wysiwygHeadingText, exact: true }),
     ).toBeVisible();
-    await page.getByRole("button", { name: "Source" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toBeVisible();
     await expect(source).toHaveValue(sourceMarkdown);
@@ -110,7 +111,8 @@ test.describe("document edit recovery mock contract", () => {
     await expect(page.getByText("Draft saved locally")).toBeVisible();
     await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Source revision");
     await expect(editor).toContainText("same draft");
@@ -118,7 +120,8 @@ test.describe("document edit recovery mock contract", () => {
     await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
 
     await page.getByRole("button", { name: "Edit" }).click();
-    await page.getByRole("button", { name: "Source" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     await expect(
       page.getByRole("textbox", { name: "Document body (markdown)" }),
     ).toHaveValue(editedMarkdown);
@@ -144,11 +147,13 @@ test.describe("document edit recovery mock contract", () => {
     ].join("\n");
 
     await page.goto(recovery.identity!.start_url!);
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await source.fill(markdown);
     await expect(page.getByText("Draft saved locally")).toBeVisible();
-    await page.getByRole("button", { name: "WYSIWYG", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
 
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     const parent = editor.getByRole("checkbox", { name: "Task item checkbox for TASK_PARENT_AKB330", exact: true });
@@ -172,7 +177,8 @@ test.describe("document edit recovery mock contract", () => {
     await page.keyboard.press("Tab");
     await expect(code).toBeFocused();
 
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     await expect(source).toHaveValue(/- \[x\] TASK(?:\\)?_PARENT(?:\\)?_AKB330/);
     await expect(source).toHaveValue(/- \[x\] TASK(?:\\)?_NESTED(?:\\)?_AKB330/);
     await expect(source).toHaveValue(/- \[ \] TASK(?:\\)?_POINTER(?:\\)?_AKB330/);
@@ -185,21 +191,24 @@ test.describe("document edit recovery mock contract", () => {
     await page.goto("/vault/fixture/doc/new?collection=notes");
     await expect(page.getByRole("heading", { name: "New document" })).toBeVisible();
     await page.getByRole("textbox", { name: "Title *" }).fill(title);
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
 
     const source = page.getByRole("textbox", { name: /Markdown source/ });
     await source.fill(sourceMarkdown);
     await expect(source).toHaveValue(sourceMarkdown);
     await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
     await expect(page.getByRole("textbox", { name: /Content/ })).toContainText("Created from Source");
     await page.getByRole("button", { name: "Create document" }).click();
     await expect(page.getByRole("heading", { name: title })).toBeVisible();
     await expect(page.getByText("persisted", { exact: true })).toBeVisible();
 
     await page.getByRole("button", { name: "Edit" }).click();
-    await page.getByRole("button", { name: "Source", exact: true }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     await expect(
       page.getByRole("textbox", { name: "Document body (markdown)" }),
     ).toHaveValue(sourceMarkdown);
@@ -222,7 +231,8 @@ test.describe("document edit recovery mock contract", () => {
     });
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    await page.getByRole("button", { name: "Source" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toBeVisible();
     await source.fill("Local draft before another editor saves");
@@ -235,7 +245,8 @@ test.describe("document edit recovery mock contract", () => {
     await operate(request, recovery.operations!.refetch);
     await expect(source).toHaveValue("Local draft before another editor saves");
 
-    await page.getByRole("button", { name: "WYSIWYG" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Local draft before another editor saves");
     await page.getByRole("button", { name: "Save changes" }).click();
@@ -296,7 +307,8 @@ test.describe("document edit recovery mock contract", () => {
   }) => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
-    await page.getByRole("button", { name: "Source" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await source.fill("Draft retained after a retryable server failure");
     await expect(page.getByText("Draft saved locally")).toBeVisible();
@@ -347,7 +359,8 @@ test.describe("document edit recovery mock contract", () => {
     const recovery = await fixture(request);
     await page.goto(recovery.identity!.start_url!);
     await page.getByRole("textbox", { name: "Document title" }).fill(draftTitle);
-    await page.getByRole("button", { name: "Source" }).click();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await editor.fill(draftBody);
     await expect(page.getByText("Draft saved locally")).toBeVisible();

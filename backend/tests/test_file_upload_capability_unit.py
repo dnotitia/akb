@@ -825,23 +825,20 @@ async def test_the_discarded_body_is_still_consumed(monkeypatch):
     assert consumed == [b"evil"]
 
 
-async def test_a_confirmed_file_replacement_stores_its_staging_body(monkeypatch):
-    """A confirmed File still accepts bytes through its replacement key."""
+async def test_a_pending_reservation_still_stores_its_body(monkeypatch):
+    """The ordinary path must be untouched: a fresh reservation writes."""
     from app.api.routes import files as route_mod
     from app.config import settings
 
     stored: dict = {}
-    staging_key = f"{_KEY}.replacement"
 
     async def _grant(_token):
-        return {"object_key": staging_key, "mime_type": "application/pdf",
+        return {"object_key": _KEY, "mime_type": "application/pdf",
                 "already_confirmed": False}
 
     async def _store(key, chunks, *, content_type, max_bytes, declared_bytes=None):
         stored["key"] = key
-        stored["body"] = b"".join([c async for c in chunks])
-        stored["content_type"] = content_type
-        return len(stored["body"])
+        return sum([len(c) async for c in chunks])
 
     monkeypatch.setattr(route_mod.file_service, "resolve_write_capability", _grant)
     monkeypatch.setattr(route_mod, "store_object_stream", _store)
@@ -852,26 +849,16 @@ async def test_a_confirmed_file_replacement_stores_its_staging_body(monkeypatch)
     )
 
     assert response.status_code == 200
-    assert stored["key"] == staging_key
-    assert stored["body"] == b"good"
-    assert stored["content_type"] == "application/pdf"
+    assert stored["key"] == _KEY
 
 
-@pytest.mark.parametrize(
-    ("grant_object_key", "expected_already_confirmed"),
-    [(_KEY, True), (f"{_KEY}.replacement", False)],
-    ids=("confirmed-live-key", "confirmed-staging-key"),
-)
-async def test_the_resolver_reports_whether_the_file_is_already_final(
-    monkeypatch, grant_object_key, expected_already_confirmed,
-):
+async def test_the_resolver_reports_whether_the_file_is_already_final(monkeypatch):
     """The route cannot make that decision without being told, and the
-    statement depends on both the File state and whether this grant names its
-    live object or a replacement staging key."""
+    statement is where it has to come from — the File row, not the grant."""
     row = {
         "file_id": uuid.uuid4(),
         "vault_id": uuid.uuid4(),
-        "object_key": grant_object_key,
+        "object_key": _KEY,
         "file_s3_key": _KEY,
         "mime_type": "application/pdf",
         "upload_state": "confirmed",
@@ -879,8 +866,25 @@ async def test_the_resolver_reports_whether_the_file_is_already_final(
     service, pool = await _service(monkeypatch, row=row)
 
     grant = await service.resolve_write_capability("A" * 43)
-    assert grant["already_confirmed"] is expected_already_confirmed
+    assert grant["already_confirmed"] is True
 
     sql, _params = pool.conn.queries[0]
     assert "f.upload_state" in sql, "the state must come from the File row"
-    assert "f.s3_key" in sql, "the live File key must be compared with the capability key"
+    assert "f.s3_key AS file_s3_key" in sql
+
+
+async def test_a_replacement_capability_for_a_confirmed_file_still_stores_bytes(monkeypatch):
+    row = {
+        "file_id": uuid.uuid4(),
+        "vault_id": uuid.uuid4(),
+        "object_key": "__akb_file_replacements__/team/file/replacement",
+        "file_s3_key": _KEY,
+        "mime_type": "application/pdf",
+        "upload_state": "confirmed",
+    }
+    service, _pool = await _service(monkeypatch, row=row)
+
+    grant = await service.resolve_write_capability("A" * 43)
+
+    assert grant["already_confirmed"] is False
+    assert grant["object_key"] == row["object_key"]

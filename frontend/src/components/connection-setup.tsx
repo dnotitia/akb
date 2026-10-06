@@ -13,7 +13,7 @@ import { SelectMenu } from "@/components/ui/select-menu";
 import { cn } from "@/lib/utils";
 
 export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreated, onBusyChange, invalidatedTokenId, onDirtyChange, initialDraft, replacement = false, onReceipt, layout = "compact" }: {
-  layout?: "compact" | "workspace";
+  layout?: "compact" | "workspace" | "settings";
   mcpOauthEnabled: boolean;
   onTokenCreated?: () => void;
   onSecretCreated?: () => void;
@@ -81,9 +81,9 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
     }
   }
 
-  const workspace = layout === "workspace";
-  const stepClass = workspace ? "min-w-0 space-y-4 rounded-[var(--radius-md)] border border-border bg-surface p-4 sm:p-5" : "space-y-3";
-  return <div className={cn("text-sm", workspace ? "grid items-start gap-4 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]" : "space-y-5")}>
+  const workspace = layout !== "compact";
+  const stepClass = layout === "settings" ? "min-w-0 space-y-4 border-t border-border pt-5 first:border-t-0 first:pt-0" : workspace ? "min-w-0 space-y-4 rounded-[var(--radius-md)] border border-border bg-surface p-4 sm:p-5" : "space-y-3";
+  return <div className={cn("text-sm", layout === "settings" ? "space-y-6" : workspace ? "grid items-start gap-4 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]" : "space-y-5")}>
     <section className={stepClass} aria-labelledby={`${id}-choose`}>
       <h3 id={`${id}-choose`} className="font-semibold text-foreground">{workspace ? "1. Prepare access" : "1. Choose your tool"}</h3>
       <div className="space-y-1.5">

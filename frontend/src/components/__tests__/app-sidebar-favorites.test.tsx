@@ -26,17 +26,17 @@ describe("Workspace favorite navigation", () => {
   it("keeps account Settings last in the fixed support area, distinct from Vault settings", () => {
     mount();
     const support = screen.getByRole("navigation", { name: "Workspace support" });
-    const settings = within(support).getByRole("link", { name: "Settings" });
-    expect(settings).toHaveAttribute("href", "/settings");
+    const settings = within(support).getByRole("button", { name: "Settings" });
+    expect(settings).toHaveAttribute("aria-haspopup", "dialog");
     expect(settings).not.toHaveAttribute("aria-current");
     expect(support.lastElementChild).toBe(settings);
   });
 
-  it.each([false, true])("marks Settings active and preserves the open section (compact=%s)", async compact => {
+  it.each([false, true])("keeps Settings as a modal action rather than an active page (compact=%s)", async compact => {
     mount(compact, "/settings?tab=tokens");
-    const settings = screen.getByRole("link", { name: "Settings" });
-    expect(settings).toHaveAttribute("aria-current", "page");
-    expect(settings).toHaveAttribute("href", "/settings?tab=tokens");
+    const settings = screen.getByRole("button", { name: "Settings" });
+    expect(settings).not.toHaveAttribute("aria-current");
+    expect(settings).toHaveAttribute("aria-haspopup", "dialog");
     expect(screen.queryByRole("link", { name: "Connect AI tools" })).not.toBeInTheDocument();
     if (compact) {
       const user = userEvent.setup();
@@ -60,7 +60,7 @@ describe("Workspace favorite navigation", () => {
     mount(); const user = userEvent.setup();
     expect(screen.queryByRole("link", { name: /Inbox/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Connect AI tools" })).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
+    expect(screen.getByRole("button", { name: "Settings" })).toHaveAttribute("aria-haspopup", "dialog");
     await user.click(screen.getByRole("button", { name: "Help" }));
     expect(screen.getByRole("dialog", { name: "Getting around AKB" })).toBeVisible();
     await user.keyboard("{Escape}");

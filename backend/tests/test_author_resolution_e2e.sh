@@ -98,7 +98,7 @@ DN_OK=$(curl -sk -X PATCH "$BASE_URL/api/v1/auth/me" \
 
 SID1=$(setup_mcp "$PAT1")
 VAULT="authres-$(date +%s)"
-mc "$PAT1" "$SID1" "akb_vault_manage" "{\"action\":\"create\",\"name\":\"$VAULT\",\"description\":\"author resolution test\"}" >/dev/null
+mc "$PAT1" "$SID1" "akb_create_vault" "{\"name\":\"$VAULT\",\"description\":\"author resolution test\"}" >/dev/null
 pass "vault created"
 
 # Create a doc via the REST write path → documents.created_by = USER1 username.
@@ -144,8 +144,8 @@ fi
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-mc "$PAT1" "$SID1" "akb_vault_manage" "{\"action\":\"archive\",\"vault\":\"$VAULT\"}" >/dev/null 2>&1
-mc "$PAT1" "$SID1" "akb_vault_manage" "{\"action\":\"delete\",\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+mc "$PAT1" "$SID1" "akb_archive_vault" "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+mc "$PAT1" "$SID1" "akb_delete_vault" "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
 pass "Vault deleted"
 
 echo ""

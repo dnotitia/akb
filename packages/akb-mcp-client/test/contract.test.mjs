@@ -438,8 +438,8 @@ itAsync("proxy-local first write returns the vault guide before side effects", a
   };
 
   const response = await proxy._handleFileTool(7, {
-    name: "akb_file_write",
-    arguments: { action: "put_image", vault: "myvault", file_path: "/not-read-before-preflight.png" },
+    name: "akb_put_image",
+    arguments: { vault: "myvault", file_path: "/not-read-before-preflight.png" },
   });
   const body = JSON.parse(response.result.content[0].text);
   assert.equal(body.code, "vault_skill_required");
@@ -447,7 +447,7 @@ itAsync("proxy-local first write returns the vault guide before side effects", a
   assert.deepEqual(body.vault_skill, guide);
 });
 
-itAsync("proxy-local exact retry acknowledges the guide before writing", async () => {
+itAsync("proxy-local acknowledgements bind the exact write and credential", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
   const guide = {
     vault: "myvault", version: "abc123", reason: "first_touch",
@@ -463,14 +463,14 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
       ),
     }],
   });
-  let writes = 0;
-  proxy._putImage = async () => {
-    writes++;
+  const writes = [];
+  proxy._putImage = async (args) => {
+    writes.push(args.file_path);
     return { kind: "document_image", url: "/api/assets/test" };
   };
   const params = {
-    name: "akb_file_write",
-    arguments: { action: "put_image", vault: "myvault", file_path: "/tmp/example.png" },
+    name: "akb_put_image",
+    arguments: { vault: "myvault", file_path: "/tmp/example.png" },
   };
 
   const first = await proxy._handle({
@@ -479,14 +479,106 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
   const firstBody = JSON.parse(first.result.content[0].text);
   assert.equal(firstBody.code, "vault_skill_required");
   assert.equal(typeof firstBody.vault_skill.ack_token, "string");
-  assert.equal(writes, 0);
+  const acknowledgementA = firstBody.vault_skill.ack_token;
+  assert.deepEqual(writes, []);
 
-  const second = await proxy._handle({
-    jsonrpc: "2.0", id: 2, method: "tools/call", params,
+  const mismatch = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "akb_put_image",
+      arguments: {
+        vault: "myvault",
+        file_path: "/tmp/different.png",
+        _vault_skill_ack: acknowledgementA,
+      },
+    },
   });
-  const secondBody = JSON.parse(second.result.content[0].text);
-  assert.equal(secondBody.kind, "document_image");
-  assert.equal(writes, 1);
+  const mismatchBody = JSON.parse(mismatch.result.content[0].text);
+  assert.equal(mismatchBody.code, "vault_skill_required");
+  assert.notEqual(mismatchBody.vault_skill.ack_token, acknowledgementA);
+  assert.deepEqual(writes, []);
+
+  proxy.pat = "rotated-credential";
+  const changedCredential = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      ...params,
+      arguments: { ...params.arguments, _vault_skill_ack: acknowledgementA },
+    },
+  });
+  const changedCredentialBody = JSON.parse(changedCredential.result.content[0].text);
+  assert.equal(changedCredentialBody.code, "vault_skill_required");
+  assert.notEqual(changedCredentialBody.vault_skill.ack_token, acknowledgementA);
+  assert.deepEqual(writes, []);
+
+  proxy.pat = "test";
+  const exactRetry = await proxy._handle({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      ...params,
+      arguments: { ...params.arguments, _vault_skill_ack: acknowledgementA },
+    },
+  });
+  const exactRetryBody = JSON.parse(exactRetry.result.content[0].text);
+  assert.equal(exactRetryBody.kind, "document_image");
+  assert.equal("ack_token" in exactRetryBody, false);
+  assert.deepEqual(writes, ["/tmp/example.png"]);
+});
+
+itAsync("proxy-local file uploads reject another operation's acknowledgement", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const guide = {
+    vault: "myvault", version: "abc123", reason: "first_touch",
+    body: "# Owner guide", truncated: false,
+  };
+  let helpCalls = 0;
+  proxy._ensureBackend = async () => true;
+  proxy._rpc = async () => ({
+    content: [{
+      type: "text",
+      text: JSON.stringify(
+        helpCalls++ === 0 ? { help: "guide", vault_skill: guide } : { help: "guide" },
+      ),
+    }],
+  });
+  const writes = [];
+  proxy._putFile = async (args) => {
+    writes.push(args.file_path);
+    return { kind: "file", uri: "akb://myvault/file/test" };
+  };
+  const call = (id, filePath, acknowledgement) => proxy._handle({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: {
+      name: "akb_put_file",
+      arguments: {
+        vault: "myvault",
+        file_path: filePath,
+        ...(acknowledgement ? { _vault_skill_ack: acknowledgement } : {}),
+      },
+    },
+  });
+
+  const first = await call(1, "/tmp/a.pdf");
+  const tokenA = JSON.parse(first.result.content[0].text).vault_skill.ack_token;
+  const mismatch = await call(2, "/tmp/b.pdf", tokenA);
+  const mismatchBody = JSON.parse(mismatch.result.content[0].text);
+  assert.equal(mismatchBody.code, "vault_skill_required");
+  assert.notEqual(mismatchBody.vault_skill.ack_token, tokenA);
+  assert.deepEqual(writes, []);
+
+  const retry = await call(3, "/tmp/a.pdf", tokenA);
+  const retryBody = JSON.parse(retry.result.content[0].text);
+  assert.equal(retryBody.kind, "file");
+  assert.equal("ack_token" in retryBody, false);
+  assert.deepEqual(writes, ["/tmp/a.pdf"]);
 });
 
 itAsync("proxy-local read attaches the guide to the successful result", async () => {
@@ -499,9 +591,8 @@ itAsync("proxy-local read attaches the guide to the successful result", async ()
   proxy._getFile = async () => ({ kind: "file", save_to: "/tmp/a.bin" });
 
   const response = await proxy._handleFileTool(8, {
-    name: "akb_file_read",
+    name: "akb_get_file",
     arguments: {
-      action: "read",
       uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555",
       save_to: "/tmp/a.bin",
     },
@@ -511,81 +602,49 @@ itAsync("proxy-local read attaches the guide to the successful result", async ()
   assert.deepEqual(body.vault_skill, guide);
 });
 
-itAsync("rejects invalid local candidate actions before preflight or file access", async () => {
+itAsync("proxy-local file errors preserve the public REST error fields", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
-  let preflights = 0;
-  let reads = 0;
-  proxy._fileToolSkillPreflight = async () => { preflights++; return null; };
-  proxy._getFile = async () => { reads++; return { kind: "file" }; };
+  proxy._fileToolSkillPreflight = async () => null;
+  const error = new Error("HTTP 409: stale version");
+  error.statusCode = 409;
+  error.body = JSON.stringify({
+    message: "content_hash moved: expected old, actual current",
+    error: "content_hash moved: expected old, actual current",
+    code: "conflict",
+    details: { expected: "old", actual: "current" },
+    hint: "Fetch the current file before retrying.",
+  });
+  proxy._updateFile = async () => { throw error; };
 
-  for (const args of [
-    { action: "missing", uri: "akb://myvault/file/id", save_to: "/tmp/a.bin" },
-    { action: "read", uri: "akb://myvault/file/id", save_to: "/tmp/a.bin", file_path: "/private/secret" },
-    { action: "read", uri: "akb://myvault/file/id", save_to: 17 },
-    { action: "read", uri: "akb://myvault/file/id" },
-  ]) {
-    const response = await proxy._handleFileTool(9, {
-      name: "akb_file_read",
-      arguments: args,
-    });
-    const body = JSON.parse(response.result.content[0].text);
-    assert.equal(response.result.isError, true);
-    assert.match(body.error, /required|unknown|must be/i);
-  }
-
-  assert.equal(preflights, 0);
-  assert.equal(reads, 0);
+  const response = await proxy._handleFileTool(9, {
+    name: "akb_update_file",
+    arguments: { uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555" },
+  });
+  assert.equal(response.result.isError, true);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), {
+    error: "content_hash moved: expected old, actual current",
+    code: "conflict",
+    details: { expected: "old", actual: "current" },
+    hint: "Fetch the current file before retrying.",
+  });
 });
 
-itAsync("document-write file input becomes content only for put/update", async () => {
+itAsync("proxy-local errors do not invent REST codes for unstructured failures", async () => {
   const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
-  const root = await mkdtemp(join(tmpdir(), "akb-proxy-document-file-"));
-  const filePath = join(root, "body.md");
-  await writeFile(filePath, "file-backed body");
-  const forwarded = [];
-  proxy._forward = async (msg) => {
-    forwarded.push(msg);
-    return { jsonrpc: "2.0", id: msg.id, result: { content: [] } };
-  };
+  proxy._fileToolSkillPreflight = async () => null;
+  const error = new Error("HTTP 409: upstream connection reset");
+  error.statusCode = 409;
+  error.body = "upstream connection reset";
+  proxy._updateFile = async () => { throw error; };
 
-  try {
-    await proxy._handle({
-      jsonrpc: "2.0", id: 1, method: "tools/call",
-      params: {
-        name: "akb_document_write",
-        arguments: { action: "put", parent: "akb://myvault", title: "From file", file: filePath },
-      },
-    });
-    await proxy._handle({
-      jsonrpc: "2.0", id: 2, method: "tools/call",
-      params: {
-        name: "akb_document_write",
-        arguments: { action: "update", uri: "akb://myvault/doc/test.md", file: filePath },
-      },
-    });
-
-    assert.equal(forwarded.length, 2);
-    for (const call of forwarded) {
-      assert.equal(call.params.arguments.file, undefined);
-      assert.equal(call.params.arguments.content, "file-backed body");
-    }
-
-    const invalid = await proxy._handle({
-      jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: {
-        name: "akb_document_write",
-        arguments: {
-          action: "put", parent: "akb://myvault", title: "Conflict",
-          content: "", file: filePath,
-        },
-      },
-    });
-    assert.equal(invalid.result.isError, true);
-    assert.match(JSON.parse(invalid.result.content[0].text).error, /both 'file' and 'content'/);
-    assert.equal(forwarded.length, 2);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  const response = await proxy._handleFileTool(10, {
+    name: "akb_update_file",
+    arguments: { uri: "akb://myvault/file/11111111-2222-3333-4444-555555555555" },
+  });
+  assert.equal(response.result.isError, true);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), {
+    error: "HTTP 409: upstream connection reset",
+  });
 });
 
 // ── Summary ──────────────────────────────────────────────────────

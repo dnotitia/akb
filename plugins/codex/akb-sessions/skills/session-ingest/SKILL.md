@@ -163,8 +163,7 @@ Store:
 #### Search Vault for Existing Session
 
 ```text
-mcp__akb__akb_search(
-  query="{session_id}",
+mcp__akb__akb_discover(action="search", query="{session_id}",
   vault="{vault_name}",
   collection="sessions",
   tags=["session:{session_id}"],
@@ -178,7 +177,7 @@ mcp__akb__akb_search(
 **Match found** → read the existing session note:
 
 ```text
-mcp__akb__akb_get(vault="{vault_name}", doc_id="{matched_doc_id}")
+mcp__akb__akb_document_read(action="get", vault="{vault_name}", doc_id="{matched_doc_id}")
 → existing_session_doc_id, existing_tags, existing_session_content
 ```
 
@@ -219,7 +218,7 @@ After filtering, judge whether the remaining entries represent **meaningful work
 
 Before reading the full JSONL, retrieve project-scoped open tasks from the vault so the session drafter can identify which tasks this session resolved.
 
-**Parallel execution with Phase 1-1**: the project-name parse step below runs immediately (no MCP), and the `akb_search` for open tasks is independent of Phase 1-1's duplicate-detection search. Issue Phase 1-1's existing-session search and Phase 1-2's open-task search in a single parallel tool-use block. Act on Phase 1-2 results only after Phase 1-1 greenlights continuation (otherwise discard).
+**Parallel execution with Phase 1-1**: the project-name parse step below runs immediately (no MCP), and the `akb_discover` for open tasks is independent of Phase 1-1's duplicate-detection search. Issue Phase 1-1's existing-session search and Phase 1-2's open-task search in a single parallel tool-use block. Act on Phase 1-2 results only after Phase 1-1 greenlights continuation (otherwise discard).
 
 #### Derive Project Name
 
@@ -233,8 +232,7 @@ If derivation fails entirely, set `project_name` to the empty string. The downst
 #### Query Open Tasks
 
 ```text
-mcp__akb__akb_search(
-  query="open task",
+mcp__akb__akb_discover(action="search", query="open task",
   vault="{vault_name}",
   collection="sessions/tasks",
   type="task",
@@ -374,7 +372,7 @@ Each agent receives:
 3. **JSONL path** — primary source for each drafter's domain analysis
 4. **Vault config** — `vault_name` and `collections` for duplicate checking
 
-Each agent drafts notes, then validates them against the vault using `akb_search`. Drafts are returned with a `disposition` (create / append; `supersede` additionally for decisions), optional `resolves_question: Q{n}` when a draft addresses a specific session Open Question, and `related_to` doc IDs. Duplicates are reported as skipped and excluded from the output.
+Each agent drafts notes, then validates them against the vault using `akb_discover`. Drafts are returned with a `disposition` (create / append; `supersede` additionally for decisions), optional `resolves_question: Q{n}` when a draft addresses a specific session Open Question, and `related_to` doc IDs. Duplicates are reported as skipped and excluded from the output.
 
 **idea-drafter specific.** Idea drafts additionally carry `impact` / `effort` / `confidence` enum assessments. The drafter silent-drops any idea it rates `impact: low` before returning (no report, no skipped block). The main agent re-triages the surviving drafts in Phase 3-2.
 
@@ -441,15 +439,15 @@ For each sub-note, extract metadata from the draft and call `akb_put(vault="{vau
 
 **Idea notes** — append four namespaced tags to `draft_tags` before put: `category:{draft.category}`, `impact:{draft.impact}`, `effort:{draft.effort}`, `confidence:{draft.confidence}`. Drop duplicates (the drafter may have already emitted some as tags). These four tags are the durable carriers for the external maintenance layer's consolidation synthesis and staleness checks.
 
-**`append` disposition** — the drafter has already merged compiled truth + one new timeline entry. Read the existing document with `akb_get(vault="{vault_name}", doc_id=draft.append_target)`, apply timeline merge **Mode A** against `draft.body`, and `akb_update(vault="{vault_name}", doc_id=draft.append_target, content={merged}, tags=[...existing, ...new from draft], summary=draft.summary, message="Appended from session ingest: {brief description}")`.
+**`append` disposition** — the drafter has already merged compiled truth + one new timeline entry. Read the existing document with `akb_document_read(action="get", vault="{vault_name}", doc_id=draft.append_target)`, apply timeline merge **Mode A** against `draft.body`, and `akb_update(vault="{vault_name}", doc_id=draft.append_target, content={merged}, tags=[...existing, ...new from draft], summary=draft.summary, message="Appended from session ingest: {brief description}")`.
 
-**`supersede` disposition (decisions only)** — write the new decision via `akb_put(vault="{vault_name}", ..., tags=[..., "supersedes:{old_doc_id}"])` (tags use bare doc_id; the `:` already binds `key:value`). Capture `new_doc_id` and `new_doc_path`; compose `new_doc_ref = akb://{vault_name}/doc/{new_doc_path}`. Then read the old decision via `akb_get(vault="{vault_name}", doc_id=draft.supersedes)`, apply timeline merge **Mode B** with `new_entry = "- **{today}** | Superseded by {new_title} ({new_doc_ref}). {reason}. [Source: session:{session_id}, {today}]"`, and `akb_update(vault="{vault_name}", doc_id=draft.supersedes, content={merged}, tags=[...old, "superseded-by:{new_doc_id}"], status="superseded", message="Superseded by {new_doc_ref} in session ingest")`. Setting `status="superseded"` removes the old decision from the external maintenance layer's active-document pools.
+**`supersede` disposition (decisions only)** — write the new decision via `akb_put(vault="{vault_name}", ..., tags=[..., "supersedes:{old_doc_id}"])` (tags use bare doc_id; the `:` already binds `key:value`). Capture `new_doc_id` and `new_doc_path`; compose `new_doc_ref = akb://{vault_name}/doc/{new_doc_path}`. Then read the old decision via `akb_document_read(action="get", vault="{vault_name}", doc_id=draft.supersedes)`, apply timeline merge **Mode B** with `new_entry = "- **{today}** | Superseded by {new_title} ({new_doc_ref}). {reason}. [Source: session:{session_id}, {today}]"`, and `akb_update(vault="{vault_name}", doc_id=draft.supersedes, content={merged}, tags=[...old, "superseded-by:{new_doc_id}"], status="superseded", message="Superseded by {new_doc_ref} in session ingest")`. Setting `status="superseded"` removes the old decision from the external maintenance layer's active-document pools.
 
 ### 4-3. Resolve Completed Tasks
 
 For each task in `resolved_tasks`:
 
-1. Read the task document with `akb_get(vault="{vault_name}", doc_id={task_doc_id})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
+1. Read the task document with `akb_document_read(action="get", vault="{vault_name}", doc_id={task_doc_id})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
 2. `akb_update(vault="{vault_name}", doc_id={task_doc_id}, content={merged}, tags=[...existing, "resolved"], status="archived", message="Resolved in session {session_doc_id}")`.
 
 The archived task document is the record of resolution.

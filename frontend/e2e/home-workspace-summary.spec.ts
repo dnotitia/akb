@@ -119,6 +119,24 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     const totals = page.getByRole("region", { name: "Workspace summary" });
     await expect(totals).toContainText("1,284");
     await expect(totals).toContainText("20");
+    const dimensions = await totals.locator("dl").evaluate(element => {
+      const rows = Array.from(element.children).map(item => {
+        const label = item.querySelector("dt")!.getBoundingClientRect();
+        const value = item.querySelector("dd")!.getBoundingClientRect();
+        return { labelBottom: label.bottom, valueTop: value.top, valueLeft: value.left, valueRight: value.right };
+      });
+      return { width: element.getBoundingClientRect().width, rows };
+    });
+    // Keep totals grouped by resource kind instead of a sentence-like baseline.
+    for (const row of dimensions.rows) expect(row.valueTop - row.labelBottom).toBeGreaterThanOrEqual(4);
+    expect(dimensions.width).toBeLessThanOrEqual(672);
+    if (width < 640) {
+      expect(dimensions.rows[2].valueTop).toBeGreaterThan(dimensions.rows[0].valueTop);
+      expect(dimensions.rows[0].valueRight).toBeLessThan(dimensions.rows[1].valueLeft);
+    } else {
+      expect(Math.abs(dimensions.rows[0].valueTop - dimensions.rows[3].valueTop)).toBeLessThanOrEqual(1);
+      expect((await totals.boundingBox())!.height).toBeLessThanOrEqual(80);
+    }
     await expectPaperHome(page);
     await expect(totals.getByText("Available to you", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "View all vaults", exact: true })).toBeVisible();
@@ -137,11 +155,36 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     expect(state.details).toBeLessThanOrEqual(4);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath("home-workspace.png"), fullPage: true });
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    const footer = page.getByRole("contentinfo");
+    // scrollHeight rounds to CSS pixels; the footer edge may retain a subpixel.
+    await expect(footer).toBeInViewport({ ratio: 0.99 });
+    await expect(footer).not.toContainText("Seahorse");
+    const copyright = footer.getByText("© Dnotitia");
+    const product = footer.getByText("Agent Knowledgebase");
+    await expect(product).toBeVisible();
+    const left = (await copyright.boundingBox())!;
+    const right = (await product.boundingBox())!;
+    const mainBounds = await page.getByRole("main").locator(":scope > div").evaluate(element => {
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return { left: bounds.left + parseFloat(style.paddingLeft), right: bounds.right - parseFloat(style.paddingRight) };
+    });
+    expect(left.x).toBeCloseTo(mainBounds.left, 0);
+    expect(right.x + right.width).toBeCloseTo(mainBounds.right, 0);
+    expect(left.y).toBeCloseTo(right.y, 0);
+    const invitationBounds = (await invitation.boundingBox())!;
+    for (const label of [copyright, product]) {
+      await expect(label).toBeInViewport({ ratio: 1 });
+      const bounds = (await label.boundingBox())!;
+      expect(bounds.x + bounds.width <= invitationBounds.x || bounds.y + bounds.height <= invitationBounds.y || bounds.y >= invitationBounds.y + invitationBounds.height).toBe(true);
+    }
+    await page.screenshot({ path: testInfo.outputPath("home-footer.png") });
   });
 }
 
 for (const reducedMotion of ["no-preference", "reduce"] as const) {
-  test(`Connection launcher stays viewport-fixed on a long Home (${reducedMotion})`, async ({ page }) => {
+  test(`Connection launcher clears the footer and returns to its viewport anchor (${reducedMotion})`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 700 });
     await page.emulateMedia({ reducedMotion });
     const state = await fixture(page);
@@ -155,8 +198,15 @@ for (const reducedMotion of ["no-preference", "reduce"] as const) {
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     await expect(invitation).toBeInViewport({ ratio: 1 });
+    await expect.poll(async () => {
+      const floating = (await invitation.boundingBox())!;
+      const footer = (await page.getByRole("contentinfo").boundingBox())!;
+      return footer.y - floating.y - floating.height;
+    }).toBeGreaterThanOrEqual(16);
     const scrolled = (await invitation.boundingBox())!;
-    expect(scrolled.y).toBeCloseTo(initial.y, 0);
+    expect(scrolled.x).toBeCloseTo(initial.x, 0);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await expect.poll(async () => (await invitation.boundingBox())!.y).toBeCloseTo(initial.y, 0);
     await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
     await expect(page.getByRole("dialog", { name: "Connect an agent", exact: true })).toBeVisible();
   });

@@ -20,7 +20,7 @@ export function Logo({
   return (
     <span className={cn("inline-flex items-center gap-2.5", className)}>
       <span
-        className="brand-mark relative inline-grid place-items-center rounded-[36%] font-display text-white"
+        className="brand-mark relative inline-grid shrink-0 place-items-center rounded-[36%] font-display text-white"
         style={{
           width: size,
           height: size,
@@ -42,13 +42,13 @@ export function Logo({
         />
       </span>
       {wordmark && headerLockup ? (
-        <span className="flex items-baseline gap-2 whitespace-nowrap leading-none">
+        <span className="flex flex-col gap-0.5 whitespace-nowrap leading-none">
           <span className="font-display text-sm font-semibold tracking-tight text-foreground">
             AKB
           </span>
           {subtitle && (
-            <span className="coord hidden tracking-wide md:inline">
-              AGENT KNOWLEDGEBASE
+            <span className="text-xs leading-4 text-foreground-muted">
+              Agent Knowledgebase
             </span>
           )}
         </span>
@@ -61,8 +61,8 @@ export function Logo({
             akb
           </span>
           {subtitle && (
-            <span className="coord mt-0.5">
-              knowledgebase
+            <span className="mt-1 whitespace-nowrap text-xs leading-4 text-foreground-muted">
+              Agent Knowledgebase
             </span>
           )}
         </span>

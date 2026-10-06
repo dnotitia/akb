@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { SettingsLink } from "@/contexts/settings-dialog-context";
 import {
   AlertTriangle,
   BookText,
@@ -34,6 +35,7 @@ import {
 } from "@/lib/api";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { recentIcon, recentTone } from "@/lib/recent";
+import { stripFrontmatter } from "@/lib/markdown";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -155,7 +157,7 @@ function VaultContentSummary({ info }: { info: VaultInfo | null }) {
  *  stripped, for the "About this vault" excerpt. */
 function aboutExcerpt(md?: string): string {
   if (!md) return "";
-  const body = md.replace(/^---\n[\s\S]*?\n---\n/, "");
+  const body = stripFrontmatter(md);
   const out: string[] = [];
   for (const raw of body.split("\n")) {
     const t = raw.trim();
@@ -1241,6 +1243,7 @@ function OnboardStep({
   );
 
   if (to) {
+    if (to.startsWith("/settings")) return <SettingsLink to={to} className={className}>{content}</SettingsLink>;
     return (
       <Link to={to} className={className}>
         {content}

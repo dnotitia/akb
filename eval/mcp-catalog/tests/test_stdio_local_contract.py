@@ -13,8 +13,6 @@ from mcp_catalog.execution import (
     TrialOutcome,
     bind_tool_calls,
     capture_result_fields_for_task,
-    logical_operation_for,
-    resource_type_for,
     render_task_prompt,
 )
 from mcp_catalog.runtime import StateObservation
@@ -28,94 +26,6 @@ IMAGE_NAME = "sample-image.png"
 DOCUMENT_TITLE = "catalog-bench-stdio-document"
 IMAGE_ALT = "benchmark sample image"
 IMAGE_MARKDOWN = f"![{IMAGE_ALT}](/api/assets/fixture-image)"
-
-
-def test_candidate_action_map_covers_each_non_independent_operation_once() -> None:
-    manifest = load_run_manifest(ROOT / "config" / "run.json")
-    candidate_pairs = [
-        (tool_name, action, baseline_tool)
-        for tool_name, actions in manifest.candidate_operation_map.items()
-        for action, baseline_tool in actions.items()
-    ]
-    registered = {tool for names in manifest.operation_map.values() for tool in names}
-
-    assert len(candidate_pairs) == 49
-    baseline_tools = {baseline_tool for _tool, _action, baseline_tool in candidate_pairs if baseline_tool is not None}
-    candidate_only_pairs = {
-        (tool, action)
-        for tool, actions in manifest.candidate_only_operation_attribution.items()
-        for action in actions
-    }
-    assert len(baseline_tools) == 48
-    assert len(registered) == 50
-    assert "akb_grep_replace" not in registered
-    assert baseline_tools == registered - {"akb_help", "akb_sql"}
-    assert candidate_only_pairs == {("akb_document_write", "grep_replace")}
-    assert len(candidate_pairs) + 2 == 51
-    for tool_name, action, baseline_tool in candidate_pairs:
-        arguments = {"action": action}
-        attribution = manifest.candidate_only_operation_attribution.get(tool_name, {}).get(action)
-        expected_operation = attribution.operation if attribution else next(
-            logical for logical, names in manifest.operation_map.items() if baseline_tool in names
-        )
-        assert logical_operation_for(
-            tool_name,
-            manifest.operation_map,
-            arguments,
-            manifest.candidate_operation_map,
-            manifest.candidate_only_operation_attribution,
-        ) == expected_operation
-        assert resource_type_for(
-            tool_name,
-            arguments,
-            manifest.tool_resources,
-            manifest.candidate_operation_map,
-            manifest.candidate_only_operation_attribution,
-        ) == (attribution.resource_type if attribution else manifest.tool_resources[baseline_tool])
-
-    [replace_call] = bind_tool_calls(
-        [("akb_document_write", '{"action":"grep_replace"}')],
-        [],
-        manifest.operation_map,
-        (),
-        tool_resources=manifest.tool_resources,
-        candidate_operation_map=manifest.candidate_operation_map,
-        candidate_only_operation_attribution=manifest.candidate_only_operation_attribution,
-    )
-    assert (replace_call.logical_operation, replace_call.resource_type) == ("update", "document")
-
-
-@pytest.mark.asyncio
-async def test_image_result_capture_includes_baseline_tool_and_candidate_action() -> None:
-    manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-ko")
-    capture_fields = capture_result_fields_for_task(
-        task, manifest.operation_map, manifest.candidate_operation_map
-    )
-
-    assert capture_fields == {
-        ("akb_put_image", None): ["markdown"],
-        ("akb_file_write", "put_image"): ["markdown"],
-    }
-
-    recorder = ToolCallRecorder(
-        operation_map=manifest.operation_map,
-        candidate_operation_map=manifest.candidate_operation_map,
-        secrets=(),
-        capture_result_fields=capture_fields,
-    )
-    result = {"content": [{"type": "text", "text": json.dumps({"markdown": IMAGE_MARKDOWN})}]}
-
-    async def image_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
-        return result
-
-    await recorder(None, image_upload, "akb_put_image", {"parent": PARENT})
-    await recorder(None, image_upload, "akb_file_write", {"action": "put_image", "parent": PARENT})
-    await recorder(None, image_upload, "akb_file_write", {"action": "put_file", "parent": PARENT})
-
-    assert recorder.calls[0].result_fields == {"markdown": IMAGE_MARKDOWN}
-    assert recorder.calls[1].result_fields == {"markdown": IMAGE_MARKDOWN}
-    assert recorder.calls[2].result_fields == {}
 
 
 def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
@@ -213,11 +123,8 @@ async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() ->
     }
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
-        candidate_operation_map=manifest.candidate_operation_map,
         secrets=(),
-        capture_result_fields=capture_result_fields_for_task(
-            task, manifest.operation_map, manifest.candidate_operation_map
-        ),
+        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
     )
 
     async def image_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
@@ -226,8 +133,8 @@ async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() ->
     returned = await recorder(
         None,
         image_upload,
-        "akb_file_write",
-        {"action": "put_image", "parent": PARENT, "file_path": "/tmp/sample-image.png", "alt_text": IMAGE_ALT},
+        "akb_put_image",
+        {"parent": PARENT, "file_path": "/tmp/sample-image.png", "alt_text": IMAGE_ALT},
     )
 
     assert returned is result
@@ -238,13 +145,13 @@ async def test_image_result_capture_reads_the_public_mcp_text_json_envelope() ->
     async def text_image_upload(_name: str, _arguments: dict[str, object]) -> str:
         return text_result
 
-    await recorder(None, text_image_upload, "akb_file_write", {"action": "put_image", "parent": PARENT})
+    await recorder(None, text_image_upload, "akb_put_image", {"parent": PARENT})
     assert recorder.calls[1].result_fields == {"markdown": IMAGE_MARKDOWN}
 
     async def content_blocks_image_upload(_name: str, _arguments: dict[str, object]) -> list[dict[str, str]]:
         return [{"type": "text", "text": text_result}]
 
-    await recorder(None, content_blocks_image_upload, "akb_file_write", {"action": "put_image", "parent": PARENT})
+    await recorder(None, content_blocks_image_upload, "akb_put_image", {"parent": PARENT})
     assert recorder.calls[2].result_fields == {"markdown": IMAGE_MARKDOWN}
 
 
@@ -262,11 +169,8 @@ async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data
     }
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
-        candidate_operation_map=manifest.candidate_operation_map,
         secrets=(),
-        capture_result_fields=capture_result_fields_for_task(
-            task, manifest.operation_map, manifest.candidate_operation_map
-        ),
+        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
     )
 
     async def image_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
@@ -275,8 +179,8 @@ async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data
     returned = await recorder(
         None,
         image_upload,
-        "akb_file_write",
-        {"action": "put_image", "parent": PARENT, "file_path": "/tmp/sample-image.png", "alt_text": IMAGE_ALT},
+        "akb_put_image",
+        {"parent": PARENT, "file_path": "/tmp/sample-image.png", "alt_text": IMAGE_ALT},
     )
 
     assert returned is result
@@ -292,7 +196,7 @@ async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data
     async def oversized_upload(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
         return oversized
 
-    await recorder(None, oversized_upload, "akb_file_write", {"action": "put_image", "parent": PARENT})
+    await recorder(None, oversized_upload, "akb_put_image", {"parent": PARENT})
     assert recorder.calls[-1].result_fields == {}
 
 
@@ -303,19 +207,16 @@ def _stdio_calls(
     image_markdown: str = IMAGE_MARKDOWN,
 ) -> list[ToolCallRecord]:
     file_args = {
-        "action": "put_file",
         "parent": PARENT,
         "file_path": str(consumer_root / FILE_NAME),
         "collection": "",
     }
     image_args = {
-        "action": "put_image",
         "parent": PARENT,
         "file_path": str(consumer_root / IMAGE_NAME),
         "alt_text": IMAGE_ALT,
     }
     document_args = {
-        "action": "put",
         "parent": PARENT,
         "title": DOCUMENT_TITLE,
         "content": document_content,
@@ -325,7 +226,7 @@ def _stdio_calls(
     return [
         ToolCallRecord(
             order=1,
-            tool_name="akb_file_write",
+            tool_name="akb_put_file",
             logical_operation="file_upload",
             raw_model_args=file_args,
             server_args=file_args,
@@ -337,7 +238,7 @@ def _stdio_calls(
         ),
         ToolCallRecord(
             order=2,
-            tool_name="akb_file_write",
+            tool_name="akb_put_image",
             logical_operation="image_upload",
             raw_model_args=image_args,
             server_args=image_args,
@@ -350,7 +251,7 @@ def _stdio_calls(
         ),
         ToolCallRecord(
             order=3,
-            tool_name="akb_document_write",
+            tool_name="akb_put",
             logical_operation="create",
             raw_model_args=document_args,
             server_args=document_args,
@@ -391,89 +292,6 @@ def _score_stdio(task, consumer_root: Path, calls: list[ToolCallRecord], *, item
     )
     outcome.finalize(task, before, after, consumer_root=str(consumer_root))
     return outcome
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("candidate_surface", (False, True), ids=("baseline", "candidate"))
-async def test_bound_stdio_image_traces_score_result_binding_for_both_catalogs(
-    tmp_path: Path,
-    candidate_surface: bool,
-) -> None:
-    manifest = load_run_manifest(ROOT / "config" / "run.json")
-    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "stdio-local-ko")
-    consumer_root = tmp_path / "node-consumer"
-    consumer_root.mkdir()
-    for filename in (FILE_NAME, IMAGE_NAME):
-        shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
-
-    names = (
-        ("akb_file_write", "akb_file_write", "akb_document_write")
-        if candidate_surface
-        else ("akb_put_file", "akb_put_image", "akb_put")
-    )
-    file_args = {
-        "parent": PARENT,
-        "file_path": str(consumer_root / FILE_NAME),
-        "collection": "",
-    }
-    image_args = {
-        "parent": PARENT,
-        "file_path": str(consumer_root / IMAGE_NAME),
-        "alt_text": IMAGE_ALT,
-    }
-    document_args = {
-        "parent": PARENT,
-        "title": DOCUMENT_TITLE,
-        "content": f"Attached image:\n\n{IMAGE_MARKDOWN}",
-        "type": "note",
-        "status": "draft",
-    }
-    if candidate_surface:
-        file_args["action"] = "put_file"
-        image_args["action"] = "put_image"
-        document_args["action"] = "put"
-    steps = list(zip(names, (file_args, image_args, document_args), strict=True))
-
-    async def score(document_content: str) -> TrialOutcome:
-        arguments = [dict(args) for _name, args in steps]
-        arguments[2]["content"] = document_content
-        calls = [(name, args) for (name, _), args in zip(steps, arguments, strict=True)]
-        recorder = ToolCallRecorder(
-            operation_map=manifest.operation_map,
-            candidate_operation_map=manifest.candidate_operation_map,
-            candidate_only_operation_attribution=manifest.candidate_only_operation_attribution,
-            secrets=(),
-            capture_result_fields=capture_result_fields_for_task(
-                task, manifest.operation_map, manifest.candidate_operation_map
-            ),
-        )
-
-        async def fake_server(name: str, args: dict[str, object]) -> dict[str, object]:
-            is_image = name == "akb_put_image" or args.get("action") == "put_image"
-            value = {"url": "/api/assets/fixture-image", "markdown": IMAGE_MARKDOWN} if is_image else {"ok": True}
-            return {"content": [{"type": "text", "text": json.dumps(value)}], "isError": False}
-
-        for name, args in calls:
-            await recorder(None, fake_server, name, args)
-        raw_calls = [(name, json.dumps(args, separators=(",", ":"))) for name, args in calls]
-        bound = bind_tool_calls(
-            raw_calls,
-            recorder.calls,
-            manifest.operation_map,
-            (),
-            tool_resources=manifest.tool_resources,
-            candidate_operation_map=manifest.candidate_operation_map,
-            candidate_only_operation_attribution=manifest.candidate_only_operation_attribution,
-        )
-        return _score_stdio(task, consumer_root, bound)
-
-    correct = await score(f"Attached image:\n\n{IMAGE_MARKDOWN}")
-    wrong_binding = await score("![benchmark sample image](/api/assets/unrelated)")
-
-    assert correct.result_binding_accuracy is True
-    assert correct.success is True
-    assert wrong_binding.result_binding_accuracy is False
-    assert wrong_binding.success is False
 
 
 @pytest.mark.parametrize(
@@ -567,15 +385,7 @@ def test_stdio_attempts_reject_wrong_sources_targets_and_outcomes(tmp_path: Path
         args = {**calls[1].server_args, "alt_text": "different alt"}
         calls[1] = calls[1].model_copy(update={"raw_model_args": args, "server_args": args, "effective_server_args": args})
     elif mutation == "wrong_tool":
-        args = {**calls[1].server_args, "action": "put_file"}
-        calls[1] = calls[1].model_copy(
-            update={
-                "logical_operation": "file_upload",
-                "raw_model_args": args,
-                "server_args": args,
-                "effective_server_args": args,
-            }
-        )
+        calls[1] = calls[1].model_copy(update={"tool_name": "akb_put_file", "logical_operation": "file_upload"})
     elif mutation == "wrong_order":
         calls = [calls[1], calls[0], calls[2]]
     elif mutation == "wrong_title":
@@ -648,11 +458,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
             "vault_skill_retry_ack": "fixture-ack",
         }
     )
-    recorder = ToolCallRecorder(
-        operation_map=manifest.operation_map,
-        candidate_operation_map=manifest.candidate_operation_map,
-        secrets=(),
-    )
+    recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
 
     async def preflight(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
         return {
@@ -672,14 +478,12 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
             "isError": False,
         }
 
-    await recorder(None, preflight, "akb_file_write", file_args)
+    await recorder(None, preflight, "akb_put_file", file_args)
     challenge = bind_tool_calls(
-        [("akb_file_write", json.dumps(file_args, separators=(",", ":")))],
+        [("akb_put_file", json.dumps(file_args, separators=(",", ":")))],
         recorder.calls,
         manifest.operation_map,
         (),
-        tool_resources=manifest.tool_resources,
-        candidate_operation_map=manifest.candidate_operation_map,
     )
 
     assert challenge[0].vault_skill_ack == "fixture-ack"
@@ -687,16 +491,12 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
     assert "fixture-ack" not in challenge[0].result_preview
     assert "ack_token" in challenge[0].result_preview
 
-    retry_recorder = ToolCallRecorder(
-        operation_map=manifest.operation_map,
-        candidate_operation_map=manifest.candidate_operation_map,
-        secrets=(),
-    )
+    retry_recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
 
     async def accepted(_name: str, _arguments: dict[str, object]) -> dict[str, bool]:
         return {"ok": True}
 
-    await retry_recorder(None, accepted, "akb_file_write", retry_file_args)
+    await retry_recorder(None, accepted, "akb_put_file", retry_file_args)
     assert retry_recorder.calls[0].server_args["_vault_skill_ack"] == "[redacted]"
     assert retry_recorder.calls[0].vault_skill_retry_ack == "fixture-ack"
 
@@ -718,7 +518,7 @@ def test_vault_skill_handshake_requires_the_returned_ack_and_same_semantic_retry
     base_file_args = dict(calls[0].server_args or {})
     challenge = ToolCallRecord(
         order=1,
-        tool_name="akb_file_write",
+        tool_name="akb_put_file",
         logical_operation="file_upload",
         server_args=base_file_args,
         effective_server_args=base_file_args,
@@ -765,10 +565,10 @@ def test_uncommitted_image_cleanup_is_allowed_only_after_a_failed_material_attem
     for filename in (FILE_NAME, IMAGE_NAME):
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     calls = _stdio_calls(consumer_root, document_content=IMAGE_MARKDOWN)
-    cleanup_args = {"action": "discard_image", "parent": PARENT, "url": "/api/assets/fixture-image"}
+    cleanup_args = {"parent": PARENT, "url": "/api/assets/fixture-image"}
     cleanup = ToolCallRecord(
         order=4,
-        tool_name="akb_file_write",
+        tool_name="akb_discard_image",
         logical_operation="cleanup",
         raw_model_args=cleanup_args,
         server_args=cleanup_args,

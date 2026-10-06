@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.16.1
+
+- Preserve escaped punctuation in image alt text across parse and serialize
+  round trips.
+- Keep resolved reference titles and runtime routes out of authored Markdown
+  while displaying accessible labels in the editor.
+- Preserve canonical reference marks when parsing their HTML representation.
+- Include links (also resolved asynchronously), resolved references, task
+  checkboxes, and scrollable code blocks in the editor's keyboard traversal.
+- Keep slash and reference menu scrolling correct when options use a different
+  offset parent, and keep the slash menu within surrounding dialogs.
+
+## 0.16.0
+
+- Add `MarkdownLocaleProvider` with package-owned English and Korean common UI
+  copy. Hosts choose the locale; standalone usage defaults to English.
+- Localize toolbar, Source mode, link, table, image, upload, slash, reference,
+  task, code, and resource-state UI without changing canonical Markdown.
+- Preserve editor identity and active UI state when locale changes, including
+  open menus, pending search requests, and in-progress uploads.
+- Remove common per-feature labels/messages and duplicated AKB copy. Keep
+  product-owned search prompts, custom controls, adapter errors, and style
+  options at the host boundary.
+
 ## 0.15.0
 
 - Close the public editor boundary around the package-owned

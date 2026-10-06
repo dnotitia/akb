@@ -159,7 +159,7 @@ export default function PublicationPage() {
       {/* Footer */}
       <footer className="border-t border-border mt-16">
         <div className="mx-auto max-w-[1200px] px-6 py-5 flex items-center justify-between flex-wrap gap-2">
-          <div className="text-xs text-foreground-muted">© Dnotitia · Seahorse</div>
+          <div className="text-xs text-foreground-muted">© Dnotitia</div>
           <a
             href="/"
             className="inline-flex items-center gap-1.5 text-xs text-foreground-muted hover:text-link rounded-[var(--radius-sm)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
