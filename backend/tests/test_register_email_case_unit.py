@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.exceptions import ConflictError
+from app.exceptions import ConflictError, ValidationError
 from app.services import auth_service
 
 
@@ -92,3 +92,16 @@ def test_migration_109_creates_lower_unique_index():
     ).read_text(encoding="utf-8")
     assert "lower(email)" in src
     assert "CREATE UNIQUE INDEX" in src
+
+
+async def test_register_rejects_a_password_shorter_than_change_password_allows(monkeypatch):
+    # Registration and password change share one minimum, so self-service
+    # signup can never create a password the account could not change to.
+    async def no_pool():
+        raise AssertionError("a rejected registration must not reach the database")
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    monkeypatch.setattr(auth_service, "get_pool", no_pool)
+
+    with pytest.raises(ValidationError, match="at least 8 characters"):
+        await auth_service.register("newbie", "newbie@corp.example", "short", None)
