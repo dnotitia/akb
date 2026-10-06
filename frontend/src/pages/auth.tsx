@@ -344,7 +344,7 @@ const FIELD_IDS: Record<FieldName, string> = {
   username: "auth-username",
   email: "auth-email",
   displayName: "auth-display-name",
-  password: "auth-password",
+  password: "auth-password", // pragma: allowlist secret — DOM id, not a credential
   confirm: "auth-confirm-password",
 };
 const MIN_PASSWORD_LENGTH = 8;
