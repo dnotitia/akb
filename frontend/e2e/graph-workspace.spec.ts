@@ -506,7 +506,7 @@ test("floating tools preserve the canvas and keep list rows and inspectors reach
   await graphReady(page, 30);
   const workspace = page.locator("#graph-workspace");
   const canvas = page.getByTestId("graph-canvas");
-  const tools = workspace.locator("header");
+  const tools = workspace.locator(":scope > div > header");
   const workspaceBox = await workspace.boundingBox(), canvasBox = await canvas.boundingBox();
   expect(Math.abs(canvasBox!.y - workspaceBox!.y)).toBeLessThan(2);
   expect(Math.abs(canvasBox!.height - workspaceBox!.height)).toBeLessThan(2);
