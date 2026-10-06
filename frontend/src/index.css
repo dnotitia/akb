@@ -281,8 +281,12 @@
 .vault-app-header > div { overflow-x: auto; }
 
 /* ── Global ──────────────────────────────────────────────────────── */
-* {
-  border-color: var(--color-border);
+/* In the base layer so every `border-*` color utility (and its hover, focus,
+   aria-invalid variants) still wins. Unlayered, this beat all utilities. */
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
 }
 
 html, body, #root {
