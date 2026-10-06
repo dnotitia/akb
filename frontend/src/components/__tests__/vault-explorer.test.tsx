@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within, cleanup, waitFor, fireEvent } from "@testing-library/react";
+import { screen, within, cleanup, waitFor, fireEvent } from "@testing-library/react";
+import { render } from "@/test-query-client";
 import userEvent from "@testing-library/user-event";
 import { Link, MemoryRouter } from "react-router-dom";
 import { VaultExplorer } from "@/components/vault-explorer";

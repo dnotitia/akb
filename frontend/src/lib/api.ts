@@ -1134,7 +1134,18 @@ export interface VaultTemplateSummary {
 export const listVaultTemplates = () =>
   api<VaultTemplateSummary[]>("/vaults/templates");
 
-export const listVaults = () => api<{ vaults: any[] }>("/my/vaults");
+// Several shell surfaces ask for these on the same navigation. Concurrent
+// identical reads share one request; nothing is kept after it settles.
+const inFlightReads = new Map<string, Promise<unknown>>();
+function sharedRead<T>(path: string): Promise<T> {
+  const pending = inFlightReads.get(path);
+  if (pending) return pending as Promise<T>;
+  const request = api<T>(path).finally(() => inFlightReads.delete(path));
+  inFlightReads.set(path, request);
+  return request;
+}
+
+export const listVaults = () => sharedRead<{ vaults: any[] }>("/my/vaults");
 export const createVault = (
   name: string,
   description?: string,
@@ -1145,7 +1156,7 @@ export const createVault = (
   if (template) params.set("template", template);
   return api<any>(`/vaults?${params}`, { method: "POST" });
 };
-export const getVaultInfo = (vault: string) => api<any>(`/vaults/${vault}/info`);
+export const getVaultInfo = (vault: string) => sharedRead<any>(`/vaults/${vault}/info`);
 export const getVaultMembers = (vault: string) => api<{ members: any[] }>(`/vaults/${vault}/members`);
 export const grantAccess = (vault: string, user: string, role: string) =>
   api<any>(`/vaults/${vault}/grant`, { method: "POST", body: JSON.stringify({ user, role }) });
