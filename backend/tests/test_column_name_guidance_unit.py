@@ -102,7 +102,7 @@ def test_the_tools_tell_agents_where_the_header_goes():
 
 
 class _Conn:
-    """Answers the three reads `_list_tables_with_schema` makes."""
+    """Answers the reads `_list_tables_with_schema` makes."""
 
     def __init__(self, registry: list[dict], attributes: list[dict]):
         self._registry = registry
@@ -113,6 +113,8 @@ class _Conn:
             return self._registry
         if "pg_attribute" in sql:
             return self._attributes
+        if "FROM pg_class" in sql:
+            return []  # no row estimates, so every table reports 0 rows
         raise AssertionError(f"unexpected query: {sql}")
 
     async def fetchval(self, sql: str, *args):

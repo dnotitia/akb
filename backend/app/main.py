@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 
 from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
@@ -304,6 +305,17 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+)
+# JSON listings such as a full-vault browse are multi-MB and compress well.
+# Starlette already skips SSE and 206 range responses; binary downloads are
+# excluded too so file streaming keeps its length and costs no CPU.
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1024,
+    compresslevel=5,
+    exclude_content_types=(
+        *DEFAULT_EXCLUDED_CONTENT_TYPES, "application/octet-stream", "application/pdf", "image/*",
+    ),
 )
 
 

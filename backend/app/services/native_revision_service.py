@@ -1652,29 +1652,90 @@ class NativeRevisionService:
             return self.payload_store
         return payload_store_for_placement(self.pool, selected_placement)
 
+    async def list_live_head_snapshots(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path_like: str | None = None,
+        max_slashes: int | None = None,
+    ) -> list[NativeRevisionSnapshot]:
+        """Read and verify every live Head under a namespace in one query.
+
+        Equivalent to ``get_resource_revision`` per live Head, newest first,
+        with the same fail-closed checks: store-row verification by the
+        placement's own adapter, then the manifest binding.  Bulk readers such
+        as browse would otherwise pay several sequential round-trips per
+        Resource.
+        """
+        rows = await self.repository.list_live_heads_with_payloads(
+            namespace_id=namespace_id,
+            surface=surface,
+            path_like=path_like,
+            max_slashes=max_slashes,
+        )
+        for row in rows:
+            if row["revision_id"] is None:
+                raise NotFoundError("Native Revision", row["head_revision_id"])
+            if row["payload_manifest_id"] is None:
+                raise NotFoundError("Native Revision payload", row["revision_id"])
+            row["path"] = row["path_at_revision"]
+        stores = [self._read_store(row["selected_placement"]) for row in rows]
+        if not all(hasattr(type(store), "_verify_row") for store in stores):
+            # An injected test double only offers ``open_verified``.
+            return [await self._snapshot_from_row(row) for row in rows]
+        return await asyncio.to_thread(self._verify_head_rows, rows, stores)
+
+    @staticmethod
+    def _verify_head_rows(rows: list[dict], stores: list) -> list[NativeRevisionSnapshot]:
+        snapshots = []
+        for row, store in zip(rows, stores, strict=True):
+            if row["private_locator"] is None:
+                raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
+            if row["payload_payload_id"] is None:
+                raise ReferencePayloadIntegrityError(
+                    f"Native payload is missing: {row['private_locator']}"
+                )
+            stored = {
+                key: row[f"payload_{key}"]
+                for key in (
+                    "payload_id", "namespace_id", "content_profile", "digest",
+                    "byte_size", "encoding", "selected_placement",
+                    "verification_profile", "canonical_bytes",
+                )
+            }
+            payload_bytes = type(store)._verify_row(stored)
+            text = _verify_snapshot_payload(payload_bytes, row)
+            snapshots.append(_snapshot(row, payload_bytes, text))
+        return snapshots
+
     async def _snapshot_from_row(self, row: dict) -> NativeRevisionSnapshot:
         if row["payload_manifest_id"] is None or row["private_locator"] is None:
             raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
         store = self._read_store(row["selected_placement"])
         payload_bytes = await store.open_verified(row["private_locator"])
         text = await asyncio.to_thread(_verify_snapshot_payload, payload_bytes, row)
-        return NativeRevisionSnapshot(
-            resource_id=row["resource_id"],
-            revision_id=row["revision_id"],
-            parent_revision_id=row["parent_revision_id"],
-            surface=row["surface"],
-            content_profile=row["content_profile"],
-            path=row["path"],
-            action=row["action"],
-            occurred_at=row["occurred_at"],
-            resource_created_at=row["resource_created_at"],
-            resource_updated_at=row["resource_updated_at"],
-            payload_manifest_id=row["payload_manifest_id"],
-            digest=row["digest"],
-            byte_size=row["byte_size"],
-            encoding=row["encoding"],
-            selected_placement=row["selected_placement"],
-            verification_profile=row["verification_profile"],
-            payload_bytes=payload_bytes,
-            text=text,
-        )
+        return _snapshot(row, payload_bytes, text)
+
+
+def _snapshot(row: dict, payload_bytes: bytes, text: str) -> NativeRevisionSnapshot:
+    return NativeRevisionSnapshot(
+        resource_id=row["resource_id"],
+        revision_id=row["revision_id"],
+        parent_revision_id=row["parent_revision_id"],
+        surface=row["surface"],
+        content_profile=row["content_profile"],
+        path=row["path"],
+        action=row["action"],
+        occurred_at=row["occurred_at"],
+        resource_created_at=row["resource_created_at"],
+        resource_updated_at=row["resource_updated_at"],
+        payload_manifest_id=row["payload_manifest_id"],
+        digest=row["digest"],
+        byte_size=row["byte_size"],
+        encoding=row["encoding"],
+        selected_placement=row["selected_placement"],
+        verification_profile=row["verification_profile"],
+        payload_bytes=payload_bytes,
+        text=text,
+    )

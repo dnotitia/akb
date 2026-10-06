@@ -2014,12 +2014,11 @@ class DocumentService:
             table_rows = await table_registry_repo.list_for_vault(
                 conn, vault_id, max_depth=max_depth, prefix=prefix,
             )
+            counts = await table_data_repo.row_counts(conn, [
+                table_data_repo.pg_table_name(vault_row["name"], r["name"]) for r in table_rows
+            ])
             for r in table_rows:
-                pg_name = table_data_repo.pg_table_name(vault_row["name"], r["name"])
-                try:
-                    row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
-                except Exception:
-                    row_count = 0
+                row_count = counts.get(table_data_repo.pg_table_name(vault_row["name"], r["name"]), 0)
                 cols = ensure_list(r["columns"]) if isinstance(r["columns"], str) else r["columns"]
                 items.append(BrowseItem(
                     # `path` is the table name. Pre-0.3.0 it was a

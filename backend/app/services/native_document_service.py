@@ -319,33 +319,29 @@ class NativeDocumentService(DocumentService):
                 vault_id,
                 snapshot.resource_id,
             )
-        if legacy is None:
-            return frontmatter, body
-
-        row = dict(legacy)
-        fallback = {
-            "title": row.get("title"),
-            "type": row.get("doc_type") or "note",
-            "status": row.get("status") or "draft",
-            "summary": row.get("summary"),
-            "domain": row.get("domain"),
-            "created_by": row.get("created_by"),
-            "created_at": (
-                row["created_at"].isoformat()
-                if isinstance(row.get("created_at"), datetime)
-                else row.get("created_at")
-            ),
-            "updated_at": (
-                row["updated_at"].isoformat()
-                if isinstance(row.get("updated_at"), datetime)
-                else row.get("updated_at")
-            ),
-            "tags": list(row.get("tags") or []),
-        }
-        for key, value in fallback.items():
-            if frontmatter.get(key) is None and value is not None:
-                frontmatter[key] = value
+        if legacy is not None:
+            _fill_from_legacy(frontmatter, dict(legacy))
         return frontmatter, body
+
+    async def _legacy_projection_rows(
+        self, vault_id: uuid.UUID, resource_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, dict]:
+        """Batch form of the ``_document_frontmatter`` legacy read."""
+        if not resource_ids:
+            return {}
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, title, doc_type, status, summary, domain, created_by,
+                       created_at, updated_at, tags
+                  FROM documents
+                 WHERE vault_id = $1 AND id = ANY($2::uuid[])
+                """,
+                vault_id,
+                resource_ids,
+            )
+        return {row["id"]: dict(row) for row in rows}
 
     async def _native(self) -> NativeRevisionService:
         """Compose the substrate on the frozen P1 searchable-body placement.
@@ -1485,46 +1481,25 @@ class NativeDocumentService(DocumentService):
         surfaces during the selector rollout, but this query must never hydrate
         the legacy ``documents`` projection or Git.
         """
-        params: list[object] = [vault_id]
-        clauses = [
-            "rs.namespace_id = $1",
-            "rs.surface = 'document'",
-            "rs.lifecycle = 'live'",
-        ]
-        if prefix:
-            params.append(like_escape(prefix) + "/%")
-            clauses.append(f"rs.current_path LIKE ${len(params)} ESCAPE '\\'")
-            depth_offset = prefix.count("/") + 1
-        else:
-            depth_offset = 0
-        if max_depth >= 0:
-            params.append(max_depth + depth_offset)
-            clauses.append(
-                "(length(rs.current_path) - "
-                f"length(replace(rs.current_path, '/', ''))) <= ${len(params)}"
-            )
-
-        sql = """
-            SELECT rs.resource_id, rs.current_path AS path,
-                   rs.head_revision_id AS revision_id, rs.updated_at
-              FROM native_resources rs
-             WHERE """ + " AND ".join(clauses) + """
-             ORDER BY rs.updated_at DESC, rs.resource_id DESC
-        """
-        pool = await self._pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
-
+        depth_offset = prefix.count("/") + 1 if prefix else 0
         native = await self._native()
+        snapshots = await native.list_live_head_snapshots(
+            namespace_id=vault_id,
+            surface="document",
+            path_like=like_escape(prefix) + "/%" if prefix else None,
+            max_slashes=max_depth + depth_offset if max_depth >= 0 else None,
+        )
+        # Parsing every body is CPU-bound; keep it off the event loop.
+        parsed = await asyncio.to_thread(lambda: [_parse_markdown(s.text) for s in snapshots])
+        legacy = await self._legacy_projection_rows(vault_id, [
+            snapshot.resource_id
+            for snapshot, (frontmatter, _) in zip(snapshots, parsed, strict=True)
+            if not self._has_complete_native_frontmatter(frontmatter)
+        ])
         items: list[BrowseItem] = []
-        for row in rows:
-            snapshot = await native.get_resource_revision(
-                namespace_id=vault_id,
-                surface="document",
-                resource_id=row["resource_id"],
-                revision_id=row["revision_id"],
-            )
-            frontmatter, body = await self._document_frontmatter(vault_id, snapshot)
+        for snapshot, (frontmatter, body) in zip(snapshots, parsed, strict=True):
+            if snapshot.resource_id in legacy:
+                _fill_from_legacy(frontmatter, legacy[snapshot.resource_id])
             status = frontmatter.get("status") or "draft"
             if not include_archived and status == "archived":
                 continue
@@ -1565,12 +1540,11 @@ class NativeDocumentService(DocumentService):
             rows = await table_registry_repo.list_for_vault(
                 conn, vault_id, max_depth=max_depth, prefix=prefix,
             )
+            counts = await table_data_repo.row_counts(conn, [
+                table_data_repo.pg_table_name(vault_name, row["name"]) for row in rows
+            ])
             for row in rows:
-                pg_name = table_data_repo.pg_table_name(vault_name, row["name"])
-                try:
-                    row_count = await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}")
-                except Exception:
-                    row_count = 0
+                row_count = counts.get(table_data_repo.pg_table_name(vault_name, row["name"]), 0)
                 columns = ensure_list(row["columns"]) if isinstance(row["columns"], str) else row["columns"]
                 items.append(
                     BrowseItem(
@@ -1820,3 +1794,29 @@ class NativeDocumentService(DocumentService):
 
     async def list_vaults(self) -> list[dict]:
         self._unsupported("vault listing")
+
+
+def _fill_from_legacy(frontmatter: dict, row: dict) -> None:
+    """Fill only absent frontmatter fields from a retained Legacy row."""
+    fallback = {
+        "title": row.get("title"),
+        "type": row.get("doc_type") or "note",
+        "status": row.get("status") or "draft",
+        "summary": row.get("summary"),
+        "domain": row.get("domain"),
+        "created_by": row.get("created_by"),
+        "created_at": (
+            row["created_at"].isoformat()
+            if isinstance(row.get("created_at"), datetime)
+            else row.get("created_at")
+        ),
+        "updated_at": (
+            row["updated_at"].isoformat()
+            if isinstance(row.get("updated_at"), datetime)
+            else row.get("updated_at")
+        ),
+        "tags": list(row.get("tags") or []),
+    }
+    for key, value in fallback.items():
+        if frontmatter.get(key) is None and value is not None:
+            frontmatter[key] = value

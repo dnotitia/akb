@@ -1085,13 +1085,12 @@ async def _list_tables_with_schema(vault_name: str, vault_id) -> list[dict]:
             by_table.setdefault(row["table_name"], []).append(col)
 
         # Row counts + one-row sample (only when row_count > 0).
+        from app.repositories.table_data_repo import row_counts
+        counts = await row_counts(conn, pg_names)
         out: list[dict] = []
         for r in registry:
             pg_name = pg_table_name(vault_name, r["name"])
-            # Identifier is built from validated vault + table names —
-            # vault_tables.name is constrained by `akb_create_table`
-            # validation, so direct interpolation is safe.
-            row_count = await conn.fetchval(f'SELECT COUNT(*) FROM "{pg_name}"')
+            row_count = counts.get(pg_name, 0)
             columns = by_table.get(pg_name, [])
             described = {
                 spec["name"]: spec["description"]
