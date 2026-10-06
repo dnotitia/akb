@@ -47,6 +47,22 @@ def test_runtime_load_accepts_explicit_local_auth_mode(
     assert loaded.keycloak_sso_only is False
 
 
+def test_retired_account_self_service_flag_still_loads_and_is_ignored(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from app.services import account_self_service
+
+    loaded = _load(monkeypatch, tmp_path, {"auth_mode": "local", "account_self_service_enabled": False})
+    monkeypatch.setattr(account_self_service, "settings", loaded)
+    human = SimpleNamespace(auth_method="jwt", account_kind="human")
+
+    assert account_self_service._carrier_reason(human) is None
+    assert account_self_service._session_reason(human) is None
+
+
 def test_runtime_load_accepts_explicit_sso_auth_mode(
     monkeypatch,
     tmp_path: Path,

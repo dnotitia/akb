@@ -9,6 +9,12 @@ specifically; the proxy has its own log in
 
 ### Authentication
 
+- Settings → Security (sign out all sessions, delete account) is always
+  available according to `auth_mode`; the `account_self_service_enabled`
+  rollout flag is retired. Existing configs that still set the key keep
+  loading, and the value is ignored. Account deletion still requires a healthy
+  cleanup worker heartbeat and reports `cleanup_unavailable` otherwise.
+
 - `POST /api/v1/auth/register` rejects passwords shorter than 8 characters
   with 422 `invalid_argument`, matching the existing change-password minimum.
   Registration and password change also reject passwords over 72 UTF-8 bytes

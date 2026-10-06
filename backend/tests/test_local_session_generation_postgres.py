@@ -137,7 +137,6 @@ async def test_rapid_login_revoke_and_password_change_use_current_generation(dat
     key_dir = tmp_path / "session-keys"
     generate_local_session_keyset(key_dir)
     monkeypatch.setattr(settings, "auth_mode", "local")
-    monkeypatch.setattr(settings, "account_self_service_enabled", False)
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.test")
     monkeypatch.setattr(settings, "local_session_private_key_path", str(key_dir / "private.pem"))
     monkeypatch.setattr(settings, "local_session_jwks_path", str(key_dir / "jwks.json"))

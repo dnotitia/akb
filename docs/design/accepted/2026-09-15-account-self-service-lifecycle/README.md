@@ -2,7 +2,7 @@
 status: accepted
 stage: implementation
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-10-06
 baseline: 30968585
 ---
 
@@ -25,8 +25,8 @@ account suspension.
 ## API contract
 
 All paths below are relative to `/api/v1`. Mutations require an active local
-human JWT or (for SSO browser revocation only) a CSRF-verified browser session,
-and `account_self_service_enabled: true`. PATs and service credentials cannot
+human JWT or (for SSO browser revocation only) a CSRF-verified browser session.
+PATs and service credentials cannot
 perform these mutations. GET responses use `Cache-Control: no-store`.
 
 | Endpoint | Contract |
@@ -161,8 +161,10 @@ preserves cancellation focus and navigation protection during submission.
    protects revocation but does not guarantee seamless mixed-version login. Old
    processes also retain the retired self-delete endpoint. The default Kubernetes
    `Recreate` strategy avoids overlapping old and new request handlers.
-3. Verify the worker heartbeat and enable `account_self_service_enabled: true`.
-   The default is false; unsupported deployments display an explanatory state.
+3. Verify the worker heartbeat. *(Updated 2026-10-06: the original
+   `account_self_service_enabled` rollout flag is retired; the key is accepted but
+   ignored, and self-service is always available per `auth_mode`. Deletion still
+   reports `cleanup_unavailable` until the cleanup worker heartbeat is healthy.)*
 4. Validate deployment behavior with disposable accounts. Do not use real accounts
    for destructive smoke tests. A rollback to generation-unaware verifiers needs a
    verified forced-logout procedure, such as rotating the local signing keyset.
@@ -225,7 +227,6 @@ do not suspend accounts or delete PATs.
 Configuration defaults:
 
 ```yaml
-account_self_service_enabled: false
 sso_account_sync_enabled: false
 sso_account_sync_interval_secs: 30
 ```

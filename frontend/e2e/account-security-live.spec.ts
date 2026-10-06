@@ -1,9 +1,9 @@
 import { expect, test } from "@playwright/test";
 
-// Opt in only against the isolated runtime after enabling account_self_service_enabled.
+// Destructive: opt in only against the isolated local runtime.
 // This test creates its own account and never operates on an existing user's data.
 test("Security: revoke two local sessions, retain PAT, reauthenticate and delete account", async ({ page, request }) => {
-  test.skip(process.env.AKB_FE_E2E_MODE !== "real" || process.env.AKB_ACCOUNT_SELF_SERVICE_E2E !== "1", "Requires isolated local runtime with account self-service enabled.");
+  test.skip(process.env.AKB_FE_E2E_MODE !== "real" || process.env.AKB_ACCOUNT_SELF_SERVICE_E2E !== "1", "Requires the isolated local runtime and explicit opt-in.");
   test.setTimeout(60_000);
   page.setDefaultTimeout(10_000);
   const username = `security-e2e-${Date.now()}`;

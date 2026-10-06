@@ -528,10 +528,6 @@ notification_retention_days: 90
 #   sampler_interval_secs: 300    # the only thing that decides what this surface costs
 #   activity_grace_minutes: 5     # settling time after a UTC day closes, before its volume is folded (permanently)
 
-# Enable after the session-generation backend rollout is complete on every pod.
-# Account deletion also requires the cleanup worker heartbeat to be healthy.
-account_self_service_enabled: false
-
 # Audit/migrate existing token-provisioning automation before upgrading. All PAT
 # callers are refused by self/admin mint routes. Only the exact listed active,
 # unscoped admin service keys with read+write may use admin issuance routes.

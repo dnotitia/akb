@@ -21,6 +21,7 @@ function reasonText(reason: string | null | undefined): string {
     case "local_auth_disabled": return "Local account management is disabled by your organization's sign-in policy.";
     case "credential_change_required": return "Change your issued password before managing account security.";
     case "cleanup_unavailable": return "Account deletion is temporarily unavailable. Try again later.";
+    case "rollout_not_enabled": return "Account security self-service is not enabled on this server. Contact your AKB administrator.";
     default: return "This server does not currently support this action for your account.";
   }
 }

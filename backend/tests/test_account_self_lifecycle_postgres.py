@@ -30,7 +30,6 @@ async def pool(monkeypatch):
         for module in (service, worker, auth_service):
             monkeypatch.setattr(module, "get_pool", get_pool)
         monkeypatch.setattr(service.settings, "auth_mode", "local")
-        monkeypatch.setattr(service.settings, "account_self_service_enabled", True)
         await pool.execute("INSERT INTO account_deletion_worker_state VALUES(true,clock_timestamp())")
         yield pool
 

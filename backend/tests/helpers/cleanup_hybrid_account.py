@@ -1,7 +1,7 @@
 """Remove one freshly registered hybrid E2E fixture through the safe API.
 
 The fixture password arrives on stdin. Requires the isolated test runtime to
-have account_self_service_enabled and its account cleanup worker running.
+run in local auth_mode with its account cleanup worker running.
 Never falls back to the retired cascading account endpoint.
 """
 from __future__ import annotations
@@ -41,8 +41,8 @@ def cleanup(origin: str, username: str, password: str) -> None:
     if preview["username"] != username or uid != login["user"]["id"]:
         raise RuntimeError("cleanup identity mismatch")
     if preview["deletion"]["supported"] is not True:
-        raise RuntimeError("account cleanup unsupported: enable account_self_service_enabled "
-                           "and the cleanup worker in the isolated test runtime")
+        raise RuntimeError("account cleanup unsupported: the isolated test runtime needs "
+                           "local auth_mode and a running cleanup worker")
     # All vaults here are owned by the freshly registered fixture account.
     # Ownership blockers are authoritative even after test ownership transfers.
     while True:
