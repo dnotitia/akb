@@ -105,3 +105,20 @@ async def test_register_rejects_a_password_shorter_than_change_password_allows(m
 
     with pytest.raises(ValidationError, match="at least 8 characters"):
         await auth_service.register("newbie", "newbie@corp.example", "short", None)
+
+
+async def test_password_over_bcrypts_byte_limit_is_a_client_error(monkeypatch):
+    # bcrypt raises ValueError past 72 bytes, which used to surface as a 500.
+    async def no_pool():
+        raise AssertionError("a rejected password must not reach the database")
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    monkeypatch.setattr(auth_service, "get_pool", no_pool)
+    too_long = "가" * 25  # 25 characters, 75 UTF-8 bytes
+
+    with pytest.raises(ValidationError, match="at most 72 UTF-8 bytes"):
+        await auth_service.register("newbie", "newbie@corp.example", too_long, None)
+    with pytest.raises(auth_service.BadPasswordChange, match="^New password must be at most 72"):
+        await auth_service.change_password("user-id", "current-pw", too_long)
+    with pytest.raises(auth_service.BadPasswordChange, match="^New password must be at least 8"):
+        await auth_service.change_password("user-id", "current-pw", "short")

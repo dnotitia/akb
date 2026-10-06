@@ -262,12 +262,22 @@ def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
 # Shared by self-service registration and password change, so a new account
 # can never be created with a password it could not later change to.
 MIN_PASSWORD_LENGTH = 8
+# bcrypt refuses longer input; checked first so it is a 4xx, not a 500.
+MAX_PASSWORD_BYTES = 72
+
+
+def _password_rule_violation(password: str) -> str | None:
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return f"Password must be at most {MAX_PASSWORD_BYTES} UTF-8 bytes"
+    return None
 
 
 async def register(username: str, email: str, password: str, display_name: str | None = None) -> dict:
     require_local_auth_enabled()
-    if len(password) < MIN_PASSWORD_LENGTH:
-        raise ValidationError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if violation := _password_rule_violation(password):
+        raise ValidationError(violation)
     pool = await get_pool()
     pw_hash = await hash_password_async(password)
     user_id = uuid.uuid4()
@@ -1026,8 +1036,8 @@ class BadPasswordChange(Exception):
 async def change_password(user_id: str, current: str, new: str) -> None:
     """Change own password. Verifies current; rejects too-short or unchanged."""
     require_local_auth_enabled()
-    if len(new) < MIN_PASSWORD_LENGTH:
-        raise BadPasswordChange(f"New password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if violation := _password_rule_violation(new):
+        raise BadPasswordChange(f"New {violation[0].lower()}{violation[1:]}")
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
