@@ -684,6 +684,11 @@ body::before {
   color: var(--color-foreground);
   max-width: 72ch;
   line-height: 1.75;
+  /* Table rules use theme tokens in both modes (prose-invert included). */
+  --tw-prose-th-borders: var(--color-border-strong);
+  --tw-prose-td-borders: var(--color-border);
+  --tw-prose-invert-th-borders: var(--color-border-strong);
+  --tw-prose-invert-td-borders: var(--color-border);
 }
 .prose a {
   color: var(--color-link);

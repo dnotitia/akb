@@ -37,8 +37,8 @@ function SetupChoice({ label, name, value, options, disabled, onChange, appearan
         appearance === "tabs" ? "rounded-t-[var(--radius-sm)] border-b-2" : "rounded-[var(--radius-sm)] border",
         disabled && "cursor-not-allowed opacity-50",
         value === option.value
-          ? cn("bg-surface-selected font-semibold text-surface-selected-foreground", appearance === "tabs" ? "border-link!" : "border-border-strong!")
-          : "border-transparent! text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+          ? cn("bg-surface-selected font-semibold text-surface-selected-foreground", appearance === "tabs" ? "border-link" : "border-border-strong")
+          : "border-transparent text-foreground-muted hover:bg-surface-hover hover:text-foreground",
       )}>
         <input type="radio" className="sr-only" name={name} value={option.value} aria-label={option.accessibleName} checked={value === option.value} tabIndex={value === option.value ? 0 : -1} onChange={() => onChange(option.value)} />
         {appearance === "segmented" && <Check aria-hidden className={cn("h-3.5 w-3.5 shrink-0", value !== option.value && "invisible")} />}
