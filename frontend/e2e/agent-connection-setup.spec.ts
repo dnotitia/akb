@@ -34,6 +34,9 @@ for (const width of [1440, 375]) for (const oauth of [false, true]) {
     await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
     const modal = page.getByRole("dialog", { name: "Connect an agent", exact: true });
     await expect(modal.getByRole("group", { name: "AI tool" })).toBeVisible();
+    const selectedUnderline = await modal.getByRole("radio", { name: "Claude Code", exact: true }).locator("..").evaluate(el => getComputedStyle(el).borderBottomColor);
+    const inactiveUnderline = await modal.getByRole("radio", { name: "Cursor", exact: true }).locator("..").evaluate(el => getComputedStyle(el).borderBottomColor);
+    expect(selectedUnderline).not.toBe(inactiveUnderline);
     await expect(modal.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
     await expect(modal.getByRole("heading", { name: "3. Try it in your agent" })).toHaveCount(1);
     expect(creations()).toBe(0);
@@ -92,3 +95,40 @@ test("setup preserves a draft across choices and protects the one-time token", a
   await expect(modal.getByText("Token created — save it now")).toBeVisible();
   expect(creations()).toBe(1);
 });
+
+for (const viewport of [{ width: 375, height: 568 }, { width: 1440, height: 850 }]) {
+  test(`setup keeps keyboard choices visible after focus wraps at ${viewport.width}px`, async ({ page }, testInfo) => {
+    await setup(page, { oauth: true, dark: viewport.width === 375 });
+    await page.setViewportSize(viewport);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
+    const modal = page.getByRole("dialog", { name: "Connect an agent", exact: true });
+    const tool = modal.getByRole("radio", { name: "VS Code", exact: true });
+    await tool.locator("..").click();
+    await modal.getByRole("radio", { name: "Use a saved token" }).locator("..").click();
+    await modal.getByLabel("Full saved token").fill("akb_fixture_saved_secret");
+    const body = modal.locator("[data-connection-scroll]");
+    await body.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    const modalBefore = await modal.boundingBox();
+    const pageBefore = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+    await modal.getByRole("button", { name: "Close dialog", exact: true }).focus();
+    await page.keyboard.press("Tab");
+    await expect(tool).toBeFocused();
+    await expect(tool).toBeChecked();
+    const bounds = await tool.locator("..").boundingBox();
+    const viewportBounds = await body.boundingBox();
+    expect(bounds!.y).toBeGreaterThanOrEqual(viewportBounds!.y);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewportBounds!.y + viewportBounds!.height);
+    expect(await modal.boundingBox()).toEqual(modalBefore);
+    expect(await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }))).toEqual(pageBefore);
+    await page.keyboard.press("ArrowRight");
+    await expect(modal.getByRole("radio", { name: "OpenClaw", exact: true })).toBeChecked();
+    await page.keyboard.press("ArrowLeft");
+    await expect(tool).toBeFocused();
+    await expect(tool).toBeChecked();
+    await page.screenshot({ path: testInfo.outputPath("setup-tabs-focus.png") });
+    await page.keyboard.press("Shift+Tab");
+    await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeFocused();
+    await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeInViewport();
+  });
+}

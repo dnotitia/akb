@@ -1,5 +1,5 @@
 import { useEffect, useId, useState, type ReactNode } from "react";
-import { Terminal } from "lucide-react";
+import { Check, Terminal } from "lucide-react";
 import { authSessionSnapshot, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
 import { type PatReceipt } from "@/lib/api-pat-issuance";
 import { scopeSummary, type PatDraft } from "@/lib/pat-draft";
@@ -23,16 +23,25 @@ function SetupStep({ id, number, title, children }: { id: string; number: number
 }
 
 /** One labelled choice, without another select box or nested setup branch. */
-function SetupChoice({ label, name, value, options, disabled, onChange }: {
+function SetupChoice({ label, name, value, options, disabled, onChange, appearance = "segmented" }: {
   label: string; name: string; value: string;
   options: { value: string; label: string; accessibleName?: string }[];
   disabled: boolean; onChange: (value: string) => void;
+  appearance?: "tabs" | "segmented";
 }) {
   return <fieldset disabled={disabled} className="min-w-0">
     <legend className="mb-2 text-xs font-medium text-foreground-muted">{label}</legend>
-    <div className="flex flex-wrap gap-1 rounded-[var(--radius-md)] bg-surface-2 p-1">
-      {options.map(option => <label key={option.value} className={cn("relative flex min-h-11 flex-1 cursor-pointer items-center justify-center whitespace-nowrap rounded-[var(--radius-sm)] px-3 text-sm transition-colors has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring", disabled && "cursor-not-allowed opacity-50", value === option.value ? "bg-surface font-medium text-link shadow-sm" : "text-foreground-muted hover:bg-surface/70 hover:text-foreground")}>
-        <input type="radio" className="sr-only" name={name} value={option.value} aria-label={option.accessibleName} checked={value === option.value} onChange={() => onChange(option.value)} />
+    <div className={cn("flex flex-wrap gap-1", appearance === "tabs" ? "border-b border-border" : "rounded-[var(--radius-md)] border border-border bg-surface-2 p-1")}>
+      {options.map(option => <label key={option.value} className={cn(
+        "relative flex min-h-11 flex-[1_0_auto] cursor-pointer items-center justify-center gap-2 whitespace-nowrap px-3 text-sm transition-token has-[:focus-visible]:z-10 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-surface",
+        appearance === "tabs" ? "rounded-t-[var(--radius-sm)] border-b-2" : "rounded-[var(--radius-sm)] border",
+        disabled && "cursor-not-allowed opacity-50",
+        value === option.value
+          ? cn("bg-surface-selected font-semibold text-surface-selected-foreground", appearance === "tabs" ? "border-link!" : "border-border-strong!")
+          : "border-transparent! text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+      )}>
+        <input type="radio" className="sr-only" name={name} value={option.value} aria-label={option.accessibleName} checked={value === option.value} tabIndex={value === option.value ? 0 : -1} onChange={() => onChange(option.value)} />
+        {appearance === "segmented" && <Check aria-hidden className={cn("h-3.5 w-3.5 shrink-0", value !== option.value && "invisible")} />}
         {option.label}
       </label>)}
     </div>
@@ -111,8 +120,8 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
   const accessMethod = useOauth ? "oauth" : freshToken ? "create" : credentialMode;
   const configVisible = useOauth || (usableToken && (!freshToken || showSecret));
   return <div className="min-w-0 text-sm" data-layout={layout}>
-    <div className="border-b border-border pb-5">
-      <SetupChoice label="AI tool" name={`${id}-agent`} value={agent} disabled={creating} onChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
+    <div>
+      <SetupChoice label="AI tool" appearance="tabs" name={`${id}-agent`} value={agent} disabled={creating} onChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
     </div>
     <div className="divide-y divide-border">
     <SetupStep id={`${id}-choose`} number={1} title="Prepare access">

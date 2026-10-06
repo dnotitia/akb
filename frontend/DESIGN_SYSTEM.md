@@ -583,11 +583,16 @@ an `sr-only` summary, never the only signal.
   Quickstart and Settings share the same numbered, hairline-separated flow.
   One tool choice leads into one access-method choice (supported browser sign-in,
   new token, or saved token), rather than nested tool/auth/token selects.
+  Tool choices use an underline strip; access methods use a bordered segmented
+  choice with a check on the selection. Both retain labelled native radio groups,
+  a single selected tab stop, arrow-key selection and visible focus in both themes.
   Expiration and write restrictions remain under Advanced options, with the
   reviewed permissions summary always visible before issuance. Keep the form
   mounted across method changes; a hidden draft or uncertain result is not reset.
   Quickstart keeps its header and close controls fixed while only setup content
   scrolls. On narrow screens, step content uses the full available width.
+  Focus-trap wrap reveals the focused control inside that scroll region without
+  moving the modal or background workspace.
   Below `md`, use a labelled section selector; below `sm`, fill the viewport.
   The workspace route, scroll position and sidebar preference stay unchanged.
   Sidebar, account menu, watched-document management and onboarding open this

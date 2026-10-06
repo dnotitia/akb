@@ -47,6 +47,20 @@ describe("Connection setup", () => {
     expect(issuePat).not.toHaveBeenCalled();
   });
 
+  it("keeps one tab stop per choice group as the selected option changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionSetup mcpOauthEnabled />);
+    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "VS Code" })).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toHaveAttribute("tabindex", "0");
+    await user.click(screen.getByRole("radio", { name: "VS Code" }));
+    expect(screen.getByRole("radio", { name: "VS Code" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "-1");
+    await user.click(screen.getByRole("radio", { name: "Use a saved token" }));
+    expect(screen.getByRole("radio", { name: "Use a saved token" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toHaveAttribute("tabindex", "-1");
+  });
+
   it("rejects a token prefix instead of putting it into a command", async () => {
     const user = userEvent.setup();
     render(<ConnectionSetup mcpOauthEnabled={false} />);
