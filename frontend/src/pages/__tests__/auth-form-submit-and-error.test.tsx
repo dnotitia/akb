@@ -225,6 +225,7 @@ describe("AuthPage · guards & validation", () => {
     expect(screen.getByRole("tab", { name: "Sign in" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Username")).toHaveValue("bob");
     expect(screen.getByLabelText("Username")).not.toHaveAttribute("aria-invalid");
+    await waitFor(() => expect(screen.getByLabelText("Password")).toHaveFocus());
   });
 
   it("toggles password visibility", async () => {
@@ -232,9 +233,38 @@ describe("AuthPage · guards & validation", () => {
     renderAuth();
     const password = await screen.findByLabelText("Password");
     expect(password).toHaveAttribute("type", "password");
-    await u.click(screen.getByRole("button", { name: "Show password" }));
+    const toggle = screen.getByRole("button", { name: "Show password" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    await u.click(toggle);
     expect(password).toHaveAttribute("type", "text");
-    expect(screen.getByRole("button", { name: "Hide password" })).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("sends a trimmed username and accepts a single-label mail domain", async () => {
+    mockedRegister.mockResolvedValue({});
+    mockedLogin.mockResolvedValue({ token: "tok" });
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
+    await u.type(screen.getByLabelText("Username"), "  bob ");
+    await u.type(screen.getByLabelText("Email"), "bob@intranet");
+    await u.type(screen.getByLabelText("Password"), "pw-12345");
+    await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
+    await u.click(screen.getByRole("button", { name: /create account/i }));
+    await waitFor(() => expect(mockedRegister).toHaveBeenCalledWith("bob", "bob@intranet", "pw-12345", undefined));
+    expect(mockedLogin).toHaveBeenCalledWith("bob", "pw-12345");
+  });
+
+  it("clears a shown mismatch as soon as the password is corrected", async () => {
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
+    await u.type(screen.getByLabelText("Password"), "pw-1234");
+    await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
+    await u.tab();
+    expect(screen.getByLabelText("Confirm password")).toHaveAccessibleDescription("Doesn't match the password.");
+    await u.type(screen.getByLabelText("Password"), "5");
+    expect(screen.getByLabelText("Confirm password")).not.toHaveAttribute("aria-invalid");
   });
 
   it("treats a token-less 200 login as an error (no token, no navigate)", async () => {

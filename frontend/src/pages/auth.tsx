@@ -43,7 +43,6 @@ export default function AuthPage() {
   const [register, setRegister] = useState<RegisterDraft>(EMPTY_REGISTER);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [message, setMessage] = useState<FormMessage | null>(null);
-  const formRef = useRef<HTMLFormElement | null>(null);
   // The SSO callback is reached by a browser following a redirect, so it cannot
   // answer with an error body — whatever it returns IS the page. It sends the
   // person back here with a reason instead, and this is where that reason
@@ -119,12 +118,10 @@ export default function AuthPage() {
     window.location.href = `${loginUrl}?redirect=${encodeURIComponent(next)}`;
   }
 
-  function focusField(id: string) {
-    requestAnimationFrame(() => {
-      const field = formRef.current?.querySelector<HTMLInputElement>(`#${id}`);
-      field?.focus();
-    });
-  }
+  // The form that owns the field focuses it once mounted: after a failed
+  // auto-login the tab switches, and Radix mounts the new panel a render later.
+  const [pendingFocus, setPendingFocus] = useState<string | null>(null);
+  const focusField = (id: string) => setPendingFocus(id);
 
   function switchMode(next: Mode) {
     setMode(next);
@@ -143,12 +140,12 @@ export default function AuthPage() {
       focusField(FIELD_IDS[firstInvalid]);
       return;
     }
-    const username = mode === "login" ? login.username : register.username;
+    const username = (mode === "login" ? login.username : register.username).trim();
     const password = mode === "login" ? login.password : register.password;
     setLoading(true);
     try {
       if (mode === "register") {
-        const reg = await authRegister(username, register.email, password, register.displayName || undefined);
+        const reg = await authRegister(username, register.email.trim(), password, register.displayName || undefined);
         if (reg.error) {
           setMessage({ kind: "error", text: reg.error });
           return;
@@ -266,15 +263,24 @@ export default function AuthPage() {
                   </TabsList>
                   <TabsContent value="login" className="pt-5">
                     <AuthForm
-                      mode="login" formRef={formRef} values={login}
+                      mode="login" values={login}
+                      focusId={mode === "login" ? pendingFocus : null} onFocused={() => setPendingFocus(null)}
                       onChange={(field, value) => setLogin((draft) => ({ ...draft, [field]: value }))}
                       fieldErrors={fieldErrors} message={message} loading={loading} onSubmit={handleSubmit}
                     />
                   </TabsContent>
                   <TabsContent value="register" className="pt-5">
                     <AuthForm
-                      mode="register" formRef={formRef} values={register}
-                      onChange={(field, value) => setRegister((draft) => ({ ...draft, [field]: value }))}
+                      mode="register" values={register}
+                      focusId={mode === "register" ? pendingFocus : null} onFocused={() => setPendingFocus(null)}
+                      onChange={(field, value) => {
+                        const draft = { ...register, [field]: value };
+                        setRegister(draft);
+                        // Fixing either side of a shown mismatch clears it right away.
+                        if (fieldErrors.confirm && (field === "password" || field === "confirm")) {
+                          setFieldErrors((current) => ({ ...current, confirm: confirmError(draft) }));
+                        }
+                      }}
                       onBlurConfirm={() => setFieldErrors((current) => ({ ...current, confirm: confirmError(register) }))}
                       fieldErrors={fieldErrors} message={message} loading={loading} onSubmit={handleSubmit}
                     />
@@ -366,7 +372,7 @@ function validateRegister(draft: RegisterDraft): FieldErrors {
     username: draft.username.trim() ? undefined : "Enter a username.",
     email: !draft.email.trim()
       ? "Enter your email address."
-      : /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(draft.email.trim()) ? undefined : "Enter a valid email address.",
+      : /^[^\s@]+@[^\s@]+$/.test(draft.email.trim()) ? undefined : "Enter a valid email address.",
     password: draft.password.length >= MIN_PASSWORD_LENGTH ? undefined : `Use at least ${MIN_PASSWORD_LENGTH} characters.`,
     confirm: draft.confirm ? confirmError(draft) : "Re-enter your password.",
   };
@@ -374,7 +380,8 @@ function validateRegister(draft: RegisterDraft): FieldErrors {
 
 interface AuthFormProps {
   mode: Mode;
-  formRef: React.RefObject<HTMLFormElement | null>;
+  focusId: string | null;
+  onFocused: () => void;
   values: LoginDraft | RegisterDraft;
   onChange: (field: FieldName, value: string) => void;
   onBlurConfirm?: () => void;
@@ -384,8 +391,14 @@ interface AuthFormProps {
   onSubmit: (e: React.FormEvent) => void;
 }
 
-function AuthForm({ mode, formRef, values, onChange, onBlurConfirm, fieldErrors, message, loading, onSubmit }: AuthFormProps) {
+function AuthForm({ mode, focusId, onFocused, values, onChange, onBlurConfirm, fieldErrors, message, loading, onSubmit }: AuthFormProps) {
   const [showPassword, setShowPassword] = useState(false);
+  const formRef = useRef<HTMLFormElement | null>(null);
+  useEffect(() => {
+    if (!focusId) return;
+    formRef.current?.querySelector<HTMLInputElement>(`#${focusId}`)?.focus();
+    onFocused();
+  }, [focusId, onFocused]);
   const register = mode === "register" ? (values as RegisterDraft) : null;
   const passwordType = showPassword ? "text" : "password";
   const field = (name: FieldName) => ({
@@ -415,7 +428,7 @@ function AuthForm({ mode, formRef, values, onChange, onBlurConfirm, fieldErrors,
           <button
             type="button"
             onClick={() => setShowPassword((shown) => !shown)}
-            aria-label={showPassword ? "Hide password" : "Show password"}
+            aria-label="Show password"
             aria-pressed={showPassword}
             className="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-r-[var(--radius-md)] text-foreground-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
