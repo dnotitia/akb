@@ -29,7 +29,6 @@ async def issue(uid, sequence=None):
 def configure(monkeypatch, pool):
     _configure(monkeypatch, sessions, pool)
     monkeypatch.setattr(lifecycle, "get_pool", sessions.get_pool)
-    monkeypatch.setattr(lifecycle.settings, "account_self_service_enabled", True)
 
 
 async def test_sso_all_logout_preserves_pat_account_vault_and_fences_callbacks(monkeypatch):

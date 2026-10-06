@@ -30,8 +30,6 @@ def _carrier_reason(user: AuthenticatedUser) -> str | None:
         return "managed_account"
     if user.auth_method != "jwt" or user.account_kind != "human":
         return "human_session_required"
-    if not settings.account_self_service_enabled:
-        return "rollout_not_enabled"
     return None
 
 
@@ -46,8 +44,6 @@ def _session_reason(user: AuthenticatedUser) -> str | None:
         return _carrier_reason(user)
     if user.auth_method != "browser_session" or user.account_kind != "human":
         return "human_session_required"
-    if not settings.account_self_service_enabled:
-        return "rollout_not_enabled"
     return None
 
 

@@ -1438,7 +1438,11 @@ class Settings(BaseModel):
     # DDL online; this timer is the belt-and-suspenders that catches
     # any silent hook failure (logged + counted in metrics_snapshot
     # but otherwise not auto-recovered). Set to 0 to disable.
-    # Enable only after every local-session issuer/verifier supports generation claims.
+    # Retained and ignored. It gated account self-service during the 0.15.0
+    # session-generation rollout; Settings → Security is now always available
+    # per auth_mode. Removing the field would make every existing deployment's
+    # config that still sets it fail to load — `Settings` forbids unknown keys —
+    # so it stays until a release that can take that break.
     account_self_service_enabled: bool = False
     # Explicit machine authority for admin token provisioning only. PAT callers
     # are never eligible; listed IDs must resolve to unscoped admin service keys.

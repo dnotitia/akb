@@ -2,7 +2,7 @@
 
 Run with AKB_NOTIFICATION_E2E_URL=http://127.0.0.1:18000. Accounts and the
 private Vault are unique to this run and deleted in finally. No token is logged.
-The runtime must enable account_self_service_enabled and run its cleanup worker.
+The runtime must run its account cleanup worker.
 """
 import ipaddress
 import os
@@ -138,7 +138,7 @@ def test_personal_inbox_http_and_background_worker():
                     })
                     if not response.is_success:
                         cleanup_errors.append(f"Account cleanup HTTP {response.status_code}; "
-                                              "runtime requires account_self_service_enabled and cleanup worker")
+                                              "runtime requires local auth_mode and the cleanup worker")
                     elif response.json() != {"deleted": True, "user_id": uid}:
                         cleanup_errors.append("Account cleanup response did not confirm fixture identity")
                     del password
