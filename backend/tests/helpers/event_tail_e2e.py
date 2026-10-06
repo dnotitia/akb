@@ -135,8 +135,7 @@ def assert_heartbeat_timing() -> None:
     assert baseline_gap <= 20, f"quiet baseline heartbeat arrived after {baseline_gap:.3f}s"
     print(f"quiet baseline: first comment at {baseline_gap:.3f}s with no writes")
 
-    busy_stream, stream_started = open_tail(quiet_vault)
-    busy_writes = []
+    busy_writes = []  # (started, finished) monotonic pairs; the NOTIFY lands in between
     writer_errors = []
     stop_writer = threading.Event()
 
@@ -155,42 +154,87 @@ def assert_heartbeat_timing() -> None:
                     f"Busy write {sequence}",
                     f"heartbeat-busy-{sequence}",
                 )
-                busy_writes.append(time.monotonic())
+                busy_writes.append((write_started, time.monotonic()))
             except Exception as exc:  # the assertion below reports a sanitized class name
                 writer_errors.append(type(exc).__name__)
                 stop_writer.set()
                 return
             next_write_at = write_started + 2.5
 
+    def busy_window(opened, closed):
+        """Return (write count, worst-case wakeup gap) for writes fully inside the window.
+
+        A pre-#717 stream restarted its 15s wait on every cross-Vault wakeup, so a
+        heartbeat window whose worst-case wakeup gap stays under the interval could
+        not have produced that heartbeat. Bounds are conservative: each NOTIFY is
+        only known to fall between its write's start and finish.
+        """
+        inside = [w for w in list(busy_writes) if w[0] >= opened and w[1] <= closed]
+        if not inside:
+            return 0, closed - opened
+        gaps = [inside[0][1] - opened, closed - inside[-1][0]]
+        gaps += [later[1] - earlier[0] for earlier, later in zip(inside, inside[1:])]
+        return len(inside), max(gaps)
+
+    def timeline():
+        writes = [
+            (round(s - stream_started, 3), round(f - stream_started, 3))
+            for s, f in list(busy_writes)
+        ]
+        windows = [
+            (count, round(gap, 3))
+            for count, gap in (
+                busy_window(opened, closed)
+                for opened, closed in zip([stream_started] + heartbeats, heartbeats)
+            )
+        ]
+        return (
+            f"busy_writes={len(writes)} write_offsets={writes} "
+            f"heartbeat_offsets={[round(h - stream_started, 3) for h in heartbeats]} "
+            f"windows(count, worst_gap)={windows} writer_errors={writer_errors}"
+        )
+
+    # Start writing first: the Tail only flushes its response headers with the
+    # first frame, so a writer started after open_tail() would miss window one.
     writer = threading.Thread(target=keep_busy_vault_changing, daemon=True)
     writer.start()
     heartbeats = []
+    busy_windows = 0
+    busy_stream = None
+    stream_started = time.monotonic()  # replaced by open_tail(); keeps timeline() valid
     try:
-        while len(heartbeats) < 3:
-            frame = read_frame(busy_stream)
-            received = time.monotonic()
-            if frame != [": heartbeat"]:
-                raise AssertionError(
-                    f"quiet Vault received a non-heartbeat before its own write: {frame}"
-                )
-            heartbeats.append(received)
+        try:
+            busy_stream, stream_started = open_tail(quiet_vault)
+            # Keep the Vault busy until three heartbeat windows were each provably
+            # busy; a slow runner only lengthens the observation instead of failing.
+            while busy_windows < 3 and len(heartbeats) < 8 and not writer_errors:
+                frame = read_frame(busy_stream)
+                received = time.monotonic()
+                if frame != [": heartbeat"]:
+                    raise AssertionError(
+                        f"quiet Vault received a non-heartbeat before its own write: {frame}; {timeline()}"
+                    )
+                opened = heartbeats[-1] if heartbeats else stream_started
+                heartbeats.append(received)
+                count, worst_gap = busy_window(opened, received)
+                if count >= 2 and worst_gap < 15:
+                    busy_windows += 1
+        except OSError as exc:  # a starved Tail sends nothing, not even headers, until timeout
+            raise AssertionError(
+                f"no heartbeat before the read timeout ({type(exc).__name__}); {timeline()}"
+            ) from exc
         stop_writer.set()
         writer.join(timeout=10)
-        assert not writer.is_alive(), "busy writer did not stop"
-        assert not writer_errors, f"busy writer failed: {writer_errors}"
-        assert len(busy_writes) >= 15, f"only {len(busy_writes)} busy writes succeeded"
-        assert busy_writes[-1] - stream_started >= 35, "busy writes did not span the observation"
+        assert not writer.is_alive(), f"busy writer did not stop; {timeline()}"
+        assert not writer_errors, f"busy writer failed; {timeline()}"
+        assert busy_windows >= 3, f"only {busy_windows} heartbeat windows stayed busy; {timeline()}"
         heartbeat_gaps = [heartbeats[0] - stream_started] + [
             later - earlier for earlier, later in zip(heartbeats, heartbeats[1:])
         ]
-        assert all(gap <= 20 for gap in heartbeat_gaps), heartbeat_gaps
-        observation_seconds = heartbeats[-1] - stream_started
-        busy_write_offsets = [round(received - stream_started, 3) for received in busy_writes]
+        assert all(gap <= 20 for gap in heartbeat_gaps), f"gaps={heartbeat_gaps}; {timeline()}"
         print(
-            "busy Vault: "
-            f"successful_write_offsets={busy_write_offsets}, "
-            f"observation={observation_seconds:.3f}s, "
-            f"heartbeats=3, received_gaps={[round(gap, 3) for gap in heartbeat_gaps]}s"
+            f"busy Vault: {timeline()}, "
+            f"received_gaps={[round(gap, 3) for gap in heartbeat_gaps]}s"
         )
 
         # A target-Vault write after the comments must still arrive as a normal change.
@@ -215,7 +259,8 @@ def assert_heartbeat_timing() -> None:
     finally:
         stop_writer.set()
         writer.join(timeout=10)
-        busy_stream.close()
+        if busy_stream is not None:
+            busy_stream.close()
 
 
 def main() -> int:
