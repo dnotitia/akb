@@ -64,7 +64,7 @@ export const LocalLoginInvalidCredentials: Story = {
 };
 
 export const RegisterForm: Story = {
-  name: "Register / form state",
+  name: "Create account / form state",
   parameters: {
     router: { initialEntries: ["/auth"] },
     msw: {
@@ -78,7 +78,7 @@ export const RegisterForm: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("tab", { name: "Register" }));
+    await userEvent.click(await canvas.findByRole("tab", { name: "Create account" }));
     await expect(canvas.getByLabelText("Email")).toBeInTheDocument();
     await expect(canvas.getByLabelText(/Display name/i)).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();

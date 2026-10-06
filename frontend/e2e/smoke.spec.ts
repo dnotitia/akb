@@ -8,9 +8,10 @@
 //   - Profile edit form / save round-trip (PR #43 — settings tab)
 //
 // Selector notes (from frontend/src/pages/auth.tsx, settings.tsx):
-//   - Tabs render "Log in" / "Register" — NOT "Sign in/up".
-//   - Submit button text is "Create Account" (register) or
-//     "Enter the Base" (login). During submit it flips to "Signing in…".
+//   - Tabs and submit buttons read "Sign in" / "Create account". During
+//     submit the button flips to "Signing in…" / "Creating account…".
+//   - Registration asks for "Password" and "Confirm password"; match the
+//     password label exactly (a "Show password" toggle also exists).
 //   - Profile labels are uppercase ("DISPLAY NAME", "EMAIL").
 //   - Save confirmation is the literal string "Saved" (not "saved").
 //
@@ -28,10 +29,11 @@ test.describe.configure({ mode: "serial" });
 test("signup → land in shell → profile edit round-trip", async ({ page, request }) => {
   // ── 1. Register ────────────────────────────────────────────
   await page.goto("/auth");
-  await page.getByRole("tab", { name: /^register$/i }).click();
+  await page.getByRole("tab", { name: "Create account", exact: true }).click();
   await page.getByLabel("Username").fill(USER);
   await page.getByLabel("Email").fill(`${USER}@e2e.test`);
-  await page.getByLabel("Password").fill(PASS);
+  await page.getByLabel("Password", { exact: true }).fill(PASS);
+  await page.getByLabel("Confirm password", { exact: true }).fill(PASS);
   await page.getByRole("button", { name: /create account/i }).click();
 
   // The authenticated shell sets up nav links — "Home" is the
