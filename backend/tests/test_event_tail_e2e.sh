@@ -7,11 +7,14 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVENT_TAIL_HELPER="$SCRIPT_DIR/helpers/event_tail_e2e.py"
 PASS=0
 FAIL=0
 ERRORS=()
 TMP_DIR=$(mktemp -d)
 VAULT="event-tail-$(date +%s)-$RANDOM"
+BUSY_VAULT="event-tail-busy-$(date +%s)-$RANDOM"
 USER="event-tail-user-$(date +%s)-$RANDOM"
 OTHER="event-tail-other-$(date +%s)-$RANDOM"
 
@@ -19,14 +22,16 @@ pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 cleanup() {
   if [ -n "${TOKEN:-}" ]; then
-    curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$VAULT" \
-      -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+    for vault in "$VAULT" "$BUSY_VAULT"; do
+      curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$vault" \
+        -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+    done
   fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
-json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+json_field() { python3 "$EVENT_TAIL_HELPER" json-field "$1" 2>/dev/null; }
 
 echo "╔══════════════════════════════════════════╗"
 echo "║       REST/SSE Event Tail E2E             ║"
@@ -56,6 +61,11 @@ VAULT_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT" \
 VAULT_ID=$(echo "$VAULT_RESPONSE" | json_field vault_id)
 [ -n "$VAULT_ID" ] && pass "private Vault created" || { fail "vault" "$VAULT_RESPONSE"; exit 1; }
 
+BUSY_VAULT_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$BUSY_VAULT" \
+  -H "Authorization: Bearer $TOKEN")
+BUSY_VAULT_ID=$(echo "$BUSY_VAULT_RESPONSE" | json_field vault_id)
+[ -n "$BUSY_VAULT_ID" ] && pass "second Vault created for heartbeat isolation" || { fail "busy vault" "$BUSY_VAULT_RESPONSE"; exit 1; }
+
 DOC_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -82,40 +92,7 @@ curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT?start=earliest&kind=table.rows_changed" \
   -H "Authorization: Bearer $TOKEN" >"$FILTERED" 2>/dev/null || true
 
-python3 - "$FILTERED" <<'PY'
-import json
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-frames = []
-current = {}
-for line in text.splitlines():
-    if not line:
-        if current:
-            frames.append(current)
-            current = {}
-        continue
-    if line.startswith("event: "):
-        current["event"] = line[7:]
-    elif line.startswith("id: "):
-        current["id"] = line[4:]
-    elif line.startswith("data: "):
-        current["data"] = json.loads(line[6:])
-if current:
-    frames.append(current)
-
-changes = [frame for frame in frames if frame.get("event") == "change"]
-checkpoints = [frame for frame in frames if frame.get("event") == "checkpoint"]
-assert len(changes) == 1, (frames, "expected exactly one selected change")
-assert checkpoints, (frames, "excluded producer events must advance by checkpoint")
-change = changes[0]
-assert change["id"] == change["data"]["cursor"]
-assert change["data"]["version"] == 1
-assert change["data"]["vault"].startswith("event-tail-")
-assert change["data"]["kind"] == "table.rows_changed"
-assert "vault_id" not in change["data"]
-assert "redis" not in text.lower()
-PY
+python3 "$EVENT_TAIL_HELPER" assert-filtered "$FILTERED"
 [ $? -eq 0 ] && pass "exact filter emits change plus checkpoint" || fail "filter/checkpoint" "unexpected SSE frames"
 
 echo ""
@@ -125,21 +102,7 @@ curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT?start=earliest" \
   -H "Authorization: Bearer $TOKEN" >"$ALL_EVENTS" 2>/dev/null || true
 
-python3 - "$ALL_EVENTS" <<'PY'
-import json
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-events = []
-for block in text.split("\n\n"):
-    rows = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
-    if rows.get("event") == "change":
-        events.append(json.loads(rows["data"]))
-assert len(events) >= 3, events
-assert {item["kind"] for item in events} >= {"document.put", "table.create", "table.rows_changed"}
-assert all(item["cursor"] for item in events)
-assert "redis" not in text.lower()
-PY
+python3 "$EVENT_TAIL_HELPER" assert-all-events "$ALL_EVENTS"
 [ $? -eq 0 ] && pass "all Vault kinds are ordered and Redis-free" || fail "all events" "retained event envelope mismatch"
 
 LAST_CURSOR=$(awk '/^id: / {cursor=$2} END {print cursor}' "$ALL_EVENTS")
@@ -155,21 +118,7 @@ curl -sk --no-buffer --max-time 2 \
   -H "Authorization: Bearer $TOKEN" \
   -H "Last-Event-ID: $LAST_CURSOR" >"$RESUMED" 2>/dev/null || true
 
-python3 - "$RESUMED" <<'PY'
-import json
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-changes = []
-for block in text.split("\n\n"):
-    rows = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
-    if rows.get("event") == "change":
-        changes.append(json.loads(rows["data"]))
-assert changes, text
-assert all(item["kind"] == "document.put" for item in changes), changes
-assert "Second document" in text
-assert "redis" not in text.lower()
-PY
+python3 "$EVENT_TAIL_HELPER" assert-resumed "$RESUMED"
 [ $? -eq 0 ] && pass "Last-Event-ID resumes after the retained cursor" || fail "resume" "new event was not delivered"
 
 RESUME_CURSOR=$(awk '/^id: / {cursor=$2} END {print cursor}' "$RESUMED")
@@ -211,6 +160,15 @@ UNAUTHORIZED_CODE=$(curl -sk -o "$TMP_DIR/unauthorized.json" -w '%{http_code}' \
 UNAUTHORIZED_BODY=$(cat "$TMP_DIR/unauthorized.json")
 [ "$UNAUTHORIZED_CODE" = "403" ] && ! echo "$UNAUTHORIZED_BODY" | grep -q 'document.put' \
   && pass "non-member cannot observe the tail" || fail "access isolation" "code=$UNAUTHORIZED_CODE body=$UNAUTHORIZED_BODY"
+
+echo ""
+echo "▸ 4. quiet and cross-Vault heartbeat deadlines"
+if AKB_URL="$BASE_URL" AKB_TOKEN="$TOKEN" AKB_QUIET_VAULT="$VAULT" AKB_BUSY_VAULT="$BUSY_VAULT" python3 "$EVENT_TAIL_HELPER" heartbeat;
+then
+  pass "quiet baseline and repeated 15s-contract heartbeats stay scoped to the target Vault"
+else
+  fail "heartbeat starvation" "baseline, busy cross-Vault cadence, comment shape, or target resume failed"
+fi
 
 echo ""
 echo "═══════════════════════════════════════════"

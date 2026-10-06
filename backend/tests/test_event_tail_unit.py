@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -243,6 +245,64 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert "vault_id" not in change_body
     connection.remove_listener.assert_awaited_once()
     assert access.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch) -> None:
+    from app.services import event_tail_service
+
+    pool, connection, request = _stream_test_doubles()
+    listener_ready = asyncio.Event()
+    notify: Callable[[], None] | None = None
+
+    async def add_listener(_channel, callback) -> None:
+        nonlocal notify
+        notify = callback
+        listener_ready.set()
+
+    connection.add_listener = AsyncMock(side_effect=add_listener)
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    list_events = AsyncMock(return_value=[])
+    monkeypatch.setattr(event_tail_service, "list_vault_events", list_events)
+    monkeypatch.setattr(
+        event_tail_service,
+        "check_vault_access",
+        AsyncMock(return_value={"vault_id": VAULT_ID}),
+    )
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", 0.04)
+
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+    )
+    notification_task: asyncio.Task[None] | None = None
+
+    async def keep_waking() -> None:
+        while True:
+            await asyncio.sleep(0.005)
+            assert notify is not None
+            notify()
+
+    try:
+        next_frame = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(listener_ready.wait(), timeout=0.1)
+        notification_task = asyncio.create_task(keep_waking())
+        frame = await asyncio.wait_for(next_frame, timeout=0.2)
+    finally:
+        if notification_task is not None:
+            notification_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await notification_task
+        await stream.aclose()
+
+    assert frame == format_heartbeat()
+    assert list_events.await_count > 1
+    connection.remove_listener.assert_awaited_once()
 
 
 @pytest.mark.asyncio
