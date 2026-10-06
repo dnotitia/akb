@@ -212,6 +212,44 @@ def pg_short_name(table_name: str) -> str:
     return _sanitize_pg_part(table_name)
 
 
+# Tables up to this many estimated rows are counted exactly; larger ones
+# report the planner estimate. COUNT(*) is a full scan, so exact counts for
+# every table made a vault listing scale with total table rows.
+EXACT_ROW_COUNT_LIMIT = 10_000
+
+
+async def row_counts(conn, pg_names: list[str]) -> dict[str, int]:
+    """Return a display row count per physical vault table.
+
+    One catalog query supplies ``pg_class.reltuples``; only small or
+    never-analysed tables (``reltuples`` < 0) are then counted exactly.
+    Missing tables are absent from the result.
+    """
+    if not pg_names:
+        return {}
+    estimates = await conn.fetch(
+        """
+        SELECT c.relname, c.reltuples
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = ANY($1::text[])
+           AND n.nspname = current_schema()
+           AND c.relkind = 'r'
+        """,
+        pg_names,
+    )
+    counts: dict[str, int] = {}
+    for row in estimates:
+        if row["reltuples"] > EXACT_ROW_COUNT_LIMIT:
+            counts[row["relname"]] = int(row["reltuples"])
+        else:
+            # Identifier comes from pg_class for a validated vt_* name.
+            counts[row["relname"]] = await conn.fetchval(
+                f'SELECT COUNT(*) FROM "{row["relname"]}"'
+            )
+    return counts
+
+
 def safe_ident(name: str) -> str:
     """Sanitise a column / table name for use as a SQL identifier."""
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)

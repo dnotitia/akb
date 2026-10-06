@@ -701,6 +701,65 @@ class NativeRevisionRepository:
             raise NativeRevisionSelectorAmbiguousError(revision_id)
         return dict(rows[0]) if rows else None
 
+    async def list_live_heads_with_payloads(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        surface: str,
+        path_like: str | None = None,
+        max_slashes: int | None = None,
+    ) -> list[dict]:
+        """Read every live Head with its manifest and stored body in one query.
+
+        Rows carry the same columns as ``get_revision`` plus the raw payload
+        row under ``payload_*`` keys, so the caller can apply the unchanged
+        store verification without one round-trip per Resource.  A Head whose
+        Revision is missing keeps ``revision_id`` NULL so the caller can fail
+        closed exactly like the per-Resource read.
+        """
+        params: list[object] = [namespace_id, surface]
+        clauses = ["rs.namespace_id = $1", "rs.surface = $2", "rs.lifecycle = 'live'"]
+        if path_like is not None:
+            params.append(path_like)
+            clauses.append(f"rs.current_path LIKE ${len(params)} ESCAPE '\\'")
+        if max_slashes is not None:
+            params.append(max_slashes)
+            clauses.append(
+                "(length(rs.current_path) - "
+                f"length(replace(rs.current_path, '/', ''))) <= ${len(params)}"
+            )
+        sql = f"""
+            SELECT rv.*, rs.resource_id AS head_resource_id,
+                   rs.head_revision_id, rs.surface, rs.content_profile,
+                   rs.created_at AS resource_created_at,
+                   rs.updated_at AS resource_updated_at,
+                   pm.digest, pm.byte_size, pm.encoding,
+                   pm.selected_placement, pm.private_locator,
+                   pm.verification_profile,
+                   p.payload_id AS payload_payload_id,
+                   p.namespace_id AS payload_namespace_id,
+                   p.content_profile AS payload_content_profile,
+                   p.digest AS payload_digest,
+                   p.byte_size AS payload_byte_size,
+                   p.encoding AS payload_encoding,
+                   p.selected_placement AS payload_selected_placement,
+                   p.verification_profile AS payload_verification_profile,
+                   p.canonical_bytes AS payload_canonical_bytes
+              FROM native_resources rs
+              LEFT JOIN native_revisions rv
+                ON rv.resource_id = rs.resource_id
+               AND rv.revision_id = rs.head_revision_id
+              LEFT JOIN native_payload_manifests pm
+                ON pm.payload_manifest_id = rv.payload_manifest_id
+              LEFT JOIN m1_reference_payloads p
+                ON p.payload_id = pm.private_locator
+             WHERE {" AND ".join(clauses)}
+             ORDER BY rs.updated_at DESC, rs.resource_id DESC
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [dict(row) for row in rows]
+
     async def list_history(
         self,
         *,
