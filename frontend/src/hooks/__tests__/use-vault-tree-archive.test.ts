@@ -1,4 +1,5 @@
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, waitFor } from "@testing-library/react";
+import { renderHook } from "@/test-query-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { browseVault, type ArchiveScope } from "@/lib/api";
 import { useVaultTree } from "../use-vault-tree";
@@ -33,9 +34,21 @@ describe("archive-aware Vault tree", () => {
     expect(result.current.showingPreviousScope).toBe(true);
     expect(result.current.refreshing).toBe(true);
     await act(async () => resolve(response("archived")));
-    expect(result.current.showingPreviousScope).toBe(false);
+    await waitFor(() => expect(result.current.showingPreviousScope).toBe(false));
     expect(result.current.tree?.[0].children?.[0].raw.status).toBe("archived");
     expect(browse).toHaveBeenLastCalledWith("v", undefined, -1, { archive_scope: "archived" });
+  });
+
+  it("reuses a Vault's tree on return and never shows another Vault's tree", async () => {
+    const { result, rerender } = renderHook(({ vault }: { vault: string }) => useVaultTree(vault), { initialProps: { vault: "v" } });
+    await waitFor(() => expect(result.current.tree).not.toBeNull());
+    browse.mockReturnValueOnce(new Promise(() => {}));
+    rerender({ vault: "other" });
+    expect(result.current.tree).toBeNull();
+    expect(result.current.loading).toBe(true);
+    rerender({ vault: "v" });
+    expect(result.current.tree?.[0].children?.[0].name).toBe("Current");
+    expect(browse.mock.calls.filter(([vault]) => vault === "v")).toHaveLength(1);
   });
 
   it("does not expose an ignored scope as a valid tree", async () => {

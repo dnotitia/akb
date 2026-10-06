@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { browseVault, type ArchiveScope } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
@@ -46,26 +48,54 @@ interface BrowseItem {
  * kind disclosures and progressive pages. True network/memory scaling will
  * require a future browse contract with collection + kind + cursor inputs.
  */
-interface TreeSnapshot {
-  vault: string;
-  scope: ArchiveScope;
-  items: BrowseItem[];
-  unsupported: boolean;
+export function vaultTreeQueryKey(
+  userId: string | undefined,
+  revision: number,
+  vault: string,
+  archiveScope: ArchiveScope = "unarchived",
+) {
+  return ["vault-tree", userId, revision, vault, archiveScope] as const;
+}
+
+/**
+ * One cached full-subtree browse per account, access revision, Vault and
+ * scope. The explorer, breadcrumb and move dialog share it, so returning to a
+ * Vault or opening a document inside it reuses the tree instead of
+ * downloading the whole Vault again.
+ */
+export function vaultTreeQueryOptions(
+  userId: string | undefined,
+  revision: number,
+  vault: string,
+  archiveScope: ArchiveScope = "unarchived",
+) {
+  return {
+    queryKey: vaultTreeQueryKey(userId, revision, vault, archiveScope),
+    queryFn: () => archiveScope === "unarchived"
+      ? browseVault(vault, undefined, -1)
+      : browseVault(vault, undefined, -1, { archive_scope: archiveScope }),
+    staleTime: 30_000,
+    retry: false,
+  };
 }
 
 export function useVaultTree(vault: string | undefined, archiveScope: ArchiveScope = "unarchived") {
-  const [snapshot, setSnapshot] = useState<TreeSnapshot | null>(null);
-  const snapshotRef = useRef<TreeSnapshot | null>(null);
-  const [error, setError] = useState<string>("");
-  const [refreshing, setRefreshing] = useState(false);
-  // Counter bumped on every refetch invocation so the underlying
-  // effect re-runs even when `vault` is unchanged (manual refresh,
-  // post-mutation invalidate).
-  const [refetchTick, setRefetchTick] = useState(0);
-
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
+  const query = useQuery({
+    ...vaultTreeQueryOptions(user?.user_id, revision, vault ?? "", archiveScope),
+    enabled: Boolean(vault) && !checking,
+    // While another scope of the same Vault loads, keep showing the last one;
+    // never show a different Vault's tree.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[3] === vault ? previous : undefined,
+  });
+  const queryClient = useQueryClient();
+  const userId = user?.user_id;
+  // A mutation changes every scope of this Vault and every surface sharing it.
   const refetch = useCallback(() => {
-    setRefetchTick((n) => n + 1);
-  }, []);
+    void queryClient.invalidateQueries({ queryKey: ["vault-tree", userId, revision, vault] });
+  }, [queryClient, userId, revision, vault]);
 
   useEffect(() => {
     const refresh = (event: Event) => {
@@ -75,52 +105,31 @@ export function useVaultTree(vault: string | undefined, archiveScope: ArchiveSco
     return () => window.removeEventListener("akb:document-status-changed", refresh);
   }, [vault, refetch]);
 
-  // `alive` guard still matters: if `vault` changes mid-flight (or the
-  // user fires refetch twice before the first resolves), we don't want
-  // a late response to clobber the newer state.
-  useEffect(() => {
-    if (!vault) {
-      snapshotRef.current = null;
-      setSnapshot(null);
-      setRefreshing(false);
-      setError("");
-      return;
-    }
-    let alive = true;
-    const hasCurrentSnapshot = snapshotRef.current?.vault === vault;
-    setRefreshing(hasCurrentSnapshot);
-    setError("");
-    const request = archiveScope === "unarchived"
-      ? browseVault(vault, undefined, -1)
-      : browseVault(vault, undefined, -1, { archive_scope: archiveScope });
-    request
-      .then((d) => {
-        if (!alive) return;
-        const unsupported = archiveScope !== "unarchived" && d.archive_scope !== archiveScope;
-        const next = { vault, scope: archiveScope, unsupported, items: unsupported ? [] : d.items as BrowseItem[] };
-        snapshotRef.current = next;
-        setSnapshot(next);
-      })
-      .catch((e) => {
-        if (alive) setError(e.message || String(e));
-      })
-      .finally(() => {
-        if (alive) setRefreshing(false);
-      });
-    return () => { alive = false; };
-  }, [vault, archiveScope, refetchTick]);
-
-  const items = snapshot && snapshot.vault === vault ? snapshot.items : null;
-  const scopePending = Boolean(snapshot && snapshot.vault === vault && snapshot.scope !== archiveScope && !error);
-  const unsupported = Boolean(snapshot && snapshot.vault === vault && snapshot.scope === archiveScope && snapshot.unsupported);
-  const showingPreviousScope = Boolean(snapshot && snapshot.vault === vault && snapshot.scope !== archiveScope);
+  const data = vault ? query.data : undefined;
+  const showingPreviousScope = query.isPlaceholderData;
+  const unsupported = Boolean(
+    data && !showingPreviousScope && archiveScope !== "unarchived" && data.archive_scope !== archiveScope,
+  );
+  const items = useMemo(
+    () => (data ? (unsupported ? [] : data.items as BrowseItem[]) : null),
+    [data, unsupported],
+  );
+  const error = vault && query.error ? (query.error as Error).message || String(query.error) : "";
 
   const tree = useMemo<TreeNode[] | null>(() => {
     if (!items) return null;
     return buildTree(items);
   }, [items]);
 
-  return { tree, loading: items === null && !error, refreshing: refreshing || scopePending, showingPreviousScope, unsupported, error, refetch };
+  return {
+    tree,
+    loading: items === null && !error && Boolean(vault),
+    refreshing: Boolean(vault) && query.isFetching && items !== null,
+    showingPreviousScope,
+    unsupported,
+    error,
+    refetch,
+  };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

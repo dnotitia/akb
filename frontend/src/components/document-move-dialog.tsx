@@ -8,11 +8,12 @@ import {
 } from "lucide-react";
 import {
   ApiError,
-  browseVault,
   moveDocument,
   type DocumentMoveResult,
 } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
+import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { vaultTreeQueryOptions } from "@/hooks/use-vault-tree";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -109,12 +110,11 @@ export function DocumentMoveDialog({
   const errorRef = useRef<HTMLDivElement | null>(null);
   const conflictRef = useRef<HTMLDivElement | null>(null);
 
+  const user = useCurrentUser();
+  const { checking, revision } = useAccessVerification();
   const collectionsQuery = useQuery({
-    queryKey: ["document-move-collections", vault],
-    queryFn: () => browseVault(vault, undefined, -1),
-    enabled: open && Boolean(vault),
-    retry: false,
-    staleTime: 30_000,
+    ...vaultTreeQueryOptions(user?.user_id, revision, vault),
+    enabled: open && Boolean(vault) && !checking,
   });
 
   useEffect(() => {

@@ -4,7 +4,7 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { File, FileText, MoreHorizontal, Table2 } from "lucide-react";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { VaultBreadcrumb } from "@/components/vault-breadcrumb";
-import { browseVault } from "@/lib/api";
+import { vaultTreeQueryOptions } from "@/hooks/use-vault-tree";
 import { cn } from "@/lib/utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import type { ResourceLocation } from "@/contexts/resource-location-context";
@@ -17,11 +17,8 @@ export function ResourceBreadcrumb({ location, className }: { location: Resource
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const directory = useQuery({
-    queryKey: ["resource-collection-directory", user?.user_id, revision, location.vault],
-    queryFn: () => browseVault(location.vault, undefined, -1),
+    ...vaultTreeQueryOptions(user?.user_id, revision, location.vault),
     enabled: !!user && !checking && !!location.collectionPath,
-    staleTime: 30_000,
-    retry: false,
   });
   const collectionNames = new Map<string, string>();
   if (user && !checking && !directory.isError) {
