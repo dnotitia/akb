@@ -194,8 +194,8 @@ async def test_product_error_envelope_does_not_require_sdk_is_error(
     result = await product_call_json(
         RecordingClient(),  # type: ignore[arg-type]
         _runtime_context(),
-        "akb_browse",
-        {"vault": "missing"},
+        "akb_discover",
+        {"action": "browse", "vault": "missing"},
         expect_error=True,
     )
     assert result == {"error": "denied", "code": "forbidden"}

@@ -108,7 +108,7 @@ echo ""
 echo "▸ 2. Unified Browse"
 
 # Top-level: should show collections + tables (+ files if any)
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\"}" | mcp_result)
 ITEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['items']))" 2>/dev/null)
 HAS_TABLE=$(echo "$R" | python3 -c "import sys,json; print(any(i['type']=='table' for i in json.load(sys.stdin)['items']))" 2>/dev/null)
 HAS_COLL=$(echo "$R" | python3 -c "import sys,json; print(any(i['type']=='collection' for i in json.load(sys.stdin)['items']))" 2>/dev/null)
@@ -125,22 +125,22 @@ TBL_URI_CHECK=$(echo "$R" | python3 -c "import sys,json; ts=[i for i in json.loa
 [ -n "$TBL_URI_CHECK" ] && pass "Table has URI ($TBL_URI_CHECK)" || fail "Table URI" "no uri"
 
 # Filter by content_type=tables
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
 ONLY_TABLES=$(echo "$R" | python3 -c "import sys,json; items=json.load(sys.stdin)['items']; print(all(i['type']=='table' for i in items) and len(items)>0)" 2>/dev/null)
 [ "$ONLY_TABLES" = "True" ] && pass "content_type=tables filters correctly" || fail "Filter tables" "mixed types"
 
 # Filter by content_type=documents
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"documents\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"documents\"}" | mcp_result)
 NO_TABLES=$(echo "$R" | python3 -c "import sys,json; items=json.load(sys.stdin)['items']; print(not any(i['type']=='table' for i in items))" 2>/dev/null)
 [ "$NO_TABLES" = "True" ] && pass "content_type=documents excludes tables" || fail "Filter docs" "tables leaked"
 
 # Browse into collection: should show documents with URIs
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"collection\":\"specs\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"collection\":\"specs\"}" | mcp_result)
 DOC_URI_CHECK=$(echo "$R" | python3 -c "import sys,json; items=json.load(sys.stdin)['items']; print(items[0].get('uri','') if items else '')" 2>/dev/null)
 [ -n "$DOC_URI_CHECK" ] && pass "Documents have URI in browse ($DOC_URI_CHECK)" || fail "Doc URI in browse" "no uri"
 
 # depth=2: collections + docs + tables + files
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":2}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":2}" | mcp_result)
 D2_TYPES=$(echo "$R" | python3 -c "import sys,json; items=json.load(sys.stdin)['items']; print(sorted(set(i['type'] for i in items)))" 2>/dev/null)
 echo "  depth=2 types: $D2_TYPES"
 D2_HAS_DOC=$(echo "$R" | python3 -c "import sys,json; print(any(i['type']=='document' for i in json.load(sys.stdin)['items']))" 2>/dev/null)
@@ -150,7 +150,7 @@ D2_HAS_DOC=$(echo "$R" | python3 -c "import sys,json; print(any(i['type']=='docu
 echo ""
 echo "▸ 3. Vault Info (counts for all types)"
 
-R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"vault_info\",\"vault\":\"$VAULT\"}" | mcp_result)
 INFO_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('document_count',0))" 2>/dev/null)
 INFO_TBL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('table_count',0))" 2>/dev/null)
 INFO_FILE=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('file_count',0))" 2>/dev/null)
@@ -257,7 +257,7 @@ DOC_GRAPH=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.std
 echo ""
 echo "▸ 7. Provenance"
 
-R=$(mcp_call akb_provenance "{\"uri\":\"$DOC1_URI\"}" | mcp_result)
+R=$(mcp_call akb_document_read "{\"action\":\"provenance\",\"uri\":\"$DOC1_URI\"}" | mcp_result)
 PROV_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uri',''))" 2>/dev/null)
 PROV_RELS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('relations',[])))" 2>/dev/null)
 [ -n "$PROV_URI" ] && pass "Provenance includes URI ($PROV_URI)" || fail "Provenance URI" "no uri"
@@ -460,7 +460,7 @@ LR_HELP=$(echo "$R" | python3 -c "import sys,json; print('derived_from' in json.
 echo ""
 echo "▸ 16. Edge Count in Vault Info"
 
-R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"vault_info\",\"vault\":\"$VAULT\"}" | mcp_result)
 FINAL_EDGES=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('edge_count',0))" 2>/dev/null)
 [ "$FINAL_EDGES" -ge 1 ] 2>/dev/null && pass "vault_info edge_count=$FINAL_EDGES" || fail "Edge count" "expected >=1"
 
@@ -499,7 +499,7 @@ esac
 
 # depth=0 — direct children of vault root only. Root docs visible,
 # sub-collection docs (specs/, designs/) hidden.
-R0=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":0}" | mcp_result)
+R0=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":0}" | mcp_result)
 LEAK=$(echo "$R0" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -531,7 +531,7 @@ print(len(empties))
 # Sub-collection docs from §1 (specs/api-spec-v2, designs/system-design)
 # appear because their paths have exactly 1 slash. Deeper nested
 # docs (none in this vault) would not.
-R1=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
+R1=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\"}" | mcp_result)
 RESULT=$(echo "$R1" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -545,7 +545,7 @@ D1_LEAK=$(echo "$RESULT" | awk '{print $2}')
 
 # depth=-1 — unbounded. Every doc/table/file in the entire vault.
 # This is what the frontend tree builder uses (use-vault-tree.ts).
-RN=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":-1}" | mcp_result)
+RN=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":-1}" | mcp_result)
 ALL_DOCS=$(echo "$RN" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -556,7 +556,7 @@ print(len([i for i in d['items'] if i.get('type')=='document']))
 # Collection-scoped browse with depth — collection becomes the new
 # browse root. depth=0 → items directly inside `specs`; no cross-
 # collection leak.
-RC=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"depth\":0}" | mcp_result)
+RC=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"collection\":\"specs\",\"depth\":0}" | mcp_result)
 SPECS_CHECK=$(echo "$RC" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -574,7 +574,7 @@ else:
 mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"root_metrics\",\"description\":\"depth-0 sentinel\",\"columns\":[{\"name\":\"k\",\"type\":\"text\"}]}" >/dev/null
 mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"collection\":\"specs\",\"name\":\"specs_metrics\",\"description\":\"depth-1 sentinel\",\"columns\":[{\"name\":\"k\",\"type\":\"text\"}]}" >/dev/null
 
-RT0=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":0,\"content_type\":\"tables\"}" | mcp_result)
+RT0=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":0,\"content_type\":\"tables\"}" | mcp_result)
 TABLE_DEPTH0=$(echo "$RT0" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -584,7 +584,7 @@ print(int('root_metrics' in names and 'specs_metrics' not in names))
 " 2>/dev/null)
 [ "$TABLE_DEPTH0" = "1" ] && pass "browse(depth=0, content_type=tables): root table only, sub-collection table hidden" || fail "Tables depth=0" "shape=$RT0"
 
-RTM1=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":-1,\"content_type\":\"tables\"}" | mcp_result)
+RTM1=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":-1,\"content_type\":\"tables\"}" | mcp_result)
 TABLE_ALL=$(echo "$RTM1" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -609,7 +609,7 @@ echo "▸ 20. akb_activity Truncation Flag"
 
 # Vault has at least the put/create commits from §1; ask for limit=1
 # → expect truncated=true (more commits exist), no misleading `total`.
-RA=$(mcp_call akb_activity "{\"vault\":\"$VAULT\",\"limit\":1}" | mcp_result)
+RA=$(mcp_call akb_document_read "{\"action\":\"activity\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_result)
 RA_OK=$(echo "$RA" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -619,7 +619,7 @@ print(int(d.get('returned')==1 and d.get('truncated') is True and 'total' not in
 
 # limit at the MCP maximum → must comfortably exceed the small
 # number of seed commits in this vault → truncated=false.
-RA2=$(mcp_call akb_activity "{\"vault\":\"$VAULT\",\"limit\":100}" | mcp_result)
+RA2=$(mcp_call akb_document_read "{\"action\":\"activity\",\"vault\":\"$VAULT\",\"limit\":100}" | mcp_result)
 RA2_OK=$(echo "$RA2" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -657,7 +657,7 @@ ROOT_TBL_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 [ "$ROOT_TBL_URI" = "akb://$VAULT/table/root_tbl" ] && pass "Root table URI: $ROOT_TBL_URI" || fail "Root table URI" "got '$ROOT_TBL_URI'"
 
 # Collection itself emits a coll URI in browse.
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"depth\":-1}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":-1}" | mcp_result)
 COLL_URI=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -671,12 +671,12 @@ echo ""
 echo "▸ 22. akb_browse via URI"
 
 # Vault root URI — equivalent to no `collection`.
-R=$(mcp_call akb_browse "{\"uri\":\"akb://$VAULT\",\"depth\":0}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"uri\":\"akb://$VAULT\",\"depth\":0}" | mcp_result)
 URI_PATH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('path',''))" 2>/dev/null)
 [ "$URI_PATH" = "" ] && pass "browse(uri='akb://$VAULT'): vault-root mode" || fail "Vault URI browse" "path='$URI_PATH'"
 
 # Collection URI — equivalent to collection="specs".
-R=$(mcp_call akb_browse "{\"uri\":\"akb://$VAULT/coll/specs\",\"depth\":0}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"uri\":\"akb://$VAULT/coll/specs\",\"depth\":0}" | mcp_result)
 COLL_BROWSE_OK=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -686,7 +686,7 @@ print(int(d.get('path')=='specs'))
 [ "$COLL_BROWSE_OK" = "1" ] && pass "browse(uri='akb://$VAULT/coll/specs'): scoped to specs" || fail "Coll URI browse" "wrong path"
 
 # Passing a doc/table/file URI to browse is an error (those are leaves).
-R=$(mcp_call akb_browse "{\"uri\":\"akb://$VAULT/doc/root-uri-doc.md\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"uri\":\"akb://$VAULT/doc/root-uri-doc.md\"}" | mcp_result)
 DRILL_REJECT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d)" 2>/dev/null)
 [ "$DRILL_REJECT" = "True" ] && pass "browse(uri=doc/...) rejected — use akb_get/akb_drill_down for leaves" || fail "Leaf URI rejection" "should have errored"
 
@@ -731,7 +731,7 @@ echo "▸ 24. Search hit collection field"
 
 # Trigger the indexing — give the worker a moment to embed the new docs.
 sleep 3
-R=$(mcp_call akb_search "{\"vault\":\"$VAULT\",\"query\":\"v1\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"search\",\"vault\":\"$VAULT\",\"query\":\"v1\"}" | mcp_result)
 COLL_FIELD=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -761,7 +761,7 @@ HIER_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['
 sleep 2
 
 # Drill into the parent section — response should suggest sub-sections.
-R=$(mcp_call akb_drill_down "{\"uri\":\"$HIER_URI\",\"section\":\"Setup\"}" | mcp_result)
+R=$(mcp_call akb_document_read "{\"action\":\"section\",\"uri\":\"$HIER_URI\",\"section\":\"Setup\"}" | mcp_result)
 HINT_OK=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -830,7 +830,7 @@ echo "▸ 27. BrowseItem.path for tables — bare name"
 # Create a sentinel table and verify its browse `path` is just the
 # table name (pre-0.3.0 was the synthetic `_tables/<name>`).
 mcp_call akb_create_table "{\"vault\":\"$VAULT\",\"name\":\"path_check\",\"description\":\"pc\",\"columns\":[{\"name\":\"k\",\"type\":\"text\"}]}" >/dev/null
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
 TBL_PATH=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)

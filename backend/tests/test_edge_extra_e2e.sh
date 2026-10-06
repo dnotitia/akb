@@ -172,7 +172,7 @@ SQL_VAULT_BLOCKED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.std
 [ "$SQL_VAULT_BLOCKED" = "True" ] && pass "Vault name with SQL injection rejected" || fail "Vault SQL inject" "$R"
 
 # Search query with SQL — should not crash
-R=$(m1 "akb_search" "{\"query\":\"'; DROP TABLE documents; --\",\"vault\":\"$VAULT\"}")
+R=$(m1 "akb_discover" "{\"action\":\"search\",\"query\":\"'; DROP TABLE documents; --\",\"vault\":\"$VAULT\"}")
 SEARCH_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' not in d and 'total' in d)" 2>/dev/null)
 [ "$SEARCH_OK" = "True" ] && pass "Search with SQL injection: returns clean response" || fail "Search SQL inject" "$R"
 
@@ -181,7 +181,7 @@ USERS_OK=$(curl -sk "$BASE_URL/api/v1/auth/me" -H "Authorization: Bearer $PAT1" 
 [ "$USERS_OK" = "True" ] && pass "Users table still intact (injection failed)" || fail "Users table" "user not found"
 
 # Grep pattern with SQL/regex chars
-R=$(m1 "akb_grep" "{\"pattern\":\"'; DELETE FROM chunks WHERE 1=1 --\",\"vault\":\"$VAULT\"}")
+R=$(m1 "akb_discover" "{\"action\":\"grep\",\"pattern\":\"'; DELETE FROM chunks WHERE 1=1 --\",\"vault\":\"$VAULT\"}")
 GREP_INJ_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('total_matches' in d or 'error' in d)" 2>/dev/null)
 [ "$GREP_INJ_OK" = "True" ] && pass "Grep with SQL chars: handled cleanly" || fail "Grep SQL inject" "$R"
 
@@ -212,13 +212,13 @@ AFTER_DOWNGRADE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin
 [ "$AFTER_DOWNGRADE" = "True" ] && pass "User2 blocked from write after downgrade to reader" || fail "Downgrade block" "$R"
 
 # Reader can still read
-R=$(m2 "akb_browse" "{\"vault\":\"$VAULT\"}")
+R=$(m2 "akb_discover" "{\"action\":\"browse\",\"vault\":\"$VAULT\"}")
 READER_OK=$(echo "$R" | python3 -c "import sys,json; print('items' in json.load(sys.stdin))" 2>/dev/null)
 [ "$READER_OK" = "True" ] && pass "Reader can still browse after downgrade" || fail "Reader read" "$R"
 
 # Revoke
 m1 "akb_revoke" "{\"vault\":\"$VAULT\",\"user\":\"$USER2\"}" >/dev/null
-R=$(m2 "akb_browse" "{\"vault\":\"$VAULT\"}")
+R=$(m2 "akb_discover" "{\"action\":\"browse\",\"vault\":\"$VAULT\"}")
 AFTER_REVOKE=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d or 'denied' in str(d).lower())" 2>/dev/null)
 [ "$AFTER_REVOKE" = "True" ] && pass "User2 fully blocked after revoke" || fail "Revoke" "$R"
 
@@ -243,7 +243,7 @@ else
 fi
 
 # Both docs accessible
-R=$(m1 "akb_browse" "{\"vault\":\"$VAULT\",\"collection\":\"collide\",\"depth\":2}")
+R=$(m1 "akb_discover" "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"collection\":\"collide\",\"depth\":2}")
 COLLIDE_DOCS=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin).get('items',[]) if i.get('type')=='document']))" 2>/dev/null)
 [ "$COLLIDE_DOCS" -ge 1 ] 2>/dev/null && pass "Collide collection has $COLLIDE_DOCS doc(s)" || fail "Collide browse" "$R"
 
@@ -303,12 +303,12 @@ echo ""
 echo "▸ 8. Limit Boundaries"
 
 # Limit at min (1)
-R=$(m1 "akb_search" "{\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":1}")
+R=$(m1 "akb_discover" "{\"action\":\"search\",\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":1}")
 LIMIT1_OK=$(echo "$R" | python3 -c "import sys,json; r=json.load(sys.stdin); print(len(r.get('results',[])) <= 1)" 2>/dev/null)
 [ "$LIMIT1_OK" = "True" ] && pass "limit=1 respected" || fail "Limit 1" "$R"
 
 # Limit at max (50)
-R=$(m1 "akb_search" "{\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":50}")
+R=$(m1 "akb_discover" "{\"action\":\"search\",\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":50}")
 LIMIT50_OK=$(echo "$R" | python3 -c "import sys,json; r=json.load(sys.stdin); print('error' not in r)" 2>/dev/null)
 [ "$LIMIT50_OK" = "True" ] && pass "limit=50 accepted" || fail "Limit 50" "$R"
 
@@ -316,7 +316,7 @@ LIMIT50_OK=$(echo "$R" | python3 -c "import sys,json; r=json.load(sys.stdin); pr
 R=$(MCP_ID=$((MCP_ID+1)); curl -sk -X POST "$BASE_URL/mcp/" \
   -H "Authorization: Bearer $PAT1" -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $SID1" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_search\",\"arguments\":{\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":100}}}" 2>&1)
+  -d "{\"jsonrpc\":\"2.0\",\"id\":$MCP_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_discover\",\"arguments\":{\"action\":\"search\",\"query\":\"test\",\"vault\":\"$VAULT\",\"limit\":100}}}" 2>&1)
 LIMIT_OVER=$(echo "$R" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('error' in d or 'maximum' in str(d).lower())" 2>/dev/null)
 [ "$LIMIT_OVER" = "True" ] && pass "limit=100 (over max): rejected by schema" || fail "Limit over" "$R"
 

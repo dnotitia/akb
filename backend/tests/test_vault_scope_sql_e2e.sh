@@ -153,8 +153,10 @@ R=$(mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_sql" "{\"vault\":\"$NONGDN_VAULT\",\"sq
 [ "$(echo "$R" | wrote_ok)" = "True" ] && pass "unscoped PAT CAN INSERT non-gdn (proves denial = scope, not ACL)" || fail "control INSERT" "$R"
 
 # ── Cleanup ──────────────────────────────────────────────────
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$GDN_VAULT\",\"confirm\":true}" >/dev/null 2>&1
-mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$NONGDN_VAULT\",\"confirm\":true}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_archive_vault" "{\"vault\":\"$GDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$GDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_archive_vault" "{\"vault\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
+mcp_as "$UNSCOPED_PAT" "$SID_U" "akb_delete_vault" "{\"vault\":\"$NONGDN_VAULT\"}" >/dev/null 2>&1
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""

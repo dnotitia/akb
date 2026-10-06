@@ -885,8 +885,8 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 token=owner_pat,
                 session_id=native_session,
                 request_id=5,
-                tool="akb_get",
-                arguments={"uri": mcp_document["uri"]},
+                tool="akb_document_read",
+                arguments={"action": "get", "uri": mcp_document["uri"]},
             )
             assert mcp_result.get("isError") is not True
             assert "version two" in json.dumps(mcp_read)
@@ -1098,6 +1098,24 @@ async def test_real_legacy_seed_stops_then_backfills_same_database_and_git(
                 },
             )
             response.raise_for_status()
+            replacement_result = response.json()
+            assert post_digest_v2 != post_digest_v1
+            assert replacement_result["uri"] == post_upload["uri"]
+            assert replacement_result["content_hash"] == post_digest_v2
+            assert replacement_result["previous_content_hash"] == post_digest_v1
+
+            download_info = await search_client.get(
+                f"/api/v1/files/{vault_one}/{post_file_id}/download",
+                headers=owner_headers,
+            )
+            download_info.raise_for_status()
+            download_metadata = download_info.json()
+            assert download_metadata["content_hash"] == post_digest_v2
+            downloaded = await search_client.get(download_metadata["download_url"])
+            downloaded.raise_for_status()
+            assert downloaded.content == post_text_v2
+            assert hashlib.sha256(downloaded.content).hexdigest() == post_digest_v2
+
             replaced_projection = await wait_projection("replaced", "live")
             assert replaced_projection["head_revision_id"] != created_projection["head_revision_id"]
             response = await search_client.get(

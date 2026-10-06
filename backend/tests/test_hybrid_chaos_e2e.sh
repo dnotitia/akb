@@ -83,7 +83,7 @@ DUP=$(kubectl exec -n akb statefulset/postgres -- psql -U akbuser -d akb -t -c "
   ) x" 2>/dev/null | tr -d ' \n')
 [ "$DUP" = "0" ] && pass "no duplicate term_ids after race" || fail "C1-dup" "$DUP duplicate ids"
 
-# ── C2. MCP akb_search ≡ REST /api/v1/search for same query ──
+# ── C2. MCP akb_discover/search ≡ REST /api/v1/search for same query ──
 echo ""
 echo "▸ C2. MCP vs REST parity"
 
@@ -105,7 +105,7 @@ rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
 MCP_RAW=$(rcurl -X POST "$BASE/mcp/" -H "Authorization: Bearer $PAT" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -H "mcp-session-id: $SID" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_search\",\"arguments\":{\"query\":\"ParityCornerEchelon\",\"vault\":\"$VAULT\",\"limit\":3}}}")
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_discover\",\"arguments\":{\"action\":\"search\",\"query\":\"ParityCornerEchelon\",\"vault\":\"$VAULT\",\"limit\":3}}}")
 MCP_TITLES=$(echo "$MCP_RAW" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())

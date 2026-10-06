@@ -54,7 +54,7 @@ mcp() {  # tool args  -> result-text json
 field() { python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$1',''))" 2>/dev/null; }
 # put: vault coll title content -> echoes uri
 put() { mcp akb_put "{\"vault\":\"$1\",\"collection\":\"$2\",\"title\":\"$3\",\"content\":\"$4\"}"; }
-geturi() { mcp akb_get "{\"uri\":\"$1\"}"; }
+geturi() { mcp akb_document_read "{\"action\":\"get\",\"uri\":\"$1\"}"; }
 has() { echo "$1" | grep -q "$2" && echo y || echo n; }     # body contains tag
 iserr() { echo "$1" | python3 -c "import sys,json;print('error' in json.load(sys.stdin))" 2>/dev/null; }
 
@@ -168,7 +168,7 @@ mcp akb_update "{\"uri\":\"$UM\",\"content\":\"UPDATED_VIA_OLD\"}" >/dev/null
 DM=$(put "$VAULT" "ops" "Del By Old" "DEL1" | field uri)
 mcp akb_move "{\"uri\":\"$DM\",\"slug\":\"del-by-old-2\"}" >/dev/null
 mcp akb_delete "{\"uri\":\"$DM\"}" >/dev/null
-[ "$(iserr "$(mcp akb_get "{\"uri\":\"$DM\"}")")" = True ] && pass "delete via OLD uri + alias cleaned (old 404)" || fail "delete-old" "$DM"
+[ "$(iserr "$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"$DM\"}")")" = True ] && pass "delete via OLD uri + alias cleaned (old 404)" || fail "delete-old" "$DM"
 
 echo ""; echo "▸ S6. Edges survive move"
 GA=$(put "$VAULT" "g" "Graph A" "GA" | field uri)
@@ -183,14 +183,14 @@ CV=$(put "$VAULT" "x" "Cross Vault" "CV" | field uri)
 mcp akb_move "{\"uri\":\"$CV\",\"slug\":\"cross-moved\"}" >/dev/null
 # old path in vault1 must NOT resolve when queried under vault2
 CVP=$(echo "$CV" | sed "s#/$VAULT/#/$VAULT2/#")
-[ "$(iserr "$(mcp akb_get "{\"uri\":\"$CVP\"}")")" = True ] && pass "alias is vault-scoped (no cross-vault leak)" || fail "cross-vault" "$CVP"
+[ "$(iserr "$(mcp akb_document_read "{\"action\":\"get\",\"uri\":\"$CVP\"}")")" = True ] && pass "alias is vault-scoped (no cross-vault leak)" || fail "cross-vault" "$CVP"
 
 echo ""; echo "▸ S8. Collection doc_count adjusts on move"
 # Maintained collections.doc_count, read from the collection row in a full browse
 # (content_type=all so collection rows are present). Empty → 0.
 ccount() {
   local n
-  n=$(mcp akb_browse "{\"vault\":\"$VAULT\",\"depth\":-1}" \
+  n=$(mcp akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"depth\":-1}" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((it.get('doc_count') or 0 for it in d.get('items',[]) if it.get('type')=='collection' and it.get('path')=='$1'),0))" 2>/dev/null)
   echo "${n:-0}"
 }

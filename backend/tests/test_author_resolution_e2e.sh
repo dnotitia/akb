@@ -144,7 +144,8 @@ fi
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-mc "$PAT1" "$SID1" "akb_delete_vault" "{\"name\":\"$VAULT\"}" >/dev/null 2>&1
+mc "$PAT1" "$SID1" "akb_archive_vault" "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
+mc "$PAT1" "$SID1" "akb_delete_vault" "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
 pass "Vault deleted"
 
 echo ""

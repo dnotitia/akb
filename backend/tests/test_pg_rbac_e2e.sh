@@ -420,6 +420,7 @@ N=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ite
 [ "$N" -ge 1 ] 2>/dev/null && pass "Newly-registered user reads public vault" || fail "New user public read" "$R"
 
 # Cleanup of the public-vault scratchpad.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_archive_vault" "{\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_delete_vault" "{\"vault\":\"$VAULT_PUB\"}" >/dev/null 2>&1
 
 # ── 3. Lifecycle ────────────────────────────────────────────
@@ -439,6 +440,7 @@ echo "$R" | grep -qiE 'denied|forbid|permission|require' && pass "Revoke takes e
 
 # 3c: Vault delete drops vault group roles. After delete, subsequent
 #     SELECT via the same vault name must 404 / not-found.
+mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_archive_vault" "{\"vault\":\"$VAULT_B\"}" >/dev/null 2>&1
 mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_delete_vault" "{\"vault\":\"$VAULT_B\"}" >/dev/null 2>&1
 R=$(mcp_as "$PAT_ALICE" "$SID_ALICE" "akb_sql" "{\"vault\":\"$VAULT_B\",\"sql\":\"SELECT 1\"}" | mr)
 echo "$R" | grep -qiE 'not[ _]?found|does not exist' && pass "Deleted vault → not found" || fail "Vault delete" "$R"

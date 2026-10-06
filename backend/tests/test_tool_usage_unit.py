@@ -993,7 +993,12 @@ def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_pa
     monkeypatch.setattr(srv.tool_usage, "record", lambda *a, **k: usage.append(a[0]))
     monkeypatch.setattr(srv.audit_log, "record_tool", lambda *a, **k: audit.append(a[0]))
 
-    out = asyncio.run(srv.call_tool("akb_put", {"vault": "v"}))
+    out = asyncio.run(
+        srv.call_tool(
+            "akb_put",
+            {"vault": "v", "title": "t", "content": "c"},
+        )
+    )
 
     assert len(usage) == 1, f"usage recorded {len(usage)} times for one call"
     assert len(audit) == 1, f"audit recorded {len(audit)} times for one call"

@@ -124,7 +124,7 @@ echo "▸ 4. Poll until reconcile completes (up to 120s)"
 
 SYNCED=0
 for i in $(seq 1 60); do
-  R=$(mcp_call akb_vault_info "{\"vault\":\"$VAULT\"}")
+  R=$(mcp_call akb_discover "{\"action\":\"vault_info\",\"vault\":\"$VAULT\"}")
   DOC_COUNT=$(echo "$R" | mcp_result_field "['document_count']")
   if [ -n "$DOC_COUNT" ] && [ "$DOC_COUNT" -ge 1 ] 2>/dev/null; then
     SYNCED=1
@@ -150,26 +150,26 @@ echo "▸ 5. Read path"
 # lives at repo root (NULL collection_id by design — parent path is ""),
 # so the top-level listing is expected to be empty items with a "Vault
 # is empty" hint. Just assert the call returned a well-formed response.
-R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}")
+R=$(mcp_call akb_discover "{\"action\":\"browse\",\"vault\":\"$VAULT\"}")
 VAULT_ECHO=$(echo "$R" | mcp_result_field "['vault']")
-[ "$VAULT_ECHO" = "$VAULT" ] && pass "akb_browse responds (root empty is expected for root-only repos)" || fail "akb_browse" "got '$VAULT_ECHO'"
+[ "$VAULT_ECHO" = "$VAULT" ] && pass "akb_discover/browse responds (root empty is expected for root-only repos)" || fail "akb_discover/browse" "got '$VAULT_ECHO'"
 
 # Spoon-Knife's README.md is the canonical indexed file.
 README_URI="akb://$VAULT/doc/README.md"
-R=$(mcp_call akb_get "{\"uri\":\"$README_URI\"}")
+R=$(mcp_call akb_document_read "{\"action\":\"get\",\"uri\":\"$README_URI\"}")
 TITLE=$(echo "$R" | mcp_result_field "['title']")
-[ -n "$TITLE" ] && pass "akb_get README.md (title='$TITLE')" || fail "akb_get" "no title"
+[ -n "$TITLE" ] && pass "akb_document_read/get README.md (title='$TITLE')" || fail "akb_document_read/get" "no title"
 
-R=$(mcp_call akb_history "{\"uri\":\"$README_URI\",\"limit\":5}")
+R=$(mcp_call akb_document_read "{\"action\":\"history\",\"uri\":\"$README_URI\",\"limit\":5}")
 HIST_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(len(d.get('history',[])))" 2>/dev/null)
-[ -n "$HIST_COUNT" ] && [ "$HIST_COUNT" -ge 1 ] 2>/dev/null && pass "akb_history returns $HIST_COUNT commit(s)" || fail "akb_history" "no commits"
+[ -n "$HIST_COUNT" ] && [ "$HIST_COUNT" -ge 1 ] 2>/dev/null && pass "akb_document_read/history returns $HIST_COUNT commit(s)" || fail "akb_document_read/history" "no commits"
 
 # Grab the first commit and diff it.
 FIRST_COMMIT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(d['history'][0]['hash'])" 2>/dev/null)
 if [ -n "$FIRST_COMMIT" ]; then
-  R=$(mcp_call akb_diff "{\"uri\":\"$README_URI\",\"commit\":\"$FIRST_COMMIT\"}")
+  R=$(mcp_call akb_document_read "{\"action\":\"diff\",\"uri\":\"$README_URI\",\"commit\":\"$FIRST_COMMIT\"}")
   DIFF=$(echo "$R" | mcp_result_field "['diff']")
-  [ -n "$DIFF" ] && pass "akb_diff returns patch for $FIRST_COMMIT" || fail "akb_diff" "empty diff"
+  [ -n "$DIFF" ] && pass "akb_document_read/diff returns patch for $FIRST_COMMIT" || fail "akb_document_read/diff" "empty diff"
 fi
 
 # ── 6. Health surface — new workers visible ─────────────────

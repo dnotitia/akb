@@ -136,7 +136,7 @@ putdoc "$V6" "lineage" "beta-content" >/dev/null
 URI="akb://$V6/doc/specs/lineage.md"
 RESP=$(curl -sk -X POST "$BASE_URL/mcp/" -H "$H_AUTH" -H "$H_JSON" \
   -H "Accept: application/json, text/event-stream" -H "mcp-session-id: $SID" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_history\",\"arguments\":{\"uri\":\"$URI\",\"limit\":20}}}")
+  -d "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_document_read\",\"arguments\":{\"action\":\"history\",\"uri\":\"$URI\",\"limit\":20}}}")
 COUNT=$(echo "$RESP" | python3 -c 'import sys,json
 try:
   d=json.loads(sys.stdin.read())

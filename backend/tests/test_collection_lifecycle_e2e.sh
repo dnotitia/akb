@@ -281,6 +281,7 @@ NP_HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
 
 # Clean up the ephemeral Vault even when an earlier assertion failed. The
 # generated test users are intentionally left to the auth lifecycle suites.
+R=$(mcp_call akb_archive_vault "{\"vault\":\"$VAULT\"}" | mcp_result)
 R=$(mcp_call akb_delete_vault "{\"vault\":\"$VAULT\"}" | mcp_result)
 CLEANED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deleted'))" 2>/dev/null)
 [ "$CLEANED" = "True" ] && pass "ephemeral vault cleaned up" \

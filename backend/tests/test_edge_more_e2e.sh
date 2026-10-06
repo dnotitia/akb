@@ -94,7 +94,7 @@ FM_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get
 [ -n "$FM_DOC" ] && pass "Frontmatter-like in code block accepted" || fail "FM body" "$R"
 
 # Verify title is preserved (not overridden by fake frontmatter)
-R=$(m "akb_get" "{\"uri\":\"$FM_DOC\"}")
+R=$(m "akb_document_read" "{\"action\":\"get\",\"uri\":\"$FM_DOC\"}")
 TITLE_OK=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('title','')=='FM in Body')" 2>/dev/null)
 [ "$TITLE_OK" = "True" ] && pass "Title not overridden by code block" || fail "Title" "$R"
 
@@ -119,27 +119,27 @@ m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"filter-b\",\"title\":\"Spec 
 pass "3 docs with different type/tags/collection created"
 
 # Filter by type only
-R=$(m "akb_search" "{\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\"}")
 SPEC_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$SPEC_COUNT" -ge 2 ] 2>/dev/null && pass "Type filter (spec): $SPEC_COUNT results" || fail "Type filter" "$R"
 
 # Filter by tag only
-R=$(m "akb_search" "{\"query\":\"content\",\"vault\":\"$VAULT\",\"tags\":[\"blue\"]}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"content\",\"vault\":\"$VAULT\",\"tags\":[\"blue\"]}")
 BLUE_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$BLUE_COUNT" -ge 2 ] 2>/dev/null && pass "Tag filter (blue): $BLUE_COUNT results" || fail "Tag filter" "$R"
 
 # Filter by collection only
-R=$(m "akb_search" "{\"query\":\"content\",\"vault\":\"$VAULT\",\"collection\":\"filter-a\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"content\",\"vault\":\"$VAULT\",\"collection\":\"filter-a\"}")
 COLLA_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$COLLA_COUNT" -ge 2 ] 2>/dev/null && pass "Collection filter (filter-a): $COLLA_COUNT results" || fail "Collection filter" "$R"
 
 # Combined: type + tags
-R=$(m "akb_search" "{\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"blue\"]}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"blue\"]}")
 COMBO_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$COMBO_COUNT" = "1" ] && pass "Combined type+tags: 1 result (spec AND blue)" || fail "Combined filters" "expected 1, got $COMBO_COUNT"
 
 # All three combined
-R=$(m "akb_search" "{\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"blue\"],\"collection\":\"filter-a\"}")
+R=$(m "akb_discover" "{\"action\":\"search\",\"query\":\"content\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"blue\"],\"collection\":\"filter-a\"}")
 ALL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
 [ "$ALL_COUNT" = "1" ] && pass "All 3 filters combined: 1 result" || fail "All filters" "expected 1, got $ALL_COUNT"
 
@@ -157,7 +157,7 @@ UPD_OK=$(echo "$R" | python3 -c "import sys,json; print(bool(json.load(sys.stdin
 [ "$UPD_OK" = "True" ] && pass "Tags-only update succeeded" || fail "Tag update" "$R"
 
 # Verify tags changed and content preserved
-R=$(m "akb_get" "{\"uri\":\"$UPD_DOC\"}")
+R=$(m "akb_document_read" "{\"action\":\"get\",\"uri\":\"$UPD_DOC\"}")
 TAG_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tags',[]); print('renamed' in t and 'updated' in t and 'original' not in t and 'Original body' in d.get('content',''))" 2>/dev/null)
 [ "$TAG_OK" = "True" ] && pass "Tags updated, content preserved" || fail "Tag verify" "$R"
 
@@ -170,7 +170,7 @@ ST_DOC=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get
 [ -n "$ST_DOC" ] && pass "Status test doc created" || fail "Status doc" "$R"
 
 # Default should be draft
-R=$(m "akb_get" "{\"uri\":\"$ST_DOC\"}")
+R=$(m "akb_document_read" "{\"action\":\"get\",\"uri\":\"$ST_DOC\"}")
 DEFAULT_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
 [ "$DEFAULT_STATUS" = "draft" ] && pass "Default status is 'draft'" || fail "Default status" "$DEFAULT_STATUS"
 
@@ -210,7 +210,7 @@ B_OK=$(grep -c "commit_hash" /tmp/race_b.txt 2>/dev/null || echo 0)
 ( [ "$A_OK" -ge 1 ] || [ "$B_OK" -ge 1 ] ) && pass "Concurrent updates: at least one succeeded (A=$A_OK B=$B_OK)" || fail "Concurrent writes" "both failed"
 
 # Verify final state is consistent (one of A or B)
-R=$(m "akb_get" "{\"uri\":\"$RACE_DOC\"}")
+R=$(m "akb_document_read" "{\"action\":\"get\",\"uri\":\"$RACE_DOC\"}")
 FINAL=$(echo "$R" | python3 -c "import sys,json; c=json.load(sys.stdin).get('content',''); print('Update A' in c or 'Update B' in c)" 2>/dev/null)
 [ "$FINAL" = "True" ] && pass "Race result is consistent (one update won)" || fail "Race consistency" "$R"
 rm -f /tmp/race_a.txt /tmp/race_b.txt
@@ -267,7 +267,7 @@ RESERVED_REJ=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); 
 
 # Use non-reserved column names
 m "akb_create_table" "{\"vault\":\"$VAULT\",\"name\":\"validation\",\"columns\":[{\"name\":\"item\",\"type\":\"text\",\"required\":true},{\"name\":\"qty\",\"type\":\"number\"}]}" >/dev/null
-TBL_OK=$(m "akb_browse" "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); print(any(i['name']=='validation' for i in items))" 2>/dev/null)
+TBL_OK=$(m "akb_discover" "{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); print(any(i['name']=='validation' for i in items))" 2>/dev/null)
 [ "$TBL_OK" = "True" ] && pass "Table 'validation' created" || fail "Table create" "not found"
 
 # Insert NULL into required column
@@ -295,7 +295,7 @@ m "akb_put" "{\"vault\":\"$VAULT\",\"collection\":\"redos\",\"title\":\"ReDoS Ta
 # Catastrophic backtracking pattern: (a+)+$ on string of all 'a's followed by 'X'
 # Should either complete quickly or be rejected
 START=$(date +%s)
-R=$(m "akb_grep" "{\"pattern\":\"(a+)+\$\",\"regex\":true,\"vault\":\"$VAULT\"}" 2>&1 || echo "TIMEOUT")
+R=$(m "akb_discover" "{\"action\":\"grep\",\"pattern\":\"(a+)+\$\",\"regex\":true,\"vault\":\"$VAULT\"}" 2>&1 || echo "TIMEOUT")
 END=$(date +%s)
 ELAPSED=$((END - START))
 # Should complete in < 30s (either matched or rejected)
@@ -303,7 +303,7 @@ ELAPSED=$((END - START))
 
 # Another known catastrophic: ^(([a-z])+.)+[A-Z]([a-z])+$
 START=$(date +%s)
-R=$(m "akb_grep" "{\"pattern\":\"^(([a-z])+.)+[A-Z]([a-z])+\$\",\"regex\":true,\"vault\":\"$VAULT\"}" 2>&1)
+R=$(m "akb_discover" "{\"action\":\"grep\",\"pattern\":\"^(([a-z])+.)+[A-Z]([a-z])+\$\",\"regex\":true,\"vault\":\"$VAULT\"}" 2>&1)
 END=$(date +%s)
 ELAPSED=$((END - START))
 [ "$ELAPSED" -lt 30 ] 2>/dev/null && pass "Catastrophic regex 2 completes in ${ELAPSED}s" || fail "ReDoS 2" "took ${ELAPSED}s"

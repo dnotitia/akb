@@ -145,21 +145,21 @@ ${AKB_RECOMPUTE_CMD:-docker compose exec -T backend python -m scripts.init_bm25_
 search_total() {
   local q=$1 vault=$2
   local R
-  R=$(mcp_call akb_search "{\"query\":\"$q\",\"vault\":\"$vault\",\"limit\":10}" | mcp_result)
+  R=$(mcp_call akb_discover "{\"action\":\"search\",\"query\":\"$q\",\"vault\":\"$vault\",\"limit\":10}" | mcp_result)
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total', 0))" 2>/dev/null
 }
 
-# Issue one akb_search and return pipe-joined titles. Used by tests
+# Issue one akb_discover/search and return pipe-joined titles. Used by tests
 # that expect 0 hits (isolation, nonsense) — no retry, the empty
 # response is the assertion.
 search_titles() {
   local q=$1 vault=$2
   local R
-  R=$(mcp_call akb_search "{\"query\":\"$q\",\"vault\":\"$vault\",\"limit\":10}" | mcp_result)
+  R=$(mcp_call akb_discover "{\"action\":\"search\",\"query\":\"$q\",\"vault\":\"$vault\",\"limit\":10}" | mcp_result)
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join([r.get('title','') for r in d.get('results', [])]))" 2>/dev/null
 }
 
-# Polls akb_search until `expected_substr` appears in the result
+# Polls akb_discover/search until `expected_substr` appears in the result
 # titles, up to `AKB_SEARCH_RETRIES` times with `AKB_SEARCH_RETRY_INTERVAL`s
 # spacing. Returns the latest titles (may not contain the substring
 # on timeout — caller's grep assertion catches that).
@@ -283,7 +283,7 @@ fi
 
 # ── 7b. Response shape: returned vs total_matches (#35) ──────
 # `total` alias kept for back-compat; `returned`/`total_matches` are new.
-R=$(mcp_call akb_search "{\"query\":\"PostgreSQL\",\"vault\":\"$VAULT_A\",\"limit\":2}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"search\",\"query\":\"PostgreSQL\",\"vault\":\"$VAULT_A\",\"limit\":2}" | mcp_result)
 RETURNED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned'))")
 TOTAL_M=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches'))")
 TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total'))")
@@ -316,33 +316,33 @@ TOTAL=$(search_total "Blarghnizophorpquix$RANDOM" "$VAULT_A")
 
 # ── 9. /grep sanity ──────────────────────────────────────────
 echo ""
-echo "▸ 9. akb_grep regression"
+echo "▸ 9. akb_discover/grep regression"
 
-R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\"}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\"}" | mcp_result)
 GREP_TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches', 0))" 2>/dev/null)
-[ "$GREP_TOTAL" -ge 1 ] 2>/dev/null && pass "akb_grep still finds literal string" || fail "grep" "total_matches=$GREP_TOTAL"
+[ "$GREP_TOTAL" -ge 1 ] 2>/dev/null && pass "akb_discover/grep still finds literal string" || fail "grep" "total_matches=$GREP_TOTAL"
 
 # count_only (grep -c) — issue #41
-R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
 CO_TOTAL=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches', 0))" 2>/dev/null)
 HAS_BY_DOC=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'by_doc' in d and 'results' not in d else 'no')" 2>/dev/null)
 [ "$CO_TOTAL" -ge 1 ] 2>/dev/null && [ "$HAS_BY_DOC" = "yes" ] \
-  && pass "akb_grep count_only ($CO_TOTAL via by_doc)" \
+  && pass "akb_discover/grep count_only ($CO_TOTAL via by_doc)" \
   || fail "grep count_only" "total=$CO_TOTAL has_by_doc=$HAS_BY_DOC"
 
 # files_with_matches (grep -l) — issue #41
-R=$(mcp_call akb_grep "{\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"files_with_matches\":true}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"shared_buffers\",\"vault\":\"$VAULT_A\",\"files_with_matches\":true}" | mcp_result)
 N_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('n_files', 0))" 2>/dev/null)
 HAS_FILES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'files' in d and 'results' not in d else 'no')" 2>/dev/null)
 [ "$N_FILES" -ge 1 ] 2>/dev/null && [ "$HAS_FILES" = "yes" ] \
-  && pass "akb_grep files_with_matches ($N_FILES files)" \
+  && pass "akb_discover/grep files_with_matches ($N_FILES files)" \
   || fail "grep files_with_matches" "n=$N_FILES has_files=$HAS_FILES"
 
 # Mutual exclusion error
-R=$(mcp_call akb_grep "{\"pattern\":\"x\",\"vault\":\"$VAULT_A\",\"count_only\":true,\"files_with_matches\":true}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"x\",\"vault\":\"$VAULT_A\",\"count_only\":true,\"files_with_matches\":true}" | mcp_result)
 ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
 case "$ERR" in
-  *"mutually exclusive"*) pass "akb_grep count_only + files_with_matches blocked" ;;
+  *"mutually exclusive"*) pass "akb_discover/grep count_only + files_with_matches blocked" ;;
   *) fail "grep mutual excl" "got err=$ERR" ;;
 esac
 
@@ -354,7 +354,7 @@ esac
 # Now: `returned_*` = post-limit, `total_*` = full scan, plus a
 # `truncated` flag + hint so the agent can switch to count_only.
 echo ""
-echo "▸ 10. akb_grep default-mode truncation reports full corpus totals"
+echo "▸ 10. akb_discover/grep default-mode truncation reports full corpus totals"
 
 TRUNC="TruncMarker${RANDOM}${RANDOM}"
 for i in 1 2 3; do
@@ -365,7 +365,7 @@ done
 wait_for_indexing "$INDEX_WAIT"
 
 # limit=1 → 1 doc returned, but full scan must surface total_docs=3.
-R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":1}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":1}" | mcp_result)
 RD=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_docs',-1))")
 RM=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_matches',-1))")
 TD=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
@@ -378,7 +378,7 @@ HH=$(echo  "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ye
   || fail "grep truncated" "returned=($RD,$RM) total=($TD,$TM) truncated=$TR hint=$HH"
 
 # count_only on the same scope must agree with default's total_*.
-R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"count_only\":true}" | mcp_result)
 CO_TD=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
 CO_TM=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_matches',-1))")
 [ "$CO_TD" = "$TD" ] && [ "$CO_TM" = "$TM" ] \
@@ -386,7 +386,7 @@ CO_TM=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d
   || fail "grep count_only parity" "count_only=($CO_TD,$CO_TM) default=($TD,$TM)"
 
 # When everything fits, returned == total, truncated=false, no hint.
-R=$(mcp_call akb_grep "{\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":50}" | mcp_result)
+R=$(mcp_call akb_discover "{\"action\":\"grep\",\"pattern\":\"$TRUNC\",\"vault\":\"$VAULT_A\",\"limit\":50}" | mcp_result)
 RD2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('returned_docs',-1))")
 TD2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_docs',-1))")
 TR2=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('truncated',True))")

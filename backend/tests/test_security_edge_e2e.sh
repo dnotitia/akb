@@ -125,6 +125,7 @@ ROLE_SOURCE=$(echo "$INFO" | python3 -c 'import sys,json; print(json.load(sys.st
 [ "$ROLE_SOURCE" = "public" ] && pass "non-member role_source=public" || fail "public role_source" "got $ROLE_SOURCE"
 curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT" -H "Authorization: Bearer $PAT1" >/dev/null
 
+mcp_call akb_archive_vault "{\"vault\":\"$VAULT\"}" >/dev/null 2>&1
 R=$(mcp_call akb_delete_vault "{\"vault\":\"$VAULT\"}")
 DELETED=$(echo "$R" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted", False))' 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "private setup vault cleaned" || fail "cleanup" "deleted=$DELETED"

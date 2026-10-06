@@ -127,7 +127,7 @@ echo "$DOC_URI" | grep -q "slug-path-probe-title" \
 # ── 5. Title is preserved (slug only affects the path) ───────
 echo ""
 echo "▸ 5. Title independent of slug"
-GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
+GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_document_read\",\"arguments\":{\"action\":\"get\",\"uri\":\"$DOC_URI\"}}")
 GOT_TITLE=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
 [ "$GOT_TITLE" = "Slug Path Probe Title" ] \
   && pass "title preserved: '$GOT_TITLE'" \

@@ -79,12 +79,12 @@ R=$(mcp akb_create_vault "{\"name\":\"$VAULT\",\"description\":\"edge\"}" | mcp_
 
 search_total() {
   local q=$1
-  local R=$(mcp akb_search "{\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$q"),\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
+  local R=$(mcp akb_discover "{\"action\":\"search\",\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$q"),\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total', 0))" 2>/dev/null
 }
 search_titles() {
   local q=$1
-  local R=$(mcp akb_search "{\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$q"),\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
+  local R=$(mcp akb_discover "{\"action\":\"search\",\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$q"),\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
   echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join([r.get('title','') for r in d.get('results', [])]))" 2>/dev/null
 }
 
@@ -96,12 +96,12 @@ mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"Edge Seed
 sleep "$INDEX_WAIT"
 
 # Empty query → API may 422 (query is required) or return 0
-R=$(mcp akb_search "{\"query\":\"\",\"vault\":\"$VAULT\"}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"\",\"vault\":\"$VAULT\"}" | mcp_text)
 OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total',0) == 0 or 'error' in d)" 2>/dev/null)
 [ "$OK" = "True" ] && pass "empty query: 0 or error" || fail "empty query" "$R"
 
 # Whitespace-only
-R=$(mcp akb_search "{\"query\":\"     \",\"vault\":\"$VAULT\"}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"     \",\"vault\":\"$VAULT\"}" | mcp_text)
 OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total',0) == 0 or 'error' in d)" 2>/dev/null)
 [ "$OK" = "True" ] && pass "whitespace-only query: 0 or error" || fail "ws query" "$R"
 
@@ -118,7 +118,7 @@ TOTAL=$(search_total "!@#\$%^&*()_+-=[]")
 echo ""
 echo "▸ 2. Vault scoping (no cross-vault leak)"
 
-R=$(mcp akb_search "{\"query\":\"kubernetes orchestration\",\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"kubernetes orchestration\",\"vault\":\"$VAULT\",\"limit\":10}" | mcp_text)
 LEAKED=$(echo "$R" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -176,7 +176,7 @@ sleep "$INDEX_WAIT"
 TITLES=$(search_titles "Xyloph")
 # Acceptable outcomes: empty (doc never chunked because body blank) or title
 # hit (heading copied into chunk body). Just verify response is well-formed.
-R=$(mcp akb_search "{\"query\":\"Xyloph\",\"vault\":\"$VAULT\"}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"Xyloph\",\"vault\":\"$VAULT\"}" | mcp_text)
 WELL_FORMED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('total' in d and 'error' not in d)" 2>/dev/null)
 [ "$WELL_FORMED" = "True" ] && pass "headings-only doc: response well-formed" || fail "headings-only" "$R"
 
@@ -229,11 +229,11 @@ done
 echo ""
 echo "▸ 8. limit boundaries (1 / 50)"
 
-R=$(mcp akb_search "{\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
 N=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('results',[])))" 2>/dev/null)
 [ "$N" -le 1 ] 2>/dev/null && pass "limit=1 returns ≤1" || fail "limit=1" "got $N"
 
-R=$(mcp akb_search "{\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":50}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":50}" | mcp_text)
 N=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('results',[])))" 2>/dev/null)
 [ "$N" -le 50 ] 2>/dev/null && pass "limit=50 returns ≤50" || fail "limit=50" "got $N"
 
@@ -245,7 +245,7 @@ mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"Tagged Sp
 mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"Tagged Note\",\"content\":\"## note\\n\\nspecial-filter-target-term in a note doc.\",\"type\":\"note\",\"tags\":[\"filter-test\"]}" >/dev/null
 sleep "$INDEX_WAIT"
 
-R=$(mcp akb_search "{\"query\":\"special-filter-target-term\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"filter-test\"]}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"special-filter-target-term\",\"vault\":\"$VAULT\",\"type\":\"spec\",\"tags\":[\"filter-test\"]}" | mcp_text)
 TITLES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('|'.join([r.get('title','') for r in d.get('results',[])]))" 2>/dev/null)
 echo "$TITLES" | grep -q "Tagged Spec" && ! echo "$TITLES" | grep -q "Tagged Note" && pass "type+tags combo filters correctly" || fail "combined filter" "got: $TITLES"
 
@@ -254,7 +254,7 @@ echo ""
 echo "▸ 10. Very long query (stress tokenizer + vector-store payload)"
 
 LONG_Q=$(python3 -c "print(('federation ' + 'graphql ' + 'apollo ') * 100)")
-R=$(mcp akb_search "{\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$LONG_Q"),\"vault\":\"$VAULT\",\"limit\":5}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":$(python3 -c 'import sys,json; print(json.dumps(sys.argv[1]))' "$LONG_Q"),\"vault\":\"$VAULT\",\"limit\":5}" | mcp_text)
 WELL_FORMED=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('total' in d and 'error' not in d)" 2>/dev/null)
 [ "$WELL_FORMED" = "True" ] && pass "long query handled" || fail "long query" "$R"
 
@@ -287,7 +287,7 @@ V_AFTER=$(curl -sk "$BASE_URL/health" | python3 -c "import sys,json; print(json.
 echo ""
 echo "▸ 13. Score monotonic (top score >= every other)"
 
-R=$(mcp akb_search "{\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":5}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"federation\",\"vault\":\"$VAULT\",\"limit\":5}" | mcp_text)
 SCORES=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(str(r.get('score',0)) for r in d.get('results',[])))" 2>/dev/null)
 MONO=$(python3 -c "
 s = '$SCORES'.split(',') if '$SCORES' else []
@@ -301,10 +301,10 @@ print('ok' if all(xs[i] >= xs[i+1] for i in range(len(xs)-1)) and xs[0] > 0 else
 echo ""
 echo "▸ 14. Drill-down alignment"
 
-R=$(mcp akb_search "{\"query\":\"Rhinoceros\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"Rhinoceros\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
 HIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); rs=d.get('results',[]); print(rs[0]['uri'] if rs else '')" 2>/dev/null)
 if [ -n "$HIT_DOC_URI" ]; then
-  R=$(mcp akb_drill_down "{\"uri\":\"$HIT_DOC_URI\"}" | mcp_text)
+  R=$(mcp akb_document_read "{\"action\":\"section\",\"uri\":\"$HIT_DOC_URI\"}" | mcp_text)
   N_SEC=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('sections',[])))" 2>/dev/null)
   [ "$N_SEC" -ge 1 ] 2>/dev/null && pass "drill-down on search hit: $N_SEC sections" || fail "drill-down" "no sections for $HIT_DOC_URI"
 else
@@ -347,7 +347,7 @@ HAS_ERROR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); pri
 [ "$HAS_ERROR" = "True" ] && pass "duplicate path returns structured error" || fail "dup-path" "got: $R"
 
 # Update flow (the actual replace path)
-R=$(mcp akb_search "{\"query\":\"UniqornAlpha\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"UniqornAlpha\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
 DOC_URI=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(next((r['uri'] for r in rs if r.get('title')=='Idempo'),''))" 2>/dev/null)
 if [ -n "$DOC_URI" ]; then
   mcp akb_update "{\"uri\":\"$DOC_URI\",\"content\":\"## a\\n\\nUniqornBeta replacement content.\"}" >/dev/null
@@ -365,7 +365,7 @@ echo "▸ 17. Delete after seeing in search"
 mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"DelTarget\",\"content\":\"## x\\n\\nPlatypussa habitat content.\"}" >/dev/null
 sleep "$INDEX_WAIT"
 
-R=$(mcp akb_search "{\"query\":\"Platypussa\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
+R=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"Platypussa\",\"vault\":\"$VAULT\",\"limit\":3}" | mcp_text)
 DEL_DOC_URI=$(echo "$R" | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0]['uri'] if rs else '')" 2>/dev/null)
 [ -n "$DEL_DOC_URI" ] && pass "DelTarget visible in search ($DEL_DOC_URI)" || fail "del-find" "not found"
 
@@ -386,8 +386,8 @@ echo "▸ 18. grep top doc == search top doc (rare keyword)"
 mcp akb_put "{\"vault\":\"$VAULT\",\"collection\":\"edge\",\"title\":\"Consist\",\"content\":\"## c\\n\\nQuetzalcoatlus wingspan estimated.\"}" >/dev/null
 sleep "$INDEX_WAIT"
 
-GREP_PATH=$(mcp akb_grep "{\"pattern\":\"Quetzalcoatlus\",\"vault\":\"$VAULT\"}" | mcp_text | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0].get('path','') if rs else '')" 2>/dev/null)
-SEARCH_PATH=$(mcp akb_search "{\"query\":\"Quetzalcoatlus\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0].get('path','') if rs else '')" 2>/dev/null)
+GREP_PATH=$(mcp akb_discover "{\"action\":\"grep\",\"pattern\":\"Quetzalcoatlus\",\"vault\":\"$VAULT\"}" | mcp_text | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0].get('path','') if rs else '')" 2>/dev/null)
+SEARCH_PATH=$(mcp akb_discover "{\"action\":\"search\",\"query\":\"Quetzalcoatlus\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text | python3 -c "import sys,json; rs=json.load(sys.stdin).get('results',[]); print(rs[0].get('path','') if rs else '')" 2>/dev/null)
 [ -n "$GREP_PATH" ] && [ "$GREP_PATH" = "$SEARCH_PATH" ] && pass "top hit aligns ($GREP_PATH)" || fail "grep/search top mismatch" "g='$GREP_PATH' s='$SEARCH_PATH'"
 
 # ── Cleanup ──────────────────────────────────────────────────

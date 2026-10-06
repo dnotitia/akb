@@ -131,8 +131,10 @@ REMAINING=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)[
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""
 echo "▸ Cleanup"
-m1 "akb_delete_vault" "{\"name\":\"$VAULT1\"}" >/dev/null 2>&1
-m1 "akb_delete_vault" "{\"name\":\"$VAULT2\"}" >/dev/null 2>&1
+m1 "akb_archive_vault" "{\"vault\":\"$VAULT1\"}" >/dev/null 2>&1
+m1 "akb_delete_vault" "{\"vault\":\"$VAULT1\"}" >/dev/null 2>&1
+m1 "akb_archive_vault" "{\"vault\":\"$VAULT2\"}" >/dev/null 2>&1
+m1 "akb_delete_vault" "{\"vault\":\"$VAULT2\"}" >/dev/null 2>&1
 pass "Vaults deleted"
 
 # ── Summary ──────────────────────────────────────────────────

@@ -154,11 +154,11 @@ FILE2_SIZE=$(tool_result "$UPLOAD2" | python3 -c 'import sys,json; print(json.lo
 echo ""
 echo "▸ 5. Browse files"
 
-BROWSE_ALL=$(rpc_call "tools/call" "{\"name\":\"akb_browse\",\"arguments\":{\"vault\":\"$VAULT\",\"content_type\":\"files\"}}")
+BROWSE_ALL=$(rpc_call "tools/call" "{\"name\":\"akb_discover\",\"arguments\":{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"files\"}}")
 TOTAL=$(tool_result "$BROWSE_ALL" | python3 -c 'import sys,json; print(len([i for i in json.load(sys.stdin).get("items",[]) if i["type"]=="file"]))' 2>/dev/null)
 [ "$TOTAL" = "2" ] && pass "Total files: 2" || fail "Browse all files" "expected 2, got $TOTAL"
 
-BROWSE_DOCS=$(rpc_call "tools/call" "{\"name\":\"akb_browse\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"content_type\":\"files\"}}")
+BROWSE_DOCS=$(rpc_call "tools/call" "{\"name\":\"akb_discover\",\"arguments\":{\"action\":\"browse\",\"vault\":\"$VAULT\",\"collection\":\"docs\",\"content_type\":\"files\"}}")
 DOCS_COUNT=$(tool_result "$BROWSE_DOCS" | python3 -c 'import sys,json; print(len([i for i in json.load(sys.stdin).get("items",[]) if i["type"]=="file"]))' 2>/dev/null)
 [ "$DOCS_COUNT" = "1" ] && pass "Docs collection: 1 file" || fail "Browse docs files" "expected 1, got $DOCS_COUNT"
 
@@ -233,7 +233,7 @@ DEL1=$(rpc_call "tools/call" "{\"name\":\"akb_delete_file\",\"arguments\":{\"uri
 DELETED=$(tool_result "$DEL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("deleted",False))' 2>/dev/null)
 [ "$DELETED" = "True" ] && pass "Deleted text file" || fail "Delete" "expected True, got $DELETED"
 
-BROWSE_AFTER=$(rpc_call "tools/call" "{\"name\":\"akb_browse\",\"arguments\":{\"vault\":\"$VAULT\",\"content_type\":\"files\"}}")
+BROWSE_AFTER=$(rpc_call "tools/call" "{\"name\":\"akb_discover\",\"arguments\":{\"action\":\"browse\",\"vault\":\"$VAULT\",\"content_type\":\"files\"}}")
 REMAINING=$(tool_result "$BROWSE_AFTER" | python3 -c 'import sys,json; print(len([i for i in json.load(sys.stdin).get("items",[]) if i["type"]=="file"]))' 2>/dev/null)
 [ "$REMAINING" = "1" ] && pass "1 file remaining after delete" || fail "Post-delete browse" "expected 1, got $REMAINING"
 

@@ -92,7 +92,7 @@ async def service(pool, monkeypatch):
 
 async def _grant(
     pool, vault_id, *, file_id=None, object_key=_KEY, method="PUT",
-    ttl=3600, with_file_row=True, upload_state="pending",
+    ttl=3600, with_file_row=True, upload_state="pending", file_s3_key=None,
 ) -> str:
     fid = file_id or uuid.uuid4()
     token = fs._new_capability_token()
@@ -106,7 +106,10 @@ async def _grant(
                 VALUES ($1, $2, 'file', $3, 'report.bin', $4,
                         'application/pdf', 0, 'tester')
                 """,
-                fid, vault_id, upload_state, object_key or _KEY,
+                fid,
+                vault_id,
+                upload_state,
+                file_s3_key if file_s3_key is not None else (object_key or _KEY),
             )
         # The table's own CHECK splits the two lanes: a GET intent carries no
         # filename and a PUT intent must carry filename, mime_type and actor.
@@ -132,6 +135,30 @@ async def test_a_live_grant_resolves_to_its_key(service, pool, vault_id):
     resolved = await service.resolve_write_capability(token)
     assert resolved["object_key"] == _KEY
     assert resolved["mime_type"] == "application/pdf"
+
+
+@pytest.mark.parametrize(
+    ("grant_key", "file_key", "expected_already_confirmed"),
+    [
+        (_KEY, _KEY, True),
+        (f"{_KEY}.replacement", _KEY, False),
+    ],
+    ids=("confirmed-live-key", "confirmed-staging-key"),
+)
+async def test_confirmed_file_discards_only_a_grant_to_its_live_key(
+    service, pool, vault_id, grant_key, file_key, expected_already_confirmed,
+):
+    token = await _grant(
+        pool,
+        vault_id,
+        object_key=grant_key,
+        file_s3_key=file_key,
+        upload_state="confirmed",
+    )
+
+    resolved = await service.resolve_write_capability(token)
+
+    assert resolved["already_confirmed"] is expected_already_confirmed
 
 
 async def test_a_grant_whose_file_was_deleted_stops_working(service, pool, vault_id):

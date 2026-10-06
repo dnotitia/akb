@@ -15,7 +15,7 @@
 #   3. `/mcp` rejects a syntactically-valid but wrong-audience token
 #      with 401
 #   4. `/mcp` accepts a human access token with both scopes
-#      and dispatches a read-grade tool (akb_list_vaults)
+#      and dispatches a read-grade capability (akb_discover/list_vaults)
 #   5. `/mcp` rejects a local session JWT and accepts a real `akb_` PAT
 #   6. A token with only `akb:vault:read` is refused at a write-grade
 #      tool with `insufficient_scope`

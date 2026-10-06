@@ -109,11 +109,11 @@ B_VID=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.
 echo ""
 echo "▸ 3. Verify vault ownership"
 
-R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 11 akb_vault_info "{\"vault\":\"$ALICE_VAULT\"}")
+R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 11 akb_discover "{\"action\":\"vault_info\",\"vault\":\"$ALICE_VAULT\"}")
 ALICE_OWNER=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['owner'])" 2>/dev/null)
 [ "$ALICE_OWNER" = "$ALICE" ] && pass "Alice's vault owned by '$ALICE'" || fail "Alice ownership" "owner is '$ALICE_OWNER', expected '$ALICE'"
 
-R=$(mcp_call "$BOB_PAT" "$BOB_SID" 11 akb_vault_info "{\"vault\":\"$BOB_VAULT\"}")
+R=$(mcp_call "$BOB_PAT" "$BOB_SID" 11 akb_discover "{\"action\":\"vault_info\",\"vault\":\"$BOB_VAULT\"}")
 BOB_OWNER=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['owner'])" 2>/dev/null)
 [ "$BOB_OWNER" = "$BOB" ] && pass "Bob's vault owned by '$BOB'" || fail "Bob ownership" "owner is '$BOB_OWNER', expected '$BOB'"
 
@@ -133,11 +133,11 @@ BOB_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.loa
 echo ""
 echo "▸ 5. Verify created_by attribution"
 
-R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 13 akb_get "{\"uri\":\"$ALICE_DOC_URI\"}")
+R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 13 akb_document_read "{\"action\":\"get\",\"uri\":\"$ALICE_DOC_URI\"}")
 ALICE_AUTHOR=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text']).get('created_by',''))" 2>/dev/null)
 [ "$ALICE_AUTHOR" = "$ALICE" ] && pass "Alice's doc created_by='$ALICE'" || fail "Alice attribution" "created_by='$ALICE_AUTHOR'"
 
-R=$(mcp_call "$BOB_PAT" "$BOB_SID" 13 akb_get "{\"uri\":\"$BOB_DOC_URI\"}")
+R=$(mcp_call "$BOB_PAT" "$BOB_SID" 13 akb_document_read "{\"action\":\"get\",\"uri\":\"$BOB_DOC_URI\"}")
 BOB_AUTHOR=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)['result']['content'][0]['text']).get('created_by',''))" 2>/dev/null)
 [ "$BOB_AUTHOR" = "$BOB" ] && pass "Bob's doc created_by='$BOB'" || fail "Bob attribution" "created_by='$BOB_AUTHOR'"
 
@@ -146,7 +146,7 @@ echo ""
 echo "▸ 6. Cross-access isolation"
 
 # Alice tries to browse Bob's vault (should fail — no access)
-R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 14 akb_browse "{\"vault\":\"$BOB_VAULT\"}")
+R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 14 akb_discover "{\"action\":\"browse\",\"vault\":\"$BOB_VAULT\"}")
 IS_ERROR=$(echo "$R" | python3 -c "import sys,json; t=json.load(sys.stdin)['result']['content'][0]['text']; print('error' in t.lower() or 'forbidden' in t.lower())" 2>/dev/null)
 [ "$IS_ERROR" = "True" ] && pass "Alice can't browse Bob's vault" || fail "Cross-access" "Alice accessed Bob's vault"
 
@@ -165,7 +165,7 @@ GRANTED=$(echo "$R" | python3 -c "import sys,json; print(json.loads(json.load(sy
 [ "$GRANTED" = "True" ] && pass "Alice granted Bob reader on her vault" || fail "Grant" "failed"
 
 # Bob can now read Alice's vault
-R=$(mcp_call "$BOB_PAT" "$BOB_SID" 16 akb_browse "{\"vault\":\"$ALICE_VAULT\"}")
+R=$(mcp_call "$BOB_PAT" "$BOB_SID" 16 akb_discover "{\"action\":\"browse\",\"vault\":\"$ALICE_VAULT\"}")
 ITEMS=$(echo "$R" | python3 -c "import sys,json; print(len(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['items']))" 2>/dev/null)
 [ "$ITEMS" -ge 1 ] 2>/dev/null && pass "Bob can now browse Alice's vault ($ITEMS items)" || fail "Read after grant" "expected >=1"
 
@@ -178,11 +178,11 @@ IS_ERROR=$(echo "$R" | python3 -c "import sys,json; t=json.load(sys.stdin)['resu
 echo ""
 echo "▸ 8. Vault listing per user"
 
-R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 18 akb_list_vaults '{}')
+R=$(mcp_call "$ALICE_PAT" "$ALICE_SID" 18 akb_discover '{"action":"list_vaults"}')
 ALICE_VAULTS=$(echo "$R" | python3 -c "import sys,json; vaults=json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['vaults']; print([v['name'] for v in vaults])" 2>/dev/null)
 echo "    Alice sees: $ALICE_VAULTS"
 
-R=$(mcp_call "$BOB_PAT" "$BOB_SID" 18 akb_list_vaults '{}')
+R=$(mcp_call "$BOB_PAT" "$BOB_SID" 18 akb_discover '{"action":"list_vaults"}')
 BOB_VAULTS=$(echo "$R" | python3 -c "import sys,json; vaults=json.loads(json.load(sys.stdin)['result']['content'][0]['text'])['vaults']; print([v['name'] for v in vaults])" 2>/dev/null)
 echo "    Bob sees: $BOB_VAULTS"
 

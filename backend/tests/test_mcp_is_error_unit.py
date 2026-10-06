@@ -39,7 +39,9 @@ def _call(monkeypatch, outcome):
         return outcome
 
     monkeypatch.setattr(srv, "_dispatch", _dispatch)
-    out = asyncio.run(srv.call_tool("akb_discover", {"action": "search", "query": "seam"}))
+    out = asyncio.run(
+        srv.call_tool("akb_discover", {"action": "search", "query": "seam"})
+    )
     # The SDK model names the field is_error; the wire name is isError.
     assert out.model_dump(by_alias=True)["isError"] is out.is_error
     return out, json.loads(out.content[0].text)
