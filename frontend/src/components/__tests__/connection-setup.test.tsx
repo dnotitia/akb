@@ -14,11 +14,13 @@ describe("Connection setup", () => {
   it("does not create credentials or offer a placeholder config on open", () => {
     render(<ConnectionSetup mcpOauthEnabled={false} />);
     expect(issuePat).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("AI tool")).toBeVisible();
+    expect(screen.getByRole("group", { name: "AI tool" })).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Claude Code" })).toBeChecked();
     expect(screen.getByLabelText("Token name")).toBeVisible();
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
-    expect(screen.queryByText(/This browser cannot verify/)).toBeNull();
-    expect(screen.queryByText("3. Try it in your agent")).toBeNull();
+    expect(screen.getByText(/This browser cannot verify/)).toBeVisible();
+    expect(screen.getAllByRole("heading", { level: 3 }).map(heading => heading.textContent)).toEqual(["1. Prepare access", "2. Configure Claude Code", "3. Try it in your agent"]);
+    expect(screen.queryByRole("menuitemradio")).toBeNull();
   });
 
   it("guards repeated submission and keeps failure recoverable", async () => {
@@ -38,18 +40,31 @@ describe("Connection setup", () => {
 
   it("allows browser sign-in without minting a token", async () => {
     render(<ConnectionSetup mcpOauthEnabled />);
-    expect(screen.getByLabelText("Sign-in method")).toHaveTextContent("Browser sign-in (OAuth)");
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toBeChecked();
     expect(screen.queryByLabelText("Token name")).toBeNull();
     expect(screen.getByText(/--transport http/)).toBeVisible();
     expect(screen.getByText(/This browser cannot verify/)).toBeVisible();
     expect(issuePat).not.toHaveBeenCalled();
   });
 
+  it("keeps one tab stop per choice group as the selected option changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionSetup mcpOauthEnabled />);
+    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "VS Code" })).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toHaveAttribute("tabindex", "0");
+    await user.click(screen.getByRole("radio", { name: "VS Code" }));
+    expect(screen.getByRole("radio", { name: "VS Code" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "-1");
+    await user.click(screen.getByRole("radio", { name: "Use a saved token" }));
+    expect(screen.getByRole("radio", { name: "Use a saved token" })).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toHaveAttribute("tabindex", "-1");
+  });
+
   it("rejects a token prefix instead of putting it into a command", async () => {
     const user = userEvent.setup();
     render(<ConnectionSetup mcpOauthEnabled={false} />);
-    await user.click(screen.getByLabelText("Access token"));
-    await user.click(screen.getByRole("menuitemradio", { name: "Use a saved token" }));
+    await user.click(screen.getByRole("radio", { name: "Use a saved token" }));
     await user.type(screen.getByLabelText("Full saved token"), "akb_prefix…");
     expect(screen.getByRole("alert")).toHaveTextContent("Enter the full token");
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
@@ -60,21 +75,19 @@ describe("Connection setup", () => {
     await user.clear(screen.getByLabelText("Full saved token"));
     await user.type(screen.getByLabelText("Full saved token"), "akb_complete_saved_secret");
     expect(screen.getByText(/npx akb-mcp/)).toHaveTextContent("akb_complete_saved_secret");
-    expect(screen.getByText("3. Try it in your agent")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
     expect(issuePat).not.toHaveBeenCalled();
   });
 
   it("preserves an explicit token choice when the client changes", async () => {
     const user = userEvent.setup();
     render(<ConnectionSetup mcpOauthEnabled />);
-    await user.click(screen.getByLabelText("Sign-in method"));
-    await user.click(screen.getByRole("menuitemradio", { name: "Access token" }));
-    await user.click(screen.getByLabelText("AI tool"));
-    await user.click(screen.getByRole("menuitemradio", { name: "Cursor" }));
-    expect(screen.getByLabelText("Sign-in method")).toHaveTextContent("Access token");
+    await user.click(screen.getByRole("radio", { name: "Create a new token" }));
+    await user.click(screen.getByRole("radio", { name: "Cursor" }));
+    expect(screen.getByRole("radio", { name: "Create a new token" })).toBeChecked();
     expect(screen.getByLabelText("Token name")).toBeVisible();
-    expect(screen.queryByText("3. Try it in your agent")).toBeNull();
-    expect(screen.getByText(/read or change content within your existing vault permissions/)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
+    expect(screen.getByText(/Your account permissions still apply/)).toBeVisible();
   });
 
   it("keeps a new secret available until closing is acknowledged", async () => {
@@ -112,13 +125,27 @@ describe("Connection setup", () => {
   it("clears a pasted token after revocation because its ID is unknown", async () => {
     const user = userEvent.setup();
     const { rerender } = render(<ConnectionSetup mcpOauthEnabled={false} />);
-    await user.click(screen.getByLabelText("Access token"));
-    await user.click(screen.getByRole("menuitemradio", { name: "Use a saved token" }));
+    await user.click(screen.getByRole("radio", { name: "Use a saved token" }));
     await user.type(screen.getByLabelText("Full saved token"), "akb_saved_secret");
     expect(screen.getByText(/npx akb-mcp/)).toBeVisible();
     rerender(<ConnectionSetup mcpOauthEnabled={false} invalidatedTokenId="revoked-id" />);
     expect(screen.getByLabelText("Full saved token")).toHaveValue("");
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
     expect(screen.getByRole("alert")).toHaveTextContent("Enter your current full token again");
+  });
+
+  it("falls back to token setup for tools without OAuth support and restores browser sign-in", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionSetup mcpOauthEnabled />);
+    await user.click(screen.getByRole("radio", { name: "Codex" }));
+    expect(screen.queryByRole("radio", { name: "Browser sign-in" })).toBeNull();
+    expect(screen.getByLabelText("Token name")).toBeVisible();
+    expect(screen.queryByText(/codex mcp add/)).toBeNull();
+    await user.type(screen.getByLabelText("Token name"), "retained draft");
+    await user.click(screen.getByRole("radio", { name: "Claude Code" }));
+    expect(screen.getByRole("radio", { name: "Browser sign-in" })).toBeChecked();
+    await user.click(screen.getByRole("radio", { name: "Create a new token" }));
+    expect(screen.getByLabelText("Token name")).toHaveValue("retained draft");
+    expect(issuePat).not.toHaveBeenCalled();
   });
 });

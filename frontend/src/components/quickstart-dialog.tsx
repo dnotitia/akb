@@ -1,4 +1,4 @@
-import { useState, type RefObject } from "react";
+import { useState, type FocusEvent, type RefObject } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -6,6 +6,21 @@ import { ConnectionSetup } from "@/components/connection-setup";
 import { isModalOpen } from "@/lib/modal-visibility";
 
 export const QUICKSTART_DISMISS_KEY = "akb.quickstartDismissed";
+
+function revealSetupFocus(event: FocusEvent<HTMLDivElement>) {
+  const scroller = event.currentTarget;
+  // Radix's focus trap wraps with preventScroll. Reveal the full radio label
+  // inside this body only, without shifting the modal or background workspace.
+  const target = event.target instanceof HTMLInputElement && event.target.type === "radio"
+    ? event.target.closest("label") ?? event.target
+    : event.target;
+  const viewport = scroller.getBoundingClientRect();
+  const bounds = target.getBoundingClientRect();
+  const top = viewport.top + 4;
+  const bottom = viewport.bottom - 4;
+  if (bounds.top < top) scroller.scrollTop += bounds.top - top;
+  else if (bounds.bottom > bottom) scroller.scrollTop += Math.min(bounds.bottom - bottom, bounds.top - top);
+}
 
 export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthEnabled, returnFocusRef }: {
   open: boolean;
@@ -30,7 +45,7 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
   }
   return <>
     <Dialog open={open} onOpenChange={requestClose}>
-      <DialogContent className="max-w-2xl" onCloseAutoFocus={event => {
+      <DialogContent className="flex max-w-3xl flex-col gap-0 overflow-hidden p-0" onCloseAutoFocus={event => {
         if (!returnFocusRef) return;
         event.preventDefault();
         // The floating trigger becomes visible after the last modal releases
@@ -40,12 +55,12 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
           if (target?.isConnected && !isModalOpen()) target.focus({ preventScroll: true });
         });
       }}>
-        <DialogHeader>
+        <DialogHeader className="shrink-0 border-b border-border px-5 py-5 pr-12 sm:px-7 sm:pr-12">
           <DialogTitle>Connect an agent</DialogTitle>
-          <DialogDescription>Choose your AI tool, add AKB, then try a read-only request.</DialogDescription>
+          <DialogDescription>Choose your tool. Follow the three steps below.</DialogDescription>
         </DialogHeader>
-        {open && <ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} />}
-        <DialogFooter><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
+        {open && <div data-connection-scroll className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7" onFocusCapture={revealSetupFocus}><ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} /></div>}
+        <DialogFooter className="shrink-0 border-t border-border px-5 py-3 sm:px-7"><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
       </DialogContent>
     </Dialog>
     <ConfirmDialog open={confirmClose} onOpenChange={setConfirmClose} title="Have you saved your token?" description="Unsaved token options will be discarded. Any new token cannot be shown again after closing; save it or its configuration somewhere private first. Closing does not revoke it." confirmLabel="I've saved it — close" cancelLabel="Keep setup open" onConfirm={close} />

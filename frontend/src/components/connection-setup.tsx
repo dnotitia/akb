@@ -1,4 +1,5 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import { Check, Terminal } from "lucide-react";
 import { authSessionSnapshot, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
 import { type PatReceipt } from "@/lib/api-pat-issuance";
 import { scopeSummary, type PatDraft } from "@/lib/pat-draft";
@@ -9,8 +10,43 @@ import { Button } from "@/components/ui/button";
 import { CodeSnippet } from "@/components/ui/code-snippet";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SelectMenu } from "@/components/ui/select-menu";
 import { cn } from "@/lib/utils";
+
+function SetupStep({ id, number, title, children }: { id: string; number: number; title: string; children: ReactNode }) {
+  return <section aria-labelledby={id} className="grid min-w-0 grid-cols-[1.75rem_minmax(0,1fr)] gap-x-3 py-4 sm:gap-x-4">
+    <span aria-hidden className="flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] bg-primary/10 text-xs font-semibold tabular-nums text-link">{number}</span>
+    <h3 id={id} aria-label={`${number}. ${title}`} className="pt-0.5 text-sm font-semibold leading-6 text-foreground"><span className="sr-only">{number}. </span>{title}</h3>
+    <div className="col-span-2 min-w-0 space-y-3 pt-3 sm:col-span-1 sm:col-start-2">
+      {children}
+    </div>
+  </section>;
+}
+
+/** One labelled choice, without another select box or nested setup branch. */
+function SetupChoice({ label, name, value, options, disabled, onChange, appearance = "segmented" }: {
+  label: string; name: string; value: string;
+  options: { value: string; label: string; accessibleName?: string }[];
+  disabled: boolean; onChange: (value: string) => void;
+  appearance?: "tabs" | "segmented";
+}) {
+  return <fieldset disabled={disabled} className="min-w-0">
+    <legend className="mb-2 text-xs font-medium text-foreground-muted">{label}</legend>
+    <div className={cn("flex flex-wrap gap-1", appearance === "tabs" ? "border-b border-border" : "rounded-[var(--radius-md)] border border-border bg-surface-2 p-1")}>
+      {options.map(option => <label key={option.value} className={cn(
+        "relative flex min-h-11 flex-[1_0_auto] cursor-pointer items-center justify-center gap-2 whitespace-nowrap px-3 text-sm transition-token has-[:focus-visible]:z-10 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-surface",
+        appearance === "tabs" ? "rounded-t-[var(--radius-sm)] border-b-2" : "rounded-[var(--radius-sm)] border",
+        disabled && "cursor-not-allowed opacity-50",
+        value === option.value
+          ? cn("bg-surface-selected font-semibold text-surface-selected-foreground", appearance === "tabs" ? "border-link!" : "border-border-strong!")
+          : "border-transparent! text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+      )}>
+        <input type="radio" className="sr-only" name={name} value={option.value} aria-label={option.accessibleName} checked={value === option.value} tabIndex={value === option.value ? 0 : -1} onChange={() => onChange(option.value)} />
+        {appearance === "segmented" && <Check aria-hidden className={cn("h-3.5 w-3.5 shrink-0", value !== option.value && "invisible")} />}
+        {option.label}
+      </label>)}
+    </div>
+  </fieldset>;
+}
 
 export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreated, onBusyChange, invalidatedTokenId, onDirtyChange, initialDraft, replacement = false, onReceipt, layout = "compact" }: {
   layout?: "compact" | "workspace" | "settings";
@@ -81,64 +117,64 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
     }
   }
 
-  const workspace = layout !== "compact";
-  const stepClass = layout === "settings" ? "min-w-0 space-y-4 border-t border-border pt-5 first:border-t-0 first:pt-0" : workspace ? "min-w-0 space-y-4 rounded-[var(--radius-md)] border border-border bg-surface p-4 sm:p-5" : "space-y-3";
-  return <div className={cn("text-sm", layout === "settings" ? "space-y-6" : workspace ? "grid items-start gap-4 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]" : "space-y-5")}>
-    <section className={stepClass} aria-labelledby={`${id}-choose`}>
-      <h3 id={`${id}-choose`} className="font-semibold text-foreground">{workspace ? "1. Prepare access" : "1. Choose your tool"}</h3>
-      <div className="space-y-1.5">
-        <Label htmlFor={`${id}-agent`}>AI tool</Label>
-        <SelectMenu id={`${id}-agent`} value={agent} disabled={creating} onValueChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
-      </div>
-      {oauthAvailable && <div className="space-y-1.5">
-        <Label htmlFor={`${id}-auth`}>Sign-in method</Label>
-        <SelectMenu id={`${id}-auth`} value={auth} disabled={creating} onValueChange={setAuth} options={[{ value: "pat", label: "Access token" }, { value: "oauth", label: "Browser sign-in (OAuth)" }]} />
-      </div>}
-      <p className="text-xs text-foreground-muted">Your AI tool can read or change content within your existing vault permissions. The test request below is read-only.</p>
+  const accessMethod = useOauth ? "oauth" : freshToken ? "create" : credentialMode;
+  const configVisible = useOauth || (usableToken && (!freshToken || showSecret));
+  return <div className="min-w-0 text-sm" data-layout={layout}>
+    <div>
+      <SetupChoice label="AI tool" appearance="tabs" name={`${id}-agent`} value={agent} disabled={creating} onChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
+    </div>
+    <div className="divide-y divide-border">
+    <SetupStep id={`${id}-choose`} number={1} title="Prepare access">
+      <SetupChoice label="Access method" name={`${id}-access`} value={accessMethod} disabled={creating} onChange={value => {
+        if (value === "oauth") setAuth("oauth");
+        else { setAuth("pat"); setCredentialMode(value); }
+      }} options={[
+        ...(oauthAvailable ? [{ value: "oauth", label: "Browser sign-in" }] : []),
+        { value: "create", label: freshToken ? "Access token" : "New token", accessibleName: freshToken ? "Access token" : "Create a new token" },
+        ...(!freshToken ? [{ value: "existing", label: "Saved token", accessibleName: "Use a saved token" }] : []),
+      ]} />
       {invalidationNotice && <Alert variant="warning">{invalidationNotice}</Alert>}
-      {useOauth ? <p className="text-foreground-muted">{agent === "claude" ? "After running the command, open Claude Code and use /mcp to authenticate AKB in your browser." : "Add this server in your tool, then complete its browser sign-in."} No access token is needed.</p> : <>
-        {!freshToken && <>
-          <div className="space-y-1.5">
-            <Label htmlFor={`${id}-credential`}>Access token</Label>
-            <SelectMenu id={`${id}-credential`} value={credentialMode} disabled={creating} onValueChange={setCredentialMode} options={[{ value: "create", label: "Create a new token" }, { value: "existing", label: "Use a saved token" }]} />
-          </div>
-          {credentialMode === "existing" && <div className="space-y-2">
+      {useOauth ? <p className="leading-relaxed text-foreground-muted">Your tool will open AKB's browser sign-in after you add the server. No access token is needed. Your existing vault permissions still apply.</p> : <>
+        {!oauthAvailable && mcpOauthEnabled && <p className="text-xs text-foreground-muted">{MCP_AGENT_LABELS[agent]} uses an access token for this connection.</p>}
+        {!freshToken && credentialMode === "existing" && <div className="space-y-2">
             <Label htmlFor={`${id}-saved`}>Full saved token</Label>
             <Input id={`${id}-saved`} type="password" value={existingToken} onChange={event => { setExistingToken(event.target.value); setInvalidationNotice(null); }} autoComplete="off" spellCheck={false} aria-describedby={`${id}-saved-help`} />
-            <p id={`${id}-saved-help`} className="text-xs text-foreground-muted">Use the full secret you saved earlier. The prefix in the token list cannot authenticate. It stays only in this setup session.</p>
+            <p id={`${id}-saved-help`} className="text-xs text-foreground-muted">Use the full secret, not the prefix in the token list. It stays only in this setup session. Your existing vault permissions still apply.</p>
             {existingToken && !usableToken && <Alert variant="destructive">Enter the full token using only letters, numbers, underscores, and hyphens. A prefix or placeholder cannot authenticate.</Alert>}
-          </div>}
-        </>}
+        </div>}
       </>}
       {/* Keep issuance state mounted across credential/OAuth switches. Only a
           completed issuance or leaving setup may discard this form session. */}
       {!freshToken && issuanceStarted && <div hidden={useOauth || credentialMode !== "create"}>
         <PatIssuanceForm initial={initialDraft} replacement={replacement} onDirtyChange={setFormDirty} onBusyChange={value => { setCreating(value); onBusyChange?.(value); }} onMetadataChanged={onTokenCreated} onCreated={(result, snapshot) => {
-            setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setShowSecret(true); setInvalidationNotice(null); onSecretCreated?.(); onReceipt?.(result, snapshot);
+            setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setCredentialMode("create"); setShowSecret(true); setInvalidationNotice(null); onSecretCreated?.(); onReceipt?.(result, snapshot);
           }} />
       </div>}
       {freshToken && isCurrentAuthSession(session) && <div className="space-y-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
         <p role="status" className="font-medium">Token created — save it now</p>
         <p className="text-xs text-foreground-muted">This secret is shown only during this setup. Store it privately before leaving. The configuration below also contains the token when using token sign-in.</p>
         <p className="text-xs text-foreground-muted">{receipt?.verified ? `${receipt.scopes?.join(" + ")} · ${receipt.expires_at ? `Expires ${receipt.expires_at}` : "No expiration"} · ${scopeSummary(receipt.vault_scope)}` : "Created with server defaults; advanced restrictions were not verified."}</p>
-        <div className="flex flex-wrap gap-2"><Button type="button" variant="outline" onClick={() => setShowSecret(!showSecret)}>{showSecret ? "Hide token and configuration" : "Show token and configuration"}</Button><Button type="button" variant="outline" onClick={() => { setFreshToken(""); setFreshTokenId(null); setReceipt(null); }}>I've saved it — dismiss token</Button></div>
+        <div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" onClick={() => setShowSecret(!showSecret)}>{showSecret ? "Hide token and configuration" : "Show token and configuration"}</Button><Button type="button" variant="ghost" size="sm" onClick={() => { setFreshToken(""); setFreshTokenId(null); setReceipt(null); }}>I've saved it — dismiss token</Button></div>
         {showSecret ? <CodeSnippet code={freshToken} filename="Access token" /> : <p>Token and token-bearing configuration are hidden.</p>}
       </div>}
-    </section>
+    </SetupStep>
 
-    <section className={cn(stepClass, !workspace && "border-t border-border pt-4")} aria-labelledby={`${id}-configure`}>
-      <h3 id={`${id}-configure`} className="font-semibold text-foreground">2. Configure {MCP_AGENT_LABELS[agent]}</h3>
-      {useOauth || (usableToken && (!freshToken || showSecret)) ? <>
+    <SetupStep id={`${id}-configure`} number={2} title={`Configure ${MCP_AGENT_LABELS[agent]}`}>
+      {configVisible ? <>
         <p className="text-foreground-muted">{MCP_AGENT_FILES[agent] === "terminal" ? "Run this in your terminal." : `Merge this configuration into your tool's ${MCP_AGENT_FILES[agent]}; keep any existing servers.`}</p>
         <CodeSnippet code={useOauth ? oauthSnippet! : mcpInstallSnippets(token)[agent]} filename={MCP_AGENT_FILES[agent]} />
-      </> : <p className="text-xs text-foreground-muted">Create or enter a token to reveal your configuration.</p>}
-    </section>
+      </> : <div className="flex items-start gap-3 rounded-[var(--radius-md)] border border-dashed border-border bg-surface-2/50 p-4">
+        <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
+        <div className="space-y-1"><p className="font-medium">Your configuration will appear here</p><p className="text-xs leading-relaxed text-foreground-muted">{freshToken && !showSecret ? "Show your token and configuration in step 1 to copy it." : "Create or enter a token in step 1. No placeholder credentials are included."}</p></div>
+      </div>}
+    </SetupStep>
 
-    {(workspace || useOauth || usableToken) && <section className={cn(stepClass, !workspace && "border-t border-border pt-4")} aria-labelledby={`${id}-try`}>
-      <h3 id={`${id}-try`} className="font-semibold text-foreground">3. Try it in your agent</h3>
-      <p className="text-foreground-muted">Reload your tool if needed, enable the AKB server, then send this read-only request:</p>
+    <SetupStep id={`${id}-try`} number={3} title="Try it in your agent">
+      <p className="leading-relaxed text-foreground-muted">{useOauth ? agent === "claude" ? "Open Claude Code and use /mcp to sign in to AKB in your browser. Then send this read-only request:" : "Reload your tool, enable AKB and complete its browser sign-in. Then send this read-only request:" : "Reload your tool if needed, enable AKB, then send this read-only request:"}</p>
       <CodeSnippet code="Use akb_help to show me how AKB works, then list the vaults I can access. Do not create or change anything." filename="Prompt for your agent" />
-      <p className="text-xs text-foreground-muted">Your agent should return AKB's usage guide and your accessible vaults. This browser cannot verify an external agent connection. If it fails, check that the server is enabled, this AKB address is reachable, and sign-in completed.</p>
-    </section>}
+      <p className="text-xs leading-relaxed text-foreground-muted">Expected response: AKB's usage guide and the vaults you can access. This browser cannot verify an external agent connection.</p>
+      <details className="text-xs text-foreground-muted"><summary className="w-fit cursor-pointer rounded-[var(--radius-sm)] py-2 font-medium text-link focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">Connection not working?</summary><p className="pb-2 leading-relaxed">Check that the AKB server is enabled in your tool, this AKB address is reachable, and sign-in completed.</p></details>
+    </SetupStep>
+    </div>
   </div>;
 }

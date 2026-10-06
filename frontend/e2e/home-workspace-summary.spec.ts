@@ -7,7 +7,12 @@ test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated authenticated H
 async function fixture(page: Page, dark = false) {
   const userId = "00000000-0000-4000-8000-000000000001";
   const tokenId = "00000000-0000-4000-8000-000000000002";
-  const state = { legacy: false, vaults: 20, tokens: 0, summaries: 0, details: 0, authGate: null as Promise<void> | null };
+  const state = {
+    legacy: false, vaults: 20, tokens: 0, summaries: 0, details: 0,
+    authGate: null as Promise<void> | null,
+    directoryGate: null as Promise<void> | null,
+    summaryGate: null as Promise<void> | null,
+  };
   await page.addInitScript(({ dark }) => {
     localStorage.setItem("akb_token", "home-summary-isolated-fixture");
     localStorage.setItem("akb_theme", dark ? "dark" : "light");
@@ -40,10 +45,10 @@ async function fixture(page: Page, dark = false) {
     }
     if (path.endsWith("/my/workspace-summary")) {
       state.summaries++;
-      return state.legacy ? route.fulfill({ status: 404, json: { detail: "Not found" } })
-        : route.fulfill({ json: { version: 1, scope: "accessible", observed_at: new Date().toISOString(), vault_count: state.vaults, document_count: state.vaults ? 1284 : 0, table_count: state.vaults ? 12 : 0, file_count: state.vaults ? 86 : 0 } });
+      return Promise.resolve(state.summaryGate).then(() => state.legacy ? route.fulfill({ status: 404, json: { detail: "Not found" } })
+        : route.fulfill({ json: { version: 1, scope: "accessible", observed_at: new Date().toISOString(), vault_count: state.vaults, document_count: state.vaults ? 1284 : 0, table_count: state.vaults ? 12 : 0, file_count: state.vaults ? 86 : 0 } }));
     }
-    if (path.endsWith("/my/vaults")) return route.fulfill({ json: { vaults: Array.from({ length: state.vaults }, (_, i) => ({ id: `vault-${i}`, name: ["Product knowledge", "Research", "Engineering", "Team handbook"][i] ?? `Workspace ${i}`, role: i % 2 ? "reader" : "owner", description: ["Decisions, project notes, and release plans.", "Evidence and recommendations for upcoming work.", "Architecture and operational guides.", "People, practices, and shared context."][i] })) } });
+    if (path.endsWith("/my/vaults")) return Promise.resolve(state.directoryGate).then(() => route.fulfill({ json: { vaults: Array.from({ length: state.vaults }, (_, i) => ({ id: `vault-${i}`, name: ["Product knowledge", "Research", "Engineering", "Team handbook"][i] ?? `Workspace ${i}`, role: i % 2 ? "reader" : "owner", description: ["Decisions, project notes, and release plans.", "Evidence and recommendations for upcoming work.", "Architecture and operational guides.", "People, practices, and shared context."][i] })) } }));
     if (path.endsWith("/info")) {
       state.details++;
       return route.fulfill({ json: { document_count: 21, table_count: 2, file_count: 3, role: "reader" } });
@@ -293,4 +298,41 @@ test("Local account foreground proof hides and refreshes totals after access cha
   await expect(totals).toContainText("1,284");
   await expect(totals.locator("dd").first()).toHaveText("2");
   expect(state.summaries).toBe(before + 1);
+});
+
+test("Workspace totals do not wait for a slow Vault directory or refetch when it finishes", async ({ page }) => {
+  const state = await fixture(page);
+  let release!: () => void;
+  state.directoryGate = new Promise<void>(resolve => { release = resolve; });
+  await page.goto("/");
+  const totals = page.getByRole("region", { name: "Workspace summary" });
+  await expect(totals).toContainText("1,284");
+  await expect(page.getByRole("status", { name: "Loading your vaults" })).toBeVisible();
+  expect(state.summaries).toBe(1);
+  expect(state.details).toBe(0);
+  state.directoryGate = null;
+  release();
+  await expect(page.getByRole("status", { name: "Loading your vaults" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Your vaults" }).getByRole("link", { name: /Product knowledge/ })).toBeVisible();
+  expect(state.summaries).toBe(1);
+});
+
+test("Verified Vault count appears while the aggregate is slow without hiding it from screen readers", async ({ page }) => {
+  const state = await fixture(page);
+  let release!: () => void;
+  state.summaryGate = new Promise<void>(resolve => { release = resolve; });
+  await page.goto("/");
+  const totals = page.getByRole("region", { name: "Workspace summary" });
+  const count = totals.getByRole("definition").first();
+  await expect(count).toHaveText("20");
+  await expect(totals.getByLabel("Loading", { exact: true })).toHaveCount(3);
+  await expect(totals.getByRole("status", { name: "Loading workspace totals" })).toHaveCount(1);
+  await expect(totals).not.toContainText("Totals unavailable");
+  const before = await totals.locator("dl").boundingBox();
+  state.summaryGate = null;
+  release();
+  await expect(totals).toContainText("1,284");
+  const after = await totals.locator("dl").boundingBox();
+  expect(after?.height).toBeCloseTo(before!.height, 1);
+  expect(state.summaries).toBe(1);
 });
