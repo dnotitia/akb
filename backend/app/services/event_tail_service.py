@@ -327,6 +327,8 @@ async def _stream_events(
     pool = await get_pool()
     async with pool.acquire() as conn:
         wakeup = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        last_frame_at = loop.time()
 
         def on_notify(*_args: Any) -> None:
             wakeup.set()
@@ -356,23 +358,32 @@ async def _stream_events(
                         current_position = int(row["id"])
                         event_cursor = codec.encode(vault_id, kinds, current_position)
                         if not kinds or row["kind"] in kinds:
-                            yield format_sse(
+                            frame = format_sse(
                                 "change",
                                 event_cursor,
                                 _event_envelope(row, cursor=event_cursor, vault=vault),
                             )
+                            yield frame
+                            last_frame_at = loop.time()
                         else:
                             checkpoint = TailCheckpointV1(version=1, cursor=event_cursor)
-                            yield format_sse(
+                            frame = format_sse(
                                 "checkpoint",
                                 event_cursor,
                                 checkpoint.model_dump(mode="json", exclude_none=True),
                             )
+                            yield frame
+                            last_frame_at = loop.time()
                     continue
 
+                remaining = max(
+                    0.0,
+                    HEARTBEAT_INTERVAL_SECONDS - (loop.time() - last_frame_at),
+                )
                 try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+                    await asyncio.wait_for(wakeup.wait(), timeout=remaining)
                 except TimeoutError:
                     yield format_heartbeat()
+                    last_frame_at = loop.time()
         finally:
             await conn.remove_listener(EVENT_CHANNEL, on_notify)
