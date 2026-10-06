@@ -374,7 +374,7 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
                       ? "Unsaved changes"
                       : undefined
                   }
-                  className="h-11 rounded-none border-b-2 border-transparent! px-3 data-[state=active]:border-primary! data-[state=active]:bg-transparent data-[state=active]:text-link data-[state=active]:shadow-none"
+                  className="h-11 rounded-none border-b-2 border-transparent px-3 data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-link data-[state=active]:shadow-none"
                 >
                   {label}
                   {((value === "general" && descriptionDirty) ||

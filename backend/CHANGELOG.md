@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Authentication
+
+- `POST /api/v1/auth/register` rejects passwords shorter than 8 characters
+  with 422 `invalid_argument`, matching the existing change-password minimum.
+  Registration and password change also reject passwords over 72 UTF-8 bytes
+  (the bcrypt limit) as client errors instead of failing with 500.
+
 ### Search retrieval
 
 - Scoped pgvector posting searches choose term-first, scope-first, or bounded
