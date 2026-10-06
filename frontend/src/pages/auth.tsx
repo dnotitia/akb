@@ -257,9 +257,10 @@ export default function AuthPage() {
                 <h2 className="font-display text-xl font-semibold tracking-tight text-foreground">Welcome to AKB</h2>
                 <p className="mt-1 mb-5 text-sm text-foreground-muted">Sign in or create an account to continue.</p>
                 <Tabs value={mode} onValueChange={(v) => switchMode(v as Mode)}>
-                  <TabsList className="grid w-full grid-cols-2">
-                    <TabsTrigger value="login" className="min-h-11 justify-center sm:min-h-9">Sign in</TabsTrigger>
-                    <TabsTrigger value="register" className="min-h-11 justify-center sm:min-h-9">Create account</TabsTrigger>
+                  {/* Underline tabs, as on Vault settings and Search. */}
+                  <TabsList className="grid w-full grid-cols-2 gap-0 rounded-none border-b border-border bg-transparent p-0">
+                    <TabsTrigger value="login" className={AUTH_TAB}>Sign in</TabsTrigger>
+                    <TabsTrigger value="register" className={AUTH_TAB}>Create account</TabsTrigger>
                   </TabsList>
                   <TabsContent value="login" className="pt-5">
                     <AuthForm
@@ -336,6 +337,9 @@ export default function AuthPage() {
     </div>
   );
 }
+
+const AUTH_TAB =
+  "-mb-px min-h-11 justify-center rounded-none border-b-2 border-transparent px-3 sm:min-h-10 data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-link data-[state=active]:shadow-none";
 
 type LoginDraft = { username: string; password: string };
 type RegisterDraft = LoginDraft & { email: string; displayName: string; confirm: string };
