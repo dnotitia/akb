@@ -1691,12 +1691,11 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
 }
 
 function searchModeClass(active: boolean) {
-  // Keep the selected underline visible above the global unlayered border reset.
   return cn(
     "-mb-px inline-flex min-h-10 flex-1 cursor-pointer items-center justify-center gap-1.5 border-b-2 px-2.5 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
     active
-      ? "border-primary! text-link"
-      : "border-transparent! text-foreground-muted hover:bg-surface-hover hover:text-foreground",
+      ? "border-primary text-link"
+      : "border-transparent text-foreground-muted hover:bg-surface-hover hover:text-foreground",
   );
 }
 

@@ -281,8 +281,12 @@
 .vault-app-header > div { overflow-x: auto; }
 
 /* ── Global ──────────────────────────────────────────────────────── */
-* {
-  border-color: var(--color-border);
+/* In the base layer so every `border-*` color utility (and its hover, focus,
+   aria-invalid variants) still wins. Unlayered, this beat all utilities. */
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
 }
 
 html, body, #root {
@@ -680,6 +684,11 @@ body::before {
   color: var(--color-foreground);
   max-width: 72ch;
   line-height: 1.75;
+  /* Table rules use theme tokens in both modes (prose-invert included). */
+  --tw-prose-th-borders: var(--color-border-strong);
+  --tw-prose-td-borders: var(--color-border);
+  --tw-prose-invert-th-borders: var(--color-border-strong);
+  --tw-prose-invert-td-borders: var(--color-border);
 }
 .prose a {
   color: var(--color-link);
