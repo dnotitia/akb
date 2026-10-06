@@ -186,8 +186,11 @@ export default function AuthPage() {
     }
   }
 
+  // Centre the default sign-in card (~28.5rem) vertically, but pin its top:
+  // the taller Create account form then grows downward instead of making the
+  // card jump when switching tabs.
   return (
-    <div className="relative flex min-h-screen justify-center overflow-clip bg-background text-foreground px-4 pb-6 pt-16 sm:p-6 sm:pt-[12vh]">
+    <div className="relative flex min-h-screen justify-center overflow-clip bg-background text-foreground px-4 pb-6 pt-16 sm:p-6 sm:pt-[max(1.5rem,calc((100dvh_-_28.5rem)/2))]">
       <div className="absolute right-4 top-4 z-10">
         <ThemeToggle />
       </div>
