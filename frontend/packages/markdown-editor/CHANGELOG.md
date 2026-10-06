@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.1
+
+- Preserve escaped punctuation in image alt text across parse and serialize
+  round trips.
+- Keep resolved reference titles and runtime routes out of authored Markdown
+  while displaying accessible labels in the editor.
+- Preserve canonical reference marks when parsing their HTML representation.
+- Include links (also resolved asynchronously), resolved references, task
+  checkboxes, and scrollable code blocks in the editor's keyboard traversal.
+- Keep slash and reference menu scrolling correct when options use a different
+  offset parent, and keep the slash menu within surrounding dialogs.
+
 ## 0.16.0
 
 - Add `MarkdownLocaleProvider` with package-owned English and Korean common UI

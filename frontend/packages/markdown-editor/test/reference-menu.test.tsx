@@ -264,6 +264,38 @@ describe('markdown @ reference menu', () => {
     expect(screen.queryByText('Old vault')).not.toBeInTheDocument()
   })
 
+  it('keeps the active reference option visible when the scroll container is not its offset parent', async () => {
+    const adapter: MarkdownReferenceAdapter = {
+      search: vi.fn(async () => candidates),
+    }
+    const editor = mountEditor(adapter)
+    await act(async () => editor.commands.insertContent('@'))
+
+    const menu = await screen.findByTestId('markdown-reference-menu')
+    const options = menu.querySelector<HTMLElement>('.markdown-reference-options')!
+    const option = menu.querySelectorAll<HTMLElement>('[role="option"]')[1]!
+    Object.defineProperty(options, 'clientHeight', { configurable: true, value: 100 })
+    Object.defineProperty(options, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(100, 200, 300, 100),
+    })
+    Object.defineProperty(option, 'offsetTop', { configurable: true, value: 1_000 })
+    Object.defineProperty(option, 'offsetHeight', { configurable: true, value: 20 })
+    Object.defineProperty(option, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(120, 270, 80, 20),
+    })
+
+    await act(async () => {
+      dispatchKey(editor, 'ArrowDown')
+      await Promise.resolve()
+    })
+
+    expect(option).toHaveAttribute('aria-selected', 'true')
+    expect(editor.view.dom).toHaveAttribute('aria-activedescendant', option.id)
+    expect(options.scrollTop).toBe(0)
+  })
+
   it('rejects inline, code, link, read-only, and IME triggers and consumes Escape locally', async () => {
     const adapter: MarkdownReferenceAdapter = {
       search: vi.fn(async () => candidates),

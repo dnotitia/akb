@@ -283,6 +283,99 @@ async def test_publisher_fanout_preserves_rows_changed_envelope(monkeypatch):
             ) is True
 
 
+async def _make_named_vault(pool: asyncpg.Pool, name: str) -> uuid.UUID:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
+            name,
+            f"/tmp/{name}.git",
+        )
+
+
+async def test_publisher_suppresses_gardener_bookkeeping_without_xadd(monkeypatch):
+    """sweep_log / gardener_event_log / gardener_kv rows_changed events in a
+    gdn-* vault are marked published WITHOUT an XADD (self-feedback
+    suppression, SKH 2026-09-30: the daemon's own bookkeeping flooded
+    akb:events at ~60%). A user vault's same-named tables still publish."""
+    async with _fresh_database() as (pool, postgres_module):
+        await postgres_module._apply_migrations()
+        gdn_vault_id = await _make_named_vault(pool, "gdn-state")
+        user_vault_id = await _make_named_vault(pool, "user-vault")
+        for vault_name, vault_id in (("gdn-state", gdn_vault_id), ("user-vault", user_vault_id)):
+            for table_name in ("sweep_log", "gardener_event_log", "gardener_kv", "nodes"):
+                pg_name = table_data_repo.pg_table_name(vault_name, table_name)
+                async with pool.acquire() as conn:
+                    await table_data_repo.create_dynamic_table(
+                        conn,
+                        pg_name,
+                        [{"name": "value", "type": "text"}],
+                        vault_name=vault_name,
+                        vault_id=vault_id,
+                        resource_uri=f"akb://{vault_name}/table/{table_name}",
+                    )
+
+        executor = UserSqlExecutor(pool)
+        for vault_name, vault_id in (("gdn-state", gdn_vault_id), ("user-vault", user_vault_id)):
+            for table_name in ("sweep_log", "gardener_event_log", "gardener_kv", "nodes"):
+                pg_name = table_data_repo.pg_table_name(vault_name, table_name)
+                await executor.execute(
+                    user_id="user-id",
+                    actor_id="alice",
+                    sql=f"INSERT INTO {pg_name} (value) VALUES ('one')",
+                    is_admin=True,
+                    vault_names=[vault_name],
+                )
+
+        from app.services import events_publisher
+
+        class _Redis:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[Any, Any]]] = []
+
+            async def xadd(self, stream: str, fields: dict[Any, Any], **_: Any) -> str:
+                self.calls.append((stream, fields))
+                return "1-0"
+
+        redis = _Redis()
+        monkeypatch.setattr(events_publisher.settings, "redis_url", "redis://test")
+        monkeypatch.setattr(events_publisher, "get_pool", lambda: pool)
+        monkeypatch.setattr(events_publisher, "_client", AsyncMock(return_value=redis))
+
+        # 8 rows claimed across two batches of 4; the gdn-state bookkeeping
+        # trio is suppressed, everything else (user-vault trio + both `nodes`)
+        # reaches the stream.
+        total = 0
+        for _ in range(4):
+            total += await events_publisher._process_once()
+        assert total == 8
+        assert len(redis.calls) == 5
+        uris = sorted(call[1][b"resource_uri"].decode() for call in redis.calls)
+        assert uris == [
+            "akb://gdn-state/table/nodes",
+            "akb://user-vault/table/gardener_event_log",
+            "akb://user-vault/table/gardener_kv",
+            "akb://user-vault/table/nodes",
+            "akb://user-vault/table/sweep_log",
+        ]
+
+        async with pool.acquire() as conn:
+            # All eight drained (published), none left pending.
+            assert await conn.fetchval(
+                "SELECT COUNT(*) FROM events WHERE redis_published_at IS NULL",
+            ) == 0
+
+        # A non-rows_changed kind on a suppressed (vault, table) still publishes
+        # (the filter is kind + identity, not identity alone).
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload) "
+                "VALUES ($1, 'document.put', 'akb://gdn-state/table/sweep_log', 'alice', '{}')",
+                gdn_vault_id,
+            )
+        assert await events_publisher._process_once() == 1
+        assert len(redis.calls) == 6
+
+
 async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch):
     redis_url = os.environ.get("AKB_TEST_REDIS_URL")
     if not redis_url:

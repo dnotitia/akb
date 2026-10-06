@@ -212,13 +212,14 @@ const RUNTIME_REFERENCE_ATTRIBUTES = new Set([
   'aria-label',
   'data-markdown-reference-id',
   'data-markdown-reference-kind',
-  'data-markdown-reference-label',
   'data-markdown-reference-resolution',
   'data-markdown-reference-runtime-url',
   'data-markdown-reference-title',
   'data-markdown-reference-value',
   'href',
   'rel',
+  'role',
+  'tabindex',
   'target',
   'title',
 ])
@@ -406,15 +407,34 @@ export const MarkdownReference = Mark.create({
 
   addAttributes() {
     return {
-      kind: { default: 'person' },
-      id: { default: '' },
-      value: { default: '' },
-      escaped: { default: false },
+      kind: {
+        default: 'person',
+        parseHTML: element => element.getAttribute('data-markdown-reference-kind') ?? 'person',
+      },
+      id: {
+        default: '',
+        parseHTML: element => element.getAttribute('data-markdown-reference-id') ?? '',
+      },
+      value: {
+        default: '',
+        parseHTML: element => element.getAttribute('data-markdown-reference-value') ?? '',
+      },
+      escaped: {
+        default: false,
+        parseHTML: element => element.getAttribute('data-markdown-reference-escaped') === 'true',
+      },
     }
   },
 
   parseHTML() {
-    return [{ tag: 'a[data-markdown-reference]' }]
+    return [
+      {
+        tag: 'a[data-markdown-reference]',
+        getAttrs: element =>
+          element.querySelector('[data-markdown-reference-token]') ? false : null,
+      },
+      { tag: 'span[data-markdown-reference-token]' },
+    ]
   },
 
   addMarkView() {
@@ -427,6 +447,10 @@ export const MarkdownReference = Mark.create({
       dom.dataset.markdownReferenceValue = String(HTMLAttributes.value ?? '')
       dom.dataset.markdownReferenceEscaped = String(HTMLAttributes.escaped ?? false)
       token.dataset.markdownReferenceToken = 'true'
+      token.dataset.markdownReferenceKind = String(HTMLAttributes.kind ?? '')
+      token.dataset.markdownReferenceId = String(HTMLAttributes.id ?? '')
+      token.dataset.markdownReferenceValue = String(HTMLAttributes.value ?? '')
+      token.dataset.markdownReferenceEscaped = String(HTMLAttributes.escaped ?? false)
       dom.append(token)
       for (const [name, value] of Object.entries(HTMLAttributes)) {
         if (value === null || value === undefined || value === false) continue
@@ -477,7 +501,19 @@ export const MarkdownReference = Mark.create({
 })
 
 function escapeImageLabel(value: string): string {
-  return value.replace(/([\\\]])/g, '\\$1')
+  return value.replace(/([\\[\]])/g, '\\$1')
+}
+
+function unescapeImageLabel(value: string): string {
+  return value.replace(/\\([\s\S])/g, (escape, character: string) => {
+    const code = character.codePointAt(0) ?? 0
+    const isMarkdownPunctuation =
+      (code >= 0x21 && code <= 0x2f) ||
+      (code >= 0x3a && code <= 0x40) ||
+      (code >= 0x5b && code <= 0x60) ||
+      (code >= 0x7b && code <= 0x7e)
+    return isMarkdownPunctuation ? character : escape
+  })
 }
 
 function imageDestination(target: string): string {
@@ -549,7 +585,7 @@ export const MarkdownImage = Node.create<{ referrerPolicy?: string }>({
   parseMarkdown: (token: MarkdownImageToken, helpers) =>
     helpers.createNode('image', {
       target: token.href ?? '',
-      alt: token.text ?? '',
+      alt: unescapeImageLabel(token.text ?? ''),
       title: token.title ?? null,
     }),
 
@@ -571,6 +607,7 @@ const RUNTIME_LINK_ATTRIBUTES = new Set([
   'data-markdown-resolution',
   'data-markdown-target',
   'href',
+  'tabindex',
   'title',
 ])
 
@@ -580,6 +617,14 @@ const RUNTIME_LINK_ATTRIBUTES = new Set([
  * Markdown continue to own the canonical href.
  */
 const MarkdownLink = Link.extend({
+  parseHTML() {
+    return this.parent?.()?.map(rule =>
+      rule.tag === 'a[href]'
+        ? { ...rule, tag: 'a[href]:not([data-markdown-reference])' }
+        : rule,
+    ) ?? []
+  },
+
   addMarkView() {
     return ({ HTMLAttributes }) => {
       const dom = document.createElement('a')

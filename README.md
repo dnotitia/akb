@@ -591,8 +591,11 @@ Gateway policy or budget denials are never fanned out into per-item retries.
 The PG `events` outbox is always written. Set `redis_url` in `app.yaml` to
 have the `events_publisher` worker drain the outbox to a Redis Stream
 (`akb:events`) so external services can subscribe via `XREAD` / consumer
-groups. Leave blank to disable; events still accumulate in PG and you can
-build an SSE endpoint on top of the LISTEN/NOTIFY trigger without Redis.
+groups. Leave blank to disable Redis fanout; the authenticated
+`GET /api/v1/events/{vault}` SSE tail reads the same PG outbox. Native document
+writes participate in this outbox at the authority transaction boundary.
+See the [change-event contract](docs/operations/change-events.md) for supported
+File/document actions, move identity, retry semantics and consumer recovery.
 
 ### Audit log (optional)
 

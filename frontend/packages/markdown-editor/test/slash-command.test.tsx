@@ -7,6 +7,7 @@ import { createMarkdownExtensions } from '../src/extensions.js'
 import {
   createMarkdownSlashCommandExtension,
   createMarkdownSlashCommandRegistry,
+  ensureMarkdownSlashOptionVisible,
   filterMarkdownSlashCommands,
   getMarkdownSlashMenuBoundary,
   resolveMarkdownSlashMenuPosition,
@@ -221,5 +222,60 @@ describe('markdown slash command menu', () => {
     })
     const clipped = getMarkdownSlashMenuBoundary(root)
     expect(clipped).toMatchObject({ left: 28, right: 312, top: 38, bottom: 262 })
+  })
+
+  it('uses the dialog boundary instead of the nested editor scroller', () => {
+    const dialog = document.createElement('div')
+    dialog.setAttribute('role', 'dialog')
+    dialog.style.overflow = 'hidden'
+    const editorScroller = document.createElement('div')
+    editorScroller.style.overflow = 'auto'
+    const root = document.createElement('div')
+    editorScroller.append(root)
+    dialog.append(editorScroller)
+    document.body.append(dialog)
+    Object.defineProperty(dialog, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(30, 40, 800, 600),
+    })
+    Object.defineProperty(editorScroller, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(100, 120, 400, 120),
+    })
+
+    expect(getMarkdownSlashMenuBoundary(root)).toEqual({
+      left: 38,
+      right: 822,
+      top: 48,
+      bottom: 632,
+    })
+  })
+
+  it('scrolls an active option using its scroll-container coordinates', () => {
+    const listboxId = 'slash-offset-parent-test'
+    const options = document.createElement('div')
+    options.className = 'markdown-slash-command-options'
+    const positionedAncestor = document.createElement('div')
+    positionedAncestor.style.position = 'relative'
+    const option = document.createElement('button')
+    option.id = `${listboxId}-table`
+    positionedAncestor.append(option)
+    options.append(positionedAncestor)
+    document.body.append(options)
+    Object.defineProperty(options, 'clientHeight', { configurable: true, value: 100 })
+    Object.defineProperty(options, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(100, 200, 300, 100),
+    })
+    Object.defineProperty(option, 'offsetTop', { configurable: true, value: 1_000 })
+    Object.defineProperty(option, 'offsetHeight', { configurable: true, value: 20 })
+    Object.defineProperty(option, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => new DOMRect(120, 270, 80, 20),
+    })
+
+    ensureMarkdownSlashOptionVisible(listboxId, 'table')
+
+    expect(options.scrollTop).toBe(0)
   })
 })

@@ -41,8 +41,8 @@ def _database_dsn(name: str) -> str:
     return f"{_DSN.rsplit('/', 1)[0]}/{name}"
 
 
-def _load_migration():
-    spec = importlib.util.spec_from_file_location("native_public_selector_048", _MIGRATION)
+def _load_migration(path: Path = _MIGRATION):
+    spec = importlib.util.spec_from_file_location("native_public_selector_048", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -62,6 +62,7 @@ async def _fresh_database():
         await admin.execute(f'CREATE DATABASE "{name}"')
         conn = await asyncpg.connect(_database_dsn(name))
         await conn.execute(_INIT_SQL)
+        await _load_migration(_MIGRATION.with_name("015_events_outbox.py")).migrate(conn=conn)
         await _load_migration().migrate(conn=conn)
         await conn.close()
         conn = None

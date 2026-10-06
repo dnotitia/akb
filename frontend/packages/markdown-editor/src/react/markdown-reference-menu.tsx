@@ -183,8 +183,10 @@ function ensureMarkdownReferenceOptionVisible(
   const options = option?.closest<HTMLElement>('.markdown-reference-options')
   if (!option || !options) return
 
-  const optionTop = option.offsetTop
-  const optionBottom = optionTop + option.offsetHeight
+  const optionsRect = options.getBoundingClientRect()
+  const optionRect = option.getBoundingClientRect()
+  const optionTop = optionRect.top - optionsRect.top + options.scrollTop
+  const optionBottom = optionRect.bottom - optionsRect.top + options.scrollTop
   if (optionTop < options.scrollTop) options.scrollTop = optionTop
   else if (optionBottom > options.scrollTop + options.clientHeight) {
     options.scrollTop = optionBottom - options.clientHeight
