@@ -372,7 +372,7 @@ describe("Vault Settings redesign", () => {
     expect(
       await screen.findByRole("tab", { name: "Advanced", selected: true }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Archive" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Archive" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Delete vault" })).toBeVisible();
     expect(
       screen.getByText("Search-update status has not been verified."),
