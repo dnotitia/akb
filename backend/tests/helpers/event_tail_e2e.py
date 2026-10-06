@@ -221,7 +221,7 @@ def assert_heartbeat_timing() -> None:
                     busy_windows += 1
         except OSError as exc:  # a starved Tail sends nothing, not even headers, until timeout
             raise AssertionError(
-                f"no heartbeat before the read timeout ({type(exc).__name__}); {timeline()}"
+                f"busy-phase stream failed ({exc!r}); a starved Tail times out here; {timeline()}"
             ) from exc
         stop_writer.set()
         writer.join(timeout=10)
@@ -239,7 +239,9 @@ def assert_heartbeat_timing() -> None:
 
         # A target-Vault write after the comments must still arrive as a normal change.
         write_document(quiet_vault, "Target after heartbeat", "target-after-heartbeat")
+        target_deadline = time.monotonic() + 30
         while True:
+            assert time.monotonic() < target_deadline, "target change did not arrive within 30s"
             frame = read_frame(busy_stream)
             if frame == [": heartbeat"]:
                 continue
