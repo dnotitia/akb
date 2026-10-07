@@ -988,6 +988,38 @@ class KeycloakStandaloneSSOControl:
             await self._mark_linked_accounts(spec, alias, role, token=token)
         await self._brokered_account_guard_readback(spec, token=token)
 
+    async def native_client_registration_disabled(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+    ) -> bool | None:
+        """Ask, anonymously, whether Keycloak still serves its own registration endpoint.
+
+        That endpoint accepts a whole client representation, so a client that
+        registers itself there could choose an authentication flow the realm
+        does not guard. The body is deliberately not JSON: a server that still
+        serves the endpoint refuses to parse it and registers nothing. Returns
+        None when the answer cannot be told apart from another failure.
+        """
+        try:
+            response = await self._client(spec).post(
+                f"/realms/{_path(spec.realm)}/clients-registrations/default",
+                content=b"-",
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError:
+            return None
+        if response.status_code == 404:
+            try:
+                body = response.json()
+            except (TypeError, ValueError):
+                return None
+            if isinstance(body, dict) and body.get("error") == "Client registration provider not found":
+                return True
+            return None
+        if 400 <= response.status_code < 500:
+            return False
+        return None
+
     async def _list_clients(
         self,
         spec: StandaloneSSOBootstrapSpec,

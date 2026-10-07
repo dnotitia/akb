@@ -122,6 +122,7 @@ class _Control:
         self.realm_events = False
         self.brokered_account_guard = False
         self.every_provider_marked = True
+        self.native_client_registration_disabled_state: bool | None = True
         self.events: list[str] = []
         self._readback = _readback()
 
@@ -172,6 +173,9 @@ class _Control:
             raise StandaloneSSOBootstrapError("keycloak_brokered_account_guard_readback_failed")
         if not self.every_provider_marked:
             raise StandaloneSSOBootstrapError("keycloak_identity_provider_guard_mapper_missing")
+
+    async def native_client_registration_disabled(self, _spec):
+        return self.native_client_registration_disabled_state
 
     async def readback(self, spec, *, management_token: str):
         assert management_token == "manager-token"
@@ -1521,3 +1525,38 @@ async def test_v5_install_refuses_to_start_with_an_enabled_provider_that_does_no
 
     assert captured.value.code == "keycloak_identity_provider_guard_mapper_missing"
     assert "apply-brokered-account-guard" not in control.events
+
+
+@pytest.mark.parametrize(
+    ("probe", "reported", "warned"),
+    [(True, "disabled", False), (False, "enabled", True), (None, "unknown", True)],
+)
+async def test_native_client_registration_is_reported_and_never_blocks_startup(probe, reported, warned, caplog):
+    """A Keycloak server setting, not realm state: observed, never a gate.
+
+    A managed tenant's Keycloak is deployed by the platform, which may not carry
+    the setting yet; refusing to start would turn that lag into an outage.
+    """
+    import logging
+
+    from app.services.standalone_sso_bootstrap import bootstrap_standalone_sso
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    control.realm_events = True
+    control.brokered_account_guard = True
+    control.native_client_registration_disabled_state = probe
+    receipts = _ReceiptStore(control.events, _receipt())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.standalone_sso_bootstrap"):
+        report = await bootstrap_standalone_sso(
+            _installed_spec(),
+            control=control,
+            provision_admin=_existing_admin(control),
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert report["mode"] == "readback"
+    assert report["native_client_registration"] == reported
+    assert any("client registration" in record.getMessage() for record in caplog.records) is warned
+

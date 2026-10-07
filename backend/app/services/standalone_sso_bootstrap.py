@@ -298,6 +298,11 @@ class StandaloneSSOControl(Protocol):
         management_token: str,
     ) -> None: ...
 
+    async def native_client_registration_disabled(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+    ) -> bool | None: ...
+
 
 ProvisionAdmin = Callable[..., Awaitable[Mapping[str, object]]]
 LoadRetirementReceipt = Callable[[], Awaitable[StandaloneSSORetirementReceipt | None]]
@@ -660,6 +665,18 @@ async def bootstrap_standalone_sso(
         # keep a brokered account off its password is refused, not reported.
         await control.brokered_account_guard_readback(spec, management_token=permanent_token)
         brokered_account_guard = "converged"
+    # A Keycloak server setting rather than realm state, and on a managed tenant
+    # the platform deploys that server: reported, never a reason to refuse.
+    native_registration = await control.native_client_registration_disabled(spec)
+    native_client_registration = (
+        "disabled" if native_registration is True else ("enabled" if native_registration is False else "unknown")
+    )
+    if native_client_registration != "disabled":
+        logger.warning(
+            "standalone SSO Keycloak native client registration is %s; "
+            "set KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED=false",
+            native_client_registration,
+        )
 
     expected_receipt = _expected_retirement_receipt(
         spec,
@@ -722,6 +739,7 @@ async def bootstrap_standalone_sso(
         "receipt_profile": target_profile,
         "realm_events": realm_events,
         "brokered_account_guard": brokered_account_guard,
+        "native_client_registration": native_client_registration,
         "realm_id": final_readback.realm_id,
         "product_admin_subject": final_readback.product_admin_subject,
         "akb_user_id": user_id,

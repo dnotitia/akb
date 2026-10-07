@@ -59,6 +59,12 @@ spec:
               value: "true"
             - name: KC_METRICS_ENABLED
               value: "true"
+            # Clients that register themselves (MCP) use the OpenID Connect
+            # registration endpoint, which cannot choose an authentication
+            # flow. Keycloak's own endpoint accepts a whole client
+            # representation, flow overrides included, so it is not served.
+            - name: KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED
+              value: "false"
             - name: KC_BOOTSTRAP_ADMIN_CLIENT_ID
               value: akb-bootstrap-temporary
             - name: KC_BOOTSTRAP_ADMIN_CLIENT_SECRET
