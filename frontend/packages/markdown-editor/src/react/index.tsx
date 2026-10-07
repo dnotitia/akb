@@ -1708,7 +1708,7 @@ export function MarkdownEditingSurface({
         normalizeEditorBody(editor)
         if (editorHandle) onMarkdownApplied?.(editorHandle)
       }
-      sourceSession.markApplied()
+      sourceSession.markApplied(editor.getMarkdown())
       sourceSession.leaveSource()
     }
   }
@@ -1747,7 +1747,7 @@ export function MarkdownEditingSurface({
 
   const header = renderHeader ? (
     <div
-      className="sticky top-0 z-10"
+      className="sticky top-0 z-[var(--z-sticky)]"
       onDragOverCapture={mode === 'wysiwyg' ? handleWysiwygDragOverCapture : undefined}
       onDropCapture={mode === 'wysiwyg' ? handleWysiwygDropCapture : undefined}
     >
@@ -1760,7 +1760,7 @@ export function MarkdownEditingSurface({
       />
     </div>
   ) : (
-      <div className="sticky top-0 z-10 flex min-w-0 items-start border-b border-border bg-surface">
+      <div className="sticky top-0 z-[var(--z-sticky)] flex min-w-0 items-center border-b border-border bg-surface">
         {toolbar}
         <div className="ml-auto shrink-0 px-2 py-1.5">
           <div

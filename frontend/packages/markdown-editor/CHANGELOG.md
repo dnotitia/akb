@@ -9,6 +9,8 @@
   WYSIWYG-only controls in Source.
 - Add `sourceContextKey` so products can invalidate deferred Source edits when
   reusing an editor for another document or commit; document the public API.
+- Preserve exact Source spelling and undo history when a controlled host echoes
+  canonical Markdown after switching to WYSIWYG.
 
 ## 0.16.1
 

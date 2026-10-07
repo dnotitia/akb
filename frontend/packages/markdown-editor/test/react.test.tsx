@@ -396,6 +396,61 @@ describe('React surfaces', () => {
     expect(editor.getMarkdown()).not.toBe(markdownBefore)
   })
 
+  it('preserves the Source draft and history when the controlled host echoes canonical Markdown', async () => {
+    const user = userEvent.setup()
+    const initial = '- item'
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const editor = useMarkdownEditor({ initialMarkdown: initial })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <output data-testid="markdown-value">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            onMarkdownApplied={appliedEditor =>
+              setMarkdown(getMarkdownEditor(appliedEditor)?.getMarkdown() ?? '')
+            }
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' })
+    fireEvent.change(source, { target: { value: '* item' } })
+    expect(view.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    const canonicalMarkdown = getMarkdownEditor(activeEditor)!.getMarkdown()
+    expect(canonicalMarkdown).not.toBe('* item')
+    await waitFor(() =>
+      expect(view.getByTestId('markdown-value').textContent).toBe(canonicalMarkdown),
+    )
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue('* item')
+    expect(view.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    await user.click(view.getByRole('button', { name: 'Undo' }))
+    await waitFor(() => expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue(initial))
+    expect(view.getByRole('button', { name: 'Redo' })).toBeEnabled()
+  })
+
   it('edits the same Markdown draft in Source and reflects external values and readOnly', async () => {
     const user = userEvent.setup()
     const sourceChanges = vi.fn()
