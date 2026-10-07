@@ -9,6 +9,16 @@ specifically; the proxy has its own log in
 
 ### Authentication
 
+- The bundled Keycloak realm now keeps seven days of user events: login and
+  broker outcomes, restarts of an expired login, and credential or broker-link
+  changes. New installs record a `bundled-keycloak-v4` receipt with the events
+  on. Existing installs stay on v3 and keep converging read-only; supplying the
+  one-time upgrade client moves a v2 or v3 install to v4. The v4 receipt is a
+  new row, so rolling back to an older image still reads its v3 receipt. The
+  permanent `akb-sso-manager` gains no events authority. The bootstrap report
+  adds `realm_events` (`converged`, `drift`, or `pending_upgrade`); drift is
+  logged and never blocks startup.
+
 - Settings → Security (sign out all sessions, delete account) is always
   available according to `auth_mode`; the `account_self_service_enabled`
   rollout flag is retired. Existing configs that still set the key keep

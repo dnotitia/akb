@@ -20,11 +20,11 @@ The bundle implements the product-administrator bootstrap and recovery slice:
 2. The AKB bootstrap init container creates and reads back the `akb` realm,
    separate `akb-web`, `akb-admin`, and `akb-sso-manager` clients, the
    RSA-3072 active signing key, the signed broker-provenance mapper on
-   `akb-web`, the native product administrator, and the exact AKB administrator
-   projection.
+   `akb-web`, the realm's seven-day user-event settings, the native product
+   administrator, and the exact AKB administrator projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
-   non-secret `bundled-keycloak-v3` retirement receipt in the AKB database.
+   non-secret `bundled-keycloak-v4` retirement receipt in the AKB database.
 4. A subsequent init-container run is read-only and succeeds without either
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
@@ -239,6 +239,27 @@ different callback, including this overlay's in-cluster backend URL. A v3
 receipt needs the same bounded authority when its recorded callback differs
 from the newly configured callback.
 
+`bundled-keycloak-v4` adds the realm's user-event settings. Keycloak keeps
+login, broker, login-restart, and credential or broker-link change events for
+seven days. The exact types are `REALM_EVENT_TYPES` in
+`backend/app/services/standalone_sso_bootstrap.py`. A new install starts on v4.
+The permanent `akb-sso-manager` holds no events authority, by design: a manager
+able to change the settings could also switch the login audit off. An existing
+install therefore cannot reach v4 through its own init container. A v3 receipt
+keeps converging read-only exactly as before and reports
+`receipt_profile=bundled-keycloak-v3` with `realm_events=pending_upgrade`.
+Supplying the one-time authority below to a v2 or v3 installation also applies
+the event settings and moves it to v4 (`mode=upgrade-v2-to-v4` or
+`mode=upgrade-v3-to-v4`). A v1 receipt always goes to v4.
+
+The v4 receipt is a new row; the older row stays exactly as it was. A backend
+image that predates v4 reads only the profiles it knows, so rolling the image
+back still finds its v3 receipt. A callback migration completed after the move
+to v4 updates only the v4 row, so such a rollback needs the one-time authority
+again. On v4 the init container reports `realm_events=converged`, or
+`realm_events=drift` with a warning when the settings were changed afterwards.
+Drift is reported; it is never a reason to refuse startup.
+
 Before rolling this version onto such an installation, create exactly one
 temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
 supported recovery command requires every Keycloak node to be stopped. Follow
@@ -266,15 +287,15 @@ kubectl -n akb rollout status statefulset/keycloak --timeout=300s
 ```
 
 Then deploy the new AKB overlay. Its init container must report
-`mode=upgrade-v1-to-v3`, `mode=upgrade-v2-to-v3`, or
-`mode=upgrade-v3-callback` and
-`receipt_profile=bundled-keycloak-v3`. The lifecycle first validates the exact
+`mode=upgrade-v1-to-v4`, `mode=upgrade-v2-to-v4`, `mode=upgrade-v3-to-v4`, or
+`mode=upgrade-v4-callback` and
+`receipt_profile=bundled-keycloak-v4`. The lifecycle first validates the exact
 receipt-bound source read-back using the permanent manager, reconciles only the
 `akb-web` client metadata and, when required, signed broker-provenance mapper,
-revalidates the complete
-v3 profile through the permanent manager, deletes the temporary upgrade client,
+applies and reads back the realm event settings, revalidates the complete
+profile through the permanent manager, deletes the temporary upgrade client,
 proves both its old and newly requested tokens are rejected, and only then
-writes or compare-and-swaps the v3 receipt. Retrying after a partial client
+writes the v4 receipt (or compare-and-swaps it on a v4 callback change). Retrying after a partial client
 update accepts only the exact receipt source or exact target metadata, so the
 process is convergent without accepting arbitrary drift. It does not require
 or reset the existing product-admin password.
@@ -284,7 +305,7 @@ Delete `akb-keycloak-upgrade` only after that report and a subsequent
 `keycloak_upgrade_credential_required`, do not grant `manage-clients` to
 `akb-sso-manager`; complete this one-time procedure instead. A failed migration
 deliberately leaves the temporary authority available for repair. If deletion
-succeeds but the v3 receipt write does not, use the same official recovery
+succeeds but the receipt write does not, use the same official recovery
 procedure to create the exact upgrade client again before retrying.
 
 ## Retire one-time material

@@ -970,3 +970,181 @@ async def test_api_client_maps_signed_broker_provenance_into_both_token_profiles
     changed["config"] = dict(mapper["config"], **{"access.token.claim": "false"})
     assert KeycloakStandaloneSSOControl._mapper_matches(mapper, mapper) is True  # noqa: SLF001
     assert KeycloakStandaloneSSOControl._mapper_matches(changed, mapper) is False  # noqa: SLF001
+
+
+_EXPECTED_EVENT_TYPES = {
+    "CODE_TO_TOKEN_ERROR",
+    "FEDERATED_IDENTITY_LINK",
+    "IDENTITY_PROVIDER_FIRST_LOGIN",
+    "IDENTITY_PROVIDER_LOGIN",
+    "IDENTITY_PROVIDER_LOGIN_ERROR",
+    "LOGIN",
+    "LOGIN_ERROR",
+    "LOGOUT",
+    "REMOVE_CREDENTIAL",
+    "REMOVE_FEDERATED_IDENTITY",
+    "RESTART_AUTHENTICATION",
+    "UPDATE_CREDENTIAL",
+    "UPDATE_CREDENTIAL_ERROR",
+    "UPDATE_PASSWORD",
+    "UPDATE_PASSWORD_ERROR",
+}
+
+
+def _converged_realm(**overrides):
+    from app.services.standalone_sso_bootstrap import (
+        REALM_EVENT_TYPES,
+        REALM_EVENTS_EXPIRATION_SECONDS,
+    )
+
+    realm = {
+        "id": "akb-realm-id",
+        "realm": "akb",
+        "eventsEnabled": True,
+        "eventsExpiration": REALM_EVENTS_EXPIRATION_SECONDS,
+        "enabledEventTypes": list(reversed(REALM_EVENT_TYPES)),
+        "eventsListeners": ["jboss-logging"],
+        "adminEventsEnabled": True,
+        "adminEventsDetailsEnabled": False,
+    }
+    realm.update(overrides)
+    return realm
+
+
+async def test_realm_event_contract_is_seven_days_of_authentication_events():
+    from app.services.standalone_sso_bootstrap import (
+        REALM_EVENT_TYPES,
+        REALM_EVENTS_EXPIRATION_SECONDS,
+    )
+
+    assert REALM_EVENTS_EXPIRATION_SECONDS == 7 * 24 * 60 * 60
+    assert REALM_EVENT_TYPES == tuple(sorted(REALM_EVENT_TYPES))
+    assert set(REALM_EVENT_TYPES) == _EXPECTED_EVENT_TYPES
+
+
+async def test_realm_events_apply_uses_events_config_and_reads_it_back():
+    from app.services.standalone_sso_bootstrap import (
+        REALM_EVENT_TYPES,
+        REALM_EVENTS_EXPIRATION_SECONDS,
+    )
+
+    realm = _converged_realm(eventsEnabled=False, eventsExpiration=None, enabledEventTypes=[])
+    seen: list[tuple[str, str, object, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers["authorization"]
+        if request.method == "PUT" and request.url.path == "/admin/realms/akb/events/config":
+            body = json.loads(request.content)
+            seen.append(("PUT", request.url.path, body, auth))
+            realm.update(body)
+            return httpx.Response(204)
+        if request.method == "GET" and request.url.path == "/admin/realms/akb":
+            seen.append(("GET", request.url.path, None, auth))
+            return httpx.Response(200, json=realm)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        await control.apply_realm_events(spec, token="one-time-token")
+    finally:
+        await control.aclose()
+
+    assert [(method, path) for method, path, _body, _auth in seen] == [
+        ("PUT", "/admin/realms/akb/events/config"),
+        ("GET", "/admin/realms/akb"),
+    ]
+    # Only the three owned settings travel. Listeners and the admin-event
+    # settings are absent, which Keycloak's events/config update leaves as is.
+    assert seen[0][2] == {
+        "eventsEnabled": True,
+        "eventsExpiration": REALM_EVENTS_EXPIRATION_SECONDS,
+        "enabledEventTypes": list(REALM_EVENT_TYPES),
+    }
+    assert {auth for *_rest, auth in seen} == {"Bearer one-time-token"}
+    assert realm["eventsListeners"] == ["jboss-logging"]
+    assert realm["adminEventsDetailsEnabled"] is False
+
+
+async def test_realm_events_apply_fails_closed_when_keycloak_does_not_keep_them():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(204)
+        return httpx.Response(200, json=_converged_realm(eventsEnabled=False))
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control.apply_realm_events(spec, token="one-time-token")
+    finally:
+        await control.aclose()
+
+    assert captured.value.code == "keycloak_realm_events_readback_failed"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "converged"),
+    [
+        ({}, True),
+        ({"eventsEnabled": False}, False),
+        ({"eventsExpiration": None}, False),
+        ({"eventsExpiration": 3600}, False),
+        ({"enabledEventTypes": ["LOGIN"]}, False),
+        ({"enabledEventTypes": [*sorted(_EXPECTED_EVENT_TYPES), "CLIENT_LOGIN"]}, False),
+        ({"enabledEventTypes": None}, False),
+    ],
+)
+async def test_realm_events_readback_is_exact_and_order_insensitive(overrides, converged):
+    realm = _converged_realm(**overrides)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/admin/realms/akb"
+        assert request.headers["authorization"] == "Bearer manager-token"
+        return httpx.Response(200, json=realm)
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        assert await control.realm_events_converged(spec, management_token="manager-token") is converged
+    finally:
+        await control.aclose()
+
+
+async def test_fresh_reconcile_turns_realm_events_on_with_the_bootstrap_authority(monkeypatch):
+    control = KeycloakStandaloneSSOControl()
+    spec = _spec()
+    calls: list[tuple[str, object]] = []
+
+    async def _reconcile_realm(_spec, *, token):
+        calls.append(("realm", token))
+        return {"id": "akb-realm-id"}
+
+    async def _apply_realm_events(_spec, *, token):
+        calls.append(("events", token))
+
+    async def _step(name):
+        async def _record(*_args, token, **_kwargs):
+            calls.append((name, token))
+            return {"id": f"{name}-uuid"}
+
+        return _record
+
+    monkeypatch.setattr(control, "_reconcile_realm", _reconcile_realm)
+    monkeypatch.setattr(control, "apply_realm_events", _apply_realm_events)
+    for name in (
+        "_reconcile_signing_key",
+        "_reconcile_native_amr",
+        "_reconcile_client",
+        "_reconcile_mapper",
+        "_reconcile_management_roles",
+        "_reconcile_product_admin",
+    ):
+        monkeypatch.setattr(control, name, await _step(name))
+
+    async def _readback(_spec, *, management_token):
+        calls.append(("readback", management_token))
+        return "readback"
+
+    monkeypatch.setattr(control, "readback", _readback)
+
+    assert await control.reconcile(spec, bootstrap_token="bootstrap-token") == "readback"
+    assert calls[:2] == [("realm", "bootstrap-token"), ("events", "bootstrap-token")]

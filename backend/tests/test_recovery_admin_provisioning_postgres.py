@@ -1610,6 +1610,60 @@ async def test_sso_bootstrap_retirement_receipt_migrates_and_is_monotonic(
         assert await conn.fetchval("SELECT COUNT(*) FROM standalone_sso_bootstrap_retirements") == 1
 
 
+async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
+    services,
+    monkeypatch,
+):
+    """A v4 receipt joins the v3 row instead of replacing it.
+
+    An image that predates v4 asks only for the profiles it knows, so the v3 row
+    must still be there, unchanged, after the realm-settings upgrade.
+    """
+    pool, _, _, _, _, _ = services
+    from app.services import standalone_sso_receipt as receipt_service
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE,
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        StandaloneSSORetirementReceipt,
+    )
+
+    async def _get_pool():
+        return pool
+
+    monkeypatch.setattr(receipt_service, "get_pool", _get_pool)
+    v3 = StandaloneSSORetirementReceipt(
+        profile=STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        issuer="https://auth.akb.example.com/realms/akb",
+        realm_id="akb-realm-id",
+        bootstrap_client_id="akb-bootstrap-temporary",
+        management_client_uuid="management-client-uuid",
+        admin_client_uuid="admin-client-uuid",
+        api_client_uuid="api-client-uuid",
+        product_admin_subject="00000000-0000-4000-8000-000000000001",
+        akb_user_id="11111111-1111-4111-8111-111111111111",
+        backchannel_logout_uri=("https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"),
+    )
+    v4 = replace(
+        v3,
+        profile=STANDALONE_SSO_RECEIPT_PROFILE,
+        bootstrap_client_id="akb-bootstrap-upgrade-v2",
+    )
+
+    await receipt_service.record_standalone_sso_retirement_receipt(v3)
+    await receipt_service.record_standalone_sso_retirement_receipt(v4)
+    await receipt_service.record_standalone_sso_retirement_receipt(v4)
+
+    assert await receipt_service.load_standalone_sso_retirement_receipt() == v4
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT profile, bootstrap_client_id FROM standalone_sso_bootstrap_retirements ORDER BY profile"
+        )
+    assert [(row["profile"], row["bootstrap_client_id"]) for row in rows] == [
+        ("bundled-keycloak-v3", "akb-bootstrap-temporary"),
+        ("bundled-keycloak-v4", "akb-bootstrap-upgrade-v2"),
+    ]
+
+
 async def test_credential_issue_replaces_the_credential_the_account_already_had(
     services,
     monkeypatch,

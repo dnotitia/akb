@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+import logging
 import re
 from typing import Protocol
 
@@ -29,13 +30,48 @@ MANAGEMENT_REALM_ROLES = (
 )
 STANDALONE_SSO_RECEIPT_PROFILE_V1 = "bundled-keycloak-v1"
 STANDALONE_SSO_RECEIPT_PROFILE_V2 = "bundled-keycloak-v2"
-STANDALONE_SSO_RECEIPT_PROFILE = "bundled-keycloak-v3"
+STANDALONE_SSO_RECEIPT_PROFILE_V3 = "bundled-keycloak-v3"
+# v4 adds the realm's authentication-event settings (REALM_EVENT_TYPES, kept for
+# REALM_EVENTS_EXPIRATION_SECONDS). The permanent manager cannot change them, so
+# an existing install reaches v4 only through one-time upgrade authority and
+# keeps converging read-only on v3 until an operator supplies it.
+STANDALONE_SSO_RECEIPT_PROFILE = "bundled-keycloak-v4"
 STANDALONE_SSO_RECEIPT_PROFILES = (
     STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V3,
     STANDALONE_SSO_RECEIPT_PROFILE_V2,
     STANDALONE_SSO_RECEIPT_PROFILE_V1,
 )
+# Profiles whose receipt records the exact back-channel callback.
+STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES = (
+    STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V3,
+)
+# Keycloak user events the realm keeps, and for how long. Login outcomes,
+# broker outcomes, restarts of an expired login, and every change to a
+# credential or a broker link: enough to reconstruct a failed sign-in and to
+# notice a password appearing on a brokered account, without per-refresh noise.
+REALM_EVENTS_EXPIRATION_SECONDS = 7 * 24 * 60 * 60
+REALM_EVENT_TYPES = (
+    "CODE_TO_TOKEN_ERROR",
+    "FEDERATED_IDENTITY_LINK",
+    "IDENTITY_PROVIDER_FIRST_LOGIN",
+    "IDENTITY_PROVIDER_LOGIN",
+    "IDENTITY_PROVIDER_LOGIN_ERROR",
+    "LOGIN",
+    "LOGIN_ERROR",
+    "LOGOUT",
+    "REMOVE_CREDENTIAL",
+    "REMOVE_FEDERATED_IDENTITY",
+    "RESTART_AUTHENTICATION",
+    "UPDATE_CREDENTIAL",
+    "UPDATE_CREDENTIAL_ERROR",
+    "UPDATE_PASSWORD",
+    "UPDATE_PASSWORD_ERROR",
+)
 _BOOTSTRAP_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
+
+logger = logging.getLogger(__name__)
 
 
 class StandaloneSSOBootstrapError(RuntimeError):
@@ -222,6 +258,20 @@ class StandaloneSSOControl(Protocol):
         upgrade_token: str,
     ) -> None: ...
 
+    async def apply_realm_events(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> None: ...
+
+    async def realm_events_converged(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> bool: ...
+
 
 ProvisionAdmin = Callable[..., Awaitable[Mapping[str, object]]]
 LoadRetirementReceipt = Callable[[], Awaitable[StandaloneSSORetirementReceipt | None]]
@@ -295,7 +345,9 @@ def _expected_retirement_receipt(
         backchannel_logout_uri=(
             backchannel_logout_uri
             if backchannel_logout_uri is not None
-            else (spec.backchannel_logout_uri_effective if profile == STANDALONE_SSO_RECEIPT_PROFILE else None)
+            else (
+                spec.backchannel_logout_uri_effective if profile in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES else None
+            )
         ),
     )
 
@@ -311,7 +363,7 @@ def _validate_receipt_static_binding(
             spec.bootstrap_client_id,
             spec.upgrade_client_id,
         }
-    elif receipt.profile == STANDALONE_SSO_RECEIPT_PROFILE:
+    elif receipt.profile in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES:
         expected_client_ids = {
             spec.bootstrap_client_id,
             spec.upgrade_client_id,
@@ -370,7 +422,7 @@ async def bootstrap_standalone_sso(
         legacy_v2 and spec.backchannel_logout_uri_effective != spec.legacy_backchannel_logout_uri
     )
     source_callback_uri: str | None = None
-    if source_profile == STANDALONE_SSO_RECEIPT_PROFILE:
+    if source_profile in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES:
         assert retirement_receipt is not None
         assert retirement_receipt.backchannel_logout_uri is not None
         source_callback_uri = retirement_receipt.backchannel_logout_uri
@@ -386,6 +438,14 @@ async def bootstrap_standalone_sso(
     )
     if management_token is None and bootstrap_token is None and upgrade_token is None:
         raise StandaloneSSOBootstrapError("keycloak_install_credential_unavailable")
+    # A receipt below the current profile moves up only while the operator's
+    # one-time upgrade authority is present. Without it the install converges
+    # exactly as it did before the profile existed.
+    settings_upgrade = (
+        retirement_receipt is not None
+        and source_profile != STANDALONE_SSO_RECEIPT_PROFILE
+        and upgrade_token is not None
+    )
 
     if retirement_receipt is None:
         if bootstrap_token is None:
@@ -416,12 +476,10 @@ async def bootstrap_standalone_sso(
             raise StandaloneSSOBootstrapError("keycloak_management_credential_unavailable")
         if legacy_mutation_required and upgrade_token is None:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_credential_required")
-        if not legacy_mutation_required and upgrade_token is not None:
-            raise StandaloneSSOBootstrapError("keycloak_upgrade_client_unexpected")
         mode = (
-            "upgrade-v1-to-v3"
+            "upgrade-v1-to-v4"
             if legacy_v1
-            else ("upgrade-v2-to-v3" if legacy_mutation_required else "upgrade-v2-to-v3-readback")
+            else ("upgrade-v2-to-v4" if settings_upgrade else "upgrade-v2-to-v3-readback")
         )
         keycloak_mutated = False
         readback = await (
@@ -443,7 +501,7 @@ async def bootstrap_standalone_sso(
         if upgrade_token is None:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_credential_required")
         assert source_callback_uri is not None
-        mode = "upgrade-v3-callback"
+        mode = "upgrade-v3-to-v4" if settings_upgrade else "upgrade-v4-callback"
         keycloak_mutated = False
         readback = await control.readback_callback_migration(
             spec,
@@ -453,9 +511,9 @@ async def bootstrap_standalone_sso(
     else:
         if bootstrap_token is not None:
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_client_reactivated")
-        if upgrade_token is not None:
+        if upgrade_token is not None and not settings_upgrade:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_client_reactivated")
-        mode = "readback"
+        mode = "upgrade-v3-to-v4" if settings_upgrade else "readback"
         if management_token is None:
             raise StandaloneSSOBootstrapError("keycloak_management_credential_unavailable")
         keycloak_mutated = False
@@ -473,7 +531,7 @@ async def bootstrap_standalone_sso(
     )
     user_id = _validate_projection(projection)
 
-    if legacy_profile or callback_migration_required:
+    if legacy_profile or callback_migration_required or settings_upgrade:
         assert retirement_receipt is not None
         expected_source_receipt = _expected_retirement_receipt(
             spec,
@@ -509,6 +567,10 @@ async def bootstrap_standalone_sso(
                 raise StandaloneSSOBootstrapError("keycloak_upgrade_readback_changed")
             readback = upgraded_readback
             keycloak_mutated = True
+    if settings_upgrade:
+        assert upgrade_token is not None
+        await control.apply_realm_events(spec, token=upgrade_token)
+        keycloak_mutated = True
 
     # Re-authenticate through the permanent path after projection.  A client
     # merely present in a prior read-back is not yet a proven recovery path.
@@ -523,13 +585,37 @@ async def bootstrap_standalone_sso(
     if final_readback != readback:
         raise StandaloneSSOBootstrapError("keycloak_readback_changed")
 
+    if retirement_receipt is None or settings_upgrade:
+        target_profile = STANDALONE_SSO_RECEIPT_PROFILE
+    elif legacy_profile:
+        target_profile = STANDALONE_SSO_RECEIPT_PROFILE_V3
+    else:
+        assert source_profile is not None
+        target_profile = source_profile
+    if target_profile != STANDALONE_SSO_RECEIPT_PROFILE:
+        realm_events = "pending_upgrade"
+    elif await control.realm_events_converged(spec, management_token=permanent_token):
+        realm_events = "converged"
+    else:
+        # Observation, not a gate: refusing to start because someone switched
+        # the login audit off would turn a console edit into an outage.
+        realm_events = "drift"
+    if realm_events == "drift":
+        logger.warning("standalone SSO realm events drifted from receipt profile %s", target_profile)
+    elif realm_events == "pending_upgrade":
+        logger.info(
+            "standalone SSO realm events need one-time upgrade authority (receipt profile %s)",
+            target_profile,
+        )
+
     expected_receipt = _expected_retirement_receipt(
         spec,
         final_readback,
         akb_user_id=user_id,
+        profile=target_profile,
         retired_client_id=(
             spec.upgrade_client_id
-            if mutation_upgrade_required
+            if mutation_upgrade_required or settings_upgrade
             else (
                 retirement_receipt.bootstrap_client_id if retirement_receipt is not None else spec.bootstrap_client_id
             )
@@ -549,8 +635,9 @@ async def bootstrap_standalone_sso(
         await record_retirement_receipt(expected_receipt)
         if await load_retirement_receipt() != expected_receipt:
             raise StandaloneSSOBootstrapError("keycloak_bootstrap_retirement_receipt_write_failed")
-    elif mutation_upgrade_required:
+    elif mutation_upgrade_required or settings_upgrade:
         assert upgrade_token is not None
+        assert retirement_receipt is not None
         await control.retire_upgrade(
             spec,
             upgrade_token=upgrade_token,
@@ -559,9 +646,11 @@ async def bootstrap_standalone_sso(
             spec,
             upgrade_token=upgrade_token,
         )
+        # Same profile: compare-and-swap the one row. A newer profile: insert
+        # its own row and leave the older receipt for a rollback to read.
         await record_retirement_receipt(
             expected_receipt,
-            previous_receipt=(retirement_receipt if callback_migration_required else None),
+            previous_receipt=(retirement_receipt if retirement_receipt.profile == expected_receipt.profile else None),
         )
         if await load_retirement_receipt() != expected_receipt:
             raise StandaloneSSOBootstrapError("keycloak_upgrade_retirement_receipt_write_failed")
@@ -577,7 +666,8 @@ async def bootstrap_standalone_sso(
         "mode": mode,
         "keycloak_mutated": keycloak_mutated,
         "bootstrap_admin_retired": True,
-        "receipt_profile": STANDALONE_SSO_RECEIPT_PROFILE,
+        "receipt_profile": target_profile,
+        "realm_events": realm_events,
         "realm_id": final_readback.realm_id,
         "product_admin_subject": final_readback.product_admin_subject,
         "akb_user_id": user_id,

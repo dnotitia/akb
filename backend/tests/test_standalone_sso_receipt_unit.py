@@ -16,6 +16,7 @@ def _receipt(
     backchannel_logout_uri: str | None = None,
 ):
     from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES,
         STANDALONE_SSO_RECEIPT_PROFILE,
         StandaloneSSORetirementReceipt,
     )
@@ -36,7 +37,7 @@ def _receipt(
             if backchannel_logout_uri is not None
             else (
                 "https://akb.example.com/api/v1/auth/keycloak/backchannel-logout"
-                if selected_profile == STANDALONE_SSO_RECEIPT_PROFILE
+                if selected_profile in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES
                 else None
             )
         ),
@@ -171,16 +172,18 @@ async def test_current_callback_receipt_replacement_is_an_exact_compare_and_swap
     assert conn.writes == 2
 
 
-async def test_loader_prefers_current_v3_then_v2_then_v1(monkeypatch):
+async def test_loader_prefers_current_v4_then_v3_then_v2_then_v1(monkeypatch):
     from app.services import standalone_sso_receipt as service
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V1,
         STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
     )
 
     conn = _Connection()
     legacy = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V1)
     v2 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2)
+    v3 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V3)
     current = _receipt()
 
     def _row(receipt):
@@ -197,14 +200,18 @@ async def test_loader_prefers_current_v3_then_v2_then_v1(monkeypatch):
             "backchannel_logout_uri": receipt.backchannel_logout_uri,
         }
 
-    for receipt in (legacy, v2, current):
+    for receipt in (legacy, v2, v3, current):
         conn.rows[receipt.profile] = _row(receipt)
 
     async def _get_pool():
         return _Pool(conn)
 
     monkeypatch.setattr(service, "get_pool", _get_pool)
+    assert await service.load_standalone_sso_retirement_receipt() == current
     del conn.rows[current.profile]
+    assert await service.load_standalone_sso_retirement_receipt() == v3
+
+    del conn.rows[v3.profile]
     assert await service.load_standalone_sso_retirement_receipt() == v2
 
     del conn.rows[v2.profile]
@@ -212,6 +219,48 @@ async def test_loader_prefers_current_v3_then_v2_then_v1(monkeypatch):
 
     conn.rows[current.profile] = _row(current)
     assert await service.load_standalone_sso_retirement_receipt() == current
+
+
+async def test_v4_receipt_is_added_beside_v3_so_an_older_image_still_reads_v3(monkeypatch):
+    """A realm-settings upgrade must stay rollback-safe.
+
+    An image that predates v4 walks only the profiles it knows. Writing v4 as a
+    new row, instead of rewriting the v3 row, leaves that image an exact v3
+    receipt to read back on a rollback.
+    """
+    from app.services import standalone_sso_receipt as service
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
+    )
+
+    conn = _Connection()
+
+    async def _get_pool():
+        return _Pool(conn)
+
+    monkeypatch.setattr(service, "get_pool", _get_pool)
+    v3 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V3)
+    v4 = replace(_receipt(), bootstrap_client_id="akb-bootstrap-upgrade-v2")
+
+    await service.record_standalone_sso_retirement_receipt(v3)
+    await service.record_standalone_sso_retirement_receipt(v4)
+
+    assert await service.load_standalone_sso_retirement_receipt() == v4
+    assert conn.writes == 2
+    pre_v4_profiles = (
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+    )
+    older_image_view = None
+    for profile in pre_v4_profiles:
+        older_image_view = await conn.fetchrow("FROM standalone_sso_bootstrap_retirements", profile)
+        if older_image_view is not None:
+            break
+    assert older_image_view is not None
+    assert service._from_row(older_image_view) == v3  # noqa: SLF001
 
 
 async def test_receipt_schema_is_present_for_fresh_and_upgraded_databases():
