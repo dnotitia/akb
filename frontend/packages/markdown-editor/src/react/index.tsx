@@ -107,6 +107,7 @@ import {
   getMarkdownSourceSession,
   getOrCreateMarkdownSourceSession,
 } from './markdown-source.js'
+import type { MarkdownSourceSyncResult } from './markdown-source.js'
 import type {
   MarkdownAdapters,
   MarkdownEditingCommands,
@@ -1548,6 +1549,10 @@ export function MarkdownEditingSurface({
   const sourceState = useMarkdownSourceState(sourceSession)
   const mode = sourceState.mode
   const lastMarkdownRef = useRef(markdown)
+  const sourceSyncResultRef = useRef<{
+    markdown: string
+    result: MarkdownSourceSyncResult
+  } | null>(null)
   const previousSourceSessionRef = useRef(sourceSession)
   const previousModeRef = useRef(mode)
   const resetMarkdownRef = useRef(markdown)
@@ -1605,7 +1610,10 @@ export function MarkdownEditingSurface({
   }, [sourceContextKey, sourceSession])
 
   useLayoutEffect(() => {
-    sourceSession?.syncExternalValue(markdown)
+    sourceSyncResultRef.current = {
+      markdown,
+      result: sourceSession?.syncExternalValue(markdown) ?? 'unchanged',
+    }
   }, [markdown, sourceSession])
 
   useLayoutEffect(() => {
@@ -1650,6 +1658,12 @@ export function MarkdownEditingSurface({
     const externalValueChanged = markdown !== lastMarkdownRef.current
     lastMarkdownRef.current = markdown
     if (!editor || (mode === 'source' && sourceSession?.hasPendingChanges)) return
+    const sourceSyncResult = sourceSyncResultRef.current
+    if (
+      externalValueChanged &&
+      sourceSyncResult?.markdown === markdown &&
+      sourceSyncResult.result === 'applied-echo'
+    ) return
 
     if (externalValueChanged && serializeEditorMarkdown(editor, { profile }) !== markdown) {
       editor.commands.setContent(markdown, {
@@ -1697,10 +1711,9 @@ export function MarkdownEditingSurface({
       sourceSession.enterSource(serializeEditorMarkdown(editor, { profile }))
     } else {
       const sourceMarkdown = sourceSession.getSnapshot().markdown
-      if (
-        sourceSession.hasPendingChanges &&
+      const applySource = sourceSession.hasPendingChanges &&
         serializeEditorMarkdown(editor, { profile }) !== sourceMarkdown
-      ) {
+      if (applySource) {
         editor.commands.setContent(sourceMarkdown, {
           contentType: 'markdown',
           emitUpdate: false,
@@ -1711,6 +1724,7 @@ export function MarkdownEditingSurface({
       sourceSession.markApplied(
         serializeEditorMarkdown(editor, { profile }),
         editor.getMarkdown(),
+        applySource && editorHandle !== null && onMarkdownApplied !== undefined,
       )
       sourceSession.leaveSource()
     }

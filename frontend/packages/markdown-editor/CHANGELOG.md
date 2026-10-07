@@ -11,7 +11,8 @@
   reusing an editor for another document or commit; document the public API.
 - Preserve exact Source spelling and undo history when a controlled host echoes
   canonical Markdown after switching to WYSIWYG.
-- Rebase Source on visual edits made before the controlled Markdown value echoes.
+- Rebase Source on visual edits made before controlled Markdown echoes, including
+  delayed echoes from an earlier Source apply.
 
 ## 0.16.1
 

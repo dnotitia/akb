@@ -13,6 +13,7 @@ interface HistoryEntry {
 }
 
 type SourceChangeHandler = (markdown: string, editor: MarkdownEditorHandle) => void
+export type MarkdownSourceSyncResult = 'unchanged' | 'applied-echo' | 'draft-preserved' | 'external-value'
 
 const EMPTY_SELECTION: MarkdownSourceSelection = {
   start: 0,
@@ -97,6 +98,7 @@ export class MarkdownSourceSession {
   private lastAppliedSource: string | null = null
   private lastAppliedWysiwygMarkdown: string | null = null
   private lastAppliedEditorMarkdown: string | null = null
+  private pendingAppliedEchoes: Array<readonly [string, string]> = []
   private lastInputType = ''
   private lastInputAt = 0
   private changeHandler?: SourceChangeHandler
@@ -169,6 +171,7 @@ export class MarkdownSourceSession {
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
     this.lastAppliedEditorMarkdown = null
+    this.pendingAppliedEchoes.splice(0)
     this.changeHandler = undefined
     this.inputElement = null
     this.focusRequested = false
@@ -186,6 +189,7 @@ export class MarkdownSourceSession {
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
     this.lastAppliedEditorMarkdown = null
+    this.pendingAppliedEchoes.splice(0)
     this.revision += 1
     this.session += 1
     this.history.splice(0, this.history.length, { markdown, selection: this.selection })
@@ -204,6 +208,7 @@ export class MarkdownSourceSession {
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
     this.lastAppliedEditorMarkdown = null
+    this.pendingAppliedEchoes.splice(0)
     this.history.splice(0, this.history.length, { markdown: this.markdown, selection: this.selection })
     this.historyIndex = 0
     this.lastInputType = ''
@@ -211,20 +216,29 @@ export class MarkdownSourceSession {
     this.publish()
   }
 
-  syncExternalValue(markdown: string): boolean {
-    if (markdown === this.markdown) return false
+  syncExternalValue(markdown: string): MarkdownSourceSyncResult {
+    if (markdown === this.markdown) {
+      return this.consumePendingAppliedEcho(markdown) ? 'applied-echo' : 'unchanged'
+    }
+    if (this.consumePendingAppliedEcho(markdown)) {
+      if (
+        this.mode === 'source' &&
+        (this.lastAppliedSource === null || this.lastAppliedSource !== this.markdown)
+      ) this.changeHandler?.(this.markdown, this.handle)
+      return 'applied-echo'
+    }
     if (
       this.mode === 'wysiwyg' &&
       this.lastAppliedSource !== null &&
       this.lastAppliedSource === this.markdown &&
       (this.lastAppliedWysiwygMarkdown === markdown ||
         this.lastAppliedEditorMarkdown === markdown)
-    ) return false
+    ) return 'applied-echo'
     if (this.mode === 'source' && (this.dirty || this.composing)) {
       this.revision += 1
       this.session += 1
       this.publish()
-      return false
+      return 'draft-preserved'
     }
 
     this.markdown = markdown
@@ -239,7 +253,7 @@ export class MarkdownSourceSession {
     this.lastInputType = ''
     this.lastInputAt = 0
     this.publish()
-    return true
+    return 'external-value'
   }
 
   enterSource(markdown: string): void {
@@ -266,11 +280,18 @@ export class MarkdownSourceSession {
     this.publish()
   }
 
-  markApplied(wysiwygMarkdown: string, editorMarkdown: string): void {
+  markApplied(
+    wysiwygMarkdown: string,
+    editorMarkdown: string,
+    expectHostEcho: boolean,
+  ): void {
     this.dirty = false
     this.lastAppliedSource = this.markdown
     this.lastAppliedWysiwygMarkdown = wysiwygMarkdown
     this.lastAppliedEditorMarkdown = editorMarkdown
+    if (expectHostEcho) {
+      this.pendingAppliedEchoes.push([wysiwygMarkdown, editorMarkdown])
+    }
   }
 
   setSelection(selection: MarkdownSourceSelection): void {
@@ -403,6 +424,13 @@ export class MarkdownSourceSession {
     this.historyIndex = 0
     this.lastInputType = ''
     this.lastInputAt = 0
+  }
+
+  private consumePendingAppliedEcho(markdown: string): boolean {
+    const index = this.pendingAppliedEchoes.findIndex(echo => echo.includes(markdown))
+    if (index === -1) return false
+    this.pendingAppliedEchoes.splice(index, 1)
+    return true
   }
 
   private pushHistory(
