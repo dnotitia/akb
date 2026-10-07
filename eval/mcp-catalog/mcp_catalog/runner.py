@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import math
 import os
 import platform
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -49,14 +51,20 @@ from .execution import (
     TrialExecutor,
     TrialOutcome,
     build_model,
+    canonicalize_arguments,
+    decode_raw_args,
     evaluate_dataset,
     execute_smoke,
+    has_measured_evidence,
+    provider_response_cost,
+    provider_token_totals,
     summarize_outcomes,
     summarize_outcomes_by_locale,
+    validate_routing_evidence,
     validate_model_configuration,
     worst_case_cost,
 )
-from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
+from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
 from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
 
@@ -882,7 +890,7 @@ class BenchmarkRunner:
             "breakdown": {"other": end_to_end_wall_seconds},
         }
         artifact: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "incomplete" if failure is not None or incomplete_reasons else "complete",
             "incomplete_reasons": sorted(incomplete_reasons),
             "completed_trials": completed_trials,
@@ -894,15 +902,7 @@ class BenchmarkRunner:
                 {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
                 for task in self.tasks
             ],
-            "task_contracts": [
-                {
-                    "id": task.id,
-                    "suite": task.suite,
-                    "capability_families": sorted(task.capability_families),
-                    "risk_hypotheses": sorted(task.risk_hypotheses),
-                }
-                for task in self.tasks
-            ],
+            "task_contracts": [task.model_dump(mode="json") for task in self.tasks],
             "paired_order_plan": [
                 {
                     "task_id": task.id,
@@ -921,6 +921,7 @@ class BenchmarkRunner:
             "protocol_revision": self.manifest.protocol_revision,
             "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             "artifact_versions": artifact_versions,
+            "execution_environment": self.pre_smoke_seal_inputs.get("environment"),
             "fixture": fixture_evidence,
             "runtime": safe_runtime,
             "manifest": self.manifest.model_dump(mode="json"),
@@ -2071,6 +2072,485 @@ def _all_run_outcomes(runs: dict[str, Any]) -> list[TrialOutcome]:
     ]
 
 
+_DERIVED_TRIAL_FIELDS = (
+    "cluster_id",
+    "state_before",
+    "state_after",
+    "state_observations_before",
+    "state_observations_after",
+    "state_available_before",
+    "state_available_after",
+    "state_contract_passed",
+    "state_checks",
+    "response_rubric_passed",
+    "first_action_accuracy",
+    "first_material_operation",
+    "first_material_action_accuracy",
+    "preparatory_call_count",
+    "discouraged_preflight_calls",
+    "material_call_count",
+    "argument_validity",
+    "required_operations_completed",
+    "required_attempts_completed",
+    "tool_outcome_match",
+    "expected_error_match",
+    "user_outcome_completed",
+    "protocol_handshake_valid",
+    "clarification_accuracy",
+    "stopping_accuracy",
+    "target_payload_accuracy",
+    "multi_step_ordering",
+    "result_binding_accuracy",
+    "accepted_behavior_matched",
+    "accepted_behavior_ids",
+    "nonexistent_tool_attempts",
+    "wrong_capability_calls",
+    "wrong_resource_calls",
+    "wrong_target_calls",
+    "fabricated_resource_claims",
+    "unsupported_success_claims",
+    "post_completion_overshoot",
+    "semantic_reasons",
+    "trial_error",
+    "trial_error_kinds",
+    "forbidden_mutation_attempts",
+    "unsafe_mutation",
+    "success",
+    "safety",
+)
+
+
+def _state_observations(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    *,
+    before: bool,
+) -> list[StateObservation]:
+    label = "before" if before else "after"
+    raw_items = outcome.state_observations_before if before else outcome.state_observations_after
+    expectations = task.expected_final_state.observation_sets
+    if not isinstance(raw_items, list) or len(raw_items) != len(expectations):
+        raise ValueError(f"{label}-state observations are missing or incomplete")
+    observations: list[StateObservation] = []
+    for expectation, raw in zip(expectations, raw_items, strict=True):
+        if not isinstance(raw, dict) or set(raw) != {"available", "status_code", "payload", "error"}:
+            raise ValueError(f"{label}-state observation record is invalid")
+        available = raw["available"]
+        status_code = raw["status_code"]
+        error = raw["error"]
+        if not isinstance(available, bool):
+            raise ValueError(f"{label}-state availability is invalid")
+        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+            raise ValueError(f"{label}-state HTTP status is invalid")
+        if error is not None and not isinstance(error, str):
+            raise ValueError(f"{label}-state error is invalid")
+        expected_status = (
+            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
+        )
+        if available and status_code != expected_status:
+            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if available and error is not None:
+            raise ValueError(f"{label}-state observation reports an error despite being available")
+        if not available and not error:
+            raise ValueError(f"{label}-state observation is unavailable without an error")
+        observations.append(
+            StateObservation(
+                available=available,
+                status_code=status_code,
+                payload=raw["payload"],
+                error=error,
+            )
+        )
+    return observations
+
+
+def _validate_trial_evidence(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    *,
+    arm: str,
+    model_spec: Any,
+    transport: str,
+    public_operations: list[PublicOperation],
+    input_schemas: dict[str, dict[str, Any]],
+    consumer_root: str | Path | None,
+) -> None:
+    if (
+        outcome.task_id != task.id
+        or outcome.cluster_id != task.pair_id
+        or outcome.category != task.category
+        or outcome.locale != task.locale
+        or outcome.arm != arm
+        or outcome.model_class != model_spec.class_name
+        or outcome.model_id != model_spec.model_id
+        or outcome.transport != transport
+    ):
+        raise ValueError("trial identity differs from its registered task, model, transport, or arm")
+    if not has_measured_evidence(outcome):
+        raise ValueError("trial is missing provider, state, or raw call evidence")
+    if outcome.error is not None:
+        raise ValueError("trial outcome contains an execution error")
+    if not all(math.isfinite(value) for value in (outcome.cost_usd, outcome.latency_seconds)):
+        raise ValueError("trial usage contains a non-finite cost or latency")
+    observed_routing, valid_routing = validate_routing_evidence(outcome.provider_evidence, model_spec)
+    if (outcome.routing_observed, outcome.routing_valid) != (observed_routing, valid_routing) or not valid_routing:
+        raise ValueError("trial routing flags do not match its provider responses")
+    input_tokens, output_tokens = provider_token_totals(outcome.provider_evidence)
+    provider_cost = provider_response_cost(outcome.provider_evidence)
+    if (
+        outcome.model_requests != len(outcome.provider_evidence)
+        or (outcome.input_tokens, outcome.output_tokens) != (input_tokens, output_tokens)
+        or outcome.total_tokens != input_tokens + output_tokens
+        or provider_cost is None
+        or outcome.provider_cost_usd is None
+        or not math.isclose(outcome.provider_cost_usd, provider_cost, rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(outcome.cost_usd, provider_cost, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        raise ValueError("trial usage totals do not match its provider responses")
+
+    before = _state_observations(outcome, task, before=True)
+    after = _state_observations(outcome, task, before=False)
+    expected_checkpoints = [checkpoint.after_attempt for checkpoint in task.expected_final_state.checkpoints]
+    raw_checkpoints = outcome.state_checkpoint_observations
+    recorded_checkpoints = [item.get("after_attempt") for item in raw_checkpoints if isinstance(item, dict)]
+    if recorded_checkpoints != expected_checkpoints or len(raw_checkpoints) != len(expected_checkpoints):
+        raise ValueError("state checkpoint observations do not cover the registered checkpoints")
+    for item in raw_checkpoints:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"after_attempt", "available", "status_code", "payload", "error"}
+            or not isinstance(item.get("available"), bool)
+            or (item.get("error") is not None and not isinstance(item.get("error"), str))
+        ):
+            raise ValueError("state checkpoint observation is invalid")
+
+    for call in outcome.tool_calls:
+        decoded, raw_valid = decode_raw_args(call.raw_model_args)
+        if call.raw_args_valid != raw_valid:
+            raise ValueError("raw tool argument validity flag does not match the recorded call")
+        if call.server_args is None:
+            if call.server_args_equal_raw or call.effective_server_args is not None:
+                raise ValueError("unobserved tool call claims server-side arguments")
+        else:
+            equal = raw_valid and call.server_args == decoded
+            if call.server_args_equal_raw != equal:
+                raise ValueError("raw and server tool arguments disagree with the recorded equality flag")
+            schema = input_schemas.get(call.tool_name)
+            if schema is not None and call.effective_server_args != canonicalize_arguments(call.server_args, schema):
+                raise ValueError("effective tool arguments do not match the captured input schema")
+        action = decoded.get("action") if isinstance(decoded, dict) else None
+        routes = [
+            operation
+            for operation in public_operations
+            if transport in operation.transports
+            and getattr(operation, arm).tool == call.tool_name
+            and getattr(operation, arm).action == (action if isinstance(action, str) else None)
+        ]
+        if len(routes) > 1:
+            raise ValueError("tool call matches more than one registered public operation")
+        expected_exists = call.tool_name in input_schemas
+        if call.tool_exists != expected_exists:
+            raise ValueError("tool existence flag does not match the captured catalog")
+        if routes:
+            route = routes[0]
+            if (
+                not call.tool_exists
+                or call.canonical_operation != route.operation
+                or call.surface_action != getattr(route, arm).action
+                or call.logical_operation != route.logical_operation
+                or call.resource_type != route.resource_type
+            ):
+                raise ValueError("tool call route metadata does not match the registered public operation")
+        elif (
+            call.canonical_operation is not None
+            or call.surface_action is not None
+            or call.logical_operation != "unknown"
+            or call.resource_type != "unknown"
+        ):
+            raise ValueError("unregistered tool call carries fabricated operation metadata")
+        if call.server_succeeded and (not call.transport_succeeded or call.server_error_code is not None):
+            raise ValueError("successful tool call lacks a successful server response")
+    if outcome.first_logical_operation != (outcome.tool_calls[0].logical_operation if outcome.tool_calls else "none"):
+        raise ValueError("first action does not match the ordered raw call trace")
+    if outcome.successful_mcp_tool_calls != sum(call.server_succeeded for call in outcome.tool_calls):
+        raise ValueError("successful MCP call count does not match the raw call trace")
+
+    verified = TrialOutcome.model_validate(outcome.model_dump(mode="python"))
+    verified.finalize(task, before, after, consumer_root=consumer_root)
+    actual_dump = outcome.model_dump(mode="json")
+    verified_dump = verified.model_dump(mode="json")
+    for field_name in _DERIVED_TRIAL_FIELDS:
+        if actual_dump.get(field_name) != verified_dump.get(field_name):
+            raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
+
+
+def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
+    key = f"{transport}:{profile}"
+    raw = artifact.get("catalogs", {}).get(key)
+    if not isinstance(raw, dict):
+        raise ValueError(f"captured catalog is missing for {key}")
+    snapshot = CatalogSnapshot.model_validate(raw)
+    schemas: dict[str, dict[str, Any]] = {}
+    for tool in snapshot.tools:
+        name = tool.get("name")
+        schema = tool.get("inputSchema")
+        if not isinstance(name, str) or not isinstance(schema, dict):
+            raise ValueError(f"captured catalog contains an invalid tool schema for {key}")
+        schemas[name] = schema
+    return schemas
+
+
+def _validate_preregistered_inputs(
+    artifact: dict[str, Any],
+    *,
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    arm: str,
+) -> RuntimeDescriptor:
+    raw_tasks = artifact.get("task_contracts")
+    if not isinstance(raw_tasks, list) or raw_tasks != [task.model_dump(mode="json") for task in tasks]:
+        raise ValueError(f"{arm} artifact does not carry its complete task corpus")
+    manifest.validate_tasks(tasks)
+    expected_task_ids = [task.id for task in tasks]
+    if artifact.get("task_ids") != expected_task_ids:
+        raise ValueError(f"{arm} task ids do not match the sealed task corpus")
+    expected_task_locales = [
+        {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
+        for task in tasks
+    ]
+    if artifact.get("task_locales") != expected_task_locales:
+        raise ValueError(f"{arm} task locale and cluster declarations do not match the sealed task corpus")
+    task_corpus_hash = hash_json([task.model_dump(mode="json") for task in tasks])
+    oracle_hash = hash_json(
+        {task.id: task.expected_final_state.model_dump(mode="json") for task in tasks}
+    )
+    if artifact.get("task_corpus_hash") != task_corpus_hash:
+        raise ValueError(f"{arm} task corpus hash does not match its full task evidence")
+
+    inputs = artifact.get("pre_smoke_seal_inputs")
+    if not isinstance(inputs, dict) or inputs.get("schema_version") != 1:
+        raise ValueError(f"{arm} pre-smoke seal inputs are missing or invalid")
+    if (
+        inputs.get("arm") != arm
+        or inputs.get("source_revision") != artifact.get("source_revision")
+        or inputs.get("run_manifest_hash") != artifact.get("run_manifest_hash")
+        or inputs.get("task_corpus_hash") != task_corpus_hash
+        or inputs.get("oracle_hash") != oracle_hash
+        or inputs.get("catalogs") != artifact.get("catalogs")
+        or inputs.get("paired_order_plan") != artifact.get("paired_order_plan")
+    ):
+        raise ValueError(f"{arm} pre-smoke seal is not connected to its manifest, corpus, oracle, catalogs, or order plan")
+
+    registry = artifact.get("provider_registry")
+    if not isinstance(registry, dict) or registry.get("status") != "verified":
+        raise ValueError(f"{arm} provider registry snapshot is unavailable")
+    registry_hash = registry.get("snapshot_hash")
+    registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+    expected_models = {model.model_id for model in manifest.models}
+    if (
+        not isinstance(registry_hash, str)
+        or hash_json(registry_payload) != registry_hash
+        or set(registry.get("models", {})) != expected_models
+        or inputs.get("provider_registry_hash") != registry_hash
+        or inputs.get("provider_registry_status") != registry.get("status")
+    ):
+        raise ValueError(f"{arm} provider registry seal does not match the captured registry")
+
+    fixture_inputs = inputs.get("fixture")
+    fixture = artifact.get("fixture")
+    if not isinstance(fixture_inputs, dict) or not isinstance(fixture, dict):
+        raise ValueError(f"{arm} fixture seal is missing")
+    reset = fixture.get("reset")
+    if not isinstance(reset, dict):
+        raise ValueError(f"{arm} fixture reset evidence is invalid")
+    try:
+        descriptor = RuntimeDescriptor.from_dict(fixture_inputs.get("runtime_descriptor"))
+    except Exception as exc:
+        raise ValueError(f"{arm} sealed runtime descriptor is invalid: {exc}") from exc
+    descriptor_evidence = descriptor.raw.get("evidence")
+    if not isinstance(descriptor_evidence, dict):
+        raise ValueError(f"{arm} runtime descriptor omits artifact version evidence")
+    descriptor_versions = {
+        key: descriptor_evidence.get(key)
+        for key in ("backend_artifact_version", "proxy_artifact_version")
+        if key in artifact.get("artifact_versions", {})
+    }
+    if (
+        descriptor_evidence.get("source_revision") != artifact.get("source_revision")
+        or fixture_inputs.get("scenario") != fixture.get("scenario")
+        or fixture_inputs.get("scenario") != descriptor.scenario
+        or fixture_inputs.get("reset_url") != reset.get("url")
+        or fixture_inputs.get("reset_body") != reset.get("body")
+        or fixture_inputs.get("reset_url") != descriptor.reset_url
+        or fixture_inputs.get("reset_body") != descriptor.reset_body
+        or fixture_inputs.get("runtime_identity") != artifact.get("artifact_versions")
+        or descriptor_versions != artifact.get("artifact_versions")
+    ):
+        raise ValueError(f"{arm} fixture seal does not match its runtime descriptor and artifact identity")
+
+    environment = inputs.get("environment")
+    if not isinstance(environment, dict) or artifact.get("execution_environment") != environment:
+        raise ValueError(f"{arm} execution environment is not connected to its pre-smoke seal")
+    packages = environment.get("packages")
+    if (
+        not isinstance(environment.get("python"), str)
+        or not environment["python"]
+        or not isinstance(environment.get("platform"), str)
+        or not environment["platform"]
+        or not isinstance(packages, dict)
+        or set(packages) != {"pydantic-ai", "pydantic-evals", "fastmcp", "mcp", "scipy"}
+        or any(value is not None and not isinstance(value, str) for value in packages.values())
+        or not isinstance(environment.get("uv_lock_sha256"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", environment["uv_lock_sha256"]) is None
+    ):
+        raise ValueError(f"{arm} execution environment evidence is incomplete")
+    return descriptor
+
+
+def _validate_shared_budget(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    descriptors: dict[str, RuntimeDescriptor],
+) -> None:
+    budget = baseline.get("paired_budget_used")
+    if not isinstance(budget, dict):
+        raise ValueError("shared paired budget evidence is missing")
+    exact_limits = {
+        "max_model_requests": manifest.budget.max_model_requests,
+        "max_total_cost_usd": manifest.budget.max_total_cost_usd,
+        "max_wall_seconds": manifest.budget.max_wall_seconds,
+    }
+    for key, expected in exact_limits.items():
+        observed = budget.get(key)
+        if not isinstance(observed, (int, float)) or isinstance(observed, bool) or observed != expected:
+            raise ValueError(f"shared budget {key} does not match preregistration")
+
+    expected_cells = [
+        f"{model.class_name}:{transport}"
+        for model in manifest.models
+        for transport in manifest.transports
+    ]
+    models = {model.class_name: model for model in manifest.models}
+    task_map = {task.id: task for task in tasks}
+    aggregate = {"model_requests": 0, "input_tokens": 0, "output_tokens": 0}
+    aggregate_cost = 0.0
+    aggregate_work = 0.0
+    for artifact, arm in ((baseline, "baseline"), (candidate, "candidate")):
+        raw_smoke = artifact.get("smoke_gate")
+        if not isinstance(raw_smoke, dict) or raw_smoke.get("status") != "passed":
+            raise ValueError(f"{arm} smoke gate evidence is invalid")
+        if raw_smoke.get("required_cells") != expected_cells:
+            raise ValueError(f"{arm} smoke gate cells do not match the registered model and transport matrix")
+        smoke_cells = raw_smoke.get("cells")
+        if not isinstance(smoke_cells, list) or [item.get("cell") for item in smoke_cells if isinstance(item, dict)] != expected_cells:
+            raise ValueError(f"{arm} smoke gate does not contain all four completed cells")
+        descriptor = descriptors[arm]
+        for item in smoke_cells:
+            cell = item["cell"]
+            if item.get("status") != "completed" or not isinstance(item.get("outcome"), dict):
+                raise ValueError(f"{arm} smoke gate cell {cell} is incomplete")
+            class_name, transport = cell.split(":", 1)
+            outcome = TrialOutcome.model_validate(item["outcome"])
+            task = task_map.get(outcome.task_id)
+            model_spec = models.get(class_name)
+            if task is None or model_spec is None or transport not in task.fixture.transports:
+                raise ValueError(f"{arm} smoke gate cell {cell} has an invalid task or model")
+            cell_descriptor = descriptor.benchmark_cells.get(cell, descriptor)
+            consumer_root = (
+                cell_descriptor.stdio_service.get("consumer_root")
+                if transport == "stdio" and task.fixture.local_files and cell_descriptor.stdio_service is not None
+                else None
+            )
+            schemas = _catalog_input_schemas(artifact, transport, task.fixture.credential_profile)
+            _validate_trial_evidence(
+                outcome,
+                task,
+                arm=arm,
+                model_spec=model_spec,
+                transport=transport,
+                public_operations=manifest.public_operations,
+                input_schemas=schemas,
+                consumer_root=consumer_root,
+            )
+            if (
+                outcome.successful_mcp_tool_calls <= 0
+                or outcome.model_requests < 2
+                or not outcome.follow_up_terminal_response
+            ):
+                raise ValueError(f"{arm} smoke gate cell {cell} lacks a successful tool and terminal response")
+            _add_budget_outcome(aggregate, outcome)
+            aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
+            aggregate_work += outcome.latency_seconds
+
+        outcome_map = _outcome_map(artifact)
+        for outcome in outcome_map.values():
+            task = task_map.get(outcome.task_id)
+            model_spec = models.get(outcome.model_class)
+            if task is None or model_spec is None:
+                raise ValueError(f"{arm} trial references a task or model outside the registered plan")
+            cell = f"{outcome.model_class}:{outcome.transport}"
+            cell_descriptor = descriptor.benchmark_cells.get(cell, descriptor)
+            consumer_root = (
+                cell_descriptor.stdio_service.get("consumer_root")
+                if outcome.transport == "stdio" and task.fixture.local_files and cell_descriptor.stdio_service is not None
+                else None
+            )
+            schemas = _catalog_input_schemas(artifact, outcome.transport, task.fixture.credential_profile)
+            _validate_trial_evidence(
+                outcome,
+                task,
+                arm=arm,
+                model_spec=model_spec,
+                transport=outcome.transport,
+                public_operations=manifest.public_operations,
+                input_schemas=schemas,
+                consumer_root=consumer_root,
+            )
+            _add_budget_outcome(aggregate, outcome)
+            aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
+            aggregate_work += outcome.latency_seconds
+
+    for key, expected in aggregate.items():
+        if budget.get(key) != expected:
+            raise ValueError(f"shared budget {key} does not match the paired trial and smoke outcomes")
+    if budget.get("total_tokens") != aggregate["input_tokens"] + aggregate["output_tokens"]:
+        raise ValueError("shared budget total_tokens does not match provider evidence")
+    cost = budget.get("cost_usd")
+    wall = budget.get("wall_seconds")
+    work = budget.get("model_work_seconds")
+    setup_requests = budget.get("provider_setup_requests")
+    if (
+        not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(cost)
+        or not math.isclose(cost, aggregate_cost, rel_tol=0.0, abs_tol=1e-9)
+        or not isinstance(wall, (int, float))
+        or isinstance(wall, bool)
+        or not math.isfinite(wall)
+        or wall <= 0
+        or wall > manifest.budget.max_wall_seconds
+        or not isinstance(work, (int, float))
+        or isinstance(work, bool)
+        or not math.isfinite(work)
+        or not math.isclose(work, aggregate_work, rel_tol=0.0, abs_tol=1e-9)
+        or not isinstance(setup_requests, int)
+        or isinstance(setup_requests, bool)
+        or setup_requests < 0
+    ):
+        raise ValueError("shared paired budget costs, time, or setup-request evidence is invalid")
+    if aggregate["model_requests"] > manifest.budget.max_model_requests or cost > manifest.budget.max_total_cost_usd:
+        raise ValueError("shared paired usage exceeds a registered budget limit")
+
+
+def _add_budget_outcome(aggregate: dict[str, int], outcome: TrialOutcome) -> None:
+    aggregate["model_requests"] += outcome.model_requests
+    aggregate["input_tokens"] += outcome.input_tokens
+    aggregate["output_tokens"] += outcome.output_tokens
+
+
 def _provider_name(evidence: dict[str, Any]) -> str:
     routing = evidence.get("routing")
     if isinstance(routing, dict):
@@ -2130,12 +2610,19 @@ def _provider_distribution_sensitivity(
 
 def _empty_comparison(baseline: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "baseline_source_revision": baseline.get("source_revision"),
         "candidate_source_revision": candidate.get("source_revision"),
         "verdict": "inconclusive",
         "gate": {"status": "inconclusive", "reasons": [reason]},
     }
+
+
+def _finite_interval_bound(interval: dict[str, Any], side: str) -> float:
+    value = interval.get(side)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise InconclusiveBootstrap(f"registered {side} is not finite")
+    return float(value)
 
 
 def _outcome_map(artifact: dict[str, Any]) -> dict[tuple[str, str, str, int], TrialOutcome]:
@@ -2218,7 +2705,7 @@ def _catalog_contract_errors(
 
 
 def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | None:
-    if artifact.get("schema_version") != 1 or artifact.get("arm") != arm:
+    if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
         return f"invalid {arm} artifact identity"
     hash_input = artifact.get("artifact_hash_input")
     artifact_hash = artifact.get("artifact_hash")
@@ -2294,19 +2781,52 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     except Exception as exc:
         return _empty_comparison(baseline, candidate, f"paired evidence is incomplete or invalid: {exc}")
 
-    if baseline.get("pre_smoke_seal_hash") != candidate.get("pre_smoke_seal_hash") or not baseline.get("pre_smoke_seal_hash"):
-        return _empty_comparison(baseline, candidate, "paired pre-smoke seal is missing or differs between arms")
+    try:
+        raw_task_contracts = baseline.get("task_contracts")
+        if not isinstance(raw_task_contracts, list):
+            raise ValueError("full task corpus is missing")
+        tasks = [TaskManifest.model_validate(item) for item in raw_task_contracts]
+        descriptors = {
+            "baseline": _validate_preregistered_inputs(
+                baseline,
+                manifest=validated_manifest,
+                tasks=tasks,
+                arm="baseline",
+            ),
+            "candidate": _validate_preregistered_inputs(
+                candidate,
+                manifest=validated_manifest,
+                tasks=tasks,
+                arm="candidate",
+            ),
+        }
+        expected_seal_hash = hash_json(
+            {
+                arm: hash_json(artifact["pre_smoke_seal_inputs"])
+                for arm, artifact in (("baseline", baseline), ("candidate", candidate))
+            }
+        )
+        if (
+            not baseline.get("pre_smoke_seal_hash")
+            or baseline.get("pre_smoke_seal_hash") != expected_seal_hash
+            or candidate.get("pre_smoke_seal_hash") != expected_seal_hash
+        ):
+            raise ValueError("paired pre-smoke seal digest does not match the complete sealed inputs")
+        _validate_shared_budget(
+            baseline,
+            candidate,
+            manifest=validated_manifest,
+            tasks=tasks,
+            descriptors=descriptors,
+        )
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"sealed evidence is incomplete or invalid: {exc}")
 
     registries = [baseline.get("provider_registry"), candidate.get("provider_registry")]
-    if any(not isinstance(item, dict) or item.get("status") != "verified" for item in registries):
-        return _empty_comparison(baseline, candidate, "provider registry snapshot is missing or unavailable")
     base_registry = cast(dict[str, Any], registries[0])
     candidate_registry = cast(dict[str, Any], registries[1])
     if base_registry.get("snapshot_hash") != candidate_registry.get("snapshot_hash"):
         return _empty_comparison(baseline, candidate, "provider registry drifted between paired arms")
-    expected_models = {model["model_id"] for model in manifest["models"]}
-    if set(base_registry.get("models", {})) != expected_models:
-        return _empty_comparison(baseline, candidate, "provider registry does not cover the pinned model aliases")
 
     try:
         baseline_map = _outcome_map(baseline)
@@ -2436,6 +2956,22 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
             resamples=resamples,
             seed=seed,
         )
+        success_lower_bounds = {
+            "overall": _finite_interval_bound(overall_success, "lower_bound"),
+            **{
+                key: _finite_interval_bound(value, "lower_bound")
+                for key, value in cell_success.items()
+            },
+        }
+        success_failure_upper_bounds = {
+            "overall": _finite_interval_bound(overall_success_clear_failure, "upper_bound"),
+            **{
+                key: _finite_interval_bound(value, "upper_bound")
+                for key, value in cell_success_clear_failure.items()
+            },
+        }
+        error_upper_bound = _finite_interval_bound(error_rate, "upper_bound")
+        error_failure_lower_bound = _finite_interval_bound(error_rate_clear_failure, "lower_bound")
     except (KeyError, InconclusiveBootstrap, ValueError) as exc:
         return _empty_comparison(baseline, candidate, f"registered BCa evidence is inconclusive: {exc}")
 
@@ -2456,18 +2992,16 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         values["candidate"] <= values["baseline"] for values in material_error_counts.values()
     )
     margin = float(manifest["statistical_procedure"]["noninferiority_margin"])
-    success_intervals = {"overall": overall_success, **cell_success}
     success_clear_failure_intervals = {
         "overall": overall_success_clear_failure,
         **cell_success_clear_failure,
     }
-    success_pass = all(float(result["lower_bound"]) >= -margin for result in success_intervals.values())
-    error_pass = float(error_rate["upper_bound"]) < 0
+    success_pass = all(bound >= -margin for bound in success_lower_bounds.values())
+    error_pass = error_upper_bound < 0
     success_clear_fail = any(
-        float(success_clear_failure_intervals[key]["upper_bound"]) < -margin
-        for key in success_intervals
+        bound < -margin for bound in success_failure_upper_bounds.values()
     )
-    error_clear_fail = float(error_rate_clear_failure["lower_bound"]) > 0
+    error_clear_fail = error_failure_lower_bound > 0
     boundary = (
         not success_pass and not success_clear_fail
     ) or (not error_pass and not error_clear_fail)
@@ -2496,7 +3030,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     all_base_cost = sum(item.cost_usd for item in baseline_outcomes)
     all_candidate_cost = sum(item.cost_usd for item in candidate_outcomes)
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "baseline_source_revision": baseline["source_revision"],
         "candidate_source_revision": candidate["source_revision"],
         "protocol_revision": baseline["protocol_revision"],
@@ -2578,6 +3112,7 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "provider_registry": artifact.get("provider_registry"),
         "pre_smoke_seal_inputs": artifact.get("pre_smoke_seal_inputs"),
         "pre_smoke_seal_hash": artifact.get("pre_smoke_seal_hash"),
+        "execution_environment": artifact.get("execution_environment"),
         "category_counts": artifact["category_counts"],
         "suite_counts": artifact.get("suite_counts", {}),
         "locale_counts": artifact["locale_counts"],
@@ -2690,7 +3225,7 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
 
 def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     for artifact, expected_arm in ((baseline, "baseline"), (candidate, "candidate")):
-        if artifact.get("schema_version") != 1 or artifact.get("arm") != expected_arm:
+        if artifact.get("schema_version") != 2 or artifact.get("arm") != expected_arm:
             raise ValueError(f"invalid {expected_arm} run artifact")
         if artifact.get("status", "complete") != "complete":
             raise ValueError(f"cannot compare incomplete {expected_arm} run artifact")
@@ -2729,6 +3264,7 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "paired_budget_used",
         "provider_registry",
         "pre_smoke_seal_hash",
+        "execution_environment",
         "locale_counts",
     ):
         if baseline.get(key) != candidate.get(key):

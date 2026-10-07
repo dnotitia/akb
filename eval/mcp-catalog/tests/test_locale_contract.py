@@ -15,6 +15,7 @@ from mcp_catalog.execution import (
     ToolCallRecorder,
     TrialOutcome,
     bind_tool_calls as _bind_tool_calls,
+    canonicalize_arguments,
     response_matches_rubric,
 )
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
@@ -802,9 +803,54 @@ def test_comparison_aggregates_locales_into_registered_semantic_clusters() -> No
 
 def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -> None:
     baseline, candidate = complete_paired_artifacts()
+    manifest, tasks = _loaded()
+    task = next(item for item in tasks if item.id == "read-vaults-ko")
+    route = next(item for item in manifest.public_operations if item.logical_operation == "identity")
     for artifact in (baseline, candidate):
+        arm = artifact["arm"]
+        route_spec = getattr(route, arm)
+        schema = next(
+            tool["inputSchema"]
+            for tool in artifact["catalogs"]["http:default"]["tools"]
+            if tool["name"] == route_spec.tool
+        )
+        arguments = {"action": route_spec.action} if route_spec.action is not None else {}
+        effective_arguments = canonicalize_arguments(arguments, schema)
         for trial in artifact["runs"]["primary:http"]["trials"]:
-            trial["first_action_accuracy"] = False
+            if trial["task_id"] != task.id:
+                continue
+            outcome = TrialOutcome.model_validate(trial)
+            outcome.tool_calls = [
+                ToolCallRecord(
+                    order=1,
+                    tool_name=route_spec.tool,
+                    canonical_operation=route.operation,
+                    surface_action=route_spec.action,
+                    logical_operation=route.logical_operation,
+                    resource_type=route.resource_type,
+                    tool_exists=True,
+                    operation_kind="preparatory",
+                    raw_model_args=arguments,
+                    server_args=arguments,
+                    effective_server_args=effective_arguments,
+                    raw_args_valid=True,
+                    server_args_equal_raw=True,
+                    transport_succeeded=True,
+                    server_succeeded=True,
+                    server_status_code=200,
+                ),
+                *[
+                    call.model_copy(update={"order": call.order + 1})
+                    for call in outcome.tool_calls
+                ],
+            ]
+            outcome.successful_mcp_tool_calls += 1
+            outcome.first_logical_operation = "identity"
+            before = [StateObservation(**item) for item in outcome.state_observations_before]
+            after = [StateObservation(**item) for item in outcome.state_observations_after]
+            outcome.finalize(task, before, after)
+            trial.clear()
+            trial.update(outcome.model_dump(mode="json"))
         _seal_comparison_artifact(artifact)
 
     result = compare_artifacts(baseline, candidate)
@@ -868,6 +914,7 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         model_id=manifest.models[0].model_id,
         transport="http",
         repeat_index=1,
+        tool_calls=[],
         input_tokens=10,
         output_tokens=2,
         total_tokens=12,
@@ -878,6 +925,28 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before={},
+        state_after={},
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
     store = CheckpointStore(
         tmp_path / "checkpoint.json",

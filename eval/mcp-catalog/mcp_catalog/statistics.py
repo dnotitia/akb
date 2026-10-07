@@ -21,7 +21,7 @@ def paired_cluster_bca(
     confidence: float = 0.95,
     resamples: int = 20_000,
     seed: int = 358,
-) -> dict[str, float | int | str]:
+) -> dict[str, float | int | str | None]:
     """Compute a one-sided paired BCa interval over equal-weight clusters."""
 
     if len(baseline) != len(candidate) or len(baseline) < 3:
@@ -52,16 +52,22 @@ def paired_cluster_bca(
         raise InconclusiveBootstrap(f"BCa interval failed: {type(exc).__name__}") from exc
 
     low, high = float(interval.low), float(interval.high)
-    # A one-sided SciPy result intentionally uses infinity at the unbounded
-    # side. NaN at either side signals a degenerate BCa acceleration.
     if math.isnan(low) or math.isnan(high):
         raise InconclusiveBootstrap("BCa interval is degenerate")
+    if alternative == "greater":
+        if not math.isfinite(low) or high != math.inf:
+            raise InconclusiveBootstrap("BCa interval has invalid greater-alternative bounds")
+        lower_bound, upper_bound = low, None
+    else:
+        if low != -math.inf or not math.isfinite(high):
+            raise InconclusiveBootstrap("BCa interval has invalid less-alternative bounds")
+        lower_bound, upper_bound = None, high
     return {
         "baseline_mean": float(np.mean(baseline_array)),
         "candidate_mean": float(np.mean(candidate_array)),
         "difference_candidate_minus_baseline": float(np.mean(candidate_array - baseline_array)),
-        "lower_bound": low,
-        "upper_bound": high,
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
         "independent_clusters": len(baseline),
         "method": "paired_cluster_bca_bootstrap",
         "confidence": confidence,

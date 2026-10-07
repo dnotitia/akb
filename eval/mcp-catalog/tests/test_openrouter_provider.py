@@ -307,7 +307,7 @@ def test_pinned_parasail_upstream_preserves_model_usage_cost_and_selected_route(
     ]
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
-    assert has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome)
 
 
 def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
@@ -355,7 +355,32 @@ def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_meas
         error=error,
         latency=0.1,
         secrets=(),
-    ).model_copy(update={"state_available_before": True, "state_available_after": True})
+    ).model_copy(
+        update={
+            "state_available_before": True,
+            "state_available_after": True,
+            "state_before": {},
+            "state_after": {},
+            "state_observations_before": [
+                {
+                    "available": True,
+                    "status_code": item.resolved_before_expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+            "state_observations_after": [
+                {
+                    "available": True,
+                    "status_code": item.probe.expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+        }
+    )
 
     assert outcome.failure_kind == failure_kind
     assert not outcome.success

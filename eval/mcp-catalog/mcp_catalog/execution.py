@@ -255,6 +255,8 @@ class TrialOutcome(BaseModel):
     material_call_count: int = Field(default=0, ge=0)
     state_before: Any = None
     state_after: Any = None
+    state_observations_before: list[dict[str, Any]] = Field(default_factory=list)
+    state_observations_after: list[dict[str, Any]] = Field(default_factory=list)
     state_available_before: bool = False
     state_available_after: bool = False
     state_contract_passed: bool = False
@@ -334,6 +336,8 @@ class TrialOutcome(BaseModel):
         expectation_sets = task.expected_final_state.observation_sets
         self.state_before = _state_payload(before_items)
         self.state_after = _state_payload(after_items)
+        self.state_observations_before = [_state_observation_record(item) for item in before_items]
+        self.state_observations_after = [_state_observation_record(item) for item in after_items]
         self.state_available_before = all(
             observation.available
             for expectation, observation in zip(expectation_sets, before_items, strict=False)
@@ -752,15 +756,67 @@ def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> l
 def has_measured_evidence(outcome: TrialOutcome) -> bool:
     """Return whether a trial has real provider and lifecycle evidence to keep."""
 
+    if "tool_calls" not in outcome.model_fields_set:
+        return False
     if not _has_provider_usage_evidence(outcome):
         return False
+    before_payload, before_valid = _measured_state_payload(outcome.state_observations_before)
+    after_payload, after_valid = _measured_state_payload(outcome.state_observations_after)
+    if (
+        not before_valid
+        or not after_valid
+        or not outcome.state_available_before
+        or not outcome.state_available_after
+        or outcome.state_before != before_payload
+        or outcome.state_after != after_payload
+    ):
+        return False
+    if outcome.successful_mcp_tool_calls != sum(call.server_succeeded for call in outcome.tool_calls):
+        return False
+    if outcome.material_call_count != sum(call.operation_kind == "material" for call in outcome.tool_calls):
+        return False
+    if [call.order for call in outcome.tool_calls] != list(range(1, len(outcome.tool_calls) + 1)):
+        return False
+    if outcome.first_logical_operation != (outcome.tool_calls[0].logical_operation if outcome.tool_calls else "none"):
+        return False
+    for call in outcome.tool_calls:
+        _decoded, raw_valid = decode_raw_args(call.raw_model_args)
+        if call.raw_args_valid != raw_valid:
+            return False
+        if call.server_args is None:
+            if call.server_args_equal_raw or call.effective_server_args is not None:
+                return False
+        elif call.server_args_equal_raw != (raw_valid and call.server_args == _decoded):
+            return False
+        if call.server_succeeded and (not call.transport_succeeded or call.server_error_code is not None):
+            return False
     if outcome.error is None:
         return True
     if outcome.expected_error_match:
-        return outcome.state_available_before and outcome.state_available_after
+        return True
     if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
         return False
-    return outcome.state_available_before and outcome.state_available_after
+    return True
+
+
+def _measured_state_payload(records: list[dict[str, Any]]) -> tuple[Any, bool]:
+    if not records:
+        return None, False
+    observations: list[StateObservation] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"available", "status_code", "payload", "error"}:
+            return None, False
+        status_code = record["status_code"]
+        if (
+            record["available"] is not True
+            or not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+            or record["error"] is not None
+        ):
+            return None, False
+        observations.append(StateObservation(True, status_code, record["payload"], None))
+    return _state_payload(observations), True
 
 
 @dataclass(slots=True)
@@ -834,6 +890,15 @@ def _resolve_result_probe(probe: StateProbe, result_fields: list[dict[str, str]]
 def _state_payload(observations: list[StateObservation]) -> Any:
     payloads = [observation.payload if observation.available else None for observation in observations]
     return payloads[0] if len(payloads) == 1 else payloads
+
+
+def _state_observation_record(observation: StateObservation) -> dict[str, Any]:
+    return {
+        "available": observation.available,
+        "status_code": observation.status_code,
+        "payload": observation.payload,
+        "error": observation.error,
+    }
 
 
 def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
@@ -1960,6 +2025,11 @@ async def execute_smoke(
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
 
+    before = [
+        await fixture.observe(expectation.probe, token=token)
+        for expectation in task.expected_final_state.observation_sets
+    ]
+
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=secrets,
@@ -2045,6 +2115,25 @@ async def execute_smoke(
         secrets=secrets,
         partial_messages=partial_messages,
         request_count=request_guard.requests if request_guard is not None else None,
+    )
+    material_calls = [
+        call for call in outcome.tool_calls
+        if call.logical_operation in task.allowed_material_operations
+        and call.server_error_code != "vault_skill_required"
+    ]
+    result_fields = [call.result_fields for call in material_calls]
+    after: list[StateObservation] = []
+    for expectation in task.expected_final_state.observation_sets:
+        try:
+            probe = _resolve_result_probe(expectation.probe, result_fields)
+            after.append(await fixture.observe(probe, token=token))
+        except Exception as exc:
+            after.append(StateObservation(False, None, error=redact_exception(exc, secrets)))
+    outcome.finalize(
+        task,
+        before,
+        after,
+        consumer_root=(fixture.stdio_consumer_root if task.fixture.local_files else None),
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)

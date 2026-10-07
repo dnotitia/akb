@@ -10,7 +10,7 @@ import pytest
 
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
-from mcp_catalog.execution import TrialOutcome
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
 from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
@@ -96,6 +96,11 @@ def _parallel_descriptor() -> RuntimeDescriptor:
     return dataclasses.replace(descriptor, benchmark_cells=cells)
 
 
+def _empty_state_payload(task) -> dict | list[dict]:
+    payloads = [{} for _item in task.expected_final_state.observation_sets]
+    return payloads[0] if len(payloads) == 1 else payloads
+
+
 def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
@@ -106,7 +111,17 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         transport=transport,
         repeat_index=repeat_index,
         final_answer_text="완료",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="fixture_tool",
+                logical_operation="search",
+                transport_succeeded=True,
+                server_succeeded=True,
+            )
+        ],
         successful_mcp_tool_calls=1,
+        first_logical_operation="search",
         follow_up_terminal_response=True,
         input_tokens=10,
         output_tokens=2,
@@ -125,6 +140,28 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before=_empty_state_payload(task),
+        state_after=_empty_state_payload(task),
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
 
 

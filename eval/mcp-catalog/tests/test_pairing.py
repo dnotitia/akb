@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 
-from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, token_estimate
+from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
 from mcp_catalog.statistics import InconclusiveBootstrap, paired_cluster_bca
-from paired_artifact_factory import complete_paired_artifacts
+from paired_artifact_factory import complete_paired_artifacts, mark_candidate_unsafe
 
 ROOT = Path(__file__).parents[1]
 
@@ -52,13 +55,11 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
 
 
 def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() -> None:
-    baseline, candidate = complete_paired_artifacts()
-    failed_pairs = {item["pair_id"] for item in baseline["task_locales"]}
-    for run in candidate["runs"].values():
-        for trial in run["trials"]:
-            if trial["cluster_id"] in failed_pairs:
-                trial["success"] = False
-    _seal(candidate)
+    pairs = list(dict.fromkeys(task.pair_id for task in load_task_corpus(ROOT / "corpus" / "tasks.json")))
+    baseline, candidate = complete_paired_artifacts(
+        baseline_failure_pairs=set(pairs[:5]),
+        candidate_failure_pairs=set(pairs),
+    )
 
     success_failure = compare_artifacts(baseline, candidate)
 
@@ -69,13 +70,10 @@ def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() ->
         < -success_failure["gate"]["noninferiority_margin"]
     )
 
-    baseline, candidate = complete_paired_artifacts()
-    for run in candidate["runs"].values():
-        for trial in run["trials"]:
-            trial["success"] = False
-            trial["trial_error"] = True
-            trial["trial_error_kinds"] = ["unsupported_success_claim"]
-    _seal(candidate)
+    baseline, candidate = complete_paired_artifacts(
+        baseline_failure_pairs=set(pairs[:5]),
+        candidate_failure_pairs=set(pairs),
+    )
 
     error_failure = compare_artifacts(baseline, candidate)
 
@@ -86,7 +84,7 @@ def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() ->
 
 def test_verified_candidate_state_mutation_returns_reject() -> None:
     baseline, candidate = complete_paired_artifacts()
-    candidate["runs"]["primary:http"]["trials"][0]["unsafe_mutation"] = True
+    mark_candidate_unsafe(candidate)
     _seal(candidate)
 
     result = compare_artifacts(baseline, candidate)
@@ -158,6 +156,119 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
     assert "provider_registry" in result["gate"]["reasons"][0]
 
 
+def test_missing_state_or_raw_call_evidence_is_rejected_after_resealing() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    trial = candidate["runs"]["primary:http"]["trials"][0]
+    trial["state_observations_after"] = []
+    _seal(candidate)
+
+    missing_state = compare_artifacts(baseline, candidate)
+    assert missing_state["verdict"] == "inconclusive"
+    assert "state" in missing_state["gate"]["reasons"][0]
+
+    baseline, candidate = complete_paired_artifacts()
+    trial = candidate["runs"]["primary:http"]["trials"][0]
+    trial["tool_calls"] = []
+    _seal(candidate)
+
+    missing_calls = compare_artifacts(baseline, candidate)
+    assert missing_calls["verdict"] == "inconclusive"
+    assert "raw call" in missing_calls["gate"]["reasons"][0]
+
+    baseline, candidate = complete_paired_artifacts()
+    trial = candidate["runs"]["primary:http"]["trials"][0]
+    trial.pop("tool_calls")
+    _seal(candidate)
+
+    missing_call_trace = compare_artifacts(baseline, candidate)
+    assert missing_call_trace["verdict"] == "inconclusive"
+    assert "raw call" in missing_call_trace["gate"]["reasons"][0]
+
+
+def test_resealed_success_flag_and_preregistered_seal_tampering_are_rejected() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    trial = next(
+        item
+        for item in candidate["runs"]["primary:http"]["trials"]
+        if item["task_id"] == "ambiguous-clarification-ko"
+    )
+    trial["success"] = True
+    _seal(candidate)
+
+    changed_score = compare_artifacts(baseline, candidate)
+    assert changed_score["verdict"] == "inconclusive"
+    assert "success" in changed_score["gate"]["reasons"][0]
+
+    baseline, candidate = complete_paired_artifacts()
+    candidate["pre_smoke_seal_inputs"]["oracle_hash"] = "f" * 64
+    _seal(candidate)
+
+    changed_oracle = compare_artifacts(baseline, candidate)
+    assert changed_oracle["verdict"] == "inconclusive"
+    assert "oracle" in changed_oracle["gate"]["reasons"][0]
+
+
+def test_resealed_shared_budget_mismatch_is_rejected() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    baseline["paired_budget_used"]["model_requests"] += 1
+    candidate["paired_budget_used"]["model_requests"] += 1
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "budget" in result["gate"]["reasons"][0]
+
+
+def test_external_compare_cli_writes_all_four_verdicts(tmp_path: Path) -> None:
+    pairs = list(dict.fromkeys(task.pair_id for task in load_task_corpus(ROOT / "corpus" / "tasks.json")))
+    cases = [
+        ("adopt", complete_paired_artifacts()),
+        (
+            "redesign",
+            complete_paired_artifacts(
+                baseline_failure_pairs=set(pairs[:5]),
+                candidate_failure_pairs=set(pairs),
+            ),
+        ),
+    ]
+    baseline, candidate = complete_paired_artifacts()
+    mark_candidate_unsafe(candidate)
+    _seal(candidate)
+    cases.append(("reject", (baseline, candidate)))
+    cases.append(("inconclusive", complete_paired_artifacts(mirror_baseline_failures=True)))
+
+    for index, (expected_verdict, (baseline, candidate)) in enumerate(cases):
+        baseline_path = tmp_path / f"baseline-{index}.json"
+        candidate_path = tmp_path / f"candidate-{index}.json"
+        output_path = tmp_path / f"comparison-{index}.json"
+        baseline_path.write_text(json.dumps(baseline, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+        candidate_path.write_text(json.dumps(candidate, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mcp_catalog.cli",
+                "compare",
+                "--baseline",
+                str(baseline_path),
+                "--candidate",
+                str(candidate_path),
+                "--output",
+                str(output_path),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == (0 if expected_verdict == "adopt" else 1), completed.stderr
+        assert output_path.is_file()
+        report = json.loads(output_path.read_text(encoding="utf-8"))
+        assert report["verdict"] == expected_verdict
+
+
 def test_registered_one_sided_bca_returns_inconclusive_on_degenerate_samples() -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     procedure = manifest.statistical_procedure
@@ -173,4 +284,14 @@ def test_registered_one_sided_bca_returns_inconclusive_on_degenerate_samples() -
         )
     except InconclusiveBootstrap:
         return
-    assert result["lower_bound"] == result["upper_bound"] == 0.0
+    assert result["lower_bound"] == 0.0
+    assert result["upper_bound"] is None
+
+
+def test_one_sided_unbounded_interval_is_strict_json() -> None:
+    greater = paired_cluster_bca([0.0, 0.1, 0.2], [0.2, 0.4, 0.6], alternative="greater")
+    less = paired_cluster_bca([0.0, 0.1, 0.2], [0.2, 0.4, 0.6], alternative="less")
+
+    assert greater["upper_bound"] is None
+    assert less["lower_bound"] is None
+    json.dumps({"greater": greater, "less": less}, allow_nan=False)

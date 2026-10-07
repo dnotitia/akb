@@ -305,7 +305,9 @@ async def run_paired(args: argparse.Namespace) -> int:
         "cost_usd": float(ledger.cost_usd),
         "wall_seconds": ledger.observe_wall(),
         "model_work_seconds": ledger.model_work_seconds,
+        "max_model_requests": baseline_manifest.budget.max_model_requests,
         "max_total_cost_usd": baseline_manifest.budget.max_total_cost_usd,
+        "max_wall_seconds": baseline_manifest.budget.max_wall_seconds,
     }
     runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}

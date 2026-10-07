@@ -13,7 +13,7 @@ from mcp_catalog.checkpoint import (
     CheckpointStore,
 )
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
-from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
+from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 
 ROOT = Path(__file__).parents[1]
 
@@ -45,6 +45,7 @@ def _inputs() -> tuple[object, list[object], CheckpointHeader, CheckpointKey, di
 
 
 def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
+    task = next(task for task in _inputs()[1] if task.id == key.task_id)
     return TrialOutcome(
         task_id=key.task_id,
         category="single_operation",
@@ -54,6 +55,7 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
         transport=key.transport,
         locale=key.locale,
         repeat_index=key.repeat_index,
+        tool_calls=[],
         final_answer_text="완료",
         input_tokens=10,
         output_tokens=2,
@@ -75,6 +77,28 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before={},
+        state_after={},
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
         error=error,
     )
 
@@ -222,6 +246,18 @@ def test_failed_checkpoint_trial_is_not_reused_but_spent_is_preserved(tmp_path: 
     assert resumed.document.spent.model_requests == 1
 
 
+def test_checkpoint_outcome_without_call_trace_is_not_reusable(tmp_path: Path) -> None:
+    path = tmp_path / "checkpoint.json"
+    store, key = _store(path)
+    store.record_trial(key, _outcome(key), status="completed")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    next(iter(raw["records"].values()))["outcome"].pop("tool_calls")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="invalid completed trial"):
+        _store(path, resume=True)
+
+
 def test_measured_behavioral_failure_is_completed_and_reusable(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     store, key = _store(path)
@@ -355,8 +391,18 @@ def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_
                 "model_class": model_class,
                 "model_id": model_id,
                 "transport": transport,
-                "successful_mcp_tool_calls": 1,
-                "follow_up_terminal_response": True,
+                "tool_calls": [
+                    ToolCallRecord(
+                        order=1,
+                        tool_name="find_documents",
+                        logical_operation="search",
+                        transport_succeeded=True,
+                        server_succeeded=True,
+                    )
+                    ],
+                    "successful_mcp_tool_calls": 1,
+                    "first_logical_operation": "search",
+                    "follow_up_terminal_response": True,
                 "model_requests": 2,
                 "provider_evidence": [
                     {
