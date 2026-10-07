@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Brand artwork, the app's logo mark. An image, not a style: the theme's
+       colour-literal rule covers stylesheets, templates and scripts. -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#004059"/>
+      <stop offset="1" stop-color="#0a6f86"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="23" fill="url(#g)"/>
+  <text x="29" y="43" text-anchor="middle" font-family="Pretendard, system-ui, sans-serif" font-size="34" font-weight="600" fill="#ffffff">a</text>
+  <circle cx="49" cy="48" r="5" fill="#e55e2c"/>
+</svg>

@@ -1,0 +1,942 @@
+/* AKB login theme components.
+ *
+ * Reads only the vocabulary in akb-vocabulary.css (and custom properties it
+ * declares itself). No colour literals: tests/theme-static.test.ts fails on
+ * one. Layout follows the app's sign-in screen (src/pages/auth.tsx). */
+
+/* ── PatternFly 5 → vocabulary ───────────────────────────────────────────
+ * Inherited Keycloak pages are PatternFly markup. Pointing PatternFly's own
+ * globals at the vocabulary makes them speak AKB without overriding each
+ * component. `:root` outranks PatternFly's `:where(.pf-v5-theme-dark)`, and
+ * the vocabulary already changes with data-theme, so one block serves both. */
+:root {
+  --pf-v5-global--FontFamily--text: var(--font-family-body);
+  --pf-v5-global--FontFamily--heading: var(--font-family-display);
+  --pf-v5-global--FontFamily--redhat-updatedfont-path: var(--font-family-body);
+  --pf-v5-global--BackgroundColor--100: var(--color-background-card);
+  --pf-v5-global--BackgroundColor--200: var(--color-background-muted);
+  --pf-v5-global--BackgroundColor--light-100: var(--color-background-card);
+  --pf-v5-global--BackgroundColor--dark-100: var(--color-background-body);
+  --pf-v5-global--Color--100: var(--color-text-primary);
+  --pf-v5-global--Color--200: var(--color-text-secondary);
+  --pf-v5-global--Color--dark-100: var(--color-text-primary);
+  --pf-v5-global--Color--dark-200: var(--color-text-secondary);
+  --pf-v5-global--BorderColor--100: var(--color-border-emphasized);
+  --pf-v5-global--BorderColor--200: var(--color-border);
+  --pf-v5-global--BorderColor--300: var(--color-border);
+  --pf-v5-global--primary-color--100: var(--color-accent);
+  --pf-v5-global--primary-color--200: var(--color-accent-hover);
+  --pf-v5-global--primary-color--dark-100: var(--color-accent);
+  --pf-v5-global--active-color--100: var(--color-accent);
+  --pf-v5-global--link--Color: var(--color-link);
+  --pf-v5-global--link--Color--hover: var(--color-link-hover);
+  --pf-v5-global--link--Color--dark: var(--color-link);
+  --pf-v5-global--link--Color--dark--hover: var(--color-link-hover);
+  --pf-v5-global--danger-color--100: var(--color-error);
+  --pf-v5-global--danger-color--200: var(--color-on-error-muted);
+  --pf-v5-global--success-color--100: var(--color-success);
+  --pf-v5-global--warning-color--100: var(--color-warning);
+  --pf-v5-global--info-color--100: var(--color-info);
+  --pf-v5-global--BorderRadius--sm: var(--radius-control);
+  --pf-v5-global--BorderRadius--lg: var(--radius-container);
+}
+
+/* ── Page ─────────────────────────────────────────────────────────────── */
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body.akb-page {
+  position: relative;
+  background: var(--color-background-body);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* The app's background glow (src/index.css body::before), from the brand
+ * vocabulary rather than literals. */
+body.akb-page::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(45rem 45rem at 8% -12%, var(--color-brand-glow-primary), transparent 60%),
+    radial-gradient(40rem 40rem at 102% -6%, var(--color-brand-glow-spark), transparent 55%),
+    radial-gradient(50rem 30rem at 50% 120%, var(--color-brand-glow-primary), transparent 60%);
+}
+
+.akb-shell {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 100vh;
+  min-height: 100dvh;
+  justify-content: center;
+  padding: 4rem 1rem 1.5rem;
+  box-sizing: border-box;
+}
+
+@media (min-width: 640px) {
+  .akb-shell {
+    padding: max(1.5rem, calc((100dvh - 30rem) / 2)) 1.5rem 1.5rem;
+  }
+}
+
+.akb-toolbar {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  z-index: 2;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.akb-layout {
+  display: grid;
+  width: 100%;
+  max-width: 64rem;
+  align-items: start;
+  gap: 2.5rem;
+}
+
+@media (min-width: 1024px) {
+  .akb-layout {
+    grid-template-columns: 1fr 1fr;
+    gap: 4rem;
+  }
+}
+
+/* ── Brand panel (wide screens only, like the app) ────────────────────── */
+.akb-brand {
+  display: none;
+}
+
+@media (min-width: 1024px) {
+  .akb-brand {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    padding: 2rem 1rem 0 0;
+  }
+}
+
+.akb-brand__headline {
+  margin: 0;
+  max-width: 24rem;
+  font-family: var(--font-family-display);
+  font-size: 1.875rem;
+  line-height: 2.25rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--color-text-primary);
+}
+
+.akb-brand__lead {
+  margin: -0.75rem 0 0;
+  max-width: 28rem;
+  font-size: 0.9375rem;
+  line-height: 1.625;
+  color: var(--color-text-secondary);
+}
+
+.akb-brand__features {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.akb-brand__features li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+.akb-feature-tile {
+  display: inline-grid;
+  width: 2.125rem;
+  height: 2.125rem;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: var(--radius-container);
+  color: var(--color-on-brand);
+  box-shadow: var(--shadow-medium);
+}
+
+.akb-feature-tile .akb-icon {
+  width: 1.0625rem;
+  height: 1.0625rem;
+}
+
+.akb-feature-tile--knowledge {
+  background: linear-gradient(135deg, var(--color-brand-primary), var(--color-brand-primary-2));
+}
+
+.akb-feature-tile--memory {
+  background: linear-gradient(135deg, var(--color-brand-spark), color-mix(in srgb, var(--color-brand-spark) 80%, var(--color-warning)));
+}
+
+.akb-feature-tile--agent {
+  background: linear-gradient(135deg, var(--color-brand-primary-2), color-mix(in srgb, var(--color-brand-primary-2) 70%, var(--color-success)));
+}
+
+/* ── Logo: the app's CSS-only mark (src/components/logo.tsx) ──────────── */
+.akb-logo {
+  --logo-size: 2.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.akb-logo--lg {
+  --logo-size: 2.625rem;
+}
+
+.akb-logo__mark {
+  position: relative;
+  display: inline-grid;
+  width: var(--logo-size);
+  height: var(--logo-size);
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 36%;
+  background: linear-gradient(135deg, var(--color-brand-primary), var(--color-brand-primary-2));
+  color: var(--color-on-brand);
+  font-family: var(--font-family-display);
+  font-size: calc(var(--logo-size) * 0.5);
+  font-weight: 600;
+  line-height: 1;
+  filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--color-brand-primary) 18%, transparent));
+}
+
+.akb-logo__spark {
+  position: absolute;
+  right: calc(var(--logo-size) * 0.14);
+  bottom: calc(var(--logo-size) * 0.16);
+  width: calc(var(--logo-size) * 0.16);
+  height: calc(var(--logo-size) * 0.16);
+  border-radius: var(--radius-pill);
+  background: var(--color-brand-spark);
+}
+
+.akb-logo__text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1;
+}
+
+.akb-logo__wordmark {
+  font-family: var(--font-family-display);
+  font-size: calc(var(--logo-size) * 0.62);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(92deg, var(--color-brand-wordmark-from) 0%, var(--color-brand-wordmark-via) 45%, var(--color-brand-spark) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.akb-logo__subtitle {
+  margin-top: 0.25rem;
+  white-space: nowrap;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: var(--color-text-secondary);
+}
+
+/* ── Card column ──────────────────────────────────────────────────────── */
+.akb-column {
+  width: 100%;
+  max-width: 28rem;
+  margin: 0 auto;
+}
+
+.akb-column__logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 2rem;
+}
+
+@media (min-width: 1024px) {
+  .akb-column__logo {
+    display: none;
+  }
+}
+
+.akb-card {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 1.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-container);
+  background: var(--color-background-card);
+  box-shadow: var(--shadow-high);
+}
+
+@media (min-width: 640px) {
+  .akb-card {
+    padding: 2rem;
+  }
+}
+
+/* PatternFly's .pf-v5-c-login__main (kcLoginMain) adds its own frame. */
+.akb-card.pf-v5-c-login__main {
+  grid-area: auto;
+  margin: 0;
+}
+
+.akb-card__title {
+  margin: 0;
+  font-family: var(--font-family-display);
+  font-size: 1.25rem;
+  line-height: 1.75rem;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  color: var(--color-text-primary);
+}
+
+.akb-card__title:focus {
+  outline: none;
+}
+
+.akb-card__lead {
+  margin: 0.25rem 0 1.25rem;
+  color: var(--color-text-secondary);
+}
+
+.akb-card__required {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+.akb-card__username {
+  margin-top: 1rem;
+}
+
+.akb-card__body {
+  margin-top: 1rem;
+}
+
+.akb-card__body > .akb-card__lead:first-child {
+  margin-top: -0.75rem;
+}
+
+.akb-card__aside-action {
+  margin-top: 1rem;
+}
+
+.akb-card__info {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--color-border);
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+
+.akb-footer {
+  margin-top: 1.25rem;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+/* ── Primitives ───────────────────────────────────────────────────────── */
+.akb-icon {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+  vertical-align: -0.125em;
+}
+
+.akb-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.akb-button {
+  display: inline-flex;
+  box-sizing: border-box;
+  min-height: var(--size-element-md);
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0 1rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  font: inherit;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-in-out),
+    border-color var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out);
+}
+
+.akb-button:focus-visible,
+.akb-icon-button:focus-visible,
+.akb-locale__select:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.akb-button--lg {
+  min-height: var(--size-element-lg);
+  padding: 0 1.25rem;
+  font-size: 1rem;
+}
+
+@media (min-width: 640px) {
+  .akb-button--lg {
+    min-height: var(--size-element-lg);
+  }
+}
+
+.akb-button--block {
+  display: flex;
+  width: 100%;
+}
+
+.akb-button--primary {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  box-shadow: var(--shadow-low);
+}
+
+.akb-button--primary:hover {
+  background: var(--color-accent-hover);
+  color: var(--color-on-accent);
+}
+
+.akb-button--outline {
+  border-color: var(--color-border);
+  background: var(--color-background-card);
+  color: var(--color-text-primary);
+}
+
+.akb-button--outline:hover {
+  border-color: var(--color-border-emphasized);
+  background: var(--color-background-muted);
+  color: var(--color-text-primary);
+}
+
+.akb-button[aria-disabled="true"],
+.akb-button:disabled,
+.akb-button--busy {
+  opacity: 0.5;
+  cursor: default;
+  pointer-events: none;
+}
+
+.akb-icon-button {
+  display: inline-grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-background-card);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.akb-icon-button:hover {
+  background: var(--color-background-hover);
+}
+
+/* Without script the toggle could not do anything: leave it out. */
+:root:not(.akb-js) .akb-theme-toggle {
+  display: none;
+}
+
+.akb-theme-toggle__icon {
+  display: none;
+  line-height: 0;
+}
+
+:root[data-theme-preference="system"] .akb-theme-toggle__icon--system,
+:root[data-theme-preference="light"] .akb-theme-toggle__icon--light,
+:root[data-theme-preference="dark"] .akb-theme-toggle__icon--dark,
+:root:not([data-theme-preference]) .akb-theme-toggle__icon--system {
+  display: inline;
+}
+
+/* Without scripts the toggle cannot do anything; do not offer it. */
+:root:not(.akb-js) .akb-theme-toggle {
+  display: none;
+}
+
+.akb-locale {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-secondary);
+}
+
+.akb-locale .akb-icon {
+  position: absolute;
+  left: 0.625rem;
+  pointer-events: none;
+}
+
+.akb-locale__select {
+  height: 2.25rem;
+  padding: 0 0.75rem 0 2rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-background-card);
+  color: var(--color-text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.akb-alert {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin: 1rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid;
+  border-radius: var(--radius-control);
+  font-size: 0.875rem;
+}
+
+.akb-alert .akb-icon {
+  margin-top: 0.125rem;
+}
+
+.akb-alert__text {
+  margin: 0;
+}
+
+.akb-alert--error {
+  border-color: color-mix(in srgb, var(--color-error) 30%, transparent);
+  background: var(--color-error-muted);
+  color: var(--color-on-error-muted);
+}
+
+.akb-alert--warning {
+  border-color: color-mix(in srgb, var(--color-warning) 30%, transparent);
+  background: var(--color-warning-muted);
+  color: var(--color-on-warning-muted);
+}
+
+.akb-alert--success {
+  border-color: color-mix(in srgb, var(--color-success) 30%, transparent);
+  background: var(--color-success-muted);
+  color: var(--color-on-success-muted);
+}
+
+.akb-alert--info {
+  border-color: color-mix(in srgb, var(--color-info) 30%, transparent);
+  background: var(--color-info-muted);
+  color: var(--color-on-info-muted);
+}
+
+.akb-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.5rem 0 1rem;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+.akb-divider::before,
+.akb-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: var(--color-border);
+}
+
+.akb-form-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 1.25rem 0 0;
+}
+
+.akb-form-actions--split {
+  flex-direction: row;
+}
+
+.akb-form-actions--split > .akb-button {
+  flex: 1;
+}
+
+.akb-providers__list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.akb-message .akb-alert {
+  margin-top: 0;
+}
+
+.akb-message__trace {
+  margin: 0.75rem 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+/* ── Consent ──────────────────────────────────────────────────────────── */
+.akb-consent__scopes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-background-muted);
+  list-style: none;
+}
+
+.akb-consent__scope {
+  display: flex;
+  gap: 0.625rem;
+  align-items: flex-start;
+  color: var(--color-text-primary);
+}
+
+.akb-consent__check {
+  margin-top: 0.125rem;
+  color: var(--color-success);
+  line-height: 0;
+}
+
+.akb-consent__terms,
+.akb-consent__revoke {
+  margin: 0.875rem 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+/* ── Expired page: resuming first, explaining second ─────────────────── */
+.akb-expired__resuming,
+.akb-expired__title-resuming {
+  display: none;
+}
+
+:root.akb-js:not(.akb-expired-explain) .akb-expired__resuming,
+:root.akb-js:not(.akb-expired-explain) .akb-expired__title-resuming {
+  display: block;
+}
+
+:root.akb-js:not(.akb-expired-explain) .akb-expired__explain,
+:root.akb-js:not(.akb-expired-explain) .akb-expired__title-explain {
+  display: none;
+}
+
+.akb-form-actions--stack {
+  flex-direction: column;
+}
+
+/* ── Inherited PatternFly pages, in AKB's control style ──────────────── */
+.akb-card .pf-v5-c-form {
+  gap: 1rem;
+}
+
+.akb-card .pf-v5-c-form__label-text,
+.akb-card .pf-v5-c-form__label {
+  color: var(--color-text-primary);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.akb-card .pf-v5-c-form-control {
+  min-height: var(--size-element-lg);
+  border-radius: var(--radius-control);
+  background: var(--color-background-card);
+  color: var(--color-text-primary);
+  font-size: 1rem;
+}
+
+@media (min-width: 640px) {
+  .akb-card .pf-v5-c-form-control {
+    min-height: var(--size-element-md);
+    font-size: 0.875rem;
+  }
+}
+
+.akb-card .pf-v5-c-form-control::before {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+}
+
+.akb-card .pf-v5-c-form-control::after {
+  border: 0;
+}
+
+.akb-card .pf-v5-c-form-control:hover::before {
+  border-color: var(--color-border-emphasized);
+}
+
+.akb-card .pf-v5-c-form-control:focus-within::before {
+  border-color: var(--color-focus-ring);
+  box-shadow: 0 0 0 1px var(--color-focus-ring);
+}
+
+.akb-card .pf-v5-c-form-control.pf-m-error::before {
+  border-color: var(--color-error);
+}
+
+.akb-card .pf-v5-c-form-control > input,
+.akb-card .pf-v5-c-form-control > select,
+.akb-card .pf-v5-c-form-control > textarea {
+  color: inherit;
+  font: inherit;
+}
+
+/* keycloak.v2's user-profile fields put the form-control class on the input
+   as well as on its wrapper. The inner one is positioned and opaque, so it
+   would paint over the wrapper's border. */
+.akb-card .pf-v5-c-form-control > .pf-v5-c-form-control {
+  position: static;
+  background: transparent;
+}
+
+/* The control's own ring (::before, above) is the focus indicator; the
+   browser's outline on the bare input would draw a second one inside it. */
+.akb-card .pf-v5-c-form-control > input:focus,
+.akb-card .pf-v5-c-form-control > select:focus,
+.akb-card .pf-v5-c-form-control > textarea:focus {
+  outline: none;
+}
+
+.akb-card .pf-v5-c-form-control.pf-m-readonly {
+  background: var(--color-background-muted);
+}
+
+.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control {
+  --pf-v5-c-button--m-control--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-control--hover--BackgroundColor: var(--color-background-hover);
+  --pf-v5-c-button--m-control--focus--BackgroundColor: var(--color-background-hover);
+  --pf-v5-c-button--m-control--active--BackgroundColor: var(--color-background-active);
+  --pf-v5-c-button--m-control--Color: var(--color-text-secondary);
+  --pf-v5-c-button--m-control--hover--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--focus--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--active--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--after--BorderTopColor: var(--color-border);
+  --pf-v5-c-button--m-control--after--BorderRightColor: var(--color-border);
+  --pf-v5-c-button--m-control--after--BorderBottomColor: var(--color-border);
+  --pf-v5-c-button--m-control--after--BorderLeftColor: var(--color-border);
+  --pf-v5-c-button--m-control--hover--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--hover--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--focus--after--BorderBottomColor: var(--color-focus-ring);
+  --pf-v5-c-button--m-control--focus--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--active--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--active--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--BorderRadius: 0 var(--radius-control) var(--radius-control) 0;
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+}
+
+.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control::after {
+  border-radius: inherit;
+  border-left-width: 0;
+}
+
+.akb-card .pf-v5-c-input-group .pf-v5-c-form-control::before {
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
+}
+
+/* A field with a button (password + show) is one control: it takes the
+   focus ring as a whole, not just its input half. */
+.akb-card .pf-v5-c-input-group {
+  border-radius: var(--radius-control);
+}
+
+.akb-card .pf-v5-c-input-group:focus-within {
+  box-shadow: 0 0 0 1px var(--color-focus-ring);
+}
+
+.akb-card .pf-v5-c-input-group:focus-within .pf-v5-c-form-control::before {
+  border-color: var(--color-focus-ring);
+  box-shadow: none;
+}
+
+.akb-card .pf-v5-c-input-group:focus-within .pf-v5-c-button.pf-m-control {
+  --pf-v5-c-button--m-control--after--BorderTopColor: var(--color-focus-ring);
+  --pf-v5-c-button--m-control--after--BorderRightColor: var(--color-focus-ring);
+  --pf-v5-c-button--m-control--after--BorderBottomColor: var(--color-focus-ring);
+  --pf-v5-c-button--m-control--hover--after--BorderBottomColor: var(--color-focus-ring);
+  --pf-v5-c-button--m-control--focus--after--BorderBottomColor: var(--color-focus-ring);
+}
+
+.akb-card .pf-v5-c-helper-text__item.pf-m-error,
+.akb-card .kc-feedback-text.pf-m-error {
+  color: var(--color-error);
+  font-size: 0.75rem;
+}
+
+.akb-card .pf-v5-c-button {
+  border-radius: var(--radius-control);
+  font-weight: 500;
+}
+
+/* Choices stacked straight in a form group (base's link-confirm page); a
+   horizontal action group spaces its own buttons. */
+.akb-card .pf-v5-c-form__group > .pf-v5-c-button.pf-m-block + .pf-v5-c-button.pf-m-block {
+  margin-top: 0.75rem;
+}
+
+.akb-card .pf-v5-c-button.pf-m-primary {
+  --pf-v5-c-button--m-primary--BackgroundColor: var(--color-accent);
+  --pf-v5-c-button--m-primary--hover--BackgroundColor: var(--color-accent-hover);
+  --pf-v5-c-button--m-primary--focus--BackgroundColor: var(--color-accent-hover);
+  --pf-v5-c-button--m-primary--active--BackgroundColor: var(--color-accent-hover);
+  --pf-v5-c-button--m-primary--Color: var(--color-on-accent);
+  --pf-v5-c-button--m-primary--hover--Color: var(--color-on-accent);
+  min-height: var(--size-element-lg);
+}
+
+.akb-card .pf-v5-c-button.pf-m-secondary {
+  --pf-v5-c-button--m-secondary--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-secondary--hover--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-secondary--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-secondary--hover--BackgroundColor: var(--color-background-muted);
+  --pf-v5-c-button--m-secondary--after--BorderColor: var(--color-border);
+  --pf-v5-c-button--m-secondary--hover--after--BorderColor: var(--color-border-emphasized);
+  min-height: var(--size-element-lg);
+}
+
+.akb-card .pf-v5-c-button.pf-m-link {
+  --pf-v5-c-button--m-link--Color: var(--color-link);
+  --pf-v5-c-button--m-link--hover--Color: var(--color-link-hover);
+}
+
+.akb-card .pf-v5-c-button:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.akb-card .pf-v5-c-check__label {
+  color: var(--color-text-primary);
+}
+
+.akb-card .pf-v5-c-alert {
+  --pf-v5-c-alert--BackgroundColor: var(--color-background-muted);
+  --pf-v5-c-alert--BoxShadow: none;
+  border-radius: var(--radius-control);
+}
+
+.akb-card a:not(.akb-button):not(.pf-v5-c-button) {
+  color: var(--color-link);
+}
+
+.akb-card a:not(.akb-button):not(.pf-v5-c-button):hover {
+  color: var(--color-link-hover);
+}
+
+/* Kept from keycloak.v2's styles.css, which this theme does not load. */
+.kc-login-tooltip {
+  position: relative;
+  display: inline-block;
+}
+
+.kc-login-tooltip .kc-tooltip-text {
+  position: absolute;
+  top: -3px;
+  left: 160%;
+  z-index: 3;
+  min-width: 130px;
+  padding: 5px;
+  border-radius: var(--radius-chip);
+  background: var(--color-text-primary);
+  color: var(--color-background-card);
+  text-align: center;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity var(--duration-base);
+}
+
+.kc-login-tooltip:hover .kc-tooltip-text,
+.kc-login-tooltip:focus-visible .kc-tooltip-text {
+  visibility: visible;
+  opacity: 1;
+}
+
+#kc-recovery-codes-list {
+  columns: 2;
+}
+
+#certificate_subjectDN {
+  overflow-wrap: break-word;
+}
+
+#kc-verify-email-form {
+  margin-top: 24px;
+  margin-bottom: 24px;
+}
+
+#kc-code pre code {
+  word-break: break-all;
+}
+
+/* ── Motion and forced colours ────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .akb-button,
+  .kc-login-tooltip .kc-tooltip-text {
+    transition: none;
+  }
+}
+
+:root:not([data-theme-control-ready="true"]) .akb-theme-toggle * {
+  transition: none;
+}
+
+@media (forced-colors: active) {
+  .akb-card,
+  .akb-button,
+  .akb-icon-button,
+  .akb-alert,
+  .akb-consent__scopes {
+    border: 1px solid CanvasText;
+  }
+
+  .akb-logo__wordmark {
+    background: none;
+    color: CanvasText;
+  }
+
+  body.akb-page::before {
+    display: none;
+  }
+
+  /* Box shadows vanish in forced colours; the focus ring must not. */
+  .akb-card .pf-v5-c-input-group:focus-within,
+  .akb-card .pf-v5-c-form-control:not(.pf-v5-c-input-group .pf-v5-c-form-control):focus-within {
+    outline: 2px solid Highlight;
+    outline-offset: 1px;
+  }
+}

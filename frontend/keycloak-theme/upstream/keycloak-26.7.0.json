@@ -1,0 +1,39 @@
+{
+  "keycloak": "26.7.0",
+  "image": "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13",
+  "jar": "/opt/keycloak/lib/lib/main/org.keycloak.keycloak-themes-26.7.0.jar",
+  "overrides": {
+    "error.ftl": {
+      "upstream": "theme/base/login/error.ftl",
+      "sha256": "1a358dc521c16ac678d72de5dfa1a4fa356f2fb0e532cadfffcc6e6caa283bc3"
+    },
+    "info.ftl": {
+      "upstream": "theme/base/login/info.ftl",
+      "sha256": "77019d077436cdcacf88c67ac809381b6cb0257d1223f2882ad1eef75f4ef457"
+    },
+    "login-config-totp.ftl": {
+      "upstream": "theme/keycloak.v2/login/login-config-totp.ftl",
+      "sha256": "d7a2a85b6f73e034300a31ed9da378f79e42db50e76a5e785598a4c8b4259d55"
+    },
+    "login-oauth-grant.ftl": {
+      "upstream": "theme/keycloak.v2/login/login-oauth-grant.ftl",
+      "sha256": "855c74189b438c5ae2950aef9a196de92772ffa0871e34ed5b24a64500a5396c"
+    },
+    "login-page-expired.ftl": {
+      "upstream": "theme/base/login/login-page-expired.ftl",
+      "sha256": "df4e9795782f512c97f67fdaa08cd382f1c300639bbc87a27cab302e08f3078c"
+    },
+    "login.ftl": {
+      "upstream": "theme/keycloak.v2/login/login.ftl",
+      "sha256": "c9ec5c28a14aa30f0d6887044f431c2c04cbe1ad7732c1bf4a1c3c89250efe31"
+    },
+    "logout-confirm.ftl": {
+      "upstream": "theme/base/login/logout-confirm.ftl",
+      "sha256": "9a5f5070691bd7d122afd621693402778c0ec7bf8a79304aa20600c18c4e6f06"
+    },
+    "template.ftl": {
+      "upstream": "theme/keycloak.v2/login/template.ftl",
+      "sha256": "6221a3176c73a3fd67abc97076deb9cef112378ce157735a78bd865800315b37"
+    }
+  }
+}

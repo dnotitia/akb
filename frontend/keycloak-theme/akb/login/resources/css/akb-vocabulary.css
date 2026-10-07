@@ -1,0 +1,105 @@
+/* The theme's vocabulary: the only names templates and component CSS use.
+ *
+ * Names follow DNUI's semantic vocabulary, and every value here is a reference
+ * into akb-tokens.generated.css, which is copied from the app's src/index.css.
+ * When AKB's tokens come from a DNUI theme instead, only this file's right-hand
+ * sides change; nothing that consumes these names does.
+ *
+ * Two rules keep the seam honest (keycloak-theme/tests checks both):
+ *   - no colour literal anywhere outside the generated file;
+ *   - nothing outside this file references an --akb-* token directly.
+ *
+ * "accent" is DNUI's interactive colour. In AKB that role is teal
+ * (--color-primary); AKB's orange is decoration and only the logo uses it. */
+:root {
+  /* Surfaces */
+  --color-background-body: var(--akb-color-background);
+  --color-background-card: var(--akb-color-surface);
+  --color-background-muted: var(--akb-color-surface-muted);
+  --color-background-hover: var(--akb-color-surface-hover);
+  --color-background-active: var(--akb-color-surface-active);
+  --color-background-selected: var(--akb-color-surface-selected);
+  --color-on-background-selected: var(--akb-color-surface-selected-foreground);
+
+  /* Text */
+  --color-text-primary: var(--akb-color-foreground);
+  --color-text-secondary: var(--akb-color-foreground-muted);
+  --color-text-tertiary: var(--akb-color-subtle);
+
+  /* Lines */
+  --color-border: var(--akb-color-border);
+  --color-border-emphasized: var(--akb-color-border-strong);
+  --color-border-input: var(--akb-color-input);
+
+  /* Interaction */
+  --color-accent: var(--akb-color-primary);
+  --color-on-accent: var(--akb-color-primary-foreground);
+  --color-accent-hover: color-mix(in srgb, var(--akb-color-primary) 90%, var(--akb-color-surface));
+  --color-link: var(--akb-color-link);
+  --color-link-hover: var(--akb-color-link-hover);
+  --color-focus-ring: var(--akb-color-ring);
+
+  /* State: base, soft background, text on the soft background */
+  --color-error: var(--akb-color-danger);
+  --color-error-muted: var(--akb-color-danger-soft);
+  --color-on-error-muted: var(--akb-color-danger-soft-foreground);
+  --color-success: var(--akb-color-success);
+  --color-success-muted: var(--akb-color-success-soft);
+  --color-on-success-muted: var(--akb-color-success-soft-foreground);
+  --color-warning: var(--akb-color-warning);
+  --color-warning-muted: var(--akb-color-warning-soft);
+  --color-on-warning-muted: var(--akb-color-warning-soft-foreground);
+  --color-info: var(--akb-color-info);
+  --color-info-muted: var(--akb-color-info-soft);
+  --color-on-info-muted: var(--akb-color-info-soft-foreground);
+
+  /* Brand: the logo and the page glow, never interactive */
+  --color-brand-primary: var(--akb-color-teal);
+  --color-brand-primary-2: var(--akb-color-teal-2);
+  --color-brand-spark: var(--akb-color-orange);
+  --color-brand-wordmark-from: var(--akb-color-teal);
+  --color-brand-wordmark-via: var(--akb-color-teal-2);
+  --color-on-brand: var(--akb-color-primary-foreground);
+  --color-brand-glow-primary: color-mix(in srgb, var(--akb-color-teal-2) 10%, transparent);
+  --color-brand-glow-spark: color-mix(in srgb, var(--akb-color-orange) 7%, transparent);
+
+  /* Type */
+  --font-family-body: var(--akb-font-sans);
+  --font-family-display: var(--akb-font-display);
+  --font-family-mono: var(--akb-font-mono);
+
+  /* Shape and depth */
+  --radius-control: var(--akb-radius-md);
+  --radius-container: var(--akb-radius-lg);
+  --radius-chip: var(--akb-radius-sm);
+  --radius-pill: var(--akb-radius-full);
+  --shadow-low: var(--akb-shadow-sm);
+  --shadow-medium: var(--akb-shadow-md);
+  --shadow-high: var(--akb-shadow-lg);
+
+  /* Motion */
+  --duration-fast: var(--akb-duration-fast);
+  --duration-base: var(--akb-duration-base);
+  --duration-slow: var(--akb-duration-slow);
+  --ease-out: var(--akb-ease-out);
+  --ease-in-out: var(--akb-ease-in-out);
+
+  /* Control sizes: the app's h-11 on touch widths and h-10 from sm up */
+  --size-element-md: 2.5rem;
+  --size-element-lg: 2.75rem;
+}
+
+/* The wordmark gradient starts at the app's deep teal, which disappears on
+ * the dark canvas. Dark mode starts it at the dark palette's teal-family link
+ * colour instead; the mark and the spark keep their brand colours. */
+:root[data-theme="dark"] {
+  --color-brand-wordmark-from: var(--akb-color-link);
+  --color-brand-wordmark-via: color-mix(in srgb, var(--akb-color-link) 55%, var(--akb-color-orange));
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --color-brand-wordmark-from: var(--akb-color-link);
+    --color-brand-wordmark-via: color-mix(in srgb, var(--akb-color-link) 55%, var(--akb-color-orange));
+  }
+}

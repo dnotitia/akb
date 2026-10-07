@@ -125,3 +125,45 @@ jobs:
         env:
           CI: "1"
         run: pnpm run test:e2e:mock
+
+  keycloak-theme:
+    name: keycloak login theme (real Keycloak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for the theme harness
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Starts the pinned Keycloak with the assembled theme, checks the
+      # replaced originals against that image, then walks every page.
+      - name: Render the login theme in Keycloak and check every page
+        working-directory: frontend
+        env:
+          CI: "1"
+        run: pnpm run theme:harness
+
+      - name: Keep the failing pages
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keycloak-theme-results
+          path: frontend/test-results/keycloak-theme
+          retention-days: 7
