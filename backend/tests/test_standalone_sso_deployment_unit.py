@@ -225,3 +225,40 @@ def test_bundled_keycloak_does_not_serve_its_own_client_registration_endpoint():
     }
     helm = (_ROOT / "deploy" / "helm" / "akb" / "templates" / "sso.yaml").read_text(encoding="utf-8")
     assert '- {name: KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED, value: "false"}' in helm
+
+
+def _frontend_image() -> str:
+    with (_K8S / "frontend.yaml").open(encoding="utf-8") as source:
+        frontend = next(
+            item for item in yaml.safe_load_all(source) if isinstance(item, dict) and item.get("kind") == "Deployment"
+        )
+    return frontend["spec"]["template"]["spec"]["containers"][0]["image"]
+
+
+def test_bundled_keycloak_takes_its_login_theme_from_the_frontend_image():
+    """The frontend image carries the assembled theme; Keycloak copies it in.
+
+    The init container names the frontend Deployment's own image, so whatever
+    substitutes that image (deploy.sh, a kustomize `images:` entry) moves the
+    theme with it, and a new frontend image restarts Keycloak onto the theme
+    built from the same commit. Keycloak's own image stays the pinned upstream.
+    """
+    keycloak = _one("keycloak.yaml", kind="StatefulSet", resource_name="keycloak")
+    spec = keycloak["spec"]["template"]["spec"]
+    init = {item["name"]: item for item in spec["initContainers"]}["login-theme"]
+    assert init["image"] == _frontend_image()
+    assert init["command"] == ["cp", "-R", "/usr/share/akb/keycloak-theme/akb/.", "/theme/"]
+    assert init["volumeMounts"] == [{"name": "login-theme", "mountPath": "/theme"}]
+    server = spec["containers"][0]
+    assert server["image"].startswith("quay.io/keycloak/keycloak:")
+    assert {"name": "login-theme", "mountPath": "/opt/keycloak/themes/akb", "readOnly": True} in server["volumeMounts"]
+    assert {"name": "login-theme", "emptyDir": {}} in spec["volumes"]
+
+
+def test_frontend_image_ships_the_assembled_login_theme_outside_the_web_root():
+    dockerfile = (_ROOT / "frontend" / "Dockerfile").read_text(encoding="utf-8")
+    builder, runtime = dockerfile.split("\nFROM nginx", 1)
+    assert "RUN pnpm run theme:assemble" in builder
+    # Not under /usr/share/nginx/html: nginx serves the app, Keycloak serves
+    # the theme, and nothing of one should be reachable through the other.
+    assert "COPY --from=builder /app/dist-keycloak-theme/akb /usr/share/akb/keycloak-theme/akb" in runtime

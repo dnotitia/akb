@@ -212,3 +212,16 @@ def test_postgres_persistent_volumes_use_a_subdirectory(manifest: Path):
     resources = [item for item in yaml.safe_load_all(manifest.read_text(encoding="utf-8")) if isinstance(item, dict)]
     statefulset = next(item for item in resources if item.get("kind") == "StatefulSet")
     assert _container_env(statefulset, "postgres")["PGDATA"] == ("/var/lib/postgresql/data/pgdata")
+
+
+def test_sso_profile_keycloak_takes_its_login_theme_from_the_frontend_image():
+    rendered = _render("standalone-sso")
+    frontend = _one(rendered, "Deployment", "frontend")
+    keycloak = _one(rendered, "StatefulSet", "keycloak")
+    spec = keycloak["spec"]["template"]["spec"]
+    init = {item["name"]: item for item in spec["initContainers"]}["login-theme"]
+    assert init["image"] == frontend["spec"]["template"]["spec"]["containers"][0]["image"]
+    assert init["command"] == ["cp", "-R", "/usr/share/akb/keycloak-theme/akb/.", "/theme/"]
+    server = spec["containers"][0]
+    assert {"name": "login-theme", "mountPath": "/opt/keycloak/themes/akb", "readOnly": True} in server["volumeMounts"]
+    assert {"name": "login-theme", "emptyDir": {}} in spec["volumes"]

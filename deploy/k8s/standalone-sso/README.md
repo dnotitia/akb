@@ -21,11 +21,12 @@ The bundle implements the product-administrator bootstrap and recovery slice:
    separate `akb-web`, `akb-admin`, and `akb-sso-manager` clients, the
    RSA-3072 active signing key, the signed broker-provenance mapper on
    `akb-web`, the realm's seven-day user-event settings, the brokered-account
-   password guard, the native product administrator, and the exact AKB
-   administrator projection.
+   password guard, the login presentation (AKB's login theme in English and
+   Korean), the native product administrator, and the exact AKB administrator
+   projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
-   non-secret `bundled-keycloak-v5` retirement receipt in the AKB database.
+   non-secret `bundled-keycloak-v6` retirement receipt in the AKB database.
 4. A subsequent init-container run is read-only and succeeds without either
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
@@ -267,13 +268,31 @@ Keycloak this overlay does not deploy may not carry the setting yet.
 The provider control writes the mapper whenever it configures or enables a
 provider in a realm that has the role, and refuses to enable one it cannot
 mark. A provider created or enabled in the Keycloak console has no mapper
-until it is configured or enabled through AKB. On a v5 receipt the guard is a
-startup gate, checked on every init-container run through the permanent
+until it is configured or enabled through AKB. From a v5 receipt on, the guard
+is a startup gate, checked on every init-container run through the permanent
 manager: a realm whose bound flows no longer deny the role is refused with
 `keycloak_brokered_account_guard_readback_failed`, and one with an enabled
 provider that does not grant it with
 `keycloak_identity_provider_guard_mapper_missing`. Add the mapper (or disable
 the provider) in the console to recover.
+
+## Sign-in pages
+
+The realm's sign-in pages use AKB's login theme (`frontend/keycloak-theme`),
+built from the app's own tokens and typeface, in light and dark, in English
+and Korean. The theme ships in the AKB frontend image, not in Keycloak's. The
+`login-theme` init container in `keycloak.yaml` names the frontend
+Deployment's image, so `deploy.sh` and a kustomize `images:` entry substitute
+both; it copies the theme into an `emptyDir` that Keycloak reads at
+`/opt/keycloak/themes/akb`. A new frontend image therefore restarts Keycloak
+onto the theme built from the same commit, and Keycloak's own image stays the
+pinned upstream one.
+
+The realm selects the theme (receipt v6, below). The administration client
+carries `akb.login.native-only=true`, so its sign-in page shows the password
+form only: `/admin` refuses identity-provider sign-ins, and a provider button
+there would lead nowhere. A Keycloak that has not received the theme serves
+its built-in pages and logs an error, so selecting it never locks anyone out.
 
 ## Upgrade an existing receipt
 
@@ -305,7 +324,8 @@ therefore cannot gain them through its own init container. A v3 receipt keeps
 converging read-only exactly as before and reports
 `receipt_profile=bundled-keycloak-v3` with `realm_events=pending_upgrade`.
 Supplying the one-time authority below to a v1, v2 or v3 installation applies
-the event settings together with the v5 guard and moves it straight to v5.
+the event settings together with the v5 guard and the v6 login presentation
+and moves it straight to v6.
 
 Each receipt profile is its own row; the older row stays exactly as it was. A
 backend image that predates a profile reads only the profiles it knows, so
@@ -316,23 +336,39 @@ reports `realm_events=converged`, or `realm_events=drift` with a warning when
 the settings were changed afterwards. Drift is reported; it is never a reason
 to refuse startup.
 
-`bundled-keycloak-v5` adds the brokered-account password guard above. A new
-install starts on v5. Binding a flow needs `manage-realm` and marking accounts
-needs `manage-users`, neither of which the permanent manager holds, so an
-existing install reaches v5 only through the one-time authority below. Without
+`bundled-keycloak-v5` adds the brokered-account password guard above.
+Binding a flow needs `manage-realm` and marking accounts needs `manage-users`,
+neither of which the permanent manager holds, so an existing install reaches
+v5 only through the one-time authority below. Without
 it a v4 receipt keeps converging read-only and reports
 `brokered_account_guard=pending_upgrade` (v3 and older report the events as
 pending too). With it, the init container installs the guard, adds the mapper
 to every existing provider, grants the role to the accounts each provider
 already links (a disabled provider included: that is where a revoked upstream
-leaves people), and moves the install to v5 (`mode=upgrade-v4-to-v5`, or
-`upgrade-v1-to-v5` through `upgrade-v3-to-v5`). A move from v4 leaves the event
-settings as the realm has them. If the realm binds a browser or direct-grant
+leaves people), and moves the install on (to v6 today, with the login
+presentation below). A move from v4 leaves the event settings as the realm has
+them. If the realm binds a browser or direct-grant
 flow other than Keycloak's built-in one or AKB's copy, the upgrade stops before
 changing anything (`keycloak_authentication_flow_binding_unexpected`). The v5
 receipt is a new row: an image that predates v5 still reads its v4 receipt,
 and the realm it reads back keeps the guard, which that image neither checks
 nor removes.
+
+`bundled-keycloak-v6` adds the login presentation: the realm's login theme is
+`akb`, its languages are English and Korean (English by default), and the
+administration client carries `akb.login.native-only=true`. A new install
+starts on v6. These are realm and client settings the permanent manager cannot
+change, so an existing install reaches v6 only through the one-time authority
+below. Without it a v5 receipt keeps converging read-only, its guard still a
+startup gate, and reports `login_presentation=pending_upgrade`. With it, the
+init container sends only those settings (the realm's other settings and the
+client's secret, redirects and other attributes stay as they are) and moves
+the install to v6 (`mode=upgrade-v5-to-v6`, or `upgrade-v1-to-v6` through
+`upgrade-v4-to-v6` together with the steps those receipts lack). From v6 on,
+every run reports `login_presentation=converged`, or `login_presentation=drift`
+with a warning when the settings were changed afterwards; like the events, it
+never blocks startup. The v6 receipt is a new row: an image that predates v6
+still reads its v5 receipt and keeps enforcing the guard.
 
 Before rolling this version onto such an installation, create exactly one
 temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
@@ -361,16 +397,17 @@ kubectl -n akb rollout status statefulset/keycloak --timeout=300s
 ```
 
 Then deploy the new AKB overlay. Its init container must report one of
-`mode=upgrade-v1-to-v5` through `mode=upgrade-v4-to-v5`, or
-`mode=upgrade-v5-callback`, and
-`receipt_profile=bundled-keycloak-v5`. The lifecycle first validates the exact
+`mode=upgrade-v1-to-v6` through `mode=upgrade-v5-to-v6`, or
+`mode=upgrade-v6-callback`, and
+`receipt_profile=bundled-keycloak-v6`. The lifecycle first validates the exact
 receipt-bound source read-back using the permanent manager, reconciles only the
 `akb-web` client metadata and, when required, signed broker-provenance mapper,
 applies and reads back the realm event settings when the source predates v4,
-installs and reads back the brokered-account password guard, revalidates the
+installs and reads back the brokered-account password guard when the source
+predates v5, applies and reads back the login presentation, revalidates the
 complete profile and the guard through the permanent manager, deletes the
 temporary upgrade client, proves both its old and newly requested tokens are
-rejected, and only then writes the v5 receipt (or compare-and-swaps it on a v5
+rejected, and only then writes the v6 receipt (or compare-and-swaps it on a v6
 callback change). Retrying after a partial client
 update accepts only the exact receipt source or exact target metadata, so the
 process is convergent without accepting arbitrary drift. It does not require

@@ -122,6 +122,7 @@ class _Control:
         self.realm_events = False
         self.brokered_account_guard = False
         self.every_provider_marked = True
+        self.login_presentation = False
         self.native_client_registration_disabled_state: bool | None = True
         self.events: list[str] = []
         self._readback = _readback()
@@ -143,10 +144,12 @@ class _Control:
         self.events.append("reconcile-keycloak")
         self.manager_available = True
         self.callback_uri = spec.backchannel_logout_uri_effective
-        # The adapter converges the realm event settings and the
-        # brokered-account password guard inside reconcile.
+        # The adapter converges the realm event settings, the
+        # brokered-account password guard and the login presentation inside
+        # reconcile.
         self.realm_events = True
         self.brokered_account_guard = True
+        self.login_presentation = True
         return self._readback
 
     async def apply_realm_events(self, _spec, *, token: str):
@@ -173,6 +176,16 @@ class _Control:
             raise StandaloneSSOBootstrapError("keycloak_brokered_account_guard_readback_failed")
         if not self.every_provider_marked:
             raise StandaloneSSOBootstrapError("keycloak_identity_provider_guard_mapper_missing")
+
+    async def apply_login_presentation(self, _spec, *, token: str):
+        assert token == "upgrade-token"
+        self.events.append("apply-login-presentation")
+        self.login_presentation = True
+
+    async def login_presentation_converged(self, _spec, *, management_token: str):
+        assert management_token == "manager-token"
+        self.events.append("readback-login-presentation")
+        return self.login_presentation
 
     async def native_client_registration_disabled(self, _spec):
         return self.native_client_registration_disabled_state
@@ -333,6 +346,7 @@ async def test_fresh_bootstrap_retires_temporary_admin_only_after_akb_projection
         "readback-keycloak",
         "readback-realm-events",
         "readback-brokered-account-guard",
+        "readback-login-presentation",
         "retire-bootstrap",
         "assert-bootstrap-retired",
         "record-retirement-receipt",
@@ -340,9 +354,10 @@ async def test_fresh_bootstrap_retires_temporary_admin_only_after_akb_projection
     ]
     assert receipts.receipt == _receipt()
     assert report["mode"] == "fresh"
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "converged"
+    assert report["login_presentation"] == "converged"
     assert report["bootstrap_admin_retired"] is True
     assert report["product_admin_subject"] == _readback().product_admin_subject
     assert report["akb_user_id"] == "11111111-1111-4111-8111-111111111111"
@@ -364,6 +379,7 @@ async def test_completed_bootstrap_rerun_is_read_only_and_does_not_need_temp_adm
     control = _Control(manager_available=True, bootstrap_available=False)
     control.realm_events = True
     control.brokered_account_guard = True
+    control.login_presentation = True
     receipts = _ReceiptStore(control.events, _receipt())
 
     async def _provision(**_kwargs):
@@ -393,11 +409,12 @@ async def test_completed_bootstrap_rerun_is_read_only_and_does_not_need_temp_adm
         "readback-keycloak",
         "readback-realm-events",
         "readback-brokered-account-guard",
+        "readback-login-presentation",
     ]
     assert report["mode"] == "readback"
     assert report["keycloak_mutated"] is False
     assert report["akb_admin_created"] is False
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "converged"
 
@@ -450,10 +467,12 @@ async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it
         "upgrade-keycloak-to-current",
         "apply-realm-events",
         "apply-brokered-account-guard",
+        "apply-login-presentation",
         "acquire-management",
         "readback-keycloak",
         "readback-realm-events",
         "readback-brokered-account-guard",
+        "readback-login-presentation",
         "retire-upgrade",
         "assert-upgrade-retired",
         "record-retirement-receipt",
@@ -462,9 +481,9 @@ async def test_legacy_v1_receipt_uses_one_time_upgrade_authority_then_retires_it
     assert receipts.receipt == _receipt(
         retired_client_id=_spec().upgrade_client_id,
     )
-    assert report["mode"] == "upgrade-v1-to-v5"
+    assert report["mode"] == "upgrade-v1-to-v6"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "converged"
     assert control.upgrade_available is False
@@ -519,6 +538,7 @@ async def test_legacy_v2_public_callback_promotes_receipt_without_mutation_autho
     # the guard, so the lifecycle reads neither and names the pending steps.
     assert report["realm_events"] == "pending_upgrade"
     assert report["brokered_account_guard"] == "pending_upgrade"
+    assert report["login_presentation"] == "pending_upgrade"
 
 
 async def test_v2_readback_promotion_preserves_later_exact_callback_migration_retry():
@@ -587,9 +607,9 @@ async def test_v2_readback_promotion_preserves_later_exact_callback_migration_re
         record_retirement_receipt=receipts.record,
     )
 
-    assert report["mode"] == "upgrade-v3-to-v5"
+    assert report["mode"] == "upgrade-v3-to-v6"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert control.upgrade_available is False
     assert receipts.receipt.backchannel_logout_uri == internal_uri
     assert receipts.receipt.bootstrap_client_id == migration_spec.upgrade_client_id
@@ -608,7 +628,9 @@ async def test_v2_readback_promotion_preserves_later_exact_callback_migration_re
     assert settled["keycloak_mutated"] is False
 
 
-@pytest.mark.parametrize("profile", ["bundled-keycloak-v3", "bundled-keycloak-v4", "bundled-keycloak-v5"])
+@pytest.mark.parametrize(
+    "profile", ["bundled-keycloak-v3", "bundled-keycloak-v4", "bundled-keycloak-v5", "bundled-keycloak-v6"]
+)
 async def test_callback_migration_without_one_time_authority_fails_closed(profile):
     from app.services.standalone_sso_bootstrap import (
         StandaloneSSOBootstrapError,
@@ -683,9 +705,9 @@ async def test_legacy_v2_internal_callback_uses_bounded_upgrade_authority():
     assert "apply-realm-events" in control.events
     assert "apply-brokered-account-guard" in control.events
     assert "retire-upgrade" in control.events
-    assert report["mode"] == "upgrade-v2-to-v5"
+    assert report["mode"] == "upgrade-v2-to-v6"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
 
 
 async def test_legacy_v2_internal_callback_without_authority_fails_before_projection():
@@ -1186,9 +1208,10 @@ async def test_v3_install_without_upgrade_authority_keeps_booting_read_only():
     assert report["receipt_profile"] == "bundled-keycloak-v3"
     assert report["realm_events"] == "pending_upgrade"
     assert report["brokered_account_guard"] == "pending_upgrade"
+    assert report["login_presentation"] == "pending_upgrade"
 
 
-async def test_v3_install_with_upgrade_authority_applies_events_and_guard_and_adds_v5_receipt():
+async def test_v3_install_with_upgrade_authority_applies_every_setting_and_adds_v6_receipt():
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V3,
         bootstrap_standalone_sso,
@@ -1219,10 +1242,12 @@ async def test_v3_install_with_upgrade_authority_applies_events_and_guard_and_ad
         "provision-akb-admin",
         "apply-realm-events",
         "apply-brokered-account-guard",
+        "apply-login-presentation",
         "acquire-management",
         "readback-keycloak",
         "readback-realm-events",
         "readback-brokered-account-guard",
+        "readback-login-presentation",
         "retire-upgrade",
         "assert-upgrade-retired",
         "record-retirement-receipt",
@@ -1230,9 +1255,9 @@ async def test_v3_install_with_upgrade_authority_applies_events_and_guard_and_ad
     ]
     assert receipts.rows[STANDALONE_SSO_RECEIPT_PROFILE_V3] == v3
     assert receipts.receipt == _receipt(retired_client_id=_spec().upgrade_client_id)
-    assert report["mode"] == "upgrade-v3-to-v5"
+    assert report["mode"] == "upgrade-v3-to-v6"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "converged"
     assert control.upgrade_available is False
@@ -1297,12 +1322,12 @@ async def test_event_drift_is_reported_without_refusing_to_boot():
 
     assert report["mode"] == "readback"
     assert report["keycloak_mutated"] is False
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "drift"
     assert "apply-realm-events" not in control.events
 
 
-async def test_legacy_v2_public_callback_with_upgrade_authority_reaches_v5():
+async def test_legacy_v2_public_callback_with_upgrade_authority_reaches_v6():
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V2,
         bootstrap_standalone_sso,
@@ -1329,10 +1354,11 @@ async def test_legacy_v2_public_callback_with_upgrade_authority_reaches_v5():
     assert "upgrade-keycloak-to-current" not in control.events
     assert "apply-realm-events" in control.events
     assert "apply-brokered-account-guard" in control.events
+    assert "apply-login-presentation" in control.events
     assert receipts.rows[STANDALONE_SSO_RECEIPT_PROFILE_V2] == v2
     assert receipts.receipt == _receipt(retired_client_id=_spec().upgrade_client_id)
-    assert report["mode"] == "upgrade-v2-to-v5"
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["mode"] == "upgrade-v2-to-v6"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert control.upgrade_available is False
 
 
@@ -1376,9 +1402,10 @@ async def test_v4_install_without_upgrade_authority_keeps_booting_on_v4():
     assert report["receipt_profile"] == "bundled-keycloak-v4"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "pending_upgrade"
+    assert report["login_presentation"] == "pending_upgrade"
 
 
-async def test_v4_install_with_upgrade_authority_installs_only_the_guard_and_adds_v5_receipt():
+async def test_v4_install_with_upgrade_authority_installs_the_guard_and_presentation_and_adds_v6_receipt():
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V4,
         bootstrap_standalone_sso,
@@ -1411,10 +1438,12 @@ async def test_v4_install_with_upgrade_authority_installs_only_the_guard_and_add
         "readback-keycloak",
         "provision-akb-admin",
         "apply-brokered-account-guard",
+        "apply-login-presentation",
         "acquire-management",
         "readback-keycloak",
         "readback-realm-events",
         "readback-brokered-account-guard",
+        "readback-login-presentation",
         "retire-upgrade",
         "assert-upgrade-retired",
         "record-retirement-receipt",
@@ -1422,11 +1451,12 @@ async def test_v4_install_with_upgrade_authority_installs_only_the_guard_and_add
     ]
     assert receipts.rows[STANDALONE_SSO_RECEIPT_PROFILE_V4] == v4
     assert receipts.receipt == _receipt(retired_client_id=_spec().upgrade_client_id)
-    assert report["mode"] == "upgrade-v4-to-v5"
+    assert report["mode"] == "upgrade-v4-to-v6"
     assert report["keycloak_mutated"] is True
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
     assert report["realm_events"] == "converged"
     assert report["brokered_account_guard"] == "converged"
+    assert report["login_presentation"] == "converged"
     assert control.upgrade_available is False
 
 
@@ -1467,10 +1497,10 @@ async def test_guard_failure_keeps_the_one_time_authority_for_a_retry():
     assert receipts.rows == {STANDALONE_SSO_RECEIPT_PROFILE_V4: v4}
 
 
-async def test_v5_install_refuses_to_start_when_the_guard_is_gone():
+async def test_guarded_install_refuses_to_start_when_the_guard_is_gone():
     """The guard is a gate, unlike the events.
 
-    A v5 realm whose flows stopped refusing a brokered account's password has
+    A v5 or v6 realm whose flows stopped refusing a brokered account's password has
     reopened the way around the upstream. Starting anyway would serve that
     realm as if it were the one the receipt describes.
     """
@@ -1497,7 +1527,7 @@ async def test_v5_install_refuses_to_start_when_the_guard_is_gone():
     assert "record-retirement-receipt" not in control.events
 
 
-async def test_v5_install_refuses_to_start_with_an_enabled_provider_that_does_not_mark():
+async def test_guarded_install_refuses_to_start_with_an_enabled_provider_that_does_not_mark():
     """Accounts an unmarked provider brings are outside every guarded flow.
 
     AKB's provider control marks a provider before enabling it, so only a change
@@ -1560,3 +1590,195 @@ async def test_native_client_registration_is_reported_and_never_blocks_startup(p
     assert report["native_client_registration"] == reported
     assert any("client registration" in record.getMessage() for record in caplog.records) is warned
 
+
+
+async def test_v5_install_without_upgrade_authority_keeps_booting_on_v5():
+    """Every install guarded so far holds a v5 receipt.
+
+    Without one-time authority it converges exactly as before: read-only, its
+    events read, its guard still a startup gate, and the login presentation
+    only named as pending.
+    """
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V5,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    control.realm_events = True
+    control.brokered_account_guard = True
+    v5 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V5)
+    receipts = _ReceiptStore(control.events, v5)
+
+    report = await bootstrap_standalone_sso(
+        _installed_spec(),
+        control=control,
+        provision_admin=_existing_admin(control),
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    assert control.events == [
+        "load-retirement-receipt",
+        "acquire-management",
+        "acquire-bootstrap",
+        "readback-keycloak",
+        "provision-akb-admin",
+        "acquire-management",
+        "readback-keycloak",
+        "readback-realm-events",
+        "readback-brokered-account-guard",
+    ]
+    assert receipts.rows == {STANDALONE_SSO_RECEIPT_PROFILE_V5: v5}
+    assert report["mode"] == "readback"
+    assert report["keycloak_mutated"] is False
+    assert report["receipt_profile"] == "bundled-keycloak-v5"
+    assert report["brokered_account_guard"] == "converged"
+    assert report["login_presentation"] == "pending_upgrade"
+
+
+async def test_v5_guard_stays_a_startup_gate_before_the_presentation_upgrade():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V5,
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    control.realm_events = True
+    control.brokered_account_guard = False
+    receipts = _ReceiptStore(control.events, _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V5))
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            _installed_spec(),
+            control=control,
+            provision_admin=_existing_admin(control),
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_brokered_account_guard_readback_failed"
+
+
+async def test_v5_install_with_upgrade_authority_applies_only_the_login_presentation_and_adds_v6_receipt():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V5,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(
+        manager_available=True,
+        bootstrap_available=False,
+        upgrade_available=True,
+    )
+    control.realm_events = True
+    control.brokered_account_guard = True
+    v5 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V5, retired_client_id=_spec().upgrade_client_id)
+    receipts = _ReceiptStore(control.events, v5)
+
+    report = await bootstrap_standalone_sso(
+        _installed_spec(upgrade_client_secret=_UPGRADE_SECRET),
+        control=control,
+        provision_admin=_existing_admin(control),
+        load_retirement_receipt=receipts.load,
+        record_retirement_receipt=receipts.record,
+    )
+
+    # The events and the guard are read, not rewritten: a v5 realm already has
+    # both, and whatever an operator changed since stays as it is.
+    assert control.events == [
+        "load-retirement-receipt",
+        "acquire-management",
+        "acquire-bootstrap",
+        "acquire-upgrade",
+        "readback-keycloak",
+        "provision-akb-admin",
+        "apply-login-presentation",
+        "acquire-management",
+        "readback-keycloak",
+        "readback-realm-events",
+        "readback-brokered-account-guard",
+        "readback-login-presentation",
+        "retire-upgrade",
+        "assert-upgrade-retired",
+        "record-retirement-receipt",
+        "load-retirement-receipt",
+    ]
+    assert receipts.rows[STANDALONE_SSO_RECEIPT_PROFILE_V5] == v5
+    assert receipts.receipt == _receipt(retired_client_id=_spec().upgrade_client_id)
+    assert report["mode"] == "upgrade-v5-to-v6"
+    assert report["keycloak_mutated"] is True
+    assert report["receipt_profile"] == "bundled-keycloak-v6"
+    assert report["login_presentation"] == "converged"
+    assert control.upgrade_available is False
+
+
+async def test_login_presentation_failure_keeps_the_one_time_authority_for_a_retry():
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V5,
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
+
+    control = _Control(
+        manager_available=True,
+        bootstrap_available=False,
+        upgrade_available=True,
+    )
+    control.realm_events = True
+    control.brokered_account_guard = True
+    v5 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V5)
+    receipts = _ReceiptStore(control.events, v5)
+
+    async def _refuse(_spec, *, token: str):
+        control.events.append("apply-login-presentation")
+        raise StandaloneSSOBootstrapError("keycloak_login_presentation_readback_failed")
+
+    control.apply_login_presentation = _refuse
+
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            _installed_spec(upgrade_client_secret=_UPGRADE_SECRET),
+            control=control,
+            provision_admin=_existing_admin(control),
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert captured.value.code == "keycloak_login_presentation_readback_failed"
+    assert "retire-upgrade" not in control.events
+    assert control.upgrade_available is True
+    assert receipts.rows == {STANDALONE_SSO_RECEIPT_PROFILE_V5: v5}
+
+
+async def test_login_presentation_drift_is_reported_without_refusing_to_boot(caplog):
+    """How the sign-in pages look is an observation, not a boot gate.
+
+    Someone choosing another login theme in the console, or a Keycloak that
+    has not received AKB's theme, must not stop AKB from starting.
+    """
+    import logging
+
+    from app.services.standalone_sso_bootstrap import bootstrap_standalone_sso
+
+    control = _Control(manager_available=True, bootstrap_available=False)
+    control.realm_events = True
+    control.brokered_account_guard = True
+    control.login_presentation = False
+    receipts = _ReceiptStore(control.events, _receipt())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.standalone_sso_bootstrap"):
+        report = await bootstrap_standalone_sso(
+            _installed_spec(),
+            control=control,
+            provision_admin=_existing_admin(control),
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
+
+    assert report["mode"] == "readback"
+    assert report["keycloak_mutated"] is False
+    assert report["login_presentation"] == "drift"
+    assert "apply-login-presentation" not in control.events
+    assert any("login presentation" in record.getMessage() for record in caplog.records)
