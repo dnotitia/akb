@@ -298,6 +298,7 @@ async def run_paired(args: argparse.Namespace) -> int:
     evidence = coordinator.evidence()
     paired_budget = {
         "model_requests": ledger.requests,
+        "provider_setup_requests": ledger.provider_setup_requests,
         "input_tokens": ledger.input_tokens,
         "output_tokens": ledger.output_tokens,
         "total_tokens": ledger.input_tokens + ledger.output_tokens,
@@ -311,15 +312,15 @@ async def run_paired(args: argparse.Namespace) -> int:
     for arm, artifact in artifacts.items():
         attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
         write_json(outputs[arm], artifact, runners[arm].secrets)
-    if failures:
-        raise primary_failure if primary_failure is not None else failures[0]
-
-    comparison = compare_artifacts(artifacts["baseline"], artifacts["candidate"])
+    comparison = compare_artifacts(
+        artifacts.get("baseline", {}),
+        artifacts.get("candidate", {}),
+    )
     write_json(args.comparison_output, comparison)
     print(
         json.dumps(
             {
-                "status": comparison["gate"]["status"],
+                "status": comparison["verdict"],
                 "baseline": str(args.baseline_output),
                 "candidate": str(args.candidate_output),
                 "comparison": str(args.comparison_output),
@@ -329,7 +330,7 @@ async def run_paired(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0 if comparison["gate"]["status"] == "pass" else 1
+    return 0 if comparison["verdict"] == "adopt" and not failures else 1
 
 
 def compare(args: argparse.Namespace) -> int:
@@ -339,8 +340,8 @@ def compare(args: argparse.Namespace) -> int:
         raise ValueError("run artifacts must be JSON objects")
     result = compare_artifacts(baseline, candidate)
     write_json(args.output, result)
-    print(json.dumps({"status": result["gate"]["status"], "output": str(args.output)}, ensure_ascii=False, sort_keys=True))
-    return 0 if result["gate"]["status"] == "pass" else 1
+    print(json.dumps({"status": result["verdict"], "output": str(args.output)}, ensure_ascii=False, sort_keys=True))
+    return 0 if result["verdict"] == "adopt" else 1
 
 
 if __name__ == "__main__":

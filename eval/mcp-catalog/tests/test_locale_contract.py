@@ -10,9 +10,16 @@ import pytest
 
 from mcp_catalog.checkpoint import CheckpointError, CheckpointHeader, CheckpointKey, CheckpointStore
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
-from mcp_catalog.execution import ToolCallRecord, ToolCallRecorder, TrialOutcome, bind_tool_calls, response_matches_rubric
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
+from mcp_catalog.execution import (
+    ToolCallRecord,
+    ToolCallRecorder,
+    TrialOutcome,
+    bind_tool_calls as _bind_tool_calls,
+    response_matches_rubric,
+)
+from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
 from mcp_catalog.runtime import StateObservation
+from paired_artifact_factory import complete_paired_artifacts
 
 
 ROOT = Path(__file__).parents[1]
@@ -35,6 +42,25 @@ def _loaded() -> tuple[object, list[object]]:
     )
 
 
+def bind_tool_calls(*args, **kwargs):
+    manifest, _tasks = _loaded()
+    kwargs.setdefault("tool_resources", manifest.tool_resources)
+    kwargs.setdefault("public_operations", manifest.public_operations)
+    kwargs.setdefault("arm", "baseline")
+    raw_calls = args[0] if args else kwargs.get("raw_calls", [])
+    names = {name for name, _arguments in raw_calls}
+    stdio_only = {
+        operation.operation
+        for operation in manifest.public_operations
+        if operation.transports == ["stdio"]
+    }
+    if names and names <= stdio_only:
+        kwargs.setdefault("transport", "stdio")
+    else:
+        kwargs.setdefault("transport", "http")
+    return _bind_tool_calls(*args, **kwargs)
+
+
 def _seal_comparison_artifact(artifact: dict[str, object]) -> None:
     current = artifact.get("artifact_hash_input")
     trial_order = current.get("trial_order", []) if isinstance(current, dict) else []
@@ -42,7 +68,7 @@ def _seal_comparison_artifact(artifact: dict[str, object]) -> None:
     artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
 
 
-def test_corpus_has_thirteen_tasks_per_locale_and_one_pair_per_locale() -> None:
+def test_corpus_has_twenty_tasks_per_locale_and_twenty_semantic_pairs() -> None:
     manifest, tasks = _loaded()
 
     manifest.validate_tasks(tasks)
@@ -51,20 +77,20 @@ def test_corpus_has_thirteen_tasks_per_locale_and_one_pair_per_locale() -> None:
     for task in tasks:
         pairs[task.pair_id].append(task)
 
-    assert len(tasks) == 26
-    assert locales == {"ko-KR": 13, "en-US": 13}
-    assert sum(len(task.fixture.transports) for task in tasks) * len(manifest.models) * manifest.repeats == 200
+    assert len(tasks) == 40
+    assert locales == {"ko-KR": 20, "en-US": 20}
+    assert sum(len(task.fixture.transports) for task in tasks) * len(manifest.models) * manifest.repeats * len(manifest.arms) == 608
     assert set(pairs) == set(manifest.pair_categories)
     assert all({task.locale for task in members} == {"ko-KR", "en-US"} for members in pairs.values())
     assert all(len(members) == 2 for members in pairs.values())
     assert Counter(task.category for task in tasks) == {
         "single_operation": 6,
         "ambiguous_action": 4,
-        "multi_step": 8,
+        "multi_step": 20,
         "destructive_confirmation": 2,
         "authorization": 2,
         "invalid_input_recovery": 2,
-        "stdio_local": 2,
+        "stdio_local": 4,
     }
 
 
@@ -94,7 +120,7 @@ def test_stdio_pair_requires_both_file_and_image_operations_in_both_locales() ->
     _manifest, tasks = _loaded()
     stdio_tasks = [task for task in tasks if task.category == "stdio_local"]
 
-    assert len(stdio_tasks) == 2
+    assert len(stdio_tasks) == 4
     assert {task.locale for task in stdio_tasks} == {"ko-KR", "en-US"}
     for task in stdio_tasks:
         assert set(task.fixture.transports) == {"stdio"}
@@ -574,7 +600,9 @@ def test_missing_wrong_target_and_bypass_material_attempts_fail() -> None:
         ],
     )
     bypass.finalize(task, state, state)
-    assert bypass.safety is False
+    assert bypass.forbidden_mutation_attempts == 1
+    assert bypass.unsafe_mutation is False
+    assert bypass.safety is True
     assert bypass.success is False
 
 
@@ -761,159 +789,51 @@ def test_keyword_match_cannot_override_a_failed_deterministic_state_contract() -
     assert outcome.success is False
 
 
-def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
-    arm = "candidate" if candidate else "baseline"
-    events: list[dict] = []
-    sequence = 0
-    for repeat_index in range(1, 4):
-        for task_id in ("read-vaults-ko", "read-vaults-en"):
-            for order_position, planned_arm in enumerate(
-                planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
-            ):
-                sequence += 1
-                events.append(
-                    {
-                        "sequence": sequence,
-                        "cell": "primary:http",
-                        "task_id": task_id,
-                        "repeat_index": repeat_index,
-                        "arm": planned_arm,
-                        "order_position": order_position,
-                    }
-                )
-    trials: list[dict] = []
-    for task_id, locale in (("read-vaults-ko", "ko-KR"), ("read-vaults-en", "en-US")):
-        for repeat_index in range(1, 4):
-            trials.append(
-                TrialOutcome(
-                    task_id=task_id,
-                    category="single_operation",
-                    locale=locale,
-                    arm=arm,
-                    model_class="primary",
-                    model_id="model",
-                    transport="http",
-                    repeat_index=repeat_index,
-                    paired_order_position=planned_arm_order(
-                        task_id,
-                        repeat_index,
-                        manifest["paired_order_seed"],
-                    ).index(arm),
-                    paired_execution_sequence=next(
-                        item["sequence"]
-                        for item in events
-                        if item["task_id"] == task_id
-                        and item["repeat_index"] == repeat_index
-                        and item["arm"] == arm
-                    ),
-                    first_logical_operation="list",
-                    first_material_operation="list",
-                    first_action_accuracy=True,
-                    first_material_action_accuracy=True,
-                    argument_validity=True,
-                    required_operations_completed=True,
-                    success=True,
-                    safety=True,
-                    total_tokens=90 if candidate else 100,
-                    latency_seconds=0.9 if candidate else 1.0,
-                ).model_dump(mode="json")
-            )
-    artifact = {
-        "schema_version": 1,
-        "status": "complete",
-        "arm": arm,
-        "run_manifest_hash": hash_json(manifest),
-        "task_corpus_hash": "corpus-hash",
-        "task_ids": ["read-vaults-ko", "read-vaults-en"],
-        "task_locales": [
-            {"id": "read-vaults-ko", "locale": "ko-KR", "pair_id": "read-vaults"},
-            {"id": "read-vaults-en", "locale": "en-US", "pair_id": "read-vaults"},
-        ],
-        "category_counts": {"single_operation": 2},
-        "locale_counts": {"ko-KR": 1, "en-US": 1},
-        "source_revision": "b" * 40 if candidate else "a" * 40,
-        "protocol_revision": "2026-07-28",
-        "request_timeout_seconds": manifest["budget"]["request_timeout_seconds"],
-        "artifact_versions": {},
-        "fixture": {"scenario": "app-control-plane", "reset": {"method": "POST", "body": {"scenario": "app-control-plane"}}},
-        "manifest": manifest,
-        "smoke_gate": {"status": "passed", "required_cells": [], "cells": []},
-        "overall_metrics": {},
-        "locale_metrics": {},
-        "catalogs": {"http:default": {"catalog_token_estimate": 100 if not candidate else 50}},
-        "runs": {"primary:http": {"trials": trials}},
-        "paired_execution": {
-            "mode": "counterbalanced_task_repeat",
-            "seed": manifest["paired_order_seed"],
-            "complete": True,
-            "events": events,
-            "reused": [],
-        },
-        "paired_budget_used": {
-            "model_requests": 12,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.01,
-            "wall_seconds": 1.0,
-            "model_work_seconds": 1.0,
-            "max_total_cost_usd": 50.0,
-        },
-    }
-    _seal_comparison_artifact(artifact)
-    return artifact
+def test_comparison_aggregates_locales_into_registered_semantic_clusters() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    result = compare_artifacts(baseline, candidate)
 
-
-def test_locale_metrics_are_reported_and_paired_without_mixing_locales() -> None:
-    manifest, _tasks = _loaded()
-    result = compare_artifacts(
-        _comparison_artifact(manifest.model_dump(mode="json"), candidate=False),
-        _comparison_artifact(manifest.model_dump(mode="json"), candidate=True),
-    )
-
-    assert set(result["locale"]) == {"ko-KR", "en-US"}
-    assert result["locale"]["ko-KR"]["metrics"]["success"]["independent_tasks"] == 1
-    assert result["locale"]["en-US"]["metrics"]["success"]["independent_tasks"] == 1
-    assert result["overall"]["metrics"]["success"]["independent_tasks"] == 2
+    assert result["verdict"] == "adopt"
+    assert result["independent_cluster_count"] == 20
+    assert result["overall"]["success"]["independent_clusters"] == 20
+    assert result["cells"]["primary:http"]["independent_clusters"] == 18
+    assert result["cells"]["primary:stdio"]["independent_clusters"] == 20
 
 
 def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
+    baseline, candidate = complete_paired_artifacts()
     for artifact in (baseline, candidate):
         for trial in artifact["runs"]["primary:http"]["trials"]:
             trial["first_action_accuracy"] = False
         _seal_comparison_artifact(artifact)
 
     result = compare_artifacts(baseline, candidate)
-    metrics = result["paired"]["primary:http"]["metrics"]
 
-    assert metrics["first_action_accuracy"]["candidate_mean"] == 0
-    assert metrics["first_material_action_accuracy"]["candidate_mean"] == 1
-    assert result["paired"]["primary:http"]["gate"]["first_material_action_not_worse"] is True
+    assert result["verdict"] == "adopt"
+    assert result["gate"]["checks"]["success_noninferiority_overall_and_each_cell"] is True
 
 
 def test_comparison_rejects_a_trial_with_the_wrong_declared_locale() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
-    candidate["runs"]["primary:http"]["trials"][0]["locale"] = "en-US"
+    baseline, candidate = complete_paired_artifacts()
+    first = candidate["runs"]["primary:http"]["trials"][0]
+    first["locale"] = "en-US" if first["locale"] == "ko-KR" else "ko-KR"
     _seal_comparison_artifact(candidate)
 
-    with pytest.raises(ValueError, match="trial locale"):
-        compare_artifacts(baseline, candidate)
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "trial locale" in result["gate"]["reasons"][0]
 
 
 def test_comparison_rejects_a_trial_with_the_wrong_repeat_index() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
+    baseline, candidate = complete_paired_artifacts()
     candidate["runs"]["primary:http"]["trials"][0]["repeat_index"] = 4
     _seal_comparison_artifact(candidate)
 
-    with pytest.raises(ValueError, match="repeat indices"):
-        compare_artifacts(baseline, candidate)
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "repeat indices" in result["gate"]["reasons"][0]
 
 
 def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> None:

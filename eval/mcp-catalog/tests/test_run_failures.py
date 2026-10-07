@@ -46,7 +46,7 @@ async def test_primary_failure_survives_pat_cleanup_failure_and_serializes_incom
     )
     resolver = _Resolver()
     runtime = {
-        "source_revision": "a" * 40,
+        "source_revision": manifest.arm_source_revisions["baseline"],
         "artifact_versions": {"backend_artifact_version": "0.0.0", "proxy_artifact_version": "0.0.0"},
         "discovery": {"status": "ready", "scenario": descriptor.scenario},
     }

@@ -31,6 +31,7 @@ class CheckpointHeader(ContractModel):
     run_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     arm: ArmName
+    pre_smoke_seal_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class CheckpointKey(ContractModel):
@@ -50,6 +51,7 @@ class CheckpointKey(ContractModel):
 
 class CheckpointBudget(ContractModel):
     model_requests: int = Field(default=0, ge=0)
+    provider_setup_requests: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
@@ -61,6 +63,7 @@ class CheckpointBudget(ContractModel):
 
         return CheckpointBudget(
             model_requests=self.model_requests + outcome.model_requests,
+            provider_setup_requests=self.provider_setup_requests,
             input_tokens=self.input_tokens + outcome.input_tokens,
             output_tokens=self.output_tokens + outcome.output_tokens,
             cost_usd=float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd))),
@@ -470,7 +473,9 @@ class CheckpointStore:
             document = CheckpointDocument.model_validate(raw)
         except Exception as exc:
             raise CheckpointError(f"resume checkpoint contract validation failed: {exc}") from exc
-        if document.header != self.header:
+        if document.header.model_dump(exclude={"pre_smoke_seal_hash"}) != self.header.model_dump(
+            exclude={"pre_smoke_seal_hash"}
+        ):
             raise CheckpointError("resume checkpoint exact-input header does not match this run")
         if document.spent_hash != spent_hash(document.spent):
             raise CheckpointError("resume checkpoint spent-usage digest does not match")
@@ -517,6 +522,30 @@ class CheckpointStore:
         if active is not None and active.attempt_index in finalized_indexes:
             raise CheckpointError("resume checkpoint timing attempt is both active and finalized")
         return document
+
+    def bind_pre_smoke_seal(self, seal_hash: str) -> None:
+        """Bind or verify the exact pre-paid evidence seal before smoke requests."""
+
+        self._ensure_writable()
+        if len(seal_hash) != 64 or any(char not in "0123456789abcdef" for char in seal_hash):
+            raise CheckpointError("pre-smoke seal must be a SHA-256 digest")
+        previous = self.document.header.pre_smoke_seal_hash
+        if previous is not None and previous != seal_hash:
+            raise CheckpointError("resume checkpoint pre-smoke seal does not match this run")
+        if previous is None and (self.document.records or self.document.smoke_gate or self.document.smoke_status is not None):
+            raise CheckpointError("resume checkpoint with reusable trials is missing its pre-smoke seal")
+        self.header = self.header.model_copy(update={"pre_smoke_seal_hash": seal_hash})
+        self.document.header = self.header
+        self._write_atomic()
+
+    def record_provider_setup_requests(self, count: int) -> None:
+        self._ensure_writable()
+        if count < 0:
+            raise CheckpointError("provider setup request count cannot be negative")
+        self.document.spent.model_requests += count
+        self.document.spent.provider_setup_requests += count
+        self.document.spent_hash = spent_hash(self.document.spent)
+        self._write_atomic()
 
     def _ensure_writable(self) -> None:
         if self.document.lifecycle != "open":

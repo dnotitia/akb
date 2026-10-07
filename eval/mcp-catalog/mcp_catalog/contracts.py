@@ -107,7 +107,7 @@ Transport = Literal["http", "stdio"]
 ArmName = Literal["baseline", "candidate"]
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
-EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 8, "en-US": 8}
+EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 20, "en-US": 20}
 EXPECTED_PAIR_CATEGORIES: dict[str, Category] = {
     "read-vaults": "single_operation",
     "create-vault": "single_operation",
@@ -149,14 +149,34 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class StateProbeResultBinding(ContractModel):
+    source_attempt: int = Field(ge=1)
+    source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    transform: Literal["document_asset_id_from_url", "publication_slug", "uri_query"]
+
+
 class StateProbe(ContractModel):
     """A read-only state endpoint owned by the runtime or application."""
 
     service: Literal["app", "fixture"]
     method: Literal["GET", "POST"] = "GET"
-    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&-]*$")
+    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&:%-]*$")
     body: dict[str, JsonValue] | None = None
     expected_status: int = Field(default=200, ge=100, le=599)
+    result_binding: StateProbeResultBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_result_binding(self) -> StateProbe:
+        marker = {
+            "document_asset_id_from_url": "{asset_id}",
+            "publication_slug": "{slug}",
+            "uri_query": "{uri}",
+        }
+        if self.result_binding is None and any(item in self.path for item in marker.values()):
+            raise ValueError("state probe path templates require a result binding")
+        if self.result_binding is not None and self.path.count(marker[self.result_binding.transform]) != 1:
+            raise ValueError("state probe path must contain the single placeholder required by its binding")
+        return self
 
 
 class StateExpectation(ContractModel):
@@ -173,9 +193,12 @@ class StateExpectation(ContractModel):
         return self
 
 
-class StateContract(ContractModel):
+class StateExpectationSet(ContractModel):
     probe: StateProbe
     before_expected_status: int | None = Field(default=None, ge=100, le=599)
+    check_before: bool = True
+    before_must: list[StateExpectation] = Field(default_factory=list)
+    before_must_not: list[StateExpectation] = Field(default_factory=list)
     must: list[StateExpectation] = Field(default_factory=list)
     must_not: list[StateExpectation] = Field(default_factory=list)
     unchanged: list[str] = Field(default_factory=list)
@@ -191,6 +214,22 @@ class StateContract(ContractModel):
             if JSON_POINTER_RE.fullmatch(value) is None:
                 raise ValueError(f"invalid JSON pointer: {value}")
         return values
+
+
+class StateCheckpointContract(ContractModel):
+    after_attempt: int = Field(ge=1)
+    probe: StateProbe
+    must: list[StateExpectation] = Field(default_factory=list)
+    must_not: list[StateExpectation] = Field(default_factory=list)
+
+
+class StateContract(StateExpectationSet):
+    additional_observations: list[StateExpectationSet] = Field(default_factory=list, max_length=8)
+    checkpoints: list[StateCheckpointContract] = Field(default_factory=list, max_length=8)
+
+    @property
+    def observation_sets(self) -> list[StateExpectationSet]:
+        return [self, *self.additional_observations]
 
 
 class FixtureContract(ContractModel):
@@ -333,6 +372,7 @@ class ExpectedMaterialAttempt(ContractModel):
     resource_type: ResourceType | None = None
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     local_file_arguments: dict[str, str] = Field(default_factory=dict)
+    capture_result_fields: list[str] = Field(default_factory=list)
     outcome: Literal["success", "permission_denied", "rejected"]
     status_code: int | None = Field(default=None, ge=100, le=599)
     error_code: str | None = None
@@ -361,6 +401,15 @@ class ExpectedMaterialAttempt(ContractModel):
             for argument, filename in values.items()
         ):
             raise ValueError("local file arguments must map fields to file names")
+        return values
+
+    @field_validator("capture_result_fields")
+    @classmethod
+    def validate_capture_result_fields(cls, values: list[str]) -> list[str]:
+        if any(re.fullmatch(r"^[A-Za-z][A-Za-z0-9_]*$", value) is None for value in values):
+            raise ValueError("captured result fields must be identifier names")
+        if len(set(values)) != len(values):
+            raise ValueError("captured result fields must be unique")
         return values
 
 
@@ -572,6 +621,38 @@ class TaskManifest(ContractModel):
             if target_key in binding_targets:
                 raise ValueError("material result binding targets must be unique")
             binding_targets.add(target_key)
+        captured_fields = {
+            (index, field_name)
+            for index, attempt in enumerate(self.expected_material_attempts, start=1)
+            for field_name in attempt.capture_result_fields
+        } | {
+            (binding.source_attempt, binding.source_field)
+            for binding in self.expected_result_bindings
+        }
+        for observation in self.expected_final_state.observation_sets:
+            probe_binding = observation.probe.result_binding
+            if probe_binding is not None and observation.check_before:
+                raise ValueError("result-bound state probes can only be checked after their source attempt")
+            if probe_binding is not None and (
+                probe_binding.source_attempt > len(self.expected_material_attempts)
+                or (probe_binding.source_attempt, probe_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state probes must bind a captured result from an expected material attempt")
+        for checkpoint in self.expected_final_state.checkpoints:
+            checkpoint_binding = checkpoint.probe.result_binding
+            if checkpoint_binding is not None and checkpoint_binding.source_attempt > checkpoint.after_attempt:
+                raise ValueError("state checkpoint bindings must reference an earlier material result")
+            if checkpoint_binding is not None and (
+                checkpoint_binding.source_attempt > len(self.expected_material_attempts)
+                or (checkpoint_binding.source_attempt, checkpoint_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state checkpoints must bind a captured material result")
+        checkpoint_attempts = [item.after_attempt for item in self.expected_final_state.checkpoints]
+        if (
+            len(set(checkpoint_attempts)) != len(checkpoint_attempts)
+            or any(index > len(self.expected_material_attempts) for index in checkpoint_attempts)
+        ):
+            raise ValueError("state checkpoints must reference unique expected material attempts")
         if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
             raise ValueError("expected material arguments must be material operations")
         if not set(self.required_attempted_operations) <= set(expected_operations):
@@ -730,6 +811,7 @@ class Budget(ContractModel):
 
 class StatisticalProcedure(ContractModel):
     method: Literal["paired_cluster_bca_bootstrap"]
+    implementation: Literal["scipy==1.18.1"] = "scipy==1.18.1"
     confidence: float = Field(default=0.95, gt=0, lt=1)
     noninferiority_margin: float = Field(default=0.03, ge=0, lt=1)
     resamples: Literal[20000] = 20000
@@ -798,6 +880,16 @@ class BenchmarkRunManifest(ContractModel):
     locales: list[TaskLocale] = Field(default_factory=default_locales)
     locale_counts: dict[TaskLocale, int] = Field(default_factory=default_locale_counts)
     pair_categories: dict[str, Category] = Field(default_factory=default_pair_categories)
+
+    @field_validator("arm_source_revisions", mode="before")
+    @classmethod
+    def normalize_git_revision_prefix(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        return {
+            arm: revision.removeprefix("git:") if isinstance(revision, str) else revision
+            for arm, revision in values.items()
+        }
 
     @field_validator("arms", "transports")
     @classmethod

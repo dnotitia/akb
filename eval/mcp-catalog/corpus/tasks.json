@@ -517,7 +517,8 @@
           "create",
           "search",
           "list",
-          "delete"
+          "delete",
+          "read"
         ],
         "allowed_first_operations": [
           "create"
@@ -541,20 +542,21 @@
         "material_attempt_limits": {
           "create": 3,
           "search": 1,
-          "list": 1,
+          "list": 2,
           "delete": 1
         },
         "material_attempt_minimums": {
           "create": 3,
           "search": 1,
-          "list": 1,
+          "list": 2,
           "delete": 1
         },
         "required_operations": [
           "create",
           "search",
           "list",
-          "delete"
+          "delete",
+          "read"
         ],
         "expected_material_outcomes": [
           {
@@ -571,6 +573,10 @@
           },
           {
             "logical_operation": "delete",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "read",
             "outcome": "success"
           }
         ],
@@ -615,6 +621,25 @@
               "vault": "catalog-bench-data",
               "query_sql": "SELECT * FROM scores LIMIT 5"
             },
+            "outcome": "success",
+            "capture_result_fields": [
+              "slug"
+            ]
+          },
+          {
+            "logical_operation": "list",
+            "resource_type": "publication",
+            "arguments": {
+              "vault": "catalog-bench-data"
+            },
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "read",
+            "resource_type": "publication",
+            "arguments": {
+              "vault": "catalog-bench-data"
+            },
             "outcome": "success"
           },
           {
@@ -639,6 +664,13 @@
             "target_attempt": 6,
             "target_argument": "slug",
             "relation": "equals"
+          },
+          {
+            "source_attempt": 4,
+            "source_field": "slug",
+            "target_attempt": 8,
+            "target_argument": "slug",
+            "relation": "equals"
           }
         ],
         "expected_final_state": {
@@ -656,13 +688,88 @@
                 "name": "scores"
               }
             }
+          ],
+          "additional_observations": [
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/publications/catalog-bench-data?resource_type=table_query"
+              },
+              "before_must": [
+                {
+                  "pointer": "/publications",
+                  "operator": "equals",
+                  "value": []
+                }
+              ],
+              "must": [
+                {
+                  "pointer": "/publications",
+                  "operator": "equals",
+                  "value": []
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/public/{slug}/meta",
+                "expected_status": 404,
+                "result_binding": {
+                  "source_attempt": 4,
+                  "source_field": "slug",
+                  "transform": "publication_slug"
+                }
+              },
+              "check_before": false
+            }
+          ],
+          "checkpoints": [
+            {
+              "after_attempt": 5,
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/publications/catalog-bench-data?resource_type=table_query"
+              },
+              "must": [
+                {
+                  "pointer": "/publications",
+                  "operator": "contains",
+                  "value": {
+                    "resource_type": "table_query",
+                    "mode": "live"
+                  }
+                }
+              ]
+            },
+            {
+              "after_attempt": 7,
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/publications/catalog-bench-data?resource_type=table_query"
+              },
+              "must": [
+                {
+                  "pointer": "/publications",
+                  "operator": "contains",
+                  "value": {
+                    "resource_type": "table_query",
+                    "mode": "snapshot"
+                  }
+                }
+              ]
+            }
           ]
         }
       },
       "locales": {
         "ko-KR": {
           "id": "table-publication-ko",
-          "prompt": "`catalog-bench-data` 보관함과 텍스트 열 `label`이 있는 `scores` 표를 만들어 줘. `SELECT * FROM scores LIMIT 5`를 실행하고 같은 제한 쿼리를 공개한 뒤 공개 목록에서 확인해. 마지막에는 반환된 공개 식별자로 공유만 해제하고 표와 보관함은 남겨 둬.",
+          "prompt": "`catalog-bench-data` 보관함과 텍스트 열 `label`이 있는 `scores` 표를 만들어 줘. `SELECT * FROM scores LIMIT 5`를 실행하고 같은 제한 쿼리를 공개해. 공개 목록에서 확인한 뒤 snapshot으로 전환하고, 다시 목록에서 전환을 확인해. 마지막에는 반환된 공개 식별자로 공유만 해제하고 표와 보관함은 남겨 둬.",
           "response_rubric": {
             "require_non_empty": true,
             "success_claim_terms": [
@@ -674,7 +781,7 @@
         },
         "en-US": {
           "id": "table-publication-en",
-          "prompt": "Create `catalog-bench-data` and a `scores` table with text column `label`. Run `SELECT * FROM scores LIMIT 5`, publish that same bounded query, and confirm it in the publication list. Finally remove only the share by its returned identifier and leave the table and vault intact.",
+          "prompt": "Create `catalog-bench-data` and a `scores` table with text column `label`. Run `SELECT * FROM scores LIMIT 5`, publish that same bounded query, and confirm it in the publication list. Convert it to a snapshot, confirm the snapshot mode in the list, then remove only the share by its returned identifier and leave the table and vault intact.",
           "response_rubric": {
             "require_non_empty": true,
             "success_claim_terms": [
@@ -969,6 +1076,22 @@
               "value": {
                 "name": "imported.md"
               }
+            }
+          ],
+          "additional_observations": [
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/vaults/catalog-bench-io/export?format=okf&as=json"
+              },
+              "must": [
+                {
+                  "pointer": "/files/notes~1imported.md",
+                  "operator": "equals",
+                  "value": "---\\ntype: note\\n---\\n# Imported\\nportable"
+                }
+              ]
             }
           ]
         }
@@ -2892,7 +3015,7 @@
         "material_attempt_limits": {
           "create": 8,
           "update": 8,
-          "delete": 8,
+          "delete": 1,
           "read": 8
         },
         "material_attempt_minimums": {
@@ -2913,6 +3036,7 @@
             "method": "GET",
             "path": "/api/v1/collections/catalog-bench-relations"
           },
+          "before_expected_status": 404,
           "must": [
             {
               "pointer": "/collections",
@@ -2922,7 +3046,83 @@
               }
             }
           ],
-          "before_expected_status": 404
+          "additional_observations": [
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/browse/catalog-bench-relations?depth=-1"
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "left"
+                  }
+                },
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "right"
+                  }
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/documents/catalog-bench-relations/notes/left"
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/content",
+                  "operator": "equals",
+                  "value": "left"
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/documents/catalog-bench-relations/notes/right"
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/content",
+                  "operator": "equals",
+                  "value": "right"
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/relations?uri={uri}",
+                "result_binding": {
+                  "source_attempt": 3,
+                  "source_field": "uri",
+                  "transform": "uri_query"
+                }
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/relations",
+                  "operator": "equals",
+                  "value": []
+                }
+              ],
+              "check_before": false
+            }
+          ]
         },
         "expected_material_attempts": [
           {
@@ -2951,7 +3151,10 @@
               "title": "left",
               "content": "left"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "capture_result_fields": [
+              "uri"
+            ]
           },
           {
             "logical_operation": "create",
@@ -2962,7 +3165,10 @@
               "title": "right",
               "content": "right"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "capture_result_fields": [
+              "uri"
+            ]
           },
           {
             "logical_operation": "update",
@@ -2980,15 +3186,6 @@
             "logical_operation": "delete",
             "resource_type": "relation",
             "arguments": {},
-            "outcome": "success"
-          },
-          {
-            "logical_operation": "delete",
-            "resource_type": "collection",
-            "arguments": {
-              "vault": "catalog-bench-relations",
-              "path": "notes"
-            },
             "outcome": "success"
           }
         ],
@@ -3009,19 +3206,49 @@
             "logical_operation": "read",
             "outcome": "success"
           }
+        ],
+        "expected_result_bindings": [
+          {
+            "source_attempt": 3,
+            "source_field": "uri",
+            "target_attempt": 5,
+            "target_argument": "source",
+            "relation": "equals"
+          },
+          {
+            "source_attempt": 4,
+            "source_field": "uri",
+            "target_attempt": 5,
+            "target_argument": "target",
+            "relation": "equals"
+          },
+          {
+            "source_attempt": 3,
+            "source_field": "uri",
+            "target_attempt": 6,
+            "target_argument": "uri",
+            "relation": "equals"
+          }
+        ],
+        "forbidden_mutations": [
+          {
+            "operation": "delete",
+            "target_contains": "\"path\":\"notes\"",
+            "reason": "The collection and documents must remain."
+          }
         ]
       },
       "locales": {
         "ko-KR": {
           "id": "collection-relation-lifecycle-ko",
-          "prompt": "`catalog-bench-relations` 보관함과 `notes` collection을 만들고 문서 두 개를 연결해. 관계를 조회한 뒤 같은 연결만 해제하고 문서와 collection은 남아 있는지 확인해.",
+          "prompt": "`catalog-bench-relations` 보관함과 `notes` collection을 만들고 그 안에 본문이 각각 `left`, `right`인 문서를 만들어. 두 문서의 반환된 URI로 연결하고 관계를 조회해. 같은 연결만 해제한 뒤 문서 본문 두 개와 collection은 남아 있고 관계가 없는지 확인해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "collection-relation-lifecycle-en",
-          "prompt": "Create vault `catalog-bench-relations`, collection `notes`, and two documents. Link them, inspect the relation, unlink only that edge, and verify both documents and the collection remain.",
+          "prompt": "Create vault `catalog-bench-relations`, collection `notes`, and documents with bodies `left` and `right`. Link them using the returned document URIs, inspect the relation, unlink only that edge, and verify both bodies and the collection remain with no relation.",
           "response_rubric": {
             "require_non_empty": true
           }
@@ -3343,6 +3570,16 @@
               "pointer": "/name",
               "operator": "equals",
               "value": "catalog-bench-access"
+            },
+            {
+              "pointer": "/owner",
+              "operator": "equals",
+              "value": "fixture-owner"
+            },
+            {
+              "pointer": "/public_access",
+              "operator": "equals",
+              "value": "none"
             }
           ],
           "before_expected_status": 404
@@ -3369,7 +3606,7 @@
             "resource_type": "access",
             "arguments": {
               "vault": "catalog-bench-access",
-              "new_owner": "fixture-owner"
+              "level": "none"
             },
             "outcome": "success"
           },
@@ -3378,7 +3615,7 @@
             "resource_type": "access",
             "arguments": {
               "vault": "catalog-bench-access",
-              "level": "none"
+              "new_owner": "fixture-owner"
             },
             "outcome": "success"
           },
@@ -3409,14 +3646,14 @@
       "locales": {
         "ko-KR": {
           "id": "access-ownership-public-ko",
-          "prompt": "`catalog-bench-access` 보관함을 만들고 소유자와 공개 상태를 확인해. 지정한 fixture 사용자에게 소유권을 한 번 넘기고 비공개로 유지한 뒤 적용된 상태를 조회해.",
+          "prompt": "`catalog-bench-access` 보관함을 만들고 소유자와 공개 상태를 확인해. 소유권을 넘기기 전에 비공개(`none`)로 설정하고, 지정한 fixture 사용자 `fixture-owner`에게 소유권을 한 번 넘긴 뒤 소유자와 공개 상태가 적용됐는지 확인해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "access-ownership-public-en",
-          "prompt": "Create `catalog-bench-access`, inspect its owner and visibility, transfer ownership once to the declared fixture user, keep it private, and verify the effective state.",
+          "prompt": "Create `catalog-bench-access` and inspect its owner and visibility. Set it to private (`none`) before transferring ownership once to fixture user `fixture-owner`, then verify the owner and visibility state.",
           "response_rubric": {
             "require_non_empty": true
           }
@@ -3570,6 +3807,47 @@
                 "name": "sample-note.txt",
                 "type": "file"
               }
+            }
+          ],
+          "additional_observations": [
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/files/catalog-bench-vault-authorization"
+              },
+              "before_must_not": [
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "sample-note.txt"
+                  }
+                }
+              ],
+              "must_not": [
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "sample-note.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/assets/catalog-bench-vault-authorization/{asset_id}/metadata",
+                "expected_status": 404,
+                "result_binding": {
+                  "source_attempt": 2,
+                  "source_field": "url",
+                  "transform": "document_asset_id_from_url"
+                }
+              },
+              "check_before": false
             }
           ]
         },

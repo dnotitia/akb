@@ -102,6 +102,7 @@
   },
   "statistical_procedure": {
     "method": "paired_cluster_bca_bootstrap",
+    "implementation": "scipy==1.18.1",
     "confidence": 0.95,
     "noninferiority_margin": 0.03,
     "resamples": 20000,
@@ -292,8 +293,8 @@
     "stdio-image-files": "stdio_local"
   },
   "arm_source_revisions": {
-    "baseline": "9daf7b44f9387776f845f181d29f1a7c8d21b37a",
-    "candidate": "8d74114042b7d94a02c6b0f7aa27a6ab749e1874"
+    "baseline": "git:9daf7b44f9387776f845f181d29f1a7c8d21b37a",
+    "candidate": "git:8d74114042b7d94a02c6b0f7aa27a6ab749e1874"
   },
   "public_operations": [
     {
