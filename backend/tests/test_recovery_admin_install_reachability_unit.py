@@ -177,7 +177,7 @@ class _Control:
         return None
 
     async def brokered_account_guard_readback(self, _spec, *, management_token):
-        return True
+        return None
 
 
 def _readback():

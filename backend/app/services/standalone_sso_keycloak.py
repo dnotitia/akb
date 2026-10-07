@@ -883,7 +883,7 @@ class KeycloakStandaloneSSOControl:
         spec: StandaloneSSOBootstrapSpec,
         *,
         token: str,
-    ) -> bool:
+    ) -> None:
         realm = await self._realm(spec, token=token)
         if realm is None:
             raise _fail("keycloak_realm_readback_failed")
@@ -919,30 +919,29 @@ class KeycloakStandaloneSSOControl:
                     or native.get("config") != _NATIVE_AMR_VALUES
                 ):
                     raise _fail("keycloak_brokered_account_guard_readback_failed")
+        # An enabled provider that does not mark the accounts it brings lets
+        # them past every flow above. A disabled one brings nobody, and the
+        # provider control marks a provider before it enables it.
         for provider in await self._identity_providers(spec, token=token):
             if provider.get("enabled") is not True:
                 continue
             alias = _required_string(provider, "alias", "keycloak_identity_provider_read_failed")
             marks = await self._identity_provider_marks(spec, alias, token=token)
             if len(marks) != 1 or not identity_provider_mapper_matches(marks[0], alias):
-                return False
-        return True
+                raise _fail("keycloak_identity_provider_guard_mapper_missing")
 
     async def brokered_account_guard_readback(
         self,
         spec: StandaloneSSOBootstrapSpec,
         *,
         management_token: str,
-    ) -> bool:
-        """Read the guard through view-realm; never change it.
+    ) -> None:
+        """Read the guard through view-realm and manage-identity-providers; never change it.
 
-        A realm whose flows no longer refuse a brokered account's password is
-        refused outright. Whether every enabled identity provider still marks
-        the accounts it brings is returned, because an unmarked provider leaves
-        only its newcomers outside the guard and is fixed through the provider
-        control rather than by refusing to start.
+        Refuses a realm whose bound flows no longer deny the brokered-account
+        role, and one with an enabled identity provider that does not grant it.
         """
-        return await self._brokered_account_guard_readback(spec, token=management_token)
+        await self._brokered_account_guard_readback(spec, token=management_token)
 
     async def apply_brokered_account_guard(
         self,
@@ -987,8 +986,7 @@ class KeycloakStandaloneSSOControl:
             alias = _required_string(provider, "alias", "keycloak_identity_provider_read_failed")
             await self._reconcile_identity_provider_mark(spec, alias, token=token)
             await self._mark_linked_accounts(spec, alias, role, token=token)
-        if not await self._brokered_account_guard_readback(spec, token=token):
-            raise _fail("keycloak_brokered_account_guard_readback_failed")
+        await self._brokered_account_guard_readback(spec, token=token)
 
     async def _list_clients(
         self,

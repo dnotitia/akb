@@ -345,10 +345,10 @@ async def _install(realm: _Realm) -> None:
         await control.aclose()
 
 
-async def _readback(realm: _Realm) -> bool:
+async def _readback(realm: _Realm) -> None:
     control, spec = _control(realm)
     try:
-        return await control.brokered_account_guard_readback(spec, management_token="manager-token")
+        await control.brokered_account_guard_readback(spec, management_token="manager-token")
     finally:
         await control.aclose()
 
@@ -398,7 +398,7 @@ async def test_install_binds_guarded_copies_of_both_password_flows():
     assert direct_guard["index"] > direct_password["index"]
     assert direct_guard["requirement"] == "CONDITIONAL"
 
-    assert await _readback(realm) is True
+    await _readback(realm)
 
 
 async def test_install_binds_only_after_both_guards_are_armed():
@@ -426,7 +426,7 @@ async def test_install_marks_every_provider_and_the_accounts_it_already_linked()
     # A provider switched off is where an upstream revocation leaves people;
     # its accounts are marked too, so a password they made cannot replace it.
     assert all(realm.user_roles[user] == {BROKERED_ACCOUNT_ROLE} for user in [*entra, *dormant])
-    assert await _readback(realm) is True
+    await _readback(realm)
 
 
 async def test_install_is_convergent_on_a_second_run():
@@ -542,17 +542,19 @@ async def test_readback_refuses_a_realm_whose_flows_no_longer_refuse(damage):
     assert captured.value.code == "keycloak_brokered_account_guard_readback_failed"
 
 
-async def test_readback_reports_an_enabled_provider_that_does_not_mark_arrivals():
+async def test_readback_refuses_an_enabled_provider_that_does_not_mark_arrivals():
     realm = _Realm()
     await _install(realm)
     realm.add_provider("added-in-the-console")
     realm.add_provider("parked", enabled=False)
 
-    assert await _readback(realm) is False
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await _readback(realm)
+    assert captured.value.code == "keycloak_identity_provider_guard_mapper_missing"
 
     realm.mappers["added-in-the-console"] = [{**identity_provider_mapper("added-in-the-console"), "id": "m"}]
     # A disabled provider brings nobody, so it does not count against the mark.
-    assert await _readback(realm) is True
+    await _readback(realm)
 
 
 async def test_readback_never_writes():

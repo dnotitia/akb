@@ -170,7 +170,8 @@ class _Control:
         self.events.append("readback-brokered-account-guard")
         if not self.brokered_account_guard:
             raise StandaloneSSOBootstrapError("keycloak_brokered_account_guard_readback_failed")
-        return self.every_provider_marked
+        if not self.every_provider_marked:
+            raise StandaloneSSOBootstrapError("keycloak_identity_provider_guard_mapper_missing")
 
     async def readback(self, spec, *, management_token: str):
         assert management_token == "manager-token"
@@ -1492,13 +1493,16 @@ async def test_v5_install_refuses_to_start_when_the_guard_is_gone():
     assert "record-retirement-receipt" not in control.events
 
 
-async def test_v5_unmarked_identity_provider_is_reported_without_refusing_to_boot():
-    """An enabled provider without the mapper leaves only its newcomers out.
+async def test_v5_install_refuses_to_start_with_an_enabled_provider_that_does_not_mark():
+    """Accounts an unmarked provider brings are outside every guarded flow.
 
-    Every flow still refuses everyone already marked, and the fix goes through
-    the provider control, which needs AKB running. So it is reported.
+    AKB's provider control marks a provider before enabling it, so only a change
+    made around AKB reaches this, and it is refused like a removed guard.
     """
-    from app.services.standalone_sso_bootstrap import bootstrap_standalone_sso
+    from app.services.standalone_sso_bootstrap import (
+        StandaloneSSOBootstrapError,
+        bootstrap_standalone_sso,
+    )
 
     control = _Control(manager_available=True, bootstrap_available=False)
     control.realm_events = True
@@ -1506,15 +1510,14 @@ async def test_v5_unmarked_identity_provider_is_reported_without_refusing_to_boo
     control.every_provider_marked = False
     receipts = _ReceiptStore(control.events, _receipt())
 
-    report = await bootstrap_standalone_sso(
-        _installed_spec(),
-        control=control,
-        provision_admin=_existing_admin(control),
-        load_retirement_receipt=receipts.load,
-        record_retirement_receipt=receipts.record,
-    )
+    with pytest.raises(StandaloneSSOBootstrapError) as captured:
+        await bootstrap_standalone_sso(
+            _installed_spec(),
+            control=control,
+            provision_admin=_existing_admin(control),
+            load_retirement_receipt=receipts.load,
+            record_retirement_receipt=receipts.record,
+        )
 
-    assert report["mode"] == "readback"
-    assert report["receipt_profile"] == "bundled-keycloak-v5"
-    assert report["brokered_account_guard"] == "drift"
+    assert captured.value.code == "keycloak_identity_provider_guard_mapper_missing"
     assert "apply-brokered-account-guard" not in control.events

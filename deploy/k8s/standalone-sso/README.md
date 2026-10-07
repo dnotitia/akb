@@ -249,14 +249,20 @@ So the bootstrap installs a guard on the use of that password:
 Accounts with no identity-provider link, the product administrator included,
 are not affected. Setting the password is still possible; using it is not.
 
+The guard lives in the flows the realm binds. A client given its own
+authentication-flow override in Keycloak does not run them, so do not give a
+client in this realm an override.
+
 The provider control writes the mapper whenever it configures or enables a
 provider in a realm that has the role, and refuses to enable one it cannot
-mark. A provider added in the Keycloak console has no mapper until it is
-configured or enabled through AKB. Every init-container run reports it:
-`brokered_account_guard=drift` names an enabled provider without the mapper,
-which leaves only that provider's newcomers outside the guard. A realm whose
-flows no longer deny the role is refused at startup with
-`keycloak_brokered_account_guard_readback_failed`.
+mark. A provider created or enabled in the Keycloak console has no mapper
+until it is configured or enabled through AKB. On a v5 receipt the guard is a
+startup gate, checked on every init-container run through the permanent
+manager: a realm whose bound flows no longer deny the role is refused with
+`keycloak_brokered_account_guard_readback_failed`, and one with an enabled
+provider that does not grant it with
+`keycloak_identity_provider_guard_mapper_missing`. Add the mapper (or disable
+the provider) in the console to recover.
 
 ## Upgrade an existing receipt
 

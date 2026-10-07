@@ -296,7 +296,7 @@ class StandaloneSSOControl(Protocol):
         spec: StandaloneSSOBootstrapSpec,
         *,
         management_token: str,
-    ) -> bool: ...
+    ) -> None: ...
 
 
 ProvisionAdmin = Callable[..., Awaitable[Mapping[str, object]]]
@@ -655,15 +655,11 @@ async def bootstrap_standalone_sso(
             "standalone SSO brokered-account password guard needs one-time upgrade authority (receipt profile %s)",
             target_profile,
         )
-    elif await control.brokered_account_guard_readback(spec, management_token=permanent_token):
-        # The read-back refuses, rather than reports, a realm whose flows no
-        # longer refuse a brokered account's password: that is a gate.
-        brokered_account_guard = "converged"
     else:
-        # Every flow still refuses; an enabled provider is not marking the
-        # accounts it brings, so its newcomers are outside the guard.
-        brokered_account_guard = "drift"
-        logger.warning("standalone SSO identity provider without the brokered-account mapper")
+        # A gate, unlike the events: a realm whose flows or providers no longer
+        # keep a brokered account off its password is refused, not reported.
+        await control.brokered_account_guard_readback(spec, management_token=permanent_token)
+        brokered_account_guard = "converged"
 
     expected_receipt = _expected_retirement_receipt(
         spec,

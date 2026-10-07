@@ -2303,15 +2303,13 @@ async def _install_brokered_account_guard() -> dict[str, object]:
                 raise _fail("fixture_pre_guard_link_failed")
 
             await control.apply_brokered_account_guard(spec, token=operator)
-            covered = await control.brokered_account_guard_readback(spec, management_token=management)
+            await control.brokered_account_guard_readback(spec, management_token=management)
             pre_guard_marked = BROKERED_ACCOUNT_ROLE in await _broker_realm_roles(client, pre_guard_subject)
     finally:
         await control.aclose()
         if pre_guard_subject:
             async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
                 await _remove_broker_person(client, pre_guard_subject)
-    if not covered:
-        raise _fail("fixture_identity_provider_not_marked")
     if not pre_guard_marked:
         raise _fail("fixture_pre_guard_account_not_marked")
     return {
