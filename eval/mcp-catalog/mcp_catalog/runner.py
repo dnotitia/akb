@@ -36,6 +36,7 @@ from .contracts import (
     ArmName,
     BenchmarkRunManifest,
     CatalogSnapshot,
+    ModelSpec,
     PublicOperation,
     TaskManifest,
     hash_json,
@@ -2433,7 +2434,7 @@ def _validate_shared_budget(
         for model in manifest.models
         for transport in manifest.transports
     ]
-    models = {model.class_name: model for model in manifest.models}
+    models: dict[str, ModelSpec] = {model.class_name: model for model in manifest.models}
     task_map = {task.id: task for task in tasks}
     aggregate = {"model_requests": 0, "input_tokens": 0, "output_tokens": 0}
     aggregate_cost = 0.0
