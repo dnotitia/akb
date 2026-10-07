@@ -11,15 +11,14 @@
     <#if section = "header">
         <span class="akb-expired__title-resuming">${msg("akbExpiredResumingTitle")}</span>
         <span class="akb-expired__title-explain">${msg("akbExpiredTitle")}</span>
+    <#elseif section = "subtitle">
+        <span class="akb-expired__resuming" role="status">${msg("akbExpiredResuming")}</span>
+        <span id="instruction1" class="akb-expired__explain instruction">${msg("akbExpiredExplain")}</span>
     <#elseif section = "form">
         <div id="akb-expired" class="akb-expired" data-akb-expired data-akb-expired-target="loginRestartLink">
-            <p class="akb-expired__resuming akb-card__lead" role="status">${msg("akbExpiredResuming")}</p>
-            <div class="akb-expired__explain">
-                <p id="instruction1" class="instruction akb-card__lead">${msg("akbExpiredExplain")}</p>
-                <div class="akb-form-actions akb-form-actions--stack">
-                    <a id="loginRestartLink" class="akb-button akb-button--primary akb-button--block akb-button--lg" href="${url.loginRestartFlowUrl}">${msg("akbExpiredRestart")}</a>
-                    <a id="loginContinueLink" class="akb-button akb-button--outline akb-button--block akb-button--lg" href="${url.loginAction}">${msg("akbExpiredContinue")}</a>
-                </div>
+            <div class="akb-expired__explain akb-form-actions akb-form-actions--stack">
+                <a id="loginRestartLink" class="akb-button akb-button--primary akb-button--block" href="${url.loginRestartFlowUrl}">${msg("akbExpiredRestart")}</a>
+                <a id="loginContinueLink" class="akb-button akb-button--secondary akb-button--block" href="${url.loginAction}">${msg("akbExpiredContinue")}</a>
             </div>
         </div>
     </#if>

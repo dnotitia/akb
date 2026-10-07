@@ -1,8 +1,15 @@
 # AKB login theme for Keycloak
 
-The sign-in pages of AKB's bundled Keycloak, in AKB's own look: the same
-tokens, typeface, light and dark schemes, and layout as the app. It is a
-Keycloak login theme named `akb`, with `keycloak.v2` as its parent.
+The sign-in pages of AKB's bundled Keycloak: AKB's tokens and typeface,
+light and dark, English and Korean, laid out after Astryx's login card. It is
+a Keycloak login theme named `akb`, with `keycloak.v2` as its parent.
+
+Every page is the same shape: the mark and the product name, one 400px card
+(1px outline, no shadow) with a centred title and an optional subtitle, and a
+quiet row below it for language and theme. Controls are 36px high (44px for
+touch) with 10px corners. The primary action is the text colour itself,
+secondary actions are a faint fill of it, and AKB's teal stays in the focus
+ring and the mark.
 
 ## Layout
 
@@ -44,18 +51,17 @@ Replaced, with what differs from the original:
 
 | Template | Original | Change |
 | --- | --- | --- |
-| `template.ftl` | `keycloak.v2` | AKB frame: brand panel, card, language and theme controls. Keycloak's scripts (session checker, password visibility, once-links, import map) are kept as they are. Its dark-mode script is replaced by `akb-theme-init.js`, which sets the same `pf-v5-theme-dark` class but follows an explicit choice as well as the system. |
-| `login.ftl` | `keycloak.v2` | Identity providers first, then the realm's own accounts. A client with the attribute `akb.login.native-only=true` (AKB's administration client) gets the password form only: a provider sign-in would be refused there. |
+| `template.ftl` | `keycloak.v2` | The frame above: mark and name, the card (a page may fill a `subtitle` section under its title), language and theme below. Keycloak's scripts (session checker, password visibility, once-links, import map) are kept as they are. Its dark-mode script is replaced by `akb-theme-init.js`, which sets the same `pf-v5-theme-dark` class but follows an explicit choice as well as the system. |
+| `login.ftl` | `keycloak.v2` | The realm's account form and its primary button, then "Or continue with" and one quiet button per identity provider. A client with the attribute `akb.login.native-only=true` (AKB's administration client) gets the password form only: a provider sign-in would be refused there. |
 | `login-oauth-grant.ftl` | `keycloak.v2` | Names the client in the title and lists what it may do; Allow and Deny. |
 | `login-page-expired.ftl` | `base` | Resumes once per browser tab by itself, and explains from the second time (see below). |
 | `error.ftl`, `logout-confirm.ftl` | `base` | Same content, AKB layout. |
 | `info.ftl` | `base` | Same content, AKB layout; a message with no separate header is shown once, not as both title and body. |
 | `login-config-totp.ftl` | `keycloak.v2` | Copy with one fix: both labels point at their inputs (upstream they point at an id that does not exist). |
 
-`theme.properties` also defines three classes that pages inherited from
+`theme.properties` also defines two classes that pages inherited from
 `base` use and `keycloak.v2` leaves undefined (`kcButtonDefaultClass`,
-`kcButtonLargeClass`, `kcFormButtonsClass`); without them those buttons have
-no variant.
+`kcFormButtonsClass`); without them those buttons have no variant.
 
 **"Page has expired".** When a browser sends the same sign-in step twice
 (a double click, an extension, a retried request), the second request finds

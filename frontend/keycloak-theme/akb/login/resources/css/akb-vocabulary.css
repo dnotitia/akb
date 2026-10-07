@@ -9,8 +9,10 @@
  *   - no colour literal anywhere outside the generated file;
  *   - nothing outside this file references an --akb-* token directly.
  *
- * "accent" is DNUI's interactive colour. In AKB that role is teal
- * (--color-primary); AKB's orange is decoration and only the logo uses it. */
+ * "accent" is DNUI's interactive colour. The sign-in pages follow Astryx's
+ * login card: the primary action is the text colour itself (near-black on
+ * light, near-white on dark), secondary actions are a faint fill of it, and
+ * AKB's teal stays in the focus ring and the logo mark. */
 :root {
   /* Surfaces */
   --color-background-body: var(--akb-color-background);
@@ -32,11 +34,13 @@
   --color-border-input: var(--akb-color-input);
 
   /* Interaction */
-  --color-accent: var(--akb-color-primary);
-  --color-on-accent: var(--akb-color-primary-foreground);
-  --color-accent-hover: color-mix(in srgb, var(--akb-color-primary) 90%, var(--akb-color-surface));
-  --color-link: var(--akb-color-link);
-  --color-link-hover: var(--akb-color-link-hover);
+  --color-accent: var(--akb-color-foreground);
+  --color-on-accent: var(--akb-color-surface);
+  --color-accent-hover: color-mix(in srgb, var(--akb-color-foreground) 84%, var(--akb-color-surface));
+  --color-fill-subtle: color-mix(in srgb, var(--akb-color-foreground) 6%, transparent);
+  --color-fill-subtle-hover: color-mix(in srgb, var(--akb-color-foreground) 10%, transparent);
+  --color-link: var(--akb-color-foreground);
+  --color-link-hover: var(--akb-color-foreground);
   --color-focus-ring: var(--akb-color-ring);
 
   /* State: base, soft background, text on the soft background */
@@ -53,15 +57,11 @@
   --color-info-muted: var(--akb-color-info-soft);
   --color-on-info-muted: var(--akb-color-info-soft-foreground);
 
-  /* Brand: the logo and the page glow, never interactive */
+  /* Brand: the logo mark only, never interactive */
   --color-brand-primary: var(--akb-color-teal);
   --color-brand-primary-2: var(--akb-color-teal-2);
   --color-brand-spark: var(--akb-color-orange);
-  --color-brand-wordmark-from: var(--akb-color-teal);
-  --color-brand-wordmark-via: var(--akb-color-teal-2);
   --color-on-brand: var(--akb-color-primary-foreground);
-  --color-brand-glow-primary: color-mix(in srgb, var(--akb-color-teal-2) 10%, transparent);
-  --color-brand-glow-spark: color-mix(in srgb, var(--akb-color-orange) 7%, transparent);
 
   /* Type */
   --font-family-body: var(--akb-font-sans);
@@ -69,8 +69,9 @@
   --font-family-mono: var(--akb-font-mono);
 
   /* Shape and depth */
-  --radius-control: var(--akb-radius-md);
-  --radius-container: var(--akb-radius-lg);
+  /* Astryx: 12px containers, 10px controls (between AKB's sm and md). */
+  --radius-control: calc((var(--akb-radius-sm) + var(--akb-radius-md)) / 2);
+  --radius-container: var(--akb-radius-md);
   --radius-chip: var(--akb-radius-sm);
   --radius-pill: var(--akb-radius-full);
   --shadow-low: var(--akb-shadow-sm);
@@ -84,22 +85,7 @@
   --ease-out: var(--akb-ease-out);
   --ease-in-out: var(--akb-ease-in-out);
 
-  /* Control sizes: the app's h-11 on touch widths and h-10 from sm up */
-  --size-element-md: 2.5rem;
-  --size-element-lg: 2.75rem;
-}
-
-/* The wordmark gradient starts at the app's deep teal, which disappears on
- * the dark canvas. Dark mode starts it at the dark palette's teal-family link
- * colour instead; the mark and the spark keep their brand colours. */
-:root[data-theme="dark"] {
-  --color-brand-wordmark-from: var(--akb-color-link);
-  --color-brand-wordmark-via: color-mix(in srgb, var(--akb-color-link) 55%, var(--akb-color-orange));
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) {
-    --color-brand-wordmark-from: var(--akb-color-link);
-    --color-brand-wordmark-via: color-mix(in srgb, var(--akb-color-link) 55%, var(--akb-color-orange));
-  }
+  /* Control height: Astryx's 36px with a fine pointer, 44px for touch */
+  --size-control: 2.25rem;
+  --size-control-touch: 2.75rem;
 }

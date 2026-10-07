@@ -9,21 +9,22 @@
         <#else>
             ${message.summary}
         </#if>
+    <#elseif section = "subtitle">
+        <#if messageHeader??>
+            <span class="instruction">${message.summary}<#if requiredActions??><#list requiredActions>: <b><#items as reqActionItem>${kcSanitize(msg("requiredAction.${reqActionItem}"))?no_esc}<#sep>, </#items></b></#list><#else></#if></span>
+        <#elseif requiredActions??>
+            <span class="instruction"><#list requiredActions><b><#items as reqActionItem>${kcSanitize(msg("requiredAction.${reqActionItem}"))?no_esc}<#sep>, </#items></b></#list></span>
+        </#if>
     <#elseif section = "form">
     <div id="kc-info-message" class="akb-message">
-        <#if messageHeader??>
-            <p class="instruction akb-card__lead">${message.summary}<#if requiredActions??><#list requiredActions>: <b><#items as reqActionItem>${kcSanitize(msg("requiredAction.${reqActionItem}"))?no_esc}<#sep>, </#items></b></#list><#else></#if></p>
-        <#elseif requiredActions??>
-            <p class="instruction akb-card__lead"><#list requiredActions><b><#items as reqActionItem>${kcSanitize(msg("requiredAction.${reqActionItem}"))?no_esc}<#sep>, </#items></b></#list></p>
-        </#if>
         <#if skipLink??>
         <#else>
             <#if pageRedirectUri?has_content>
-                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block akb-button--lg" href="${pageRedirectUri}">${msg("backToApplication")}</a></p>
+                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block" href="${pageRedirectUri}">${msg("backToApplication")}</a></p>
             <#elseif actionUri?has_content>
-                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block akb-button--lg" href="${actionUri}">${msg("proceedWithAction")}</a></p>
+                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block" href="${actionUri}">${msg("proceedWithAction")}</a></p>
             <#elseif (client.baseUrl)?has_content>
-                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block akb-button--lg" href="${client.baseUrl}">${msg("backToApplication")}</a></p>
+                <p class="akb-form-actions"><a class="akb-button akb-button--primary akb-button--block" href="${client.baseUrl}">${msg("backToApplication")}</a></p>
             </#if>
         </#if>
     </div>

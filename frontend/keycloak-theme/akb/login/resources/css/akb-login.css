@@ -2,7 +2,9 @@
  *
  * Reads only the vocabulary in akb-vocabulary.css (and custom properties it
  * declares itself). No colour literals: tests/theme-static.test.ts fails on
- * one. Layout follows the app's sign-in screen (src/pages/auth.tsx). */
+ * one. The layout follows Astryx's login card: a mark and a name, one 400px
+ * card with a 1px outline and no shadow, centred heading, 36px controls with
+ * 10px corners, a monochrome primary action, quiet secondary actions. */
 
 /* ── PatternFly 5 → vocabulary ───────────────────────────────────────────
  * Inherited Keycloak pages are PatternFly markup. Pointing PatternFly's own
@@ -27,7 +29,7 @@
   --pf-v5-global--primary-color--100: var(--color-accent);
   --pf-v5-global--primary-color--200: var(--color-accent-hover);
   --pf-v5-global--primary-color--dark-100: var(--color-accent);
-  --pf-v5-global--active-color--100: var(--color-accent);
+  --pf-v5-global--active-color--100: var(--color-focus-ring);
   --pf-v5-global--link--Color: var(--color-link);
   --pf-v5-global--link--Color--hover: var(--color-link-hover);
   --pf-v5-global--link--Color--dark: var(--color-link);
@@ -39,360 +41,236 @@
   --pf-v5-global--info-color--100: var(--color-info);
   --pf-v5-global--BorderRadius--sm: var(--radius-control);
   --pf-v5-global--BorderRadius--lg: var(--radius-container);
+  --control-height: var(--size-control);
+  --control-font-size: 0.875rem;
+}
+
+/* A finger needs a bigger target, and iOS zooms into inputs under 16px. */
+@media (pointer: coarse) {
+  :root {
+    --control-height: var(--size-control-touch);
+    --control-font-size: 1rem;
+  }
 }
 
 /* ── Page ─────────────────────────────────────────────────────────────── */
 html,
 body {
   min-height: 100%;
-  margin: 0;
 }
 
 body.akb-page {
-  position: relative;
+  margin: 0;
   background: var(--color-background-body);
   color: var(--color-text-primary);
   font-family: var(--font-family-body);
   font-size: 0.875rem;
-  line-height: 1.5;
+  line-height: 1.43;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-/* The app's background glow (src/index.css body::before), from the brand
- * vocabulary rather than literals. */
-body.akb-page::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(45rem 45rem at 8% -12%, var(--color-brand-glow-primary), transparent 60%),
-    radial-gradient(40rem 40rem at 102% -6%, var(--color-brand-glow-spark), transparent 55%),
-    radial-gradient(50rem 30rem at 50% 120%, var(--color-brand-glow-primary), transparent 60%);
+  /* Korean breaks between words, not inside one; a long token still wraps. */
+  word-break: keep-all;
+  overflow-wrap: anywhere;
 }
 
 .akb-shell {
-  position: relative;
-  z-index: 1;
   display: flex;
   min-height: 100vh;
   min-height: 100dvh;
-  justify-content: center;
-  padding: 4rem 1rem 1.5rem;
   box-sizing: border-box;
-}
-
-@media (min-width: 640px) {
-  .akb-shell {
-    padding: max(1.5rem, calc((100dvh - 30rem) / 2)) 1.5rem 1.5rem;
-  }
-}
-
-.akb-toolbar {
-  position: absolute;
-  top: 1rem;
-  right: 1rem;
-  z-index: 2;
-  display: flex;
-  gap: 0.5rem;
   align-items: center;
+  justify-content: center;
+  padding: 3rem 1rem;
 }
 
-.akb-layout {
-  display: grid;
+.akb-main {
+  display: flex;
   width: 100%;
-  max-width: 64rem;
-  align-items: start;
-  gap: 2.5rem;
+  max-width: 25rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1.25rem;
 }
 
-@media (min-width: 1024px) {
-  .akb-layout {
-    grid-template-columns: 1fr 1fr;
-    gap: 4rem;
-  }
-}
-
-/* ── Brand panel (wide screens only, like the app) ────────────────────── */
+/* ── Mark and name ────────────────────────────────────────────────────── */
 .akb-brand {
-  display: none;
-}
-
-@media (min-width: 1024px) {
-  .akb-brand {
-    display: flex;
-    flex-direction: column;
-    gap: 2rem;
-    padding: 2rem 1rem 0 0;
-  }
-}
-
-.akb-brand__headline {
-  margin: 0;
-  max-width: 24rem;
-  font-family: var(--font-family-display);
-  font-size: 1.875rem;
-  line-height: 2.25rem;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  color: var(--color-text-primary);
-}
-
-.akb-brand__lead {
-  margin: -0.75rem 0 0;
-  max-width: 28rem;
-  font-size: 0.9375rem;
-  line-height: 1.625;
-  color: var(--color-text-secondary);
-}
-
-.akb-brand__features {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.akb-brand__features li {
-  display: flex;
   align-items: center;
-  gap: 0.75rem;
-  color: var(--color-text-secondary);
+  gap: 0.5rem;
 }
 
-.akb-feature-tile {
-  display: inline-grid;
-  width: 2.125rem;
-  height: 2.125rem;
-  flex-shrink: 0;
-  place-items: center;
-  border-radius: var(--radius-container);
-  color: var(--color-on-brand);
-  box-shadow: var(--shadow-medium);
-}
-
-.akb-feature-tile .akb-icon {
-  width: 1.0625rem;
-  height: 1.0625rem;
-}
-
-.akb-feature-tile--knowledge {
-  background: linear-gradient(135deg, var(--color-brand-primary), var(--color-brand-primary-2));
-}
-
-.akb-feature-tile--memory {
-  background: linear-gradient(135deg, var(--color-brand-spark), color-mix(in srgb, var(--color-brand-spark) 80%, var(--color-warning)));
-}
-
-.akb-feature-tile--agent {
-  background: linear-gradient(135deg, var(--color-brand-primary-2), color-mix(in srgb, var(--color-brand-primary-2) 70%, var(--color-success)));
-}
-
-/* ── Logo: the app's CSS-only mark (src/components/logo.tsx) ──────────── */
-.akb-logo {
-  --logo-size: 2.5rem;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.625rem;
-}
-
-.akb-logo--lg {
-  --logo-size: 2.625rem;
-}
-
-.akb-logo__mark {
+.akb-brand__mark {
+  --mark-size: 1.75rem;
   position: relative;
   display: inline-grid;
-  width: var(--logo-size);
-  height: var(--logo-size);
-  flex-shrink: 0;
+  width: var(--mark-size);
+  height: var(--mark-size);
   place-items: center;
-  border-radius: 36%;
+  border-radius: 30%;
   background: linear-gradient(135deg, var(--color-brand-primary), var(--color-brand-primary-2));
   color: var(--color-on-brand);
   font-family: var(--font-family-display);
-  font-size: calc(var(--logo-size) * 0.5);
+  font-size: 0.875rem;
   font-weight: 600;
   line-height: 1;
-  filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--color-brand-primary) 18%, transparent));
 }
 
-.akb-logo__spark {
+.akb-brand__spark {
   position: absolute;
-  right: calc(var(--logo-size) * 0.14);
-  bottom: calc(var(--logo-size) * 0.16);
-  width: calc(var(--logo-size) * 0.16);
-  height: calc(var(--logo-size) * 0.16);
+  right: 14%;
+  bottom: 16%;
+  width: 16%;
+  height: 16%;
   border-radius: var(--radius-pill);
   background: var(--color-brand-spark);
 }
 
-.akb-logo__text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1;
-}
-
-.akb-logo__wordmark {
+.akb-brand__name {
   font-family: var(--font-family-display);
-  font-size: calc(var(--logo-size) * 0.62);
+  font-size: 1.0625rem;
   font-weight: 700;
-  letter-spacing: -0.02em;
-  background: linear-gradient(92deg, var(--color-brand-wordmark-from) 0%, var(--color-brand-wordmark-via) 45%, var(--color-brand-spark) 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
 }
 
-.akb-logo__subtitle {
-  margin-top: 0.25rem;
-  white-space: nowrap;
-  font-size: 0.75rem;
-  line-height: 1rem;
-  color: var(--color-text-secondary);
-}
-
-/* ── Card column ──────────────────────────────────────────────────────── */
-.akb-column {
-  width: 100%;
-  max-width: 28rem;
-  margin: 0 auto;
-}
-
-.akb-column__logo {
-  display: flex;
-  justify-content: center;
-  margin-bottom: 2rem;
-}
-
-@media (min-width: 1024px) {
-  .akb-column__logo {
-    display: none;
-  }
-}
-
+/* ── Card ─────────────────────────────────────────────────────────────── */
 .akb-card {
   box-sizing: border-box;
   width: 100%;
-  padding: 1.75rem;
+  padding: 2rem;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-container);
   background: var(--color-background-card);
-  box-shadow: var(--shadow-high);
 }
 
-@media (min-width: 640px) {
+@media (max-width: 26rem) {
   .akb-card {
-    padding: 2rem;
+    padding: 1.5rem 1.25rem;
   }
 }
 
-/* PatternFly's .pf-v5-c-login__main (kcLoginMain) adds its own frame. */
 .akb-card.pf-v5-c-login__main {
   grid-area: auto;
-  margin: 0;
+}
+
+.akb-card__heading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  text-align: center;
+}
+
+/* The space under the heading belongs to whatever follows it, so a page
+   that is its heading alone ends right there. */
+.akb-card > .akb-card__heading + * {
+  margin-top: 1.5rem;
+}
+
+.akb-card > .akb-card__heading + .akb-card__required {
+  margin-top: 0.75rem;
 }
 
 .akb-card__title {
   margin: 0;
   font-family: var(--font-family-display);
   font-size: 1.25rem;
-  line-height: 1.75rem;
   font-weight: 600;
-  letter-spacing: -0.012em;
-  color: var(--color-text-primary);
+  letter-spacing: -0.01em;
+  line-height: 1.4;
 }
 
 .akb-card__title:focus {
   outline: none;
 }
 
-.akb-card__lead {
-  margin: 0.25rem 0 1.25rem;
+.akb-card__subtitle {
+  margin: 0;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  line-height: 1.43;
+}
+
+/* A page with nothing under its heading (e.g. "You are logged out") is the
+   heading alone: the empty body takes no room. */
+.akb-card__body:not(:has(:is(p, a, button, input, form, ul, ol, img, span, select, textarea))) {
+  display: none;
 }
 
 .akb-card__required {
-  margin: 0.5rem 0 0;
-  font-size: 0.75rem;
+  margin: 0 0 1rem;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  text-align: center;
 }
 
 .akb-card__username {
-  margin-top: 1rem;
-}
-
-.akb-card__body {
-  margin-top: 1rem;
-}
-
-.akb-card__body > .akb-card__lead:first-child {
-  margin-top: -0.75rem;
+  margin-bottom: 1rem;
 }
 
 .akb-card__aside-action {
-  margin-top: 1rem;
+  margin-top: 0.75rem;
 }
 
 .akb-card__info {
-  margin-top: 1.5rem;
-  padding-top: 1.25rem;
-  border-top: 1px solid var(--color-border);
-  text-align: center;
+  margin-top: 1.25rem;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  text-align: center;
 }
 
+/* ── Footer: language and theme, below the card ──────────────────────── */
 .akb-footer {
-  margin-top: 1.25rem;
-  text-align: center;
-  font-size: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
+}
+
+.akb-footer__controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
 }
 
 /* ── Primitives ───────────────────────────────────────────────────────── */
 .akb-icon {
   display: inline-block;
-  width: 1rem;
-  height: 1rem;
   flex-shrink: 0;
-  vertical-align: -0.125em;
+  vertical-align: middle;
 }
 
 .akb-visually-hidden {
   position: absolute;
   width: 1px;
   height: 1px;
-  margin: -1px;
-  padding: 0;
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
-  border: 0;
 }
 
 .akb-button {
   display: inline-flex;
   box-sizing: border-box;
-  min-height: var(--size-element-md);
+  min-height: var(--control-height);
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  padding: 0 1rem;
-  border: 1px solid transparent;
+  padding: 0.5rem 0.75rem;
+  border: 0;
   border-radius: var(--radius-control);
-  font: inherit;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  text-decoration: none;
   cursor: pointer;
+  font: inherit;
+  font-size: var(--control-font-size);
+  font-weight: 500;
+  line-height: 1.25rem;
+  text-align: center;
+  text-decoration: none;
   transition:
-    background-color var(--duration-fast) var(--ease-in-out),
-    border-color var(--duration-fast) var(--ease-in-out),
-    color var(--duration-fast) var(--ease-in-out);
+    background-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
 }
 
 .akb-button:focus-visible,
@@ -402,45 +280,31 @@ body.akb-page::before {
   outline-offset: 2px;
 }
 
-.akb-button--lg {
-  min-height: var(--size-element-lg);
-  padding: 0 1.25rem;
-  font-size: 1rem;
-}
-
-@media (min-width: 640px) {
-  .akb-button--lg {
-    min-height: var(--size-element-lg);
-  }
-}
-
 .akb-button--block {
   display: flex;
   width: 100%;
 }
 
 .akb-button--primary {
-  border-color: var(--color-accent);
   background: var(--color-accent);
   color: var(--color-on-accent);
-  box-shadow: var(--shadow-low);
 }
 
-.akb-button--primary:hover {
-  background: var(--color-accent-hover);
-  color: var(--color-on-accent);
-}
-
-.akb-button--outline {
-  border-color: var(--color-border);
-  background: var(--color-background-card);
+.akb-button--secondary {
+  background: var(--color-fill-subtle);
   color: var(--color-text-primary);
 }
 
-.akb-button--outline:hover {
-  border-color: var(--color-border-emphasized);
-  background: var(--color-background-muted);
-  color: var(--color-text-primary);
+@media (hover: hover) {
+  .akb-button--primary:hover {
+    background: var(--color-accent-hover);
+    color: var(--color-on-accent);
+  }
+
+  .akb-button--secondary:hover {
+    background: var(--color-fill-subtle-hover);
+    color: var(--color-text-primary);
+  }
 }
 
 .akb-button[aria-disabled="true"],
@@ -453,19 +317,22 @@ body.akb-page::before {
 
 .akb-icon-button {
   display: inline-grid;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 2rem;
+  height: 2rem;
   place-items: center;
   padding: 0;
-  border: 1px solid var(--color-border);
+  border: 0;
   border-radius: var(--radius-control);
-  background: var(--color-background-card);
-  color: var(--color-text-primary);
+  background: transparent;
+  color: var(--color-text-secondary);
   cursor: pointer;
 }
 
-.akb-icon-button:hover {
-  background: var(--color-background-hover);
+@media (hover: hover) {
+  .akb-icon-button:hover {
+    background: var(--color-fill-subtle);
+    color: var(--color-text-primary);
+  }
 }
 
 /* Without script the toggle could not do anything: leave it out. */
@@ -485,48 +352,47 @@ body.akb-page::before {
   display: inline;
 }
 
-/* Without scripts the toggle cannot do anything; do not offer it. */
-:root:not(.akb-js) .akb-theme-toggle {
-  display: none;
-}
-
 .akb-locale {
-  position: relative;
   display: inline-flex;
   align-items: center;
+  gap: 0.25rem;
+  padding-left: 0.5rem;
+  border-radius: var(--radius-control);
   color: var(--color-text-secondary);
 }
 
-.akb-locale .akb-icon {
-  position: absolute;
-  left: 0.625rem;
-  pointer-events: none;
+.akb-locale__select {
+  field-sizing: content;
+  padding: 0.375rem 0.25rem;
+  border: 0;
+  border-radius: var(--radius-chip);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
 }
 
-.akb-locale__select {
-  height: 2.25rem;
-  padding: 0 0.75rem 0 2rem;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-control);
-  background: var(--color-background-card);
-  color: var(--color-text-primary);
-  font: inherit;
-  cursor: pointer;
+@media (hover: hover) {
+  .akb-locale:hover {
+    background: var(--color-fill-subtle);
+    color: var(--color-text-primary);
+  }
 }
 
 .akb-alert {
   display: flex;
   gap: 0.5rem;
   align-items: flex-start;
-  margin: 1rem 0 0;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid;
+  margin: 0 0 1rem;
+  padding: 0.625rem 0.75rem;
   border-radius: var(--radius-control);
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
+  line-height: 1.4;
 }
 
 .akb-alert .akb-icon {
-  margin-top: 0.125rem;
+  margin-top: 0.0625rem;
 }
 
 .akb-alert__text {
@@ -534,25 +400,21 @@ body.akb-page::before {
 }
 
 .akb-alert--error {
-  border-color: color-mix(in srgb, var(--color-error) 30%, transparent);
   background: var(--color-error-muted);
   color: var(--color-on-error-muted);
 }
 
 .akb-alert--warning {
-  border-color: color-mix(in srgb, var(--color-warning) 30%, transparent);
   background: var(--color-warning-muted);
   color: var(--color-on-warning-muted);
 }
 
 .akb-alert--success {
-  border-color: color-mix(in srgb, var(--color-success) 30%, transparent);
   background: var(--color-success-muted);
   color: var(--color-on-success-muted);
 }
 
 .akb-alert--info {
-  border-color: color-mix(in srgb, var(--color-info) 30%, transparent);
   background: var(--color-info-muted);
   color: var(--color-on-info-muted);
 }
@@ -561,32 +423,36 @@ body.akb-page::before {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  margin: 1.5rem 0 1rem;
-  font-size: 0.75rem;
+  margin: 1.25rem 0;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
 }
 
 .akb-divider::before,
 .akb-divider::after {
-  content: "";
   height: 1px;
   flex: 1;
   background: var(--color-border);
+  content: "";
 }
 
 .akb-form-actions {
   display: flex;
-  flex-direction: column;
   gap: 0.75rem;
-  margin: 1.25rem 0 0;
+  margin: 1rem 0 0;
 }
 
-.akb-form-actions--split {
-  flex-direction: row;
+/* In a PatternFly form the form's own gap already spaces the actions. */
+.akb-card .pf-v5-c-form > .akb-form-actions {
+  margin-top: 0;
 }
 
 .akb-form-actions--split > .akb-button {
   flex: 1;
+}
+
+.akb-form-actions--stack {
+  flex-direction: column;
 }
 
 .akb-providers__list {
@@ -599,13 +465,13 @@ body.akb-page::before {
 }
 
 .akb-message .akb-alert {
-  margin-top: 0;
+  margin-bottom: 0;
 }
 
 .akb-message__trace {
   margin: 0.75rem 0 0;
-  font-size: 0.75rem;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
 }
 
 /* ── Consent ──────────────────────────────────────────────────────────── */
@@ -614,10 +480,7 @@ body.akb-page::before {
   flex-direction: column;
   gap: 0.625rem;
   margin: 0;
-  padding: 0.875rem 1rem;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-control);
-  background: var(--color-background-muted);
+  padding: 0;
   list-style: none;
 }
 
@@ -625,20 +488,23 @@ body.akb-page::before {
   display: flex;
   gap: 0.625rem;
   align-items: flex-start;
-  color: var(--color-text-primary);
 }
 
 .akb-consent__check {
   margin-top: 0.125rem;
-  color: var(--color-success);
+  color: var(--color-text-secondary);
   line-height: 0;
 }
 
 .akb-consent__terms,
 .akb-consent__revoke {
-  margin: 0.875rem 0 0;
-  font-size: 0.75rem;
+  margin: 1rem 0 0;
   color: var(--color-text-secondary);
+  font-size: 0.75rem;
+}
+
+.akb-consent__form {
+  margin-top: 1.25rem;
 }
 
 /* ── Expired page: resuming first, explaining second ─────────────────── */
@@ -649,7 +515,7 @@ body.akb-page::before {
 
 :root.akb-js:not(.akb-expired-explain) .akb-expired__resuming,
 :root.akb-js:not(.akb-expired-explain) .akb-expired__title-resuming {
-  display: block;
+  display: inline;
 }
 
 :root.akb-js:not(.akb-expired-explain) .akb-expired__explain,
@@ -657,11 +523,11 @@ body.akb-page::before {
   display: none;
 }
 
-.akb-form-actions--stack {
-  flex-direction: column;
+.akb-expired .akb-form-actions {
+  margin-top: 0;
 }
 
-/* ── Inherited PatternFly pages, in AKB's control style ──────────────── */
+/* ── Inherited PatternFly pages, in the same control style ───────────── */
 .akb-card .pf-v5-c-form {
   gap: 1rem;
 }
@@ -669,27 +535,24 @@ body.akb-page::before {
 .akb-card .pf-v5-c-form__label-text,
 .akb-card .pf-v5-c-form__label {
   color: var(--color-text-primary);
-  font-size: 0.875rem;
+  font-size: 0.75rem;
   font-weight: 500;
 }
 
+.akb-card .pf-v5-c-form__group-label {
+  padding-bottom: 0.375rem;
+}
+
 .akb-card .pf-v5-c-form-control {
-  min-height: var(--size-element-lg);
+  min-height: var(--control-height);
   border-radius: var(--radius-control);
   background: var(--color-background-card);
   color: var(--color-text-primary);
-  font-size: 1rem;
-}
-
-@media (min-width: 640px) {
-  .akb-card .pf-v5-c-form-control {
-    min-height: var(--size-element-md);
-    font-size: 0.875rem;
-  }
+  font-size: var(--control-font-size);
 }
 
 .akb-card .pf-v5-c-form-control::before {
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-emphasized);
   border-radius: var(--radius-control);
 }
 
@@ -697,8 +560,10 @@ body.akb-page::before {
   border: 0;
 }
 
-.akb-card .pf-v5-c-form-control:hover::before {
-  border-color: var(--color-border-emphasized);
+@media (hover: hover) {
+  .akb-card .pf-v5-c-form-control:hover::before {
+    border-color: var(--color-text-tertiary);
+  }
 }
 
 .akb-card .pf-v5-c-form-control:focus-within::before {
@@ -713,6 +578,7 @@ body.akb-page::before {
 .akb-card .pf-v5-c-form-control > input,
 .akb-card .pf-v5-c-form-control > select,
 .akb-card .pf-v5-c-form-control > textarea {
+  padding-inline: 0.75rem;
   color: inherit;
   font: inherit;
 }
@@ -737,43 +603,50 @@ body.akb-page::before {
   background: var(--color-background-muted);
 }
 
-.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control {
-  --pf-v5-c-button--m-control--BackgroundColor: var(--color-background-card);
-  --pf-v5-c-button--m-control--hover--BackgroundColor: var(--color-background-hover);
-  --pf-v5-c-button--m-control--focus--BackgroundColor: var(--color-background-hover);
-  --pf-v5-c-button--m-control--active--BackgroundColor: var(--color-background-active);
-  --pf-v5-c-button--m-control--Color: var(--color-text-secondary);
-  --pf-v5-c-button--m-control--hover--Color: var(--color-text-primary);
-  --pf-v5-c-button--m-control--focus--Color: var(--color-text-primary);
-  --pf-v5-c-button--m-control--active--Color: var(--color-text-primary);
-  --pf-v5-c-button--m-control--after--BorderTopColor: var(--color-border);
-  --pf-v5-c-button--m-control--after--BorderRightColor: var(--color-border);
-  --pf-v5-c-button--m-control--after--BorderBottomColor: var(--color-border);
-  --pf-v5-c-button--m-control--after--BorderLeftColor: var(--color-border);
-  --pf-v5-c-button--m-control--hover--after--BorderBottomColor: var(--color-border-emphasized);
-  --pf-v5-c-button--m-control--hover--after--BorderBottomWidth: 1px;
-  --pf-v5-c-button--m-control--focus--after--BorderBottomColor: var(--color-focus-ring);
-  --pf-v5-c-button--m-control--focus--after--BorderBottomWidth: 1px;
-  --pf-v5-c-button--m-control--active--after--BorderBottomColor: var(--color-border-emphasized);
-  --pf-v5-c-button--m-control--active--after--BorderBottomWidth: 1px;
-  --pf-v5-c-button--m-control--BorderRadius: 0 var(--radius-control) var(--radius-control) 0;
-  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+/* A field with a button (password + show) is one control: the button sits
+   inside its outline, and the focus ring takes the whole thing. */
+.akb-card .pf-v5-c-input-group {
+  position: relative;
+  border-radius: var(--radius-control);
 }
 
-.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control::after {
-  border-radius: inherit;
-  border-left-width: 0;
+/* PatternFly's dark theme draws a divider before each group item. */
+.akb-card .pf-v5-c-input-group__item {
+  border: 0;
 }
 
 .akb-card .pf-v5-c-input-group .pf-v5-c-form-control::before {
   border-start-end-radius: 0;
   border-end-end-radius: 0;
+  border-right-width: 0;
 }
 
-/* A field with a button (password + show) is one control: it takes the
-   focus ring as a whole, not just its input half. */
-.akb-card .pf-v5-c-input-group {
-  border-radius: var(--radius-control);
+.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control {
+  --pf-v5-c-button--m-control--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-control--hover--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-control--focus--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-control--active--BackgroundColor: var(--color-background-card);
+  --pf-v5-c-button--m-control--Color: var(--color-text-tertiary);
+  --pf-v5-c-button--m-control--hover--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--focus--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--active--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-control--after--BorderTopColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--after--BorderRightColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--after--BorderLeftColor: transparent;
+  --pf-v5-c-button--m-control--hover--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--hover--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--focus--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--focus--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--active--after--BorderBottomColor: var(--color-border-emphasized);
+  --pf-v5-c-button--m-control--active--after--BorderBottomWidth: 1px;
+  --pf-v5-c-button--m-control--BorderRadius: 0 var(--radius-control) var(--radius-control) 0;
+  min-height: var(--control-height);
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+}
+
+.akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control::after {
+  border-radius: inherit;
 }
 
 .akb-card .pf-v5-c-input-group:focus-within {
@@ -800,7 +673,9 @@ body.akb-page::before {
 }
 
 .akb-card .pf-v5-c-button {
+  min-height: var(--control-height);
   border-radius: var(--radius-control);
+  font-size: var(--control-font-size);
   font-weight: 500;
 }
 
@@ -817,22 +692,29 @@ body.akb-page::before {
   --pf-v5-c-button--m-primary--active--BackgroundColor: var(--color-accent-hover);
   --pf-v5-c-button--m-primary--Color: var(--color-on-accent);
   --pf-v5-c-button--m-primary--hover--Color: var(--color-on-accent);
-  min-height: var(--size-element-lg);
+  --pf-v5-c-button--m-primary--focus--Color: var(--color-on-accent);
+  --pf-v5-c-button--m-primary--active--Color: var(--color-on-accent);
 }
 
 .akb-card .pf-v5-c-button.pf-m-secondary {
   --pf-v5-c-button--m-secondary--Color: var(--color-text-primary);
   --pf-v5-c-button--m-secondary--hover--Color: var(--color-text-primary);
-  --pf-v5-c-button--m-secondary--BackgroundColor: var(--color-background-card);
-  --pf-v5-c-button--m-secondary--hover--BackgroundColor: var(--color-background-muted);
-  --pf-v5-c-button--m-secondary--after--BorderColor: var(--color-border);
-  --pf-v5-c-button--m-secondary--hover--after--BorderColor: var(--color-border-emphasized);
-  min-height: var(--size-element-lg);
+  --pf-v5-c-button--m-secondary--focus--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-secondary--active--Color: var(--color-text-primary);
+  --pf-v5-c-button--m-secondary--BackgroundColor: var(--color-fill-subtle);
+  --pf-v5-c-button--m-secondary--hover--BackgroundColor: var(--color-fill-subtle-hover);
+  --pf-v5-c-button--m-secondary--focus--BackgroundColor: var(--color-fill-subtle-hover);
+  --pf-v5-c-button--m-secondary--active--BackgroundColor: var(--color-fill-subtle-hover);
+  --pf-v5-c-button--m-secondary--after--BorderColor: transparent;
+  --pf-v5-c-button--m-secondary--hover--after--BorderColor: transparent;
+  --pf-v5-c-button--m-secondary--focus--after--BorderColor: transparent;
+  --pf-v5-c-button--m-secondary--active--after--BorderColor: transparent;
 }
 
 .akb-card .pf-v5-c-button.pf-m-link {
   --pf-v5-c-button--m-link--Color: var(--color-link);
   --pf-v5-c-button--m-link--hover--Color: var(--color-link-hover);
+  font-size: 0.75rem;
 }
 
 .akb-card .pf-v5-c-button:focus-visible {
@@ -842,6 +724,7 @@ body.akb-page::before {
 
 .akb-card .pf-v5-c-check__label {
   color: var(--color-text-primary);
+  font-size: 0.75rem;
 }
 
 .akb-card .pf-v5-c-alert {
@@ -852,10 +735,13 @@ body.akb-page::before {
 
 .akb-card a:not(.akb-button):not(.pf-v5-c-button) {
   color: var(--color-link);
+  font-weight: 500;
+  text-decoration: none;
 }
 
 .akb-card a:not(.akb-button):not(.pf-v5-c-button):hover {
   color: var(--color-link-hover);
+  text-decoration: underline;
 }
 
 /* Kept from keycloak.v2's styles.css, which this theme does not load. */
@@ -919,18 +805,8 @@ body.akb-page::before {
   .akb-card,
   .akb-button,
   .akb-icon-button,
-  .akb-alert,
-  .akb-consent__scopes {
+  .akb-alert {
     border: 1px solid CanvasText;
-  }
-
-  .akb-logo__wordmark {
-    background: none;
-    color: CanvasText;
-  }
-
-  body.akb-page::before {
-    display: none;
   }
 
   /* Box shadows vanish in forced colours; the focus ring must not. */

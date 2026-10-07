@@ -11,7 +11,10 @@ specifically; the proxy has its own log in
 
 - The bundled Keycloak's sign-in pages use AKB's login theme (`akb`, source in
   `frontend/keycloak-theme`): AKB's tokens and typeface, light and dark,
-  English and Korean. The frontend image now carries the assembled theme at
+  English and Korean. Every page is one card laid out after Astryx's login
+  card: the mark and name above it, a centred title, 36px controls, the
+  account form with a monochrome primary button, then the identity providers
+  under "Or continue with", and language and theme below the card. The frontend image now carries the assembled theme at
   `/usr/share/akb/keycloak-theme/akb`, outside nginx's web root. The
   `standalone-sso` overlay and the Helm `sso` template give the Keycloak
   StatefulSet a `login-theme` init container, using the frontend Deployment's

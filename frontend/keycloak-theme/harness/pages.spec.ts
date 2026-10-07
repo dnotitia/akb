@@ -5,13 +5,21 @@ import { expect, test } from "@playwright/test";
 import { authUrl, inspect, PASSWORDS, signIn, watchErrors } from "./lib";
 
 test.describe("grade A", () => {
-  test("sign-in offers the identity provider, then local accounts", async ({ page }) => {
+  test("sign-in shows the account form, then the identity provider", async ({ page }) => {
     const settled = watchErrors(page);
     await page.goto(authUrl("akb-web"));
-    await expect(page.locator("#kc-page-title")).toHaveText("Sign in to AKB");
+    await expect(page.locator("#kc-page-title")).toHaveText("Sign in");
+    await expect(page.locator(".akb-card__subtitle")).toHaveText("Continue to your AKB workspace");
+    await expect(page.locator("#kc-login")).toHaveText("Sign in");
     await expect(page.locator("#social-entra")).toHaveText("Sign in with teams");
-    await expect(page.locator(".akb-divider")).toBeVisible();
-    await expect(page.locator("#kc-form-login")).toBeVisible();
+    await expect(page.locator(".akb-divider")).toHaveText("Or continue with");
+    // Astryx's login card order: the form and its primary action first.
+    const formFirst = await page.evaluate(() => {
+      const form = document.getElementById("kc-form-login");
+      const providers = document.getElementById("kc-social-providers");
+      return !!form && !!providers && !!(form.compareDocumentPosition(providers) & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+    expect(formFirst, "form before providers").toBe(true);
     await inspect(page, "login");
     settled();
   });
@@ -19,8 +27,8 @@ test.describe("grade A", () => {
   test("the product administration sign-in has no identity provider", async ({ page }) => {
     const settled = watchErrors(page);
     await page.goto(authUrl("akb-web-admin"));
-    await expect(page.locator("#kc-page-title")).toHaveText("Sign in to AKB administration");
-    await expect(page.locator(".akb-card__lead")).toHaveText("Use this installation's administrator account.");
+    await expect(page.locator("#kc-page-title")).toHaveText("Administrator sign-in");
+    await expect(page.locator(".akb-card__subtitle")).toHaveText("Use this installation's administrator account");
     await expect(page.locator("[id^=social-]")).toHaveCount(0);
     await expect(page.locator("#kc-social-providers, .akb-divider")).toHaveCount(0);
     await expect(page.locator("#username")).toBeFocused();
@@ -41,7 +49,7 @@ test.describe("grade A", () => {
     const settled = watchErrors(page);
     await page.goto(authUrl("akb-web", { locale: "ko" }));
     await expect(page.locator("html")).toHaveAttribute("lang", "ko");
-    await expect(page.locator("#kc-page-title")).toHaveText("AKB에 로그인");
+    await expect(page.locator("#kc-page-title")).toHaveText("로그인");
     await expect(page.locator("#social-entra")).toHaveText("teams(으)로 로그인");
     await inspect(page, "login-ko");
     settled();
