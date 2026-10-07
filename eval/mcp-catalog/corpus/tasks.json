@@ -1089,7 +1089,7 @@
                 {
                   "pointer": "/files/notes~1imported.md",
                   "operator": "equals",
-                  "value": "---\\ntype: note\\n---\\n# Imported\\nportable"
+                  "value": "---\ntype: note\n---\n# Imported\nportable"
                 }
               ]
             }

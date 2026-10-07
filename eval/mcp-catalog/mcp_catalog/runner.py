@@ -2249,13 +2249,17 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         if integrity_error is not None:
             return _empty_comparison(baseline, candidate, integrity_error)
     manifest = baseline["manifest"]
-    expected_revisions = manifest.get("arm_source_revisions", {})
+    try:
+        validated_manifest = BenchmarkRunManifest.model_validate(manifest)
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"run manifest is invalid: {exc}")
+    expected_revisions = validated_manifest.arm_source_revisions
     if (
         baseline.get("source_revision") != expected_revisions.get("baseline")
         or candidate.get("source_revision") != expected_revisions.get("candidate")
     ):
         return _empty_comparison(baseline, candidate, "runtime source revision does not match the sealed arm revision")
-    public_operations = [PublicOperation.model_validate(item) for item in manifest["public_operations"]]
+    public_operations = validated_manifest.public_operations
     try:
         base_catalog_errors, _ = _catalog_contract_errors(
             baseline,
@@ -2352,17 +2356,31 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         return _empty_comparison(baseline, candidate, "all four model-by-transport cells are required")
 
     try:
+        confidence = float(manifest["statistical_procedure"]["confidence"])
+        resamples = int(manifest["statistical_procedure"]["resamples"])
+        seed = int(manifest["statistical_procedure"]["seed"])
         overall_base = _cluster_samples(baseline_outcomes, task_pairs=task_pairs, metric="success")
         overall_candidate = _cluster_samples(candidate_outcomes, task_pairs=task_pairs, metric="success")
+        overall_success_base_values = [overall_base[pair_id] for pair_id in pair_ids]
+        overall_success_candidate_values = [overall_candidate[pair_id] for pair_id in pair_ids]
         overall_success = paired_cluster_bca(
-            [overall_base[pair_id] for pair_id in pair_ids],
-            [overall_candidate[pair_id] for pair_id in pair_ids],
+            overall_success_base_values,
+            overall_success_candidate_values,
             alternative="greater",
-            confidence=float(manifest["statistical_procedure"]["confidence"]),
-            resamples=int(manifest["statistical_procedure"]["resamples"]),
-            seed=int(manifest["statistical_procedure"]["seed"]),
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        overall_success_clear_failure = paired_cluster_bca(
+            overall_success_base_values,
+            overall_success_candidate_values,
+            alternative="less",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
         )
         cell_success: dict[str, dict[str, Any]] = {}
+        cell_success_clear_failure: dict[str, dict[str, Any]] = {}
         for model_class, transport in cells:
             cell = (model_class, transport)
             expected_pairs = sorted({
@@ -2379,23 +2397,44 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
             candidate_values = _cluster_samples(
                 candidate_outcomes, task_pairs=task_pairs, metric="success", cell=cell
             )
-            cell_success[f"{model_class}:{transport}"] = paired_cluster_bca(
-                [base_values[pair_id] for pair_id in expected_pairs],
-                [candidate_values[pair_id] for pair_id in expected_pairs],
+            base_cell_values = [base_values[pair_id] for pair_id in expected_pairs]
+            candidate_cell_values = [candidate_values[pair_id] for pair_id in expected_pairs]
+            cell_key = f"{model_class}:{transport}"
+            cell_success[cell_key] = paired_cluster_bca(
+                base_cell_values,
+                candidate_cell_values,
                 alternative="greater",
-                confidence=float(manifest["statistical_procedure"]["confidence"]),
-                resamples=int(manifest["statistical_procedure"]["resamples"]),
-                seed=int(manifest["statistical_procedure"]["seed"]),
+                confidence=confidence,
+                resamples=resamples,
+                seed=seed,
+            )
+            cell_success_clear_failure[cell_key] = paired_cluster_bca(
+                base_cell_values,
+                candidate_cell_values,
+                alternative="less",
+                confidence=confidence,
+                resamples=resamples,
+                seed=seed,
             )
         overall_base_errors = _cluster_samples(baseline_outcomes, task_pairs=task_pairs, metric="trial_error")
         overall_candidate_errors = _cluster_samples(candidate_outcomes, task_pairs=task_pairs, metric="trial_error")
+        base_error_values = [overall_base_errors[pair_id] for pair_id in pair_ids]
+        candidate_error_values = [overall_candidate_errors[pair_id] for pair_id in pair_ids]
         error_rate = paired_cluster_bca(
-            [overall_base_errors[pair_id] for pair_id in pair_ids],
-            [overall_candidate_errors[pair_id] for pair_id in pair_ids],
+            base_error_values,
+            candidate_error_values,
             alternative="less",
-            confidence=float(manifest["statistical_procedure"]["confidence"]),
-            resamples=int(manifest["statistical_procedure"]["resamples"]),
-            seed=int(manifest["statistical_procedure"]["seed"]),
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        error_rate_clear_failure = paired_cluster_bca(
+            base_error_values,
+            candidate_error_values,
+            alternative="greater",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
         )
     except (KeyError, InconclusiveBootstrap, ValueError) as exc:
         return _empty_comparison(baseline, candidate, f"registered BCa evidence is inconclusive: {exc}")
@@ -2418,10 +2457,17 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     )
     margin = float(manifest["statistical_procedure"]["noninferiority_margin"])
     success_intervals = {"overall": overall_success, **cell_success}
+    success_clear_failure_intervals = {
+        "overall": overall_success_clear_failure,
+        **cell_success_clear_failure,
+    }
     success_pass = all(float(result["lower_bound"]) >= -margin for result in success_intervals.values())
     error_pass = float(error_rate["upper_bound"]) < 0
-    success_clear_fail = any(float(result["upper_bound"]) < -margin for result in success_intervals.values())
-    error_clear_fail = float(error_rate["lower_bound"]) > 0
+    success_clear_fail = any(
+        float(success_clear_failure_intervals[key]["upper_bound"]) < -margin
+        for key in success_intervals
+    )
+    error_clear_fail = float(error_rate_clear_failure["lower_bound"]) > 0
     boundary = (
         not success_pass and not success_clear_fail
     ) or (not error_pass and not error_clear_fail)
@@ -2466,6 +2512,10 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         "verdict": verdict,
         "overall": {"success": overall_success, "task_error_rate": error_rate},
         "cells": cell_success,
+        "clear_failure_intervals": {
+            "success": success_clear_failure_intervals,
+            "task_error_rate": error_rate_clear_failure,
+        },
         "secondary": {
             "input_tokens": {
                 "baseline": all_base_tokens,

@@ -51,6 +51,39 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
     )
 
 
+def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    failed_pairs = {item["pair_id"] for item in baseline["task_locales"]}
+    for run in candidate["runs"].values():
+        for trial in run["trials"]:
+            if trial["cluster_id"] in failed_pairs:
+                trial["success"] = False
+    _seal(candidate)
+
+    success_failure = compare_artifacts(baseline, candidate)
+
+    assert success_failure["verdict"] == "redesign"
+    assert "success noninferiority gate failed" in success_failure["gate"]["reasons"]
+    assert (
+        success_failure["clear_failure_intervals"]["success"]["overall"]["upper_bound"]
+        < -success_failure["gate"]["noninferiority_margin"]
+    )
+
+    baseline, candidate = complete_paired_artifacts()
+    for run in candidate["runs"].values():
+        for trial in run["trials"]:
+            trial["success"] = False
+            trial["trial_error"] = True
+            trial["trial_error_kinds"] = ["unsupported_success_claim"]
+    _seal(candidate)
+
+    error_failure = compare_artifacts(baseline, candidate)
+
+    assert error_failure["verdict"] == "redesign"
+    assert "overall task-error reduction gate failed" in error_failure["gate"]["reasons"]
+    assert error_failure["clear_failure_intervals"]["task_error_rate"]["lower_bound"] > 0
+
+
 def test_verified_candidate_state_mutation_returns_reject() -> None:
     baseline, candidate = complete_paired_artifacts()
     candidate["runs"]["primary:http"]["trials"][0]["unsafe_mutation"] = True

@@ -33,6 +33,9 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     coverage.validate_manifest(manifest)
     assert len(tasks) == 40
     assert len(coverage.entries) == 51
+    assert "public_operations" not in raw_manifest
+    assert len(raw_manifest["candidate_route_overrides"]) == 17
+    assert len(manifest.public_operations) == 51
     assert {model.class_name for model in manifest.models} == {"primary", "lightweight"}
     assert {task.category for task in tasks} == set(manifest.category_minimums)
     assert {task.suite for task in tasks} == {"capability", "tool_surface_risk"}
@@ -79,6 +82,36 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     for task in tasks:
         expected_before = 404 if task.pair_id in absent_before_pairs else task.expected_final_state.probe.expected_status
         assert task.expected_final_state.resolved_before_expected_status == expected_before
+
+    import_export = {
+        task.id: task
+        for task in tasks
+        if task.pair_id == "import-export"
+    }
+    assert set(import_export) == {"import-export-ko", "import-export-en"}
+    for task in import_export.values():
+        import_attempt = next(
+            attempt
+            for attempt in task.expected_material_attempts
+            if attempt.logical_operation == "create" and attempt.resource_type == "archive"
+        )
+        imported_files = import_attempt.arguments["files"]
+        assert isinstance(imported_files, dict)
+        imported_text = imported_files["notes/imported.md"]
+        exported_text = task.expected_final_state.additional_observations[0].must[0].value
+        assert isinstance(imported_text, str)
+        assert isinstance(exported_text, str)
+        assert exported_text == imported_text
+        assert "\n" in exported_text
+        assert "\\n" not in exported_text
+
+
+def test_manifest_rejects_expanded_public_operation_drift() -> None:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    raw["public_operations"][0]["baseline"]["tool"] = "akb_wrong_route"
+
+    with pytest.raises(ValueError, match="expanded public_operations"):
+        BenchmarkRunManifest.model_validate(raw)
 
 
 def test_manifest_rejects_provider_or_price_drift() -> None:

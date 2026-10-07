@@ -873,8 +873,9 @@ class BenchmarkRunManifest(ContractModel):
     provider_sensitivity: ProviderSensitivity = Field(default_factory=ProviderSensitivity)
     budget: Budget
     operation_map: dict[str, list[str]]
-    public_operations: list[PublicOperation] = Field(min_length=45)
     tool_resources: dict[str, ResourceType]
+    candidate_route_overrides: dict[str, ArmOperationRoute] = Field(default_factory=dict)
+    public_operations: list[PublicOperation] = Field(default_factory=list)
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
     locales: list[TaskLocale] = Field(default_factory=default_locales)
@@ -991,22 +992,47 @@ class BenchmarkRunManifest(ContractModel):
         duplicates = [tool for tool, count in Counter(tool for tools in self.operation_map.values() for tool in tools).items() if count > 1]
         if duplicates:
             raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
+        if not set(self.candidate_route_overrides) <= registered_tools:
+            raise ValueError("candidate_route_overrides cannot reference unknown canonical operations")
+        if any(
+            route == ArmOperationRoute(tool=operation)
+            for operation, route in self.candidate_route_overrides.items()
+        ):
+            raise ValueError("candidate_route_overrides must contain only non-identity routes")
         if set(self.arm_source_revisions) != {"baseline", "candidate"} or any(
             not _is_git_revision(revision) for revision in self.arm_source_revisions.values()
         ):
             raise ValueError("both arm source revisions must be exact full git revisions")
-        operations = {item.operation: item for item in self.public_operations}
-        if len(operations) != len(self.public_operations) or set(operations) != set(self.tool_resources):
-            raise ValueError("public_operations must map every canonical operation exactly once")
-        for operation, contract in operations.items():
-            if contract.logical_operation not in self.operation_map or operation not in self.operation_map[contract.logical_operation]:
-                raise ValueError(f"public operation {operation} does not match operation_map")
-            if contract.resource_type != self.tool_resources[operation]:
-                raise ValueError(f"public operation {operation} has a mismatched resource type")
-            stdio_only = {"akb_get_file", "akb_put_file", "akb_update_file", "akb_delete_file", "akb_put_image", "akb_discard_image"}
-            expected_transports = ["stdio"] if operation in stdio_only else ["http", "stdio"]
-            if contract.transports != expected_transports:
-                raise ValueError(f"public operation {operation} has an invalid transport contract")
+        stdio_only = {
+            "akb_get_file",
+            "akb_put_file",
+            "akb_update_file",
+            "akb_delete_file",
+            "akb_put_image",
+            "akb_discard_image",
+        }
+        derived_operations = [
+            PublicOperation(
+                operation=operation,
+                logical_operation=logical_operation,
+                resource_type=self.tool_resources[operation],
+                transports=["stdio"] if operation in stdio_only else ["http", "stdio"],
+                baseline=ArmOperationRoute(tool=operation),
+                candidate=self.candidate_route_overrides.get(operation, ArmOperationRoute(tool=operation)),
+            )
+            for logical_operation, tools in self.operation_map.items()
+            for operation in tools
+        ]
+        derived_by_operation = {item.operation: item for item in derived_operations}
+        if len(derived_by_operation) != len(derived_operations):
+            raise ValueError("derived public operations must map every canonical operation exactly once")
+        supplied_by_operation = {item.operation: item for item in self.public_operations}
+        if self.public_operations and (
+            len(supplied_by_operation) != len(self.public_operations)
+            or supplied_by_operation != derived_by_operation
+        ):
+            raise ValueError("expanded public_operations do not match the derived execution contract")
+        object.__setattr__(self, "public_operations", derived_operations)
         expected_transport_counts = {"http": {"baseline": 45, "candidate": 33}, "stdio": {"baseline": 51, "candidate": 39}}
         for arm in ("baseline", "candidate"):
             for transport in ("http", "stdio"):
