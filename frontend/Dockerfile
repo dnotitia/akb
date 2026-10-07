@@ -14,9 +14,14 @@ RUN pnpm install --frozen-lockfile
 
 COPY . .
 RUN pnpm run build
+# The Keycloak login theme, built from the same tokens and fonts as the app
+# (keycloak-theme/README.md). The bundled Keycloak copies it at start.
+RUN pnpm run theme:assemble
 
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
+# Outside the web root: nginx serves the app, Keycloak serves the theme.
+COPY --from=builder /app/dist-keycloak-theme/akb /usr/share/akb/keycloak-theme/akb
 
 # nginx config lives in a tracked file (frontend/nginx.conf) — it carries
 # the SPA fallback, the backend proxies, and the asset cache/404 rules

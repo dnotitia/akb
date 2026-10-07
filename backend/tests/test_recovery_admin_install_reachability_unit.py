@@ -179,6 +179,12 @@ class _Control:
     async def brokered_account_guard_readback(self, _spec, *, management_token):
         return None
 
+    async def apply_login_presentation(self, _spec, *, token):
+        return None
+
+    async def login_presentation_converged(self, _spec, *, management_token):
+        return True
+
     async def native_client_registration_disabled(self, _spec):
         return True
 

@@ -40,9 +40,15 @@ STANDALONE_SSO_RECEIPT_PROFILE_V4 = "bundled-keycloak-v4"
 # provider grants, and browser and direct-grant flows that refuse a realm
 # password to an account holding it. Binding a flow needs manage-realm, which
 # the permanent manager never holds, so it follows the same one-time ladder.
-STANDALONE_SSO_RECEIPT_PROFILE = "bundled-keycloak-v5"
+STANDALONE_SSO_RECEIPT_PROFILE_V5 = "bundled-keycloak-v5"
+# v6 adds the login presentation: AKB's login theme, English and Korean, and
+# the administration client marked as taking only the realm's own accounts
+# (the theme then draws no identity-provider button there). Realm and client
+# settings need manage-realm and manage-clients, so the same ladder again.
+STANDALONE_SSO_RECEIPT_PROFILE = "bundled-keycloak-v6"
 STANDALONE_SSO_RECEIPT_PROFILES = (
     STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V5,
     STANDALONE_SSO_RECEIPT_PROFILE_V4,
     STANDALONE_SSO_RECEIPT_PROFILE_V3,
     STANDALONE_SSO_RECEIPT_PROFILE_V2,
@@ -51,14 +57,30 @@ STANDALONE_SSO_RECEIPT_PROFILES = (
 # Profiles whose receipt records the exact back-channel callback.
 STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES = (
     STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V5,
     STANDALONE_SSO_RECEIPT_PROFILE_V4,
     STANDALONE_SSO_RECEIPT_PROFILE_V3,
 )
 # Profiles whose realm carries the user-event settings.
 STANDALONE_SSO_REALM_EVENTS_RECEIPT_PROFILES = (
     STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V5,
     STANDALONE_SSO_RECEIPT_PROFILE_V4,
 )
+# Profiles whose realm carries the brokered-account password guard.
+STANDALONE_SSO_BROKERED_ACCOUNT_GUARD_RECEIPT_PROFILES = (
+    STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_RECEIPT_PROFILE_V5,
+)
+# The login presentation (v6). The theme itself ships in AKB's frontend image
+# and reaches Keycloak through the deployment; Keycloak serves its built-in
+# theme while `akb` is absent, so the realm can name it before it arrives.
+LOGIN_THEME = "akb"
+LOGIN_LOCALES = ("en", "ko")
+LOGIN_DEFAULT_LOCALE = "en"
+# Client attribute the theme reads: the client's sign-in page shows the
+# realm's password form only, with no identity-provider buttons.
+LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE = "akb.login.native-only"
 # Keycloak user events the realm keeps, and for how long. Login outcomes,
 # broker outcomes, restarts of an expired login, and every change to a
 # credential or a broker link: enough to reconstruct a failed sign-in and to
@@ -297,6 +319,20 @@ class StandaloneSSOControl(Protocol):
         *,
         management_token: str,
     ) -> None: ...
+
+    async def apply_login_presentation(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> None: ...
+
+    async def login_presentation_converged(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> bool: ...
 
     async def native_client_registration_disabled(
         self,
@@ -616,7 +652,9 @@ async def bootstrap_standalone_sso(
         # move from v4 leaves the event settings exactly as the realm has them.
         if source_profile not in STANDALONE_SSO_REALM_EVENTS_RECEIPT_PROFILES:
             await control.apply_realm_events(spec, token=upgrade_token)
-        await control.apply_brokered_account_guard(spec, token=upgrade_token)
+        if source_profile not in STANDALONE_SSO_BROKERED_ACCOUNT_GUARD_RECEIPT_PROFILES:
+            await control.apply_brokered_account_guard(spec, token=upgrade_token)
+        await control.apply_login_presentation(spec, token=upgrade_token)
         keycloak_mutated = True
 
     # Re-authenticate through the permanent path after projection.  A client
@@ -654,7 +692,7 @@ async def bootstrap_standalone_sso(
             "standalone SSO realm events need one-time upgrade authority (receipt profile %s)",
             target_profile,
         )
-    if target_profile != STANDALONE_SSO_RECEIPT_PROFILE:
+    if target_profile not in STANDALONE_SSO_BROKERED_ACCOUNT_GUARD_RECEIPT_PROFILES:
         brokered_account_guard = "pending_upgrade"
         logger.info(
             "standalone SSO brokered-account password guard needs one-time upgrade authority (receipt profile %s)",
@@ -665,6 +703,19 @@ async def bootstrap_standalone_sso(
         # keep a brokered account off its password is refused, not reported.
         await control.brokered_account_guard_readback(spec, management_token=permanent_token)
         brokered_account_guard = "converged"
+    if target_profile != STANDALONE_SSO_RECEIPT_PROFILE:
+        login_presentation = "pending_upgrade"
+        logger.info(
+            "standalone SSO login presentation needs one-time upgrade authority (receipt profile %s)",
+            target_profile,
+        )
+    elif await control.login_presentation_converged(spec, management_token=permanent_token):
+        login_presentation = "converged"
+    else:
+        # Observation, not a gate: another theme chosen in the console changes
+        # how sign-in looks, not who can sign in.
+        login_presentation = "drift"
+        logger.warning("standalone SSO login presentation drifted from receipt profile %s", target_profile)
     # A Keycloak server setting rather than realm state, and on a managed tenant
     # the platform deploys that server: reported, never a reason to refuse.
     native_registration = await control.native_client_registration_disabled(spec)
@@ -739,6 +790,7 @@ async def bootstrap_standalone_sso(
         "receipt_profile": target_profile,
         "realm_events": realm_events,
         "brokered_account_guard": brokered_account_guard,
+        "login_presentation": login_presentation,
         "native_client_registration": native_client_registration,
         "realm_id": final_readback.realm_id,
         "product_admin_subject": final_readback.product_admin_subject,

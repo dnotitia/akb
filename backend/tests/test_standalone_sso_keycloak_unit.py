@@ -1135,6 +1135,7 @@ async def test_fresh_reconcile_turns_realm_events_on_with_the_bootstrap_authorit
         "_reconcile_native_amr",
         "apply_brokered_account_guard",
         "_reconcile_client",
+        "apply_login_presentation",
         "_reconcile_mapper",
         "_reconcile_management_roles",
         "_reconcile_product_admin",
@@ -1201,3 +1202,232 @@ async def test_native_client_registration_probe_reports_unknown_when_unreachable
         assert await control.native_client_registration_disabled(spec) is None
     finally:
         await control.aclose()
+
+
+def _presented_realm(**overrides):
+    realm = {
+        "id": "akb-realm-id",
+        "realm": "akb",
+        "displayName": "AKB",
+        "loginTheme": "akb",
+        "internationalizationEnabled": True,
+        "supportedLocales": ["ko", "en"],
+        "defaultLocale": "en",
+    }
+    realm.update(overrides)
+    return realm
+
+
+def _admin_client(**attributes):
+    return {
+        "id": "admin-client-uuid",
+        "clientId": "akb-admin",
+        "secret": "admin-browser-secret-must-not-leak",  # pragma: allowlist secret
+        "attributes": {"pkce.code.challenge.method": "S256", **attributes},
+    }
+
+
+async def test_login_presentation_contract_is_akb_theme_in_english_and_korean():
+    from app.services.standalone_sso_bootstrap import (
+        LOGIN_DEFAULT_LOCALE,
+        LOGIN_LOCALES,
+        LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE,
+        LOGIN_THEME,
+    )
+
+    assert LOGIN_THEME == "akb"
+    assert LOGIN_LOCALES == ("en", "ko")
+    assert LOGIN_DEFAULT_LOCALE == "en"
+    assert LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE == "akb.login.native-only"
+
+
+async def test_login_presentation_names_what_the_shipped_theme_provides():
+    """The realm setting and the theme are built in different places.
+
+    The theme lives in frontend/keycloak-theme and ships in the frontend
+    image; nothing at runtime would notice a renamed theme, a dropped
+    language, or a different attribute name: Keycloak would quietly fall
+    back. So they are tied here.
+    """
+    from pathlib import Path
+
+    from app.services.standalone_sso_bootstrap import (
+        LOGIN_LOCALES,
+        LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE,
+        LOGIN_THEME,
+    )
+
+    theme = Path(__file__).resolve().parents[2] / "frontend" / "keycloak-theme" / LOGIN_THEME / "login"
+    properties = dict(
+        line.split("=", 1)
+        for line in (theme / "theme.properties").read_text(encoding="utf-8").splitlines()
+        if "=" in line and not line.startswith("#")
+    )
+    assert properties["akbNativeOnlyClientAttribute"] == LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE
+    for locale in LOGIN_LOCALES:
+        assert (theme / "messages" / f"messages_{locale}.properties").is_file()
+
+
+async def test_login_presentation_apply_sends_only_the_owned_settings_and_reads_them_back():
+    realm = _presented_realm(
+        loginTheme=None, internationalizationEnabled=False, supportedLocales=[], defaultLocale=None
+    )
+    client = _admin_client()
+    seen: list[tuple[str, str, object, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers["authorization"]
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body, auth))
+        if request.method == "PUT" and request.url.path == "/admin/realms/akb":
+            realm.update(body)
+            return httpx.Response(204)
+        if request.method == "GET" and request.url.path == "/admin/realms/akb":
+            return httpx.Response(200, json=realm)
+        if request.method == "GET" and request.url.path == "/admin/realms/akb/clients":
+            assert request.url.params["clientId"] == "akb-admin"
+            return httpx.Response(200, json=[client])
+        if request.method == "PUT" and request.url.path == "/admin/realms/akb/clients/admin-client-uuid":
+            # Keycloak merges the attributes it is sent into the client's own.
+            client["attributes"].update(body["attributes"])
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        await control.apply_login_presentation(spec, token="one-time-token")
+    finally:
+        await control.aclose()
+
+    writes = [(method, path, body) for method, path, body, _auth in seen if method == "PUT"]
+    # Only the owned settings travel: Keycloak leaves what a request omits
+    # as it is, so the realm's other settings and the client's secret,
+    # redirects and other attributes are never re-sent.
+    assert writes == [
+        (
+            "PUT",
+            "/admin/realms/akb",
+            {
+                "loginTheme": "akb",
+                "internationalizationEnabled": True,
+                "supportedLocales": ["en", "ko"],
+                "defaultLocale": "en",
+            },
+        ),
+        (
+            "PUT",
+            "/admin/realms/akb/clients/admin-client-uuid",
+            {"clientId": "akb-admin", "attributes": {"akb.login.native-only": "true"}},
+        ),
+    ]
+    assert {auth for *_rest, auth in seen} == {"Bearer one-time-token"}
+    assert client["attributes"]["pkce.code.challenge.method"] == "S256"
+    assert realm["displayName"] == "AKB"
+
+
+async def test_login_presentation_apply_fails_closed_when_keycloak_does_not_keep_it():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(204)
+        if request.url.path == "/admin/realms/akb/clients":
+            return httpx.Response(200, json=[_admin_client()])
+        return httpx.Response(200, json=_presented_realm(loginTheme="keycloak.v2"))
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control.apply_login_presentation(spec, token="one-time-token")
+    finally:
+        await control.aclose()
+
+    assert captured.value.code == "keycloak_login_presentation_readback_failed"
+
+
+async def test_login_presentation_apply_refuses_a_missing_administration_client():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            return httpx.Response(204)
+        if request.url.path == "/admin/realms/akb/clients":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=_presented_realm())
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(StandaloneSSOBootstrapError) as captured:
+            await control.apply_login_presentation(spec, token="one-time-token")
+    finally:
+        await control.aclose()
+
+    assert captured.value.code == "keycloak_client_read_failed"
+
+
+@pytest.mark.parametrize(
+    ("realm_overrides", "attributes", "converged"),
+    [
+        ({}, {"akb.login.native-only": "true"}, True),
+        ({"supportedLocales": ["en", "ko"]}, {"akb.login.native-only": "true"}, True),
+        ({"loginTheme": "keycloak.v2"}, {"akb.login.native-only": "true"}, False),
+        ({"loginTheme": None}, {"akb.login.native-only": "true"}, False),
+        ({"internationalizationEnabled": False}, {"akb.login.native-only": "true"}, False),
+        ({"supportedLocales": ["en"]}, {"akb.login.native-only": "true"}, False),
+        ({"supportedLocales": ["en", "ko", "de"]}, {"akb.login.native-only": "true"}, False),
+        ({"supportedLocales": None}, {"akb.login.native-only": "true"}, False),
+        ({"defaultLocale": "ko"}, {"akb.login.native-only": "true"}, False),
+        ({}, {}, False),
+        ({}, {"akb.login.native-only": "false"}, False),
+    ],
+)
+async def test_login_presentation_readback_is_exact_and_locale_order_insensitive(
+    realm_overrides, attributes, converged
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.headers["authorization"] == "Bearer manager-token"
+        if request.url.path == "/admin/realms/akb/clients":
+            return httpx.Response(200, json=[_admin_client(**attributes)])
+        assert request.url.path == "/admin/realms/akb"
+        return httpx.Response(200, json=_presented_realm(**realm_overrides))
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        assert await control.login_presentation_converged(spec, management_token="manager-token") is converged
+    finally:
+        await control.aclose()
+
+
+async def test_fresh_reconcile_presents_the_login_after_the_clients_exist(monkeypatch):
+    control = KeycloakStandaloneSSOControl()
+    spec = _spec()
+    calls: list[tuple[str, object]] = []
+
+    async def _step(name):
+        async def _record(*_args, token, **_kwargs):
+            calls.append((name, token))
+            return {"id": f"{name}-uuid"}
+
+        return _record
+
+    for name in (
+        "_reconcile_realm",
+        "apply_realm_events",
+        "_reconcile_signing_key",
+        "_reconcile_native_amr",
+        "apply_brokered_account_guard",
+        "_reconcile_client",
+        "apply_login_presentation",
+        "_reconcile_mapper",
+        "_reconcile_management_roles",
+        "_reconcile_product_admin",
+    ):
+        monkeypatch.setattr(control, name, await _step(name))
+
+    async def _readback(_spec, *, management_token):
+        return "readback"
+
+    monkeypatch.setattr(control, "readback", _readback)
+
+    assert await control.reconcile(spec, bootstrap_token="bootstrap-token") == "readback"
+    assert ("apply_login_presentation", "bootstrap-token") in calls
+    # It marks the administration client, so it runs once that client exists.
+    last_client = max(i for i, call in enumerate(calls) if call[0] == "_reconcile_client")
+    assert calls.index(("apply_login_presentation", "bootstrap-token")) > last_client
