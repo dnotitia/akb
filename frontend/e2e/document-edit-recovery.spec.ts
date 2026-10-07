@@ -152,6 +152,14 @@ test.describe("document edit recovery mock contract", () => {
       "",
       "[canon]: https://example.test/canonical-existing",
     ].join("\n");
+    await operate(request, recovery.operations!.remote_revision, {
+      actor: "editor-b",
+      title: "Recovery document",
+      content: savedMarkdown,
+    });
+    const seededState = await operate(request, recovery.operations!.state);
+    expect(seededState.document.content).toBe(savedMarkdown);
+
     const readUrl = new URL(recovery.identity!.start_url!);
     readUrl.searchParams.delete("view");
     await page.goto(readUrl.toString());
