@@ -1616,9 +1616,9 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
 ):
     """Each newer receipt joins the older rows instead of replacing them.
 
-    An image that predates v4 or v5 asks only for the profiles it knows, so the
-    v3 and v4 rows must still be there, unchanged, after each realm-settings
-    upgrade.
+    An image that predates v4, v5 or v6 asks only for the profiles it knows, so
+    the v3, v4 and v5 rows must still be there, unchanged, after each
+    realm-settings upgrade.
     """
     pool, _, _, _, _, _ = services
     from app.services import standalone_sso_receipt as receipt_service
@@ -1626,6 +1626,7 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
         STANDALONE_SSO_RECEIPT_PROFILE,
         STANDALONE_SSO_RECEIPT_PROFILE_V3,
         STANDALONE_SSO_RECEIPT_PROFILE_V4,
+        STANDALONE_SSO_RECEIPT_PROFILE_V5,
         StandaloneSSORetirementReceipt,
     )
 
@@ -1650,7 +1651,8 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
         profile=STANDALONE_SSO_RECEIPT_PROFILE_V4,
         bootstrap_client_id="akb-bootstrap-upgrade-v2",
     )
-    v5 = replace(v4, profile=STANDALONE_SSO_RECEIPT_PROFILE)
+    v5 = replace(v4, profile=STANDALONE_SSO_RECEIPT_PROFILE_V5)
+    v6 = replace(v4, profile=STANDALONE_SSO_RECEIPT_PROFILE)
 
     await receipt_service.record_standalone_sso_retirement_receipt(v3)
     await receipt_service.record_standalone_sso_retirement_receipt(v4)
@@ -1660,6 +1662,10 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
     await receipt_service.record_standalone_sso_retirement_receipt(v5)
 
     assert await receipt_service.load_standalone_sso_retirement_receipt() == v5
+    await receipt_service.record_standalone_sso_retirement_receipt(v6)
+    await receipt_service.record_standalone_sso_retirement_receipt(v6)
+
+    assert await receipt_service.load_standalone_sso_retirement_receipt() == v6
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT profile, bootstrap_client_id FROM standalone_sso_bootstrap_retirements ORDER BY profile"
@@ -1668,6 +1674,7 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
         ("bundled-keycloak-v3", "akb-bootstrap-temporary"),
         ("bundled-keycloak-v4", "akb-bootstrap-upgrade-v2"),
         ("bundled-keycloak-v5", "akb-bootstrap-upgrade-v2"),
+        ("bundled-keycloak-v6", "akb-bootstrap-upgrade-v2"),
     ]
 
 

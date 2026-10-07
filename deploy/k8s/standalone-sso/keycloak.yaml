@@ -18,6 +18,24 @@ spec:
         fsGroup: 1000
         runAsNonRoot: true
         runAsUser: 1000
+      # AKB's login theme ships in the frontend image (the same reference as
+      # the frontend Deployment, so the image substitution moves both). The
+      # copy is the whole job: Keycloak reads it from the volume at start.
+      initContainers:
+        - name: login-theme
+          image: akb-frontend:latest
+          imagePullPolicy: Always
+          command: ["cp", "-R", "/usr/share/akb/keycloak-theme/akb/.", "/theme/"]
+          volumeMounts:
+            - name: login-theme
+              mountPath: /theme
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
       containers:
         - name: keycloak
           image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
@@ -100,6 +118,13 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 3
             failureThreshold: 6
+          volumeMounts:
+            - name: login-theme
+              mountPath: /opt/keycloak/themes/akb
+              readOnly: true
+      volumes:
+        - name: login-theme
+          emptyDir: {}
 
 ---
 apiVersion: v1

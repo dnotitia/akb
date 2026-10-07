@@ -19,6 +19,10 @@ from cryptography.hazmat.primitives.serialization import (
 import httpx
 
 from app.services.standalone_sso_bootstrap import (
+    LOGIN_DEFAULT_LOCALE,
+    LOGIN_LOCALES,
+    LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE,
+    LOGIN_THEME,
     MANAGEMENT_REALM_ROLES,
     REALM_EVENT_TYPES,
     REALM_EVENTS_EXPIRATION_SECONDS,
@@ -491,6 +495,92 @@ class KeycloakStandaloneSSOControl:
         realm = await self._realm(spec, token=token)
         if realm is None or not self._realm_events_match(realm):
             raise _fail("keycloak_realm_events_readback_failed")
+
+    @staticmethod
+    def _login_presentation_realm() -> dict[str, Any]:
+        return {
+            "loginTheme": LOGIN_THEME,
+            "internationalizationEnabled": True,
+            "supportedLocales": list(LOGIN_LOCALES),
+            "defaultLocale": LOGIN_DEFAULT_LOCALE,
+        }
+
+    @staticmethod
+    def _login_presentation_matches(realm: Mapping[str, object], admin_client: Mapping[str, object]) -> bool:
+        locales = realm.get("supportedLocales")
+        attributes = admin_client.get("attributes")
+        return (
+            realm.get("loginTheme") == LOGIN_THEME
+            and realm.get("internationalizationEnabled") is True
+            and isinstance(locales, list)
+            and sorted(locales) == sorted(LOGIN_LOCALES)
+            and realm.get("defaultLocale") == LOGIN_DEFAULT_LOCALE
+            and isinstance(attributes, dict)
+            and attributes.get(LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE) == "true"
+        )
+
+    async def _login_presentation_state(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        realm = await self._realm(spec, token=token)
+        if realm is None:
+            raise _fail("keycloak_realm_readback_failed")
+        admin = await self._exact_client(spec, spec.realm, spec.admin_client_id, token=token)
+        if admin is None:
+            raise _fail("keycloak_client_read_failed")
+        return realm, admin
+
+    async def login_presentation_converged(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> bool:
+        """Read the login presentation through view-realm and view-clients; never change it."""
+        realm, admin = await self._login_presentation_state(spec, token=management_token)
+        return self._login_presentation_matches(realm, admin)
+
+    async def apply_login_presentation(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> None:
+        """Select AKB's login theme and languages, and mark the administration client.
+
+        Keycloak's realm and client updates leave whatever a request omits as
+        it is, so only the owned settings travel: the realm keeps every other
+        setting, and the client keeps its secret, redirects and attributes.
+        """
+        _realm, admin = await self._login_presentation_state(spec, token=token)
+        admin_uuid = _required_string(admin, "id", "keycloak_client_read_failed")
+        await self._request(
+            spec,
+            "PUT",
+            f"/admin/realms/{_path(spec.realm)}",
+            token=token,
+            json_body=self._login_presentation_realm(),
+            expected=frozenset({204}),
+            code="keycloak_login_presentation_update_failed",
+        )
+        await self._request(
+            spec,
+            "PUT",
+            f"/admin/realms/{_path(spec.realm)}/clients/{_path(admin_uuid)}",
+            token=token,
+            json_body={
+                "clientId": spec.admin_client_id,
+                "attributes": {LOGIN_NATIVE_ONLY_CLIENT_ATTRIBUTE: "true"},
+            },
+            expected=frozenset({204}),
+            code="keycloak_login_presentation_update_failed",
+        )
+        realm, admin = await self._login_presentation_state(spec, token=token)
+        if not self._login_presentation_matches(realm, admin):
+            raise _fail("keycloak_login_presentation_readback_failed")
 
     async def _brokered_account_role(
         self,
@@ -1934,6 +2024,7 @@ class KeycloakStandaloneSSOControl:
             self._management_client(spec),
             token=bootstrap_token,
         )
+        await self.apply_login_presentation(spec, token=bootstrap_token)
         api_uuid = _required_string(api, "id", "keycloak_client_readback_failed")
         admin_uuid = _required_string(admin, "id", "keycloak_client_readback_failed")
         management_uuid = _required_string(

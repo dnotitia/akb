@@ -9,6 +9,29 @@ specifically; the proxy has its own log in
 
 ### Authentication
 
+- The bundled Keycloak's sign-in pages use AKB's login theme (`akb`, source in
+  `frontend/keycloak-theme`): AKB's tokens and typeface, light and dark,
+  English and Korean. The frontend image now carries the assembled theme at
+  `/usr/share/akb/keycloak-theme/akb`, outside nginx's web root. The
+  `standalone-sso` overlay and the Helm `sso` template give the Keycloak
+  StatefulSet a `login-theme` init container, using the frontend Deployment's
+  image reference, that copies the theme into an `emptyDir` mounted read-only
+  at `/opt/keycloak/themes/akb`; Keycloak's own image is unchanged. A new
+  receipt profile, `bundled-keycloak-v6`, makes the realm use it: `loginTheme`
+  `akb`, internationalization on with `en` and `ko` (default `en`), and the
+  administration client attribute `akb.login.native-only=true`, with which the
+  theme draws that client's sign-in page without identity-provider buttons.
+  New installs record v6. Existing installs keep their receipt and converge
+  read-only (`login_presentation=pending_upgrade`); the one-time upgrade client
+  moves v1–v5 to v6 and sends only those settings, so the realm's other
+  settings and the client's secret, redirects and other attributes stay as
+  they are. The bootstrap report adds `login_presentation` (`converged`,
+  `drift` with a warning, or `pending_upgrade`), which never blocks startup. A
+  Keycloak without the theme serves its built-in pages. The v6 receipt is a new
+  row, so an older image still reads its v5 receipt. On the theme's "Page has
+  expired" page, a sign-in step the browser requested twice resumes once per
+  tab by itself, and from the second time the page explains instead.
+
 - The bundled Keycloak (the `standalone-sso` overlay and the Helm `sso`
   template) no longer serves Keycloak's own client-registration endpoint
   (`KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED=false`). That endpoint accepts

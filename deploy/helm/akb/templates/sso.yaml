@@ -122,6 +122,17 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # AKB's login theme ships in the frontend image; Keycloak reads the copy.
+      initContainers:
+        - name: login-theme
+          image: {{ printf "%s:%s" .Values.images.frontend.repository .Values.images.frontend.tag | quote }}
+          imagePullPolicy: {{ .Values.images.frontend.pullPolicy }}
+          command: ["cp", "-R", "/usr/share/akb/keycloak-theme/akb/.", "/theme/"]
+          volumeMounts:
+            - {name: login-theme, mountPath: /theme}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
       containers:
         - name: keycloak
           image: {{ .Values.sso.keycloak.image | quote }}
@@ -167,6 +178,10 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 3
             failureThreshold: 6
+          volumeMounts:
+            - {name: login-theme, mountPath: /opt/keycloak/themes/akb, readOnly: true}
+      volumes:
+        - {name: login-theme, emptyDir: {}}
 {{- if .Values.sso.ingress.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
