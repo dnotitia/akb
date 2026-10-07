@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import type { ComponentPropsWithoutRef, DragEventHandler, ReactNode } from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
@@ -94,9 +103,14 @@ import {
   createMarkdownEditorHandle,
   getMarkdownEditor,
 } from './editor-handle.js'
+import {
+  getMarkdownSourceSession,
+  getOrCreateMarkdownSourceSession,
+} from './markdown-source.js'
+import type { MarkdownSourceSyncResult } from './markdown-source.js'
 import type {
   MarkdownAdapters,
-  MarkdownCommands,
+  MarkdownEditingCommands,
   MarkdownEditorConfig,
   MarkdownContentAttributes,
   MarkdownEditorHandle,
@@ -113,6 +127,10 @@ import type {
   MarkdownReferenceResolution,
   MarkdownSlashCommandOptions,
   MarkdownState,
+  MarkdownSourceChange,
+  MarkdownSourceMode,
+  MarkdownSourceSelection,
+  MarkdownSourceState,
   MarkdownTableLayoutOptions,
   MarkdownTargetResolution,
   MarkdownTargetResolverContext,
@@ -125,6 +143,13 @@ export type {
   MarkdownImageOptions,
   MarkdownHeadingOptions,
   MarkdownTableLayoutOptions,
+  MarkdownSourceChange,
+  MarkdownSourceChangeResult,
+  MarkdownEditingCommands,
+  MarkdownSourceMode,
+  MarkdownSourceSelection,
+  MarkdownSourceSelectionDirection,
+  MarkdownSourceState,
 } from '../types.js'
 import {
   getMarkdownMessages,
@@ -138,6 +163,28 @@ const EMPTY_RESOLUTIONS: ReadonlyMap<string, MarkdownTargetResolution> = new Map
 const EMPTY_REFERENCE_RESOLUTIONS: ReadonlyMap<string, MarkdownReferenceResolution> = new Map()
 const DEFAULT_MARKDOWN_SLASH_COMMAND_OPTIONS: MarkdownSlashCommandOptions = {}
 const MARKDOWN_REFERENCE_LABEL_STYLE_ID = 'akb-markdown-reference-label-style'
+const EMPTY_SOURCE_STATE: MarkdownSourceState = Object.freeze({
+  mode: 'wysiwyg',
+  markdown: '',
+  revision: 0,
+  session: 0,
+  selection: Object.freeze({ start: 0, end: 0, direction: 'none' as const }),
+  isComposing: false,
+  canUndo: false,
+  canRedo: false,
+})
+const subscribeToNothing = (): (() => void) => () => undefined
+const getEmptySourceState = (): MarkdownSourceState => EMPTY_SOURCE_STATE
+
+function useMarkdownSourceState(
+  sourceSession: ReturnType<typeof getMarkdownSourceSession>,
+): MarkdownSourceState {
+  return useSyncExternalStore(
+    sourceSession?.subscribe ?? subscribeToNothing,
+    sourceSession?.getSnapshot ?? getEmptySourceState,
+    sourceSession?.getSnapshot ?? getEmptySourceState,
+  )
+}
 
 function ensureMarkdownReferenceLabelStyle(document: Document): void {
   if (document.getElementById(MARKDOWN_REFERENCE_LABEL_STYLE_ID)) return
@@ -258,16 +305,21 @@ export function useMarkdownEditor({
       ),
   })
 
-  return editor ? createMarkdownEditorHandle(editor) : null
+  if (!editor) return null
+  const handle = createMarkdownEditorHandle(editor)
+  if (!getMarkdownSourceSession(handle)) {
+    getOrCreateMarkdownSourceSession(handle, serializeEditorMarkdown(editor, { profile }))
+  }
+  return handle
 }
 
-export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownCommands {
+export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownEditingCommands {
   const editor = getMarkdownEditor(handle)
+  const baseCommands = useMemo(() => (editor ? markdownCommands(editor) : null), [editor])
   return useMemo(
-    () =>
-      editor
-        ? markdownCommands(editor)
-        : {
+    () => {
+      if (!baseCommands) {
+        return {
             setMarkdown: () => false,
             insertMarkdown: () => false,
             insertImage: () => false,
@@ -298,25 +350,66 @@ export function useMarkdownCommands(handle: MarkdownEditorHandle | null): Markdo
             setHorizontalRule: () => false,
             undo: () => false,
             redo: () => false,
+            applySourceChange: () => ({ applied: false, reason: 'source-inactive' as const }),
             focus: () => false,
+        }
+      }
+
+      return {
+        ...baseCommands,
+        undo: () => {
+          const source = getMarkdownSourceSession(handle)
+          return source?.getSnapshot().mode === 'source' ? source.undo() : baseCommands.undo()
+        },
+        redo: () => {
+          const source = getMarkdownSourceSession(handle)
+          return source?.getSnapshot().mode === 'source' ? source.redo() : baseCommands.redo()
+        },
+        applySourceChange: (change: MarkdownSourceChange) =>
+          getMarkdownSourceSession(handle)?.apply(change) ?? {
+            applied: false as const,
+            reason: 'source-inactive' as const,
           },
-    [editor],
+      }
+    },
+    [baseCommands, handle],
   )
 }
 
 const stateMarkdown = new WeakMap<Editor['state']['doc'], string>()
 
-function readState(editor: Editor): MarkdownState {
+function readState(
+  editor: Editor,
+  sourceSession: ReturnType<typeof getMarkdownSourceSession>,
+): MarkdownState {
   const doc = editor.state.doc
-  let markdown = stateMarkdown.get(doc)
-  if (markdown === undefined) {
-    markdown = editor.getMarkdown()
-    stateMarkdown.set(doc, markdown)
+  let editorMarkdown = stateMarkdown.get(doc)
+  if (editorMarkdown === undefined) {
+    editorMarkdown = editor.getMarkdown()
+    stateMarkdown.set(doc, editorMarkdown)
   }
+  const sourceSnapshot = sourceSession?.getSnapshot()
+  const source = sourceSnapshot ? {
+    ...sourceSnapshot,
+    markdown: sourceSnapshot.mode === 'source' ? sourceSnapshot.markdown : editorMarkdown,
+    canUndo: sourceSnapshot.mode === 'source' ? sourceSnapshot.canUndo : editor.can().undo(),
+    canRedo: sourceSnapshot.mode === 'source' ? sourceSnapshot.canRedo : editor.can().redo(),
+  } : {
+    mode: 'wysiwyg' as const,
+    markdown: editorMarkdown,
+    revision: 0,
+    session: 0,
+    selection: { start: 0, end: 0, direction: 'none' as const },
+    isComposing: false,
+    canUndo: editor.can().undo(),
+    canRedo: editor.can().redo(),
+  }
+  const markdown = source.mode === 'source' ? source.markdown : editorMarkdown
   return {
     markdown,
-    isEmpty: editor.isEmpty,
+    isEmpty: source.mode === 'source' ? source.markdown.trim() === '' : editor.isEmpty,
     isEditable: editor.isEditable,
+    source,
     table: markdownTableState(editor),
     active: {
       paragraph: editor.isActive('paragraph'),
@@ -338,32 +431,37 @@ function readState(editor: Editor): MarkdownState {
       active: editor.isActive('link'),
       href: String(editor.getAttributes('link').href ?? ''),
     },
-    canUndo: editor.can().undo(),
-    canRedo: editor.can().redo(),
+    canUndo: source.mode === 'source' ? source.canUndo : editor.can().undo(),
+    canRedo: source.mode === 'source' ? source.canRedo : editor.can().redo(),
     selection: {
-      from: editor.state.selection.from,
-      to: editor.state.selection.to,
+      from: source.mode === 'source' ? source.selection.start : editor.state.selection.from,
+      to: source.mode === 'source' ? source.selection.end : editor.state.selection.to,
     },
   }
 }
 
 export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownState | null {
   const editor = getMarkdownEditor(handle)
-  const [state, setState] = useState<MarkdownState | null>(() => (editor ? readState(editor) : null))
+  const sourceSession = getMarkdownSourceSession(handle)
+  const [state, setState] = useState<MarkdownState | null>(() => (
+    editor ? readState(editor, sourceSession) : null
+  ))
 
   useEffect(() => {
     if (!editor) {
       return
     }
 
-    const update = () => setState(readState(editor))
+    const update = () => setState(readState(editor, sourceSession))
     update()
     editor.on('transaction', update)
+    const unsubscribeSource = sourceSession?.subscribe(update)
 
     return () => {
       editor.off('transaction', update)
+      unsubscribeSource?.()
     }
-  }, [editor])
+  }, [editor, sourceSession])
 
   return editor ? state : null
 }
@@ -1350,7 +1448,7 @@ export function MarkdownSurface({
   )
 }
 
-export type MarkdownEditorMode = 'wysiwyg' | 'source'
+export type MarkdownEditorMode = MarkdownSourceMode
 
 function normalizeEditorBody(editor: Editor): void {
   const document = editor.getJSON()
@@ -1363,13 +1461,25 @@ function normalizeEditorBody(editor: Editor): void {
 
   const last = editor.state.doc.lastChild
   if (!last || last.type.name !== 'paragraph') {
-    editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' })
+    editor.chain()
+      .insertContentAt(
+        editor.state.doc.content.size,
+        { type: 'paragraph' },
+      )
+      .command(({ tr }) => {
+        tr.setMeta('preventUpdate', true)
+        tr.setMeta('addToHistory', false)
+        return true
+      })
+      .run()
   }
 }
 
 export interface MarkdownEditingSurfaceProps extends Omit<ComponentPropsWithoutRef<'div'>, 'onChange'> {
   editor: MarkdownEditorHandle | null
   markdown: string
+  /** Opaque editing target identity; changing it invalidates pending Source updates. */
+  sourceContextKey?: string
   profile?: MarkdownProfile
   onSourceChange?: (markdown: string, editor: MarkdownEditorHandle) => void
   onMarkdownApplied?: (editor: MarkdownEditorHandle) => void
@@ -1412,6 +1522,7 @@ function MarkdownEditingHeader({ renderHeader, ...controls }: Parameters<NonNull
 export function MarkdownEditingSurface({
   editor: editorHandle,
   markdown,
+  sourceContextKey,
   profile = 'preserve',
   onSourceChange,
   onMarkdownApplied,
@@ -1437,13 +1548,24 @@ export function MarkdownEditingSurface({
 }: MarkdownEditingSurfaceProps) {
   const editor = getMarkdownEditor(editorHandle)
   const copy = useMarkdownMessages().editing
+  const commands = useMarkdownCommands(editorHandle)
   const imageUploadController = useMarkdownImageUpload(editorHandle, imageUpload, readOnly)
-  const [mode, setMode] = useState<MarkdownEditorMode>('wysiwyg')
-  const [source, setSource] = useState(markdown)
-  const sourceRef = useRef(markdown)
-  const sourceDirtyRef = useRef(false)
+  const sourceSession = useMemo(
+    () => editorHandle
+      ? getOrCreateMarkdownSourceSession(editorHandle, markdown, sourceContextKey)
+      : null,
+    [editorHandle, markdown, sourceContextKey],
+  )
+  const sourceState = useMarkdownSourceState(sourceSession)
+  const mode = sourceState.mode
   const lastMarkdownRef = useRef(markdown)
+  const sourceSyncResultRef = useRef<{
+    markdown: string
+    result: MarkdownSourceSyncResult
+  } | null>(null)
+  const previousSourceSessionRef = useRef(sourceSession)
   const previousModeRef = useRef(mode)
+  const resetMarkdownRef = useRef(markdown)
   const sourceInputRef = useRef<HTMLTextAreaElement>(null)
   const sourceInputId = useId()
   const sourceInputLabelId = `${sourceInputId}-label`
@@ -1458,6 +1580,16 @@ export function MarkdownEditingSurface({
     : imageMenu
   const effectiveModeSwitchDisabled = modeSwitchDisabled || Boolean(imageUploadController?.state.uploading)
 
+  const readSourceSelection = (input: HTMLTextAreaElement): MarkdownSourceSelection => ({
+    start: input.selectionStart,
+    end: input.selectionEnd,
+    direction: input.selectionDirection,
+  })
+  const setSourceInput = useCallback((input: HTMLTextAreaElement | null) => {
+    sourceInputRef.current = input
+    sourceSession?.setInputElement(input)
+  }, [sourceSession])
+
   const handleWysiwygDragOverCapture: DragEventHandler<HTMLDivElement> = event => {
     imageUploadController?.handleDragOver(event)
     onWysiwygDragOverCapture?.(event)
@@ -1467,6 +1599,55 @@ export function MarkdownEditingSurface({
     onWysiwygDropCapture?.(event)
   }
 
+  useLayoutEffect(() => {
+    resetMarkdownRef.current = markdown
+  }, [markdown])
+
+  useLayoutEffect(() => {
+    if (!sourceSession) return
+    if (!sourceSession.isAttached) {
+      sourceSession.resetForSurface(
+        resetMarkdownRef.current,
+        editor ? serializeEditorMarkdown(editor, { profile }) : resetMarkdownRef.current,
+      )
+    }
+    sourceSession?.attach()
+    return () => sourceSession?.detach()
+  }, [editor, profile, sourceSession])
+
+  useLayoutEffect(() => {
+    sourceSession?.setChangeHandler(onSourceChange)
+    sourceSession?.setEditable(!readOnly)
+  }, [onSourceChange, readOnly, sourceSession])
+
+  useLayoutEffect(() => {
+    sourceSession?.setContextKey(sourceContextKey)
+  }, [sourceContextKey, sourceSession])
+
+  useLayoutEffect(() => {
+    sourceSyncResultRef.current = {
+      markdown,
+      result: sourceSession?.syncExternalValue(markdown) ?? 'unchanged',
+    }
+  }, [markdown, sourceSession])
+
+  useLayoutEffect(() => {
+    const input = sourceInputRef.current
+    if (!input || mode !== 'source' || sourceState.isComposing) return
+    if (
+      input.selectionStart !== sourceState.selection.start ||
+      input.selectionEnd !== sourceState.selection.end ||
+      input.selectionDirection !== sourceState.selection.direction
+    ) {
+      input.setSelectionRange(
+        sourceState.selection.start,
+        sourceState.selection.end,
+        sourceState.selection.direction,
+      )
+    }
+    if (sourceSession?.takeFocusRequest()) input.focus()
+  }, [mode, sourceSession, sourceState.isComposing, sourceState.selection])
+
   const wysiwygPanel = (
     <div
       hidden={mode !== 'wysiwyg'}
@@ -1475,7 +1656,6 @@ export function MarkdownEditingSurface({
       onDropCapture={handleWysiwygDropCapture}
       onPasteCapture={event => imageUploadController?.handlePaste(event)}
     >
-      {mode === 'wysiwyg' && !renderHeader ? toolbar : null}
       {imageUploadController ? (
         <MarkdownImageUploadStatus options={imageUpload} />
       ) : null}
@@ -1490,15 +1670,15 @@ export function MarkdownEditingSurface({
   )
 
   useLayoutEffect(() => {
-    if (sourceDirtyRef.current) return
-    sourceRef.current = markdown
-    setSource(markdown)
-  }, [markdown])
-
-  useLayoutEffect(() => {
     const externalValueChanged = markdown !== lastMarkdownRef.current
     lastMarkdownRef.current = markdown
-    if (!editor || (mode === 'source' && sourceDirtyRef.current)) return
+    if (!editor || (mode === 'source' && sourceSession?.hasPendingChanges)) return
+    const sourceSyncResult = sourceSyncResultRef.current
+    if (
+      externalValueChanged &&
+      sourceSyncResult?.markdown === markdown &&
+      sourceSyncResult.result === 'applied-echo'
+    ) return
 
     if (externalValueChanged && serializeEditorMarkdown(editor, { profile }) !== markdown) {
       editor.commands.setContent(markdown, {
@@ -1508,7 +1688,10 @@ export function MarkdownEditingSurface({
       normalizeEditorBody(editor)
       if (editorHandle) onMarkdownApplied?.(editorHandle)
     }
-  }, [editor, editorHandle, markdown, mode, onMarkdownApplied, profile])
+    if (externalValueChanged) {
+      sourceSession?.setVisualBaseline(serializeEditorMarkdown(editor, { profile }))
+    }
+  }, [editor, editorHandle, markdown, mode, onMarkdownApplied, profile, sourceSession])
 
   useLayoutEffect(() => {
     if (editor) normalizeEditorBody(editor)
@@ -1527,27 +1710,28 @@ export function MarkdownEditingSurface({
   }, [autoFocus, editor, readOnly])
 
   useEffect(() => {
+    if (previousSourceSessionRef.current !== sourceSession) {
+      previousSourceSessionRef.current = sourceSession
+      previousModeRef.current = mode
+      return
+    }
     if (previousModeRef.current === mode) return
     previousModeRef.current = mode
 
     if (mode === 'source') sourceInputRef.current?.focus()
     else editor?.commands.focus()
-  }, [editor, mode])
+  }, [editor, mode, sourceSession])
 
   const selectMode = (nextMode: MarkdownEditorMode) => {
-    if (!editor || effectiveModeSwitchDisabled || nextMode === mode) return
+    if (!editor || !sourceSession || effectiveModeSwitchDisabled || nextMode === mode) return
 
     if (nextMode === 'source') {
-      const editorMarkdown = serializeEditorMarkdown(editor, { profile })
-      sourceRef.current = editorMarkdown
-      sourceDirtyRef.current = false
-      setSource(editorMarkdown)
+      sourceSession.enterSource(serializeEditorMarkdown(editor, { profile }))
     } else {
-      const sourceMarkdown = sourceRef.current
-      if (
-        sourceDirtyRef.current &&
+      const sourceMarkdown = sourceSession.getSnapshot().markdown
+      const applySource = sourceSession.hasPendingChanges &&
         serializeEditorMarkdown(editor, { profile }) !== sourceMarkdown
-      ) {
+      if (applySource) {
         editor.commands.setContent(sourceMarkdown, {
           contentType: 'markdown',
           emitUpdate: false,
@@ -1555,10 +1739,28 @@ export function MarkdownEditingSurface({
         normalizeEditorBody(editor)
         if (editorHandle) onMarkdownApplied?.(editorHandle)
       }
-      sourceDirtyRef.current = false
+      sourceSession.markApplied(
+        serializeEditorMarkdown(editor, { profile }),
+        editor.getMarkdown(),
+        applySource && editorHandle !== null && onMarkdownApplied !== undefined,
+      )
+      sourceSession.leaveSource()
     }
+  }
 
-    setMode(nextMode)
+  const handleSourceKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229 || sourceState.isComposing) return
+    if (!(event.metaKey || event.ctrlKey) || event.altKey) return
+
+    const key = event.key.toLowerCase()
+    if (key === 'z') {
+      event.preventDefault()
+      if (event.shiftKey) commands.redo()
+      else commands.undo()
+    } else if (key === 'y') {
+      event.preventDefault()
+      commands.redo()
+    }
   }
 
   const modeButton = (target: MarkdownEditorMode, label: string) => (
@@ -1580,7 +1782,7 @@ export function MarkdownEditingSurface({
 
   const header = renderHeader ? (
     <div
-      className="sticky top-0 z-10"
+      className="sticky top-0 z-[var(--z-sticky)]"
       onDragOverCapture={mode === 'wysiwyg' ? handleWysiwygDragOverCapture : undefined}
       onDropCapture={mode === 'wysiwyg' ? handleWysiwygDropCapture : undefined}
     >
@@ -1589,19 +1791,22 @@ export function MarkdownEditingSurface({
         mode={mode}
         onModeChange={selectMode}
         disabled={!editor || effectiveModeSwitchDisabled}
-        toolbar={mode === 'wysiwyg' ? toolbar : null}
+        toolbar={toolbar}
       />
     </div>
   ) : (
-      <div className="flex justify-end border-b border-border bg-surface px-2 py-1.5">
-        <div
-          role="group"
-          aria-label={copy.modeGroup}
-          className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-0.5"
-          data-markdown-mode-toggle
-        >
-          {modeButton('wysiwyg', copy.wysiwyg)}
-          {modeButton('source', copy.source)}
+      <div className="sticky top-0 z-[var(--z-sticky)] flex min-w-0 items-center border-b border-border bg-surface">
+        {toolbar}
+        <div className="ml-auto shrink-0 px-2 py-1.5">
+          <div
+            role="group"
+            aria-label={copy.modeGroup}
+            className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-surface-2 p-0.5"
+            data-markdown-mode-toggle
+          >
+            {modeButton('wysiwyg', copy.wysiwyg)}
+            {modeButton('source', copy.source)}
+          </div>
         </div>
       </div>
   )
@@ -1625,7 +1830,7 @@ export function MarkdownEditingSurface({
           {resolvedSourceLabel}
         </label>
         <textarea
-          ref={sourceInputRef}
+          ref={setSourceInput}
           id={sourceInputId}
           aria-label={sourceAriaLabel}
           aria-labelledby={
@@ -1637,13 +1842,20 @@ export function MarkdownEditingSurface({
           readOnly={readOnly}
           spellCheck={false}
           placeholder={resolvedSourcePlaceholder}
-          value={source}
+          value={sourceState.markdown}
+          onSelect={event => sourceSession?.setSelection(readSourceSelection(event.currentTarget))}
+          onCompositionStart={() => sourceSession?.startComposition()}
+          onCompositionEnd={event =>
+            sourceSession?.endComposition(readSourceSelection(event.currentTarget))
+          }
+          onKeyDown={handleSourceKeyDown}
           onChange={event => {
-            const next = event.currentTarget.value
-            sourceRef.current = next
-            sourceDirtyRef.current = true
-            setSource(next)
-            if (editorHandle && !readOnly) onSourceChange?.(next, editorHandle)
+            const input = event.currentTarget
+            sourceSession?.input(
+              input.value,
+              readSourceSelection(input),
+              (event.nativeEvent as InputEvent).inputType ?? '',
+            )
           }}
           className={
             sourceClassName ??
@@ -1651,11 +1863,11 @@ export function MarkdownEditingSurface({
           }
         />
       </div>
-      <MarkdownTableControls editor={editor} readOnly={readOnly} options={table} />
+      <MarkdownTableControls editor={editor} readOnly={readOnly || mode === 'source'} options={table} />
       <MarkdownImageMenuControls
         editor={editor}
         rootRef={surfaceRef}
-        readOnly={readOnly}
+        readOnly={readOnly || mode === 'source'}
         options={effectiveImageMenu}
       />
     </div>
@@ -1664,6 +1876,7 @@ export function MarkdownEditingSurface({
 
 export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
   markdown: string
+  sourceContextKey?: string
   profile?: MarkdownProfile
   readOnly?: boolean
   onChange?: MarkdownEditorConfig['onChange']
@@ -1677,6 +1890,7 @@ export interface MarkdownEditorProps extends Omit<MarkdownSurfaceProps, 'editor'
 
 export function MarkdownEditor({
   markdown,
+  sourceContextKey,
   profile = 'preserve',
   readOnly = false,
   onChange,
@@ -1721,6 +1935,7 @@ export function MarkdownEditor({
       {...props}
       editor={editor}
       markdown={markdown}
+      sourceContextKey={sourceContextKey}
       profile={profile}
       readOnly={readOnly}
       imageMenu={imageMenu}
@@ -2184,11 +2399,17 @@ export function MarkdownToolbar({
   const state = useMarkdownState(editorHandle)
   const commands = useMarkdownCommands(editorHandle)
   const toolbarRef = useRef<HTMLDivElement>(null)
-  const [linkOpen, setLinkOpen] = useState(false)
+  const [linkOpenSession, setLinkOpenSession] = useState<number | null>(null)
   const imageUpload = useMarkdownImageUploadContext()
   const editable = Boolean(editorHandle && state?.isEditable)
+  const wysiwygEditable = editable && state?.source.mode === 'wysiwyg'
   const active = state?.active
-  const linkDisabled = !editable || link?.disabled === true
+  const linkDisabled = !wysiwygEditable || link?.disabled === true
+  const linkOpen = state?.source.mode === 'wysiwyg' &&
+    state.source.session === linkOpenSession
+  const setLinkOpen = (open: boolean) => {
+    setLinkOpenSession(open && state?.source.mode === 'wysiwyg' ? state.source.session : null)
+  }
 
   useLayoutEffect(() => {
     const buttons = toolbarRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -2269,7 +2490,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.paragraph}
           active={Boolean(active?.paragraph)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.setParagraph()}
         >
           <Pilcrow className="h-4 w-4" />
@@ -2277,7 +2498,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.heading1}
           active={Boolean(active?.heading1)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => toggleHeading(1, Boolean(active?.heading1))}
         >
           <Heading1 className="h-4 w-4" />
@@ -2285,7 +2506,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.heading2}
           active={Boolean(active?.heading2)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => toggleHeading(2, Boolean(active?.heading2))}
         >
           <Heading2 className="h-4 w-4" />
@@ -2293,7 +2514,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.heading3}
           active={Boolean(active?.heading3)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => toggleHeading(3, Boolean(active?.heading3))}
         >
           <Heading3 className="h-4 w-4" />
@@ -2303,7 +2524,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.bold}
           active={Boolean(active?.bold)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleBold()}
         >
           <Bold className="h-4 w-4" />
@@ -2311,7 +2532,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.italic}
           active={Boolean(active?.italic)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleItalic()}
         >
           <Italic className="h-4 w-4" />
@@ -2319,7 +2540,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.strikethrough}
           active={Boolean(active?.strike)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleStrike()}
         >
           <Strikethrough className="h-4 w-4" />
@@ -2327,7 +2548,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.inlineCode}
           active={Boolean(active?.code)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleCode()}
         >
           <Code className="h-4 w-4" />
@@ -2337,7 +2558,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.bulletList}
           active={Boolean(active?.bulletList)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleBulletList()}
         >
           <List className="h-4 w-4" />
@@ -2345,7 +2566,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.numberedList}
           active={Boolean(active?.orderedList)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleOrderedList()}
         >
           <ListOrdered className="h-4 w-4" />
@@ -2353,7 +2574,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.taskList}
           active={Boolean(active?.taskList)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleTaskList()}
         >
           <CheckSquare className="h-4 w-4" />
@@ -2363,7 +2584,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.blockquote}
           active={Boolean(active?.blockquote)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleBlockquote()}
         >
           <Quote className="h-4 w-4" />
@@ -2371,14 +2592,14 @@ export function MarkdownToolbar({
         <MarkdownToolbarButton
           label={labels.codeBlock}
           active={Boolean(active?.codeBlock)}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.toggleCodeBlock()}
         >
           <Code2 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
           label={labels.horizontalRule}
-          disabled={!editable}
+          disabled={!wysiwygEditable}
           onClick={() => commands.setHorizontalRule()}
         >
           <Minus className="h-4 w-4" />
@@ -2387,7 +2608,7 @@ export function MarkdownToolbar({
       <MarkdownToolbarGroup label={labels.insert}>
         <MarkdownToolbarButton
           label={messages.table.insertTable}
-          disabled={!editable || !state?.table.canInsert}
+          disabled={!wysiwygEditable || !state?.table.canInsert}
           onClick={() => commands.insertTable()}
         >
           <Table className="h-4 w-4" />
@@ -2405,7 +2626,7 @@ export function MarkdownToolbar({
         <MarkdownToolbarGroup label={messages.imageUpload.group}>
           <MarkdownToolbarButton
             label={imageUpload.state.uploading ? messages.imageUpload.uploading : messages.imageUpload.insert}
-            disabled={!editable || imageUpload.state.uploading}
+            disabled={!wysiwygEditable || imageUpload.state.uploading}
             onClick={imageUpload.openPicker}
           >
             {imageUpload.state.uploading ? (
@@ -2419,14 +2640,14 @@ export function MarkdownToolbar({
       <MarkdownToolbarGroup label={labels.history}>
         <MarkdownToolbarButton
           label={labels.undo}
-          disabled={!editable || !state?.canUndo}
+          disabled={!editable || !state?.canUndo || state.source.isComposing}
           onClick={() => commands.undo()}
         >
           <Undo2 className="h-4 w-4" />
         </MarkdownToolbarButton>
         <MarkdownToolbarButton
           label={labels.redo}
-          disabled={!editable || !state?.canRedo}
+          disabled={!editable || !state?.canRedo || state.source.isComposing}
           onClick={() => commands.redo()}
         >
           <Redo2 className="h-4 w-4" />
