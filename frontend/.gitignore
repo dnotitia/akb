@@ -27,3 +27,4 @@ playwright-report/
 *.njsproj
 *.sln
 *.sw?
+dist-keycloak-theme

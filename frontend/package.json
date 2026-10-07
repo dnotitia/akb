@@ -21,7 +21,10 @@
     "typecheck": "tsc --noEmit",
     "test:e2e": "AKB_FE_E2E_MODE=real playwright test",
     "test:e2e:mock": "AKB_FE_E2E_MODE=mock playwright test",
-    "test:e2e:real": "AKB_FE_E2E_MODE=real playwright test"
+    "test:e2e:real": "AKB_FE_E2E_MODE=real playwright test",
+    "theme:tokens": "node keycloak-theme/scripts/theme-tokens.mjs",
+    "theme:assemble": "node keycloak-theme/scripts/assemble.mjs",
+    "theme:harness": "keycloak-theme/harness/run.sh"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -41,6 +44,7 @@
     "@vitejs/plugin-react": "^6.0.1",
     "@vitest/browser-playwright": "4.1.11",
     "@vitest/ui": "^4.1.11",
+    "axe-core": "4.12.1",
     "eslint": "^10.4.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",

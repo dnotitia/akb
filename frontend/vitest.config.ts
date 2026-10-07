@@ -26,7 +26,9 @@ export default defineConfig({
           // Playwright lives under e2e/ and runs via `npm run test:e2e`.
           // Excluding here prevents vitest from importing @playwright/test,
           // which complains when invoked outside a Playwright runner.
-          exclude: ["e2e/**", "**/node_modules/**", "**/dist/**", "storybook-static/**"],
+          // keycloak-theme/harness is Playwright against a real Keycloak
+          // (keycloak-theme/harness/run.sh); its static checks run here.
+          exclude: ["e2e/**", "keycloak-theme/harness/**", "**/node_modules/**", "**/dist/**", "storybook-static/**"],
         },
       },
       {

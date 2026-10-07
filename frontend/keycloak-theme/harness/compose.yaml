@@ -1,0 +1,24 @@
+# Disposable Keycloak for the AKB login theme harness. Run through run.sh.
+# One server holds both realms: `workforce` plays the upstream identity
+# provider and `akb` brokers to it, so every page a person meets on AKB's
+# paths can be reached without a second container. Keycloak listens on the
+# same port inside and outside so the broker's back-channel calls work.
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    command:
+      - start-dev
+      - --http-port=18480
+      - --spi-theme--cache-themes=false
+      - --spi-theme--cache-templates=false
+      - --spi-theme--static-max-age=-1
+    environment:
+      KC_HOSTNAME: http://localhost:18480
+      KC_BOOTSTRAP_ADMIN_USERNAME: fixture-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: fixture-only-admin-password # pragma: allowlist secret
+    ports:
+      - "127.0.0.1:18480:18480"
+    volumes:
+      # The parent directory, not akb/ itself: assemble.mjs replaces akb/, and
+      # a bind mount of a replaced directory keeps showing the deleted one.
+      - ${AKB_THEME_ROOT:?run through run.sh}:/opt/keycloak/themes:ro
