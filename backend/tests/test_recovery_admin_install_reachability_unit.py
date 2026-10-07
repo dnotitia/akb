@@ -167,6 +167,12 @@ class _Control:
     async def assert_upgrade_retired(self, _spec, *, upgrade_token):
         return None
 
+    async def apply_realm_events(self, _spec, *, token):
+        return None
+
+    async def realm_events_converged(self, _spec, *, management_token):
+        return True
+
 
 def _readback():
     from app.services.standalone_sso_bootstrap import StandaloneSSOReadback

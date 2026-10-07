@@ -6,7 +6,7 @@ import uuid
 
 from app.db.postgres import get_pool
 from app.services.standalone_sso_bootstrap import (
-    STANDALONE_SSO_RECEIPT_PROFILE,
+    STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES,
     STANDALONE_SSO_RECEIPT_PROFILES,
     StandaloneSSOBootstrapError,
     StandaloneSSORetirementReceipt,
@@ -42,7 +42,7 @@ def _validated_user_id(receipt: StandaloneSSORetirementReceipt) -> uuid.UUID:
         receipt.akb_user_id,
     )
     if (
-        receipt.profile != STANDALONE_SSO_RECEIPT_PROFILE
+        receipt.profile not in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES
         or any(not value.strip() for value in fields)
         or receipt.backchannel_logout_uri is None
         or not is_backchannel_logout_uri(receipt.backchannel_logout_uri)
@@ -74,7 +74,8 @@ def _same_installation(
     target: StandaloneSSORetirementReceipt,
 ) -> bool:
     return (
-        source.profile == target.profile == STANDALONE_SSO_RECEIPT_PROFILE
+        source.profile == target.profile
+        and source.profile in STANDALONE_SSO_CALLBACK_RECEIPT_PROFILES
         and source.issuer == target.issuer
         and source.realm_id == target.realm_id
         and source.management_client_uuid == target.management_client_uuid
@@ -104,7 +105,12 @@ async def record_standalone_sso_retirement_receipt(
     *,
     previous_receipt: StandaloneSSORetirementReceipt | None = None,
 ) -> None:
-    """Insert once, or replace one exact current callback receipt by CAS."""
+    """Insert once, or replace one exact callback receipt of the same profile by CAS.
+
+    Each profile is its own row. Moving to a newer profile inserts that row and
+    leaves the older one untouched, so an image that predates the newer profile
+    still reads back the receipt it understands after a rollback.
+    """
 
     akb_user_id = _validated_user_id(receipt)
     if previous_receipt is not None:
@@ -118,7 +124,7 @@ async def record_standalone_sso_retirement_receipt(
             )
             existing = await conn.fetchrow(
                 _SELECT_RECEIPT,
-                STANDALONE_SSO_RECEIPT_PROFILE,
+                receipt.profile,
             )
             if existing is not None:
                 current = _from_row(existing)
@@ -162,7 +168,7 @@ async def record_standalone_sso_retirement_receipt(
                     raise _error()
                 updated = await conn.fetchrow(
                     _SELECT_RECEIPT,
-                    STANDALONE_SSO_RECEIPT_PROFILE,
+                    receipt.profile,
                 )
                 if updated is None or _from_row(updated) != receipt:
                     raise _error()

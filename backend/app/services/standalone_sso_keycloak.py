@@ -19,6 +19,8 @@ import httpx
 
 from app.services.standalone_sso_bootstrap import (
     MANAGEMENT_REALM_ROLES,
+    REALM_EVENT_TYPES,
+    REALM_EVENTS_EXPIRATION_SECONDS,
     StandaloneSSOBootstrapError,
     StandaloneSSOBootstrapSpec,
     StandaloneSSOReadback,
@@ -306,6 +308,57 @@ class KeycloakStandaloneSSOControl:
         realm: Mapping[str, object],
     ) -> bool:
         return all(realm.get(key) == value for key, value in cls._realm_profile(spec).items())
+
+    @staticmethod
+    def _realm_events_match(realm: Mapping[str, object]) -> bool:
+        types = realm.get("enabledEventTypes")
+        return (
+            realm.get("eventsEnabled") is True
+            and realm.get("eventsExpiration") == REALM_EVENTS_EXPIRATION_SECONDS
+            and isinstance(types, list)
+            and sorted(types) == list(REALM_EVENT_TYPES)
+        )
+
+    async def realm_events_converged(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> bool:
+        """Read the event settings through view-realm; never change them."""
+        realm = await self._realm(spec, token=management_token)
+        if realm is None:
+            raise _fail("keycloak_realm_readback_failed")
+        return self._realm_events_match(realm)
+
+    async def apply_realm_events(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> None:
+        """Turn on the realm's user events under one-time authority.
+
+        Keycloak's events/config update leaves the listeners and the admin-event
+        settings alone when the request omits them, so only the three owned
+        settings travel and the realm keeps whatever else it has configured.
+        """
+        await self._request(
+            spec,
+            "PUT",
+            f"/admin/realms/{_path(spec.realm)}/events/config",
+            token=token,
+            json_body={
+                "eventsEnabled": True,
+                "eventsExpiration": REALM_EVENTS_EXPIRATION_SECONDS,
+                "enabledEventTypes": list(REALM_EVENT_TYPES),
+            },
+            expected=frozenset({204}),
+            code="keycloak_realm_events_update_failed",
+        )
+        realm = await self._realm(spec, token=token)
+        if realm is None or not self._realm_events_match(realm):
+            raise _fail("keycloak_realm_events_readback_failed")
 
     async def _list_clients(
         self,
@@ -1196,6 +1249,7 @@ class KeycloakStandaloneSSOControl:
         bootstrap_token: str,
     ) -> StandaloneSSOReadback:
         realm = await self._reconcile_realm(spec, token=bootstrap_token)
+        await self.apply_realm_events(spec, token=bootstrap_token)
         realm_id = _required_string(realm, "id", "keycloak_realm_readback_failed")
         await self._reconcile_signing_key(
             spec,
