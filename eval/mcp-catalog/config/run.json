@@ -3,18 +3,36 @@
   "name": "akb-mcp-tool-surface",
   "protocol_revision": "2026-07-28",
   "source_revision": "runtime_descriptor",
-  "arms": ["baseline", "candidate"],
-  "transports": ["http", "stdio"],
+  "arms": [
+    "baseline",
+    "candidate"
+  ],
+  "transports": [
+    "http",
+    "stdio"
+  ],
   "models": [
     {
       "class_name": "primary",
       "provider": "openrouter",
       "model_id": "deepseek/deepseek-v4-flash-0731",
-      "version": "deepseek/deepseek-v4-flash-0731",
+      "version": "20260731",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 8192},
+      "routing": {
+        "order": [
+          "parasail"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "quantizations": [
+          "fp8"
+        ]
+      },
+      "settings": {
+        "temperature": 0.0,
+        "max_tokens": 8192
+      },
       "input_cost_per_million_usd": 0.14,
       "output_cost_per_million_usd": 0.28
     },
@@ -22,11 +40,23 @@
       "class_name": "lightweight",
       "provider": "openrouter",
       "model_id": "qwen/qwen3.8-27b",
-      "version": "qwen/qwen3.8-27b",
+      "version": "20260814",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 8192},
+      "routing": {
+        "order": [
+          "parasail"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "quantizations": [
+          "fp8"
+        ]
+      },
+      "settings": {
+        "temperature": 0.0,
+        "max_tokens": 8192
+      },
       "input_cost_per_million_usd": 0.24,
       "output_cost_per_million_usd": 2.2
     }
@@ -34,15 +64,18 @@
   "repeats": 2,
   "max_concurrency": 1,
   "category_minimums": {
-    "single_operation": 2,
-    "ambiguous_action": 2,
-    "multi_step": 2,
-    "destructive_confirmation": 2,
+    "ambiguous_action": 4,
     "authorization": 2,
+    "destructive_confirmation": 2,
     "invalid_input_recovery": 2,
-    "stdio_local": 2
+    "multi_step": 20,
+    "single_operation": 6,
+    "stdio_local": 4
   },
-  "suite_minimums": {"capability": 14, "tool_surface_risk": 12},
+  "suite_minimums": {
+    "capability": 28,
+    "tool_surface_risk": 12
+  },
   "capability_minimums": {
     "vault_discovery_metadata_lifecycle": 1,
     "document_discovery_read_history": 1,
@@ -68,15 +101,22 @@
     "transport_divergence": 1
   },
   "statistical_procedure": {
-    "method": "paired_task_mean_normal_approximation",
+    "method": "paired_cluster_bca_bootstrap",
     "confidence": 0.95,
     "noninferiority_margin": 0.03,
-    "repeated_trials_are_averaged_per_task": true,
-    "z_value": 1.644854
+    "resamples": 20000,
+    "seed": 358,
+    "cluster": "pair_id",
+    "paired": true,
+    "cluster_weight": "equal",
+    "resampling": "BCa"
   },
   "paired_order": "counterbalanced_task_repeat",
-  "paired_order_seed": "akb-208-semantic-v2",
-  "provider_sensitivity": {"maximum_arm_share_difference": 0.2, "downgrade_on_imbalance": true},
+  "paired_order_seed": "akb-358-v1",
+  "provider_sensitivity": {
+    "maximum_arm_share_difference": 0.2,
+    "downgrade_on_imbalance": true
+  },
   "budget": {
     "max_model_requests": 3000,
     "max_total_cost_usd": 50.0,
@@ -86,18 +126,81 @@
     "max_cost_per_trial_usd": 0.1
   },
   "operation_map": {
-    "identity": ["akb_whoami"],
-    "list": ["akb_list_vaults", "akb_browse", "akb_publications", "akb_vault_members", "akb_search_users"],
-    "read": ["akb_get", "akb_drill_down", "akb_vault_info", "akb_activity", "akb_diff", "akb_relations", "akb_graph", "akb_provenance", "akb_publication_snapshot", "akb_explain_access", "akb_history", "akb_export", "akb_get_file"],
-    "search": ["akb_search", "akb_grep", "akb_sql"],
-    "create": ["akb_put", "akb_create_vault", "akb_create_collection", "akb_create_table", "akb_publish", "akb_import"],
-    "update": ["akb_update", "akb_edit", "akb_move", "akb_alter_table", "akb_link", "akb_transfer_ownership", "akb_set_public", "akb_update_file"],
-    "delete": ["akb_delete", "akb_archive_vault", "akb_delete_vault", "akb_delete_collection", "akb_drop_table", "akb_unpublish", "akb_unlink", "akb_delete_file"],
-    "grant": ["akb_grant", "akb_revoke"],
-    "file_upload": ["akb_put_file"],
-    "image_upload": ["akb_put_image"],
-    "cleanup": ["akb_discard_image"],
-    "help": ["akb_help"]
+    "identity": [
+      "akb_whoami"
+    ],
+    "list": [
+      "akb_list_vaults",
+      "akb_browse",
+      "akb_publications",
+      "akb_vault_members",
+      "akb_search_users"
+    ],
+    "read": [
+      "akb_get",
+      "akb_drill_down",
+      "akb_vault_info",
+      "akb_activity",
+      "akb_diff",
+      "akb_relations",
+      "akb_graph",
+      "akb_provenance",
+      "akb_publication_snapshot",
+      "akb_explain_access",
+      "akb_history",
+      "akb_export",
+      "akb_get_file"
+    ],
+    "search": [
+      "akb_search",
+      "akb_grep",
+      "akb_sql"
+    ],
+    "create": [
+      "akb_put",
+      "akb_create_vault",
+      "akb_create_collection",
+      "akb_create_table",
+      "akb_publish",
+      "akb_import"
+    ],
+    "update": [
+      "akb_update",
+      "akb_edit",
+      "akb_move",
+      "akb_alter_table",
+      "akb_link",
+      "akb_transfer_ownership",
+      "akb_set_public",
+      "akb_update_file",
+      "akb_grep_replace"
+    ],
+    "delete": [
+      "akb_delete",
+      "akb_archive_vault",
+      "akb_delete_vault",
+      "akb_delete_collection",
+      "akb_drop_table",
+      "akb_unpublish",
+      "akb_unlink",
+      "akb_delete_file"
+    ],
+    "grant": [
+      "akb_grant",
+      "akb_revoke"
+    ],
+    "file_upload": [
+      "akb_put_file"
+    ],
+    "image_upload": [
+      "akb_put_image"
+    ],
+    "cleanup": [
+      "akb_discard_image"
+    ],
+    "help": [
+      "akb_help"
+    ]
   },
   "tool_resources": {
     "akb_whoami": "identity",
@@ -149,7 +252,8 @@
     "akb_put_file": "file",
     "akb_put_image": "image",
     "akb_discard_image": "image",
-    "akb_help": "help"
+    "akb_help": "help",
+    "akb_grep_replace": "document"
   },
   "credential_profiles": {
     "default": null,
@@ -157,8 +261,14 @@
     "authorization": "MCP_BENCH_AUTHORIZATION_PAT"
   },
   "fixture_scenario": "app-control-plane",
-  "locales": ["ko-KR", "en-US"],
-  "locale_counts": {"ko-KR": 13, "en-US": 13},
+  "locales": [
+    "ko-KR",
+    "en-US"
+  ],
+  "locale_counts": {
+    "ko-KR": 20,
+    "en-US": 20
+  },
   "pair_categories": {
     "read-vaults": "single_operation",
     "create-vault": "single_operation",
@@ -172,6 +282,795 @@
     "destructive-confirm": "destructive_confirmation",
     "authorization-readonly": "authorization",
     "invalid-recovery": "invalid_input_recovery",
-    "overlapping-document": "multi_step"
-  }
+    "overlapping-document": "multi_step",
+    "grep-write": "multi_step",
+    "document-revisions": "multi_step",
+    "history-provenance": "multi_step",
+    "collection-relation-lifecycle": "multi_step",
+    "table-schema-conflict": "multi_step",
+    "access-ownership-public": "multi_step",
+    "stdio-image-files": "stdio_local"
+  },
+  "arm_source_revisions": {
+    "baseline": "9daf7b44f9387776f845f181d29f1a7c8d21b37a",
+    "candidate": "8d74114042b7d94a02c6b0f7aa27a6ab749e1874"
+  },
+  "public_operations": [
+    {
+      "operation": "akb_whoami",
+      "logical_operation": "identity",
+      "resource_type": "identity",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_whoami"
+      },
+      "candidate": {
+        "tool": "akb_identity",
+        "action": "whoami"
+      }
+    },
+    {
+      "operation": "akb_list_vaults",
+      "logical_operation": "list",
+      "resource_type": "vault",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_list_vaults"
+      },
+      "candidate": {
+        "tool": "akb_discover",
+        "action": "list_vaults"
+      }
+    },
+    {
+      "operation": "akb_browse",
+      "logical_operation": "list",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_browse"
+      },
+      "candidate": {
+        "tool": "akb_discover",
+        "action": "browse"
+      }
+    },
+    {
+      "operation": "akb_publications",
+      "logical_operation": "list",
+      "resource_type": "publication",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_publications"
+      },
+      "candidate": {
+        "tool": "akb_publications"
+      }
+    },
+    {
+      "operation": "akb_vault_members",
+      "logical_operation": "list",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_vault_members"
+      },
+      "candidate": {
+        "tool": "akb_vault_access",
+        "action": "members"
+      }
+    },
+    {
+      "operation": "akb_search_users",
+      "logical_operation": "list",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_search_users"
+      },
+      "candidate": {
+        "tool": "akb_identity",
+        "action": "search_users"
+      }
+    },
+    {
+      "operation": "akb_get",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_get"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "get"
+      }
+    },
+    {
+      "operation": "akb_drill_down",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_drill_down"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "section"
+      }
+    },
+    {
+      "operation": "akb_vault_info",
+      "logical_operation": "read",
+      "resource_type": "vault",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_vault_info"
+      },
+      "candidate": {
+        "tool": "akb_discover",
+        "action": "vault_info"
+      }
+    },
+    {
+      "operation": "akb_activity",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_activity"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "activity"
+      }
+    },
+    {
+      "operation": "akb_diff",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_diff"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "diff"
+      }
+    },
+    {
+      "operation": "akb_relations",
+      "logical_operation": "read",
+      "resource_type": "relation",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_relations"
+      },
+      "candidate": {
+        "tool": "akb_relationships",
+        "action": "relations"
+      }
+    },
+    {
+      "operation": "akb_graph",
+      "logical_operation": "read",
+      "resource_type": "relation",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_graph"
+      },
+      "candidate": {
+        "tool": "akb_relationships",
+        "action": "graph"
+      }
+    },
+    {
+      "operation": "akb_provenance",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_provenance"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "provenance"
+      }
+    },
+    {
+      "operation": "akb_publication_snapshot",
+      "logical_operation": "read",
+      "resource_type": "publication",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_publication_snapshot"
+      },
+      "candidate": {
+        "tool": "akb_publication_snapshot"
+      }
+    },
+    {
+      "operation": "akb_explain_access",
+      "logical_operation": "read",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_explain_access"
+      },
+      "candidate": {
+        "tool": "akb_vault_access",
+        "action": "explain"
+      }
+    },
+    {
+      "operation": "akb_history",
+      "logical_operation": "read",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_history"
+      },
+      "candidate": {
+        "tool": "akb_document_read",
+        "action": "history"
+      }
+    },
+    {
+      "operation": "akb_export",
+      "logical_operation": "read",
+      "resource_type": "archive",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_export"
+      },
+      "candidate": {
+        "tool": "akb_export"
+      }
+    },
+    {
+      "operation": "akb_get_file",
+      "logical_operation": "read",
+      "resource_type": "file",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_get_file"
+      },
+      "candidate": {
+        "tool": "akb_get_file"
+      }
+    },
+    {
+      "operation": "akb_search",
+      "logical_operation": "search",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_search"
+      },
+      "candidate": {
+        "tool": "akb_discover",
+        "action": "search"
+      }
+    },
+    {
+      "operation": "akb_grep",
+      "logical_operation": "search",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_grep"
+      },
+      "candidate": {
+        "tool": "akb_discover",
+        "action": "grep"
+      }
+    },
+    {
+      "operation": "akb_sql",
+      "logical_operation": "search",
+      "resource_type": "table",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_sql"
+      },
+      "candidate": {
+        "tool": "akb_sql"
+      }
+    },
+    {
+      "operation": "akb_put",
+      "logical_operation": "create",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_put"
+      },
+      "candidate": {
+        "tool": "akb_put"
+      }
+    },
+    {
+      "operation": "akb_create_vault",
+      "logical_operation": "create",
+      "resource_type": "vault",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_create_vault"
+      },
+      "candidate": {
+        "tool": "akb_create_vault"
+      }
+    },
+    {
+      "operation": "akb_create_collection",
+      "logical_operation": "create",
+      "resource_type": "collection",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_create_collection"
+      },
+      "candidate": {
+        "tool": "akb_create_collection"
+      }
+    },
+    {
+      "operation": "akb_create_table",
+      "logical_operation": "create",
+      "resource_type": "table",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_create_table"
+      },
+      "candidate": {
+        "tool": "akb_create_table"
+      }
+    },
+    {
+      "operation": "akb_publish",
+      "logical_operation": "create",
+      "resource_type": "publication",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_publish"
+      },
+      "candidate": {
+        "tool": "akb_publish"
+      }
+    },
+    {
+      "operation": "akb_import",
+      "logical_operation": "create",
+      "resource_type": "archive",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_import"
+      },
+      "candidate": {
+        "tool": "akb_import"
+      }
+    },
+    {
+      "operation": "akb_update",
+      "logical_operation": "update",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_update"
+      },
+      "candidate": {
+        "tool": "akb_update"
+      }
+    },
+    {
+      "operation": "akb_edit",
+      "logical_operation": "update",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_edit"
+      },
+      "candidate": {
+        "tool": "akb_edit"
+      }
+    },
+    {
+      "operation": "akb_move",
+      "logical_operation": "update",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_move"
+      },
+      "candidate": {
+        "tool": "akb_move"
+      }
+    },
+    {
+      "operation": "akb_alter_table",
+      "logical_operation": "update",
+      "resource_type": "table",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_alter_table"
+      },
+      "candidate": {
+        "tool": "akb_alter_table"
+      }
+    },
+    {
+      "operation": "akb_link",
+      "logical_operation": "update",
+      "resource_type": "relation",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_link"
+      },
+      "candidate": {
+        "tool": "akb_link"
+      }
+    },
+    {
+      "operation": "akb_transfer_ownership",
+      "logical_operation": "update",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_transfer_ownership"
+      },
+      "candidate": {
+        "tool": "akb_transfer_ownership"
+      }
+    },
+    {
+      "operation": "akb_set_public",
+      "logical_operation": "update",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_set_public"
+      },
+      "candidate": {
+        "tool": "akb_set_public"
+      }
+    },
+    {
+      "operation": "akb_update_file",
+      "logical_operation": "update",
+      "resource_type": "file",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_update_file"
+      },
+      "candidate": {
+        "tool": "akb_update_file"
+      }
+    },
+    {
+      "operation": "akb_grep_replace",
+      "logical_operation": "update",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_grep_replace"
+      },
+      "candidate": {
+        "tool": "akb_grep_replace"
+      }
+    },
+    {
+      "operation": "akb_delete",
+      "logical_operation": "delete",
+      "resource_type": "document",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_delete"
+      },
+      "candidate": {
+        "tool": "akb_delete"
+      }
+    },
+    {
+      "operation": "akb_archive_vault",
+      "logical_operation": "delete",
+      "resource_type": "vault",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_archive_vault"
+      },
+      "candidate": {
+        "tool": "akb_archive_vault"
+      }
+    },
+    {
+      "operation": "akb_delete_vault",
+      "logical_operation": "delete",
+      "resource_type": "vault",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_delete_vault"
+      },
+      "candidate": {
+        "tool": "akb_delete_vault"
+      }
+    },
+    {
+      "operation": "akb_delete_collection",
+      "logical_operation": "delete",
+      "resource_type": "collection",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_delete_collection"
+      },
+      "candidate": {
+        "tool": "akb_delete_collection"
+      }
+    },
+    {
+      "operation": "akb_drop_table",
+      "logical_operation": "delete",
+      "resource_type": "table",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_drop_table"
+      },
+      "candidate": {
+        "tool": "akb_drop_table"
+      }
+    },
+    {
+      "operation": "akb_unpublish",
+      "logical_operation": "delete",
+      "resource_type": "publication",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_unpublish"
+      },
+      "candidate": {
+        "tool": "akb_unpublish"
+      }
+    },
+    {
+      "operation": "akb_unlink",
+      "logical_operation": "delete",
+      "resource_type": "relation",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_unlink"
+      },
+      "candidate": {
+        "tool": "akb_unlink"
+      }
+    },
+    {
+      "operation": "akb_delete_file",
+      "logical_operation": "delete",
+      "resource_type": "file",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_delete_file"
+      },
+      "candidate": {
+        "tool": "akb_delete_file"
+      }
+    },
+    {
+      "operation": "akb_grant",
+      "logical_operation": "grant",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_grant"
+      },
+      "candidate": {
+        "tool": "akb_grant"
+      }
+    },
+    {
+      "operation": "akb_revoke",
+      "logical_operation": "grant",
+      "resource_type": "access",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_revoke"
+      },
+      "candidate": {
+        "tool": "akb_revoke"
+      }
+    },
+    {
+      "operation": "akb_put_file",
+      "logical_operation": "file_upload",
+      "resource_type": "file",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_put_file"
+      },
+      "candidate": {
+        "tool": "akb_put_file"
+      }
+    },
+    {
+      "operation": "akb_put_image",
+      "logical_operation": "image_upload",
+      "resource_type": "image",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_put_image"
+      },
+      "candidate": {
+        "tool": "akb_put_image"
+      }
+    },
+    {
+      "operation": "akb_discard_image",
+      "logical_operation": "cleanup",
+      "resource_type": "image",
+      "transports": [
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_discard_image"
+      },
+      "candidate": {
+        "tool": "akb_discard_image"
+      }
+    },
+    {
+      "operation": "akb_help",
+      "logical_operation": "help",
+      "resource_type": "help",
+      "transports": [
+        "http",
+        "stdio"
+      ],
+      "baseline": {
+        "tool": "akb_help"
+      },
+      "candidate": {
+        "tool": "akb_help"
+      }
+    }
+  ]
 }
