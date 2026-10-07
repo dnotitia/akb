@@ -566,13 +566,20 @@ body.akb-page {
   }
 }
 
+/* Focus: the outline takes the ring colour and a soft halo forms around it,
+   instead of a second hard ring. A field in error keeps its colour. */
 .akb-card .pf-v5-c-form-control:focus-within::before {
   border-color: var(--color-focus-ring);
-  box-shadow: 0 0 0 1px var(--color-focus-ring);
+  box-shadow: 0 0 0 3px var(--color-focus-halo);
 }
 
 .akb-card .pf-v5-c-form-control.pf-m-error::before {
   border-color: var(--color-error);
+}
+
+.akb-card .pf-v5-c-form-control.pf-m-error:focus-within::before {
+  border-color: var(--color-error);
+  box-shadow: 0 0 0 3px var(--color-error-halo);
 }
 
 .akb-card .pf-v5-c-form-control > input,
@@ -645,12 +652,19 @@ body.akb-page {
   border-radius: 0 var(--radius-control) var(--radius-control) 0;
 }
 
+/* No left border at all: a transparent one would mitre the top and bottom
+   borders and leave a notch where the button meets the input. */
 .akb-card .pf-v5-c-input-group .pf-v5-c-button.pf-m-control::after {
+  border-left-width: 0;
   border-radius: inherit;
 }
 
 .akb-card .pf-v5-c-input-group:focus-within {
-  box-shadow: 0 0 0 1px var(--color-focus-ring);
+  box-shadow: 0 0 0 3px var(--color-focus-halo);
+}
+
+.akb-card .pf-v5-c-input-group:focus-within:has(.pf-m-error) {
+  box-shadow: 0 0 0 3px var(--color-error-halo);
 }
 
 .akb-card .pf-v5-c-input-group:focus-within .pf-v5-c-form-control::before {
@@ -677,6 +691,13 @@ body.akb-page {
   border-radius: var(--radius-control);
   font-size: var(--control-font-size);
   font-weight: 500;
+}
+
+/* PatternFly sets a 2rem gap and overflow:hidden on the action group; the
+   form already spaces it, and hidden overflow would clip the focus outline. */
+.akb-card .pf-v5-c-form__group.pf-m-action {
+  --pf-v5-c-form__group--m-action--MarginTop: 0.25rem;
+  overflow: visible;
 }
 
 /* Choices stacked straight in a form group (base's link-confirm page); a

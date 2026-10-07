@@ -42,6 +42,8 @@
   --color-link: var(--akb-color-foreground);
   --color-link-hover: var(--akb-color-foreground);
   --color-focus-ring: var(--akb-color-ring);
+  --color-focus-halo: color-mix(in srgb, var(--akb-color-ring) 22%, transparent);
+  --color-error-halo: color-mix(in srgb, var(--akb-color-danger) 18%, transparent);
 
   /* State: base, soft background, text on the soft background */
   --color-error: var(--akb-color-danger);
