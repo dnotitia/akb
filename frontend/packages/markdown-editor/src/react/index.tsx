@@ -1461,7 +1461,17 @@ function normalizeEditorBody(editor: Editor): void {
 
   const last = editor.state.doc.lastChild
   if (!last || last.type.name !== 'paragraph') {
-    editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' })
+    editor.chain()
+      .insertContentAt(
+        editor.state.doc.content.size,
+        { type: 'paragraph' },
+      )
+      .command(({ tr }) => {
+        tr.setMeta('preventUpdate', true)
+        tr.setMeta('addToHistory', false)
+        return true
+      })
+      .run()
   }
 }
 
@@ -1595,10 +1605,15 @@ export function MarkdownEditingSurface({
 
   useLayoutEffect(() => {
     if (!sourceSession) return
-    if (!sourceSession.isAttached) sourceSession.resetForSurface(resetMarkdownRef.current)
+    if (!sourceSession.isAttached) {
+      sourceSession.resetForSurface(
+        resetMarkdownRef.current,
+        editor ? serializeEditorMarkdown(editor, { profile }) : resetMarkdownRef.current,
+      )
+    }
     sourceSession?.attach()
     return () => sourceSession?.detach()
-  }, [sourceSession])
+  }, [editor, profile, sourceSession])
 
   useLayoutEffect(() => {
     sourceSession?.setChangeHandler(onSourceChange)
@@ -1672,6 +1687,9 @@ export function MarkdownEditingSurface({
       })
       normalizeEditorBody(editor)
       if (editorHandle) onMarkdownApplied?.(editorHandle)
+    }
+    if (externalValueChanged) {
+      sourceSession?.setVisualBaseline(serializeEditorMarkdown(editor, { profile }))
     }
   }, [editor, editorHandle, markdown, mode, onMarkdownApplied, profile, sourceSession])
 

@@ -86,6 +86,7 @@ export class MarkdownSourceSession {
   private readonly history: HistoryEntry[]
   private historyIndex = 0
   private markdown: string
+  private visualBaselineMarkdown: string
   private selection: MarkdownSourceSelection = EMPTY_SELECTION
   private mode: MarkdownSourceMode = 'wysiwyg'
   private revision = 0
@@ -111,8 +112,10 @@ export class MarkdownSourceSession {
     private readonly handle: MarkdownEditorHandle,
     markdown: string,
     contextKey?: string,
+    visualBaselineMarkdown = markdown,
   ) {
     this.markdown = markdown
+    this.visualBaselineMarkdown = visualBaselineMarkdown
     this.contextKey = contextKey
     this.history = [{ markdown, selection: this.selection }]
     this.snapshot = this.createSnapshot()
@@ -179,8 +182,9 @@ export class MarkdownSourceSession {
     this.publish()
   }
 
-  resetForSurface(markdown: string): void {
+  resetForSurface(markdown: string, visualBaselineMarkdown = markdown): void {
     this.markdown = markdown
+    this.visualBaselineMarkdown = visualBaselineMarkdown
     this.selection = EMPTY_SELECTION
     this.mode = 'wysiwyg'
     this.composing = false
@@ -263,9 +267,15 @@ export class MarkdownSourceSession {
       this.lastAppliedSource !== null &&
       this.lastAppliedSource === this.markdown &&
       this.lastAppliedWysiwygMarkdown === markdown
-    if (!sourceWasAppliedWithoutWysiwygChanges && this.markdown !== markdown) {
+    const visualIsUnchanged = markdown === this.visualBaselineMarkdown
+    if (
+      !sourceWasAppliedWithoutWysiwygChanges &&
+      !visualIsUnchanged &&
+      this.markdown !== markdown
+    ) {
       this.resetDraft(markdown)
     }
+    this.visualBaselineMarkdown = markdown
     this.mode = 'source'
     this.session += 1
     this.composing = false
@@ -286,12 +296,17 @@ export class MarkdownSourceSession {
     expectHostEcho: boolean,
   ): void {
     this.dirty = false
+    this.visualBaselineMarkdown = wysiwygMarkdown
     this.lastAppliedSource = this.markdown
     this.lastAppliedWysiwygMarkdown = wysiwygMarkdown
     this.lastAppliedEditorMarkdown = editorMarkdown
     if (expectHostEcho) {
       this.pendingAppliedEchoes.push([wysiwygMarkdown, editorMarkdown])
     }
+  }
+
+  setVisualBaseline(markdown: string): void {
+    this.visualBaselineMarkdown = markdown
   }
 
   setSelection(selection: MarkdownSourceSelection): void {

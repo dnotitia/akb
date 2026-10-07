@@ -300,6 +300,88 @@ describe('React surfaces', () => {
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('외부 갱신'))
   })
 
+  it('preserves saved Markdown spelling until a visual edit actually changes the document', async () => {
+    const user = userEvent.setup()
+    const savedMarkdown = [
+      '# Recovery document',
+      '',
+      'Existing saved payload gamma-630.',
+      '',
+      '[Canonical recovery][canon]',
+      '',
+      '<!-- preserved: existing-778225f7 -->',
+      '',
+      '[canon]: https://example.test/canonical-existing',
+    ].join('\n')
+    const externalMarkdown = savedMarkdown.replace('gamma-630', 'gamma-631')
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(savedMarkdown)
+      const editor = useMarkdownEditor({
+        initialMarkdown: savedMarkdown,
+        onChange: next => {
+          onChange(next)
+          setMarkdown(next)
+        },
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button type="button" onClick={() => setMarkdown(externalMarkdown)}>
+            Set external Markdown
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+    expect(onChange).not.toHaveBeenCalled()
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    expect(source).toHaveValue(savedMarkdown)
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source).toHaveValue(savedMarkdown)
+    expect(onChange).not.toHaveBeenCalled()
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    await user.click(view.getByRole('button', { name: 'Set external Markdown' }))
+    await waitFor(() =>
+      expect(view.getByTestId('host-markdown').textContent).toBe(externalMarkdown),
+    )
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source).toHaveValue(externalMarkdown)
+    expect(onChange).not.toHaveBeenCalled()
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+
+    const editor = getMarkdownEditor(activeEditor)!
+    await act(async () => {
+      editor.commands.setTextSelection(editor.state.doc.content.size - 1)
+    })
+    editor.view.focus()
+    await user.keyboard('visual edit')
+    await waitFor(() => expect(onChange).toHaveBeenCalled())
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('visual edit')
+  })
+
   it('lets a product combine controls without replacing the mode and draft lifecycle', async () => {
     const user = userEvent.setup()
     function CustomHeader() {

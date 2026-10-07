@@ -136,6 +136,49 @@ test.describe("document edit recovery mock contract", () => {
     expect(state.document.content).toBe(editedMarkdown);
   });
 
+  test("preserves saved reference Markdown across edit mode switches and reload", async ({
+    page,
+    request,
+  }) => {
+    const recovery = await fixture(request);
+    const savedMarkdown = [
+      "# Recovery document",
+      "",
+      "The original body is safe to edit.",
+      "",
+      "[Canonical recovery][canon]",
+      "",
+      "<!-- preserved: recovery-fixture -->",
+      "",
+      "[canon]: https://example.test/canonical-existing",
+    ].join("\n");
+    const readUrl = new URL(recovery.identity!.start_url!);
+    readUrl.searchParams.delete("view");
+    await page.goto(readUrl.toString());
+    await page.getByRole("button", { name: "Edit" }).click();
+
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save changes" })).toBeDisabled();
+
+    const modeButton = page.getByRole("button", { name: /^Editor mode:/ });
+    await modeButton.click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toHaveValue(savedMarkdown);
+    await modeButton.click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save changes" })).toBeDisabled();
+
+    await page.reload();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(savedMarkdown);
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
+  });
+
   test("tabs through editable task checkboxes and code regions without changing list structure", async ({
     page,
     request,

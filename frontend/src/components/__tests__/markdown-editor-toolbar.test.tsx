@@ -107,6 +107,48 @@ describe("MarkdownEditor formatting toolbar", () => {
     expect(screen.getByRole("toolbar", { name: "Text formatting" })).toBe(toolbar);
   });
 
+  it("keeps a saved reference link unchanged through the AKB editor mode switch", async () => {
+    const user = userEvent.setup();
+    const markdown = [
+      "# Recovery document",
+      "",
+      "Existing saved payload gamma-630.",
+      "",
+      "[Canonical recovery][canon]",
+      "",
+      "<!-- preserved: existing-778225f7 -->",
+      "",
+      "[canon]: https://example.test/canonical-existing",
+    ].join("\n");
+    const onChange = vi.fn();
+    render(
+      <MarkdownEditor
+        value={markdown}
+        vault="team"
+        ariaLabel="Document content"
+        onChange={onChange}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Document content" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText("Canonical recovery")).toBeVisible();
+
+    const modeButton = screen.getByRole("button", { name: /^Editor mode:/ });
+    await user.click(modeButton);
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
+    const source = screen.getByRole("textbox", { name: "Document content" });
+    expect(source).toHaveValue(markdown);
+
+    await user.click(modeButton);
+    await user.click(screen.getByRole("menuitemradio", { name: "Visual" }));
+    await user.click(modeButton);
+    await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
+
+    expect(screen.getByRole("textbox", { name: "Document content" })).toHaveValue(markdown);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it("opens Source with the current unsaved WYSIWYG draft when the editor owns its value", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

@@ -109,6 +109,21 @@ const baseDocument = {
   metadata_is_current: true,
 };
 
+const recoveryDocument = {
+  ...baseDocument,
+  content: [
+    "# Recovery document",
+    "",
+    "The original body is safe to edit.",
+    "",
+    "[Canonical recovery][canon]",
+    "",
+    "<!-- preserved: recovery-fixture -->",
+    "",
+    "[canon]: https://example.test/canonical-existing",
+  ].join("\n"),
+};
+
 const referenceDocument = {
   ...baseDocument,
   uri: "akb://fixture/coll/notes/doc/references.md",
@@ -149,7 +164,9 @@ function documentForState(): typeof baseDocument {
     ? referenceDocument
     : isImageRenderingScenario()
       ? imageRenderingDocument
-      : baseDocument;
+      : activeScenario === "document-edit-recovery"
+        ? recoveryDocument
+        : baseDocument;
   return remote
     ? { ...template, ...remote }
     : { ...template };
