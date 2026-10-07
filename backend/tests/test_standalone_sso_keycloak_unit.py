@@ -1133,6 +1133,7 @@ async def test_fresh_reconcile_turns_realm_events_on_with_the_bootstrap_authorit
     for name in (
         "_reconcile_signing_key",
         "_reconcile_native_amr",
+        "apply_brokered_account_guard",
         "_reconcile_client",
         "_reconcile_mapper",
         "_reconcile_management_roles",
@@ -1148,3 +1149,7 @@ async def test_fresh_reconcile_turns_realm_events_on_with_the_bootstrap_authorit
 
     assert await control.reconcile(spec, bootstrap_token="bootstrap-token") == "readback"
     assert calls[:2] == [("realm", "bootstrap-token"), ("events", "bootstrap-token")]
+    # A fresh realm is born guarded, under the same bootstrap authority.
+    assert calls.index(("apply_brokered_account_guard", "bootstrap-token")) > calls.index(
+        ("_reconcile_native_amr", "bootstrap-token")
+    )

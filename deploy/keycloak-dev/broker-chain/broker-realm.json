@@ -53,6 +53,17 @@
           }
         },
         {
+          "name": "akb-native-amr-probe",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-amr-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "lightweight.claim": "false"
+          }
+        },
+        {
           "name": "akb-browser-identity-provider",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-usersessionmodel-note-mapper",

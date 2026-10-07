@@ -20,11 +20,12 @@ The bundle implements the product-administrator bootstrap and recovery slice:
 2. The AKB bootstrap init container creates and reads back the `akb` realm,
    separate `akb-web`, `akb-admin`, and `akb-sso-manager` clients, the
    RSA-3072 active signing key, the signed broker-provenance mapper on
-   `akb-web`, the realm's seven-day user-event settings, the native product
-   administrator, and the exact AKB administrator projection.
+   `akb-web`, the realm's seven-day user-event settings, the brokered-account
+   password guard, the native product administrator, and the exact AKB
+   administrator projection.
 3. It proves the permanent management credential, deletes the temporary
    bootstrap client, verifies that credential is rejected, and records a
-   non-secret `bundled-keycloak-v4` retirement receipt in the AKB database.
+   non-secret `bundled-keycloak-v5` retirement receipt in the AKB database.
 4. A subsequent init-container run is read-only and succeeds without either
    original one-time value only when its current Keycloak and AKB identities
    exactly match that durable receipt.
@@ -219,6 +220,44 @@ absent; it decides that ordinary people also hold an account here rather than at
 an upstream. Whoever arrives this way is a pending admission and still needs an
 administrator's approval, exactly like anyone arriving through a broker.
 
+The same form never accepts a password from an account that came through an
+identity provider; see
+[Brokered accounts do not use realm passwords](#brokered-accounts-do-not-use-realm-passwords).
+An account belongs to one kind or the other.
+
+## Brokered accounts do not use realm passwords
+
+An account an identity provider brought must lose this installation when the
+provider stops vouching for it. Keycloak lets anyone signed in set a realm
+password (`kc_action=UPDATE_PASSWORD`, also the account console's "set up
+password"), and that password would otherwise keep working at this realm's own
+form and at the password grant, with no upstream involved.
+
+So the bootstrap installs a guard on the use of that password:
+
+- the realm role `akb-brokered-account`, which marks an account an identity
+  provider brought;
+- on every identity provider, the hardcoded-role mapper `akb-brokered-account`
+  with `syncMode=FORCE`, so the role is granted again on every brokered sign-in;
+- the flows `akb browser` and `akb direct grant`, copies of Keycloak's built-in
+  `browser` and `direct grant` flows bound in their place. In each, a
+  conditional sub-flow after the password step denies an account holding the
+  role. Keycloak does not allow adding to a built-in flow, so the built-ins stay
+  as shipped and unbound. The browser copy carries the native-password
+  reference `/admin` relies on.
+
+Accounts with no identity-provider link, the product administrator included,
+are not affected. Setting the password is still possible; using it is not.
+
+The provider control writes the mapper whenever it configures or enables a
+provider in a realm that has the role, and refuses to enable one it cannot
+mark. A provider added in the Keycloak console has no mapper until it is
+configured or enabled through AKB. Every init-container run reports it:
+`brokered_account_guard=drift` names an enabled provider without the mapper,
+which leaves only that provider's newcomers outside the guard. A realm whose
+flows no longer deny the role is refused at startup with
+`keycloak_brokered_account_guard_readback_failed`.
+
 ## Upgrade an existing receipt
 
 An installation that already recorded `bundled-keycloak-v1` retired its
@@ -242,23 +281,41 @@ from the newly configured callback.
 `bundled-keycloak-v4` adds the realm's user-event settings. Keycloak keeps
 login, broker, login-restart, and credential or broker-link change events for
 seven days. The exact types are `REALM_EVENT_TYPES` in
-`backend/app/services/standalone_sso_bootstrap.py`. A new install starts on v4.
-The permanent `akb-sso-manager` holds no events authority, by design: a manager
-able to change the settings could also switch the login audit off. An existing
-install therefore cannot reach v4 through its own init container. A v3 receipt
-keeps converging read-only exactly as before and reports
+`backend/app/services/standalone_sso_bootstrap.py`. The permanent
+`akb-sso-manager` holds no events authority, by design: a manager able to change
+the settings could also switch the login audit off. An existing install
+therefore cannot gain them through its own init container. A v3 receipt keeps
+converging read-only exactly as before and reports
 `receipt_profile=bundled-keycloak-v3` with `realm_events=pending_upgrade`.
-Supplying the one-time authority below to a v2 or v3 installation also applies
-the event settings and moves it to v4 (`mode=upgrade-v2-to-v4` or
-`mode=upgrade-v3-to-v4`). A v1 receipt always goes to v4.
+Supplying the one-time authority below to a v1, v2 or v3 installation applies
+the event settings together with the v5 guard and moves it straight to v5.
 
-The v4 receipt is a new row; the older row stays exactly as it was. A backend
-image that predates v4 reads only the profiles it knows, so rolling the image
-back still finds its v3 receipt. A callback migration completed after the move
-to v4 updates only the v4 row, so such a rollback needs the one-time authority
-again. On v4 the init container reports `realm_events=converged`, or
-`realm_events=drift` with a warning when the settings were changed afterwards.
-Drift is reported; it is never a reason to refuse startup.
+Each receipt profile is its own row; the older row stays exactly as it was. A
+backend image that predates a profile reads only the profiles it knows, so
+rolling the image back still finds the receipt it understands. A callback
+migration completed after a move updates only the newest row, so such a
+rollback needs the one-time authority again. From v4 on, the init container
+reports `realm_events=converged`, or `realm_events=drift` with a warning when
+the settings were changed afterwards. Drift is reported; it is never a reason
+to refuse startup.
+
+`bundled-keycloak-v5` adds the brokered-account password guard above. A new
+install starts on v5. Binding a flow needs `manage-realm` and marking accounts
+needs `manage-users`, neither of which the permanent manager holds, so an
+existing install reaches v5 only through the one-time authority below. Without
+it a v4 receipt keeps converging read-only and reports
+`brokered_account_guard=pending_upgrade` (v3 and older report the events as
+pending too). With it, the init container installs the guard, adds the mapper
+to every existing provider, grants the role to the accounts each provider
+already links (a disabled provider included: that is where a revoked upstream
+leaves people), and moves the install to v5 (`mode=upgrade-v4-to-v5`, or
+`upgrade-v1-to-v5` through `upgrade-v3-to-v5`). A move from v4 leaves the event
+settings as the realm has them. If the realm binds a browser or direct-grant
+flow other than Keycloak's built-in one or AKB's copy, the upgrade stops before
+changing anything (`keycloak_authentication_flow_binding_unexpected`). The v5
+receipt is a new row: an image that predates v5 still reads its v4 receipt,
+and the realm it reads back keeps the guard, which that image neither checks
+nor removes.
 
 Before rolling this version onto such an installation, create exactly one
 temporary upgrade service account named `akb-bootstrap-upgrade-v2`. Keycloak's
@@ -286,16 +343,18 @@ kubectl -n akb scale statefulset/keycloak --replicas=1
 kubectl -n akb rollout status statefulset/keycloak --timeout=300s
 ```
 
-Then deploy the new AKB overlay. Its init container must report
-`mode=upgrade-v1-to-v4`, `mode=upgrade-v2-to-v4`, `mode=upgrade-v3-to-v4`, or
-`mode=upgrade-v4-callback` and
-`receipt_profile=bundled-keycloak-v4`. The lifecycle first validates the exact
+Then deploy the new AKB overlay. Its init container must report one of
+`mode=upgrade-v1-to-v5` through `mode=upgrade-v4-to-v5`, or
+`mode=upgrade-v5-callback`, and
+`receipt_profile=bundled-keycloak-v5`. The lifecycle first validates the exact
 receipt-bound source read-back using the permanent manager, reconciles only the
 `akb-web` client metadata and, when required, signed broker-provenance mapper,
-applies and reads back the realm event settings, revalidates the complete
-profile through the permanent manager, deletes the temporary upgrade client,
-proves both its old and newly requested tokens are rejected, and only then
-writes the v4 receipt (or compare-and-swaps it on a v4 callback change). Retrying after a partial client
+applies and reads back the realm event settings when the source predates v4,
+installs and reads back the brokered-account password guard, revalidates the
+complete profile and the guard through the permanent manager, deletes the
+temporary upgrade client, proves both its old and newly requested tokens are
+rejected, and only then writes the v5 receipt (or compare-and-swaps it on a v5
+callback change). Retrying after a partial client
 update accepts only the exact receipt source or exact target metadata, so the
 process is convergent without accepting arbitrary drift. It does not require
 or reset the existing product-admin password.

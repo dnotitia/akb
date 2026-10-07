@@ -172,19 +172,22 @@ async def test_current_callback_receipt_replacement_is_an_exact_compare_and_swap
     assert conn.writes == 2
 
 
-async def test_loader_prefers_current_v4_then_v3_then_v2_then_v1(monkeypatch):
+async def test_loader_prefers_current_v5_then_v4_then_v3_then_v2_then_v1(monkeypatch):
     from app.services import standalone_sso_receipt as service
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE_V1,
         STANDALONE_SSO_RECEIPT_PROFILE_V2,
         STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V4,
     )
 
     conn = _Connection()
     legacy = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V1)
     v2 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V2)
     v3 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V3)
+    v4 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V4)
     current = _receipt()
+    assert current.profile == "bundled-keycloak-v5"
 
     def _row(receipt):
         return {
@@ -200,7 +203,7 @@ async def test_loader_prefers_current_v4_then_v3_then_v2_then_v1(monkeypatch):
             "backchannel_logout_uri": receipt.backchannel_logout_uri,
         }
 
-    for receipt in (legacy, v2, v3, current):
+    for receipt in (legacy, v2, v3, v4, current):
         conn.rows[receipt.profile] = _row(receipt)
 
     async def _get_pool():
@@ -209,6 +212,9 @@ async def test_loader_prefers_current_v4_then_v3_then_v2_then_v1(monkeypatch):
     monkeypatch.setattr(service, "get_pool", _get_pool)
     assert await service.load_standalone_sso_retirement_receipt() == current
     del conn.rows[current.profile]
+    assert await service.load_standalone_sso_retirement_receipt() == v4
+
+    del conn.rows[v4.profile]
     assert await service.load_standalone_sso_retirement_receipt() == v3
 
     del conn.rows[v3.profile]
@@ -233,6 +239,7 @@ async def test_v4_receipt_is_added_beside_v3_so_an_older_image_still_reads_v3(mo
         STANDALONE_SSO_RECEIPT_PROFILE_V1,
         STANDALONE_SSO_RECEIPT_PROFILE_V2,
         STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V4,
     )
 
     conn = _Connection()
@@ -242,7 +249,10 @@ async def test_v4_receipt_is_added_beside_v3_so_an_older_image_still_reads_v3(mo
 
     monkeypatch.setattr(service, "get_pool", _get_pool)
     v3 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V3)
-    v4 = replace(_receipt(), bootstrap_client_id="akb-bootstrap-upgrade-v2")
+    v4 = replace(
+        _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V4),
+        bootstrap_client_id="akb-bootstrap-upgrade-v2",
+    )
 
     await service.record_standalone_sso_retirement_receipt(v3)
     await service.record_standalone_sso_retirement_receipt(v4)
@@ -261,6 +271,50 @@ async def test_v4_receipt_is_added_beside_v3_so_an_older_image_still_reads_v3(mo
             break
     assert older_image_view is not None
     assert service._from_row(older_image_view) == v3  # noqa: SLF001
+
+
+async def test_v5_receipt_is_added_beside_v4_so_a_v4_image_still_reads_v4(monkeypatch):
+    """The brokered-account guard upgrade is rollback-safe the same way.
+
+    An image that predates v5 still finds its v4 row exactly as it was. The
+    realm it then reads back keeps the guard, which that image neither checks
+    nor removes.
+    """
+    from app.services import standalone_sso_receipt as service
+    from app.services.standalone_sso_bootstrap import (
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V4,
+    )
+
+    conn = _Connection()
+
+    async def _get_pool():
+        return _Pool(conn)
+
+    monkeypatch.setattr(service, "get_pool", _get_pool)
+    v4 = _receipt(profile=STANDALONE_SSO_RECEIPT_PROFILE_V4)
+    v5 = replace(_receipt(), bootstrap_client_id="akb-bootstrap-upgrade-v2")
+
+    await service.record_standalone_sso_retirement_receipt(v4)
+    await service.record_standalone_sso_retirement_receipt(v5)
+
+    assert await service.load_standalone_sso_retirement_receipt() == v5
+    assert conn.writes == 2
+    v4_image_profiles = (
+        STANDALONE_SSO_RECEIPT_PROFILE_V4,
+        STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V2,
+        STANDALONE_SSO_RECEIPT_PROFILE_V1,
+    )
+    older_image_view = None
+    for profile in v4_image_profiles:
+        older_image_view = await conn.fetchrow("FROM standalone_sso_bootstrap_retirements", profile)
+        if older_image_view is not None:
+            break
+    assert older_image_view is not None
+    assert service._from_row(older_image_view) == v4  # noqa: SLF001
 
 
 async def test_receipt_schema_is_present_for_fresh_and_upgraded_databases():

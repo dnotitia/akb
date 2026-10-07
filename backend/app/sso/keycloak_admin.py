@@ -18,6 +18,12 @@ from urllib.parse import quote
 
 import httpx
 
+from app.sso.brokered_account_guard import (
+    BROKERED_ACCOUNT_MAPPER_NAME,
+    BROKERED_ACCOUNT_ROLE,
+    identity_provider_mapper,
+    identity_provider_mapper_matches,
+)
 from app.sso.models import (
     IdentityPrelinkReadback,
     ProviderConfigureSpec,
@@ -302,6 +308,81 @@ class KeycloakProviderControl:
             code="keycloak_provider_read_failed",
         )
 
+    async def _ensure_brokered_account_mark(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+        alias: str,
+    ) -> None:
+        """Make the provider mark the accounts it brings, where the realm asks.
+
+        The realm asks by carrying the brokered-account role; its password
+        flows refuse an account holding it. A realm without the role has no
+        such guard, and a mapper naming a role that does not exist would fail
+        every brokered sign-in, so nothing is written there.
+        """
+        realm_path = f"/admin/realms/{_path(self.config.realm)}"
+        role = await self._request(
+            client,
+            "GET",
+            f"{realm_path}/roles/{_path(BROKERED_ACCOUNT_ROLE)}",
+            token=token,
+            expected=frozenset({200, 404}),
+            code="keycloak_provider_guard_read_failed",
+        )
+        if role.status_code == 404:
+            return
+        mappers_path = f"{self._instances_path()}/{_path(alias)}/mappers"
+
+        async def _marks() -> list[dict[str, Any]]:
+            response = await self._request(
+                client,
+                "GET",
+                mappers_path,
+                token=token,
+                expected=frozenset({200}),
+                code="keycloak_provider_guard_read_failed",
+            )
+            return [
+                item
+                for item in _objects(
+                    self._json(response, code="keycloak_provider_guard_read_failed"),
+                    code="keycloak_provider_guard_read_failed",
+                )
+                if item.get("name") == BROKERED_ACCOUNT_MAPPER_NAME
+            ]
+
+        marks = await _marks()
+        if len(marks) > 1:
+            raise _fail("keycloak_provider_guard_mapper_duplicate")
+        desired = identity_provider_mapper(alias)
+        if not marks:
+            await self._request(
+                client,
+                "POST",
+                mappers_path,
+                token=token,
+                json_body=desired,
+                expected=frozenset({201}),
+                code="keycloak_provider_guard_mapper_write_failed",
+            )
+        elif not identity_provider_mapper_matches(marks[0], alias):
+            mapper_id = marks[0].get("id")
+            if not isinstance(mapper_id, str) or not mapper_id:
+                raise _fail("keycloak_provider_guard_read_failed")
+            await self._request(
+                client,
+                "PUT",
+                f"{mappers_path}/{_path(mapper_id)}",
+                token=token,
+                json_body={**desired, "id": mapper_id},
+                expected=frozenset({204}),
+                code="keycloak_provider_guard_mapper_write_failed",
+            )
+        marks = await _marks()
+        if len(marks) != 1 or not identity_provider_mapper_matches(marks[0], alias):
+            raise _fail("keycloak_provider_guard_mapper_readback_failed")
+
     @staticmethod
     def _definition_for_representation(
         representation: Mapping[str, object],
@@ -532,6 +613,9 @@ class KeycloakProviderControl:
                     expected=frozenset({204}),
                     code="keycloak_provider_update_failed",
                 )
+            # The provider is still disabled here, so nobody has arrived
+            # through it unmarked; enabling checks the mark again.
+            await self._ensure_brokered_account_mark(client, token, validated.alias)
             representation = await self._get_exact(client, token, validated.alias)
         if representation is None:
             raise _fail("keycloak_provider_readback_failed")
@@ -574,6 +658,10 @@ class KeycloakProviderControl:
             current = self._readback(definition, representation)
             if enabled and current.state == "configuration_error":
                 raise _fail("provider_configuration_invalid")
+            if enabled:
+                # Never let people arrive through a provider that would not
+                # mark them. Disabling stays unconditional.
+                await self._ensure_brokered_account_mark(client, token, validated_alias)
 
             already_desired = (
                 representation.get("enabled") is enabled

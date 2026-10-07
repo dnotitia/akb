@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 import re
 from typing import Any
 from urllib.parse import quote
@@ -25,6 +26,13 @@ from app.services.standalone_sso_bootstrap import (
     StandaloneSSOBootstrapSpec,
     StandaloneSSOReadback,
 )
+from app.sso.brokered_account_guard import (
+    BROKERED_ACCOUNT_MAPPER_NAME,
+    BROKERED_ACCOUNT_ROLE,
+    BROKERED_ACCOUNT_ROLE_DESCRIPTION,
+    identity_provider_mapper,
+    identity_provider_mapper_matches,
+)
 
 
 _KEY_PROVIDER_TYPE = "org.keycloak.keys.KeyProvider"
@@ -34,6 +42,76 @@ _API_AUDIENCE_MAPPER_NAME = "akb-api-audience"
 _API_IDENTITY_PROVIDER_MAPPER_NAME = "akb-browser-identity-provider"
 _ADMIN_AMR_MAPPER_NAME = "akb-admin-native-amr"
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
+_NATIVE_AMR_VALUES = {
+    "default.reference.value": "pwd",
+    "default.reference.maxAge": "300",
+}
+# The guarded browser flow is a copy, so the native-password reference the
+# admin client's amr mapper reads has to live on the copy's password form too.
+_GUARDED_NATIVE_AMR_CONFIG_ALIAS = "akb-browser-native-password-amr"
+_BROKERED_ACCOUNT_CONDITION = "conditional-user-role"
+_DENY_ACCESS = "deny-access-authenticator"
+_BROKERED_ACCOUNT_DENY_MESSAGE = "This account signs in through its identity provider, not with a password."
+_IDENTITY_PROVIDER_LIMIT = 100
+_LINKED_ACCOUNT_PAGE = 100
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardedFlow:
+    """One password-accepting flow and the AKB-owned copy bound in its place.
+
+    Keycloak refuses to add anything to a built-in flow, so the guard lives in
+    a copy and the realm binds the copy instead.
+    """
+
+    base: str
+    alias: str
+    binding: str
+    credential_step: str
+    guard: str
+    condition_config: str
+    deny_config: str
+    native_amr: bool
+
+
+_GUARDED_FLOWS = (
+    _GuardedFlow(
+        base="browser",
+        alias="akb browser",
+        binding="browserFlow",
+        credential_step="auth-username-password-form",
+        guard="akb browser brokered-account guard",
+        condition_config="akb-browser-brokered-account-condition",
+        deny_config="akb-browser-brokered-account-deny",
+        native_amr=True,
+    ),
+    # admin-cli accepts the password grant in every realm, and a realm that
+    # lets clients register themselves lets anyone add another such client.
+    _GuardedFlow(
+        base="direct grant",
+        alias="akb direct grant",
+        binding="directGrantFlow",
+        credential_step="direct-grant-validate-password",
+        guard="akb direct grant brokered-account guard",
+        condition_config="akb-direct-grant-brokered-account-condition",
+        deny_config="akb-direct-grant-brokered-account-deny",
+        native_amr=False,
+    ),
+)
+
+
+@dataclass(slots=True)
+class _ExecutionNode:
+    entry: dict[str, Any]
+    children: list[_ExecutionNode]
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardLocation:
+    credential_step: dict[str, Any]
+    parent_alias: str
+    guard: _ExecutionNode | None
+    guard_after_password: bool
 
 
 def _fail(code: str) -> StandaloneSSOBootstrapError:
@@ -68,6 +146,60 @@ def _exact(items: list[dict[str, Any]], key: str, value: str, code: str) -> dict
 
 def _path(value: str) -> str:
     return quote(value, safe="")
+
+
+def _execution_tree(executions: list[dict[str, Any]]) -> list[_ExecutionNode]:
+    """Rebuild the nesting Keycloak flattens into ``level`` order."""
+    roots: list[_ExecutionNode] = []
+    path: list[_ExecutionNode] = []
+    for entry in executions:
+        level = entry.get("level")
+        if type(level) is not int or not 0 <= level <= len(path):
+            raise _fail("keycloak_auth_flow_read_failed")
+        node = _ExecutionNode(entry, [])
+        del path[level:]
+        (path[-1].children if path else roots).append(node)
+        path.append(node)
+    return roots
+
+
+def _locate_guard(flow: _GuardedFlow, tree: list[_ExecutionNode]) -> _GuardLocation:
+    """Find the one password authenticator and the guard beside it.
+
+    The guard must be a sibling that runs after the password: a conditional
+    sub-flow evaluated before anyone is identified has no account to test, so
+    in front of the password it would let everyone through.
+    """
+    found: list[tuple[str, list[_ExecutionNode], _ExecutionNode]] = []
+
+    def _walk(parent_alias: str, siblings: list[_ExecutionNode]) -> None:
+        for node in siblings:
+            if node.entry.get("authenticationFlow") is True:
+                _walk(
+                    _required_string(node.entry, "displayName", "keycloak_auth_flow_read_failed"),
+                    node.children,
+                )
+            elif node.entry.get("providerId") == flow.credential_step:
+                found.append((parent_alias, siblings, node))
+
+    _walk(flow.alias, tree)
+    if len(found) != 1:
+        raise _fail("keycloak_brokered_account_guard_ambiguous")
+    parent_alias, siblings, password = found[0]
+    guards = [
+        node
+        for node in siblings
+        if node.entry.get("authenticationFlow") is True and node.entry.get("displayName") == flow.guard
+    ]
+    if len(guards) > 1:
+        raise _fail("keycloak_brokered_account_guard_ambiguous")
+    guard = guards[0] if guards else None
+    return _GuardLocation(
+        credential_step=password.entry,
+        parent_alias=parent_alias,
+        guard=guard,
+        guard_after_password=guard is not None and siblings.index(guard) > siblings.index(password),
+    )
 
 
 def _rsa_public_key_size(public_key: str) -> int:
@@ -359,6 +491,504 @@ class KeycloakStandaloneSSOControl:
         realm = await self._realm(spec, token=token)
         if realm is None or not self._realm_events_match(realm):
             raise _fail("keycloak_realm_events_readback_failed")
+
+    async def _brokered_account_role(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> dict[str, Any] | None:
+        response = await self._request(
+            spec,
+            "GET",
+            f"/admin/realms/{_path(spec.realm)}/roles/{_path(BROKERED_ACCOUNT_ROLE)}",
+            token=token,
+            expected=frozenset({200, 404}),
+            code="keycloak_brokered_account_role_read_failed",
+        )
+        if response.status_code == 404:
+            return None
+        try:
+            return _object(response.json(), "keycloak_brokered_account_role_read_failed")
+        except (TypeError, ValueError) as exc:
+            raise _fail("keycloak_brokered_account_role_read_failed") from exc
+
+    async def _reconcile_brokered_account_role(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> dict[str, Any]:
+        role = await self._brokered_account_role(spec, token=token)
+        if role is None:
+            await self._request(
+                spec,
+                "POST",
+                f"/admin/realms/{_path(spec.realm)}/roles",
+                token=token,
+                json_body={
+                    "name": BROKERED_ACCOUNT_ROLE,
+                    "description": BROKERED_ACCOUNT_ROLE_DESCRIPTION,
+                },
+                expected=frozenset({201}),
+                code="keycloak_brokered_account_role_create_failed",
+            )
+            role = await self._brokered_account_role(spec, token=token)
+        if role is None or role.get("name") != BROKERED_ACCOUNT_ROLE:
+            raise _fail("keycloak_brokered_account_role_read_failed")
+        return role
+
+    async def _guard_location(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        flow: _GuardedFlow,
+        *,
+        token: str,
+    ) -> _GuardLocation:
+        value = await self._json(
+            spec,
+            f"/admin/realms/{_path(spec.realm)}/authentication/flows/{_path(flow.alias)}/executions",
+            token=token,
+            code="keycloak_auth_flow_read_failed",
+        )
+        return _locate_guard(
+            flow,
+            _execution_tree(_objects(value, "keycloak_auth_flow_read_failed")),
+        )
+
+    async def _execution_config(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        execution: Mapping[str, object],
+        *,
+        token: str,
+    ) -> dict[str, Any] | None:
+        config_id = execution.get("authenticationConfig")
+        if config_id is None:
+            return None
+        if not isinstance(config_id, str) or not config_id:
+            raise _fail("keycloak_auth_flow_read_failed")
+        return _object(
+            await self._json(
+                spec,
+                f"/admin/realms/{_path(spec.realm)}/authentication/config/{_path(config_id)}",
+                token=token,
+                code="keycloak_auth_flow_read_failed",
+            ),
+            "keycloak_auth_flow_read_failed",
+        )
+
+    async def _reconcile_execution_config(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        execution: Mapping[str, object],
+        *,
+        alias: str,
+        values: Mapping[str, str],
+        token: str,
+    ) -> None:
+        execution_id = _required_string(execution, "id", "keycloak_auth_flow_read_failed")
+        config_id = execution.get("authenticationConfig")
+        desired: dict[str, Any] = {"alias": alias, "config": dict(values)}
+        if config_id is None:
+            await self._request(
+                spec,
+                "POST",
+                f"/admin/realms/{_path(spec.realm)}/authentication/executions/{_path(execution_id)}/config",
+                token=token,
+                json_body=desired,
+                expected=frozenset({201}),
+                code="keycloak_brokered_account_guard_update_failed",
+            )
+        elif isinstance(config_id, str) and config_id:
+            current = await self._execution_config(spec, execution, token=token)
+            if current is not None and current.get("alias") == alias and current.get("config") == dict(values):
+                return
+            desired["id"] = config_id
+            await self._request(
+                spec,
+                "PUT",
+                f"/admin/realms/{_path(spec.realm)}/authentication/config/{_path(config_id)}",
+                token=token,
+                json_body=desired,
+                expected=frozenset({204}),
+                code="keycloak_brokered_account_guard_update_failed",
+            )
+        else:
+            raise _fail("keycloak_auth_flow_read_failed")
+
+    async def _set_requirement(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        parent_alias: str,
+        execution: Mapping[str, object],
+        requirement: str,
+        *,
+        token: str,
+    ) -> None:
+        if execution.get("requirement") == requirement:
+            return
+        await self._request(
+            spec,
+            "PUT",
+            f"/admin/realms/{_path(spec.realm)}/authentication/flows/{_path(parent_alias)}/executions",
+            token=token,
+            json_body={**execution, "requirement": requirement},
+            expected=frozenset({204}),
+            code="keycloak_brokered_account_guard_update_failed",
+        )
+
+    async def _reconcile_guarded_flow(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        flow: _GuardedFlow,
+        *,
+        token: str,
+    ) -> None:
+        realm_path = f"/admin/realms/{_path(spec.realm)}"
+        flows = _objects(
+            await self._json(
+                spec,
+                f"{realm_path}/authentication/flows",
+                token=token,
+                code="keycloak_auth_flow_read_failed",
+            ),
+            "keycloak_auth_flow_read_failed",
+        )
+        existing = _exact(flows, "alias", flow.alias, "keycloak_brokered_account_guard_conflict")
+        if existing is None:
+            await self._request(
+                spec,
+                "POST",
+                f"{realm_path}/authentication/flows/{_path(flow.base)}/copy",
+                token=token,
+                json_body={"newName": flow.alias},
+                expected=frozenset({201}),
+                code="keycloak_brokered_account_guard_flow_copy_failed",
+            )
+        elif (
+            existing.get("builtIn") is not False
+            or existing.get("topLevel") is not True
+            or existing.get("providerId") != "basic-flow"
+        ):
+            raise _fail("keycloak_brokered_account_guard_conflict")
+
+        location = await self._guard_location(spec, flow, token=token)
+        if flow.native_amr:
+            await self._reconcile_execution_config(
+                spec,
+                location.credential_step,
+                alias=_GUARDED_NATIVE_AMR_CONFIG_ALIAS,
+                values=_NATIVE_AMR_VALUES,
+                token=token,
+            )
+        if location.guard is None:
+            # A flow alias is unique in the realm, so 409 here means a sub-flow
+            # of this name exists somewhere it would not guard anything.
+            await self._request(
+                spec,
+                "POST",
+                f"{realm_path}/authentication/flows/{_path(location.parent_alias)}/executions/flow",
+                token=token,
+                json_body={
+                    "alias": flow.guard,
+                    "type": "basic-flow",
+                    "description": "Refuses a realm password to an account an identity provider brought.",
+                },
+                expected=frozenset({201}),
+                code="keycloak_brokered_account_guard_conflict",
+            )
+            location = await self._guard_location(spec, flow, token=token)
+        guard = location.guard
+        if guard is None or not location.guard_after_password:
+            raise _fail("keycloak_brokered_account_guard_conflict")
+        providers = [child.entry.get("providerId") for child in guard.children]
+        if (
+            any(child.entry.get("authenticationFlow") is True for child in guard.children)
+            or len(providers) != len(set(providers))
+            or not set(providers) <= {_BROKERED_ACCOUNT_CONDITION, _DENY_ACCESS}
+        ):
+            raise _fail("keycloak_brokered_account_guard_conflict")
+        for provider in (_BROKERED_ACCOUNT_CONDITION, _DENY_ACCESS):
+            if provider not in providers:
+                await self._request(
+                    spec,
+                    "POST",
+                    f"{realm_path}/authentication/flows/{_path(flow.guard)}/executions/execution",
+                    token=token,
+                    json_body={"provider": provider},
+                    expected=frozenset({201}),
+                    code="keycloak_brokered_account_guard_update_failed",
+                )
+        location = await self._guard_location(spec, flow, token=token)
+        guard = location.guard
+        if guard is None:
+            raise _fail("keycloak_brokered_account_guard_readback_failed")
+        children = {child.entry.get("providerId"): child.entry for child in guard.children}
+        if set(children) != {_BROKERED_ACCOUNT_CONDITION, _DENY_ACCESS}:
+            raise _fail("keycloak_brokered_account_guard_readback_failed")
+        await self._reconcile_execution_config(
+            spec,
+            children[_BROKERED_ACCOUNT_CONDITION],
+            alias=flow.condition_config,
+            values={"condUserRole": BROKERED_ACCOUNT_ROLE, "negate": "false"},
+            token=token,
+        )
+        await self._reconcile_execution_config(
+            spec,
+            children[_DENY_ACCESS],
+            alias=flow.deny_config,
+            values={"denyErrorMessage": _BROKERED_ACCOUNT_DENY_MESSAGE},
+            token=token,
+        )
+        # Keycloak creates a sub-flow and its executions disabled. Arm the two
+        # executions before the sub-flow, so the guard never runs half-built.
+        for provider in (_BROKERED_ACCOUNT_CONDITION, _DENY_ACCESS):
+            await self._set_requirement(spec, flow.guard, children[provider], "REQUIRED", token=token)
+        await self._set_requirement(spec, location.parent_alias, guard.entry, "CONDITIONAL", token=token)
+
+    async def _identity_providers(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> list[dict[str, Any]]:
+        providers = _objects(
+            await self._json(
+                spec,
+                f"/admin/realms/{_path(spec.realm)}/identity-provider/instances",
+                token=token,
+                params={"first": 0, "max": _IDENTITY_PROVIDER_LIMIT + 1},
+                code="keycloak_identity_provider_read_failed",
+            ),
+            "keycloak_identity_provider_read_failed",
+        )
+        if len(providers) > _IDENTITY_PROVIDER_LIMIT:
+            raise _fail("keycloak_identity_provider_catalog_truncated")
+        return providers
+
+    async def _identity_provider_marks(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        alias: str,
+        *,
+        token: str,
+    ) -> list[dict[str, Any]]:
+        mappers = _objects(
+            await self._json(
+                spec,
+                f"/admin/realms/{_path(spec.realm)}/identity-provider/instances/{_path(alias)}/mappers",
+                token=token,
+                code="keycloak_identity_provider_mapper_read_failed",
+            ),
+            "keycloak_identity_provider_mapper_read_failed",
+        )
+        return [item for item in mappers if item.get("name") == BROKERED_ACCOUNT_MAPPER_NAME]
+
+    async def _reconcile_identity_provider_mark(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        alias: str,
+        *,
+        token: str,
+    ) -> None:
+        marks = await self._identity_provider_marks(spec, alias, token=token)
+        if len(marks) > 1:
+            raise _fail("keycloak_identity_provider_mapper_duplicate")
+        base = f"/admin/realms/{_path(spec.realm)}/identity-provider/instances/{_path(alias)}/mappers"
+        desired = identity_provider_mapper(alias)
+        if not marks:
+            await self._request(
+                spec,
+                "POST",
+                base,
+                token=token,
+                json_body=desired,
+                expected=frozenset({201}),
+                code="keycloak_identity_provider_mapper_create_failed",
+            )
+        elif not identity_provider_mapper_matches(marks[0], alias):
+            mapper_id = _required_string(marks[0], "id", "keycloak_identity_provider_mapper_read_failed")
+            await self._request(
+                spec,
+                "PUT",
+                f"{base}/{_path(mapper_id)}",
+                token=token,
+                json_body={**desired, "id": mapper_id},
+                expected=frozenset({204}),
+                code="keycloak_identity_provider_mapper_update_failed",
+            )
+        marks = await self._identity_provider_marks(spec, alias, token=token)
+        if len(marks) != 1 or not identity_provider_mapper_matches(marks[0], alias):
+            raise _fail("keycloak_identity_provider_mapper_readback_failed")
+
+    async def _mark_linked_accounts(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        alias: str,
+        role: Mapping[str, object],
+        *,
+        token: str,
+    ) -> None:
+        """Mark the accounts already linked to ``alias``.
+
+        The mapper marks an account when it arrives. Someone linked before it
+        existed who already made a password, and never arrives again, would
+        otherwise keep that password; marking them here is what makes the
+        guard apply to passwords that exist today.
+        """
+        realm_path = f"/admin/realms/{_path(spec.realm)}"
+        marked: set[str] = set()
+        first = 0
+        while True:
+            page = _objects(
+                await self._json(
+                    spec,
+                    f"{realm_path}/users",
+                    token=token,
+                    params={
+                        "idpAlias": alias,
+                        "first": first,
+                        "max": _LINKED_ACCOUNT_PAGE,
+                        "briefRepresentation": "true",
+                    },
+                    code="keycloak_linked_account_read_failed",
+                ),
+                "keycloak_linked_account_read_failed",
+            )
+            fresh = [
+                user_id
+                for user_id in (_required_string(user, "id", "keycloak_linked_account_read_failed") for user in page)
+                if user_id not in marked
+            ]
+            for user_id in fresh:
+                await self._request(
+                    spec,
+                    "POST",
+                    f"{realm_path}/users/{_path(user_id)}/role-mappings/realm",
+                    token=token,
+                    json_body=[dict(role)],
+                    expected=frozenset({204}),
+                    code="keycloak_linked_account_mark_failed",
+                )
+            marked.update(fresh)
+            if len(page) < _LINKED_ACCOUNT_PAGE:
+                return
+            if not fresh:
+                raise _fail("keycloak_linked_account_read_failed")
+            first += _LINKED_ACCOUNT_PAGE
+
+    async def _brokered_account_guard_readback(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> bool:
+        realm = await self._realm(spec, token=token)
+        if realm is None:
+            raise _fail("keycloak_realm_readback_failed")
+        if any(realm.get(flow.binding) != flow.alias for flow in _GUARDED_FLOWS):
+            raise _fail("keycloak_brokered_account_guard_readback_failed")
+        if await self._brokered_account_role(spec, token=token) is None:
+            raise _fail("keycloak_brokered_account_guard_readback_failed")
+        for flow in _GUARDED_FLOWS:
+            location = await self._guard_location(spec, flow, token=token)
+            guard = location.guard
+            if guard is None or not location.guard_after_password or guard.entry.get("requirement") != "CONDITIONAL":
+                raise _fail("keycloak_brokered_account_guard_readback_failed")
+            children = {child.entry.get("providerId"): child.entry for child in guard.children}
+            if (
+                len(guard.children) != 2
+                or set(children) != {_BROKERED_ACCOUNT_CONDITION, _DENY_ACCESS}
+                or any(entry.get("requirement") != "REQUIRED" for entry in children.values())
+            ):
+                raise _fail("keycloak_brokered_account_guard_readback_failed")
+            condition = await self._execution_config(spec, children[_BROKERED_ACCOUNT_CONDITION], token=token)
+            values = None if condition is None else condition.get("config")
+            if (
+                not isinstance(values, dict)
+                or values.get("condUserRole") != BROKERED_ACCOUNT_ROLE
+                or values.get("negate") != "false"
+            ):
+                raise _fail("keycloak_brokered_account_guard_readback_failed")
+            if flow.native_amr:
+                native = await self._execution_config(spec, location.credential_step, token=token)
+                if (
+                    native is None
+                    or native.get("alias") != _GUARDED_NATIVE_AMR_CONFIG_ALIAS
+                    or native.get("config") != _NATIVE_AMR_VALUES
+                ):
+                    raise _fail("keycloak_brokered_account_guard_readback_failed")
+        for provider in await self._identity_providers(spec, token=token):
+            if provider.get("enabled") is not True:
+                continue
+            alias = _required_string(provider, "alias", "keycloak_identity_provider_read_failed")
+            marks = await self._identity_provider_marks(spec, alias, token=token)
+            if len(marks) != 1 or not identity_provider_mapper_matches(marks[0], alias):
+                return False
+        return True
+
+    async def brokered_account_guard_readback(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        management_token: str,
+    ) -> bool:
+        """Read the guard through view-realm; never change it.
+
+        A realm whose flows no longer refuse a brokered account's password is
+        refused outright. Whether every enabled identity provider still marks
+        the accounts it brings is returned, because an unmarked provider leaves
+        only its newcomers outside the guard and is fixed through the provider
+        control rather than by refusing to start.
+        """
+        return await self._brokered_account_guard_readback(spec, token=management_token)
+
+    async def apply_brokered_account_guard(
+        self,
+        spec: StandaloneSSOBootstrapSpec,
+        *,
+        token: str,
+    ) -> None:
+        """Install the brokered-account password guard under one-time authority.
+
+        The realm keeps Keycloak's built-in flows; it binds AKB-owned copies
+        whose password step is followed by a conditional sub-flow that denies
+        an account holding the brokered-account role. Every identity provider
+        gets the mapper that grants that role, and the accounts they already
+        link are marked now. The copies are bound last, so a failure part-way
+        leaves the realm on the flows it had.
+        """
+        realm = await self._realm(spec, token=token)
+        if realm is None:
+            raise _fail("keycloak_realm_read_failed")
+        if any(realm.get(flow.binding) not in {flow.base, flow.alias} for flow in _GUARDED_FLOWS):
+            # Someone bound a flow of their own. Replacing it would discard
+            # their change, and guarding it would mean reasoning about a flow
+            # AKB did not write, so stop and say so.
+            raise _fail("keycloak_authentication_flow_binding_unexpected")
+        role = await self._reconcile_brokered_account_role(spec, token=token)
+        for flow in _GUARDED_FLOWS:
+            await self._reconcile_guarded_flow(spec, flow, token=token)
+        unbound = {flow.binding: flow.alias for flow in _GUARDED_FLOWS if realm.get(flow.binding) != flow.alias}
+        if unbound:
+            # Only the bindings travel; Keycloak's realm update leaves every
+            # field the request omits as it is.
+            await self._request(
+                spec,
+                "PUT",
+                f"/admin/realms/{_path(spec.realm)}",
+                token=token,
+                json_body=unbound,
+                expected=frozenset({204}),
+                code="keycloak_brokered_account_guard_bind_failed",
+            )
+        for provider in await self._identity_providers(spec, token=token):
+            alias = _required_string(provider, "alias", "keycloak_identity_provider_read_failed")
+            await self._reconcile_identity_provider_mark(spec, alias, token=token)
+            await self._mark_linked_accounts(spec, alias, role, token=token)
+        if not await self._brokered_account_guard_readback(spec, token=token):
+            raise _fail("keycloak_brokered_account_guard_readback_failed")
 
     async def _list_clients(
         self,
@@ -1257,6 +1887,7 @@ class KeycloakStandaloneSSOControl:
             token=bootstrap_token,
         )
         await self._reconcile_native_amr(spec, token=bootstrap_token)
+        await self.apply_brokered_account_guard(spec, token=bootstrap_token)
 
         api = await self._reconcile_client(
             spec,
