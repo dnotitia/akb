@@ -10,9 +10,10 @@
 <@layout.registrationLayout bodyClass="oauth"; section>
     <#if section = "header">
         ${msg("akbConsentTitle", akbClientName)}
+    <#elseif section = "subtitle">
+        ${msg("akbConsentLead", akbClientName)}
     <#elseif section = "form">
         <div id="kc-oauth" class="content-area akb-consent">
-            <p class="akb-card__lead">${msg("akbConsentLead", akbClientName)}</p>
             <ul class="akb-consent__scopes">
                 <#if oauth.clientScopesRequested??>
                     <#list oauth.clientScopesRequested as clientScope>
@@ -41,8 +42,8 @@
             <form class="${properties.kcFormClass} akb-consent__form" action="${url.oauthAction}" method="POST">
                 <input type="hidden" name="code" value="${oauth.code}">
                 <div class="akb-form-actions akb-form-actions--split">
-                    <button class="akb-button akb-button--outline akb-button--lg" name="cancel" id="kc-cancel" type="submit">${msg("akbConsentDeny")}</button>
-                    <button class="akb-button akb-button--primary akb-button--lg" name="accept" id="kc-login" type="submit">${msg("akbConsentAllow")}</button>
+                    <button class="akb-button akb-button--secondary" name="cancel" id="kc-cancel" type="submit">${msg("akbConsentDeny")}</button>
+                    <button class="akb-button akb-button--primary" name="accept" id="kc-login" type="submit">${msg("akbConsentAllow")}</button>
                 </div>
             </form>
         </div>

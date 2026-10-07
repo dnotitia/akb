@@ -15,7 +15,7 @@
             <#if skipLink??>
             <#else>
                 <#if client?? && client.baseUrl?has_content>
-                    <p class="akb-form-actions"><a id="backToApplication" class="akb-button akb-button--outline akb-button--block akb-button--lg" href="${client.baseUrl}">${msg("backToApplication")}</a></p>
+                    <p class="akb-form-actions"><a id="backToApplication" class="akb-button akb-button--secondary akb-button--block" href="${client.baseUrl}">${msg("backToApplication")}</a></p>
                 </#if>
             </#if>
         </div>
