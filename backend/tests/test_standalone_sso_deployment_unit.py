@@ -208,3 +208,20 @@ def test_sso_profile_render_has_no_local_session_mount_when_kubectl_is_available
     assert "local-session-keys" not in result.stdout
     assert "auth_mode: sso" in result.stdout
     assert "kind: Secret" not in result.stdout
+
+
+def test_bundled_keycloak_does_not_serve_its_own_client_registration_endpoint():
+    """Self-registered clients get the OpenID Connect endpoint only.
+
+    Keycloak's own registration endpoint takes a whole client representation,
+    so a client registering itself there could pick an authentication flow the
+    realm does not guard. Both bundled shapes keep it off.
+    """
+    keycloak = _one("keycloak.yaml", kind="StatefulSet", resource_name="keycloak")
+    env = {item["name"]: item for item in keycloak["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED"] == {
+        "name": "KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED",
+        "value": "false",
+    }
+    helm = (_ROOT / "deploy" / "helm" / "akb" / "templates" / "sso.yaml").read_text(encoding="utf-8")
+    assert '- {name: KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED, value: "false"}' in helm

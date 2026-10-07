@@ -9,6 +9,18 @@ specifically; the proxy has its own log in
 
 ### Authentication
 
+- The bundled Keycloak (the `standalone-sso` overlay and the Helm `sso`
+  template) no longer serves Keycloak's own client-registration endpoint
+  (`KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED=false`). That endpoint accepts
+  a whole client representation, including an authentication-flow override,
+  so a client registering itself could run a flow without the brokered-account
+  guard. Clients that register themselves, such as MCP clients, use the OpenID
+  Connect registration endpoint, which is unchanged and cannot set an
+  override. The bootstrap report adds `native_client_registration`
+  (`disabled`, `enabled`, or `unknown`), read with one anonymous request whose
+  body is not JSON so it can register nothing; `enabled` and `unknown` are
+  logged as warnings and never block startup.
+
 - The bundled Keycloak realm's sign-in flows refuse a realm password to an
   account that arrived through an identity provider. Such an account could
   set one through Keycloak's `UPDATE_PASSWORD` action (also the account

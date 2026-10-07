@@ -144,6 +144,9 @@ spec:
             - {name: KC_PROXY_HEADERS, value: xforwarded}
             - {name: KC_HEALTH_ENABLED, value: "true"}
             - {name: KC_METRICS_ENABLED, value: "true"}
+            # Self-registered clients use the OpenID Connect endpoint, which cannot
+            # choose an authentication flow; Keycloak's own endpoint can, so it is off.
+            - {name: KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED, value: "false"}
             - {name: KC_BOOTSTRAP_ADMIN_CLIENT_ID, value: akb-bootstrap-temporary}
             - name: KC_BOOTSTRAP_ADMIN_CLIENT_SECRET
               valueFrom: {secretKeyRef: {name: akb-keycloak-bootstrap, key: client-secret}}

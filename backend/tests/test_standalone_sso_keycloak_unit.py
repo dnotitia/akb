@@ -1153,3 +1153,51 @@ async def test_fresh_reconcile_turns_realm_events_on_with_the_bootstrap_authorit
     assert calls.index(("apply_brokered_account_guard", "bootstrap-token")) > calls.index(
         ("_reconcile_native_amr", "bootstrap-token")
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (404, {"error": "Client registration provider not found"}, True),
+        (400, {"error": "invalid_request", "error_description": "Cannot parse the JSON"}, False),
+        (401, {"error": "invalid_token"}, False),
+        (403, {"error": "insufficient_scope"}, False),
+        (404, {"error": "Realm does not exist"}, None),
+        (404, None, None),
+        (500, None, None),
+    ],
+)
+async def test_native_client_registration_probe_is_anonymous_and_writes_nothing(status, body, expected):
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if body is None:
+            return httpx.Response(status, text="not json")
+        return httpx.Response(status, json=body)
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        assert await control.native_client_registration_disabled(spec) is expected
+    finally:
+        await control.aclose()
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert (request.method, request.url.path) == ("POST", "/realms/akb/clients-registrations/default")
+    assert "authorization" not in request.headers
+    # A body that is not JSON: a server still serving the endpoint refuses to
+    # parse it, so the probe can never register a client.
+    with pytest.raises(ValueError):
+        json.loads(request.content)
+
+
+async def test_native_client_registration_probe_reports_unknown_when_unreachable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable", request=request)
+
+    control, spec = _control(httpx.MockTransport(handler))
+    try:
+        assert await control.native_client_registration_disabled(spec) is None
+    finally:
+        await control.aclose()

@@ -97,7 +97,11 @@ keycloak_management_client_secret: <akb-sso-manager secret>
 embed_api_key: <provider key, if required>
 ```
 
-Generate each credential independently. The product-admin password is
+Generate each credential independently. Protect
+`keycloak_management_client_secret` as you would realm administration itself:
+its `manage-identity-providers` authority lets the holder add an identity
+provider whose mappers grant any realm role to whoever signs in through it.
+The product-admin password is
 temporary, must be at least 12 characters, must differ from its username and
 email, and Keycloak forces `UPDATE_PASSWORD` on first login. The realm enforces
 the same lean policy for the replacement password. The bootstrap client secret
@@ -251,7 +255,14 @@ are not affected. Setting the password is still possible; using it is not.
 
 The guard lives in the flows the realm binds. A client given its own
 authentication-flow override in Keycloak does not run them, so do not give a
-client in this realm an override.
+client in this realm an override. Clients that register themselves cannot set
+one: the bundled Keycloak serves only the OpenID Connect registration endpoint
+that MCP clients use. Keycloak's own registration endpoint accepts a whole
+client representation, overrides included, and
+`KC_SPI_CLIENT_REGISTRATION_DEFAULT_ENABLED=false` keeps it off. Every
+init-container run reports `native_client_registration`: `disabled`, or
+`enabled`/`unknown` with a warning. It never blocks startup, because a
+Keycloak this overlay does not deploy may not carry the setting yet.
 
 The provider control writes the mapper whenever it configures or enables a
 provider in a realm that has the role, and refuses to enable one it cannot

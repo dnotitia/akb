@@ -179,6 +179,9 @@ class _Control:
     async def brokered_account_guard_readback(self, _spec, *, management_token):
         return None
 
+    async def native_client_registration_disabled(self, _spec):
+        return True
+
 
 def _readback():
     from app.services.standalone_sso_bootstrap import StandaloneSSOReadback
