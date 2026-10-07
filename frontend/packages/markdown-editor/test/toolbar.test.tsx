@@ -5,6 +5,8 @@ import { useEffect, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  MarkdownEditingSurface,
+  MarkdownSurface,
   MarkdownToolbar,
   useMarkdownEditor,
   type MarkdownSearchAdapter,
@@ -45,6 +47,22 @@ function SelectionHarness() {
       {editor && <EditorContent editor={getMarkdownEditor(editor)} />}
       <output data-testid="markdown">{markdown}</output>
     </>
+  )
+}
+
+function EditingToolbarHarness() {
+  const [markdown, setMarkdown] = useState('text')
+  const editor = useMarkdownEditor({ initialMarkdown: 'text', onChange: setMarkdown })
+
+  return (
+    <MarkdownEditingSurface
+      editor={editor}
+      markdown={markdown}
+      onSourceChange={setMarkdown}
+      toolbar={<MarkdownToolbar editor={editor} />}
+    >
+      <MarkdownSurface editor={editor} editable />
+    </MarkdownEditingSurface>
   )
 }
 
@@ -164,6 +182,25 @@ describe('MarkdownToolbar', () => {
 
     expect(screen.getByTestId('markdown')).toHaveTextContent('text')
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveFocus())
+  })
+
+  it('closes a pending link popup when entering Source and keeps it closed after returning', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<EditingToolbarHarness />)
+
+    await waitFor(() => expect(screen.getByRole('toolbar', { name: 'Text formatting' })).toBeInTheDocument())
+    const toolbar = screen.getByRole('toolbar', { name: 'Text formatting' })
+    await user.click(screen.getByRole('button', { name: 'Insert link' }))
+    expect(screen.getByLabelText('URL')).toBeVisible()
+
+    const modeButtons = container.querySelectorAll<HTMLButtonElement>('[data-markdown-mode-toggle] button')
+    fireEvent.click(modeButtons[1]!)
+    expect(screen.queryByLabelText('URL')).not.toBeInTheDocument()
+    expect(screen.getByRole('toolbar', { name: 'Text formatting' })).toBe(toolbar)
+    expect(screen.getByRole('button', { name: 'Bold' })).toBeDisabled()
+
+    fireEvent.click(modeButtons[0]!)
+    expect(screen.queryByLabelText('URL')).not.toBeInTheDocument()
   })
 
   it('edits and removes a link through the shared command contract', async () => {

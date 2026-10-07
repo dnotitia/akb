@@ -338,6 +338,10 @@ export interface MarkdownCommands extends MarkdownTableCommands {
   focus(position?: MarkdownFocusPosition): boolean
 }
 
+export interface MarkdownEditingCommands extends MarkdownCommands {
+  applySourceChange(change: MarkdownSourceChange): MarkdownSourceChangeResult
+}
+
 export interface MarkdownActiveState {
   paragraph: boolean
   heading1: boolean
@@ -365,10 +369,67 @@ export interface MarkdownSelectionState {
   to: number
 }
 
+export type MarkdownSourceMode = 'wysiwyg' | 'source'
+
+export type MarkdownSourceSelectionDirection = 'forward' | 'backward' | 'none'
+
+export interface MarkdownSourceSelection {
+  /** Zero-based UTF-16 offset in the Source string. */
+  readonly start: number
+  /** Zero-based UTF-16 offset; the selected range excludes this position. */
+  readonly end: number
+  readonly direction: MarkdownSourceSelectionDirection
+}
+
+/** A read-only snapshot used to bind a deferred Source change to its draft. */
+export interface MarkdownSourceState {
+  readonly mode: MarkdownSourceMode
+  readonly markdown: string
+  /** Advances whenever the Source draft changes, including undo and redo. */
+  readonly revision: number
+  /** Advances on Source mode, editability, surface, or product-context changes. */
+  readonly session: number
+  readonly selection: MarkdownSourceSelection
+  readonly isComposing: boolean
+  readonly canUndo: boolean
+  readonly canRedo: boolean
+}
+
+/** Compare-and-swap request for a precise range in the current Source draft. */
+export interface MarkdownSourceChange {
+  /** Draft version from `MarkdownSourceState`. */
+  revision: number
+  /** Editing-context version from `MarkdownSourceState`. */
+  session: number
+  /** Zero-based UTF-16 offset, inclusive. */
+  from: number
+  /** Zero-based UTF-16 offset, exclusive. */
+  to: number
+  /** Exact Markdown expected in `[from, to)`. */
+  expectedText: string
+  /** Text to insert in place of `expectedText`. */
+  replacementText: string
+}
+
+export type MarkdownSourceChangeResult =
+  | { applied: true; markdown: string }
+  | {
+      applied: false
+      reason:
+        | 'source-inactive'
+        | 'read-only'
+        | 'composing'
+        | 'stale'
+        | 'invalid-range'
+        | 'target-mismatch'
+        | 'unchanged'
+    }
+
 export interface MarkdownState {
   markdown: string
   isEmpty: boolean
   isEditable: boolean
+  source: MarkdownSourceState
   table: MarkdownTableState
   active: MarkdownActiveState
   link: MarkdownLinkState

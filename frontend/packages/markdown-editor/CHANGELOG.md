@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.0
+
+- Expose revision- and session-checked Source range updates with stale-target,
+  read-only, composition, and inactive-mode rejection results.
+- Add Source selection/history state and mode-aware undo/redo commands, including
+  keyboard shortcuts, while keeping the shared toolbar mounted and disabling
+  WYSIWYG-only controls in Source.
+- Add `sourceContextKey` so products can invalidate deferred Source edits when
+  reusing an editor for another document or commit; document the public API.
+
 ## 0.16.1
 
 - Preserve escaped punctuation in image alt text across parse and serialize

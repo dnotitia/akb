@@ -65,19 +65,37 @@ describe("MarkdownEditor formatting toolbar", () => {
     );
 
     await screen.findByRole("textbox", { name: "Document content" });
+    const toolbar = screen.getByRole("toolbar", { name: "Text formatting" });
     await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
     await user.click(screen.getByRole("menuitemradio", { name: "Markdown" }));
 
     const source = screen.getByRole("textbox", { name: "Document content" });
     expect(source).toHaveValue(`![Before](/api/assets/${previousAssetId})`);
-    expect(screen.queryByRole("toolbar", { name: "Text formatting" })).not.toBeInTheDocument();
+    expect(screen.getByRole("toolbar", { name: "Text formatting" })).toBe(toolbar);
+    expect(screen.getByRole("button", { name: "Bold" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Insert link" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Undo" })).toBeDisabled();
 
     fireEvent.change(source, {
       target: { value: `![After](/api/assets/${nextAssetId})` },
     });
     await waitFor(() => expect(source).toHaveValue(`![After](/api/assets/${nextAssetId})`));
+    expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
     await waitFor(() =>
       expect(onChange).toHaveBeenLastCalledWith(`![After](/api/assets/${nextAssetId})`, [nextAssetId]),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(source).toHaveValue(`![Before](/api/assets/${previousAssetId})`));
+    expect(onChange).toHaveBeenLastCalledWith(
+      `![Before](/api/assets/${previousAssetId})`,
+      [previousAssetId],
+    );
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    await waitFor(() => expect(source).toHaveValue(`![After](/api/assets/${nextAssetId})`));
+    expect(onChange).toHaveBeenLastCalledWith(
+      `![After](/api/assets/${nextAssetId})`,
+      [nextAssetId],
     );
 
     await user.click(screen.getByRole("button", { name: /^Editor mode:/ }));
@@ -86,6 +104,7 @@ describe("MarkdownEditor formatting toolbar", () => {
       "data-markdown-target",
       `/api/assets/${nextAssetId}`,
     );
+    expect(screen.getByRole("toolbar", { name: "Text formatting" })).toBe(toolbar);
   });
 
   it("opens Source with the current unsaved WYSIWYG draft when the editor owns its value", async () => {

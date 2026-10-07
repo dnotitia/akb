@@ -54,6 +54,53 @@ The editor instance returned by `useMarkdownEditor` is an opaque package handle;
 it can only be passed to the package-owned surfaces, commands, and state hooks.
 Products persist the Markdown delivered by `onChange` or `onSourceChange`.
 
+`useMarkdownState(handle).source` exposes the current mode, Markdown text,
+selection, composition state, history availability, and revision/session tokens.
+Use those tokens to bind a deferred Source operation to the exact draft and
+editing context it inspected:
+
+```ts
+const snapshot = useMarkdownState(editor)?.source
+const commands = useMarkdownCommands(editor)
+
+if (snapshot?.mode === 'source') {
+  const from = snapshot.markdown.indexOf(target)
+  if (from >= 0) {
+    const result = commands.applySourceChange({
+      revision: snapshot.revision,
+      session: snapshot.session,
+      from,
+      to: from + target.length,
+      expectedText: target,
+      replacementText: `[Guide](${target})`,
+    })
+    // Inspect result.applied and the rejection reason before treating the
+    // update as successful.
+  }
+}
+```
+
+Source ranges are zero-based, half-open JavaScript string offsets. The update
+applies only when the captured revision and session are current and the exact
+`expectedText` still occupies that range; it preserves text outside the range
+and maps the selection through the replacement. Rejections distinguish a
+stale draft, changed target text, invalid range, read-only/composition state,
+and an inactive Source surface. Capture a fresh state after any rejection.
+`revision` changes on Source edits, undo/redo, and external value updates;
+`session` changes when Source mode, editability, surface attachment, or the
+product context changes. Pass `sourceContextKey` when one editor handle may be
+reused for different documents or commits, so pending work for an earlier
+target cannot edit the new one.
+
+The shared toolbar stays mounted in both modes. The built-in formatting and
+insertion commands in `MarkdownToolbar` are disabled in Source, while Undo and
+Redo operate on the active mode's history and are unavailable during IME
+composition. Source supports Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, and Cmd/Ctrl+Y.
+Hosts that append custom toolbar controls should check `state.source.mode`
+before running WYSIWYG-only actions. Changing locale or briefly switching
+modes keeps the Source draft and its history available. User edits remain exact
+Markdown; the host still owns save, conflict, and attachment policy.
+
 Editing updates remain synchronous so an immediate save includes the last
 keystroke. Each parser owns its tokenizer registry; repeated editing or mounting
 must not extend Marked's global parser. Immutable document snapshots reuse their
@@ -243,15 +290,17 @@ function ProductEditorContent({ markdown, onChange, readOnly }) {
 ```
 
 `MarkdownEditingSurface` owns mode switching, source input, external-value
-synchronization, and focus handoff. Its `toolbar` slot appears only in
-WYSIWYG mode; `sourcePlaceholder` can describe product-specific authoring
+synchronization, and focus handoff. Its `toolbar` slot remains mounted in both
+modes; Source disables WYSIWYG-only controls while keeping mode-aware history
+available. `sourceContextKey` can identify the current product target.
+`sourcePlaceholder` can describe product-specific authoring
 context, while the default mode and source copy follow the provider locale.
 `sourceClassName` and the source label props adapt theme and accessible names.
 `modeSwitchDisabled` can lock mode changes
 during an active product operation such as an upload. An optional `renderHeader`
 slot receives `{ mode, onModeChange, disabled, toolbar }` to combine the mode
 picker and formatting controls in a product-specific header. Render the supplied
-`toolbar` once (it is `null` in Source), respect `disabled`, and keep the picker
+`toolbar` once in either mode, respect `disabled`, and keep the picker
 available in both modes. The slot retains image-upload context; the surface still
 owns mode changes, draft synchronization, and focus handoff. Without this slot,
 the default two-button header and toolbar layout are unchanged. The optional

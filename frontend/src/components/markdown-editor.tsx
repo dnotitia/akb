@@ -390,6 +390,7 @@ function MarkdownEditorContent({
       <MarkdownEditingSurface
         editor={editor}
         markdown={value}
+        sourceContextKey={JSON.stringify([vault, document ?? null, commit ?? null])}
         autoFocus={autoFocus}
         onSourceChange={handleSourceChange}
         readOnly={readOnly}

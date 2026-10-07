@@ -107,9 +107,16 @@ test.describe("document edit recovery mock contract", () => {
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toBeVisible();
     await expect(source).toHaveValue(sourceMarkdown);
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Bold" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Undo" })).toBeDisabled();
     await source.fill(editedMarkdown);
     await expect(page.getByText("Draft saved locally")).toBeVisible();
-    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Undo" })).toBeEnabled();
+    await page.getByRole("button", { name: "Undo" }).click();
+    await expect(source).toHaveValue(sourceMarkdown);
+    await page.getByRole("button", { name: "Redo" }).click();
+    await expect(source).toHaveValue(editedMarkdown);
 
     await page.getByRole("button", { name: /^Editor mode:/ }).click();
     await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
@@ -195,9 +202,15 @@ test.describe("document edit recovery mock contract", () => {
     await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
 
     const source = page.getByRole("textbox", { name: /Markdown source/ });
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Bold" })).toBeDisabled();
     await source.fill(sourceMarkdown);
     await expect(source).toHaveValue(sourceMarkdown);
-    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Undo" })).toBeEnabled();
+    await page.getByRole("button", { name: "Undo" }).click();
+    await expect(source).toHaveValue("");
+    await page.getByRole("button", { name: "Redo" }).click();
+    await expect(source).toHaveValue(sourceMarkdown);
 
     await page.getByRole("button", { name: /^Editor mode:/ }).click();
     await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
