@@ -42,7 +42,7 @@ function EditorModeMenu({ mode, disabled, onModeChange }: {
   return (
     <DropdownMenu.Root modal={false} onOpenChange={(open) => { if (open) changed.current = false; }}>
       <DropdownMenu.Trigger asChild>
-        <Button variant="ghost" size="sm" disabled={disabled} aria-label={`Editor mode: ${label}`} className="h-8 shrink-0 gap-1.5 px-2 text-xs text-foreground-muted">
+        <Button variant="ghost" size="sm" disabled={disabled} aria-label={`Editor mode: ${label}`} className="h-8 w-24 shrink-0 gap-1.5 px-2 text-xs text-foreground-muted">
           {label}<ChevronDown className="h-3.5 w-3.5" aria-hidden />
         </Button>
       </DropdownMenu.Trigger>
@@ -390,6 +390,7 @@ function MarkdownEditorContent({
       <MarkdownEditingSurface
         editor={editor}
         markdown={value}
+        sourceContextKey={JSON.stringify([vault, document ?? null, commit ?? null])}
         autoFocus={autoFocus}
         onSourceChange={handleSourceChange}
         readOnly={readOnly}

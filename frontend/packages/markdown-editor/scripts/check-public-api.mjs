@@ -25,6 +25,21 @@ for (const path of declarationPaths) {
   }
 }
 
+const reactDeclaration = await readFile('dist/react/index.d.ts', 'utf8')
+for (const name of [
+  'MarkdownEditingCommands',
+  'MarkdownSourceChange',
+  'MarkdownSourceChangeResult',
+  'MarkdownSourceMode',
+  'MarkdownSourceSelection',
+  'MarkdownSourceSelectionDirection',
+  'MarkdownSourceState',
+]) {
+  if (!new RegExp(`\\b${name}\\b`).test(reactDeclaration)) {
+    throw new Error(`react is missing the public Source contract: ${name}`)
+  }
+}
+
 const root = await import('../dist/index.js')
 const react = await import('../dist/react/index.js')
 const forbiddenRuntimeExports = new Set([
@@ -74,6 +89,8 @@ for (const name of [
   'MarkdownToolbar',
   'MarkdownLocaleProvider',
   'useMarkdownEditor',
+  'useMarkdownCommands',
+  'useMarkdownState',
 ]) {
   if (!(name in root)) throw new Error(`root is missing the maintained export: ${name}`)
 }

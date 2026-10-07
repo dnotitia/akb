@@ -1,4 +1,33 @@
-import { expect, test, type APIRequestContext, type Locator } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+
+const BLOCK_FORMATTING_BUTTONS = ["Blockquote", "Code block", "Horizontal rule"] as const;
+
+type ToolbarButtonBounds = { x: number; y: number; width: number; height: number };
+
+async function readBlockFormattingButtonBounds(page: Page) {
+  const bounds = new Map<string, ToolbarButtonBounds>();
+  for (const label of BLOCK_FORMATTING_BUTTONS) {
+    const box = await page.getByRole("button", { name: label, exact: true }).boundingBox();
+    if (!box) throw new Error(`Expected the ${label} toolbar button to be visible`);
+    bounds.set(label, box);
+  }
+  return bounds;
+}
+
+function expectSameBlockFormattingButtonBounds(
+  before: Map<string, ToolbarButtonBounds>,
+  after: Map<string, ToolbarButtonBounds>,
+) {
+  for (const label of BLOCK_FORMATTING_BUTTONS) {
+    const original = before.get(label);
+    const current = after.get(label);
+    if (!original || !current) throw new Error(`Missing bounds for the ${label} toolbar button`);
+    expect(current.x, `${label} horizontal position`).toBeCloseTo(original.x, 1);
+    expect(current.y, `${label} vertical position`).toBeCloseTo(original.y, 1);
+    expect(current.width, `${label} width`).toBeCloseTo(original.width, 1);
+    expect(current.height, `${label} height`).toBeCloseTo(original.height, 1);
+  }
+}
 
 type MockOperation = {
   method: "GET" | "POST";
@@ -107,9 +136,16 @@ test.describe("document edit recovery mock contract", () => {
     const source = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(source).toBeVisible();
     await expect(source).toHaveValue(sourceMarkdown);
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Bold" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Undo" })).toBeDisabled();
     await source.fill(editedMarkdown);
     await expect(page.getByText("Draft saved locally")).toBeVisible();
-    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Undo" })).toBeEnabled();
+    await page.getByRole("button", { name: "Undo" }).click();
+    await expect(source).toHaveValue(sourceMarkdown);
+    await page.getByRole("button", { name: "Redo" }).click();
+    await expect(source).toHaveValue(editedMarkdown);
 
     await page.getByRole("button", { name: /^Editor mode:/ }).click();
     await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
@@ -127,6 +163,77 @@ test.describe("document edit recovery mock contract", () => {
     ).toHaveValue(editedMarkdown);
     const state = await operate(request, recovery.operations!.state);
     expect(state.document.content).toBe(editedMarkdown);
+  });
+
+  test("preserves saved reference Markdown across edit mode switches and reload", async ({
+    page,
+    request,
+  }) => {
+    const recovery = await fixture(request);
+    const savedMarkdown = [
+      "# Recovery document",
+      "",
+      "The original body is safe to edit.",
+      "",
+      "[Canonical recovery][canon]",
+      "",
+      "<!-- preserved: recovery-fixture -->",
+      "",
+      "[canon]: https://example.test/canonical-existing",
+    ].join("\n");
+    await operate(request, recovery.operations!.remote_revision, {
+      actor: "editor-b",
+      title: "Recovery document",
+      content: savedMarkdown,
+    });
+    const seededState = await operate(request, recovery.operations!.state);
+    expect(seededState.document.content).toBe(savedMarkdown);
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const readUrl = new URL(recovery.identity!.start_url!);
+    readUrl.searchParams.delete("view");
+    await page.goto(readUrl.toString());
+    await page.getByRole("button", { name: "Edit" }).click();
+
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save changes" })).toBeDisabled();
+
+    const modeButton = page.getByRole("button", { name: /^Editor mode:/ });
+    const switchMode = async (mode: "Visual" | "Markdown") => {
+      await modeButton.click();
+      await page.getByRole("menuitemradio", { name: mode, exact: true }).click();
+    };
+    const desktopVisualBounds = await readBlockFormattingButtonBounds(page);
+    await modeButton.click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+    const source = page.getByRole("textbox", { name: "Document body (markdown)" });
+    await expect(source).toHaveValue(savedMarkdown);
+    expectSameBlockFormattingButtonBounds(
+      desktopVisualBounds,
+      await readBlockFormattingButtonBounds(page),
+    );
+    await modeButton.click();
+    await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save changes" })).toBeDisabled();
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    const narrowVisualBounds = await readBlockFormattingButtonBounds(page);
+    await switchMode("Markdown");
+    expectSameBlockFormattingButtonBounds(
+      narrowVisualBounds,
+      await readBlockFormattingButtonBounds(page),
+    );
+    await switchMode("Visual");
+    await page.setViewportSize({ width: 1440, height: 900 });
+
+    await page.reload();
+    await page.getByRole("button", { name: /^Editor mode:/ }).click();
+    await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+    await expect(
+      page.getByRole("textbox", { name: "Document body (markdown)" }),
+    ).toHaveValue(savedMarkdown);
+    await expect(page.getByText("No changes", { exact: true })).toBeVisible();
   });
 
   test("tabs through editable task checkboxes and code regions without changing list structure", async ({
@@ -195,9 +302,15 @@ test.describe("document edit recovery mock contract", () => {
     await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
 
     const source = page.getByRole("textbox", { name: /Markdown source/ });
+    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Bold" })).toBeDisabled();
     await source.fill(sourceMarkdown);
     await expect(source).toHaveValue(sourceMarkdown);
-    await expect(page.getByRole("toolbar", { name: "Text formatting" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Undo" })).toBeEnabled();
+    await page.getByRole("button", { name: "Undo" }).click();
+    await expect(source).toHaveValue("");
+    await page.getByRole("button", { name: "Redo" }).click();
+    await expect(source).toHaveValue(sourceMarkdown);
 
     await page.getByRole("button", { name: /^Editor mode:/ }).click();
     await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();

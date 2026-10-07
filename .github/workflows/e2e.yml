@@ -21,11 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `cache: pip`: this job installs with uv (cached by setup-uv), so
+      # pip's cache directory never exists, and setup-python's post step fails
+      # the job whenever its cache key misses (e.g. a new runner Python).
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: pip
-          cache-dependency-path: backend/uv.lock
 
       - uses: astral-sh/setup-uv@v6
 

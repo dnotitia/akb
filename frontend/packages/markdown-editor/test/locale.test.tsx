@@ -144,6 +144,7 @@ describe('shared Markdown UI locale', () => {
     const originalEditorMarkdown = screen.getByTestId('canonical-markdown').textContent
     const sourceChangeCount = onSourceChange.mock.calls.length
     const changeCount = onChange.mock.calls.length
+    const toolbar = screen.getByRole('toolbar', { name: 'Text formatting' })
 
     ui.rerender(
       <LocalePage locale="ko" onChange={onChange} onSourceChange={onSourceChange} onEditor={onEditor} />,
@@ -157,9 +158,17 @@ describe('shared Markdown UI locale', () => {
     expect(koreanSource.selectionEnd).toBe(5)
     expect(koreanSource).toHaveFocus()
     expect(koreanSource).toHaveAttribute('placeholder', 'Markdown 원문을 입력하세요…')
+    expect(screen.getByRole('toolbar', { name: '서식 도구' })).toBe(toolbar)
+    expect(screen.getByRole('button', { name: '굵게' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '실행 취소' })).toBeEnabled()
     expect(screen.getByTestId('canonical-markdown').textContent).toBe(originalEditorMarkdown)
     expect(onSourceChange).toHaveBeenCalledTimes(sourceChangeCount)
     expect(onChange).toHaveBeenCalledTimes(changeCount)
+
+    fireEvent.click(screen.getByRole('button', { name: '실행 취소' }))
+    await waitFor(() => expect(koreanSource).toHaveValue('# Original\n\nBody'))
+    fireEvent.click(screen.getByRole('button', { name: '다시 실행' }))
+    await waitFor(() => expect(koreanSource).toHaveValue('# Draft\n\nBody'))
 
     fireEvent.click(screen.getByRole('button', { name: '시각 편집' }))
     await waitFor(() => expect(screen.getByRole('toolbar', { name: '서식 도구' })).toBeInTheDocument())

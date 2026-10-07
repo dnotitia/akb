@@ -1,9 +1,9 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { EditorContent } from '@tiptap/react'
 import { MarkdownManager } from '@tiptap/markdown'
-import { useEffect, useState } from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import { useEffect, useRef, useState } from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   MarkdownEditor,
@@ -20,11 +20,14 @@ import {
 import { createMarkdownEditor } from '../src/core.js'
 import { getMarkdownEditor } from '../src/react/editor-handle.js'
 import type {
+  MarkdownSourceChangeResult,
   MarkdownReferenceAdapter,
   MarkdownTargetResolution,
   MarkdownTargetResolver,
   MarkdownTargetResolverContext,
 } from '../src/index.js'
+
+afterEach(cleanup)
 
 function HookProbe() {
   const editor = useMarkdownEditor({ initialMarkdown: '초안' })
@@ -297,6 +300,88 @@ describe('React surfaces', () => {
     await waitFor(() => expect(container.querySelector('.ProseMirror')).toHaveTextContent('외부 갱신'))
   })
 
+  it('preserves saved Markdown spelling until a visual edit actually changes the document', async () => {
+    const user = userEvent.setup()
+    const savedMarkdown = [
+      '# Recovery document',
+      '',
+      'Existing saved payload gamma-630.',
+      '',
+      '[Canonical recovery][canon]',
+      '',
+      '<!-- preserved: existing-778225f7 -->',
+      '',
+      '[canon]: https://example.test/canonical-existing',
+    ].join('\n')
+    const externalMarkdown = savedMarkdown.replace('gamma-630', 'gamma-631')
+    const onChange = vi.fn()
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(savedMarkdown)
+      const editor = useMarkdownEditor({
+        initialMarkdown: savedMarkdown,
+        onChange: next => {
+          onChange(next)
+          setMarkdown(next)
+        },
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button type="button" onClick={() => setMarkdown(externalMarkdown)}>
+            Set external Markdown
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+    expect(onChange).not.toHaveBeenCalled()
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    expect(source).toHaveValue(savedMarkdown)
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source).toHaveValue(savedMarkdown)
+    expect(onChange).not.toHaveBeenCalled()
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    await user.click(view.getByRole('button', { name: 'Set external Markdown' }))
+    await waitFor(() =>
+      expect(view.getByTestId('host-markdown').textContent).toBe(externalMarkdown),
+    )
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source).toHaveValue(externalMarkdown)
+    expect(onChange).not.toHaveBeenCalled()
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+
+    const editor = getMarkdownEditor(activeEditor)!
+    await act(async () => {
+      editor.commands.setTextSelection(editor.state.doc.content.size - 1)
+    })
+    editor.view.focus()
+    await user.keyboard('visual edit')
+    await waitFor(() => expect(onChange).toHaveBeenCalled())
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('visual edit')
+  })
+
   it('lets a product combine controls without replacing the mode and draft lifecycle', async () => {
     const user = userEvent.setup()
     function CustomHeader() {
@@ -323,7 +408,7 @@ describe('React surfaces', () => {
     expect(view.getByRole('button', { name: 'Change mode' })).toBeDisabled()
     await user.click(view.getByRole('button', { name: 'Lock switching' }))
     await user.click(view.getByRole('button', { name: 'Change mode' }))
-    expect(view.queryByRole('button', { name: 'Format draft' })).toBeNull()
+    expect(view.getByRole('button', { name: 'Format draft' })).toBeVisible()
     const source = view.getByRole('textbox', { name: 'Markdown source' })
     await user.clear(source)
     await user.type(source, 'Updated draft')
@@ -355,7 +440,7 @@ describe('React surfaces', () => {
           editor={editor}
           markdown={markdown}
           onSourceChange={next => setMarkdown(next)}
-          toolbar={<button type="button">Formatting tool</button>}
+          toolbar={<MarkdownToolbar editor={editor} />}
         >
           {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
         </MarkdownEditingSurface>
@@ -393,6 +478,347 @@ describe('React surfaces', () => {
     expect(editor.getMarkdown()).not.toBe(markdownBefore)
   })
 
+  it('preserves the Source draft and history when the controlled host echoes canonical Markdown', async () => {
+    const user = userEvent.setup()
+    const initial = '- item'
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const editor = useMarkdownEditor({ initialMarkdown: initial })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <output data-testid="markdown-value">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            onMarkdownApplied={appliedEditor =>
+              setMarkdown(getMarkdownEditor(appliedEditor)?.getMarkdown() ?? '')
+            }
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' })
+    fireEvent.change(source, { target: { value: '* item' } })
+    expect(view.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    const canonicalMarkdown = getMarkdownEditor(activeEditor)!.getMarkdown()
+    expect(canonicalMarkdown).not.toBe('* item')
+    await waitFor(() =>
+      expect(view.getByTestId('markdown-value').textContent).toBe(canonicalMarkdown),
+    )
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue('* item')
+    expect(view.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    await user.click(view.getByRole('button', { name: 'Undo' }))
+    await waitFor(() => expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue(initial))
+    expect(view.getByRole('button', { name: 'Redo' })).toBeEnabled()
+  })
+
+  it('refreshes Source from a visual task change before the controlled host echoes it', async () => {
+    const user = userEvent.setup()
+    const sourceMarkdown = [
+      '# Keyboard controls',
+      '',
+      '- [ ] TASKPARENTAKB330',
+      '  - [x] TASKNESTEDAKB330',
+      '- [ ] TASKSIBLINGAKB330',
+      '',
+      '```text',
+      'keyboard_code_AKB330',
+      '```',
+    ].join('\n')
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    const visualChanges: string[] = []
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState('')
+      const pendingMarkdown = useRef<string | null>(null)
+      const editor = useMarkdownEditor({
+        initialMarkdown: '',
+        onChange: next => {
+          pendingMarkdown.current = next
+          visualChanges.push(next)
+        },
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              if (pendingMarkdown.current !== null) setMarkdown(pendingMarkdown.current)
+            }}
+          >
+            Deliver visual value
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    fireEvent.change(source, { target: { value: sourceMarkdown } })
+    await waitFor(() => expect(source).toHaveValue(sourceMarkdown))
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    const parent = view.getByRole('checkbox', {
+      name: 'Task item checkbox for TASKPARENTAKB330',
+    })
+    await user.click(parent)
+    expect(parent).toBeChecked()
+    expect(visualChanges.at(-1)).toContain('[x] TASKPARENTAKB330')
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('- [x] TASKPARENTAKB330')
+    expect(source.value).toContain('- [x] TASKNESTEDAKB330')
+    expect(source.value).toContain('- [ ] TASKSIBLINGAKB330')
+    expect(source.value).toContain('```text\nkeyboard_code_AKB330\n```')
+
+    await user.click(view.getByRole('button', { name: 'Deliver visual value' }))
+    await waitFor(() => expect(view.getByTestId('host-markdown').textContent).toContain('[x] TASKPARENTAKB330'))
+    expect(source.value).toContain('- [x] TASKPARENTAKB330')
+  })
+
+  it('keeps the rebased Source draft when an earlier apply echo arrives late', async () => {
+    const user = userEvent.setup()
+    const initial = '# Initial\n\n- [ ] TASKPARENTAKB331'
+    const sourceMarkdown = [
+      '# Keyboard controls',
+      '',
+      '- [ ] TASKPARENTAKB331',
+      '  - [x] TASKNESTEDAKB331',
+      '- [ ] TASKSIBLINGAKB331',
+      '',
+      '```text',
+      'keyboard_code_AKB331',
+      '```',
+    ].join('\n')
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    const visualChanges: string[] = []
+    const sourceChanges: string[] = []
+    const probe: {
+      commands: ReturnType<typeof useMarkdownCommands> | null
+      state: ReturnType<typeof useMarkdownState>
+    } = { commands: null, state: null }
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const pendingAppliedMarkdown = useRef<string | null>(null)
+      const editor = useMarkdownEditor({
+        initialMarkdown: initial,
+        onChange: next => visualChanges.push(next),
+      })
+      const commands = useMarkdownCommands(editor)
+      const state = useMarkdownState(editor)
+      useEffect(() => {
+        activeEditor = editor
+        probe.commands = commands
+        probe.state = state
+      }, [commands, editor, state])
+
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              if (pendingAppliedMarkdown.current !== null) {
+                setMarkdown(pendingAppliedMarkdown.current)
+              }
+            }}
+          >
+            Deliver earlier apply value
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={next => {
+              sourceChanges.push(next)
+              setMarkdown(next)
+            }}
+            onMarkdownApplied={appliedEditor => {
+              pendingAppliedMarkdown.current =
+                getMarkdownEditor(appliedEditor)?.getMarkdown() ?? ''
+            }}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    fireEvent.change(source, { target: { value: sourceMarkdown } })
+    await waitFor(() => expect(source).toHaveValue(sourceMarkdown))
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    expect(view.getByTestId('host-markdown').textContent).toBe(sourceMarkdown)
+
+    const parent = view.getByRole('checkbox', {
+      name: 'Task item checkbox for TASKPARENTAKB331',
+    })
+    await user.click(parent)
+    expect(parent).toBeChecked()
+    expect(visualChanges.at(-1)).toContain('[x] TASKPARENTAKB331')
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('- [x] TASKPARENTAKB331')
+    expect(source.value).toContain('- [x] TASKNESTEDAKB331')
+    expect(source.value).toContain('- [ ] TASKSIBLINGAKB331')
+    source.setSelectionRange(8, 16, 'forward')
+    fireEvent.select(source)
+    await waitFor(() =>
+      expect(probe.state?.source.selection).toMatchObject({ start: 8, end: 16 }),
+    )
+    const selectionAfterRebase = [
+      source.selectionStart,
+      source.selectionEnd,
+      source.selectionDirection,
+    ]
+    const rebasedSnapshot = probe.state!.source
+    const from = source.value.indexOf('TASKSIBLINGAKB331')
+    const replacement = 'TASKSIBLINGAKB331-EDITED'
+
+    await user.click(view.getByRole('button', { name: 'Deliver earlier apply value' }))
+    await waitFor(() => expect(view.getByTestId('host-markdown').textContent).not.toBe(sourceMarkdown))
+    expect(source.value).toContain('- [x] TASKPARENTAKB331')
+    expect(view.getByTestId('host-markdown').textContent).toContain('- [x] TASKPARENTAKB331')
+    expect(sourceChanges.at(-1)).toBe(source.value)
+    expect([
+      source.selectionStart,
+      source.selectionEnd,
+      source.selectionDirection,
+    ]).toEqual(selectionAfterRebase)
+
+    let result: MarkdownSourceChangeResult | undefined
+    await act(async () => {
+      result = probe.commands!.applySourceChange({
+        revision: rebasedSnapshot.revision,
+        session: rebasedSnapshot.session,
+        from,
+        to: from + 'TASKSIBLINGAKB331'.length,
+        expectedText: 'TASKSIBLINGAKB331',
+        replacementText: replacement,
+      })
+    })
+    const updated = rebasedSnapshot.markdown.slice(0, from) + replacement +
+      rebasedSnapshot.markdown.slice(from + 'TASKSIBLINGAKB331'.length)
+    expect(result).toEqual({ applied: true, markdown: updated })
+    await waitFor(() => expect(source).toHaveValue(updated))
+    expect(probe.state?.canUndo).toBe(true)
+    await user.click(view.getByRole('button', { name: 'Undo' }))
+    await waitFor(() => expect(source).toHaveValue(rebasedSnapshot.markdown))
+    expect(probe.state?.canRedo).toBe(true)
+  })
+
+  it('applies a distinct external Markdown value while an applied echo is pending', async () => {
+    const user = userEvent.setup()
+    const initial = '# Initial'
+    const pendingAppliedValues: string[] = []
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const editor = useMarkdownEditor({ initialMarkdown: initial })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button type="button" onClick={() => setMarkdown('## External replacement')}>
+            Set external Markdown
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const earlierValue = pendingAppliedValues.shift()
+              if (earlierValue !== undefined) setMarkdown(earlierValue)
+            }}
+          >
+            Deliver delayed Source echo
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            onMarkdownApplied={appliedEditor => {
+              pendingAppliedValues.push(getMarkdownEditor(appliedEditor)?.getMarkdown() ?? '')
+            }}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    fireEvent.change(source, { target: { value: '## Applied source value' } })
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    expect(pendingAppliedValues.length).toBeGreaterThan(0)
+
+    await user.click(view.getByRole('button', { name: 'Set external Markdown' }))
+    await waitFor(() =>
+      expect(getMarkdownEditor(activeEditor)?.getMarkdown()).toContain('External replacement'),
+    )
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('## External replacement')
+    await user.click(view.getByRole('button', { name: 'Deliver delayed Source echo' }))
+    await waitFor(() =>
+      expect(view.getByTestId('host-markdown').textContent).toContain('External replacement'),
+    )
+    expect(source.value).toContain('## External replacement')
+  })
+
   it('edits the same Markdown draft in Source and reflects external values and readOnly', async () => {
     const user = userEvent.setup()
     const sourceChanges = vi.fn()
@@ -428,7 +854,7 @@ describe('React surfaces', () => {
               setMarkdown(next)
             }}
             sourceLabel="Markdown source"
-            toolbar={<button type="button">Formatting tool</button>}
+            toolbar={<MarkdownToolbar editor={editor} />}
           >
             {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
           </MarkdownEditingSurface>
@@ -444,7 +870,8 @@ describe('React surfaces', () => {
     await user.click(view.getByRole('button', { name: 'Source' }))
     const source = view.getByRole('textbox', { name: 'Markdown source' })
     expect(source).toHaveValue('# Original')
-    expect(view.queryByRole('button', { name: 'Formatting tool' })).not.toBeInTheDocument()
+    expect(view.getByRole('toolbar', { name: 'Text formatting' })).toBeInTheDocument()
+    expect(view.getByRole('button', { name: 'Bold' })).toBeDisabled()
     await user.type(source, '/')
     expect(view.queryByTestId('slash-command-menu')).not.toBeInTheDocument()
     const editedMarkdown = '## Edited\n\n![diagram](/api/assets/00000000-0000-4000-8000-000000000001)\n\n<!-- keep -->'
@@ -480,6 +907,271 @@ describe('React surfaces', () => {
     )
     await user.click(view.getByRole('button', { name: 'Source' }))
     expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveProperty('readOnly', true)
+  })
+
+  it('applies compare-and-swap Source edits without replacing the editor and gives Source its own history', async () => {
+    const user = userEvent.setup()
+    const target = 'akb://team/coll/notes/doc/guide.md'
+    const initial = `Keep this prefix. ${target} and this suffix.\n\n<!-- preserve -->`
+    const replacement = `[Guide](${target})`
+    const onSourceChange = vi.fn()
+    const probe: {
+      editor: ReturnType<typeof useMarkdownEditor>
+      commands: ReturnType<typeof useMarkdownCommands> | null
+      state: ReturnType<typeof useMarkdownState>
+    } = { editor: null, commands: null, state: null }
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const editor = useMarkdownEditor({
+        initialMarkdown: initial,
+        onChange: setMarkdown,
+      })
+      const commands = useMarkdownCommands(editor)
+      const state = useMarkdownState(editor)
+      useEffect(() => {
+        probe.editor = editor
+        probe.commands = commands
+        probe.state = state
+      }, [commands, editor, state])
+
+      return (
+        <MarkdownEditingSurface
+          editor={editor}
+          markdown={markdown}
+          onSourceChange={next => {
+            onSourceChange(next)
+            setMarkdown(next)
+          }}
+          toolbar={<MarkdownToolbar editor={editor} />}
+        >
+          <MarkdownSurface editor={editor} editable />
+        </MarkdownEditingSurface>
+      )
+    }
+
+    render(<ControlledSurface />)
+    await waitFor(() => expect(getMarkdownEditor(probe.editor)?.view).toBeTruthy())
+    const handle = probe.editor
+    const toolbar = screen.getByRole('toolbar', { name: 'Text formatting' })
+
+    await act(async () => {
+      expect(probe.commands?.insertMarkdown(' extra')).toBe(true)
+    })
+    const editor = getMarkdownEditor(handle)!
+    const wysiwygMarkdown = editor.getMarkdown()
+    expect(editor.can().undo()).toBe(true)
+
+    await user.click(screen.getByRole('button', { name: 'Source' }))
+    const source = await screen.findByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    expect(screen.getByRole('toolbar', { name: 'Text formatting' })).toBe(toolbar)
+    expect(screen.getByRole('button', { name: 'Bold' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Insert link' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeDisabled()
+    expect(probe.state?.source.mode).toBe('source')
+    expect(probe.editor).toBe(handle)
+
+    const targetStart = source.value.indexOf(target)
+    source.setSelectionRange(targetStart, targetStart + target.length)
+    fireEvent.select(source)
+    await waitFor(() => expect(probe.state?.source.selection).toMatchObject({
+      start: targetStart,
+      end: targetStart + target.length,
+    }))
+
+    const snapshot = probe.state!.source
+    const from = snapshot.markdown.indexOf(target)
+    expect(from).toBeGreaterThan(0)
+    const request = {
+      revision: snapshot.revision,
+      session: snapshot.session,
+      from,
+      to: from + target.length,
+      expectedText: target,
+      replacementText: replacement,
+    }
+    expect(probe.commands!.applySourceChange({ ...request, from: -1 })).toEqual({
+      applied: false,
+      reason: 'invalid-range',
+    })
+    expect(probe.commands!.applySourceChange({ ...request, replacementText: target })).toEqual({
+      applied: false,
+      reason: 'unchanged',
+    })
+    let result: MarkdownSourceChangeResult | undefined
+    await act(async () => {
+      await Promise.resolve()
+      result = probe.commands!.applySourceChange(request)
+    })
+
+    const updated = snapshot.markdown.slice(0, from) + replacement + snapshot.markdown.slice(from + target.length)
+    expect(result).toEqual({ applied: true, markdown: updated })
+    await waitFor(() => expect(source).toHaveValue(updated))
+    expect(source).toBe(screen.getByRole('textbox', { name: 'Markdown source' }))
+    expect(source.selectionStart).toBe(from)
+    expect(source.selectionEnd).toBe(from + replacement.length)
+    expect(updated).toContain('Keep this prefix.')
+    expect(updated).toContain(`(${target})`)
+    expect(updated).toContain('and this suffix.')
+    expect(updated).toContain('<!-- preserve -->')
+    expect(probe.editor).toBe(handle)
+    expect(probe.state?.source.mode).toBe('source')
+    expect(probe.state?.markdown).toBe(updated)
+    expect(onSourceChange).toHaveBeenLastCalledWith(updated)
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    await user.click(screen.getByRole('button', { name: 'Undo' }))
+    await waitFor(() => expect(source).toHaveValue(snapshot.markdown))
+    expect(probe.state?.canUndo).toBe(false)
+    expect(probe.state?.canRedo).toBe(true)
+    expect(editor.getMarkdown()).toBe(wysiwygMarkdown)
+    expect(editor.can().undo()).toBe(true)
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeDisabled()
+
+    fireEvent.keyDown(source, { key: 'z', ctrlKey: true, shiftKey: true })
+    await waitFor(() => expect(source).toHaveValue(updated))
+    fireEvent.keyDown(source, { key: 'z', ctrlKey: true })
+    await waitFor(() => expect(source).toHaveValue(snapshot.markdown))
+    await user.click(screen.getByRole('button', { name: 'Redo' }))
+    await waitFor(() => expect(source).toHaveValue(updated))
+    expect(editor.getMarkdown()).toBe(wysiwygMarkdown)
+    expect(onSourceChange).toHaveBeenLastCalledWith(updated)
+
+    source.setSelectionRange(0, 0)
+    fireEvent.select(source)
+    await waitFor(() => expect(probe.state?.source.selection).toMatchObject({ start: 0, end: 0 }))
+    const insertionSnapshot = probe.state!.source
+    let insertion: MarkdownSourceChangeResult | undefined
+    await act(async () => {
+      insertion = probe.commands!.applySourceChange({
+        revision: insertionSnapshot.revision,
+        session: insertionSnapshot.session,
+        from: 0,
+        to: 0,
+        expectedText: '',
+        replacementText: 'Intro ',
+      })
+    })
+    expect(insertion).toEqual({ applied: true, markdown: `Intro ${updated}` })
+    await waitFor(() => expect(source).toHaveValue(`Intro ${updated}`))
+    expect(source.selectionStart).toBe(6)
+    expect(source.selectionEnd).toBe(6)
+    await user.click(screen.getByRole('button', { name: 'Undo' }))
+    await waitFor(() => expect(source).toHaveValue(updated))
+  })
+
+  it('rejects deferred Source changes after input, external values, target, composition, readOnly, or mode changes', async () => {
+    const user = userEvent.setup()
+    const target = 'akb://team/coll/notes/doc/guide.md'
+    const initial = `${target}\n\nKeep the authored body.`
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    let activeCommands: ReturnType<typeof useMarkdownCommands> | null = null
+    let activeState: ReturnType<typeof useMarkdownState> = null
+    let setExternalMarkdown: ((value: string) => void) | null = null
+    let setContextKey: ((value: string) => void) | null = null
+    let setReadOnly: ((value: boolean) => void) | null = null
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState(initial)
+      const [contextKey, updateContextKey] = useState('document-a')
+      const [readOnly, updateReadOnly] = useState(false)
+      const editor = useMarkdownEditor({ initialMarkdown: initial, editable: !readOnly, onChange: setMarkdown })
+      const commands = useMarkdownCommands(editor)
+      const state = useMarkdownState(editor)
+      useEffect(() => {
+        activeEditor = editor
+        activeCommands = commands
+        activeState = state
+        setExternalMarkdown = setMarkdown
+        setContextKey = updateContextKey
+        setReadOnly = updateReadOnly
+      }, [commands, editor, readOnly, state])
+
+      return (
+        <MarkdownEditingSurface
+          editor={editor}
+          markdown={markdown}
+          sourceContextKey={contextKey}
+          readOnly={readOnly}
+          onSourceChange={setMarkdown}
+          toolbar={<MarkdownToolbar editor={editor} />}
+        >
+          <MarkdownSurface editor={editor} editable={!readOnly} />
+        </MarkdownEditingSurface>
+      )
+    }
+
+    const ui = render(<ControlledSurface />)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+    await user.click(screen.getByRole('button', { name: 'Source' }))
+    const source = await screen.findByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+
+    const readRequest = () => {
+      const snapshot = activeState!.source
+      const from = snapshot.markdown.indexOf(target)
+      return {
+        revision: snapshot.revision,
+        session: snapshot.session,
+        from,
+        to: from + target.length,
+        expectedText: target,
+        replacementText: `[Guide](${target})`,
+      }
+    }
+
+    const afterType = readRequest()
+    const typedValue = `${source.value} User's newer text`
+    fireEvent.change(source, { target: { value: typedValue } })
+    await waitFor(() => expect(source).toHaveValue(typedValue))
+    expect(activeCommands!.applySourceChange(afterType)).toEqual({ applied: false, reason: 'stale' })
+    expect(source).toHaveValue(typedValue)
+
+    const targetMismatch = readRequest()
+    expect(activeCommands!.applySourceChange({
+      ...targetMismatch,
+      expectedText: 'another target',
+    })).toEqual({ applied: false, reason: 'target-mismatch' })
+
+    const beforeExternalValue = readRequest()
+    act(() => setExternalMarkdown?.(`${initial}\nServer revision`))
+    await waitFor(() => expect(source).toHaveValue(typedValue))
+    expect(activeCommands!.applySourceChange(beforeExternalValue)).toEqual({ applied: false, reason: 'stale' })
+
+    const beforeContextChange = readRequest()
+    const previousSession = activeState!.source.session
+    act(() => setContextKey?.('document-b'))
+    await waitFor(() => expect(activeState!.source.session).toBeGreaterThan(previousSession))
+    expect(activeCommands!.applySourceChange(beforeContextChange)).toEqual({ applied: false, reason: 'stale' })
+
+    const duringComposition = readRequest()
+    fireEvent.compositionStart(source)
+    expect(activeCommands!.undo()).toBe(false)
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeDisabled()
+    expect(activeCommands!.applySourceChange(duringComposition)).toEqual({ applied: false, reason: 'composing' })
+    const composingValue = `${source.value} 한`
+    fireEvent.change(source, { target: { value: composingValue } })
+    fireEvent.compositionEnd(source, { data: '한' })
+    await waitFor(() => expect(source).toHaveValue(composingValue))
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeEnabled()
+
+    const whileEditable = readRequest()
+    act(() => setReadOnly?.(true))
+    await waitFor(() => expect(source).toHaveProperty('readOnly', true))
+    expect(activeCommands!.applySourceChange(whileEditable)).toEqual({ applied: false, reason: 'read-only' })
+    act(() => setReadOnly?.(false))
+    await waitFor(() => expect(source).toHaveProperty('readOnly', false))
+
+    const afterReadOnly = readRequest()
+    const activeSession = activeState!.source.session
+    await user.click(screen.getByRole('button', { name: 'WYSIWYG' }))
+    await waitFor(() => expect(activeState!.source.mode).toBe('wysiwyg'))
+    expect(activeState!.source.session).toBeGreaterThan(activeSession)
+    expect(activeCommands!.applySourceChange(afterReadOnly)).toEqual({ applied: false, reason: 'source-inactive' })
+
+    await user.click(screen.getByRole('button', { name: 'Source' }))
+    const afterReentry = readRequest()
+    ui.unmount()
+    expect(activeCommands!.applySourceChange(afterReentry)).toEqual({ applied: false, reason: 'source-inactive' })
   })
 
   it('applies runtime URLs without changing the canonical image target', async () => {

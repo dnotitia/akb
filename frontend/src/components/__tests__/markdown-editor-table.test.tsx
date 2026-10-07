@@ -62,7 +62,7 @@ describe("MarkdownEditor table interactions", () => {
     expect(within(actions).getByRole("button", { name: "Remove selected column" })).toBeDisabled();
   });
 
-  it("does not delete the table when there is no valid selected cell", async () => {
+  it("does not treat terminal-table normalization as an edit", async () => {
     const onChange = vi.fn();
     render(
       <MarkdownEditor
@@ -73,11 +73,9 @@ describe("MarkdownEditor table interactions", () => {
       />,
     );
 
-    await waitFor(() => expect(onChange).toHaveBeenCalled());
-    const initialChangeCount = onChange.mock.calls.length;
+    await screen.findByRole("table", { name: "Editable table" });
     expect(screen.getByRole("button", { name: "Delete table" })).toBeDisabled();
-    expect(screen.getByRole("table", { name: "Editable table" })).toBeInTheDocument();
-    expect(onChange).toHaveBeenCalledTimes(initialChangeCount);
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("does not expose editing actions in read-only mode", () => {
