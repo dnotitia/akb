@@ -1614,16 +1614,18 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
     services,
     monkeypatch,
 ):
-    """A v4 receipt joins the v3 row instead of replacing it.
+    """Each newer receipt joins the older rows instead of replacing them.
 
-    An image that predates v4 asks only for the profiles it knows, so the v3 row
-    must still be there, unchanged, after the realm-settings upgrade.
+    An image that predates v4 or v5 asks only for the profiles it knows, so the
+    v3 and v4 rows must still be there, unchanged, after each realm-settings
+    upgrade.
     """
     pool, _, _, _, _, _ = services
     from app.services import standalone_sso_receipt as receipt_service
     from app.services.standalone_sso_bootstrap import (
         STANDALONE_SSO_RECEIPT_PROFILE,
         STANDALONE_SSO_RECEIPT_PROFILE_V3,
+        STANDALONE_SSO_RECEIPT_PROFILE_V4,
         StandaloneSSORetirementReceipt,
     )
 
@@ -1645,15 +1647,19 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
     )
     v4 = replace(
         v3,
-        profile=STANDALONE_SSO_RECEIPT_PROFILE,
+        profile=STANDALONE_SSO_RECEIPT_PROFILE_V4,
         bootstrap_client_id="akb-bootstrap-upgrade-v2",
     )
+    v5 = replace(v4, profile=STANDALONE_SSO_RECEIPT_PROFILE)
 
     await receipt_service.record_standalone_sso_retirement_receipt(v3)
     await receipt_service.record_standalone_sso_retirement_receipt(v4)
     await receipt_service.record_standalone_sso_retirement_receipt(v4)
-
     assert await receipt_service.load_standalone_sso_retirement_receipt() == v4
+    await receipt_service.record_standalone_sso_retirement_receipt(v5)
+    await receipt_service.record_standalone_sso_retirement_receipt(v5)
+
+    assert await receipt_service.load_standalone_sso_retirement_receipt() == v5
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT profile, bootstrap_client_id FROM standalone_sso_bootstrap_retirements ORDER BY profile"
@@ -1661,6 +1667,7 @@ async def test_sso_receipt_profiles_are_rows_so_a_rollback_reads_its_own(
     assert [(row["profile"], row["bootstrap_client_id"]) for row in rows] == [
         ("bundled-keycloak-v3", "akb-bootstrap-temporary"),
         ("bundled-keycloak-v4", "akb-bootstrap-upgrade-v2"),
+        ("bundled-keycloak-v5", "akb-bootstrap-upgrade-v2"),
     ]
 
 

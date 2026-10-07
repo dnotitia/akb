@@ -90,6 +90,27 @@ PostgreSQL rather than an embedded H2 file: a second process cannot open H2, and
 faking the creation would leave the real path unexercised while the fixture
 reported it verified.
 
+Right after the provider is configured, the fixture installs the bundled realm's
+brokered-account password guard with the product's own installer, an operator
+token standing in for the one-time upgrade client. That is the path an existing
+installation takes: the provider gains the mapper that grants
+`akb-brokered-account`, and an account linked before the guard is marked without
+having to arrive again. The permanent management account is refused the
+installation and must still read all of it back. Every later phase therefore
+runs on a guarded realm, so each one that signs a realm-local person in — the
+product administrator, the local-realm migrant — doubles as proof that the
+guard refuses no one else.
+
+The guard's own phase is about the person who arrives through the upstream and
+would outlive it. Signed in that way, alice asks for `kc_action=UPDATE_PASSWORD`,
+which Keycloak grants to anyone signed in. The phase then tries that password
+with no upstream involved, at the broker's own form and at `admin-cli`'s
+password grant, and asks AKB whose account the form's token reaches. All three
+must be refused. A realm-local person with a password of their own is the
+control: the same form and the same grant must still let them in, and the form's
+ID token must still carry `amr=pwd` — the guarded browser flow is a copy of
+Keycloak's, and `/admin` accepts only that native-password reference.
+
 Requirements: Docker Compose, OpenSSL, curl, and `uv`. Two host conditions are
 easy to miss because the runner can only report them as "Keycloak never became
 ready": `broker.localhost` and `upstream.localhost` must resolve to `127.0.0.1`

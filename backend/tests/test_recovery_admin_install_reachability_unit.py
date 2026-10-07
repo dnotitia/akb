@@ -173,6 +173,12 @@ class _Control:
     async def realm_events_converged(self, _spec, *, management_token):
         return True
 
+    async def apply_brokered_account_guard(self, _spec, *, token):
+        return None
+
+    async def brokered_account_guard_readback(self, _spec, *, management_token):
+        return None
+
 
 def _readback():
     from app.services.standalone_sso_bootstrap import StandaloneSSOReadback

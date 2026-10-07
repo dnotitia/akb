@@ -9,6 +9,40 @@ specifically; the proxy has its own log in
 
 ### Authentication
 
+- The bundled Keycloak realm's sign-in flows refuse a realm password to an
+  account that arrived through an identity provider. Such an account could
+  set one through Keycloak's `UPDATE_PASSWORD` action (also the account
+  console's "set up password") and then sign in with it, without the
+  upstream, at the realm's own form (the one AKB's `local` provider opens) or
+  at the password grant, and AKB accepted that form's token as theirs. Every
+  identity provider now grants the realm role `akb-brokered-account` on each
+  brokered sign-in, and the realm binds `akb browser` and `akb direct grant`,
+  copies of Keycloak's built-in flows in which a holder of that role is denied
+  after the password step. The guard lives in these realm-bound flows; a
+  client given its own authentication-flow override does not use them.
+  Accounts without an identity-provider link, the product administrator
+  included, sign in as before; creating the password is not blocked, using it
+  is. New installs record a `bundled-keycloak-v5` receipt. Existing installs
+  keep their receipt and converge read-only
+  (`brokered_account_guard=pending_upgrade`); the one-time upgrade client
+  moves a v1–v4 install to v5, adds the mapper to every existing provider,
+  and grants the role to the accounts each provider already links. Moving
+  from v4 leaves the event settings as they are. The upgrade stops before
+  changing anything if the realm binds a browser or direct-grant flow other
+  than Keycloak's built-in one or AKB's copy
+  (`keycloak_authentication_flow_binding_unexpected`). The v5 receipt is a new
+  row, so an older image still reads its v4 receipt after a rollback. The
+  bootstrap report adds `brokered_account_guard`. On v5 the guard is a startup
+  gate: a realm whose bound flows no longer deny the role fails with
+  `keycloak_brokered_account_guard_readback_failed`, and one with an enabled
+  provider that does not grant it fails with
+  `keycloak_identity_provider_guard_mapper_missing`. Upgrade modes are now
+  named `upgrade-vN-to-v5`, and a callback change on a v5 receipt
+  `upgrade-v5-callback`. Configuring or enabling a provider writes the mapper
+  when the realm has the role, and enabling fails closed when it cannot;
+  disabling is unaffected, and realms without the role are left alone. The
+  permanent `akb-sso-manager` gains no authority.
+
 - The bundled Keycloak realm now keeps seven days of user events: login and
   broker outcomes, restarts of an expired login, and credential or broker-link
   changes. New installs record a `bundled-keycloak-v4` receipt with the events

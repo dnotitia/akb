@@ -73,6 +73,9 @@ class KeycloakFixture:
         self.credentials: dict[str, list[dict[str, object]]] = {}
         self.federated_identities: dict[str, list[dict[str, object]]] = {}
         self.requests: list[tuple[str, str]] = []
+        self.roles: set[str] = set()
+        self.mappers: dict[str, list[dict[str, object]]] = {}
+        self.fail_mappers = False
         self.fail_admin = False
         self.drift_readback_after_write = False
         self._drift_readback = False
@@ -151,7 +154,30 @@ class KeycloakFixture:
             if self.drift_readback_after_write:
                 self._drift_readback = True
             return httpx.Response(201)
+        roles = "/auth/admin/realms/akb/roles/"
+        if path.startswith(roles) and request.method == "GET":
+            name = path.removeprefix(roles)
+            if name not in self.roles:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"id": f"{name}-id", "name": name})
         prefix = f"{collection}/"
+        if path.startswith(prefix) and "/mappers" in path:
+            if self.fail_mappers:
+                return httpx.Response(500, text=f"never expose {_SECRET}")
+            alias, _, rest = path.removeprefix(prefix).partition("/mappers")
+            mappers = self.mappers.setdefault(alias, [])
+            if request.method == "GET" and not rest:
+                return httpx.Response(200, json=deepcopy(mappers))
+            if request.method == "POST" and not rest:
+                mapper = json.loads(request.content)
+                mapper["id"] = f"mapper-{len(mappers)}"
+                mappers.append(mapper)
+                return httpx.Response(201)
+            if request.method == "PUT" and rest.startswith("/"):
+                mapper = json.loads(request.content)
+                index = next(i for i, item in enumerate(mappers) if item["id"] == rest[1:])
+                mappers[index] = mapper
+                return httpx.Response(204)
         if path.startswith(prefix):
             alias = path.removeprefix(prefix)
             provider = self.providers.get(alias)
@@ -659,3 +685,118 @@ async def test_identity_prelink_rejects_non_utf8_subject_before_network():
 
     assert captured.value.code == "identity_prelink_subject_invalid"
     assert fixture.requests == []
+
+
+def _marks(fixture: KeycloakFixture, alias: str) -> list[dict[str, object]]:
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_MAPPER_NAME
+
+    return [item for item in fixture.mappers.get(alias, []) if item.get("name") == BROKERED_ACCOUNT_MAPPER_NAME]
+
+
+async def test_configure_writes_no_mapper_where_the_realm_has_no_guard():
+    """A mapper naming a role the realm lacks would fail every brokered login."""
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+
+    assert fixture.mappers == {}
+    assert all("/mappers" not in path for _, path in fixture.requests)
+
+
+async def test_configure_marks_the_accounts_a_provider_brings_where_the_realm_is_guarded():
+    from app.sso.brokered_account_guard import (
+        BROKERED_ACCOUNT_ROLE,
+        identity_provider_mapper,
+    )
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+
+    provider = (await control.configure(_generic_spec())).after
+
+    assert provider.state == "configured_disabled"
+    marks = _marks(fixture, "entra-dn")
+    assert len(marks) == 1
+    assert {key: value for key, value in marks[0].items() if key != "id"} == identity_provider_mapper("entra-dn")
+    assert marks[0]["config"] == {"role": BROKERED_ACCOUNT_ROLE, "syncMode": "FORCE"}
+
+
+@pytest.mark.parametrize("damage", ["removed", "changed"])
+async def test_enabling_restores_the_mark_before_anyone_can_arrive(damage):
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_ROLE
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+    await control.configure(_spec())
+    if damage == "removed":
+        fixture.mappers["workforce"].clear()
+    else:
+        _marks(fixture, "workforce")[0]["config"] = {"role": "default-roles-akb", "syncMode": "IMPORT"}
+    fixture.requests.clear()
+
+    enabled = (await control.set_enabled("workforce", enabled=True)).after
+
+    assert enabled.state == "enabled"
+    marks = _marks(fixture, "workforce")
+    assert len(marks) == 1
+    assert marks[0]["config"] == {"role": BROKERED_ACCOUNT_ROLE, "syncMode": "FORCE"}
+    writes = [(method, path) for method, path in fixture.requests if method in {"POST", "PUT"}]
+    assert writes[-1] == ("PUT", "/auth/admin/realms/akb/identity-provider/instances/workforce")
+    assert any(path.endswith("/mappers") or "/mappers/" in path for _, path in writes[:-1])
+
+
+async def test_disabling_never_depends_on_the_mark():
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_ROLE
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    fixture.fail_mappers = True
+
+    disabled = (await control.set_enabled("workforce", enabled=False)).after
+
+    assert disabled.state == "configured_disabled"
+
+
+async def test_enabling_fails_closed_when_the_mark_cannot_be_written():
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_ROLE
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+    await control.configure(_spec())
+    fixture.fail_mappers = True
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.set_enabled("workforce", enabled=True)
+
+    assert captured.value.code == "keycloak_provider_guard_read_failed"
+    assert fixture.providers["workforce"]["enabled"] is False
+    assert _SECRET not in f"{captured.value!s} {captured.value!r}"
+
+
+async def test_duplicate_marks_are_refused_rather_than_guessed_between():
+    from app.sso.brokered_account_guard import (
+        BROKERED_ACCOUNT_ROLE,
+        identity_provider_mapper,
+    )
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    fixture.mappers["workforce"] = [
+        {**identity_provider_mapper("workforce"), "id": "first"},
+        {**identity_provider_mapper("workforce"), "id": "second"},
+    ]
+    control = _control(fixture)
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.configure(_spec())
+
+    assert captured.value.code == "keycloak_provider_guard_mapper_duplicate"
+
