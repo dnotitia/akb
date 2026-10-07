@@ -1906,6 +1906,297 @@ async def _prove_local_realm_migration(state: dict[str, object]) -> dict[str, ob
     }
 
 
+GUARD_CONTROL_EMAIL = "guard-control@example.com"
+GUARD_CONTROL_USERNAME = "guard-control"
+GUARD_CONTROL_PASSWORD = "fixture-only-guard-control-password"  # pragma: allowlist secret
+
+
+async def _drive_broker_pages(
+    params: dict[str, str],
+    *,
+    username: str,
+    upstream_password: str | None,
+    new_password: str | None,
+) -> dict[str, object]:
+    """Follow one browser flow on the broker, answering only the named pages.
+
+    `upstream_password` answers the upstream credential form and
+    `new_password` answers the broker's own credential form or a
+    credential-change form; any other page ends the flow and is recorded,
+    because the page a person is stopped on is the finding. Returns the page
+    shapes and, when the flow reaches the client, the access token.
+    """
+    verifier, challenge = _pkce()
+    redirect_uri = "https://client.localhost/callback"
+    query = {
+        "client_id": "fixture-browser",
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid profile email",
+        "state": secrets.token_urlsafe(24),
+        "nonce": secrets.token_urlsafe(24),
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        **params,
+    }
+    pages: list[dict[str, object]] = []
+    answered: set[str] = set()
+    code: str | None = None
+    async with httpx.AsyncClient(
+        verify=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(20.0, connect=10.0),
+    ) as client:
+        response = await client.get(
+            f"{BROKER_ISSUER}/protocol/openid-connect/auth",
+            params=query,
+        )
+        for _ in range(30):
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise _fail("fixture_drive_redirect_invalid")
+                target = urljoin(str(response.url), location)
+                if target.startswith(redirect_uri):
+                    values = parse_qs(urlsplit(target).query).get("code", [])
+                    code = values[0] if len(values) == 1 and values[0] else None
+                    break
+                response = await client.get(target)
+                continue
+            page = _page_shape(response)
+            page["status"] = response.status_code
+            pages.append(page)
+            kind = page["kind"]
+            if response.status_code != 200 or kind in answered:
+                break
+            parser = _FormParser()
+            parser.feed(response.text)
+            form = next(
+                (
+                    item
+                    for item in parser.forms
+                    if isinstance(item.get("inputs"), dict)
+                    and (
+                        {"username", "password"} <= set(item["inputs"])
+                        or "password-new" in item["inputs"]
+                    )
+                ),
+                None,
+            )
+            if form is None:
+                break
+            data = {
+                key: value
+                for key, value in form["inputs"].items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            if kind == "upstream-credential-form" and upstream_password is not None:
+                data.update({"username": username, "password": upstream_password})
+            elif kind == "existing-account-reauthentication" and new_password is not None:
+                data.update({"username": username, "password": new_password})
+            elif kind == "forced-credential-change" and new_password is not None:
+                data.update({"password-new": new_password, "password-confirm": new_password})
+            else:
+                break
+            answered.add(kind)
+            action = urljoin(str(response.url), unescape(str(form["action"])))
+            response = await client.post(action, data=data)
+        access_token: str | None = None
+        if code is not None:
+            token_response = await client.post(
+                f"{BROKER_ISSUER}/protocol/openid-connect/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": "fixture-browser",
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                    "code_verifier": verifier,
+                },
+            )
+            if token_response.status_code == 200:
+                value = _require_object(token_response.json(), "fixture_drive_token_invalid").get("access_token")
+                access_token = value if isinstance(value, str) else None
+    return {"pages": pages, "access_token": access_token}
+
+
+async def _password_grant(username: str, password: str) -> tuple[int, str | None]:
+    """Ask the broker's token endpoint for a token with a realm password alone.
+
+    Keycloak creates `admin-cli` in every realm as a public client that accepts
+    the password grant, and an installation that lets clients register
+    themselves lets anyone create another one. So the direct-grant flow is a
+    second door to the same credential, and it has to refuse the same people.
+    The status is returned with the token because "no token" must mean a
+    refusal, not a broken request.
+    """
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        response = await client.post(
+            f"{BROKER_ISSUER}/protocol/openid-connect/token",
+            data={
+                "grant_type": "password",
+                "client_id": "admin-cli",
+                "username": username,
+                "password": password,
+                "scope": "openid",
+            },
+        )
+    if response.status_code != 200:
+        if response.status_code not in {400, 401}:
+            raise _evidence("fixture_password_grant_unexpected_status", {"status": response.status_code})
+        return response.status_code, None
+    value = _require_object(response.json(), "fixture_password_grant_invalid").get("access_token")
+    if not isinstance(value, str) or not value:
+        raise _fail("fixture_password_grant_invalid")
+    return response.status_code, value
+
+
+async def _broker_credential_types(client: httpx.AsyncClient, subject: str) -> list[str]:
+    admin = await _admin_token(client, BROKER)
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/users/{subject}/credentials",
+        headers={"Authorization": f"Bearer {admin}"},
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_broker_credentials_read_failed")
+    return sorted(
+        str(item.get("type"))
+        for item in _require_objects(response.json(), "fixture_broker_credentials_read_failed")
+    )
+
+
+async def _broker_realm_roles(client: httpx.AsyncClient, subject: str) -> list[str]:
+    admin = await _admin_token(client, BROKER)
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/users/{subject}/role-mappings/realm",
+        headers={"Authorization": f"Bearer {admin}"},
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_broker_roles_read_failed")
+    return sorted(
+        str(item.get("name"))
+        for item in _require_objects(response.json(), "fixture_broker_roles_read_failed")
+    )
+
+
+async def _prove_brokered_account_cannot_sign_in_with_a_local_password(
+    state: dict[str, object],
+    *,
+    broker_subject: str,
+) -> dict[str, object]:
+    """A person who arrives through the upstream must not outlive it.
+
+    Disabling someone at the upstream has to end their access here. A
+    broker-realm password would survive that, and Keycloak offers one to anyone
+    signed in: the application-initiated action `kc_action=UPDATE_PASSWORD`,
+    which is also what the account console's "set up password" link starts.
+
+    So, as alice (linked to the upstream, no broker credential): ask for the
+    action through the upstream, then try that password at the broker's own
+    form with no upstream involved, ask AKB whose account that token is, and
+    try the same password at the token endpoint's password grant. The property
+    is that the last three are refused.
+
+    A realm-local person -- no upstream link, a password of their own -- is the
+    control: the same form and the same grant must still let them in, so a
+    refusal above is about alice's link and not about passwords. Whatever
+    happens, the credential this phase may have created and the control person
+    are removed before it returns.
+    """
+    new_password = f"fixture-only-brokered-local-{secrets.token_hex(6)}"  # pragma: allowlist secret
+    evidence: dict[str, object] = {}
+    control_subject: str | None = None
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        if await _broker_credential_types(client, broker_subject):
+            raise _fail("fixture_brokered_account_started_with_a_credential")
+        try:
+            action = await _drive_broker_pages(
+                {"kc_idp_hint": "workforce", "kc_action": "UPDATE_PASSWORD"},
+                username="alice",
+                upstream_password="fixture-only-alice-password",  # pragma: allowlist secret
+                new_password=new_password,
+            )
+            evidence["action_pages"] = [page["kind"] for page in action["pages"]]
+            evidence["credentials_after_action"] = await _broker_credential_types(client, broker_subject)
+            evidence["realm_roles"] = await _broker_realm_roles(client, broker_subject)
+            direct = await _drive_broker_pages(
+                {},
+                username="alice",
+                upstream_password=None,
+                new_password=new_password,
+            )
+            evidence["direct_pages"] = [
+                {"kind": page["kind"], "status": page["status"]} for page in direct["pages"]
+            ]
+            evidence["direct_token_issued"] = direct["access_token"] is not None
+            evidence["akb_account_reached"] = False
+            if isinstance(direct["access_token"], str):
+                keycloak_oidc._service = None  # noqa: SLF001 - disposable process fixture
+                principal = await verify_keycloak_access_v1(direct["access_token"], "api")
+                evidence["identity_provider_claim"] = (
+                    None if principal is None else principal.claims.get("identity_provider")
+                )
+                if principal is not None:
+                    projected = await auth_service.project_verified_principal(
+                        principal,
+                        provider_alias="local",
+                    )
+                    evidence["akb_account_reached"] = (
+                        projected is not None and projected.user_id == str(state["user_id"])
+                    )
+            grant_status, grant_token = await _password_grant("alice", new_password)
+            evidence["password_grant_status"] = grant_status
+            evidence["password_grant_token_issued"] = grant_token is not None
+
+            control_subject = await _create_broker_local_person(
+                client,
+                username=GUARD_CONTROL_USERNAME,
+                email=GUARD_CONTROL_EMAIL,
+                password=GUARD_CONTROL_PASSWORD,
+            )
+            control_browser = await _drive_broker_pages(
+                {},
+                username=GUARD_CONTROL_USERNAME,
+                upstream_password=None,
+                new_password=GUARD_CONTROL_PASSWORD,
+            )
+            control_grant_status, control_grant_token = await _password_grant(
+                GUARD_CONTROL_USERNAME,
+                GUARD_CONTROL_PASSWORD,
+            )
+            evidence["realm_local_control"] = {
+                "browser_token_issued": control_browser["access_token"] is not None,
+                "password_grant_status": control_grant_status,
+                "password_grant_token_issued": control_grant_token is not None,
+            }
+        finally:
+            admin = await _admin_token(client, BROKER)
+            headers = {"Authorization": f"Bearer {admin}"}
+            listing = await client.get(
+                f"{BROKER}/admin/realms/akb/users/{broker_subject}/credentials",
+                headers=headers,
+            )
+            for item in _require_objects(listing.json(), "fixture_broker_credentials_read_failed"):
+                await client.delete(
+                    f"{BROKER}/admin/realms/akb/users/{broker_subject}/credentials/{item['id']}",
+                    headers=headers,
+                )
+            if await _broker_credential_types(client, broker_subject):
+                raise _fail("fixture_brokered_account_credential_cleanup_failed")
+            if control_subject is not None:
+                await _remove_broker_person(client, control_subject)
+    control = evidence["realm_local_control"]
+    assert isinstance(control, dict)
+    if not control["browser_token_issued"] or not control["password_grant_token_issued"]:
+        raise _evidence("fixture_realm_local_password_refused", evidence)
+    if (
+        evidence["direct_token_issued"]
+        or evidence["akb_account_reached"]
+        or evidence["password_grant_token_issued"]
+    ):
+        raise _evidence("fixture_brokered_account_signed_in_with_local_password", evidence)
+    return evidence
+
+
 async def main() -> None:
     control = KeycloakProviderControl(
         KeycloakAdminConfig(
@@ -2043,6 +2334,10 @@ async def main() -> None:
     seeding_dead_end = await _prove_seeding_is_a_dead_end()
     admission = await _prove_admission_chain(state)
     local_realm_migration = await _prove_local_realm_migration(state)
+    brokered_local_password = await _prove_brokered_account_cannot_sign_in_with_a_local_password(
+        state,
+        broker_subject=broker_subject,
+    )
 
     upstream_tokens = await _authorization_code_tokens(
         issuer=UPSTREAM_ISSUER,
@@ -2109,7 +2404,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": 6,
+                "schema_version": 7,
                 "provider_type": enabled.provider_type,
                 "alias": enabled.alias,
                 "configure_state": configured.state,
@@ -2127,6 +2422,7 @@ async def main() -> None:
                 "seeding_dead_end": seeding_dead_end,
                 "admission_chain": admission,
                 "local_realm_migration": local_realm_migration,
+                "brokered_local_password": brokered_local_password,
                 "client_secret_exposed": False,
             },
             sort_keys=True,
