@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { userEvent } from '@testing-library/user-event'
 import { EditorContent } from '@tiptap/react'
 import { MarkdownManager } from '@tiptap/markdown'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -449,6 +449,87 @@ describe('React surfaces', () => {
     await user.click(view.getByRole('button', { name: 'Undo' }))
     await waitFor(() => expect(view.getByRole('textbox', { name: 'Markdown source' })).toHaveValue(initial))
     expect(view.getByRole('button', { name: 'Redo' })).toBeEnabled()
+  })
+
+  it('refreshes Source from a visual task change before the controlled host echoes it', async () => {
+    const user = userEvent.setup()
+    const sourceMarkdown = [
+      '# Keyboard controls',
+      '',
+      '- [ ] TASKPARENTAKB330',
+      '  - [x] TASKNESTEDAKB330',
+      '- [ ] TASKSIBLINGAKB330',
+      '',
+      '```text',
+      'keyboard_code_AKB330',
+      '```',
+    ].join('\n')
+    let activeEditor: ReturnType<typeof useMarkdownEditor> = null
+    const visualChanges: string[] = []
+
+    function ControlledSurface() {
+      const [markdown, setMarkdown] = useState('')
+      const pendingMarkdown = useRef<string | null>(null)
+      const editor = useMarkdownEditor({
+        initialMarkdown: '',
+        onChange: next => {
+          pendingMarkdown.current = next
+          visualChanges.push(next)
+        },
+      })
+      useEffect(() => {
+        activeEditor = editor
+      }, [editor])
+
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              if (pendingMarkdown.current !== null) setMarkdown(pendingMarkdown.current)
+            }}
+          >
+            Deliver visual value
+          </button>
+          <output data-testid="host-markdown">{markdown}</output>
+          <MarkdownEditingSurface
+            editor={editor}
+            markdown={markdown}
+            onSourceChange={setMarkdown}
+            toolbar={<MarkdownToolbar editor={editor} />}
+          >
+            {editor ? <EditorContent editor={getMarkdownEditor(editor)} /> : null}
+          </MarkdownEditingSurface>
+        </>
+      )
+    }
+
+    const { container } = render(<ControlledSurface />)
+    const view = within(container)
+    await waitFor(() => expect(getMarkdownEditor(activeEditor)?.view).toBeTruthy())
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    const source = view.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    fireEvent.change(source, { target: { value: sourceMarkdown } })
+    await waitFor(() => expect(source).toHaveValue(sourceMarkdown))
+
+    await user.click(view.getByRole('button', { name: 'WYSIWYG' }))
+    const parent = view.getByRole('checkbox', {
+      name: 'Task item checkbox for TASKPARENTAKB330',
+    })
+    await user.click(parent)
+    expect(parent).toBeChecked()
+    expect(visualChanges.at(-1)).toContain('[x] TASKPARENTAKB330')
+
+    await user.click(view.getByRole('button', { name: 'Source' }))
+    expect(source.value).toContain('- [x] TASKPARENTAKB330')
+    expect(source.value).toContain('- [x] TASKNESTEDAKB330')
+    expect(source.value).toContain('- [ ] TASKSIBLINGAKB330')
+    expect(source.value).toContain('```text\nkeyboard_code_AKB330\n```')
+
+    await user.click(view.getByRole('button', { name: 'Deliver visual value' }))
+    await waitFor(() => expect(view.getByTestId('host-markdown').textContent).toContain('[x] TASKPARENTAKB330'))
+    expect(source.value).toContain('- [x] TASKPARENTAKB330')
   })
 
   it('edits the same Markdown draft in Source and reflects external values and readOnly', async () => {

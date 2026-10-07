@@ -1708,7 +1708,10 @@ export function MarkdownEditingSurface({
         normalizeEditorBody(editor)
         if (editorHandle) onMarkdownApplied?.(editorHandle)
       }
-      sourceSession.markApplied(editor.getMarkdown())
+      sourceSession.markApplied(
+        serializeEditorMarkdown(editor, { profile }),
+        editor.getMarkdown(),
+      )
       sourceSession.leaveSource()
     }
   }

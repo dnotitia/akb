@@ -96,6 +96,7 @@ export class MarkdownSourceSession {
   private dirty = false
   private lastAppliedSource: string | null = null
   private lastAppliedWysiwygMarkdown: string | null = null
+  private lastAppliedEditorMarkdown: string | null = null
   private lastInputType = ''
   private lastInputAt = 0
   private changeHandler?: SourceChangeHandler
@@ -167,6 +168,7 @@ export class MarkdownSourceSession {
     this.dirty = false
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
+    this.lastAppliedEditorMarkdown = null
     this.changeHandler = undefined
     this.inputElement = null
     this.focusRequested = false
@@ -183,6 +185,7 @@ export class MarkdownSourceSession {
     this.dirty = false
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
+    this.lastAppliedEditorMarkdown = null
     this.revision += 1
     this.session += 1
     this.history.splice(0, this.history.length, { markdown, selection: this.selection })
@@ -200,6 +203,7 @@ export class MarkdownSourceSession {
     this.dirty = false
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
+    this.lastAppliedEditorMarkdown = null
     this.history.splice(0, this.history.length, { markdown: this.markdown, selection: this.selection })
     this.historyIndex = 0
     this.lastInputType = ''
@@ -213,7 +217,8 @@ export class MarkdownSourceSession {
       this.mode === 'wysiwyg' &&
       this.lastAppliedSource !== null &&
       this.lastAppliedSource === this.markdown &&
-      this.lastAppliedWysiwygMarkdown === markdown
+      (this.lastAppliedWysiwygMarkdown === markdown ||
+        this.lastAppliedEditorMarkdown === markdown)
     ) return false
     if (this.mode === 'source' && (this.dirty || this.composing)) {
       this.revision += 1
@@ -228,6 +233,7 @@ export class MarkdownSourceSession {
     this.dirty = false
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
+    this.lastAppliedEditorMarkdown = null
     this.history.splice(0, this.history.length, { markdown, selection: this.selection })
     this.historyIndex = 0
     this.lastInputType = ''
@@ -239,7 +245,10 @@ export class MarkdownSourceSession {
   enterSource(markdown: string): void {
     if (this.mode === 'source') return
     const sourceWasAppliedWithoutWysiwygChanges =
-      !this.dirty && this.lastAppliedSource !== null && this.lastAppliedSource === this.markdown
+      !this.dirty &&
+      this.lastAppliedSource !== null &&
+      this.lastAppliedSource === this.markdown &&
+      this.lastAppliedWysiwygMarkdown === markdown
     if (!sourceWasAppliedWithoutWysiwygChanges && this.markdown !== markdown) {
       this.resetDraft(markdown)
     }
@@ -257,10 +266,11 @@ export class MarkdownSourceSession {
     this.publish()
   }
 
-  markApplied(wysiwygMarkdown: string): void {
+  markApplied(wysiwygMarkdown: string, editorMarkdown: string): void {
     this.dirty = false
     this.lastAppliedSource = this.markdown
     this.lastAppliedWysiwygMarkdown = wysiwygMarkdown
+    this.lastAppliedEditorMarkdown = editorMarkdown
   }
 
   setSelection(selection: MarkdownSourceSelection): void {
@@ -388,6 +398,7 @@ export class MarkdownSourceSession {
     this.dirty = false
     this.lastAppliedSource = null
     this.lastAppliedWysiwygMarkdown = null
+    this.lastAppliedEditorMarkdown = null
     this.history.splice(0, this.history.length, { markdown, selection: this.selection })
     this.historyIndex = 0
     this.lastInputType = ''
