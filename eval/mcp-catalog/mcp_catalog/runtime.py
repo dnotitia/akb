@@ -451,12 +451,17 @@ class RuntimeFixture:
                 response = await self.client.post(url, headers=headers, json=probe.body or {})
         except httpx.HTTPError:
             return StateObservation(False, None, error="state probe request failed")
-        if response.status_code != probe.expected_status:
-            return StateObservation(False, response.status_code, error=f"state probe returned HTTP {response.status_code}")
         try:
             payload = response.json()
         except ValueError:
             return StateObservation(False, response.status_code, error="state probe returned non-JSON content")
+        if response.status_code != probe.expected_status:
+            return StateObservation(
+                False,
+                response.status_code,
+                payload=payload,
+                error=f"state probe returned HTTP {response.status_code}",
+            )
         return StateObservation(True, response.status_code, payload=payload)
 
     @property

@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from mcp_catalog.contracts import StateProbe
+from mcp_catalog.contracts import StateProbe, load_task_corpus
 from mcp_catalog.runtime import RESET_TIMEOUT_SECONDS, RuntimeContractError, RuntimeDescriptor, RuntimeFixture
 
 
@@ -131,8 +131,11 @@ class _MintClient:
 
 
 class _ObserveClient:
+    def __init__(self, status_code: int = 404) -> None:
+        self.status_code = status_code
+
     async def get(self, _url: str, **_kwargs: object) -> _Response:
-        return _Response(404, {"detail": "resource does not exist yet"})
+        return _Response(self.status_code, {"detail": "resource does not exist yet"})
 
     async def aclose(self) -> None:
         return None
@@ -208,6 +211,72 @@ async def test_state_probe_can_treat_expected_absence_as_available_evidence() ->
     assert observation.status_code == 404
     assert observation.payload == {"detail": "resource does not exist yet"}
     await fixture.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 404, 405, 500])
+async def test_unexpected_state_status_keeps_payload_but_remains_unavailable(status_code: int) -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _ObserveClient(status_code)  # type: ignore[assignment]
+
+    observation = await fixture.observe(
+        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=200),
+        token="fixture-token",
+    )
+
+    assert observation.available is False
+    assert observation.status_code == status_code
+    assert observation.payload == {"detail": "resource does not exist yet"}
+    await fixture.close()
+
+
+def test_task_state_probes_use_observed_absence_and_supported_read_paths() -> None:
+    tasks = {task.id: task for task in load_task_corpus(Path(__file__).parents[1] / "corpus" / "tasks.json")}
+
+    for task_id in ("table-publication-ko", "table-publication-en"):
+        observations = tasks[task_id].expected_final_state.observation_sets
+        publications = next(item for item in observations if "/publications/catalog-bench-data" in item.probe.path)
+        assert publications.resolved_before_expected_status == 404
+        assert publications.before_must == []
+        assert publications.probe.expected_status == 200
+        assert [(item.pointer, item.operator, item.value) for item in publications.must] == [
+            ("/publications", "equals", [])
+        ]
+
+    for task_id in ("import-export-ko", "import-export-en"):
+        observations = tasks[task_id].expected_final_state.observation_sets
+        export = next(item for item in observations if "/export?format=okf&as=json" in item.probe.path)
+        assert export.resolved_before_expected_status == 404
+        assert export.probe.expected_status == 200
+        assert [(item.pointer, item.operator) for item in export.must] == [
+            ("/files/notes~1imported.md", "equals")
+        ]
+
+    for task_id in ("collection-relation-lifecycle-ko", "collection-relation-lifecycle-en"):
+        observations = tasks[task_id].expected_final_state.observation_sets
+        browse = next(item for item in observations if item.probe.path.startswith("/api/v1/browse/"))
+        assert browse.probe.path == "/api/v1/browse/catalog-bench-relations?depth=-1"
+        assert len([item for item in observations if item.probe.path == browse.probe.path]) == 1
+        assert ("/items", "contains", {"type": "collection", "path": "notes"}) in [
+            (item.pointer, item.operator, item.value) for item in browse.must
+        ]
+        assert ("/items", "contains", {"type": "document", "path": "notes/left.md"}) in [
+            (item.pointer, item.operator, item.value) for item in browse.must
+        ]
+        assert ("/items", "contains", {"type": "document", "path": "notes/right.md"}) in [
+            (item.pointer, item.operator, item.value) for item in browse.must
+        ]
+        assert not any(item.probe.path == "/api/v1/collections/catalog-bench-relations" for item in observations)
+        assert observations[1].probe.path == "/api/v1/documents/catalog-bench-relations/notes/left.md"
+        assert observations[2].probe.path == "/api/v1/documents/catalog-bench-relations/notes/right.md"
+        relation_binding = observations[-1].probe.result_binding
+        assert relation_binding is not None
+        assert (relation_binding.source_attempt, relation_binding.source_field, relation_binding.transform) == (
+            3,
+            "uri",
+            "uri_query",
+        )
 
 
 def test_descriptor_rejects_revision_mismatch() -> None:

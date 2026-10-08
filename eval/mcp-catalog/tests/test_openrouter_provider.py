@@ -259,6 +259,8 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     }
     assert settings["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
     assert "models" not in settings["extra_body"]
+    assert isinstance(model.provider, OpenAIProvider)
+    assert model.provider.client.max_retries == 0
 
 
 @pytest.mark.asyncio

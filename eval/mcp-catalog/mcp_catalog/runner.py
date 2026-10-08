@@ -1693,7 +1693,9 @@ class BenchmarkRunner:
                     (
                         outcome
                         for outcome in outcomes
-                        if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
+                        if outcome.failure_kind in {"global_deadline", "interrupted", "budget"}
+                        or outcome.unsafe_mutation
+                        or (outcome.provider_evidence and not outcome.routing_valid)
                     ),
                     None,
                 )

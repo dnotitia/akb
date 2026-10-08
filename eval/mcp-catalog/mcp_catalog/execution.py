@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote, unquote, urlsplit
 
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
@@ -2187,7 +2188,10 @@ def build_model(spec: ModelSpec) -> OpenRouterChatModel:
     settings["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
     return OpenRouterChatModel(
         spec.model_id,
-        provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+        provider=OpenAIProvider(
+            # The ledger admits one wire request per model call; SDK retries would bypass that accounting.
+            openai_client=AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        ),
         profile=cast(
             Any,
             {

@@ -138,6 +138,37 @@ def test_trial_checkpoint_is_atomic_redacted_and_reusable(tmp_path: Path) -> Non
     assert resumed.document.spent.model_requests == 1
 
 
+def test_resume_rejects_checkpoint_from_a_prior_task_corpus_seal(tmp_path: Path) -> None:
+    manifest, _tasks, current_header, current_key, current_expected = _inputs()
+    old_hash = hash_json({"prior_task_corpus": current_header.task_corpus_hash})
+    old_header = current_header.model_copy(update={"task_corpus_hash": old_hash})
+    old_key = current_key.model_copy(update={"task_corpus_hash": old_hash})
+    old_expected = {hash_json(old_key.model_dump(mode="json")): old_key}
+    path = tmp_path / "prior-seal.checkpoint.json"
+    smoke_cells = {
+        "primary:http": ("primary", manifest.models[0].model_id, "http"),
+        "primary:stdio": ("primary", manifest.models[0].model_id, "stdio"),
+        "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+        "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+    }
+    old_store = CheckpointStore(
+        path,
+        header=old_header,
+        expected_keys=old_expected,
+        expected_smoke_cells=smoke_cells,
+    )
+    old_store.record_trial(old_key, _outcome(old_key), status="completed")
+
+    with pytest.raises(CheckpointError):
+        CheckpointStore(
+            path,
+            header=current_header,
+            expected_keys=current_expected,
+            expected_smoke_cells=smoke_cells,
+            resume=True,
+        )
+
+
 @pytest.mark.parametrize("record_as_smoke", [False, True])
 @pytest.mark.asyncio
 async def test_checkpoint_restores_terminal_budget_failure(

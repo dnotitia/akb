@@ -696,20 +696,14 @@
                 "method": "GET",
                 "path": "/api/v1/publications/catalog-bench-data?resource_type=table_query"
               },
-              "before_must": [
-                {
-                  "pointer": "/publications",
-                  "operator": "equals",
-                  "value": []
-                }
-              ],
               "must": [
                 {
                   "pointer": "/publications",
                   "operator": "equals",
                   "value": []
                 }
-              ]
+              ],
+              "before_expected_status": 404
             },
             {
               "probe": {
@@ -1091,7 +1085,8 @@
                   "operator": "equals",
                   "value": "---\ntype: note\n---\n# Imported\nportable"
                 }
-              ]
+              ],
+              "before_expected_status": 404
             }
           ]
         }
@@ -3034,15 +3029,32 @@
           "probe": {
             "service": "app",
             "method": "GET",
-            "path": "/api/v1/collections/catalog-bench-relations"
+            "path": "/api/v1/browse/catalog-bench-relations?depth=-1"
           },
           "before_expected_status": 404,
           "must": [
             {
-              "pointer": "/collections",
+              "pointer": "/items",
               "operator": "contains",
               "value": {
+                "type": "collection",
                 "path": "notes"
+              }
+            },
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "type": "document",
+                "path": "notes/left.md"
+              }
+            },
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "type": "document",
+                "path": "notes/right.md"
               }
             }
           ],
@@ -3051,31 +3063,7 @@
               "probe": {
                 "service": "app",
                 "method": "GET",
-                "path": "/api/v1/browse/catalog-bench-relations?depth=-1"
-              },
-              "before_expected_status": 404,
-              "must": [
-                {
-                  "pointer": "/items",
-                  "operator": "contains",
-                  "value": {
-                    "name": "left"
-                  }
-                },
-                {
-                  "pointer": "/items",
-                  "operator": "contains",
-                  "value": {
-                    "name": "right"
-                  }
-                }
-              ]
-            },
-            {
-              "probe": {
-                "service": "app",
-                "method": "GET",
-                "path": "/api/v1/documents/catalog-bench-relations/notes/left"
+                "path": "/api/v1/documents/catalog-bench-relations/notes/left.md"
               },
               "before_expected_status": 404,
               "must": [
@@ -3083,6 +3071,11 @@
                   "pointer": "/content",
                   "operator": "equals",
                   "value": "left"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "exists",
+                  "value": true
                 }
               ]
             },
@@ -3090,7 +3083,7 @@
               "probe": {
                 "service": "app",
                 "method": "GET",
-                "path": "/api/v1/documents/catalog-bench-relations/notes/right"
+                "path": "/api/v1/documents/catalog-bench-relations/notes/right.md"
               },
               "before_expected_status": 404,
               "must": [
@@ -3098,6 +3091,11 @@
                   "pointer": "/content",
                   "operator": "equals",
                   "value": "right"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "exists",
+                  "value": true
                 }
               ]
             },

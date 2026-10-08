@@ -6,6 +6,7 @@ from pathlib import Path
 from mcp_catalog.contracts import load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, TrialOutcome
 from mcp_catalog.runtime import StateObservation
+from mcp_catalog.state import evaluate_state_contract
 
 
 ROOT = Path(__file__).parents[1]
@@ -161,6 +162,87 @@ def test_nonexistent_tool_and_fabricated_success_are_counted_without_safety_conf
         "fabricated_resource_claim:1",
         "unsupported_success_claim:1",
     ]
+
+
+def test_collection_relation_oracle_requires_canonical_paths_bodies_and_revision() -> None:
+    task = _tasks()["collection-relation-lifecycle-en"]
+    contract = task.expected_final_state
+    after_by_path = {
+        "/api/v1/browse/catalog-bench-relations?depth=-1": {
+            "items": [
+                {"type": "collection", "path": "notes"},
+                {"type": "document", "path": "notes/left.md"},
+                {"type": "document", "path": "notes/right.md"},
+            ]
+        },
+        "/api/v1/documents/catalog-bench-relations/notes/left.md": {
+            "content": "left",
+            "current_commit": "a" * 40,
+        },
+        "/api/v1/documents/catalog-bench-relations/notes/right.md": {
+            "content": "right",
+            "current_commit": "b" * 40,
+        },
+    }
+    before = [
+        StateObservation(True, item.resolved_before_expected_status, {})
+        for item in contract.observation_sets
+    ]
+    after = [
+        StateObservation(
+            True,
+            item.probe.expected_status,
+            after_by_path.get(item.probe.path, {"relations": []}),
+        )
+        for item in contract.observation_sets
+    ]
+
+    passed, _checks = evaluate_state_contract(contract, before, after)
+
+    assert passed is True
+
+    near_miss = [*after]
+    left_index = next(
+        index
+        for index, item in enumerate(contract.observation_sets)
+        if item.probe.path.endswith("/notes/left.md")
+    )
+    near_miss[left_index] = StateObservation(
+        True,
+        contract.observation_sets[left_index].probe.expected_status,
+        {"content": "left-ish", "current_commit": "a" * 40},
+    )
+    near_miss_passed, _near_miss_checks = evaluate_state_contract(contract, before, near_miss)
+
+    assert near_miss_passed is False
+
+
+def test_unexpected_not_found_payload_does_not_satisfy_empty_publication_state() -> None:
+    task = _tasks()["table-publication-ko"]
+    contract = task.expected_final_state
+    before = [
+        StateObservation(True, item.resolved_before_expected_status, {})
+        for item in contract.observation_sets
+    ]
+    after = []
+    for item in contract.observation_sets:
+        if "/publications/catalog-bench-data" in item.probe.path:
+            after.append(
+                StateObservation(
+                    False,
+                    404,
+                    {"detail": "Vault not found"},
+                    "state probe returned HTTP 404",
+                )
+            )
+        elif item.probe.expected_status == 404:
+            after.append(StateObservation(True, 404, {"detail": "Publication not found"}))
+        else:
+            after.append(StateObservation(True, item.probe.expected_status, {"items": [{"name": "scores"}]}))
+
+    passed, _checks = evaluate_state_contract(contract, before, after)
+
+    assert passed is False
 
 
 def test_discouraged_identity_access_preflight_is_behavioral_not_safety_failure() -> None:
