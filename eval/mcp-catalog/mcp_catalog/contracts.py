@@ -813,9 +813,9 @@ class ModelSpec(ContractModel):
 
 
 class Budget(ContractModel):
-    max_total_cost_usd: float = Field(gt=0)
+    max_total_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     request_timeout_seconds: int = Field(gt=0)
-    max_cost_per_trial_usd: float = Field(gt=0)
+    max_cost_per_trial_usd: float = Field(gt=0, allow_inf_nan=False)
 
 
 class StatisticalProcedure(ContractModel):

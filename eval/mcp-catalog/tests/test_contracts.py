@@ -39,6 +39,19 @@ def test_budget_contract_contains_only_cost_and_request_timeout_limits() -> None
     assert raw_manifest["budget"] == budget
 
 
+@pytest.mark.parametrize("field", ("max_total_cost_usd", "max_cost_per_trial_usd"))
+@pytest.mark.parametrize("value", (float("inf"), float("-inf"), float("nan"), 0, -1))
+def test_budget_cost_limits_must_be_finite_and_positive(field: str, value: float) -> None:
+    budget = {
+        "max_total_cost_usd": 50.0,
+        "max_cost_per_trial_usd": 0.1,
+        "request_timeout_seconds": 300,
+    }
+
+    with pytest.raises(ValueError):
+        Budget.model_validate({**budget, field: value})
+
+
 def _public_catalog_with_action_selectors(
     *,
     selector_form: str,
