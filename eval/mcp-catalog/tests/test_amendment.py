@@ -51,7 +51,7 @@ def _cell_evidence(lease: str, cell: str) -> dict[str, Any]:
     return {
         "source_revision": SOURCE_REVISION,
         **ARTIFACT_VERSIONS,
-        "credential_env": {"username": "AKB_E2E_USERNAME", "password": "AKB_E2E_PASSWORD"},
+        "credential_env": {"username": "AKB_E2E_USERNAME", "password": "AKB_E2E_PASSWORD"},  # pragma: allowlist secret
         "dependency_identity": _dependency_identity(lease, cell),
         "fixture": {"scenario": "empty", "namespace": f"fixture-{lease}-{cell}"},
         "process_identity": _process_identity(lease, cell),
@@ -89,7 +89,7 @@ def _cell_descriptor(lease: str, cell: str) -> dict[str, Any]:
         },
         "credentials": {
             "username_env": "AKB_E2E_USERNAME",
-            "password_env": "AKB_E2E_PASSWORD",
+            "password_env": "AKB_E2E_PASSWORD",  # pragma: allowlist secret
             "pat_env": "AKB_E2E_PAT",
         },
         "profile": "transport-proxy",
@@ -268,7 +268,7 @@ def test_fresh_runtime_lease_provenance_is_recomputable() -> None:
         lambda inputs: inputs["paired_order_plan"][0].update(arm_order=["candidate", "baseline"]),
         lambda inputs: inputs["fixture"]["runtime_descriptor"].update(capabilities=["stdio", "oidc"]),
         lambda inputs: inputs["fixture"]["runtime_descriptor"]["credentials"].update(
-            password_env="CHANGED_PASSWORD_ENV"
+            password_env="CHANGED_PASSWORD_ENV"  # pragma: allowlist secret
         ),
         lambda inputs: inputs["fixture"]["runtime_descriptor"]["evidence"].update(
             arbitrary_runtime_id="changed"

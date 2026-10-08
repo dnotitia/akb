@@ -36,22 +36,22 @@ from .runtime import RuntimeDescriptor
 
 
 WORK_ITEM = "AKB-361"
-AUTHORIZATION_REVISION = "20a37d0a18ae33a22f035d388a16988ca65115e5"
-AUTHORIZATION_CONTENT_HASH = "df9afde7401506b7e12ea1878b3f7a0e04d197e750d9e02b18251db430bbebb9"
-SOURCE_MANIFEST_HASH = "b1a805335aa83335d7e4b44cb1305b272348fc7f3aa8b7ae9342f67eaa42ec25"
-SOURCE_TASK_CORPUS_HASH = "51028d1a27632af0ed524dc0f156780ebfecf0df4e0e24012fe4cf6e0e3ace62"
-SOURCE_PRE_SMOKE_SEAL_HASH = "9f72c9d9f24325ef3965cc8852fbbcb205e7c87298d62d63c2b6202c338388e1"
+AUTHORIZATION_REVISION = "20a37d0a18ae33a22f035d388a16988ca65115e5"  # pragma: allowlist secret
+AUTHORIZATION_CONTENT_HASH = "df9afde7401506b7e12ea1878b3f7a0e04d197e750d9e02b18251db430bbebb9"  # pragma: allowlist secret
+SOURCE_MANIFEST_HASH = "b1a805335aa83335d7e4b44cb1305b272348fc7f3aa8b7ae9342f67eaa42ec25"  # pragma: allowlist secret
+SOURCE_TASK_CORPUS_HASH = "51028d1a27632af0ed524dc0f156780ebfecf0df4e0e24012fe4cf6e0e3ace62"  # pragma: allowlist secret
+SOURCE_PRE_SMOKE_SEAL_HASH = "9f72c9d9f24325ef3965cc8852fbbcb205e7c87298d62d63c2b6202c338388e1"  # pragma: allowlist secret
 SOURCE_ARTIFACT_SHA256 = {
-    "baseline": "59d9b823f5a2247311ec286700a85d6dce20240f04b9012f7a3da8be18107900",
-    "candidate": "5a376f45ccab370b73d9f31c3fddee0e338f2683c35769166b20495e1928f435",
+    "baseline": "59d9b823f5a2247311ec286700a85d6dce20240f04b9012f7a3da8be18107900",  # pragma: allowlist secret
+    "candidate": "5a376f45ccab370b73d9f31c3fddee0e338f2683c35769166b20495e1928f435",  # pragma: allowlist secret
 }
 SOURCE_CHECKPOINT_SHA256 = {
-    "baseline": "0fba860846d1d9bf36abd14f360075e18ba31a160cf39f189550d570142f56ca",
-    "candidate": "bb08b84d6dcc3dc8a43ba8f40103dbc790411842d369ad4605a59fb1cfcd7a9c",
+    "baseline": "0fba860846d1d9bf36abd14f360075e18ba31a160cf39f189550d570142f56ca",  # pragma: allowlist secret
+    "candidate": "bb08b84d6dcc3dc8a43ba8f40103dbc790411842d369ad4605a59fb1cfcd7a9c",  # pragma: allowlist secret
 }
 SOURCE_REVISIONS = {
-    "baseline": "9daf7b44f9387776f845f181d29f1a7c8d21b37a",
-    "candidate": "8d74114042b7d94a02c6b0f7aa27a6ab749e1874",
+    "baseline": "9daf7b44f9387776f845f181d29f1a7c8d21b37a",  # pragma: allowlist secret
+    "candidate": "8d74114042b7d94a02c6b0f7aa27a6ab749e1874",  # pragma: allowlist secret
 }
 SOURCE_PAIRED_EVENT_COUNT = 595
 SOURCE_TERMINAL_COUNTS = {"baseline": 298, "candidate": 297}
