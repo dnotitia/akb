@@ -70,6 +70,27 @@ from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
 
 
+_OPENROUTER_CANONICAL_IDENTITIES = {
+    ("deepseek/deepseek-v4-flash-0731", "20260731"): "deepseek/deepseek-v4-flash-20260731",
+    ("qwen/qwen3.8-27b", "20260814"): "qwen/qwen3.8-27b-20260814",
+}
+
+
+def _expected_openrouter_canonical_slug(spec: ModelSpec) -> str:
+    canonical_slug = _OPENROUTER_CANONICAL_IDENTITIES.get((spec.model_id, spec.version))
+    if canonical_slug is None:
+        raise ValueError(f"provider model alias/version is not pinned for {spec.class_name}")
+    return canonical_slug
+
+
+def _validate_openrouter_model_identity(spec: ModelSpec, model_record: dict[str, Any]) -> None:
+    if model_record.get("id") != spec.model_id:
+        raise ValueError(f"provider model alias drifted for {spec.class_name}")
+    canonical_slug = model_record.get("canonical_slug")
+    if canonical_slug != _expected_openrouter_canonical_slug(spec):
+        raise ValueError(f"provider model canonical identity drifted for {spec.class_name}")
+
+
 class NeedsUserInput(RuntimeError):
     """The run needs a user-provided provider, credential, or cost decision."""
 
@@ -1381,12 +1402,13 @@ class BenchmarkRunner:
                                 stage="provider_registry",
                             )
                         row = matches[0]
-                        canonical_slug = row.get("canonical_slug", row.get("id"))
-                        if canonical_slug != spec.model_id:
+                        try:
+                            _validate_openrouter_model_identity(spec, row)
+                        except ValueError as exc:
                             raise RuntimeContractError(
-                                f"provider model alias drifted for {spec.class_name}",
+                                str(exc),
                                 stage="provider_registry",
-                            )
+                            ) from exc
                         author, slug = spec.model_id.split("/", 1)
                         endpoints_response = await get_json(
                             f"{base_url}/models/{author}/{slug}/endpoints"
@@ -2285,6 +2307,48 @@ def _validate_trial_evidence(
             raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
 
 
+def _validate_provider_registry_identity(
+    registry: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+    *,
+    arm: str,
+) -> None:
+    model_list_snapshot = registry.get("model_list_snapshot")
+    model_rows = model_list_snapshot.get("data") if isinstance(model_list_snapshot, dict) else None
+    if (
+        not isinstance(model_rows, list)
+        or registry.get("model_list_hash") != hash_json(model_list_snapshot)
+    ):
+        raise ValueError(f"{arm} provider model-list snapshot is missing or invalid")
+
+    registered_models = registry.get("models")
+    expected_aliases = {spec.model_id for spec in manifest.models}
+    if not isinstance(registered_models, dict) or set(registered_models) != expected_aliases:
+        raise ValueError(f"{arm} provider registry does not cover the pinned model aliases")
+
+    for spec in manifest.models:
+        matches = [
+            row
+            for row in model_rows
+            if isinstance(row, dict) and row.get("id") == spec.model_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{arm} provider registry does not contain exactly one pinned alias for {spec.class_name}")
+        model_record = matches[0]
+        try:
+            _validate_openrouter_model_identity(spec, model_record)
+        except ValueError as exc:
+            raise ValueError(f"{arm} provider registry identity is invalid: {exc}") from exc
+
+        captured_model = registered_models[spec.model_id]
+        if (
+            not isinstance(captured_model, dict)
+            or captured_model.get("manifest_version") != spec.version
+            or captured_model.get("model_record") != model_record
+        ):
+            raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
+
+
 def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
     key = f"{transport}:{profile}"
     raw = artifact.get("catalogs", {}).get(key)
@@ -2347,15 +2411,18 @@ def _validate_preregistered_inputs(
         raise ValueError(f"{arm} provider registry snapshot is unavailable")
     registry_hash = registry.get("snapshot_hash")
     registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+    registry_models = registry.get("models")
     expected_models = {model.model_id for model in manifest.models}
     if (
         not isinstance(registry_hash, str)
         or hash_json(registry_payload) != registry_hash
-        or set(registry.get("models", {})) != expected_models
+        or not isinstance(registry_models, dict)
+        or set(registry_models) != expected_models
         or inputs.get("provider_registry_hash") != registry_hash
         or inputs.get("provider_registry_status") != registry.get("status")
     ):
         raise ValueError(f"{arm} provider registry seal does not match the captured registry")
+    _validate_provider_registry_identity(registry, manifest, arm=arm)
 
     fixture_inputs = inputs.get("fixture")
     fixture = artifact.get("fixture")

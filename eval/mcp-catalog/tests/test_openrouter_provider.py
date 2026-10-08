@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from openai.types.chat import ChatCompletion
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
@@ -15,6 +16,7 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 import mcp_catalog.execution as execution_module
+import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import OPENROUTER_BASE_URL, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import (
     BudgetExceeded,
@@ -40,13 +42,116 @@ from mcp_catalog.execution import (
     run_agent_with_deadline,
 )
 from mcp_catalog.checkpoint import valid_completed_outcome
-from mcp_catalog.runtime import StateObservation
+from mcp_catalog.runner import BenchmarkRunner
+from mcp_catalog.runtime import RuntimeDescriptor, StateObservation
+from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+_MODEL_REGISTRY_FIXTURE = [
+    {
+        "id": "deepseek/deepseek-v4-flash-0731",
+        "canonical_slug": "deepseek/deepseek-v4-flash-20260731",
+    },
+    {
+        "id": "qwen/qwen3.8-27b",
+        "canonical_slug": "qwen/qwen3.8-27b-20260814",
+    },
+]
 
 
 def _model_spec():
     return load_run_manifest(ROOT / "config" / "run.json").models[0]
+
+
+async def _capture_registry_with_httpx(
+    monkeypatch: pytest.MonkeyPatch,
+    model_rows: list[dict[str, str]],
+) -> tuple[dict[str, object], list[str]]:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    for spec in manifest.models:
+        monkeypatch.setenv(spec.base_url_env, OPENROUTER_BASE_URL)
+        monkeypatch.setenv(spec.provider_key_env, "fixture-provider-key")
+
+    requested_urls: list[str] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": model_rows})
+        if request.url.path.startswith("/api/v1/models/") and request.url.path.endswith("/endpoints"):
+            return httpx.Response(
+                200,
+                json={"data": {"endpoints": [{"provider_name": "Parasail", "quantization": "fp8"}]}},
+            )
+        return httpx.Response(404, json={"error": {"message": "unexpected registry request"}})
+
+    transport = httpx.MockTransport(handle_request)
+    original_async_client = httpx.AsyncClient
+
+    def mock_async_client(*, timeout: float, follow_redirects: bool) -> httpx.AsyncClient:
+        return original_async_client(transport=transport, timeout=timeout, follow_redirects=follow_redirects)
+
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", mock_async_client)
+    runner = BenchmarkRunner(
+        manifest,
+        [],
+        RuntimeDescriptor.from_dict(descriptor_dict()),
+    )
+    registry = await runner._capture_provider_registry(BudgetLedger(manifest))
+    return registry, requested_urls
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_accepts_pinned_aliases_and_canonical_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, requested_urls = await _capture_registry_with_httpx(monkeypatch, _MODEL_REGISTRY_FIXTURE)
+
+    assert registry["status"] == "verified"
+    assert [
+        (record["model_record"]["id"], record["model_record"]["canonical_slug"])
+        for record in registry["models"].values()
+    ] == [
+        ("deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-20260731"),
+        ("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-20260814"),
+    ]
+    assert set(requested_urls) == {
+        f"{OPENROUTER_BASE_URL}/models",
+        f"{OPENROUTER_BASE_URL}/models/deepseek/deepseek-v4-flash-0731/endpoints",
+        f"{OPENROUTER_BASE_URL}/models/qwen/qwen3.8-27b/endpoints",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_canonical", "canonical identity"),
+        ("wrong_version", "canonical identity"),
+        ("alias_as_canonical", "canonical identity"),
+        ("different_alias", "exactly one pinned model"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_registry_rejects_missing_or_drifted_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    model_rows = [dict(row) for row in _MODEL_REGISTRY_FIXTURE]
+    primary = model_rows[0]
+    if mutation == "missing_canonical":
+        primary.pop("canonical_slug")
+    elif mutation == "wrong_version":
+        primary["canonical_slug"] = "deepseek/deepseek-v4-flash-20260831"
+    elif mutation == "alias_as_canonical":
+        primary["canonical_slug"] = "deepseek/deepseek-v4-flash-0731"
+    else:
+        primary["id"] = "deepseek/deepseek-v4-flash-20260731"
+
+    registry, _ = await _capture_registry_with_httpx(monkeypatch, model_rows)
+
+    assert registry["status"] == "unavailable"
+    assert expected_reason in registry["reason"]
 
 
 class _NeverReturningAgent:

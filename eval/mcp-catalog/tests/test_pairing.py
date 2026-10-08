@@ -21,6 +21,26 @@ def _seal(artifact: dict) -> None:
     artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
 
 
+def _reseal_provider_registry_pair(baseline: dict, candidate: dict) -> None:
+    artifacts = {"baseline": baseline, "candidate": candidate}
+    for artifact in artifacts.values():
+        registry = artifact["provider_registry"]
+        registry["model_list_hash"] = hash_json(registry["model_list_snapshot"])
+        registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+        registry["snapshot_hash"] = hash_json(registry_payload)
+        artifact["pre_smoke_seal_inputs"]["provider_registry_hash"] = registry["snapshot_hash"]
+
+    seal_hash = hash_json(
+        {
+            arm: hash_json(artifact["pre_smoke_seal_inputs"])
+            for arm, artifact in artifacts.items()
+        }
+    )
+    for artifact in artifacts.values():
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _seal(artifact)
+
+
 def test_preregistered_arm_order_is_counterbalanced_across_repeats() -> None:
     first = planned_arm_order("read-vaults-en", 1, "akb-358-v1")
     second = planned_arm_order("read-vaults-en", 2, "akb-358-v1")
@@ -154,6 +174,22 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "provider_registry" in result["gate"]["reasons"][0]
+
+
+def test_resealed_provider_canonical_identity_drift_is_not_admitted() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    model_id = "deepseek/deepseek-v4-flash-0731"
+
+    for artifact in (baseline, candidate):
+        model_row = artifact["provider_registry"]["model_list_snapshot"]["data"][0]
+        model_row["canonical_slug"] = "deepseek/deepseek-v4-flash-20260831"
+        artifact["provider_registry"]["models"][model_id]["model_record"] = deepcopy(model_row)
+    _reseal_provider_registry_pair(baseline, candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "canonical identity" in result["gate"]["reasons"][0]
 
 
 def test_missing_state_or_raw_call_evidence_is_rejected_after_resealing() -> None:

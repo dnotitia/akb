@@ -13,7 +13,11 @@ from mcp_catalog.contracts import (
     token_estimate,
 )
 from mcp_catalog.execution import ToolCallRecord, TrialOutcome
-from mcp_catalog.runner import _build_artifact_hash_input, planned_arm_order
+from mcp_catalog.runner import (
+    _build_artifact_hash_input,
+    _expected_openrouter_canonical_slug,
+    planned_arm_order,
+)
 from mcp_catalog.runtime import StateObservation
 
 ROOT = Path(__file__).parents[1]
@@ -35,14 +39,22 @@ EXECUTION_ENVIRONMENT = {
 
 def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
     manifest_model = manifest or load_run_manifest(ROOT / "config" / "run.json")
+    model_rows = [
+        {"id": model.model_id, "canonical_slug": _expected_openrouter_canonical_slug(model)}
+        for model in manifest_model.models
+    ]
+    model_list_snapshot = {"data": model_rows}
     payload = {
         "status": "verified",
+        "model_list_snapshot": model_list_snapshot,
+        "model_list_hash": hash_json(model_list_snapshot),
         "models": {
             model.model_id: {
                 "manifest_version": model.version,
+                "model_record": model_row,
                 "selected_endpoint": {"provider_name": "Parasail", "quantization": "fp8"},
             }
-            for model in manifest_model.models
+            for model, model_row in zip(manifest_model.models, model_rows, strict=True)
         },
     }
     return {**payload, "snapshot_hash": hash_json(payload)}
