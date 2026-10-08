@@ -140,7 +140,12 @@ def _exact_calls() -> list[ToolCallRecord]:
     ]
 
 
-def _score(task, calls: list[ToolCallRecord]) -> TrialOutcome:
+def _score(
+    task,
+    calls: list[ToolCallRecord],
+    *,
+    before: StateObservation | None = None,
+) -> TrialOutcome:
     outcome = TrialOutcome(
         task_id=task.id,
         category=task.category,
@@ -153,7 +158,11 @@ def _score(task, calls: list[ToolCallRecord]) -> TrialOutcome:
         first_logical_operation=calls[0].logical_operation if calls else "none",
         tool_calls=calls,
     )
-    before = StateObservation(True, 200, {"items": []})
+    before = before or StateObservation(
+        True,
+        task.expected_final_state.resolved_before_expected_status,
+        {"code": "not_found", "detail": f"Vault not found: {VAULT}"},
+    )
     after = StateObservation(True, 200, {"items": [{"name": "quick-update.md"}]})
     outcome.finalize(task, before, after)
     return outcome
@@ -196,6 +205,17 @@ def test_exact_outcome_and_cross_call_dataflow_complete_the_multistep_task() -> 
     assert outcome.result_binding_accuracy is True
     assert outcome.user_outcome_completed is True
     assert outcome.success is True
+
+
+def test_wrong_before_status_prevents_multistep_task_success() -> None:
+    _manifest, tasks = _multistep_tasks()
+    task = tasks[0]
+    outcome = _score(task, _exact_calls(), before=StateObservation(True, 200, {"items": []}))
+
+    assert task.expected_final_state.resolved_before_expected_status == 404
+    assert outcome.state_contract_passed is False
+    assert outcome.user_outcome_completed is False
+    assert outcome.success is False
 
 
 @pytest.mark.parametrize(
