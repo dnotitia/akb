@@ -75,24 +75,16 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
 
 
-class ProviderRequestTimeout(TimeoutError):
-    """A single provider request exceeded its registered timeout."""
-
-
-class GlobalWallDeadlineExceeded(TimeoutError):
-    """The run's monotonic wall deadline expired while work was in flight."""
-
-
 FailureKind = Literal[
     "none",
     "provider",
     "output_limit",
-    "request_limit",
     "terminal_response",
     "tool",
     "budget",
     "request_timeout",
-    "global_deadline",
+    # Retained only to parse the hash-pinned AKB-361 source outcomes; classifiers never emit it.
+    "request_limit",
     "interrupted",
     "unknown",
 ]
@@ -104,8 +96,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
     lowered = error.casefold()
     if "provider request timeout" in lowered:
         return "request_timeout"
-    if "global wall deadline" in lowered:
-        return "global_deadline"
     if "benchmark interrupted" in lowered:
         return "interrupted"
     if any(
@@ -127,11 +117,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in ("429", "rate limit", "modelhttperror", "ratelimiterror", "provider usage/cost")
     ):
         return "provider"
-    if any(
-        marker in lowered
-        for marker in ("request_limit", "request limit", "maximum number of requests", "too many requests per trial")
-    ):
-        return "request_limit"
     if any(marker in lowered for marker in ("terminal response", "final response", "no final", "empty response")):
         return "terminal_response"
     if any(marker in lowered for marker in ("unknown tool", "toolfailed", "tool error", "modelretry", "mcp tool")):
@@ -141,8 +126,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in (
             "max_cost",
             "cost_limit",
-            "max_model_requests",
-            "max_wall",
             "benchmark incomplete",
         )
     ):
@@ -795,7 +778,7 @@ def has_measured_evidence(outcome: TrialOutcome) -> bool:
         return True
     if outcome.expected_error_match:
         return True
-    if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
+    if outcome.failure_kind not in {"output_limit", "terminal_response", "tool"}:
         return False
     return True
 
@@ -1443,6 +1426,22 @@ class BudgetLedger:
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _restored_wall_offset: float = field(default=0.0, repr=False)
+    total_cost_limit_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        registered_limit = Decimal(str(self.manifest.budget.max_total_cost_usd))
+        if self.total_cost_limit_usd is None:
+            self.total_cost_limit_usd = registered_limit
+            return
+        self.total_cost_limit_usd = Decimal(str(self.total_cost_limit_usd))
+        if not self.total_cost_limit_usd.is_finite() or self.total_cost_limit_usd <= 0:
+            raise ValueError("total cost limit must be a positive finite amount")
+        if self.total_cost_limit_usd > registered_limit:
+            raise ValueError("total cost limit cannot exceed the registered manifest cap")
+
+    def _cost_limit(self) -> Decimal:
+        assert self.total_cost_limit_usd is not None
+        return self.total_cost_limit_usd
 
     @property
     def reserved_cost_usd(self) -> Decimal:
@@ -1469,12 +1468,7 @@ class BudgetLedger:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if self._open_reservations:
             raise BudgetExceeded("cannot restore budget accounting while reservations are open")
-        budget = self.manifest.budget
-        if (
-            model_requests > budget.max_model_requests
-            or restored_cost > Decimal(str(budget.max_total_cost_usd))
-            or wall_seconds > budget.max_wall_seconds
-        ):
+        if restored_cost > self._cost_limit():
             raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
         self.requests = model_requests
         self.provider_setup_requests = provider_setup_requests
@@ -1508,17 +1502,11 @@ class BudgetLedger:
         async with self._lock:
             if self._open_reservations:
                 raise BudgetExceeded("cannot restore paired budget while reservations are open")
-            next_requests = self.requests + model_requests
             next_cost = self.cost_usd + restored_cost
             next_wall = max(self.wall_seconds, wall_seconds)
-            budget = self.manifest.budget
-            if (
-                next_requests > budget.max_model_requests
-                or next_cost > Decimal(str(budget.max_total_cost_usd))
-                or next_wall > budget.max_wall_seconds
-            ):
+            if next_cost > self._cost_limit():
                 raise BudgetExceeded("paired checkpoint totals already exceed the registered run limits")
-            self.requests = next_requests
+            self.requests += model_requests
             self.provider_setup_requests += provider_setup_requests
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -1530,12 +1518,9 @@ class BudgetLedger:
             self._assert_reservation_invariant()
 
     async def record_provider_setup_request(self) -> None:
-        """Count a non-completion provider lookup against the paired request cap."""
+        """Record a non-completion provider lookup for artifact reporting."""
 
         async with self._lock:
-            if self.requests >= self.manifest.budget.max_model_requests:
-                self._budget_failure = "max_model_requests exceeded"
-                raise BudgetExceeded("max_model_requests exceeded")
             self.requests += 1
             self.provider_setup_requests += 1
 
@@ -1553,14 +1538,8 @@ class BudgetLedger:
         self.wall_seconds = self.current_wall_seconds()
         return self.wall_seconds
 
-    def remaining_wall_seconds(self) -> float:
-        return max(0.0, self.manifest.budget.max_wall_seconds - self.current_wall_seconds())
-
     def request_timeout_seconds(self) -> float:
-        remaining = self.remaining_wall_seconds()
-        if remaining <= 0:
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-        return min(float(self.manifest.budget.request_timeout_seconds), remaining)
+        return float(self.manifest.budget.request_timeout_seconds)
 
     def _assert_reservation_invariant(self) -> None:
         if any(
@@ -1595,14 +1574,9 @@ class BudgetLedger:
         if not reservation.is_finite() or reservation < 0:
             raise BudgetExceeded("preregistered worst-case trial cost cannot be negative")
         async with self._lock:
-            budget = self.manifest.budget
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"{self._budget_failure}; no further provider requests are allowed")
-            if self.requests >= budget.max_model_requests:
-                raise BudgetExceeded("max_model_requests exceeded")
-            if self.current_wall_seconds() >= budget.max_wall_seconds:
-                raise BudgetExceeded("max_wall_seconds exceeded")
-            if self.cost_usd + self.reserved_cost_usd + reservation > Decimal(str(budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd + reservation > self._cost_limit():
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
             guard = ProviderRequestGuard(self, reservation)
             self._open_reservations.add(guard)
@@ -1622,16 +1596,11 @@ class BudgetLedger:
                 raise BudgetExceeded("provider request reservation is not open")
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
-            if guard.requests >= self.manifest.budget.max_requests_per_trial:
-                raise BudgetExceeded("benchmark incomplete: max_requests_per_trial exceeded")
             if (
                 guard.reserved_cost_usd <= 0
                 or guard.provider_cost_usd >= Decimal(str(self.manifest.budget.max_cost_per_trial_usd))
             ):
                 raise BudgetExceeded("benchmark incomplete: max_cost_per_trial_usd exceeded")
-            if self.requests >= self.manifest.budget.max_model_requests:
-                self._budget_failure = "max_model_requests exceeded"
-                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
             request_id = guard._next_request_id
             guard._next_request_id += 1
             guard._pending_requests.add(request_id)
@@ -1667,7 +1636,7 @@ class BudgetLedger:
 
             global_failure: str | None = None
             trial_failure: str | None = None
-            if self.cost_usd + self.reserved_cost_usd > Decimal(str(self.manifest.budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd > self._cost_limit():
                 self._budget_failure = "max_total_cost_usd exceeded"
                 global_failure = self._budget_failure
             if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
@@ -1694,7 +1663,6 @@ class BudgetLedger:
             if guard.requests > self.requests:
                 raise BudgetExceeded("provider request accounting is inconsistent")
 
-            trial_requests = max(outcome.model_requests, guard.requests)
             next_requests = self.requests + max(0, outcome.model_requests - guard.requests)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
@@ -1714,17 +1682,13 @@ class BudgetLedger:
             budget = self.manifest.budget
             trial_failure: str | None = None
             global_failure: str | None = None
-            if trial_requests > budget.max_requests_per_trial:
-                trial_failure = "max_requests_per_trial exceeded"
-            elif guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
+            if guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
                 trial_failure = "max_cost_per_trial_usd exceeded"
-            elif next_requests > budget.max_model_requests:
-                global_failure = "max_model_requests exceeded"
             remaining_reserved = sum(
                 (owner.reserved_cost_usd for owner in self._open_reservations if owner is not guard),
                 Decimal("0"),
             )
-            if next_cost + remaining_reserved > Decimal(str(budget.max_total_cost_usd)):
+            if next_cost + remaining_reserved > self._cost_limit():
                 global_failure = "max_total_cost_usd exceeded"
 
             self.requests = next_requests
@@ -1780,7 +1744,7 @@ class ProviderRequestGuard:
         return await self.ledger.release_reservation(self)
 
 
-async def run_agent_with_deadline(
+async def run_agent_with_timeout(
     agent: Any,
     prompt: str,
     *,
@@ -1788,36 +1752,22 @@ async def run_agent_with_deadline(
     model_settings: Any,
     usage_limits: Any,
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
 ) -> Any:
-    """Run one agent turn under both request and global monotonic deadlines."""
-    if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
-        raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-    effective_timeout = min(request_timeout_seconds, remaining_wall_seconds)
+    """Set the provider's per-request timeout and run the full agent turn."""
+    if request_timeout_seconds <= 0:
+        raise ValueError("provider request timeout must be positive")
     settings = dict(model_settings or {})
-    settings["timeout"] = effective_timeout
+    settings["timeout"] = request_timeout_seconds
     guard_token = PROVIDER_REQUEST_GUARD.set(request_guard)
-    global_deadline = asyncio.timeout(remaining_wall_seconds)
     try:
-        async with global_deadline:
-            try:
-                async with asyncio.timeout(effective_timeout):
-                    return await agent.run(
-                        prompt,
-                        toolsets=toolsets,
-                        model_settings=cast(Any, settings),
-                        usage_limits=usage_limits,
-                        infer_name=False,
-                    )
-            except TimeoutError as exc:
-                if global_deadline.expired():
-                    raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-                raise ProviderRequestTimeout("provider request timeout") from exc
-    except TimeoutError as exc:
-        if global_deadline.expired():
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-        raise
+        return await agent.run(
+            prompt,
+            toolsets=toolsets,
+            model_settings=cast(Any, settings),
+            usage_limits=usage_limits,
+            infer_name=False,
+        )
     finally:
         PROVIDER_REQUEST_GUARD.reset(guard_token)
 
@@ -1939,23 +1889,18 @@ class TrialExecutor:
                     if input_schemas is None:
                         recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
-                    result = await run_agent_with_deadline(
+                    result = await run_agent_with_timeout(
                         agent,
                         render_task_prompt(task, context.local_file_paths),
                         toolsets=cast(Any, [toolset]),
                         model_settings=self.model.settings,
                         usage_limits=UsageLimits(
-                            request_limit=self.manifest.budget.max_requests_per_trial,
+                            request_limit=None,
                             cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
                         ),
                         request_timeout_seconds=self.ledger.request_timeout_seconds(),
-                        remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
                         request_guard=request_guard,
                     )
-            except ProviderRequestTimeout:
-                error = "benchmark incomplete: provider request timeout"
-            except GlobalWallDeadlineExceeded:
-                error = "benchmark incomplete: global wall deadline exceeded"
             except asyncio.CancelledError:
                 error = "benchmark incomplete: benchmark interrupted"
             except Exception as exc:
@@ -1987,7 +1932,7 @@ class TrialExecutor:
             self._tag_paired_turn(outcome)
             if self.timing_sink is not None and (
                 is_provider_wait_failure(outcome.error)
-                or outcome.failure_kind in {"request_timeout", "global_deadline"}
+                or outcome.failure_kind == "request_timeout"
             ):
                 self.timing_sink("provider_wait", started, started + latency)
             try:
@@ -2023,7 +1968,6 @@ async def execute_smoke(
     token: str,
     secrets: tuple[str, ...],
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
     input_schemas: dict[str, dict[str, Any]] | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
@@ -2078,23 +2022,18 @@ async def execute_smoke(
             if input_schemas is None:
                 recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
-            result = await run_agent_with_deadline(
+            result = await run_agent_with_timeout(
                 agent,
                 f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
                 model_settings=model.settings,
                 usage_limits=UsageLimits(
-                    request_limit=manifest.budget.max_requests_per_trial,
+                    request_limit=None,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
                 request_timeout_seconds=request_timeout_seconds,
-                remaining_wall_seconds=remaining_wall_seconds,
                 request_guard=request_guard,
             )
-    except ProviderRequestTimeout:
-        error = "benchmark incomplete: provider request timeout"
-    except GlobalWallDeadlineExceeded:
-        error = "benchmark incomplete: global wall deadline exceeded"
     except asyncio.CancelledError:
         error = "benchmark incomplete: benchmark interrupted"
     except Exception as exc:
@@ -2143,7 +2082,7 @@ async def execute_smoke(
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)
-        or outcome.failure_kind in {"request_timeout", "global_deadline"}
+        or outcome.failure_kind == "request_timeout"
     ):
         timing_sink("provider_wait", started, started + (time.perf_counter() - started))
     return outcome

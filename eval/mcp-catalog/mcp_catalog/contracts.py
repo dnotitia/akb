@@ -813,20 +813,9 @@ class ModelSpec(ContractModel):
 
 
 class Budget(ContractModel):
-    max_model_requests: int = Field(gt=0)
     max_total_cost_usd: float = Field(gt=0)
-    max_wall_seconds: int = Field(gt=0)
     request_timeout_seconds: int = Field(gt=0)
-    max_requests_per_trial: int = Field(gt=0)
     max_cost_per_trial_usd: float = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_limits(self) -> Budget:
-        if self.max_requests_per_trial > self.max_model_requests:
-            raise ValueError("per-trial request cap cannot exceed global request cap")
-        if self.request_timeout_seconds > self.max_wall_seconds:
-            raise ValueError("request timeout cannot exceed the global wall limit")
-        return self
 
 
 class StatisticalProcedure(ContractModel):
@@ -1154,11 +1143,6 @@ class BenchmarkRunManifest(ContractModel):
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
-        required_trials = trials_per_arm * len(self.arms)
-        smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
-        if self.budget.max_model_requests < required_trials + smoke_cells:
-            raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         if len(self.pair_categories) != 20 or len(tasks) != 40:
             raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
         if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:

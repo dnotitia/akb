@@ -6,6 +6,8 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
 from mcp_catalog.statistics import InconclusiveBootstrap, paired_cluster_bca
@@ -72,6 +74,20 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
         and interval["seed"] == 358
         for interval in [result["overall"]["success"], result["overall"]["task_error_rate"], *result["cells"].values()]
     )
+
+
+def test_complete_artifacts_over_retired_request_and_wall_caps_still_compare() -> None:
+    baseline, candidate = complete_paired_artifacts(request_count=25)
+    for artifact in (baseline, candidate):
+        artifact["paired_budget_used"]["wall_seconds"] = 10801.0
+        _seal(artifact)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert baseline["paired_budget_used"]["model_requests"] > 3000
+    assert baseline["paired_budget_used"]["wall_seconds"] > 10800
+    assert result["observed_paired_outcomes"] == 608
+    assert result["verdict"] == "adopt"
 
 
 def test_missing_one_of_action_branch_is_rejected_by_compare_admission() -> None:
@@ -297,6 +313,20 @@ def test_resealed_shared_budget_mismatch_is_rejected() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "budget" in result["gate"]["reasons"][0]
+
+
+@pytest.mark.parametrize("retired_limit", ("max_model_requests", "max_wall_seconds"))
+def test_resealed_shared_budget_rejects_retired_limits(retired_limit: str) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    baseline["paired_budget_used"][retired_limit] = 3000
+    candidate["paired_budget_used"][retired_limit] = 3000
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "unexpected fields" in result["gate"]["reasons"][0]
 
 
 def test_external_compare_cli_writes_all_four_verdicts(tmp_path: Path) -> None:

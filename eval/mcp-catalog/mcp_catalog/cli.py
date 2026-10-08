@@ -13,7 +13,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .contracts import load_json
+from .amendment import AmendmentPlan, CONTINUATION_RUN_CAP_USD
+from .contracts import ArmName, load_json
 from .evidence import write_json
 from .execution import BudgetLedger
 from .runner import (
@@ -72,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     paired.add_argument("--baseline-checkpoint", type=Path, required=True)
     paired.add_argument("--candidate-checkpoint", type=Path, required=True)
     paired.add_argument("--resume", action="store_true", help="resume both independent arm checkpoints")
+    paired.add_argument(
+        "--amendment",
+        type=Path,
+        help="continue only the AKB-361 authorized missing outcomes into new child artifacts",
+    )
 
     compare = subparsers.add_parser("compare", help="compare two completed arm artifacts")
     compare.add_argument("--baseline", type=Path, required=True)
@@ -237,17 +243,54 @@ async def run_paired(args: argparse.Namespace) -> int:
     )
     if baseline_manifest != candidate_manifest or baseline_tasks != candidate_tasks:
         raise ValueError("paired arms must use identical manifest and corpus inputs")
-    if args.baseline_checkpoint == args.candidate_checkpoint:
-        raise ValueError("paired arms require independent checkpoint paths")
-    output_paths = {args.baseline_output, args.candidate_output, args.comparison_output}
-    if len(output_paths) != 3:
-        raise ValueError("paired arm and comparison outputs must use distinct paths")
+    destination_paths = {
+        args.baseline_output.resolve(strict=False),
+        args.candidate_output.resolve(strict=False),
+        args.comparison_output.resolve(strict=False),
+        args.baseline_checkpoint.resolve(strict=False),
+        args.candidate_checkpoint.resolve(strict=False),
+    }
+    if len(destination_paths) != 5:
+        raise ValueError("paired artifacts and checkpoints must use five distinct paths")
+    amendment_path = getattr(args, "amendment", None)
+    continuation = (
+        AmendmentPlan.load(amendment_path, manifest=baseline_manifest, tasks=baseline_tasks)
+        if amendment_path is not None
+        else None
+    )
+    if continuation is not None:
+        output_paths = {
+            args.baseline_output.resolve(strict=False),
+            args.candidate_output.resolve(strict=False),
+            args.comparison_output.resolve(strict=False),
+            args.baseline_checkpoint.resolve(strict=False),
+            args.candidate_checkpoint.resolve(strict=False),
+        }
+        if continuation.source_paths.intersection(output_paths):
+            raise ValueError("AKB-361 continuation destinations must not overwrite parent evidence")
+        artifact_outputs = (args.baseline_output, args.candidate_output, args.comparison_output)
+        if not args.resume and any(path.exists() for path in artifact_outputs):
+            raise ValueError("AKB-361 continuation artifact outputs must be new paths")
+        child_checkpoints: dict[ArmName, Path] = {
+            "baseline": args.baseline_checkpoint,
+            "candidate": args.candidate_checkpoint,
+        }
+        continuation.seed_child_checkpoints(child_checkpoints, resume=args.resume)
 
     started = time.perf_counter()
-    coordinator = PairedArmCoordinator(baseline_manifest, baseline_tasks)
+    if continuation is None:
+        initial_events = None
+    elif args.resume:
+        initial_events = continuation.history_events_for_resume(
+            {"baseline": args.baseline_checkpoint, "candidate": args.candidate_checkpoint}
+        )
+    else:
+        initial_events = continuation.source_events
+    coordinator = PairedArmCoordinator(baseline_manifest, baseline_tasks, initial_events=initial_events)
     ledger = BudgetLedger(
         baseline_manifest,
         wall_clock=lambda: max(0.0, time.perf_counter() - started),
+        total_cost_limit_usd=(CONTINUATION_RUN_CAP_USD if continuation is not None else None),
     )
     baseline_runner = BenchmarkRunner(
         baseline_manifest,
@@ -255,9 +298,10 @@ async def run_paired(args: argparse.Namespace) -> int:
         baseline_descriptor,
         arm="baseline",
         checkpoint_path=args.baseline_checkpoint,
-        resume_path=args.baseline_checkpoint if args.resume else None,
+        resume_path=args.baseline_checkpoint if args.resume or continuation is not None else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
+        continuation=continuation,
     )
     candidate_runner = BenchmarkRunner(
         candidate_manifest,
@@ -265,9 +309,10 @@ async def run_paired(args: argparse.Namespace) -> int:
         candidate_descriptor,
         arm="candidate",
         checkpoint_path=args.candidate_checkpoint,
-        resume_path=args.candidate_checkpoint if args.resume else None,
+        resume_path=args.candidate_checkpoint if args.resume or continuation is not None else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
+        continuation=continuation,
     )
     run_tasks = {
         "baseline": asyncio.create_task(baseline_runner.run(), name="catalog-benchmark-baseline"),
@@ -306,6 +351,8 @@ async def run_paired(args: argparse.Namespace) -> int:
                 baseline_manifest,
                 checkpoints[arm],
             )
+            if continuation is not None:
+                artifacts[arm]["continuation_lineage"] = continuation.lineage
             failures.append(result)
         else:
             artifacts[arm] = result
@@ -320,13 +367,13 @@ async def run_paired(args: argparse.Namespace) -> int:
         "cost_usd": float(ledger.cost_usd),
         "wall_seconds": ledger.observe_wall(),
         "model_work_seconds": ledger.model_work_seconds,
-        "max_model_requests": baseline_manifest.budget.max_model_requests,
         "max_total_cost_usd": baseline_manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": baseline_manifest.budget.max_wall_seconds,
     }
     runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
     for arm, artifact in artifacts.items():
+        if continuation is not None:
+            artifact.setdefault("continuation_lineage", continuation.lineage)
         if isinstance(artifact.get("artifact_hash_input"), dict):
             attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
         else:

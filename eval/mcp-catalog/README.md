@@ -32,11 +32,11 @@ outcomes; task prompts do not name MCP tools.
 - SciPy `1.18.1` performs the registered paired, equal-weight cluster BCa
   bootstrap: 20,000 resamples, seed 358, one-sided 95% intervals. A degenerate
   or non-finite interval is inconclusive; no alternate interval is substituted.
-- The shared ledger caps the run at 3,000 provider requests, $50, and three
-  hours. Each trial is limited to 24 requests, $0.10, and 300 seconds. Provider
-  registry setup requests, smoke, failed requests, and resumed work count in
-  the shared request ledger. Arm order uses `akb-358-v1`; a completed paired
-  trial is reused on resume without retrying or selecting around outcomes.
+- The shared ledger enforces a $50 run ceiling and a $0.10 per-trial ceiling
+  with atomic worst-case reservations. Each individual provider request has a
+  300-second timeout. Request counts and elapsed time remain recorded as usage
+  evidence. Arm order uses `akb-358-v1`; a completed paired trial is reused on
+  resume without retrying or selecting around outcomes.
 
 ## Adoption gate and verdicts
 
@@ -123,6 +123,53 @@ Each arm has its own checkpoint. Resume with the same checkpoint paths and
 evidence is reused. Only complete outcomes with provider usage, cost, selected
 route, and state evidence are reused. The coordinator enforces the registered
 arm order and adds both checkpoints' prior usage to the shared ledger.
+
+AKB-361 has one source-bound continuation for the approved budget amendment.
+Its operator JSON names the immutable parent artifact and checkpoint paths and
+their SHA-256 digests, plus the authorized issue revision and content hash. The
+CLI accepts only the pinned AKB-361 source pair and derives the exact 13 missing
+identities from its 595-event prefix. It copies the 595 parent outcomes and
+four-cell smoke evidence to new child checkpoints, resumes their paired event
+sequence, and does not retry a recorded parent failure. Parent files must remain
+read-only; all three artifact outputs and both child checkpoints need distinct,
+new paths. `--resume` applies only to those child checkpoints after an
+interrupted continuation.
+
+The registered manifest remains at its $50 total cap. The continuation ledger
+restores the parent's $4.63290984 spend and applies a $46.763351 run ceiling,
+leaving $42.13044116 for new provider responses under the approved account
+budget. No request-count or wall-time ceiling is restored. The runtime seal and
+smoke records remain bound to the parent; a continuation proceeds only when
+current runtime and catalog evidence match the parent apart from the budget
+manifest hash.
+
+The operator file is stored outside the repository and has this shape:
+
+```json
+{
+  "schema_version": 1,
+  "work_item": "AKB-361",
+  "authorization_revision": "<approved issue revision>",
+  "authorization_content_hash": "<approved issue content hash>",
+  "parents": {
+    "baseline": {
+      "artifact_path": "<parent baseline artifact>",
+      "artifact_sha256": "<pinned digest>",
+      "checkpoint_path": "<parent baseline checkpoint>",
+      "checkpoint_sha256": "<pinned digest>"
+    },
+    "candidate": {
+      "artifact_path": "<parent candidate artifact>",
+      "artifact_sha256": "<pinned digest>",
+      "checkpoint_path": "<parent candidate checkpoint>",
+      "checkpoint_sha256": "<pinned digest>"
+    }
+  }
+}
+```
+
+Pass it with `run-paired --amendment /private/run/akb-361-continuation.json`.
+Paths may be absolute or relative to the operator file.
 
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.

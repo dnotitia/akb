@@ -7,6 +7,7 @@ import pytest
 
 from mcp_catalog.contracts import (
     BenchmarkRunManifest,
+    Budget,
     CatalogSnapshot,
     OPENROUTER_BASE_URL_ENV,
     OPENROUTER_PROVIDER_KEY_ENV,
@@ -20,6 +21,22 @@ from mcp_catalog.contracts import (
 )
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_budget_contract_contains_only_cost_and_request_timeout_limits() -> None:
+    budget = {
+        "max_total_cost_usd": 50.0,
+        "max_cost_per_trial_usd": 0.1,
+        "request_timeout_seconds": 300,
+    }
+    assert Budget.model_validate(budget).model_dump() == budget
+
+    for retired_limit in ("max_model_requests", "max_wall_seconds", "max_requests_per_trial"):
+        with pytest.raises(ValueError):
+            Budget.model_validate({**budget, retired_limit: 1})
+
+    raw_manifest = json.loads((ROOT / "config" / "run.json").read_text(encoding="utf-8"))
+    assert raw_manifest["budget"] == budget
 
 
 def _public_catalog_with_action_selectors(
@@ -115,7 +132,7 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
     assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
     assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
     assert manifest.budget.max_cost_per_trial_usd == 0.1
-    assert manifest.budget.max_requests_per_trial == 24
+    assert manifest.budget.request_timeout_seconds == 300
     assert {model.settings["max_tokens"] for model in manifest.models} == {8192}
 
     absent_before_pairs = {

@@ -77,6 +77,7 @@ def complete_paired_artifacts(
     baseline_failure_pairs: set[str] | None = None,
     candidate_failure_pairs: set[str] | None = None,
     mirror_baseline_failures: bool = False,
+    request_count: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Create sealed synthetic evidence with recomputable state and call traces."""
 
@@ -162,6 +163,7 @@ def complete_paired_artifacts(
                             paired_order_position=order.index(arm),
                             paired_execution_sequence=event_sequence[identity],
                             forced_failure=forced_failure,
+                            request_count=request_count,
                         )
                         all_usage.append(outcome)
                         run_trials[cell].append(outcome.model_dump(mode="json"))
@@ -851,9 +853,7 @@ def _paired_budget(outcomes: list[TrialOutcome], manifest: Any) -> dict[str, Any
         "cost_usd": cost,
         "wall_seconds": 120.0,
         "model_work_seconds": sum(item.latency_seconds for item in outcomes),
-        "max_model_requests": manifest.budget.max_model_requests,
         "max_total_cost_usd": manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": manifest.budget.max_wall_seconds,
     }
 
 

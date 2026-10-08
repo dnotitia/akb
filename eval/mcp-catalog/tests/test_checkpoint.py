@@ -277,6 +277,58 @@ def test_failed_checkpoint_trial_is_not_reused_but_spent_is_preserved(tmp_path: 
     assert resumed.document.spent.model_requests == 1
 
 
+def test_explicit_continuation_reuses_failed_parent_outcomes_without_retry(tmp_path: Path) -> None:
+    path = tmp_path / "continuation.checkpoint.json"
+    lineage = {"schema_version": 1, "work_item": "AKB-361"}
+    manifest, _tasks, header, key, expected = _inputs()
+    store = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=expected,
+        expected_smoke_cells={
+            "primary:http": ("primary", key.model_id, "http"),
+            "primary:stdio": ("primary", key.model_id, "stdio"),
+            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+        },
+        continuation=lineage,
+    )
+    failed = _outcome(key, error="recorded parent failure")
+    store.record_trial(key, failed, status="failed")
+
+    resumed = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=expected,
+        expected_smoke_cells={
+            "primary:http": ("primary", key.model_id, "http"),
+            "primary:stdio": ("primary", key.model_id, "stdio"),
+            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+        },
+        continuation=lineage,
+        resume=True,
+    )
+
+    assert resumed.completed_outcome_for(key) is None
+    assert resumed.reusable_outcome_for(key) == failed
+    assert resumed.status_for(key) == "failed"
+    assert resumed.document.continuation == lineage
+    assert manifest.budget.max_cost_per_trial_usd > 0
+
+
+def test_request_limit_failure_kind_remains_parseable_as_stored_evidence() -> None:
+    from mcp_catalog.execution import classify_failure
+
+    raw = _outcome(_inputs()[3], error="benchmark incomplete: max_model_requests exceeded").model_dump(mode="json")
+    raw["failure_kind"] = "request_limit"
+
+    restored = TrialOutcome.model_validate(raw)
+
+    assert restored.failure_kind == "request_limit"
+    assert classify_failure("max_model_requests exceeded", result=None, final_answer="") != "request_limit"
+
+
 def test_checkpoint_outcome_without_call_trace_is_not_reusable(tmp_path: Path) -> None:
     path = tmp_path / "checkpoint.json"
     store, key = _store(path)

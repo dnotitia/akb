@@ -24,12 +24,10 @@ from mcp_catalog.execution import (
     BudgetExceeded,
     BudgetLedger,
     CURRENT_TRIAL,
-    GlobalWallDeadlineExceeded,
     MODEL_RESPONSES,
     ModelConfigurationError,
     OpenRouterChatModel,
     ProviderRequestReceipt,
-    ProviderRequestTimeout,
     TrialContext,
     TrialExecutor,
     ToolCallRecorder,
@@ -41,7 +39,7 @@ from mcp_catalog.execution import (
     outcome_from_run,
     validate_routing_evidence,
     worst_case_cost,
-    run_agent_with_deadline,
+    run_agent_with_timeout,
 )
 from mcp_catalog.checkpoint import valid_completed_outcome
 from mcp_catalog.runner import BenchmarkRunner
@@ -207,35 +205,24 @@ class _NeverReturningAgent:
 
     async def run(self, _prompt: str, **kwargs: object) -> object:
         self.settings = kwargs["model_settings"]  # type: ignore[assignment]
-        await asyncio.Event().wait()
+        await asyncio.sleep(0.03)
+        return "completed"
 
 
 @pytest.mark.asyncio
-async def test_never_returning_provider_is_bounded_by_request_and_global_deadlines() -> None:
+async def test_never_returning_provider_uses_the_single_request_timeout() -> None:
     agent = _NeverReturningAgent()
 
-    with pytest.raises(ProviderRequestTimeout):
-        await run_agent_with_deadline(
-            agent,
-            "hang",
-            toolsets=[],
-            model_settings={},
-            usage_limits=SimpleNamespace(),
-            request_timeout_seconds=0.01,
-            remaining_wall_seconds=0.2,
-        )
+    result = await run_agent_with_timeout(
+        agent,
+        "hang",
+        toolsets=[],
+        model_settings={},
+        usage_limits=SimpleNamespace(),
+        request_timeout_seconds=0.01,
+    )
+    assert result == "completed"
     assert agent.settings == {"timeout": 0.01}
-
-    with pytest.raises(GlobalWallDeadlineExceeded):
-        await run_agent_with_deadline(
-            agent,
-            "hang",
-            toolsets=[],
-            model_settings={},
-            usage_limits=SimpleNamespace(),
-            request_timeout_seconds=0.2,
-            remaining_wall_seconds=0.01,
-        )
 
 
 def test_build_model_uses_declared_openrouter_environment_and_forces_routing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -482,7 +469,6 @@ def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelRespon
 @pytest.mark.parametrize(
     ("error", "failure_kind"),
     [
-        ("Exceeded the request_limit of 8.", "request_limit"),
         ("Model token limit (8192) exceeded", "output_limit"),
         ("MCP tool error: server rejected the call", "tool"),
         ("terminal response was empty", "terminal_response"),
@@ -611,7 +597,7 @@ def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> Non
 def test_failure_evidence_distinguishes_provider_output_terminal_and_budget() -> None:
     assert classify_failure("ModelHTTPError: status=429", result=None, final_answer="") == "provider"
     assert classify_failure("Model token limit (8192) exceeded", result=None, final_answer="") == "output_limit"
-    assert classify_failure("Exceeded the request_limit of 8", result=None, final_answer="") == "request_limit"
+    assert classify_failure("Exceeded the request_limit of 8", result=None, final_answer="") == "unknown"
     assert classify_failure("terminal response was empty", result=None, final_answer="") == "terminal_response"
     assert classify_failure("benchmark incomplete: max_cost_per_trial_usd exceeded", result=None, final_answer="") == "budget"
 
@@ -673,18 +659,48 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
 
 
 @pytest.mark.asyncio
-async def test_provider_request_admission_enforces_global_request_limit() -> None:
+async def test_budget_ledger_allows_request_and_wall_usage_past_retired_caps() -> None:
     registered = load_run_manifest(ROOT / "config" / "run.json")
-    budget = registered.budget.model_copy(update={"max_model_requests": 1})
-    manifest = registered.model_copy(update={"budget": budget})
-    ledger = BudgetLedger(manifest)
-    guard = await ledger.reserve_trial(Decimal("0.01"))
+    ledger = BudgetLedger(registered)
+    ledger.restore(
+        model_requests=3001,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0,
+        wall_seconds=10801,
+    )
+    await ledger.restore_additive(
+        model_requests=1,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0,
+        wall_seconds=10802,
+    )
+    guard = await ledger.reserve_trial(Decimal("0.1"))
+    for _ in range(25):
+        receipt = await guard()
+        await ledger.record_provider_response_cost(guard, receipt, Decimal("0.001"))
 
-    await guard()
-    with pytest.raises(BudgetExceeded, match="max_model_requests"):
-        await guard()
+    outcome = TrialOutcome(
+        task_id="past-retired-caps",
+        category="single_operation",
+        arm="baseline",
+        model_class="primary",
+        model_id=registered.models[0].model_id,
+        transport="http",
+        input_tokens=250,
+        output_tokens=50,
+        total_tokens=300,
+        model_requests=25,
+        cost_usd=0.025,
+        provider_cost_usd=0.025,
+        cost_source="provider_response",
+    )
+    await ledger.charge(outcome, guard=guard)
 
-    assert ledger.requests == 1
+    assert ledger.requests == 3027
+    assert ledger.wall_seconds == 10802
+    assert ledger.cost_usd == Decimal("0.025")
 
 
 @pytest.mark.asyncio
@@ -1042,11 +1058,9 @@ async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> 
 
 
 @pytest.mark.asyncio
-async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
+async def test_parallel_lane_wall_time_remains_observational() -> None:
     loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
-    )
+    manifest = loaded
     ledger = BudgetLedger(manifest, wall_clock=lambda: 5.0)
     provider_calls = 0
 
@@ -1076,38 +1090,13 @@ async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
     assert provider_calls == 4
     assert ledger.wall_seconds == pytest.approx(5.0)
     assert ledger.model_work_seconds == pytest.approx(16.0)
-    assert ledger.wall_seconds < manifest.budget.max_wall_seconds
 
 
-@pytest.mark.asyncio
-async def test_actual_cumulative_wall_guard_blocks_before_provider_call() -> None:
+def test_request_timeout_is_independent_of_accumulated_wall_time() -> None:
     loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
-    )
-    ledger = BudgetLedger(manifest, wall_clock=lambda: 10.0)
-    provider_calls = 0
+    ledger = BudgetLedger(loaded, wall_clock=lambda: 10801.0)
 
-    with pytest.raises(BudgetExceeded, match="max_wall_seconds"):
-        await ledger.reserve_trial(0.001)
-        provider_calls += 1
-
-    assert provider_calls == 0
-
-
-def test_request_timeout_is_capped_by_remaining_global_wall() -> None:
-    loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={
-            "budget": loaded.budget.model_copy(
-                update={"max_wall_seconds": 10, "request_timeout_seconds": 7}
-            )
-        }
-    )
-    ledger = BudgetLedger(manifest, wall_clock=lambda: 8.5)
-
-    assert ledger.remaining_wall_seconds() == pytest.approx(1.5)
-    assert ledger.request_timeout_seconds() == pytest.approx(1.5)
+    assert ledger.request_timeout_seconds() == pytest.approx(300.0)
 
 
 @pytest.mark.asyncio

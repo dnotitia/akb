@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,6 +133,68 @@ async def test_runner_applies_counterbalanced_order_to_real_evaluation_calls(
 
 
 @pytest.mark.asyncio
+async def test_paired_continuation_appends_after_parent_execution_sequence() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(item for item in load_task_corpus(ROOT / "corpus" / "tasks.json") if item.id == "read-vaults-en")
+    cell = "primary:http"
+    first_arm, second_arm = planned_arm_order(task.id, 1, manifest.paired_order_seed)
+    parent_event = {
+        "sequence": 1,
+        "cell": cell,
+        "task_id": task.id,
+        "repeat_index": 1,
+        "arm": first_arm,
+        "order_position": 0,
+    }
+    coordinator = PairedArmCoordinator(manifest, [task], initial_events=[parent_event])
+    parent_outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        arm=first_arm,
+        model_class="primary",
+        model_id=manifest.models[0].model_id,
+        transport="http",
+        repeat_index=1,
+        paired_order_position=0,
+        paired_execution_sequence=1,
+    )
+    await coordinator.register_arm(first_arm, {(cell, task.id, 1): parent_outcome})
+    await coordinator.register_arm(second_arm, {})
+
+    async with coordinator.turn(cell=cell, task_id=task.id, repeat_index=1, arm=second_arm) as turn:
+        assert turn.execution_sequence == 2
+        assert turn.order_position == 1
+
+    events = coordinator.evidence()["events"]
+    assert [item["sequence"] for item in events] == [1, 2]
+    assert events[0] == parent_event
+
+
+@pytest.mark.asyncio
+async def test_tighter_continuation_cost_limit_applies_to_restored_parent_spend() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    ledger = BudgetLedger(manifest, total_cost_limit_usd=Decimal("5.0"))
+
+    await ledger.restore_additive(
+        model_requests=1,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=Decimal("4.9"),
+        wall_seconds=0,
+    )
+    with pytest.raises(BudgetExceeded, match="paired checkpoint totals already exceed"):
+        await ledger.restore_additive(
+            model_requests=1,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=Decimal("0.1001"),
+            wall_seconds=0,
+        )
+
+    assert manifest.budget.max_total_cost_usd == 50.0
+
+
+@pytest.mark.asyncio
 async def test_single_request_timeout_does_not_stop_next_paired_trial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,8 +276,7 @@ async def test_single_request_timeout_does_not_stop_next_paired_trial(
 @pytest.mark.parametrize(
     ("failure_kind", "error", "provider_evidence", "routing_valid", "unsafe_mutation", "continues"),
     [
-        ("budget", "benchmark incomplete: max_model_requests exceeded", [], False, False, False),
-        ("global_deadline", "benchmark incomplete: global wall deadline exceeded", [], False, False, False),
+        ("budget", "benchmark incomplete: max_total_cost_usd exceeded", [], False, False, False),
         ("interrupted", "benchmark incomplete: benchmark interrupted", [], False, False, False),
         ("provider", "provider route drift", [{"model": "unregistered/model"}], False, False, False),
         ("none", None, [], False, True, False),
