@@ -11,7 +11,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
-from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
+from paired_artifact_factory import _catalog_snapshot, provider_name_for_model, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -116,7 +116,7 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
                     "endpoints": {
                         "available": [{
                             "model": runner_module._expected_openrouter_canonical_slug(executor.model_spec),
-                            "provider": "Parasail",
+                            "provider": provider_name_for_model(executor.model_spec),
                             "selected": True,
                         }]
                     },

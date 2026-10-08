@@ -8,6 +8,7 @@ import pytest
 
 from mcp_catalog.contracts import StateProbe, load_task_corpus
 from mcp_catalog.runtime import RESET_TIMEOUT_SECONDS, RuntimeContractError, RuntimeDescriptor, RuntimeFixture
+import mcp_catalog.runtime as runtime_module
 
 
 def descriptor_dict() -> dict:
@@ -130,12 +131,38 @@ class _MintClient:
         return None
 
 
+class _NonJsonResponse:
+    status_code = 404
+
+    def json(self) -> dict:
+        raise ValueError("not JSON")
+
+
+class _NonJsonObserveClient:
+    async def get(self, _url: str, **_kwargs: object) -> _NonJsonResponse:
+        return _NonJsonResponse()
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _FailedObserveClient:
+    async def get(self, _url: str, **_kwargs: object) -> _Response:
+        raise httpx.ConnectError("fixture connection refused")
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _ObserveClient:
     def __init__(self, status_code: int = 404) -> None:
         self.status_code = status_code
 
     async def get(self, _url: str, **_kwargs: object) -> _Response:
-        return _Response(self.status_code, {"detail": "resource does not exist yet"})
+        return _Response(
+            self.status_code,
+            {"code": "not_found", "detail": "Vault not found: catalog-bench-overlap"},
+        )
 
     async def aclose(self) -> None:
         return None
@@ -209,13 +236,16 @@ async def test_state_probe_can_treat_expected_absence_as_available_evidence() ->
 
     assert observation.available is True
     assert observation.status_code == 404
-    assert observation.payload == {"detail": "resource does not exist yet"}
+    assert observation.payload == {
+        "code": "not_found",
+        "detail": "Vault not found: catalog-bench-overlap",
+    }
     await fixture.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 404, 405, 500])
-async def test_unexpected_state_status_keeps_payload_but_remains_unavailable(status_code: int) -> None:
+async def test_unexpected_json_state_status_remains_an_available_observation(status_code: int) -> None:
     descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
     fixture = RuntimeFixture(descriptor)
     fixture.client = _ObserveClient(status_code)  # type: ignore[assignment]
@@ -225,9 +255,65 @@ async def test_unexpected_state_status_keeps_payload_but_remains_unavailable(sta
         token="fixture-token",
     )
 
-    assert observation.available is False
+    assert observation.available is True
     assert observation.status_code == status_code
-    assert observation.payload == {"detail": "resource does not exist yet"}
+    assert observation.payload == {
+        "code": "not_found",
+        "detail": "Vault not found: catalog-bench-overlap",
+    }
+    assert observation.error is None
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_non_json_state_response_remains_unavailable() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _NonJsonObserveClient()  # type: ignore[assignment]
+
+    observation = await fixture.observe(
+        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=200),
+        token="fixture-token",
+    )
+
+    assert observation.available is False
+    assert observation.status_code == 404
+    assert observation.error == "state probe returned non-JSON content"
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_network_failure_keeps_state_observation_unavailable() -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _FailedObserveClient()  # type: ignore[assignment]
+
+    observation = await fixture.observe(
+        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=200),
+        token="fixture-token",
+    )
+
+    assert observation.available is False
+    assert observation.status_code is None
+    assert observation.error == "state probe request failed"
+    await fixture.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_url_outside_declared_origin_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    fixture = RuntimeFixture(descriptor)
+    fixture.client = _ObserveClient()  # type: ignore[assignment]
+    monkeypatch.setattr(runtime_module, "urljoin", lambda *_args: "http://other.invalid/state")
+
+    observation = await fixture.observe(
+        StateProbe(service="app", path="/state", expected_status=200),
+        token="fixture-token",
+    )
+
+    assert observation.available is False
+    assert observation.status_code is None
+    assert observation.error == "state probe escaped its declared origin"
     await fixture.close()
 
 

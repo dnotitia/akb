@@ -724,6 +724,7 @@ class BenchmarkRunner:
             self.checkpoint_path,
             header=header,
             expected_keys=planned_keys,
+            expected_tasks={task.id: task for task in self.tasks},
             expected_smoke_cells=expected_smoke,
             secrets=resolver.secret_values(),
             continuation=(self.continuation.checkpoint_lineage[cast(ArmName, self.arm)] if self.continuation else None),
@@ -772,6 +773,7 @@ class BenchmarkRunner:
         smoke_gate: dict[str, Any] | None = None,
         checkpoint_snapshot: CheckpointDocument | None = None,
     ) -> dict[str, Any]:
+        tasks_by_id = {task.id: task for task in self.tasks}
         snapshot_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         snapshot_statuses: dict[str, list[dict[str, Any]]] = defaultdict(list)
         if checkpoint_snapshot is not None:
@@ -796,7 +798,11 @@ class BenchmarkRunner:
                 quality_reasons.append(reason)
         for run_key, outcomes in source_trials.items():
             for outcome in outcomes:
-                if outcome.error and not valid_completed_outcome(outcome):
+                task = tasks_by_id.get(outcome.task_id)
+                if task is None:
+                    incomplete_reasons.add(f"benchmark incomplete: trial {outcome.task_id} is not registered")
+                    continue
+                if outcome.error and not valid_completed_outcome(outcome, task):
                     reason = (
                         f"benchmark incomplete: {run_key} trial {outcome.task_id} "
                         f"repeat {outcome.repeat_index} failed: {redact_text(outcome.error, self.secrets)}"
@@ -883,14 +889,15 @@ class BenchmarkRunner:
                 sum(
                     1
                     for record in checkpoint_snapshot.records.values()
-                    if record.status == "completed" and valid_completed_outcome(record.outcome)
+                    if record.status == "completed"
+                    and valid_completed_outcome(record.outcome, tasks_by_id[record.key.task_id])
                 )
                 if checkpoint_snapshot is not None
                 else sum(
                     1
                     for outcomes in self._completed_trials.values()
                     for outcome in outcomes
-                    if valid_completed_outcome(outcome)
+                    if valid_completed_outcome(outcome, tasks_by_id[outcome.task_id])
                 )
             ),
         }
@@ -1278,7 +1285,7 @@ class BenchmarkRunner:
                     for item in outcome.provider_evidence
                 )
             )
-            valid = identity_matches and valid_smoke_outcome(outcome)
+            valid = identity_matches and valid_smoke_outcome(outcome, task)
             if not valid and outcome.error is None:
                 if not identity_matches:
                     outcome.error = "smoke gate outcome did not match the requested model, provider route, and transport"
@@ -1483,12 +1490,12 @@ class BenchmarkRunner:
                             endpoint
                             for endpoint in endpoints
                             if isinstance(endpoint, dict)
-                            and str(endpoint.get("provider_name", "")).casefold() == "parasail"
+                            and str(endpoint.get("provider_name", "")).casefold() == spec.routing.order[0].casefold()
                             and endpoint.get("quantization") == "fp8"
                         ]
                         if len(selected) != 1:
                             raise RuntimeContractError(
-                                f"pinned Parasail fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
+                                f"pinned {spec.routing.order[0]} fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
                                 stage="provider_registry",
                             )
                         registered_model = {
@@ -2256,19 +2263,34 @@ def _state_observations(
         error = raw["error"]
         if not isinstance(available, bool):
             raise ValueError(f"{label}-state availability is invalid")
-        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+        if status_code is not None and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
-        expected_status = (
-            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
-        )
-        if available and status_code != expected_status:
-            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if before and not expectation.check_before and raw == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
+        if available and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
+            raise ValueError(f"{label}-state HTTP status is missing or invalid")
         if available and error is not None:
             raise ValueError(f"{label}-state observation reports an error despite being available")
         if not available and not error:
             raise ValueError(f"{label}-state observation is unavailable without an error")
+        if before and not expectation.check_before and not available:
+            raise ValueError("unchecked before-state observations must be omitted explicitly")
         observations.append(
             StateObservation(
                 available=available,
@@ -2303,7 +2325,7 @@ def _validate_trial_evidence(
         or outcome.transport != transport
     ):
         raise ValueError("trial identity differs from its registered task, model, transport, or arm")
-    if not has_measured_evidence(outcome):
+    if not has_measured_evidence(outcome, task):
         raise ValueError("trial is missing provider, state, or raw call evidence")
     if outcome.error is not None:
         raise ValueError("trial outcome contains an execution error")
@@ -2453,7 +2475,7 @@ def _validate_provider_registry_identity(
         ):
             raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
         if registered_route_target(spec, captured_model) is None:
-            raise ValueError(f"{arm} provider registry endpoint evidence differs from the pinned Parasail fp8 route")
+            raise ValueError(f"{arm} provider registry endpoint evidence differs from the pinned {spec.routing.order[0]} fp8 route")
 
 
 def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:

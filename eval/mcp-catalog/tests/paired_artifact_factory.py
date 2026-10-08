@@ -22,6 +22,7 @@ from mcp_catalog.runtime import StateObservation
 
 ROOT = Path(__file__).parents[1]
 FIXTURE_ROOT = ROOT / "fixtures"
+OPENROUTER_PROVIDER_NAMES = {"deepinfra": "DeepInfra", "akashml": "AkashML"}
 ARTIFACT_VERSIONS = {"backend_artifact_version": "1.0.0", "proxy_artifact_version": "1.0.0"}
 EXECUTION_ENVIRONMENT = {
     "python": "3.14.0 synthetic fixture",
@@ -37,6 +38,10 @@ EXECUTION_ENVIRONMENT = {
 }
 
 
+def provider_name_for_model(model: Any) -> str:
+    return OPENROUTER_PROVIDER_NAMES[model.routing.order[0]]
+
+
 def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
     manifest_model = manifest or load_run_manifest(ROOT / "config" / "run.json")
     model_rows = [
@@ -47,12 +52,15 @@ def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
     models: dict[str, Any] = {}
     endpoint_snapshots: dict[str, Any] = {}
     for model, model_row in zip(manifest_model.models, model_rows, strict=True):
+        provider_name = provider_name_for_model(model)
+        provider_slug = model.routing.order[0]
         selected_endpoint = {
             "model_id": model.model_id,
-            "name": f"Parasail | {model_row['canonical_slug']}",
-            "provider_name": "Parasail",
-            "tag": "parasail/fp8",
+            "name": f"{provider_name} | {model_row['canonical_slug']}",
+            "provider_name": provider_name,
+            "tag": f"{provider_slug}/fp8",
             "quantization": "fp8",
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
         }
         endpoint_snapshot = {"data": {"endpoints": [selected_endpoint]}}
         models[model.model_id] = {
@@ -463,7 +471,7 @@ def _make_outcome(
                     "available": [
                         {
                             "model": _expected_openrouter_canonical_slug(model),
-                            "provider": "Parasail",
+                            "provider": provider_name_for_model(model),
                             "selected": True,
                         }
                     ]

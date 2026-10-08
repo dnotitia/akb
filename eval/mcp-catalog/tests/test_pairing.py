@@ -222,6 +222,19 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
     assert "provider_registry" in result["gate"]["reasons"][0]
 
 
+def test_different_model_routes_between_arms_are_not_paired() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    candidate["manifest"] = deepcopy(candidate["manifest"])
+    candidate["manifest"]["models"][0]["routing"]["order"] = ["akashml"]
+    candidate["run_manifest_hash"] = hash_json(candidate["manifest"])
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "paired artifacts differ in run_manifest_hash" in result["gate"]["reasons"][0]
+
+
 def test_compare_recomputes_response_route_against_the_sealed_provider_registry() -> None:
     baseline, candidate = complete_paired_artifacts()
     evidence = candidate["runs"]["primary:http"]["trials"][0]["provider_evidence"][0]

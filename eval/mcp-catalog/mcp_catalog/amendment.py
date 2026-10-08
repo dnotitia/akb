@@ -521,6 +521,7 @@ class AmendmentPlan:
             "baseline": {},
             "candidate": {},
         }
+        tasks_by_id = {task.id: task for task in tasks}
         for arm in ARMS:
             artifact = artifacts[arm]
             document = checkpoints[arm]
@@ -561,8 +562,8 @@ class AmendmentPlan:
                     raise ValueError(f"{arm} parent checkpoint contains a mismatched trial identity")
             if not all(record.status in {"completed", "failed"} for record in document.records.values()):
                 raise ValueError(f"{arm} parent checkpoint contains a nonterminal record")
-            cls._validate_parent_artifact_records(arm, artifact, document, all_outcomes[arm])
-            cls._validate_parent_smoke(arm, artifact, document)
+            cls._validate_parent_artifact_records(arm, artifact, document, all_outcomes[arm], tasks_by_id)
+            cls._validate_parent_smoke(arm, artifact, document, tasks_by_id)
             seal_inputs = artifact.get("pre_smoke_seal_inputs")
             if not isinstance(seal_inputs, dict):
                 raise ValueError(f"{arm} parent pre-smoke seal inputs are missing")
@@ -747,6 +748,7 @@ class AmendmentPlan:
         artifact: dict[str, Any],
         document: CheckpointDocument,
         outcomes: dict[TrialIdentity, TrialOutcome],
+        tasks: dict[str, TaskManifest],
     ) -> None:
         if not isinstance(artifact.get("runs"), dict):
             raise ValueError(f"{arm} parent artifact does not include run records")
@@ -762,6 +764,9 @@ class AmendmentPlan:
                 raise ValueError(f"{arm} parent artifact statuses are duplicated or malformed")
             for raw_outcome in run["trials"]:
                 outcome = TrialOutcome.model_validate(raw_outcome)
+                task = tasks.get(outcome.task_id)
+                if task is None or task.locale != outcome.locale:
+                    raise ValueError(f"{arm} parent artifact outcome references an unregistered task")
                 identity = _identity(cell, outcome.task_id, outcome.repeat_index, arm)
                 if identity in outcomes:
                     raise ValueError(f"{arm} parent artifact contains a duplicate outcome")
@@ -787,7 +792,7 @@ class AmendmentPlan:
                     raise ValueError(f"{arm} parent checkpoint record digest does not match")
                 if (
                     record.status == "completed"
-                    and not valid_completed_outcome(record.outcome)
+                    and not valid_completed_outcome(record.outcome, task)
                     and record.outcome.failure_kind != "request_limit"
                 ):
                     raise ValueError(f"{arm} parent checkpoint contains an invalid completed trial")
@@ -798,7 +803,12 @@ class AmendmentPlan:
             raise ValueError(f"{arm} parent artifact outcome count is invalid")
 
     @staticmethod
-    def _validate_parent_smoke(arm: ArmName, artifact: dict[str, Any], document: CheckpointDocument) -> None:
+    def _validate_parent_smoke(
+        arm: ArmName,
+        artifact: dict[str, Any],
+        document: CheckpointDocument,
+        tasks: dict[str, TaskManifest],
+    ) -> None:
         smoke = artifact.get("smoke_gate")
         if not isinstance(smoke, dict) or smoke.get("status") != "passed":
             raise ValueError(f"{arm} parent artifact smoke gate is not passed")
@@ -806,7 +816,8 @@ class AmendmentPlan:
         if set(artifact_cells) != set(document.smoke_gate) or document.smoke_status != "passed":
             raise ValueError(f"{arm} parent smoke cells do not match its checkpoint")
         for cell, record in document.smoke_gate.items():
-            if record.status != "completed" or not valid_smoke_outcome(record.outcome):
+            task = tasks.get(record.outcome.task_id)
+            if task is None or record.status != "completed" or not valid_smoke_outcome(record.outcome, task):
                 raise ValueError(f"{arm} parent smoke cell {cell} is not reusable")
             from .checkpoint import smoke_record_hash
 
@@ -956,6 +967,7 @@ class AmendmentPlan:
             path,
             header=header.model_copy(update={"pre_smoke_seal_hash": None}),
             expected_keys=self._planned_keys(arm),
+            expected_tasks={task.id: task for task in self.tasks},
             expected_smoke_cells=self._expected_smoke(),
             continuation=self.checkpoint_lineage[arm],
         )

@@ -118,6 +118,15 @@ def _evaluate_expectations(
     checks: list[StateCheckResult] = []
     if not after.available:
         return [StateCheckResult(False, "", "available", after.error or "after-state observation unavailable")]
+    if after.status_code != contract.probe.expected_status:
+        checks.append(
+            StateCheckResult(
+                False,
+                "",
+                "http_status",
+                f"expected HTTP {contract.probe.expected_status}; actual {after.status_code}",
+            )
+        )
     for expectation in contract.must:
         actual = json_pointer(after.payload, expectation.pointer)
         checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "must"))
@@ -127,6 +136,15 @@ def _evaluate_expectations(
     if contract.check_before:
         if not before.available:
             checks.append(StateCheckResult(False, "", "available_before", before.error or "before-state observation unavailable"))
+        if before.status_code != contract.resolved_before_expected_status:
+            checks.append(
+                StateCheckResult(
+                    False,
+                    "",
+                    "http_status_before",
+                    f"expected HTTP {contract.resolved_before_expected_status}; actual {before.status_code}",
+                )
+            )
         for expectation in contract.before_must:
             actual = json_pointer(before.payload, expectation.pointer)
             checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "before_must"))
@@ -162,6 +180,15 @@ def evaluate_checkpoint_contract(
             )
         ]
     checks: list[StateCheckResult] = []
+    if observation.status_code != contract.probe.expected_status:
+        checks.append(
+            StateCheckResult(
+                False,
+                "",
+                f"checkpoint:{contract.after_attempt}:http_status",
+                f"expected HTTP {contract.probe.expected_status}; actual {observation.status_code}",
+            )
+        )
     for expectation in contract.must:
         actual = json_pointer(observation.payload, expectation.pointer)
         checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "checkpoint_must"))

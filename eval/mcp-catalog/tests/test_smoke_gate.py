@@ -13,7 +13,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
-from paired_artifact_factory import provider_registry_snapshot
+from paired_artifact_factory import provider_name_for_model, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -57,6 +57,7 @@ def _smoke_outcome(
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_id or model_spec.model_id,
@@ -87,7 +88,7 @@ def _smoke_outcome(
                     "endpoints": {
                         "available": [{
                             "model": runner_module._expected_openrouter_canonical_slug(model_spec),
-                            "provider": "Parasail",
+                            "provider": provider_name_for_model(model_spec),
                             "selected": True,
                         }]
                     },
@@ -171,7 +172,7 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
         selected_provider = outcome["provider_evidence"][0]["routing"]["endpoints"]["available"][0]
         assert selected_provider == {
             "model": runner_module._expected_openrouter_canonical_slug(model_spec),
-            "provider": "Parasail",
+            "provider": provider_name_for_model(model_spec),
             "selected": True,
         }
 

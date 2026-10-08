@@ -22,13 +22,18 @@ outcomes; task prompts do not name MCP tools.
   ordinary permission refusals, and a valid vault-skill acknowledgement retry
   are excluded. Harmless extra reads are recorded as overshoot. Forbidden
   mutation attempts and verified state-changing risk mutations are separate.
-- Provider routing is pinned to OpenRouter's `parasail` provider with `fp8`
-  quantization, no fallback, required parameter support, temperature 0, and an
-  8,192-token output limit. Model aliases and versions are pinned in
-  `config/run.json`. A provider model/endpoint registry snapshot is captured
-  before sealing. Every response's selected canonical model and provider must
-  match its unique registered Parasail fp8 endpoint; compare recomputes that
-  binding from the sealed snapshot, and route drift makes the result inconclusive.
+- Provider routing is pinned per model in OpenRouter: `deepinfra` for the
+  primary model and `akashml` for the lightweight model. Both require `fp8`
+  quantization, disable fallback, and require support for tools, tool choice,
+  temperature, and max tokens. Model aliases and versions remain pinned in
+  `config/run.json`; the registered prompt/completion price ceilings are
+  `$0.06/$0.18` per million tokens for primary and `$0.225/$1.98` for
+  lightweight. A model/endpoint registry snapshot is captured before sealing.
+  Each response's selected canonical model and provider must match its unique
+  registered endpoint and usage receipt; compare recomputes that binding from
+  the sealed snapshot, and route drift makes the result inconclusive. Provider
+  slugs and fallback behavior follow OpenRouter's
+  [provider selection contract](https://openrouter.ai/docs/guides/routing/provider-selection).
 - SciPy `1.18.1` performs the registered paired, equal-weight cluster BCa
   bootstrap: 20,000 resamples, seed 358, one-sided 95% intervals. A degenerate
   or non-finite interval is inconclusive; no alternate interval is substituted.

@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 from pydantic_evals import Case, Dataset
@@ -737,14 +738,22 @@ def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> l
     return matched
 
 
-def has_measured_evidence(outcome: TrialOutcome) -> bool:
+def has_measured_evidence(outcome: TrialOutcome, task: TaskManifest) -> bool:
     """Return whether a trial has real provider and lifecycle evidence to keep."""
 
-    if "tool_calls" not in outcome.model_fields_set:
+    if (
+        outcome.task_id != task.id
+        or outcome.locale != task.locale
+        or "tool_calls" not in outcome.model_fields_set
+    ):
         return False
     if not _has_provider_usage_evidence(outcome):
         return False
-    before_payload, before_valid = _measured_state_payload(outcome.state_observations_before)
+    before_required = [item.check_before for item in task.expected_final_state.observation_sets]
+    before_payload, before_valid = _measured_state_payload(
+        outcome.state_observations_before,
+        optional={index for index, required in enumerate(before_required) if not required},
+    )
     after_payload, after_valid = _measured_state_payload(outcome.state_observations_after)
     if (
         not before_valid
@@ -783,14 +792,27 @@ def has_measured_evidence(outcome: TrialOutcome) -> bool:
     return True
 
 
-def _measured_state_payload(records: list[dict[str, Any]]) -> tuple[Any, bool]:
+def _measured_state_payload(
+    records: list[dict[str, Any]],
+    *,
+    optional: set[int] | None = None,
+) -> tuple[Any, bool]:
     if not records:
         return None, False
+    optional = optional or set()
     observations: list[StateObservation] = []
-    for record in records:
+    for index, record in enumerate(records):
         if not isinstance(record, dict) or set(record) != {"available", "status_code", "payload", "error"}:
             return None, False
         status_code = record["status_code"]
+        if index in optional and record == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
         if (
             record["available"] is not True
             or not isinstance(status_code, int)
@@ -1384,7 +1406,9 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             # one final cleanup reset after the dataset, so teardown never
             # performs a duplicate reset between adjacent cases.
             if self.checkpoint_sink is not None and self.output is not None:
-                status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
+                status: Literal["completed", "failed"] = (
+                    "completed" if has_measured_evidence(self.output, self.case.inputs) else "failed"
+                )
                 await self.checkpoint_sink(self.output, status)
         finally:
             if self.context is not None and self.context.context_token is not None:
@@ -2122,9 +2146,14 @@ def build_model(spec: ModelSpec) -> OpenRouterChatModel:
         input_price=spec.input_cost_per_million_usd,
         output_price=spec.output_cost_per_million_usd,
     )
-    settings = dict(spec.settings)
-    settings["extra_body"] = request_body
-    settings["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
+    settings = cast(
+        OpenRouterModelSettings,
+        {
+            **spec.settings,
+            "extra_body": request_body,
+            "extra_headers": {"X-OpenRouter-Metadata": "enabled"},
+        },
+    )
     return OpenRouterChatModel(
         spec.model_id,
         provider=OpenAIProvider(
@@ -2344,8 +2373,9 @@ def registered_route_target(
 ) -> tuple[str, str] | None:
     """Return the canonical model and provider pinned by one registry snapshot."""
 
+    provider_slug = model_spec.routing.order[0]
     expected_routing = {
-        "order": ["parasail"],
+        "order": [provider_slug],
         "allow_fallbacks": False,
         "require_parameters": True,
         "quantizations": ["fp8"],
@@ -2371,21 +2401,28 @@ def registered_route_target(
         for endpoint in endpoints
         if isinstance(endpoint, dict)
         and isinstance(endpoint.get("provider_name"), str)
-        and endpoint["provider_name"].casefold() == "parasail"
+        and endpoint["provider_name"].casefold() == provider_slug.casefold()
         and endpoint.get("quantization") == "fp8"
     ]
     canonical_slug = model_record["canonical_slug"]
+    selected_provider = selected_endpoint.get("provider_name")
+    supported_parameters = selected_endpoint.get("supported_parameters")
+    required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
     if (
         len(candidates) != 1
         or selected_endpoint != candidates[0]
         or selected_endpoint.get("model_id") != model_spec.model_id
-        or selected_endpoint.get("provider_name") != "Parasail"
-        or selected_endpoint.get("tag") != "parasail/fp8"
+        or not isinstance(selected_provider, str)
+        or selected_provider.casefold() != provider_slug.casefold()
+        or selected_endpoint.get("tag") != f"{provider_slug}/fp8"
         or selected_endpoint.get("quantization") != "fp8"
-        or selected_endpoint.get("name") != f"Parasail | {canonical_slug}"
+        or selected_endpoint.get("name") != f"{selected_provider} | {canonical_slug}"
+        or not isinstance(supported_parameters, list)
+        or not all(isinstance(parameter, str) for parameter in supported_parameters)
+        or not required_parameters.issubset(set(supported_parameters))
     ):
         return None
-    return canonical_slug, selected_endpoint["provider_name"]
+    return canonical_slug, selected_provider
 
 
 def validate_routing_evidence(

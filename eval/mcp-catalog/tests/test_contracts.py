@@ -137,13 +137,14 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
             input_price=model.input_cost_per_million_usd,
             output_price=model.output_cost_per_million_usd,
         )["provider"]
-        assert provider["order"] == ["parasail"]
+        assert provider["order"] == model.routing.order
         assert provider["allow_fallbacks"] is False
         assert provider["require_parameters"] is True
         assert provider["quantizations"] == ["fp8"]
         assert "models" not in provider
-    assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
-    assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
+    assert [model.routing.order for model in manifest.models] == [["deepinfra"], ["akashml"]]
+    assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.06, 0.18)
+    assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.225, 1.98)
     assert manifest.budget.max_cost_per_trial_usd == 0.1
     assert manifest.budget.request_timeout_seconds == 300
     assert {model.settings["max_tokens"] for model in manifest.models} == {8192}
@@ -207,7 +208,7 @@ def test_manifest_rejects_provider_or_price_drift() -> None:
     with pytest.raises(ValueError, match="price ceiling"):
         BenchmarkRunManifest.model_validate(raw)
 
-    raw["models"][0]["input_cost_per_million_usd"] = 0.14
+    raw["models"][0]["input_cost_per_million_usd"] = 0.06
     raw["models"][0]["routing"]["allow_fallbacks"] = True
     with pytest.raises(ValueError):
         BenchmarkRunManifest.model_validate(raw)
@@ -215,6 +216,18 @@ def test_manifest_rejects_provider_or_price_drift() -> None:
     raw["models"][0]["routing"]["allow_fallbacks"] = False
     raw["models"][0]["settings"]["max_tokens"] = 2048
     with pytest.raises(ValueError, match="output limits"):
+        BenchmarkRunManifest.model_validate(raw)
+
+
+def test_manifest_rejects_multiple_or_invalid_provider_slugs() -> None:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    raw["models"][0]["routing"]["order"] = ["deepinfra", "akashml"]
+
+    with pytest.raises(ValueError):
+        BenchmarkRunManifest.model_validate(raw)
+
+    raw["models"][0]["routing"]["order"] = ["DeepInfra"]
+    with pytest.raises(ValueError, match="lowercase OpenRouter provider slug"):
         BenchmarkRunManifest.model_validate(raw)
 
 

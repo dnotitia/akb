@@ -7,11 +7,12 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.models.openrouter import OpenRouterProviderConfig
 
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 2
@@ -19,8 +20,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
 OPENROUTER_PRICE_CEILINGS = {
-    "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
-    "qwen/qwen3.8-27b": (0.24, 2.20),
+    "deepseek/deepseek-v4-flash-0731": (0.06, 0.18),
+    "qwen/qwen3.8-27b": (0.225, 1.98),
 }
 OPENROUTER_CLASSES = {
     "primary": "deepseek/deepseek-v4-flash-0731",
@@ -448,20 +449,34 @@ class ExpectedResultBinding(ContractModel):
 
 
 class ProviderRouting(ContractModel):
-    order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
+    order: list[str] = Field(min_length=1, max_length=1)
     allow_fallbacks: Literal[False] = False
     require_parameters: Literal[True] = True
     quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
-    def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
-        return {
-            "provider": {
-                "order": ["parasail"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-                "quantizations": ["fp8"],
+    @field_validator("order")
+    @classmethod
+    def validate_provider_slug(cls, value: list[str]) -> list[str]:
+        if len(value) != 1 or re.fullmatch(
+            r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*",
+            value[0],
+        ) is None:
+            raise ValueError("provider routing order must contain one lowercase OpenRouter provider slug")
+        return value
+
+    def request_body(self, *, input_price: float, output_price: float) -> dict[str, Any]:
+        provider = cast(
+            OpenRouterProviderConfig,
+            {
+                "order": self.order,
+                "allow_fallbacks": self.allow_fallbacks,
+                "require_parameters": self.require_parameters,
+                "quantizations": self.quantizations,
                 "max_price": {"prompt": input_price, "completion": output_price},
-            }
+            },
+        )
+        return {
+            "provider": provider,
         }
 
 

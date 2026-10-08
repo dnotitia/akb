@@ -229,10 +229,9 @@ def test_unexpected_not_found_payload_does_not_satisfy_empty_publication_state()
         if "/publications/catalog-bench-data" in item.probe.path:
             after.append(
                 StateObservation(
-                    False,
+                    True,
                     404,
                     {"detail": "Vault not found"},
-                    "state probe returned HTTP 404",
                 )
             )
         elif item.probe.expected_status == 404:

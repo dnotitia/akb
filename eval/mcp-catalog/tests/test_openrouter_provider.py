@@ -44,6 +44,7 @@ from mcp_catalog.execution import (
 from mcp_catalog.checkpoint import valid_completed_outcome
 from mcp_catalog.runner import BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor, StateObservation
+from paired_artifact_factory import provider_name_for_model
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -65,12 +66,14 @@ def _model_spec():
 
 def _registered_model(spec) -> dict[str, Any]:
     canonical_slug = runner_module._expected_openrouter_canonical_slug(spec)
+    provider_name = provider_name_for_model(spec)
     endpoint = {
         "model_id": spec.model_id,
-        "name": f"Parasail | {canonical_slug}",
-        "provider_name": "Parasail",
-        "tag": "parasail/fp8",
+        "name": f"{provider_name} | {canonical_slug}",
+        "provider_name": provider_name,
+        "tag": f"{spec.routing.order[0]}/fp8",
         "quantization": "fp8",
+        "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
     }
     endpoint_snapshot = {"data": {"endpoints": [endpoint]}}
     return {
@@ -81,14 +84,14 @@ def _registered_model(spec) -> dict[str, Any]:
     }
 
 
-def _routing_metadata(spec, *, model: str | None = None, provider: str = "Parasail") -> dict[str, Any]:
+def _routing_metadata(spec, *, model: str | None = None, provider: str | None = None) -> dict[str, Any]:
     canonical_slug = runner_module._expected_openrouter_canonical_slug(spec)
     return {
         "requested": spec.model_id,
         "endpoints": {
             "available": [{
                 "model": model or canonical_slug,
-                "provider": provider,
+                "provider": provider or provider_name_for_model(spec),
                 "selected": True,
             }],
         },
@@ -114,16 +117,19 @@ async def _capture_registry_with_httpx(
             segments = request.url.path.strip("/").split("/")
             model_id = f"{segments[-3]}/{segments[-2]}"
             model_row = next(row for row in model_rows if row["id"] == model_id)
+            spec = next(spec for spec in manifest.models if spec.model_id == model_id)
+            provider_name = provider_name_for_model(spec)
             return httpx.Response(
                 200,
                 json={
                     "data": {
                         "endpoints": [{
                             "model_id": model_id,
-                            "name": f"Parasail | {model_row['canonical_slug']}",
-                            "provider_name": "Parasail",
-                            "tag": "parasail/fp8",
+                            "name": f"{provider_name} | {model_row['canonical_slug']}",
+                            "provider_name": provider_name,
+                            "tag": f"{spec.routing.order[0]}/fp8",
                             "quantization": "fp8",
+                            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
                         }]
                     }
                 },
@@ -159,6 +165,17 @@ async def test_provider_registry_accepts_pinned_aliases_and_canonical_slugs(
     ] == [
         ("deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-20260731"),
         ("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-20260814"),
+    ]
+    assert [
+        (
+            record["selected_endpoint"]["provider_name"],
+            record["selected_endpoint"]["tag"],
+            record["selected_endpoint"]["supported_parameters"],
+        )
+        for record in registry["models"].values()
+    ] == [
+        ("DeepInfra", "deepinfra/fp8", ["tools", "tool_choice", "temperature", "max_tokens"]),
+        ("AkashML", "akashml/fp8", ["tools", "tool_choice", "temperature", "max_tokens"]),
     ]
     assert set(requested_urls) == {
         f"{OPENROUTER_BASE_URL}/models",
@@ -237,11 +254,11 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     assert isinstance(model, OpenRouterChatModel)
     assert settings["extra_body"] == {
         "provider": {
-            "order": ["parasail"],
+            "order": spec.routing.order,
             "allow_fallbacks": False,
             "require_parameters": True,
             "quantizations": ["fp8"],
-            "max_price": {"prompt": 0.14, "completion": 0.28},
+            "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
         }
     }
     assert settings["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
@@ -330,11 +347,11 @@ async def test_pydantic_ai_wire_request_preserves_openrouter_extra_body(monkeypa
 
     kwargs = request.await_args.kwargs
     assert kwargs["extra_body"]["provider"] == {
-        "order": ["parasail"],
+        "order": spec.routing.order,
         "allow_fallbacks": False,
         "require_parameters": True,
         "quantizations": ["fp8"],
-        "max_price": {"prompt": 0.14, "completion": 0.28},
+        "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
     }
     assert kwargs["extra_headers"]["X-OpenRouter-Metadata"] == "enabled"
     assert "models" not in kwargs
@@ -361,8 +378,8 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
                 "prompt_tokens": 10,
                 "completion_tokens": 2,
                 "total_tokens": 12,
-                "cost": 0.00000196,
-                "cost_details": {"upstream_inference_cost": 0.00000196},
+                "cost": 0.00000096,
+                "cost_details": {"upstream_inference_cost": 0.00000096},
             },
         }
     )
@@ -370,23 +387,23 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
     details = model._process_provider_details(response)
 
     assert details is not None
-    assert details["openrouter_metadata"]["endpoints"]["available"][0]["provider"] == "Parasail"
-    assert details["openrouter_usage"]["cost"] == 0.00000196
+    assert details["openrouter_metadata"]["endpoints"]["available"][0]["provider"] == provider_name_for_model(spec)
+    assert details["openrouter_usage"]["cost"] == 0.00000096
     assert details["openrouter_usage"]["prompt_tokens"] == 10
 
 
-def test_pinned_parasail_upstream_preserves_model_usage_cost_and_selected_route() -> None:
+def test_manifest_pinned_upstream_preserves_model_usage_cost_and_selected_route() -> None:
     spec = _model_spec()
     provider_request = spec.routing.request_body(
         input_price=spec.input_cost_per_million_usd,
         output_price=spec.output_cost_per_million_usd,
     )["provider"]
     assert provider_request == {
-        "order": ["parasail"],
+        "order": spec.routing.order,
         "allow_fallbacks": False,
         "require_parameters": True,
         "quantizations": ["fp8"],
-        "max_price": {"prompt": 0.14, "completion": 0.28},
+        "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
     }
     response = ChatCompletion.model_validate(
         {
@@ -396,7 +413,7 @@ def test_pinned_parasail_upstream_preserves_model_usage_cost_and_selected_route(
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": _routing_metadata(spec),
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000096},
         }
     )
     model = OpenRouterChatModel(
@@ -436,21 +453,25 @@ def test_pinned_parasail_upstream_preserves_model_usage_cost_and_selected_route(
         secrets=(),
     )
 
-    assert outcome.provider_cost_usd == pytest.approx(0.00000196)
+    assert outcome.provider_cost_usd == pytest.approx(0.00000096)
     assert outcome.cost_source == "provider_response"
     assert outcome.routing_observed and outcome.routing_valid
     assert outcome.provider_evidence[0]["routing"]["endpoints"]["available"] == [
-        {"model": runner_module._expected_openrouter_canonical_slug(spec), "provider": "Parasail", "selected": True}
+        {
+            "model": runner_module._expected_openrouter_canonical_slug(spec),
+            "provider": provider_name_for_model(spec),
+            "selected": True,
+        }
     ]
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
-    assert not has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome, task)
 
 
 def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
     usage = {"prompt_tokens": 10, "completion_tokens": 2}
     if include_cost:
-        usage["cost"] = 0.00000196
+        usage["cost"] = 0.00000096
     return ModelResponse(
         parts=[TextPart(content="partial response")],
         usage=RequestUsage(input_tokens=10, output_tokens=2),
@@ -520,9 +541,9 @@ def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_meas
     assert outcome.failure_kind == failure_kind
     assert not outcome.success
     assert outcome.model_requests == 1
-    assert outcome.provider_cost_usd == pytest.approx(0.00000196)
-    assert has_measured_evidence(outcome)
-    assert valid_completed_outcome(outcome)
+    assert outcome.provider_cost_usd == pytest.approx(0.00000096)
+    assert has_measured_evidence(outcome, task)
+    assert valid_completed_outcome(outcome, task)
 
 
 def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
@@ -545,7 +566,7 @@ def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
 
     assert outcome.error == "provider usage/cost evidence was incomplete"
     assert outcome.failure_kind == "provider"
-    assert not has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome, task)
 
 
 @pytest.mark.asyncio
@@ -566,7 +587,7 @@ async def test_model_response_capture_survives_the_agent_request_boundary(monkey
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": _routing_metadata(spec),
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000096},
         }
     )
     monkeypatch.setattr(model, "_completions_create", AsyncMock(return_value=response))
@@ -582,7 +603,7 @@ async def test_model_response_capture_survives_the_agent_request_boundary(monkey
         MODEL_RESPONSES.reset(capture_token)
 
     assert captured == [result]
-    assert captured[0].provider_details["openrouter_usage"]["cost"] == 0.00000196
+    assert captured[0].provider_details["openrouter_usage"]["cost"] == 0.00000096
 
 
 def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> None:
@@ -1177,7 +1198,15 @@ def test_routing_evidence_binds_response_to_registered_canonical_endpoint(model_
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing_endpoint_snapshot", "wrong_provider", "wrong_tag", "wrong_quantization", "ambiguous_endpoint", "selected_endpoint_drift"],
+    [
+        "missing_endpoint_snapshot",
+        "wrong_provider",
+        "wrong_tag",
+        "wrong_quantization",
+        "missing_parameter",
+        "ambiguous_endpoint",
+        "selected_endpoint_drift",
+    ],
 )
 def test_routing_evidence_rejects_invalid_registered_endpoint(mutation: str) -> None:
     spec = _model_spec()
@@ -1188,17 +1217,20 @@ def test_routing_evidence_rejects_invalid_registered_endpoint(mutation: str) -> 
         registered_model["selected_endpoint"]["provider_name"] = "OtherProvider"
         registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["provider_name"] = "OtherProvider"
     elif mutation == "wrong_tag":
-        registered_model["selected_endpoint"]["tag"] = "parasail/fp4"
-        registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["tag"] = "parasail/fp4"
+        invalid_tag = f"{spec.routing.order[0]}/fp4"
+        registered_model["selected_endpoint"]["tag"] = invalid_tag
+        registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["tag"] = invalid_tag
     elif mutation == "wrong_quantization":
         registered_model["selected_endpoint"]["quantization"] = "fp4"
         registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["quantization"] = "fp4"
+    elif mutation == "missing_parameter":
+        registered_model["selected_endpoint"]["supported_parameters"].remove("tool_choice")
     elif mutation == "ambiguous_endpoint":
         registered_model["endpoint_snapshot"]["data"]["endpoints"].append(
             deepcopy(registered_model["selected_endpoint"])
         )
     else:
-        registered_model["selected_endpoint"]["name"] = "Parasail | unregistered/model"
+        registered_model["selected_endpoint"]["name"] = f"{provider_name_for_model(spec)} | unregistered/model"
 
     assert validate_routing_evidence(
         [{"model": spec.model_id, "routing": _routing_metadata(spec)}],

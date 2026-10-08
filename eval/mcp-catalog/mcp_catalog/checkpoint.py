@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from .contracts import ArmName, ContractModel, TaskLocale, hash_json
+from .contracts import ArmName, ContractModel, TaskLocale, TaskManifest, hash_json
 from .evidence import safe_json
 from .execution import TrialOutcome, has_measured_evidence
 
@@ -172,16 +172,16 @@ def timing_hash(timing: CheckpointTiming) -> str:
     return hash_json(timing.model_dump(mode="json"))
 
 
-def valid_completed_outcome(outcome: TrialOutcome) -> bool:
+def valid_completed_outcome(outcome: TrialOutcome, task: TaskManifest) -> bool:
     """Only measured successful or behavioral-failure trials are reusable."""
 
-    return has_measured_evidence(outcome)
+    return has_measured_evidence(outcome, task)
 
 
-def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
+def valid_smoke_outcome(outcome: TrialOutcome, task: TaskManifest) -> bool:
     return (
         outcome.error is None
-        and valid_completed_outcome(outcome)
+        and valid_completed_outcome(outcome, task)
         and len(outcome.provider_evidence) == outcome.model_requests
         and all(
             _smoke_response_has_usage(item, outcome.model_id)
@@ -211,8 +211,8 @@ def _smoke_response_has_usage(evidence: dict[str, object], model_id: str) -> boo
     )
 
 
-def status_for_outcome(outcome: TrialOutcome) -> TrialStatus:
-    return "completed" if valid_completed_outcome(outcome) else "failed"
+def status_for_outcome(outcome: TrialOutcome, task: TaskManifest) -> TrialStatus:
+    return "completed" if valid_completed_outcome(outcome, task) else "failed"
 
 
 class CheckpointStore:
@@ -224,6 +224,7 @@ class CheckpointStore:
         *,
         header: CheckpointHeader,
         expected_keys: dict[str, CheckpointKey],
+        expected_tasks: Mapping[str, TaskManifest],
         expected_smoke_cells: Mapping[str, tuple[SmokeModelClass, str, SmokeTransport]],
         secrets: tuple[str, ...] = (),
         continuation: dict[str, Any] | None = None,
@@ -232,6 +233,11 @@ class CheckpointStore:
         self.path = path
         self.header = header
         self.expected_keys = expected_keys
+        self.expected_tasks = dict(expected_tasks)
+        if not self.expected_tasks or not {
+            key.task_id for key in expected_keys.values()
+        } <= set(self.expected_tasks):
+            raise CheckpointError("checkpoint requires the registered task contracts")
         self.expected_smoke_cells = dict(expected_smoke_cells)
         self.secrets = secrets
         self.continuation = continuation
@@ -305,7 +311,7 @@ class CheckpointStore:
                 raise CheckpointError("continuation checkpoint source record digest does not match")
             if (
                 trial_record.status == "completed"
-                and not valid_completed_outcome(trial_record.outcome)
+                and not valid_completed_outcome(trial_record.outcome, self._task_for_outcome(trial_record.outcome))
                 and trial_record.outcome.failure_kind != "request_limit"
             ):
                 raise CheckpointError("continuation checkpoint contains an invalid completed trial")
@@ -320,7 +326,10 @@ class CheckpointStore:
                 smoke_record.outcome,
             ):
                 raise CheckpointError("continuation checkpoint smoke record digest does not match")
-            if smoke_record.status == "completed" and not valid_smoke_outcome(smoke_record.outcome):
+            if smoke_record.status == "completed" and not valid_smoke_outcome(
+                smoke_record.outcome,
+                self._task_for_outcome(smoke_record.outcome),
+            ):
                 raise CheckpointError(f"continuation checkpoint contains an invalid smoke cell: {cell_key}")
         if set(document.smoke_gate) != set(self.expected_smoke_cells) or document.smoke_status != "passed":
             raise CheckpointError("continuation checkpoint requires the complete parent smoke gate")
@@ -356,7 +365,7 @@ class CheckpointStore:
         record = self.document.records.get(checkpoint_key_digest(key))
         if record is None or record.status != "completed":
             return None
-        if not valid_completed_outcome(record.outcome):
+        if not valid_completed_outcome(record.outcome, self._task_for_key(key)):
             raise CheckpointError("checkpoint contains an invalid completed trial")
         return record.outcome
 
@@ -370,7 +379,7 @@ class CheckpointStore:
             return None
         if (
             record.status == "completed"
-            and not valid_completed_outcome(record.outcome)
+            and not valid_completed_outcome(record.outcome, self._task_for_key(key))
             and record.outcome.failure_kind != "request_limit"
         ):
             raise CheckpointError("checkpoint contains an invalid completed trial")
@@ -382,7 +391,7 @@ class CheckpointStore:
             return None
         if not self._smoke_cell_matches(cell_key, record):
             raise CheckpointError(f"checkpoint smoke cell identity does not match: {cell_key}")
-        if not valid_smoke_outcome(record.outcome):
+        if not valid_smoke_outcome(record.outcome, self._task_for_outcome(record.outcome)):
             raise CheckpointError(f"checkpoint contains an invalid completed smoke cell: {cell_key}")
         return record.outcome
 
@@ -408,8 +417,9 @@ class CheckpointStore:
         safe_outcome = self._safe_outcome(outcome)
         if not self._outcome_matches_key(safe_outcome, key):
             raise CheckpointError("trial outcome does not match its checkpoint key")
-        resolved_status = status or status_for_outcome(safe_outcome)
-        if resolved_status == "completed" and not valid_completed_outcome(safe_outcome):
+        task = self._task_for_key(key)
+        resolved_status = status or status_for_outcome(safe_outcome, task)
+        if resolved_status == "completed" and not valid_completed_outcome(safe_outcome, task):
             raise CheckpointError("a completed checkpoint trial must contain usage and routing evidence")
         digest = checkpoint_key_digest(key)
         existed = digest in self.document.records
@@ -459,8 +469,9 @@ class CheckpointStore:
             or safe_outcome.transport != transport
         ):
             raise CheckpointError("smoke outcome does not match its checkpoint cell")
-        resolved_status = status or status_for_outcome(safe_outcome)
-        if resolved_status == "completed" and not valid_smoke_outcome(safe_outcome):
+        task = self._task_for_outcome(safe_outcome)
+        resolved_status = status or status_for_outcome(safe_outcome, task)
+        if resolved_status == "completed" and not valid_smoke_outcome(safe_outcome, task):
             raise CheckpointError("a completed smoke checkpoint must contain usage and routing evidence")
         existed = cell_key in self.document.smoke_gate
         self.document.smoke_status = "in_progress"
@@ -563,7 +574,7 @@ class CheckpointStore:
                 raise CheckpointError("resume checkpoint trial outcome identity does not match its key")
             if (
                 trial_record.status == "completed"
-                and not valid_completed_outcome(trial_record.outcome)
+                and not valid_completed_outcome(trial_record.outcome, self._task_for_key(trial_record.key))
                 and not (self.continuation is not None and trial_record.outcome.failure_kind == "request_limit")
             ):
                 raise CheckpointError("resume checkpoint contains an invalid completed trial")
@@ -578,7 +589,10 @@ class CheckpointStore:
                 smoke_record.outcome,
             ):
                 raise CheckpointError("resume checkpoint smoke record digest does not match")
-            if smoke_record.status == "completed" and not valid_smoke_outcome(smoke_record.outcome):
+            if smoke_record.status == "completed" and not valid_smoke_outcome(
+                smoke_record.outcome,
+                self._task_for_outcome(smoke_record.outcome),
+            ):
                 raise CheckpointError(f"resume checkpoint contains an invalid completed smoke cell: {cell_key}")
         unknown_smoke = set(document.smoke_gate) - set(self.expected_smoke_cells)
         if unknown_smoke:
@@ -657,6 +671,19 @@ class CheckpointStore:
             raise CheckpointError("resume checkpoint trial key does not match its header")
         if key.task_corpus_hash != self.header.task_corpus_hash or key.arm != self.header.arm:
             raise CheckpointError("resume checkpoint trial key does not match its header")
+        self._task_for_key(key)
+
+    def _task_for_key(self, key: CheckpointKey) -> TaskManifest:
+        task = self.expected_tasks.get(key.task_id)
+        if task is None or task.locale != key.locale:
+            raise CheckpointError("checkpoint trial key does not match its registered task")
+        return task
+
+    def _task_for_outcome(self, outcome: TrialOutcome) -> TaskManifest:
+        task = self.expected_tasks.get(outcome.task_id)
+        if task is None or task.locale != outcome.locale:
+            raise CheckpointError("checkpoint outcome does not match its registered task")
+        return task
 
     @staticmethod
     def _outcome_matches_key(outcome: TrialOutcome, key: CheckpointKey) -> bool:
