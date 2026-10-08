@@ -74,6 +74,36 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
     )
 
 
+def test_missing_one_of_action_branch_is_rejected_by_compare_admission() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    catalog_key = "http:default"
+    catalog = CatalogSnapshot.model_validate(candidate["catalogs"][catalog_key])
+    tools = deepcopy(catalog.tools)
+    identity_tool = next(tool for tool in tools if tool.get("name") == "akb_identity")
+    identity_tool["inputSchema"]["oneOf"] = [
+        branch
+        for branch in identity_tool["inputSchema"]["oneOf"]
+        if branch["properties"]["action"]["const"] != "whoami"
+    ]
+    updated_catalog = CatalogSnapshot.model_validate(
+        {
+            **catalog.model_dump(mode="json"),
+            "tools": tools,
+            "catalog_hash": hash_json(tools),
+            "catalog_token_estimate": token_estimate(tools),
+        }
+    ).model_dump(mode="json")
+    candidate["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    candidate["pre_smoke_seal_inputs"]["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "redesign"
+    assert result["gate"]["checks"]["logical_function_omissions_zero"] is False
+    assert any("candidate catalog action akb_identity:whoami" in item for item in result["gate"]["logical_function_omissions"])
+
+
 def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() -> None:
     pairs = list(dict.fromkeys(task.pair_id for task in load_task_corpus(ROOT / "corpus" / "tasks.json")))
     baseline, candidate = complete_paired_artifacts(

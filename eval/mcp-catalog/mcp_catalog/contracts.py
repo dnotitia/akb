@@ -9,6 +9,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Literal
 
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 PROTOCOL_REVISION = "2026-07-28"
@@ -1279,13 +1281,48 @@ def validate_public_catalog(
             continue
         tool = by_name.get(route.tool, {})
         schema = tool.get("inputSchema", tool.get("input_schema", {}))
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        action_schema = properties.get("action", {}) if isinstance(properties, dict) else {}
-        allowed = action_schema.get("enum") if isinstance(action_schema, dict) else None
-        if not isinstance(allowed, list) or route.action not in allowed:
+        if not isinstance(schema, dict) or not _input_schema_exposes_action(schema, route.action):
             raise ValueError(
                 f"{arm} catalog action {route.tool}:{route.action} is missing from the public input schema"
             )
+
+
+def _input_schema_exposes_action(schema: dict[str, Any], action: str) -> bool:
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+
+    properties = schema.get("properties")
+    action_schema = properties.get("action") if isinstance(properties, dict) else None
+    enum_declared = isinstance(action_schema, dict) and "enum" in action_schema
+    if enum_declared and not validator_type(action_schema).is_valid(action):
+        return False
+
+    if "oneOf" not in schema:
+        return enum_declared
+
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or not branches:
+        return False
+    matching_branches = 0
+    for branch in branches:
+        if not isinstance(branch, dict) or branch.get("type") != "object":
+            return False
+        required = branch.get("required")
+        branch_properties = branch.get("properties")
+        branch_action = branch_properties.get("action") if isinstance(branch_properties, dict) else None
+        if (
+            not isinstance(required, list)
+            or "action" not in required
+            or not isinstance(branch_action, dict)
+            or "const" not in branch_action
+        ):
+            return False
+        if validator_type(branch_action).is_valid(action):
+            matching_branches += 1
+    return matching_branches == 1
 
 
 def canonical_json(value: Any) -> str:

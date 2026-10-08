@@ -840,7 +840,18 @@ def _catalog_snapshot(manifest: Any, arm: str, transport: str) -> CatalogSnapsho
     for name, selectors in sorted(actions.items()):
         schema: dict[str, Any] = {"type": "object", "properties": {}}
         if selectors:
-            schema["properties"]["action"] = {"type": "string", "enum": sorted(selectors)}
+            schema = {
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"action": {"type": "string", "const": action}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    }
+                    for action in sorted(selectors)
+                ],
+            }
         tools.append({"name": name, "description": "synthetic catalog contract fixture", "inputSchema": schema})
     revision = manifest.arm_source_revisions[arm]
     return CatalogSnapshot(

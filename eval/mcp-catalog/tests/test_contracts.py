@@ -16,9 +16,60 @@ from mcp_catalog.contracts import (
     load_tool_coverage,
     source_blind_violations_for,
     token_estimate,
+    validate_public_catalog,
 )
 
 ROOT = Path(__file__).parents[1]
+
+
+def _public_catalog_with_action_selectors(
+    *,
+    selector_form: str,
+    missing_action: tuple[str, str] | None = None,
+) -> CatalogSnapshot:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    arm = "candidate"
+    transport = "http"
+    grouped_routes: dict[str, list[str | None]] = {}
+    for operation in manifest.public_operations:
+        if transport not in operation.transports:
+            continue
+        route = getattr(operation, arm)
+        grouped_routes.setdefault(route.tool, []).append(route.action)
+
+    tools = []
+    for name, actions in sorted(grouped_routes.items()):
+        registered_actions = [action for action in actions if action is not None]
+        if not registered_actions:
+            schema = {"type": "object", "properties": {}}
+        elif selector_form == "enum":
+            schema = {
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": registered_actions}},
+            }
+        else:
+            branches = [
+                {
+                    "type": "object",
+                    "properties": {"action": {"type": "string", "const": action}},
+                    "required": ["action"],
+                    "additionalProperties": False,
+                }
+                for action in registered_actions
+                if missing_action != (name, action)
+            ]
+            schema = {"type": "object", "oneOf": branches}
+        tools.append({"name": name, "inputSchema": schema})
+
+    return CatalogSnapshot(
+        transport=transport,
+        source_revision=manifest.arm_source_revisions[arm],
+        artifact_version="test",
+        tool_count=len(tools),
+        catalog_hash=hash_json(tools),
+        catalog_token_estimate=token_estimate(tools),
+        tools=tools,
+    )
 
 
 def test_registered_manifest_and_corpus_cover_every_category() -> None:
@@ -183,3 +234,28 @@ def test_catalog_snapshot_rejects_tampered_hash() -> None:
             catalog_token_estimate=token_estimate(tools),
             tools=tools,
         )
+
+
+def test_public_catalog_accepts_grouped_one_of_const_actions() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(selector_form="oneOf")
+
+    validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_public_catalog_rejects_missing_grouped_one_of_action_branch() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(
+        selector_form="oneOf",
+        missing_action=("akb_identity", "whoami"),
+    )
+
+    with pytest.raises(ValueError, match="candidate catalog action akb_identity:whoami"):
+        validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_public_catalog_still_accepts_top_level_action_enum() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(selector_form="enum")
+
+    validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
