@@ -1,9 +1,5 @@
 {
   "source": "attempt03 baseline/candidate raw run state_observations_after[0]",
-  "source_artifacts": {
-    "baseline": "d59d990d69d97df40d0fa91bad118da49341c9d1708edb7a2a2f335b151c8fc9",
-    "candidate": "1e918653a13a2152da3067806aa275fd694a098e13b4ea9bc2035ef030777e60"
-  },
   "rows": [
     {
       "arm": "baseline",
