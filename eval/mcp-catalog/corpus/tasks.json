@@ -1068,7 +1068,10 @@
               "pointer": "/items",
               "operator": "contains",
               "value": {
-                "name": "imported.md"
+                "type": "document",
+                "name": "imported.md",
+                "path": "notes/imported.md",
+                "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
               }
             }
           ],
@@ -1082,11 +1085,44 @@
               "must": [
                 {
                   "pointer": "/files/notes~1imported.md",
-                  "operator": "equals",
-                  "value": "---\ntype: note\n---\n# Imported\nportable"
+                  "operator": "okf_document",
+                  "value": {
+                    "type": "note",
+                    "resource_uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+                    "body": "# Imported\nportable"
+                  }
                 }
               ],
               "before_expected_status": 404
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/documents/catalog-bench-io/notes/imported.md"
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/path",
+                  "operator": "equals",
+                  "value": "notes/imported.md"
+                },
+                {
+                  "pointer": "/uri",
+                  "operator": "equals",
+                  "value": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+                },
+                {
+                  "pointer": "/content",
+                  "operator": "equals",
+                  "value": "# Imported\nportable"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "nonempty"
+                }
+              ]
             }
           ]
         }

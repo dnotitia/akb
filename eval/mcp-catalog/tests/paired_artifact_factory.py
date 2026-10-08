@@ -731,6 +731,16 @@ def _apply_expectation(payload: dict[str, Any], expectation: Any, *, satisfied: 
             _remove_pointer(payload, expectation.pointer)
         elif expectation.operator == "exists":
             _set_pointer(payload, expectation.pointer, "synthetic-present")
+        elif expectation.operator == "nonempty":
+            _set_pointer(payload, expectation.pointer, "synthetic-present")
+        elif expectation.operator == "okf_document":
+            value = expectation.value
+            _set_pointer(
+                payload,
+                expectation.pointer,
+                f"---\ntype: {value['type']}\nresource: {value['resource_uri']}\n"
+                f"akb_uri: {value['resource_uri']}\n---\n\n{value['body']}\n",
+            )
         elif expectation.operator == "contains":
             _set_pointer(payload, expectation.pointer, [deepcopy(expectation.value)])
         elif expectation.operator == "not_contains":
@@ -742,6 +752,10 @@ def _apply_expectation(payload: dict[str, Any], expectation: Any, *, satisfied: 
         _remove_pointer(payload, expectation.pointer)
     elif expectation.operator == "exists":
         _set_pointer(payload, expectation.pointer, "synthetic-present")
+    elif expectation.operator == "nonempty":
+        _set_pointer(payload, expectation.pointer, "")
+    elif expectation.operator == "okf_document":
+        _set_pointer(payload, expectation.pointer, "---\ntype: invalid\n---\n\nwrong body\n")
     elif expectation.operator == "not_contains":
         _set_pointer(payload, expectation.pointer, deepcopy(expectation.value))
     else:

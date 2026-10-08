@@ -183,13 +183,31 @@ class StateProbe(ContractModel):
 
 class StateExpectation(ContractModel):
     pointer: str = Field(pattern=JSON_POINTER_RE.pattern)
-    operator: Literal["equals", "contains", "not_contains", "exists"]
+    operator: Literal["equals", "contains", "not_contains", "exists", "nonempty", "okf_document"]
     value: JsonValue = None
 
     @model_validator(mode="after")
     def validate_value(self) -> StateExpectation:
         if self.operator == "exists" and not isinstance(self.value, bool):
             raise ValueError("exists expectations require a boolean value")
+        if self.operator == "nonempty" and self.value is not None:
+            raise ValueError("nonempty expectations do not accept a value")
+        if self.operator == "okf_document":
+            fields = {"type", "resource_uri", "body"}
+            if not isinstance(self.value, dict) or set(self.value) != fields:
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            document_type = self.value["type"]
+            resource_uri = self.value["resource_uri"]
+            body = self.value["body"]
+            if (
+                not isinstance(document_type, str)
+                or not document_type
+                or not isinstance(resource_uri, str)
+                or not resource_uri.startswith("akb://")
+                or not isinstance(body, str)
+            ):
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            return self
         if self.operator in {"equals", "contains", "not_contains"} and self.value is None:
             raise ValueError(f"{self.operator} expectations require value")
         return self

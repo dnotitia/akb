@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+import yaml  # type: ignore[import-untyped]
 
 from .contracts import StateCheckpointContract, StateContract, StateExpectation, StateExpectationSet
 from .runtime import StateObservation
 
 MISSING = object()
+_OKF_FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,10 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
         return (actual is not MISSING) is bool(expectation.value)
     if actual is MISSING:
         return False
+    if expectation.operator == "nonempty":
+        return isinstance(actual, str) and bool(actual.strip())
+    if expectation.operator == "okf_document":
+        return _matches_okf_document(actual, expectation.value)
     if expectation.operator == "equals":
         return actual == expectation.value
     if expectation.operator == "contains":
@@ -58,6 +66,31 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
     if expectation.operator == "not_contains":
         return not recursively_contains(actual, expectation.value)
     raise AssertionError(f"unknown state operator: {expectation.operator}")
+
+
+def _matches_okf_document(actual: Any, expected: Any) -> bool:
+    if not isinstance(actual, str) or not isinstance(expected, dict):
+        return False
+    match = _OKF_FRONTMATTER.match(actual)
+    if match is None:
+        return False
+    try:
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    resource_uri = expected.get("resource_uri")
+    if (
+        metadata.get("type") != expected.get("type")
+        or metadata.get("resource") != resource_uri
+        or metadata.get("akb_uri") != resource_uri
+    ):
+        return False
+    body = actual[match.end():].replace("\r\n", "\n")
+    if not body.startswith("\n") or not body.endswith("\n"):
+        return False
+    return body[1:-1] == expected.get("body")
 
 
 def evaluate_state_contract(

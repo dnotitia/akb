@@ -29,6 +29,7 @@ dependencies = [
     { name = "mcp-types" },
     { name = "pydantic-ai-slim", extra = ["mcp", "openai"] },
     { name = "pydantic-evals" },
+    { name = "pyyaml" },
     { name = "scipy" },
 ]
 
@@ -55,6 +56,7 @@ requires-dist = [
     { name = "pydantic-evals", specifier = "==2.41.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.3" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "==1.3.0" },
+    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.16" },
     { name = "scipy", specifier = "==1.18.1" },
 ]

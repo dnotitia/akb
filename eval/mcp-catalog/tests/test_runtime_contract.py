@@ -246,11 +246,36 @@ def test_task_state_probes_use_observed_absence_and_supported_read_paths() -> No
 
     for task_id in ("import-export-ko", "import-export-en"):
         observations = tasks[task_id].expected_final_state.observation_sets
+        assert len(observations) == 3
+        browse = observations[0]
+        assert ("/items", "contains", {
+            "type": "document",
+            "name": "imported.md",
+            "path": "notes/imported.md",
+            "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+        }) in [(item.pointer, item.operator, item.value) for item in browse.must]
         export = next(item for item in observations if "/export?format=okf&as=json" in item.probe.path)
         assert export.resolved_before_expected_status == 404
         assert export.probe.expected_status == 200
-        assert [(item.pointer, item.operator) for item in export.must] == [
-            ("/files/notes~1imported.md", "equals")
+        assert [(item.pointer, item.operator, item.value) for item in export.must] == [
+            (
+                "/files/notes~1imported.md",
+                "okf_document",
+                {
+                    "type": "note",
+                    "resource_uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+                    "body": "# Imported\nportable",
+                },
+            )
+        ]
+        document = next(item for item in observations if "/documents/catalog-bench-io/notes/imported.md" in item.probe.path)
+        assert document.probe.path == "/api/v1/documents/catalog-bench-io/notes/imported.md"
+        assert document.resolved_before_expected_status == 404
+        assert [(item.pointer, item.operator, item.value) for item in document.must] == [
+            ("/path", "equals", "notes/imported.md"),
+            ("/uri", "equals", "akb://catalog-bench-io/coll/notes/doc/imported.md"),
+            ("/content", "equals", "# Imported\nportable"),
+            ("/current_commit", "nonempty", None),
         ]
 
     for task_id in ("collection-relation-lifecycle-ko", "collection-relation-lifecycle-en"):

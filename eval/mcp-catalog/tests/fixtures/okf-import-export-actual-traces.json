@@ -1,0 +1,42 @@
+[
+  {
+    "cell": "baseline:primary:http",
+    "export_paths": [
+      "notes/imported.md"
+    ],
+    "exported_document": "---\ntype: note\ntitle: imported\ndescription: portable\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\ntimestamp: '2026-10-08T11:08:57.459160+00:00'\nstatus: draft\ncreated_at: '2026-10-08T11:08:57.459160+00:00'\nakb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable\n",
+    "document_path": "/api/v1/documents/catalog-bench-io/notes/imported.md",
+    "document_content": "# Imported\nportable",
+    "revision_nonempty": true
+  },
+  {
+    "cell": "baseline:primary:stdio",
+    "export_paths": [
+      "notes/imported.md"
+    ],
+    "exported_document": "---\ntype: note\ntitle: imported\ndescription: portable\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\ntimestamp: '2026-10-08T11:09:12.747560+00:00'\nstatus: draft\ncreated_at: '2026-10-08T11:09:12.747560+00:00'\nakb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable\n",
+    "document_path": "/api/v1/documents/catalog-bench-io/notes/imported.md",
+    "document_content": "# Imported\nportable",
+    "revision_nonempty": true
+  },
+  {
+    "cell": "candidate:primary:http",
+    "export_paths": [
+      "notes/imported.md"
+    ],
+    "exported_document": "---\ntype: note\ntitle: imported\ndescription: portable\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\ntimestamp: '2026-10-08T11:09:26.697198+00:00'\nstatus: draft\ncreated_at: '2026-10-08T11:09:26.697198+00:00'\nakb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable\n",
+    "document_path": "/api/v1/documents/catalog-bench-io/notes/imported.md",
+    "document_content": "# Imported\nportable",
+    "revision_nonempty": true
+  },
+  {
+    "cell": "candidate:primary:stdio",
+    "export_paths": [
+      "notes/imported.md"
+    ],
+    "exported_document": "---\ntype: note\ntitle: imported\ndescription: portable\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\ntimestamp: '2026-10-08T11:09:41.322720+00:00'\nstatus: draft\ncreated_at: '2026-10-08T11:09:41.322720+00:00'\nakb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable\n",
+    "document_path": "/api/v1/documents/catalog-bench-io/notes/imported.md",
+    "document_content": "# Imported\nportable",
+    "revision_nonempty": true
+  }
+]

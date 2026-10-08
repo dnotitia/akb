@@ -149,12 +149,17 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
         imported_files = import_attempt.arguments["files"]
         assert isinstance(imported_files, dict)
         imported_text = imported_files["notes/imported.md"]
-        exported_text = task.expected_final_state.additional_observations[0].must[0].value
+        export = task.expected_final_state.additional_observations[0].must[0]
+        exported_text = export.value
         assert isinstance(imported_text, str)
-        assert isinstance(exported_text, str)
-        assert exported_text == imported_text
-        assert "\n" in exported_text
-        assert "\\n" not in exported_text
+        assert isinstance(exported_text, dict)
+        assert imported_text == "---\ntype: note\n---\n# Imported\nportable"
+        assert export.operator == "okf_document"
+        assert exported_text == {
+            "type": "note",
+            "resource_uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+            "body": "# Imported\nportable",
+        }
 
 
 def test_manifest_rejects_expanded_public_operation_drift() -> None:
