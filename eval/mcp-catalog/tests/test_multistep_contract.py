@@ -165,8 +165,8 @@ def test_multistep_pair_declares_semantic_sequence_without_legacy_tool_lock_in()
 
     assert len(tasks) == 2
     assert {task.locale for task in tasks} == {"ko-KR", "en-US"}
-    assert len(all_tasks) == 26
-    assert len(manifest.pair_categories) == 13
+    assert len(all_tasks) == 40
+    assert len(manifest.pair_categories) == 20
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
     for task in tasks:
         assert [attempt.logical_operation for attempt in task.expected_material_attempts] == [

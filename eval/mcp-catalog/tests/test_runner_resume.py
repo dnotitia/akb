@@ -7,10 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 import mcp_catalog.runner as runner_module
-from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
-from mcp_catalog.execution import TrialOutcome
+from mcp_catalog.contracts import load_run_manifest, load_task_corpus
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -21,7 +22,7 @@ class _RunResolver:
         self.refreshes = 0
 
     def required_profiles(self, _tasks):
-        return ["default"]
+        return sorted({task.fixture.credential_profile for task in _tasks})
 
     async def prepare(self, _fixture, _profiles) -> None:
         return None
@@ -73,6 +74,11 @@ class _Report:
         self.cases = [SimpleNamespace(output=outcome) for outcome in outcomes]
 
 
+def _empty_state_payload(task) -> dict | list[dict]:
+    payloads = [{} for _item in task.expected_final_state.observation_sets]
+    return payloads[0] if len(payloads) == 1 else payloads
+
+
 def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
     model_id = executor.model_spec.model_id
     return TrialOutcome(
@@ -85,7 +91,17 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         transport=executor.transport,
         repeat_index=repeat_index,
         final_answer_text="완료",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="fixture_tool",
+                logical_operation="search",
+                transport_succeeded=True,
+                server_succeeded=True,
+            )
+        ],
         successful_mcp_tool_calls=1,
+        first_logical_operation="search",
         follow_up_terminal_response=True,
         input_tokens=10,
         output_tokens=2,
@@ -95,7 +111,7 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         provider_evidence=[
             {
                 "model": model_id,
-                "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}},
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
             for _ in range(2)
@@ -104,6 +120,28 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before=_empty_state_payload(task),
+        state_after=_empty_state_payload(task),
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
 
 
@@ -131,7 +169,7 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     async def fake_preflight(_self):
         return {
             "runtime": {
-                "source_revision": "a" * 40,
+                "source_revision": manifest.arm_source_revisions["baseline"],
                 "artifact_versions": {
                     "backend_artifact_version": "0.0.0",
                     "proxy_artifact_version": "0.0.0",
@@ -142,15 +180,11 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
         }
 
     async def fake_capture(*_args, **_kwargs):
-        tools = []
-        return CatalogSnapshot(
-            transport=_kwargs["transport"],
-            source_revision="a" * 40,
-            artifact_version="0.0.0",
-            tool_count=0,
-            catalog_hash=hash_json(tools),
-            catalog_token_estimate=token_estimate(tools),
-            tools=tools,
+        return _catalog_snapshot(manifest, "baseline", _kwargs["transport"]).model_copy(
+            update={
+                "source_revision": _kwargs["source_revision"],
+                "artifact_version": _kwargs["artifact_version"],
+            }
         )
 
     async def fake_smoke(task, *, model_spec, transport, **_kwargs):
@@ -176,6 +210,11 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
 
     monkeypatch.setattr(runner_module, "RuntimeFixture", _RunFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
+    async def fake_provider_registry(self, _ledger):
+        self.provider_registry = provider_registry_snapshot(manifest)
+        return self.provider_registry
+
+    monkeypatch.setattr(BenchmarkRunner, "_capture_provider_registry", fake_provider_registry)
     monkeypatch.setattr(runner_module, "capture_catalog", fake_capture)
     monkeypatch.setattr(runner_module, "build_model", lambda spec: SimpleNamespace(settings={}, model_spec=spec))
     monkeypatch.setattr(runner_module, "execute_smoke", fake_smoke)
@@ -185,10 +224,10 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     first = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", checkpoint_path=checkpoint)
     first_artifact = await first.run()
     assert first_artifact["status"] == "complete"
-    assert first_artifact["completed_trials"] == 200
-    assert first_artifact["checkpoint"]["new_trials"] == 200
+    assert first_artifact["completed_trials"] == 304
+    assert first_artifact["checkpoint"]["new_trials"] == 304
     assert first_artifact["checkpoint"]["reused_trials"] == 0
-    assert first_artifact["locale_counts"] == {"en-US": 13, "ko-KR": 13}
+    assert first_artifact["locale_counts"] == {"en-US": 20, "ko-KR": 20}
     assert set(first_artifact["locale_metrics"]) == {"en-US", "ko-KR"}
     assert first_artifact["artifact_hash_input"]["task_locales"][0]["locale"] == tasks[0].locale
     assert first_artifact["runs"]["primary:http"]["locale_metrics"]
@@ -201,9 +240,9 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     second_artifact = await second.run()
 
     assert second_artifact["status"] == "complete"
-    assert second_artifact["completed_trials"] == 200
+    assert second_artifact["completed_trials"] == 304
     assert second_artifact["checkpoint"]["new_trials"] == 0
-    assert second_artifact["checkpoint"]["reused_trials"] == 200
+    assert second_artifact["checkpoint"]["reused_trials"] == 304
     assert second_artifact["checkpoint"]["rerun_trials"] == 0
     assert smoke_calls == []
     assert evaluation_calls == []

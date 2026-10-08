@@ -107,7 +107,7 @@ Transport = Literal["http", "stdio"]
 ArmName = Literal["baseline", "candidate"]
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
-EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 8, "en-US": 8}
+EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 20, "en-US": 20}
 EXPECTED_PAIR_CATEGORIES: dict[str, Category] = {
     "read-vaults": "single_operation",
     "create-vault": "single_operation",
@@ -119,6 +119,10 @@ EXPECTED_PAIR_CATEGORIES: dict[str, Category] = {
     "stdio-local": "stdio_local",
 }
 PAIR_ID_RE = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
+
+
+def _is_git_revision(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{40}", value) is not None
 
 
 def default_transports() -> list[Transport]:
@@ -145,14 +149,34 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class StateProbeResultBinding(ContractModel):
+    source_attempt: int = Field(ge=1)
+    source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    transform: Literal["document_asset_id_from_url", "publication_slug", "uri_query"]
+
+
 class StateProbe(ContractModel):
     """A read-only state endpoint owned by the runtime or application."""
 
     service: Literal["app", "fixture"]
     method: Literal["GET", "POST"] = "GET"
-    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&-]*$")
+    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&:%-]*$")
     body: dict[str, JsonValue] | None = None
     expected_status: int = Field(default=200, ge=100, le=599)
+    result_binding: StateProbeResultBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_result_binding(self) -> StateProbe:
+        marker = {
+            "document_asset_id_from_url": "{asset_id}",
+            "publication_slug": "{slug}",
+            "uri_query": "{uri}",
+        }
+        if self.result_binding is None and any(item in self.path for item in marker.values()):
+            raise ValueError("state probe path templates require a result binding")
+        if self.result_binding is not None and self.path.count(marker[self.result_binding.transform]) != 1:
+            raise ValueError("state probe path must contain the single placeholder required by its binding")
+        return self
 
 
 class StateExpectation(ContractModel):
@@ -169,9 +193,12 @@ class StateExpectation(ContractModel):
         return self
 
 
-class StateContract(ContractModel):
+class StateExpectationSet(ContractModel):
     probe: StateProbe
     before_expected_status: int | None = Field(default=None, ge=100, le=599)
+    check_before: bool = True
+    before_must: list[StateExpectation] = Field(default_factory=list)
+    before_must_not: list[StateExpectation] = Field(default_factory=list)
     must: list[StateExpectation] = Field(default_factory=list)
     must_not: list[StateExpectation] = Field(default_factory=list)
     unchanged: list[str] = Field(default_factory=list)
@@ -187,6 +214,22 @@ class StateContract(ContractModel):
             if JSON_POINTER_RE.fullmatch(value) is None:
                 raise ValueError(f"invalid JSON pointer: {value}")
         return values
+
+
+class StateCheckpointContract(ContractModel):
+    after_attempt: int = Field(ge=1)
+    probe: StateProbe
+    must: list[StateExpectation] = Field(default_factory=list)
+    must_not: list[StateExpectation] = Field(default_factory=list)
+
+
+class StateContract(StateExpectationSet):
+    additional_observations: list[StateExpectationSet] = Field(default_factory=list, max_length=8)
+    checkpoints: list[StateCheckpointContract] = Field(default_factory=list, max_length=8)
+
+    @property
+    def observation_sets(self) -> list[StateExpectationSet]:
+        return [self, *self.additional_observations]
 
 
 class FixtureContract(ContractModel):
@@ -329,6 +372,7 @@ class ExpectedMaterialAttempt(ContractModel):
     resource_type: ResourceType | None = None
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     local_file_arguments: dict[str, str] = Field(default_factory=dict)
+    capture_result_fields: list[str] = Field(default_factory=list)
     outcome: Literal["success", "permission_denied", "rejected"]
     status_code: int | None = Field(default=None, ge=100, le=599)
     error_code: str | None = None
@@ -359,6 +403,15 @@ class ExpectedMaterialAttempt(ContractModel):
             raise ValueError("local file arguments must map fields to file names")
         return values
 
+    @field_validator("capture_result_fields")
+    @classmethod
+    def validate_capture_result_fields(cls, values: list[str]) -> list[str]:
+        if any(re.fullmatch(r"^[A-Za-z][A-Za-z0-9_]*$", value) is None for value in values):
+            raise ValueError("captured result fields must be identifier names")
+        if len(set(values)) != len(values):
+            raise ValueError("captured result fields must be unique")
+        return values
+
 
 class ExpectedResultBinding(ContractModel):
     source_attempt: int = Field(ge=1)
@@ -376,15 +429,17 @@ class ExpectedResultBinding(ContractModel):
 
 class ProviderRouting(ContractModel):
     order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
-    allow_fallbacks: Literal[True] = True
+    allow_fallbacks: Literal[False] = False
     require_parameters: Literal[True] = True
+    quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
     def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
         return {
             "provider": {
                 "order": ["parasail"],
-                "allow_fallbacks": True,
+                "allow_fallbacks": False,
                 "require_parameters": True,
+                "quantizations": ["fp8"],
                 "max_price": {"prompt": input_price, "completion": output_price},
             }
         }
@@ -566,6 +621,38 @@ class TaskManifest(ContractModel):
             if target_key in binding_targets:
                 raise ValueError("material result binding targets must be unique")
             binding_targets.add(target_key)
+        captured_fields = {
+            (index, field_name)
+            for index, attempt in enumerate(self.expected_material_attempts, start=1)
+            for field_name in attempt.capture_result_fields
+        } | {
+            (binding.source_attempt, binding.source_field)
+            for binding in self.expected_result_bindings
+        }
+        for observation in self.expected_final_state.observation_sets:
+            probe_binding = observation.probe.result_binding
+            if probe_binding is not None and observation.check_before:
+                raise ValueError("result-bound state probes can only be checked after their source attempt")
+            if probe_binding is not None and (
+                probe_binding.source_attempt > len(self.expected_material_attempts)
+                or (probe_binding.source_attempt, probe_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state probes must bind a captured result from an expected material attempt")
+        for checkpoint in self.expected_final_state.checkpoints:
+            checkpoint_binding = checkpoint.probe.result_binding
+            if checkpoint_binding is not None and checkpoint_binding.source_attempt > checkpoint.after_attempt:
+                raise ValueError("state checkpoint bindings must reference an earlier material result")
+            if checkpoint_binding is not None and (
+                checkpoint_binding.source_attempt > len(self.expected_material_attempts)
+                or (checkpoint_binding.source_attempt, checkpoint_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state checkpoints must bind a captured material result")
+        checkpoint_attempts = [item.after_attempt for item in self.expected_final_state.checkpoints]
+        if (
+            len(set(checkpoint_attempts)) != len(checkpoint_attempts)
+            or any(index > len(self.expected_material_attempts) for index in checkpoint_attempts)
+        ):
+            raise ValueError("state checkpoints must reference unique expected material attempts")
         if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
             raise ValueError("expected material arguments must be material operations")
         if not set(self.required_attempted_operations) <= set(expected_operations):
@@ -628,6 +715,15 @@ class ToolCoverageMatrix(ContractModel):
             missing = sorted(registered_tools - matrix_tools)
             extra = sorted(matrix_tools - registered_tools)
             raise ValueError(f"coverage matrix/catalog mismatch: missing={missing}, extra={extra}")
+        declared_transport = {item.operation: set(item.transports) for item in manifest.public_operations}
+        mismatched = [
+            entry.tool
+            for entry in self.entries
+            if set(("http", "stdio") if entry.transport == "both" else (entry.transport,))
+            != declared_transport[entry.tool]
+        ]
+        if mismatched:
+            raise ValueError(f"coverage transports do not match the public operation contract: {sorted(mismatched)}")
 
 
 class LocalizedTaskDefinition(ContractModel):
@@ -678,8 +774,9 @@ class ModelSpec(ContractModel):
     @model_validator(mode="after")
     def validate_openrouter_model(self) -> ModelSpec:
         expected_model = OPENROUTER_CLASSES[self.class_name]
-        if self.model_id != expected_model or self.version != expected_model:
-            raise ValueError(f"{self.class_name} model/version must be pinned to {expected_model}")
+        expected_version = {"primary": "20260731", "lightweight": "20260814"}[self.class_name]
+        if self.model_id != expected_model or self.version != expected_version:
+            raise ValueError(f"{self.class_name} alias/version must be pinned to {expected_model}@{expected_version}")
         if self.base_url_env != OPENROUTER_BASE_URL_ENV or self.provider_key_env != OPENROUTER_PROVIDER_KEY_ENV:
             raise ValueError("OpenRouter model credentials must use the declared environment names")
         expected_prices = OPENROUTER_PRICE_CEILINGS[self.model_id]
@@ -713,11 +810,39 @@ class Budget(ContractModel):
 
 
 class StatisticalProcedure(ContractModel):
-    method: Literal["paired_task_mean_normal_approximation"]
+    method: Literal["paired_cluster_bca_bootstrap"]
+    implementation: Literal["scipy==1.18.1"] = "scipy==1.18.1"
     confidence: float = Field(default=0.95, gt=0, lt=1)
     noninferiority_margin: float = Field(default=0.03, ge=0, lt=1)
-    repeated_trials_are_averaged_per_task: Literal[True] = True
-    z_value: float = Field(default=1.644854, gt=0)
+    resamples: Literal[20000] = 20000
+    seed: Literal[358] = 358
+    cluster: Literal["pair_id"] = "pair_id"
+    paired: Literal[True] = True
+    cluster_weight: Literal["equal"] = "equal"
+    resampling: Literal["BCa"] = "BCa"
+
+
+class ArmOperationRoute(ContractModel):
+    tool: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    action: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+class PublicOperation(ContractModel):
+    """One stable logical operation and its physical public-tool route in each arm."""
+
+    operation: str = Field(pattern=r"^akb_[a-z0-9_]+$")
+    logical_operation: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    resource_type: ResourceType
+    transports: list[Transport] = Field(min_length=1)
+    baseline: ArmOperationRoute
+    candidate: ArmOperationRoute
+
+    @field_validator("transports")
+    @classmethod
+    def unique_transports(cls, values: list[Transport]) -> list[Transport]:
+        if len(set(values)) != len(values):
+            raise ValueError("public operation transports must be unique")
+        return values
 
 
 class ProviderSensitivity(ContractModel):
@@ -730,6 +855,7 @@ class BenchmarkRunManifest(ContractModel):
     name: str = Field(min_length=1, max_length=100)
     protocol_revision: Literal["2026-07-28"] = "2026-07-28"
     source_revision: str = Field(min_length=1, max_length=200)
+    arm_source_revisions: dict[ArmName, str]
     arms: list[ArmName] = Field(default_factory=default_arms)
     transports: list[Transport] = Field(default_factory=default_transports)
     models: list[ModelSpec] = Field(min_length=2)
@@ -748,11 +874,23 @@ class BenchmarkRunManifest(ContractModel):
     budget: Budget
     operation_map: dict[str, list[str]]
     tool_resources: dict[str, ResourceType]
+    candidate_route_overrides: dict[str, ArmOperationRoute] = Field(default_factory=dict)
+    public_operations: list[PublicOperation] = Field(default_factory=list)
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
     locales: list[TaskLocale] = Field(default_factory=default_locales)
     locale_counts: dict[TaskLocale, int] = Field(default_factory=default_locale_counts)
     pair_categories: dict[str, Category] = Field(default_factory=default_pair_categories)
+
+    @field_validator("arm_source_revisions", mode="before")
+    @classmethod
+    def normalize_git_revision_prefix(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        return {
+            arm: revision.removeprefix("git:") if isinstance(revision, str) else revision
+            for arm, revision in values.items()
+        }
 
     @field_validator("arms", "transports")
     @classmethod
@@ -854,6 +992,64 @@ class BenchmarkRunManifest(ContractModel):
         duplicates = [tool for tool, count in Counter(tool for tools in self.operation_map.values() for tool in tools).items() if count > 1]
         if duplicates:
             raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
+        if not set(self.candidate_route_overrides) <= registered_tools:
+            raise ValueError("candidate_route_overrides cannot reference unknown canonical operations")
+        if any(
+            route == ArmOperationRoute(tool=operation)
+            for operation, route in self.candidate_route_overrides.items()
+        ):
+            raise ValueError("candidate_route_overrides must contain only non-identity routes")
+        if set(self.arm_source_revisions) != {"baseline", "candidate"} or any(
+            not _is_git_revision(revision) for revision in self.arm_source_revisions.values()
+        ):
+            raise ValueError("both arm source revisions must be exact full git revisions")
+        stdio_only = {
+            "akb_get_file",
+            "akb_put_file",
+            "akb_update_file",
+            "akb_delete_file",
+            "akb_put_image",
+            "akb_discard_image",
+        }
+        derived_operations = [
+            PublicOperation(
+                operation=operation,
+                logical_operation=logical_operation,
+                resource_type=self.tool_resources[operation],
+                transports=["stdio"] if operation in stdio_only else ["http", "stdio"],
+                baseline=ArmOperationRoute(tool=operation),
+                candidate=self.candidate_route_overrides.get(operation, ArmOperationRoute(tool=operation)),
+            )
+            for logical_operation, tools in self.operation_map.items()
+            for operation in tools
+        ]
+        derived_by_operation = {item.operation: item for item in derived_operations}
+        if len(derived_by_operation) != len(derived_operations):
+            raise ValueError("derived public operations must map every canonical operation exactly once")
+        supplied_by_operation = {item.operation: item for item in self.public_operations}
+        if self.public_operations and (
+            len(supplied_by_operation) != len(self.public_operations)
+            or supplied_by_operation != derived_by_operation
+        ):
+            raise ValueError("expanded public_operations do not match the derived execution contract")
+        object.__setattr__(self, "public_operations", derived_operations)
+        expected_transport_counts = {"http": {"baseline": 45, "candidate": 33}, "stdio": {"baseline": 51, "candidate": 39}}
+        for arm in ("baseline", "candidate"):
+            for transport in ("http", "stdio"):
+                physical = {
+                    getattr(item, arm).tool
+                    for item in self.public_operations
+                    if transport in item.transports
+                }
+                if len(physical) != expected_transport_counts[transport][arm]:
+                    raise ValueError(f"{arm} {transport} public surface must expose {expected_transport_counts[transport][arm]} tools")
+                routes = [item for item in self.public_operations if transport in item.transports]
+                for item in routes:
+                    route = getattr(item, arm)
+                    if route.action is None and route.tool != item.operation:
+                        raise ValueError(f"{arm} direct public route for {item.operation} must retain its canonical tool name")
+                    if route.action is not None and route.tool == item.operation:
+                        raise ValueError(f"{arm} grouped public route for {item.operation} requires an action selector")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:
@@ -943,9 +1139,10 @@ class BenchmarkRunManifest(ContractModel):
         smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
         if self.budget.max_model_requests < required_trials + smoke_cells:
             raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
-        reserved_cost = self.budget.max_cost_per_trial_usd * (required_trials + smoke_cells)
-        if reserved_cost > self.budget.max_total_cost_usd:
-            raise ValueError("the preregistered trial and smoke-gate cost reservations exceed max_total_cost_usd")
+        if len(self.pair_categories) != 20 or len(tasks) != 40:
+            raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
+        if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:
+            raise ValueError("the preregistered benchmark plan must contain exactly 608 trials")
 
     def _validate_locale_pairs(self, tasks: list[TaskManifest]) -> None:
         if len(tasks) != sum(self.locale_counts.values()):
@@ -1045,6 +1242,50 @@ class CatalogSnapshot(ContractModel):
         if self.catalog_token_estimate != expected_tokens:
             raise ValueError("catalog_token_estimate does not match tools")
         return self
+
+
+def validate_public_catalog(
+    snapshot: CatalogSnapshot,
+    *,
+    arm: ArmName,
+    public_operations: list[PublicOperation],
+) -> None:
+    """Require the complete, unfiltered per-arm operation surface and action selectors."""
+
+    required = [item for item in public_operations if snapshot.transport in item.transports]
+    routes = [getattr(item, arm) for item in required]
+    expected_names = {route.tool for route in routes}
+    actual_names = {
+        tool.get("name")
+        for tool in snapshot.tools
+        if isinstance(tool.get("name"), str)
+    }
+    expected_count = 45 if arm == "baseline" and snapshot.transport == "http" else (
+        51 if arm == "baseline" else (33 if snapshot.transport == "http" else 39)
+    )
+    if len(expected_names) != expected_count or snapshot.tool_count != expected_count or actual_names != expected_names:
+        raise ValueError(
+            f"{arm} {snapshot.transport} catalog does not match the complete public operation map "
+            f"(expected {expected_count}, observed {snapshot.tool_count})"
+        )
+    by_name = {
+        tool.get("name"): tool
+        for tool in snapshot.tools
+        if isinstance(tool.get("name"), str)
+    }
+    for item in required:
+        route = getattr(item, arm)
+        if route.action is None:
+            continue
+        tool = by_name.get(route.tool, {})
+        schema = tool.get("inputSchema", tool.get("input_schema", {}))
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        action_schema = properties.get("action", {}) if isinstance(properties, dict) else {}
+        allowed = action_schema.get("enum") if isinstance(action_schema, dict) else None
+        if not isinstance(allowed, list) or route.action not in allowed:
+            raise ValueError(
+                f"{arm} catalog action {route.tool}:{route.action} is missing from the public input schema"
+            )
 
 
 def canonical_json(value: Any) -> str:

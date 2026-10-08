@@ -9,7 +9,7 @@ import pytest
 
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
-from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
+from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
 from test_runtime_contract import descriptor_dict
@@ -54,7 +54,17 @@ def _smoke_outcome(
         model_id=model_id or model_spec.model_id,
         transport=transport,
         final_answer_text="OK",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="fixture_tool",
+                logical_operation="search",
+                transport_succeeded=True,
+                server_succeeded=True,
+            )
+        ] if successful_mcp_tool_calls else [],
         successful_mcp_tool_calls=successful_mcp_tool_calls,
+        first_logical_operation="search" if successful_mcp_tool_calls else "none",
         follow_up_terminal_response=follow_up_terminal_response,
         input_tokens=10,
         output_tokens=2,
@@ -75,6 +85,28 @@ def _smoke_outcome(
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before={},
+        state_after={},
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
 
 

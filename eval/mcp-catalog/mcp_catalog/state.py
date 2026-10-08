@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import StateContract, StateExpectation
+from .contracts import StateCheckpointContract, StateContract, StateExpectation, StateExpectationSet
 from .runtime import StateObservation
 
 MISSING = object()
@@ -62,37 +62,84 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
 
 def evaluate_state_contract(
     contract: StateContract,
-    before: StateObservation,
-    after: StateObservation,
+    before: StateObservation | list[StateObservation],
+    after: StateObservation | list[StateObservation],
 ) -> tuple[bool, list[StateCheckResult]]:
     checks: list[StateCheckResult] = []
-    if not after.available:
-        checks.append(
-            StateCheckResult(False, "", "available", after.error or "after-state observation unavailable")
-        )
+    before_items = before if isinstance(before, list) else [before]
+    after_items = after if isinstance(after, list) else [after]
+    observations = contract.observation_sets
+    if len(after_items) != len(observations) or len(before_items) != len(observations):
+        checks.append(StateCheckResult(False, "", "available", "state observation count does not match contract"))
         return False, checks
-    if contract.must or contract.must_not or contract.unchanged:
-        for expectation in contract.must:
-            actual = json_pointer(after.payload, expectation.pointer)
-            passed = expectation_holds(actual, expectation)
-            checks.append(_result(expectation, passed, actual, "must"))
-        for expectation in contract.must_not:
-            actual = json_pointer(after.payload, expectation.pointer)
-            passed = not expectation_holds(actual, expectation)
-            checks.append(_result(expectation, passed, actual, "must_not"))
-        for pointer in contract.unchanged:
-            before_value = json_pointer(before.payload, pointer) if before.available else MISSING
-            after_value = json_pointer(after.payload, pointer)
-            passed = before.available and before_value == after_value
-            checks.append(
-                StateCheckResult(
-                    passed,
-                    pointer,
-                    "unchanged",
-                    "unchanged" if passed else "value changed or before-state unavailable",
-                )
-            )
+    for expectation_set, before_item, after_item in zip(observations, before_items, after_items, strict=True):
+        checks.extend(_evaluate_expectations(expectation_set, before_item, after_item))
     return all(check.passed for check in checks), checks
+
+
+def _evaluate_expectations(
+    contract: StateExpectationSet,
+    before: StateObservation,
+    after: StateObservation,
+) -> list[StateCheckResult]:
+    checks: list[StateCheckResult] = []
+    if not after.available:
+        return [StateCheckResult(False, "", "available", after.error or "after-state observation unavailable")]
+    for expectation in contract.must:
+        actual = json_pointer(after.payload, expectation.pointer)
+        checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "must"))
+    for expectation in contract.must_not:
+        actual = json_pointer(after.payload, expectation.pointer)
+        checks.append(_result(expectation, not expectation_holds(actual, expectation), actual, "must_not"))
+    if contract.check_before:
+        if not before.available:
+            checks.append(StateCheckResult(False, "", "available_before", before.error or "before-state observation unavailable"))
+        for expectation in contract.before_must:
+            actual = json_pointer(before.payload, expectation.pointer)
+            checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "before_must"))
+        for expectation in contract.before_must_not:
+            actual = json_pointer(before.payload, expectation.pointer)
+            checks.append(_result(expectation, not expectation_holds(actual, expectation), actual, "before_must_not"))
+    for pointer in contract.unchanged:
+        before_value = json_pointer(before.payload, pointer) if before.available else MISSING
+        after_value = json_pointer(after.payload, pointer)
+        passed = before.available and before_value == after_value
+        checks.append(
+            StateCheckResult(
+                passed,
+                pointer,
+                "unchanged",
+                "unchanged" if passed else "value changed or before-state unavailable",
+            )
+        )
+    return checks
+
+
+def evaluate_checkpoint_contract(
+    contract: StateCheckpointContract,
+    observation: StateObservation,
+) -> list[StateCheckResult]:
+    if not observation.available:
+        return [
+            StateCheckResult(
+                False,
+                "",
+                f"checkpoint:{contract.after_attempt}:available",
+                observation.error or "checkpoint state observation unavailable",
+            )
+        ]
+    checks: list[StateCheckResult] = []
+    for expectation in contract.must:
+        actual = json_pointer(observation.payload, expectation.pointer)
+        checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "checkpoint_must"))
+    for expectation in contract.must_not:
+        actual = json_pointer(observation.payload, expectation.pointer)
+        checks.append(_result(expectation, not expectation_holds(actual, expectation), actual, "checkpoint_must_not"))
+    if not checks:
+        checks.append(
+            StateCheckResult(False, "", f"checkpoint:{contract.after_attempt}:empty", "checkpoint has no state expectations")
+        )
+    return checks
 
 
 def _result(expectation: StateExpectation, passed: bool, actual: Any, phase: str) -> StateCheckResult:

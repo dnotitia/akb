@@ -10,6 +10,7 @@ dependencies = [
     "mcp==2.2.0",
     "mcp-types==2.2.0",
     "httpx==0.28.1",
+    "scipy==1.18.1",
 ]
 
 [project.optional-dependencies]

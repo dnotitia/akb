@@ -8,12 +8,13 @@ import json
 import os
 import re
 import time
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
@@ -33,13 +34,16 @@ from .contracts import (
     ExpectedMaterialAttempt,
     ExpectedResultBinding,
     ModelSpec,
+    StateCheckpointContract,
+    StateProbe,
     ResourceType,
     TaskLocale,
     TaskManifest,
+    PublicOperation,
 )
 from .evidence import canonical_json, redact_exception, redact_text, safe_json
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
-from .state import StateCheckResult, evaluate_state_contract
+from .state import StateCheckResult, evaluate_checkpoint_contract, evaluate_state_contract
 from .timing import TimingCategory
 
 SYSTEM_PROMPT = (
@@ -188,6 +192,8 @@ class ToolCallRecord(BaseModel):
 
     order: int = Field(ge=1)
     tool_name: str
+    canonical_operation: str | None = None
+    surface_action: str | None = None
     logical_operation: str
     resource_type: ResourceType = "unknown"
     tool_exists: bool = True
@@ -228,6 +234,7 @@ class TrialOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str
+    cluster_id: str | None = None
     category: str
     locale: TaskLocale = "en-US"
     arm: str
@@ -248,10 +255,13 @@ class TrialOutcome(BaseModel):
     material_call_count: int = Field(default=0, ge=0)
     state_before: Any = None
     state_after: Any = None
+    state_observations_before: list[dict[str, Any]] = Field(default_factory=list)
+    state_observations_after: list[dict[str, Any]] = Field(default_factory=list)
     state_available_before: bool = False
     state_available_after: bool = False
     state_contract_passed: bool = False
     state_checks: list[StateCheckResult] = Field(default_factory=list)
+    state_checkpoint_observations: list[dict[str, Any]] = Field(default_factory=list)
     response_rubric_passed: bool = False
     first_action_accuracy: bool = False
     first_material_action_accuracy: bool = False
@@ -277,6 +287,10 @@ class TrialOutcome(BaseModel):
     unsupported_success_claims: int = Field(default=0, ge=0)
     post_completion_overshoot: int = Field(default=0, ge=0)
     semantic_reasons: list[str] = Field(default_factory=list)
+    trial_error: bool = False
+    trial_error_kinds: list[str] = Field(default_factory=list)
+    forbidden_mutation_attempts: int = Field(default=0, ge=0)
+    unsafe_mutation: bool = False
     success: bool = False
     safety: bool = False
     error: str | None = None
@@ -312,16 +326,47 @@ class TrialOutcome(BaseModel):
     def finalize(
         self,
         task: TaskManifest,
-        before: StateObservation,
-        after: StateObservation,
+        before: StateObservation | list[StateObservation],
+        after: StateObservation | list[StateObservation],
         *,
         consumer_root: str | Path | None = None,
     ) -> None:
-        self.state_before = before.payload if before.available else None
-        self.state_after = after.payload if after.available else None
-        self.state_available_before = before.available
-        self.state_available_after = after.available
-        state_passed, checks = evaluate_state_contract(task.expected_final_state, before, after)
+        before_items = before if isinstance(before, list) else [before]
+        after_items = after if isinstance(after, list) else [after]
+        expectation_sets = task.expected_final_state.observation_sets
+        self.state_before = _state_payload(before_items)
+        self.state_after = _state_payload(after_items)
+        self.state_observations_before = [_state_observation_record(item) for item in before_items]
+        self.state_observations_after = [_state_observation_record(item) for item in after_items]
+        self.state_available_before = all(
+            observation.available
+            for expectation, observation in zip(expectation_sets, before_items, strict=False)
+            if expectation.check_before
+        )
+        self.state_available_after = len(after_items) == len(expectation_sets) and all(
+            observation.available for observation in after_items
+        )
+        state_passed, checks = evaluate_state_contract(task.expected_final_state, before_items, after_items)
+        checkpoint_map = {
+            item.get("after_attempt"): item
+            for item in self.state_checkpoint_observations
+            if isinstance(item, dict)
+        }
+        for checkpoint in task.expected_final_state.checkpoints:
+            evidence = checkpoint_map.get(checkpoint.after_attempt)
+            observation = (
+                StateObservation(
+                    available=bool(evidence.get("available")),
+                    status_code=evidence.get("status_code"),
+                    payload=evidence.get("payload"),
+                    error=evidence.get("error"),
+                )
+                if evidence is not None
+                else StateObservation(False, None, error="registered state checkpoint was not observed")
+            )
+            checkpoint_checks = evaluate_checkpoint_contract(checkpoint, observation)
+            checks.extend(checkpoint_checks)
+            state_passed = state_passed and all(item.passed for item in checkpoint_checks)
         self.state_contract_passed = state_passed
         self.state_checks = checks
         self.response_rubric_passed = response_matches_rubric(self.final_answer_text, task)
@@ -373,9 +418,24 @@ class TrialOutcome(BaseModel):
             if task.expected_material_attempts
             else set(task.required_attempted_operations) <= attempted_operations
         )
-        forbidden_hit = any(
+        self.forbidden_mutation_attempts = sum(
             call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task)
             for call in self.tool_calls
+        )
+        state_changed = any(
+            expected.check_before
+            and before_item.available
+            and after_item.available
+            and (before_item.status_code, before_item.payload) != (after_item.status_code, after_item.payload)
+            for expected, before_item, after_item in zip(expectation_sets, before_items, after_items, strict=False)
+        )
+        self.unsafe_mutation = bool(
+            state_changed
+            and any(
+                call.server_succeeded
+                and (call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task))
+                for call in self.tool_calls
+            )
         )
         cleanup_calls_valid = _cleanup_calls_are_valid(self.tool_calls)
         unchanged_checks_passed = all(
@@ -383,7 +443,7 @@ class TrialOutcome(BaseModel):
         )
         self.protocol_handshake_valid = _vault_skill_handshakes_are_valid(self.tool_calls)
         self.safety = (
-            not forbidden_hit
+            not self.unsafe_mutation
             and cleanup_calls_valid
             and self.state_available_before
             and self.state_available_after
@@ -414,6 +474,9 @@ class TrialOutcome(BaseModel):
             and self.safety
             and (self.stopping_accuracy or not task.stopping.enforce_for_task_success)
         )
+        self.cluster_id = task.pair_id
+        self.trial_error_kinds = _trial_error_kinds(self, task)
+        self.trial_error = bool(self.trial_error_kinds)
 
 
 def _has_provider_usage_evidence(outcome: TrialOutcome) -> bool:
@@ -693,21 +756,77 @@ def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> l
 def has_measured_evidence(outcome: TrialOutcome) -> bool:
     """Return whether a trial has real provider and lifecycle evidence to keep."""
 
+    if "tool_calls" not in outcome.model_fields_set:
+        return False
     if not _has_provider_usage_evidence(outcome):
         return False
+    before_payload, before_valid = _measured_state_payload(outcome.state_observations_before)
+    after_payload, after_valid = _measured_state_payload(outcome.state_observations_after)
+    if (
+        not before_valid
+        or not after_valid
+        or not outcome.state_available_before
+        or not outcome.state_available_after
+        or outcome.state_before != before_payload
+        or outcome.state_after != after_payload
+    ):
+        return False
+    if outcome.successful_mcp_tool_calls != sum(call.server_succeeded for call in outcome.tool_calls):
+        return False
+    if outcome.material_call_count != sum(call.operation_kind == "material" for call in outcome.tool_calls):
+        return False
+    if [call.order for call in outcome.tool_calls] != list(range(1, len(outcome.tool_calls) + 1)):
+        return False
+    if outcome.first_logical_operation != (outcome.tool_calls[0].logical_operation if outcome.tool_calls else "none"):
+        return False
+    for call in outcome.tool_calls:
+        _decoded, raw_valid = decode_raw_args(call.raw_model_args)
+        if call.raw_args_valid != raw_valid:
+            return False
+        if call.server_args is None:
+            if call.server_args_equal_raw or call.effective_server_args is not None:
+                return False
+        elif call.server_args_equal_raw != (raw_valid and call.server_args == _decoded):
+            return False
+        if call.server_succeeded and (not call.transport_succeeded or call.server_error_code is not None):
+            return False
     if outcome.error is None:
         return True
     if outcome.expected_error_match:
-        return outcome.state_available_before and outcome.state_available_after
+        return True
     if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
         return False
-    return outcome.state_available_before and outcome.state_available_after
+    return True
+
+
+def _measured_state_payload(records: list[dict[str, Any]]) -> tuple[Any, bool]:
+    if not records:
+        return None, False
+    observations: list[StateObservation] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"available", "status_code", "payload", "error"}:
+            return None, False
+        status_code = record["status_code"]
+        if (
+            record["available"] is not True
+            or not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+            or record["error"] is not None
+        ):
+            return None, False
+        observations.append(StateObservation(True, status_code, record["payload"], None))
+    return _state_payload(observations), True
 
 
 @dataclass(slots=True)
 class _ObservedCall:
     tool_name: str
     server_args: dict[str, Any]
+    canonical_operation: str | None = None
+    surface_action: str | None = None
+    logical_operation: str = "unknown"
+    resource_type: ResourceType = "unknown"
     transport_succeeded: bool = False
     succeeded: bool = False
     status_code: int | None = None
@@ -719,6 +838,105 @@ class _ObservedCall:
     vault_skill_retry_ack: str | None = None
 
 
+def _public_route(
+    tool_name: str,
+    arguments: dict[str, Any],
+    public_operations: list[PublicOperation],
+    *,
+    arm: str,
+    transport: str,
+) -> PublicOperation | None:
+    action = arguments.get("action")
+    matches = [
+        item
+        for item in public_operations
+        if transport in item.transports
+        and getattr(item, arm).tool == tool_name
+        and getattr(item, arm).action == (action if isinstance(action, str) else None)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_result_probe(probe: StateProbe, result_fields: list[dict[str, str]]) -> StateProbe:
+    binding = probe.result_binding
+    if binding is None:
+        return probe
+    if binding.source_attempt > len(result_fields):
+        raise RuntimeContractError("dynamic state probe result attempt is missing", stage="state_observation")
+    value = result_fields[binding.source_attempt - 1].get(binding.source_field)
+    if not isinstance(value, str) or not value:
+        raise RuntimeContractError("dynamic state probe result field is missing", stage="state_observation")
+    if binding.transform == "document_asset_id_from_url":
+        parts = urlsplit(value)
+        identifier = parts.path.rsplit("/", 1)[-1]
+        try:
+            identifier = str(uuid.UUID(identifier))
+        except (ValueError, AttributeError) as exc:
+            raise RuntimeContractError("document asset result URL is invalid", stage="state_observation") from exc
+        marker = "{asset_id}"
+    elif binding.transform == "publication_slug":
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None:
+            raise RuntimeContractError("publication slug result is invalid", stage="state_observation")
+        identifier = value
+        marker = "{slug}"
+    else:
+        if not value.startswith("akb://") or "\r" in value or "\n" in value:
+            raise RuntimeContractError("resource URI result is invalid", stage="state_observation")
+        identifier = quote(value, safe="")
+        marker = "{uri}"
+    return probe.model_copy(update={"path": probe.path.replace(marker, identifier), "result_binding": None})
+
+
+def _state_payload(observations: list[StateObservation]) -> Any:
+    payloads = [observation.payload if observation.available else None for observation in observations]
+    return payloads[0] if len(payloads) == 1 else payloads
+
+
+def _state_observation_record(observation: StateObservation) -> dict[str, Any]:
+    return {
+        "available": observation.available,
+        "status_code": observation.status_code,
+        "payload": observation.payload,
+        "error": observation.error,
+    }
+
+
+def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
+    kinds: set[str] = set()
+    material_calls = [call for call in outcome.tool_calls if call.operation_kind == "material"]
+    intended_error_calls: set[int] = set()
+    for index, expected in enumerate(task.expected_material_attempts):
+        if index >= len(material_calls) or expected.outcome == "success":
+            continue
+        call = material_calls[index]
+        if (
+            call.logical_operation == expected.logical_operation
+            and call.server_error_code == expected.error_code
+            and (expected.status_code is None or call.server_status_code == expected.status_code)
+        ):
+            intended_error_calls.add(id(call))
+    for call in outcome.tool_calls:
+        if not call.tool_exists or call.canonical_operation is None:
+            kinds.add("unintended_tool_action")
+        if call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task):
+            kinds.add("unintended_tool_action")
+        if call.operation_kind == "unknown" and call.logical_operation in {
+            "create", "update", "delete", "grant", "file_upload", "image_upload", "cleanup"
+        }:
+            kinds.add("unintended_tool_action")
+        if not call.argument_valid and call.tool_exists:
+            kinds.add("schema_error")
+        if call.server_error_code in {"invalid_argument", "validation_error", "invalid_params", "schema_error"} and id(call) not in intended_error_calls:
+            kinds.add("schema_error")
+        if call.server_status_code in {400, 422} and id(call) not in intended_error_calls:
+            kinds.add("schema_error")
+    if outcome.wrong_target_calls:
+        kinds.add("wrong_target_payload")
+    if outcome.unsupported_success_claims:
+        kinds.add("unsupported_success_claim")
+    return sorted(kinds)
+
+
 class ToolCallRecorder:
     """Record server-facing args and outcomes without changing the call."""
 
@@ -728,11 +946,25 @@ class ToolCallRecorder:
         operation_map: dict[str, list[str]],
         secrets: tuple[str, ...],
         capture_result_fields: dict[str, list[str]] | None = None,
+        task: TaskManifest | None = None,
+        fixture: RuntimeFixture | None = None,
+        token: str | None = None,
+        arm: str = "baseline",
+        transport: str = "http",
+        public_operations: list[PublicOperation] | None = None,
     ) -> None:
         self.operation_map = operation_map
         self.secrets = secrets
+        self.task = task
+        self.fixture = fixture
+        self.token = token
+        self.arm = arm
+        self.transport = transport
+        self.public_operations = public_operations or []
         self.calls: list[_ObservedCall] = []
         self.input_schemas: dict[str, dict[str, Any]] = {}
+        self.material_calls: list[_ObservedCall] = []
+        self.checkpoint_observations: list[dict[str, Any]] = []
         self.capture_result_fields = {
             tool: frozenset(fields) for tool, fields in (capture_result_fields or {}).items()
         }
@@ -741,9 +973,34 @@ class ToolCallRecorder:
         self.input_schemas = schemas
 
     async def __call__(self, _ctx: Any, call: Callable[..., Any], name: str, server_args: dict[str, Any]) -> Any:
+        route = _public_route(
+            name,
+            server_args,
+            self.public_operations,
+            arm=self.arm,
+            transport=self.transport,
+        )
+        logical_operation = (
+            route.logical_operation
+            if route is not None
+            else logical_operation_for(name, self.operation_map)
+        )
+        canonical_operation = route.operation if route is not None else None
+        operation_kind = "unknown"
+        if self.task is not None:
+            if logical_operation in self.task.allowed_preparatory_operations or server_args.get("_vault_skill_ack"):
+                operation_kind = "preparatory"
+            elif logical_operation in self.task.allowed_material_operations:
+                operation_kind = "material"
         observed = _ObservedCall(
             tool_name=name,
             server_args=_redact_vault_skill_ack(safe_json(server_args, self.secrets)),
+            canonical_operation=canonical_operation,
+            surface_action=route.candidate.action if route is not None and self.arm == "candidate" else (
+                route.baseline.action if route is not None else None
+            ),
+            logical_operation=logical_operation,
+            resource_type=route.resource_type if route is not None else "unknown",
             vault_skill_retry_ack=(
                 server_args.get("_vault_skill_ack")
                 if isinstance(server_args.get("_vault_skill_ack"), str)
@@ -751,27 +1008,54 @@ class ToolCallRecorder:
             ),
         )
         self.calls.append(observed)
+        result: Any = None
         try:
             result = await call(name, server_args)
+            observed.transport_succeeded = True
+            observed.error_code, observed.error = public_result_error(result, self.secrets)
+            observed.succeeded = observed.error_code is None
+            observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
+            capture_fields = self.capture_result_fields.get(name, frozenset())
+            observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
+            preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
+            result_text = (
+                canonical_json({"result_fields": observed.result_fields})
+                if capture_fields
+                else canonical_json(preview)
+            )
+            observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
+            return result
         except Exception as exc:
             observed.transport_succeeded = False
             observed.status_code, observed.error_code = error_details(exc)
             observed.error = redact_exception(exc, self.secrets)
             raise
-        observed.transport_succeeded = True
-        observed.error_code, observed.error = public_result_error(result, self.secrets)
-        observed.succeeded = observed.error_code is None
-        observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
-        capture_fields = self.capture_result_fields.get(name, frozenset())
-        observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
-        preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
-        result_text = (
-            canonical_json({"result_fields": observed.result_fields})
-            if capture_fields
-            else canonical_json(preview)
-        )
-        observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
-        return result
+        finally:
+            if operation_kind == "material":
+                self.material_calls.append(observed)
+                if self.task is not None and self.fixture is not None and self.token is not None:
+                    attempt_index = len(self.material_calls)
+                    for checkpoint in self.task.expected_final_state.checkpoints:
+                        if checkpoint.after_attempt == attempt_index:
+                            self.checkpoint_observations.append(
+                                await self._observe_checkpoint(checkpoint, attempt_index)
+                            )
+
+    async def _observe_checkpoint(self, checkpoint: StateCheckpointContract, attempt_index: int) -> dict[str, Any]:
+        assert self.fixture is not None and self.token is not None
+        try:
+            result_fields = [item.result_fields for item in self.material_calls]
+            probe = _resolve_result_probe(checkpoint.probe, result_fields)
+            observation = await self.fixture.observe(probe, token=self.token)
+        except Exception as exc:
+            observation = StateObservation(False, None, error=redact_exception(exc, self.secrets))
+        return {
+            "after_attempt": attempt_index,
+            "available": observation.available,
+            "status_code": observation.status_code,
+            "payload": safe_json(observation.payload, self.secrets),
+            "error": observation.error,
+        }
 
 
 def _capture_structured_result_fields(
@@ -873,19 +1157,37 @@ def _redact_vault_skill_ack(value: Any) -> Any:
 def capture_result_fields_for_task(
     task: TaskManifest,
     operation_map: dict[str, list[str]] | None = None,
+    public_operations: list[PublicOperation] | None = None,
 ) -> dict[str, list[str]]:
     fields: dict[str, set[str]] = defaultdict(set)
-    for binding in task.expected_result_bindings:
-        attempt = task.expected_material_attempts[binding.source_attempt - 1]
+    requested = [
+        (attempt_index, field_name)
+        for attempt_index, attempt in enumerate(task.expected_material_attempts, start=1)
+        for field_name in attempt.capture_result_fields
+    ]
+    requested.extend(
+        (binding.source_attempt, binding.source_field)
+        for binding in task.expected_result_bindings
+    )
+    for attempt_index, field_name in requested:
+        attempt = task.expected_material_attempts[attempt_index - 1]
         tool_names = (
             [attempt.tool_name]
             if attempt.tool_name is not None
             else (operation_map or {}).get(attempt.logical_operation, [])
         )
         if not tool_names:
-            raise ValueError("result bindings require an exact tool or registered logical operation")
+            raise ValueError("result capture requires an exact tool or registered logical operation")
         for tool_name in tool_names:
-            fields[tool_name].add(binding.source_field)
+            fields[tool_name].add(field_name)
+        if public_operations is not None:
+            for operation in public_operations:
+                if attempt.tool_name is not None and operation.operation != attempt.tool_name:
+                    continue
+                if attempt.tool_name is None and operation.logical_operation != attempt.logical_operation:
+                    continue
+                for route in (operation.baseline, operation.candidate):
+                    fields[route.tool].add(field_name)
     return {tool_name: sorted(names) for tool_name, names in fields.items()}
 
 
@@ -951,7 +1253,7 @@ def public_result_error(result: Any, secrets: tuple[str, ...]) -> tuple[str | No
 class TrialContext:
     task: TaskManifest
     token: str
-    before: StateObservation
+    before: list[StateObservation]
     secrets: tuple[str, ...]
     local_file_paths: dict[str, Path] = field(default_factory=dict)
     context_token: contextvars.Token[TrialContext | None] | None = None
@@ -1019,12 +1321,21 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                 if task.fixture.local_files
                 else {}
             )
-            before = await self.fixture.observe(
-                task.expected_final_state.probe.model_copy(
-                    update={"expected_status": task.expected_final_state.resolved_before_expected_status}
-                ),
-                token=token,
-            )
+            before: list[StateObservation] = []
+            for expectation_set in task.expected_final_state.observation_sets:
+                if not expectation_set.check_before:
+                    before.append(StateObservation(True, None, payload=None))
+                elif expectation_set.probe.result_binding is not None:
+                    before.append(StateObservation(False, None, error="result-bound probe has no initial identifier"))
+                else:
+                    before.append(
+                        await self.fixture.observe(
+                            expectation_set.probe.model_copy(
+                                update={"expected_status": expectation_set.resolved_before_expected_status}
+                            ),
+                            token=token,
+                        )
+                    )
             self.context = TrialContext(
                 task=task,
                 token=token,
@@ -1044,7 +1355,20 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             self.output = ctx.output
             if self.repeat_index is not None:
                 ctx.output.repeat_index = self.repeat_index
-            after = await self.fixture.observe(self.case.inputs.expected_final_state.probe, token=self.context.token)
+            material_calls = [
+                call
+                for call in self.output.tool_calls
+                if call.logical_operation in self.case.inputs.allowed_material_operations
+                and call.server_error_code != "vault_skill_required"
+            ]
+            result_fields = [call.result_fields for call in material_calls]
+            after: list[StateObservation] = []
+            for expectation_set in self.case.inputs.expected_final_state.observation_sets:
+                try:
+                    probe = _resolve_result_probe(expectation_set.probe, result_fields)
+                    after.append(await self.fixture.observe(probe, token=self.context.token))
+                except Exception as exc:
+                    after.append(StateObservation(False, None, error=redact_exception(exc, self.context.secrets)))
             ctx.output.finalize(
                 self.case.inputs,
                 self.context.before,
@@ -1108,6 +1432,7 @@ class BudgetLedger:
     manifest: BenchmarkRunManifest
     wall_clock: Callable[[], float] | None = None
     requests: int = 0
+    provider_setup_requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Decimal = Decimal("0")
@@ -1130,13 +1455,14 @@ class BudgetLedger:
         output_tokens: int,
         cost_usd: float | Decimal,
         wall_seconds: float,
+        provider_setup_requests: int = 0,
         model_work_seconds: float = 0.0,
         budget_failure: str | None = None,
     ) -> None:
         """Restore already-spent usage from a checkpoint before new calls."""
 
         restored_cost = Decimal(str(cost_usd))
-        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
+        if min(model_requests, provider_setup_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if not restored_cost.is_finite() or restored_cost < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
@@ -1150,6 +1476,7 @@ class BudgetLedger:
         ):
             raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
         self.requests = model_requests
+        self.provider_setup_requests = provider_setup_requests
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cost_usd = restored_cost
@@ -1166,13 +1493,14 @@ class BudgetLedger:
         output_tokens: int,
         cost_usd: float | Decimal,
         wall_seconds: float,
+        provider_setup_requests: int = 0,
         model_work_seconds: float = 0.0,
         budget_failure: str | None = None,
     ) -> None:
         """Merge one independent arm checkpoint into a shared paired budget."""
 
         restored_cost = Decimal(str(cost_usd))
-        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
+        if min(model_requests, provider_setup_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if not restored_cost.is_finite() or restored_cost < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
@@ -1190,6 +1518,7 @@ class BudgetLedger:
             ):
                 raise BudgetExceeded("paired checkpoint totals already exceed the registered run limits")
             self.requests = next_requests
+            self.provider_setup_requests += provider_setup_requests
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.cost_usd = next_cost
@@ -1198,6 +1527,16 @@ class BudgetLedger:
             self._restored_wall_offset = max(self._restored_wall_offset, wall_seconds)
             self._budget_failure = self._budget_failure or budget_failure
             self._assert_reservation_invariant()
+
+    async def record_provider_setup_request(self) -> None:
+        """Count a non-completion provider lookup against the paired request cap."""
+
+        async with self._lock:
+            if self.requests >= self.manifest.budget.max_model_requests:
+                self._budget_failure = "max_model_requests exceeded"
+                raise BudgetExceeded("max_model_requests exceeded")
+            self.requests += 1
+            self.provider_setup_requests += 1
 
     def current_wall_seconds(self) -> float:
         observed = (
@@ -1537,7 +1876,15 @@ class TrialExecutor:
         recorder = ToolCallRecorder(
             operation_map=self.manifest.operation_map,
             secrets=secrets,
-            capture_result_fields=capture_result_fields_for_task(task, self.manifest.operation_map),
+            capture_result_fields=capture_result_fields_for_task(
+                task, self.manifest.operation_map, self.manifest.public_operations
+            ),
+            task=task,
+            fixture=self.fixture,
+            token=token,
+            arm=self.arm,
+            transport=self.transport,
+            public_operations=self.manifest.public_operations,
         )
         input_schemas = self.input_schemas_by_profile.get(task.fixture.credential_profile)
         if input_schemas is not None:
@@ -1626,6 +1973,7 @@ class TrialExecutor:
                 recorder=recorder,
                 operation_map=self.manifest.operation_map,
                 tool_resources=self.manifest.tool_resources,
+                public_operations=self.manifest.public_operations,
                 error=error,
                 latency=latency,
                 secrets=secrets,
@@ -1677,10 +2025,23 @@ async def execute_smoke(
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
 
+    before = [
+        await fixture.observe(expectation.probe, token=token)
+        for expectation in task.expected_final_state.observation_sets
+    ]
+
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=secrets,
-        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
+        capture_result_fields=capture_result_fields_for_task(
+            task, manifest.operation_map, manifest.public_operations
+        ),
+        task=task,
+        fixture=fixture,
+        token=token,
+        arm=arm,
+        transport=transport,
+        public_operations=manifest.public_operations,
     )
     if input_schemas is not None:
         recorder.set_input_schemas(input_schemas)
@@ -1748,11 +2109,31 @@ async def execute_smoke(
         recorder=recorder,
         operation_map=manifest.operation_map,
         tool_resources=manifest.tool_resources,
+        public_operations=manifest.public_operations,
         error=error,
         latency=time.perf_counter() - started,
         secrets=secrets,
         partial_messages=partial_messages,
         request_count=request_guard.requests if request_guard is not None else None,
+    )
+    material_calls = [
+        call for call in outcome.tool_calls
+        if call.logical_operation in task.allowed_material_operations
+        and call.server_error_code != "vault_skill_required"
+    ]
+    result_fields = [call.result_fields for call in material_calls]
+    after: list[StateObservation] = []
+    for expectation in task.expected_final_state.observation_sets:
+        try:
+            probe = _resolve_result_probe(expectation.probe, result_fields)
+            after.append(await fixture.observe(probe, token=token))
+        except Exception as exc:
+            after.append(StateObservation(False, None, error=redact_exception(exc, secrets)))
+    outcome.finalize(
+        task,
+        before,
+        after,
+        consumer_root=(fixture.stdio_consumer_root if task.fixture.local_files else None),
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)
@@ -1826,6 +2207,7 @@ def outcome_from_run(
     latency: float,
     secrets: tuple[str, ...],
     tool_resources: dict[str, ResourceType] | None = None,
+    public_operations: list[PublicOperation] | None = None,
     partial_messages: list[ModelResponse] | None = None,
     request_count: int | None = None,
 ) -> TrialOutcome:
@@ -1878,6 +2260,9 @@ def outcome_from_run(
         secrets,
         input_schemas=recorder.input_schemas,
         tool_resources=tool_resources,
+        arm=arm,
+        transport=transport,
+        public_operations=public_operations,
     )
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
@@ -1889,6 +2274,7 @@ def outcome_from_run(
     failure_kind = classify_failure(error, result=result, final_answer=final_answer)
     return TrialOutcome(
         task_id=task.id,
+        cluster_id=task.pair_id,
         category=task.category,
         locale=task.locale,
         arm=arm,
@@ -1897,6 +2283,7 @@ def outcome_from_run(
         transport=transport,
         final_answer_text=final_answer,
         tool_calls=tool_calls,
+        state_checkpoint_observations=list(recorder.checkpoint_observations),
         successful_mcp_tool_calls=successful_mcp_tool_calls,
         follow_up_terminal_response=follow_up_terminal_response,
         first_logical_operation=first_operation,
@@ -2011,14 +2398,15 @@ def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelS
         endpoints = routing.get("endpoints")
         available = endpoints.get("available") if isinstance(endpoints, dict) else None
         selected = [
-            endpoint.get("provider")
+            endpoint
             for endpoint in available
             if isinstance(endpoint, dict) and endpoint.get("selected") is True
         ] if isinstance(available, list) else []
         if (
             len(selected) != 1
-            or not isinstance(selected[0], str)
-            or not selected[0].strip()
+            or not isinstance(selected[0].get("provider"), str)
+            or selected[0]["provider"].casefold() != "parasail"
+            or selected[0].get("quantization") != "fp8"
         ):
             return observed, False
         observed = True
@@ -2037,6 +2425,9 @@ def bind_tool_calls(
     *,
     input_schemas: dict[str, dict[str, Any]] | None = None,
     tool_resources: dict[str, ResourceType] | None = None,
+    arm: str = "baseline",
+    transport: str = "http",
+    public_operations: list[PublicOperation] | None = None,
 ) -> list[ToolCallRecord]:
     records: list[ToolCallRecord] = []
     remaining = list(server_calls)
@@ -2044,12 +2435,21 @@ def bind_tool_calls(
         observed_index = next((idx for idx, call in enumerate(remaining) if call.tool_name == name), None)
         observed = remaining.pop(observed_index) if observed_index is not None else None
         raw_dict, raw_valid = decode_raw_args(raw_args)
+        route = _public_route(
+            name,
+            observed.server_args if observed is not None else raw_dict or {},
+            public_operations or [],
+            arm=arm,
+            transport=transport,
+        )
         records.append(
             ToolCallRecord(
                 order=order,
                 tool_name=name,
-                logical_operation=logical_operation_for(name, operation_map),
-                resource_type=(tool_resources or {}).get(name, "unknown"),
+                canonical_operation=route.operation if route is not None else None,
+                surface_action=(getattr(route, arm).action if route is not None else None),
+                logical_operation=route.logical_operation if route is not None else "unknown",
+                resource_type=route.resource_type if route is not None else "unknown",
                 tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
                 raw_model_args=raw_args,
                 server_args=observed.server_args if observed else None,
@@ -2075,12 +2475,21 @@ def bind_tool_calls(
             )
         )
     for observed in remaining:
+        route = _public_route(
+            observed.tool_name,
+            observed.server_args,
+            public_operations or [],
+            arm=arm,
+            transport=transport,
+        )
         records.append(
             ToolCallRecord(
                 order=len(records) + 1,
                 tool_name=observed.tool_name,
-                logical_operation=logical_operation_for(observed.tool_name, operation_map),
-                resource_type=(tool_resources or {}).get(observed.tool_name, "unknown"),
+                canonical_operation=route.operation if route is not None else None,
+                surface_action=(getattr(route, arm).action if route is not None else None),
+                logical_operation=route.logical_operation if route is not None else "unknown",
+                resource_type=route.resource_type if route is not None else "unknown",
                 tool_exists=(
                     observed.tool_name in input_schemas if input_schemas is not None else True
                 ),

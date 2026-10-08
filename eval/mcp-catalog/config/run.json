@@ -3,18 +3,36 @@
   "name": "akb-mcp-tool-surface",
   "protocol_revision": "2026-07-28",
   "source_revision": "runtime_descriptor",
-  "arms": ["baseline", "candidate"],
-  "transports": ["http", "stdio"],
+  "arms": [
+    "baseline",
+    "candidate"
+  ],
+  "transports": [
+    "http",
+    "stdio"
+  ],
   "models": [
     {
       "class_name": "primary",
       "provider": "openrouter",
       "model_id": "deepseek/deepseek-v4-flash-0731",
-      "version": "deepseek/deepseek-v4-flash-0731",
+      "version": "20260731",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 8192},
+      "routing": {
+        "order": [
+          "parasail"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "quantizations": [
+          "fp8"
+        ]
+      },
+      "settings": {
+        "temperature": 0.0,
+        "max_tokens": 8192
+      },
       "input_cost_per_million_usd": 0.14,
       "output_cost_per_million_usd": 0.28
     },
@@ -22,11 +40,23 @@
       "class_name": "lightweight",
       "provider": "openrouter",
       "model_id": "qwen/qwen3.8-27b",
-      "version": "qwen/qwen3.8-27b",
+      "version": "20260814",
       "base_url_env": "MCP_BENCH_OPENROUTER_BASE_URL",
       "provider_key_env": "MCP_BENCH_OPENROUTER_API_KEY",
-      "routing": {"order": ["parasail"], "allow_fallbacks": true, "require_parameters": true},
-      "settings": {"temperature": 0.0, "max_tokens": 8192},
+      "routing": {
+        "order": [
+          "parasail"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true,
+        "quantizations": [
+          "fp8"
+        ]
+      },
+      "settings": {
+        "temperature": 0.0,
+        "max_tokens": 8192
+      },
       "input_cost_per_million_usd": 0.24,
       "output_cost_per_million_usd": 2.2
     }
@@ -34,15 +64,18 @@
   "repeats": 2,
   "max_concurrency": 1,
   "category_minimums": {
-    "single_operation": 2,
-    "ambiguous_action": 2,
-    "multi_step": 2,
-    "destructive_confirmation": 2,
+    "ambiguous_action": 4,
     "authorization": 2,
+    "destructive_confirmation": 2,
     "invalid_input_recovery": 2,
-    "stdio_local": 2
+    "multi_step": 20,
+    "single_operation": 6,
+    "stdio_local": 4
   },
-  "suite_minimums": {"capability": 14, "tool_surface_risk": 12},
+  "suite_minimums": {
+    "capability": 28,
+    "tool_surface_risk": 12
+  },
   "capability_minimums": {
     "vault_discovery_metadata_lifecycle": 1,
     "document_discovery_read_history": 1,
@@ -68,15 +101,23 @@
     "transport_divergence": 1
   },
   "statistical_procedure": {
-    "method": "paired_task_mean_normal_approximation",
+    "method": "paired_cluster_bca_bootstrap",
+    "implementation": "scipy==1.18.1",
     "confidence": 0.95,
     "noninferiority_margin": 0.03,
-    "repeated_trials_are_averaged_per_task": true,
-    "z_value": 1.644854
+    "resamples": 20000,
+    "seed": 358,
+    "cluster": "pair_id",
+    "paired": true,
+    "cluster_weight": "equal",
+    "resampling": "BCa"
   },
   "paired_order": "counterbalanced_task_repeat",
-  "paired_order_seed": "akb-208-semantic-v2",
-  "provider_sensitivity": {"maximum_arm_share_difference": 0.2, "downgrade_on_imbalance": true},
+  "paired_order_seed": "akb-358-v1",
+  "provider_sensitivity": {
+    "maximum_arm_share_difference": 0.2,
+    "downgrade_on_imbalance": true
+  },
   "budget": {
     "max_model_requests": 3000,
     "max_total_cost_usd": 50.0,
@@ -86,18 +127,81 @@
     "max_cost_per_trial_usd": 0.1
   },
   "operation_map": {
-    "identity": ["akb_whoami"],
-    "list": ["akb_list_vaults", "akb_browse", "akb_publications", "akb_vault_members", "akb_search_users"],
-    "read": ["akb_get", "akb_drill_down", "akb_vault_info", "akb_activity", "akb_diff", "akb_relations", "akb_graph", "akb_provenance", "akb_publication_snapshot", "akb_explain_access", "akb_history", "akb_export", "akb_get_file"],
-    "search": ["akb_search", "akb_grep", "akb_sql"],
-    "create": ["akb_put", "akb_create_vault", "akb_create_collection", "akb_create_table", "akb_publish", "akb_import"],
-    "update": ["akb_update", "akb_edit", "akb_move", "akb_alter_table", "akb_link", "akb_transfer_ownership", "akb_set_public", "akb_update_file"],
-    "delete": ["akb_delete", "akb_archive_vault", "akb_delete_vault", "akb_delete_collection", "akb_drop_table", "akb_unpublish", "akb_unlink", "akb_delete_file"],
-    "grant": ["akb_grant", "akb_revoke"],
-    "file_upload": ["akb_put_file"],
-    "image_upload": ["akb_put_image"],
-    "cleanup": ["akb_discard_image"],
-    "help": ["akb_help"]
+    "identity": [
+      "akb_whoami"
+    ],
+    "list": [
+      "akb_list_vaults",
+      "akb_browse",
+      "akb_publications",
+      "akb_vault_members",
+      "akb_search_users"
+    ],
+    "read": [
+      "akb_get",
+      "akb_drill_down",
+      "akb_vault_info",
+      "akb_activity",
+      "akb_diff",
+      "akb_relations",
+      "akb_graph",
+      "akb_provenance",
+      "akb_publication_snapshot",
+      "akb_explain_access",
+      "akb_history",
+      "akb_export",
+      "akb_get_file"
+    ],
+    "search": [
+      "akb_search",
+      "akb_grep",
+      "akb_sql"
+    ],
+    "create": [
+      "akb_put",
+      "akb_create_vault",
+      "akb_create_collection",
+      "akb_create_table",
+      "akb_publish",
+      "akb_import"
+    ],
+    "update": [
+      "akb_update",
+      "akb_edit",
+      "akb_move",
+      "akb_alter_table",
+      "akb_link",
+      "akb_transfer_ownership",
+      "akb_set_public",
+      "akb_update_file",
+      "akb_grep_replace"
+    ],
+    "delete": [
+      "akb_delete",
+      "akb_archive_vault",
+      "akb_delete_vault",
+      "akb_delete_collection",
+      "akb_drop_table",
+      "akb_unpublish",
+      "akb_unlink",
+      "akb_delete_file"
+    ],
+    "grant": [
+      "akb_grant",
+      "akb_revoke"
+    ],
+    "file_upload": [
+      "akb_put_file"
+    ],
+    "image_upload": [
+      "akb_put_image"
+    ],
+    "cleanup": [
+      "akb_discard_image"
+    ],
+    "help": [
+      "akb_help"
+    ]
   },
   "tool_resources": {
     "akb_whoami": "identity",
@@ -149,7 +253,8 @@
     "akb_put_file": "file",
     "akb_put_image": "image",
     "akb_discard_image": "image",
-    "akb_help": "help"
+    "akb_help": "help",
+    "akb_grep_replace": "document"
   },
   "credential_profiles": {
     "default": null,
@@ -157,8 +262,14 @@
     "authorization": "MCP_BENCH_AUTHORIZATION_PAT"
   },
   "fixture_scenario": "app-control-plane",
-  "locales": ["ko-KR", "en-US"],
-  "locale_counts": {"ko-KR": 13, "en-US": 13},
+  "locales": [
+    "ko-KR",
+    "en-US"
+  ],
+  "locale_counts": {
+    "ko-KR": 20,
+    "en-US": 20
+  },
   "pair_categories": {
     "read-vaults": "single_operation",
     "create-vault": "single_operation",
@@ -172,6 +283,87 @@
     "destructive-confirm": "destructive_confirmation",
     "authorization-readonly": "authorization",
     "invalid-recovery": "invalid_input_recovery",
-    "overlapping-document": "multi_step"
+    "overlapping-document": "multi_step",
+    "grep-write": "multi_step",
+    "document-revisions": "multi_step",
+    "history-provenance": "multi_step",
+    "collection-relation-lifecycle": "multi_step",
+    "table-schema-conflict": "multi_step",
+    "access-ownership-public": "multi_step",
+    "stdio-image-files": "stdio_local"
+  },
+  "arm_source_revisions": {
+    "baseline": "git:9daf7b44f9387776f845f181d29f1a7c8d21b37a",
+    "candidate": "git:8d74114042b7d94a02c6b0f7aa27a6ab749e1874"
+  },
+  "candidate_route_overrides": {
+    "akb_whoami": {
+      "tool": "akb_identity",
+      "action": "whoami"
+    },
+    "akb_list_vaults": {
+      "tool": "akb_discover",
+      "action": "list_vaults"
+    },
+    "akb_browse": {
+      "tool": "akb_discover",
+      "action": "browse"
+    },
+    "akb_vault_members": {
+      "tool": "akb_vault_access",
+      "action": "members"
+    },
+    "akb_search_users": {
+      "tool": "akb_identity",
+      "action": "search_users"
+    },
+    "akb_get": {
+      "tool": "akb_document_read",
+      "action": "get"
+    },
+    "akb_drill_down": {
+      "tool": "akb_document_read",
+      "action": "section"
+    },
+    "akb_vault_info": {
+      "tool": "akb_discover",
+      "action": "vault_info"
+    },
+    "akb_activity": {
+      "tool": "akb_document_read",
+      "action": "activity"
+    },
+    "akb_diff": {
+      "tool": "akb_document_read",
+      "action": "diff"
+    },
+    "akb_relations": {
+      "tool": "akb_relationships",
+      "action": "relations"
+    },
+    "akb_graph": {
+      "tool": "akb_relationships",
+      "action": "graph"
+    },
+    "akb_provenance": {
+      "tool": "akb_document_read",
+      "action": "provenance"
+    },
+    "akb_explain_access": {
+      "tool": "akb_vault_access",
+      "action": "explain"
+    },
+    "akb_history": {
+      "tool": "akb_document_read",
+      "action": "history"
+    },
+    "akb_search": {
+      "tool": "akb_discover",
+      "action": "search"
+    },
+    "akb_grep": {
+      "tool": "akb_discover",
+      "action": "grep"
+    }
   }
 }

@@ -9,10 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 import mcp_catalog.runner as runner_module
-from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
-from mcp_catalog.execution import TrialOutcome
+from mcp_catalog.contracts import load_run_manifest, load_task_corpus
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -20,7 +21,7 @@ ROOT = Path(__file__).parents[1]
 
 class _ParallelResolver:
     def required_profiles(self, _tasks):
-        return ["default"]
+        return sorted({task.fixture.credential_profile for task in _tasks})
 
     async def prepare(self, _fixture, _profiles) -> None:
         return None
@@ -95,6 +96,11 @@ def _parallel_descriptor() -> RuntimeDescriptor:
     return dataclasses.replace(descriptor, benchmark_cells=cells)
 
 
+def _empty_state_payload(task) -> dict | list[dict]:
+    payloads = [{} for _item in task.expected_final_state.observation_sets]
+    return payloads[0] if len(payloads) == 1 else payloads
+
+
 def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
@@ -105,7 +111,17 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         transport=transport,
         repeat_index=repeat_index,
         final_answer_text="완료",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="fixture_tool",
+                logical_operation="search",
+                transport_succeeded=True,
+                server_succeeded=True,
+            )
+        ],
         successful_mcp_tool_calls=1,
+        first_logical_operation="search",
         follow_up_terminal_response=True,
         input_tokens=10,
         output_tokens=2,
@@ -115,7 +131,7 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         provider_evidence=[
             {
                 "model": model_spec.model_id,
-                "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}},
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
             for _ in range(2)
@@ -124,6 +140,28 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before=_empty_state_payload(task),
+        state_after=_empty_state_payload(task),
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
 
 
@@ -139,7 +177,7 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
     async def fake_preflight(_runner):
         return {
             "runtime": {
-                "source_revision": "a" * 40,
+                "source_revision": manifest.arm_source_revisions["baseline"],
                 "artifact_versions": {
                     "backend_artifact_version": "0.0.0",
                     "proxy_artifact_version": "0.0.0",
@@ -151,14 +189,8 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
 
     async def fake_capture(*_args, **kwargs):
         assert kwargs["token"] == f"{_args[0].descriptor.app_origin}:fresh-token"
-        return CatalogSnapshot(
-            transport=kwargs["transport"],
-            source_revision="a" * 40,
-            artifact_version="0.0.0",
-            tool_count=0,
-            catalog_hash=hash_json([]),
-            catalog_token_estimate=token_estimate([]),
-            tools=[],
+        return _catalog_snapshot(manifest, "baseline", kwargs["transport"]).model_copy(
+            update={"source_revision": kwargs["source_revision"], "artifact_version": kwargs["artifact_version"]}
         )
 
     async def fake_smoke(task, *, model_spec, transport, **_kwargs):
@@ -183,6 +215,11 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
 
     monkeypatch.setattr(runner_module, "RuntimeFixture", _ParallelFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
+    async def fake_provider_registry(self, _ledger):
+        self.provider_registry = provider_registry_snapshot(manifest)
+        return self.provider_registry
+
+    monkeypatch.setattr(BenchmarkRunner, "_capture_provider_registry", fake_provider_registry)
     monkeypatch.setattr(runner_module, "capture_catalog", fake_capture)
     monkeypatch.setattr(runner_module, "build_model", lambda spec: SimpleNamespace(settings={}, model_spec=spec))
     monkeypatch.setattr(runner_module, "execute_smoke", fake_smoke)
@@ -229,7 +266,7 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
     async def fake_preflight(_runner):
         return {
             "runtime": {
-                "source_revision": "a" * 40,
+                "source_revision": manifest.arm_source_revisions["baseline"],
                 "artifact_versions": {"backend_artifact_version": "0.0.0", "proxy_artifact_version": "0.0.0"},
                 "discovery": {"status": "ready"},
             },
@@ -237,14 +274,8 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
         }
 
     async def fake_capture(*_args, **kwargs):
-        return CatalogSnapshot(
-            transport=kwargs["transport"],
-            source_revision="a" * 40,
-            artifact_version="0.0.0",
-            tool_count=0,
-            catalog_hash=hash_json([]),
-            catalog_token_estimate=token_estimate([]),
-            tools=[],
+        return _catalog_snapshot(manifest, "baseline", kwargs["transport"]).model_copy(
+            update={"source_revision": kwargs["source_revision"], "artifact_version": kwargs["artifact_version"]}
         )
 
     async def fake_smoke(task, *, model_spec, transport, **_kwargs):
@@ -300,6 +331,11 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
 
     monkeypatch.setattr(runner_module, "RuntimeFixture", _ParallelFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
+    async def fake_provider_registry(self, _ledger):
+        self.provider_registry = provider_registry_snapshot(manifest)
+        return self.provider_registry
+
+    monkeypatch.setattr(BenchmarkRunner, "_capture_provider_registry", fake_provider_registry)
     monkeypatch.setattr(runner_module, "capture_catalog", fake_capture)
     monkeypatch.setattr(runner_module, "build_model", lambda spec: SimpleNamespace(settings={}, model_spec=spec))
     monkeypatch.setattr(runner_module, "execute_smoke", fake_smoke)

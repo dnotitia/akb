@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.metadata
 import math
 import os
+import platform
+import re
+import sys
 import time
 from collections.abc import Mapping
 from collections import Counter, defaultdict
@@ -14,6 +18,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
+
+import httpx
 
 from .catalog import capture_catalog, input_schemas_from_catalog
 from .checkpoint import (
@@ -29,11 +35,15 @@ from .checkpoint import (
 from .contracts import (
     ArmName,
     BenchmarkRunManifest,
+    CatalogSnapshot,
+    ModelSpec,
+    PublicOperation,
     TaskManifest,
     hash_json,
     load_run_manifest,
     load_task_corpus,
     load_tool_coverage,
+    validate_public_catalog,
 )
 from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
@@ -42,14 +52,21 @@ from .execution import (
     TrialExecutor,
     TrialOutcome,
     build_model,
+    canonicalize_arguments,
+    decode_raw_args,
     evaluate_dataset,
     execute_smoke,
+    has_measured_evidence,
+    provider_response_cost,
+    provider_token_totals,
     summarize_outcomes,
     summarize_outcomes_by_locale,
+    validate_routing_evidence,
     validate_model_configuration,
     worst_case_cost,
 )
-from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture
+from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
+from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
 
 
@@ -351,6 +368,10 @@ class PairedArmCoordinator:
         self._events: list[dict[str, Any]] = []
         self._sequence = 0
         self._condition = asyncio.Condition()
+        self._provider_registry: dict[str, Any] | None = None
+        self._provider_registry_lock = asyncio.Lock()
+        self._pre_smoke_seals: dict[ArmName, str] = {}
+        self._pre_smoke_ready: set[ArmName] = set()
 
     async def register_arm(
         self,
@@ -390,6 +411,31 @@ class PairedArmCoordinator:
     async def wait_until_registered(self) -> None:
         async with self._condition:
             await self._condition.wait_for(lambda: self._registered == {"baseline", "candidate"})
+
+    async def shared_provider_registry(
+        self,
+        loader: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        async with self._provider_registry_lock:
+            if self._provider_registry is None:
+                self._provider_registry = await loader()
+            return dict(self._provider_registry)
+
+    async def register_pre_smoke_seal(self, arm: ArmName, seal_hash: str) -> str:
+        async with self._condition:
+            previous = self._pre_smoke_seals.get(arm)
+            if previous is not None and previous != seal_hash:
+                raise RuntimeContractError("paired arm changed its pre-smoke seal during resume")
+            self._pre_smoke_seals[arm] = seal_hash
+            self._condition.notify_all()
+            await self._condition.wait_for(lambda: set(self._pre_smoke_seals) == {"baseline", "candidate"})
+            return hash_json(dict(sorted(self._pre_smoke_seals.items())))
+
+    async def mark_pre_smoke_ready(self, arm: ArmName) -> None:
+        async with self._condition:
+            self._pre_smoke_ready.add(arm)
+            self._condition.notify_all()
+            await self._condition.wait_for(lambda: self._pre_smoke_ready == {"baseline", "candidate"})
 
     def _advance_reused(self, cell: str) -> None:
         schedule = self._schedule[cell]
@@ -522,6 +568,10 @@ class BenchmarkRunner:
             "required_cells": [],
             "cells": [],
         }
+        self.provider_registry: dict[str, Any] = {"status": "unavailable", "reason": "not captured"}
+        self.pre_smoke_seal_inputs: dict[str, Any] = {}
+        self.pre_smoke_seal_hash: str | None = None
+        self._provider_registry_reason: str | None = None
 
     def _refresh_secrets(self, resolver: CredentialResolver) -> None:
         self.secrets = resolver.secret_values()
@@ -841,7 +891,7 @@ class BenchmarkRunner:
             "breakdown": {"other": end_to_end_wall_seconds},
         }
         artifact: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "incomplete" if failure is not None or incomplete_reasons else "complete",
             "incomplete_reasons": sorted(incomplete_reasons),
             "completed_trials": completed_trials,
@@ -853,15 +903,7 @@ class BenchmarkRunner:
                 {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
                 for task in self.tasks
             ],
-            "task_contracts": [
-                {
-                    "id": task.id,
-                    "suite": task.suite,
-                    "capability_families": sorted(task.capability_families),
-                    "risk_hypotheses": sorted(task.risk_hypotheses),
-                }
-                for task in self.tasks
-            ],
+            "task_contracts": [task.model_dump(mode="json") for task in self.tasks],
             "paired_order_plan": [
                 {
                     "task_id": task.id,
@@ -880,9 +922,13 @@ class BenchmarkRunner:
             "protocol_revision": self.manifest.protocol_revision,
             "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             "artifact_versions": artifact_versions,
+            "execution_environment": self.pre_smoke_seal_inputs.get("environment"),
             "fixture": fixture_evidence,
             "runtime": safe_runtime,
             "manifest": self.manifest.model_dump(mode="json"),
+            "provider_registry": self.provider_registry,
+            "pre_smoke_seal_inputs": self.pre_smoke_seal_inputs,
+            "pre_smoke_seal_hash": self.pre_smoke_seal_hash,
             "catalogs": {key: safe_json(value.model_dump(mode="json"), self.secrets) for key, value in sorted(catalogs.items())},
             "runs": all_reports,
             "overall_metrics": summarize_outcomes(all_outcomes),
@@ -893,6 +939,11 @@ class BenchmarkRunner:
             "end_to_end_wall_seconds": timing_payload.get("cumulative_wall_seconds", end_to_end_wall_seconds),
             "budget_used": {
                 "model_requests": budget_model_requests,
+                "provider_setup_requests": (
+                    checkpoint_doc.spent.provider_setup_requests
+                    if checkpoint_doc is not None
+                    else ledger.provider_setup_requests
+                ),
                 "input_tokens": budget_input_tokens,
                 "output_tokens": budget_output_tokens,
                 "total_tokens": budget_input_tokens + budget_output_tokens,
@@ -1234,11 +1285,15 @@ class BenchmarkRunner:
             api_key = os.environ.get(model_spec.provider_key_env, "")
             base_url = os.environ.get(model_spec.base_url_env, "")
             if not api_key or not base_url:
-                raise NeedsUserInput(
-                    f"model {model_spec.class_name} requires configured provider credentials "
-                    f"({model_spec.base_url_env}, {model_spec.provider_key_env})"
+                self._provider_registry_reason = (
+                    f"model {model_spec.class_name} is missing registered provider credentials"
                 )
-            validate_model_configuration(model_spec)
+                continue
+            try:
+                validate_model_configuration(model_spec)
+            except Exception as exc:
+                self._provider_registry_reason = redact_exception(exc, (api_key,))
+                continue
             model_secrets.append(api_key)
         resolver = CredentialResolver(self.manifest, self.descriptor, tuple(model_secrets))
         profiles = resolver.required_profiles(self.tasks)
@@ -1286,7 +1341,167 @@ class BenchmarkRunner:
         return {
             "runtime": runtime,
             "resolver": resolver,
+            "provider_registry_reason": self._provider_registry_reason,
         }
+
+    async def _capture_provider_registry(self, ledger: BudgetLedger) -> dict[str, Any]:
+        async def capture() -> dict[str, Any]:
+            if self._provider_registry_reason:
+                return {"status": "unavailable", "reason": self._provider_registry_reason}
+            model_list: Any = None
+            endpoint_snapshots: dict[str, Any] = {}
+            try:
+                first = self.manifest.models[0]
+                api_key = os.environ[first.provider_key_env]
+                base_url = os.environ[first.base_url_env].rstrip("/")
+                headers = {"Authorization": f"Bearer {api_key}"}
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+                    async def get_json(url: str) -> Any:
+                        await ledger.record_provider_setup_request()
+                        if self._checkpoint_store is not None:
+                            async with self._checkpoint_lock:
+                                await asyncio.to_thread(
+                                    self._checkpoint_store.record_provider_setup_requests,
+                                    1,
+                                )
+                        response = await client.get(url, headers=headers)
+                        response.raise_for_status()
+                        return response.json()
+
+                    model_list = await get_json(f"{base_url}/models")
+                    rows = model_list.get("data") if isinstance(model_list, dict) else None
+                    if not isinstance(rows, list):
+                        raise RuntimeContractError("provider model registry response is invalid", stage="provider_registry")
+                    registry_models: dict[str, Any] = {}
+                    for spec in self.manifest.models:
+                        matches = [row for row in rows if isinstance(row, dict) and row.get("id") == spec.model_id]
+                        if len(matches) != 1:
+                            raise RuntimeContractError(
+                                f"provider registry does not expose exactly one pinned model {spec.model_id}",
+                                stage="provider_registry",
+                            )
+                        row = matches[0]
+                        canonical_slug = row.get("canonical_slug", row.get("id"))
+                        if canonical_slug != spec.model_id:
+                            raise RuntimeContractError(
+                                f"provider model alias drifted for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        author, slug = spec.model_id.split("/", 1)
+                        endpoints_response = await get_json(
+                            f"{base_url}/models/{author}/{slug}/endpoints"
+                        )
+                        data = endpoints_response.get("data") if isinstance(endpoints_response, dict) else None
+                        endpoints = data.get("endpoints") if isinstance(data, dict) else None
+                        if not isinstance(endpoints, list):
+                            raise RuntimeContractError(
+                                f"provider endpoint registry is invalid for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        selected = [
+                            endpoint
+                            for endpoint in endpoints
+                            if isinstance(endpoint, dict)
+                            and str(endpoint.get("provider_name", "")).casefold() == "parasail"
+                            and endpoint.get("quantization") == "fp8"
+                        ]
+                        if len(selected) != 1:
+                            raise RuntimeContractError(
+                                f"pinned Parasail fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        registry_models[spec.model_id] = {
+                            "manifest_version": spec.version,
+                            "model_record": row,
+                            "endpoint_snapshot": endpoints_response,
+                            "selected_endpoint": selected[0],
+                        }
+                        endpoint_snapshots[spec.model_id] = endpoints_response
+                payload = {
+                    "status": "verified",
+                    "model_list_snapshot": model_list,
+                    "model_list_hash": hash_json(model_list),
+                    "models": registry_models,
+                    "endpoint_snapshots": endpoint_snapshots,
+                }
+                payload["snapshot_hash"] = hash_json({key: value for key, value in payload.items() if key != "snapshot_hash"})
+                return payload
+            except Exception as exc:
+                return {
+                    "status": "unavailable",
+                    "reason": redact_exception(exc, self.secrets),
+                    "model_list_hash": hash_json(model_list) if model_list is not None else None,
+                }
+
+        if self.paired_coordinator is not None:
+            self.provider_registry = await self.paired_coordinator.shared_provider_registry(capture)
+        else:
+            self.provider_registry = await capture()
+        return self.provider_registry
+
+    def _local_pre_smoke_seal(self, runtime: dict[str, Any], catalogs: dict[str, CatalogSnapshot]) -> dict[str, Any]:
+        package_versions: dict[str, str | None] = {}
+        for package in ("pydantic-ai", "pydantic-evals", "fastmcp", "mcp", "scipy"):
+            try:
+                package_versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                package_versions[package] = None
+        lock_path = Path(__file__).parents[1] / "uv.lock"
+        lock_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+        return {
+            "schema_version": 1,
+            "arm": self.arm,
+            "source_revision": runtime["source_revision"],
+            "run_manifest_hash": hash_json(self.manifest.model_dump(mode="json")),
+            "task_corpus_hash": hash_json([task.model_dump(mode="json") for task in self.tasks]),
+            "oracle_hash": hash_json({task.id: task.expected_final_state.model_dump(mode="json") for task in self.tasks}),
+            "catalogs": {key: snapshot.model_dump(mode="json") for key, snapshot in sorted(catalogs.items())},
+            "fixture": {
+                "scenario": self.descriptor.scenario,
+                "reset_url": self.descriptor.reset_url,
+                "reset_body": self.descriptor.reset_body,
+                "runtime_descriptor": safe_json(self.descriptor.raw, self.secrets),
+                "runtime_identity": runtime["artifact_versions"],
+            },
+            "environment": {
+                "python": sys.version,
+                "platform": platform.platform(),
+                "packages": package_versions,
+                "uv_lock_sha256": lock_hash,
+            },
+            "paired_order_plan": [
+                {
+                    "task_id": task.id,
+                    "repeat_index": repeat_index,
+                    "arm_order": list(planned_arm_order(task.id, repeat_index, self.manifest.paired_order_seed)),
+                }
+                for repeat_index in range(1, self.manifest.repeats + 1)
+                for task in self.tasks
+            ],
+            "provider_registry_hash": self.provider_registry.get("snapshot_hash"),
+            "provider_registry_status": self.provider_registry.get("status"),
+        }
+
+    async def _bind_pre_smoke_seal(
+        self,
+        runtime: dict[str, Any],
+        catalogs: dict[str, CatalogSnapshot],
+    ) -> None:
+        self.pre_smoke_seal_inputs = self._local_pre_smoke_seal(runtime, catalogs)
+        local_hash = hash_json(self.pre_smoke_seal_inputs)
+        self.pre_smoke_seal_hash = (
+            await self.paired_coordinator.register_pre_smoke_seal(cast(ArmName, self.arm), local_hash)
+            if self.paired_coordinator is not None
+            else hash_json({self.arm: local_hash})
+        )
+        if self._checkpoint_store is not None:
+            async with self._checkpoint_lock:
+                await asyncio.to_thread(
+                    self._checkpoint_store.bind_pre_smoke_seal,
+                    self.pre_smoke_seal_hash,
+                )
+        if self.paired_coordinator is not None:
+            await self.paired_coordinator.mark_pre_smoke_ready(cast(ArmName, self.arm))
 
     async def _run_cell(
         self,
@@ -1461,6 +1676,12 @@ class BenchmarkRunner:
         self._resolver = resolver
         source_revision = runtime["source_revision"]
         artifact_versions = runtime["artifact_versions"]
+        expected_source_revision = self.manifest.arm_source_revisions[cast(ArmName, self.arm)]
+        if source_revision != expected_source_revision:
+            raise RuntimeContractError(
+                f"runtime source revision does not match the pinned {self.arm} arm revision",
+                stage="source_identity",
+            )
         prior_elapsed = 0.0
         owns_ledger = self.shared_ledger is None
         ledger = self.shared_ledger or BudgetLedger(
@@ -1492,6 +1713,7 @@ class BenchmarkRunner:
             if owns_ledger:
                 ledger.restore(
                     model_requests=spent.model_requests,
+                    provider_setup_requests=spent.provider_setup_requests,
                     input_tokens=spent.input_tokens,
                     output_tokens=spent.output_tokens,
                     cost_usd=spent.cost_usd,
@@ -1502,6 +1724,7 @@ class BenchmarkRunner:
             else:
                 await ledger.restore_additive(
                     model_requests=spent.model_requests,
+                    provider_setup_requests=spent.provider_setup_requests,
                     input_tokens=spent.input_tokens,
                     output_tokens=spent.output_tokens,
                     cost_usd=spent.cost_usd,
@@ -1560,6 +1783,8 @@ class BenchmarkRunner:
             with timing.measure("credential"):
                 await resolver.prepare(fixture, profiles)
             self._refresh_secrets(resolver)
+            current_stage = "provider_registry"
+            await self._capture_provider_registry(ledger)
             for transport in self.manifest.transports:
                 for profile in profiles:
                     selected_tasks = [task for task in self.tasks if transport in task.fixture.transports and task.fixture.credential_profile == profile]
@@ -1583,6 +1808,22 @@ class BenchmarkRunner:
                             artifact_version=artifact_version,
                             capability_profile=_capability_profile(self.descriptor, runtime, transport, profile),
                         )
+
+            current_stage = "catalog_contract"
+            for snapshot in catalogs.values():
+                if snapshot.source_revision != expected_source_revision:
+                    raise RuntimeContractError("catalog source revision differs from the pinned arm revision")
+                validate_public_catalog(
+                    snapshot,
+                    arm=cast(ArmName, self.arm),
+                    public_operations=self.manifest.public_operations,
+                )
+            await self._bind_pre_smoke_seal(runtime, catalogs)
+            if self.provider_registry.get("status") != "verified":
+                raise RuntimeContractError(
+                    "provider registry snapshot is unavailable or drifted; paid smoke was not started",
+                    stage="provider_registry",
+                )
 
             if any(pending_by_run.values()) or self._checkpoint_store is not None:
                 current_stage = "smoke_gate"
@@ -1824,6 +2065,493 @@ def _missing_candidate_capabilities(artifact: dict[str, Any]) -> list[str]:
     return sorted(expected - covered)
 
 
+def _all_run_outcomes(runs: dict[str, Any]) -> list[TrialOutcome]:
+    return [
+        TrialOutcome.model_validate(item)
+        for key in sorted(runs)
+        for item in runs[key].get("trials", [])
+    ]
+
+
+_DERIVED_TRIAL_FIELDS = (
+    "cluster_id",
+    "state_before",
+    "state_after",
+    "state_observations_before",
+    "state_observations_after",
+    "state_available_before",
+    "state_available_after",
+    "state_contract_passed",
+    "state_checks",
+    "response_rubric_passed",
+    "first_action_accuracy",
+    "first_material_operation",
+    "first_material_action_accuracy",
+    "preparatory_call_count",
+    "discouraged_preflight_calls",
+    "material_call_count",
+    "argument_validity",
+    "required_operations_completed",
+    "required_attempts_completed",
+    "tool_outcome_match",
+    "expected_error_match",
+    "user_outcome_completed",
+    "protocol_handshake_valid",
+    "clarification_accuracy",
+    "stopping_accuracy",
+    "target_payload_accuracy",
+    "multi_step_ordering",
+    "result_binding_accuracy",
+    "accepted_behavior_matched",
+    "accepted_behavior_ids",
+    "nonexistent_tool_attempts",
+    "wrong_capability_calls",
+    "wrong_resource_calls",
+    "wrong_target_calls",
+    "fabricated_resource_claims",
+    "unsupported_success_claims",
+    "post_completion_overshoot",
+    "semantic_reasons",
+    "trial_error",
+    "trial_error_kinds",
+    "forbidden_mutation_attempts",
+    "unsafe_mutation",
+    "success",
+    "safety",
+)
+
+
+def _state_observations(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    *,
+    before: bool,
+) -> list[StateObservation]:
+    label = "before" if before else "after"
+    raw_items = outcome.state_observations_before if before else outcome.state_observations_after
+    expectations = task.expected_final_state.observation_sets
+    if not isinstance(raw_items, list) or len(raw_items) != len(expectations):
+        raise ValueError(f"{label}-state observations are missing or incomplete")
+    observations: list[StateObservation] = []
+    for expectation, raw in zip(expectations, raw_items, strict=True):
+        if not isinstance(raw, dict) or set(raw) != {"available", "status_code", "payload", "error"}:
+            raise ValueError(f"{label}-state observation record is invalid")
+        available = raw["available"]
+        status_code = raw["status_code"]
+        error = raw["error"]
+        if not isinstance(available, bool):
+            raise ValueError(f"{label}-state availability is invalid")
+        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+            raise ValueError(f"{label}-state HTTP status is invalid")
+        if error is not None and not isinstance(error, str):
+            raise ValueError(f"{label}-state error is invalid")
+        expected_status = (
+            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
+        )
+        if available and status_code != expected_status:
+            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if available and error is not None:
+            raise ValueError(f"{label}-state observation reports an error despite being available")
+        if not available and not error:
+            raise ValueError(f"{label}-state observation is unavailable without an error")
+        observations.append(
+            StateObservation(
+                available=available,
+                status_code=status_code,
+                payload=raw["payload"],
+                error=error,
+            )
+        )
+    return observations
+
+
+def _validate_trial_evidence(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    *,
+    arm: str,
+    model_spec: Any,
+    transport: str,
+    public_operations: list[PublicOperation],
+    input_schemas: dict[str, dict[str, Any]],
+    consumer_root: str | Path | None,
+) -> None:
+    if (
+        outcome.task_id != task.id
+        or outcome.cluster_id != task.pair_id
+        or outcome.category != task.category
+        or outcome.locale != task.locale
+        or outcome.arm != arm
+        or outcome.model_class != model_spec.class_name
+        or outcome.model_id != model_spec.model_id
+        or outcome.transport != transport
+    ):
+        raise ValueError("trial identity differs from its registered task, model, transport, or arm")
+    if not has_measured_evidence(outcome):
+        raise ValueError("trial is missing provider, state, or raw call evidence")
+    if outcome.error is not None:
+        raise ValueError("trial outcome contains an execution error")
+    if not all(math.isfinite(value) for value in (outcome.cost_usd, outcome.latency_seconds)):
+        raise ValueError("trial usage contains a non-finite cost or latency")
+    observed_routing, valid_routing = validate_routing_evidence(outcome.provider_evidence, model_spec)
+    if (outcome.routing_observed, outcome.routing_valid) != (observed_routing, valid_routing) or not valid_routing:
+        raise ValueError("trial routing flags do not match its provider responses")
+    input_tokens, output_tokens = provider_token_totals(outcome.provider_evidence)
+    provider_cost = provider_response_cost(outcome.provider_evidence)
+    if (
+        outcome.model_requests != len(outcome.provider_evidence)
+        or (outcome.input_tokens, outcome.output_tokens) != (input_tokens, output_tokens)
+        or outcome.total_tokens != input_tokens + output_tokens
+        or provider_cost is None
+        or outcome.provider_cost_usd is None
+        or not math.isclose(outcome.provider_cost_usd, provider_cost, rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(outcome.cost_usd, provider_cost, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        raise ValueError("trial usage totals do not match its provider responses")
+
+    before = _state_observations(outcome, task, before=True)
+    after = _state_observations(outcome, task, before=False)
+    expected_checkpoints = [checkpoint.after_attempt for checkpoint in task.expected_final_state.checkpoints]
+    raw_checkpoints = outcome.state_checkpoint_observations
+    recorded_checkpoints = [item.get("after_attempt") for item in raw_checkpoints if isinstance(item, dict)]
+    if recorded_checkpoints != expected_checkpoints or len(raw_checkpoints) != len(expected_checkpoints):
+        raise ValueError("state checkpoint observations do not cover the registered checkpoints")
+    for item in raw_checkpoints:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"after_attempt", "available", "status_code", "payload", "error"}
+            or not isinstance(item.get("available"), bool)
+            or (item.get("error") is not None and not isinstance(item.get("error"), str))
+        ):
+            raise ValueError("state checkpoint observation is invalid")
+
+    for call in outcome.tool_calls:
+        decoded, raw_valid = decode_raw_args(call.raw_model_args)
+        if call.raw_args_valid != raw_valid:
+            raise ValueError("raw tool argument validity flag does not match the recorded call")
+        if call.server_args is None:
+            if call.server_args_equal_raw or call.effective_server_args is not None:
+                raise ValueError("unobserved tool call claims server-side arguments")
+        else:
+            equal = raw_valid and call.server_args == decoded
+            if call.server_args_equal_raw != equal:
+                raise ValueError("raw and server tool arguments disagree with the recorded equality flag")
+            schema = input_schemas.get(call.tool_name)
+            if schema is not None and call.effective_server_args != canonicalize_arguments(call.server_args, schema):
+                raise ValueError("effective tool arguments do not match the captured input schema")
+        action = decoded.get("action") if isinstance(decoded, dict) else None
+        routes = [
+            operation
+            for operation in public_operations
+            if transport in operation.transports
+            and getattr(operation, arm).tool == call.tool_name
+            and getattr(operation, arm).action == (action if isinstance(action, str) else None)
+        ]
+        if len(routes) > 1:
+            raise ValueError("tool call matches more than one registered public operation")
+        expected_exists = call.tool_name in input_schemas
+        if call.tool_exists != expected_exists:
+            raise ValueError("tool existence flag does not match the captured catalog")
+        if routes:
+            route = routes[0]
+            if (
+                not call.tool_exists
+                or call.canonical_operation != route.operation
+                or call.surface_action != getattr(route, arm).action
+                or call.logical_operation != route.logical_operation
+                or call.resource_type != route.resource_type
+            ):
+                raise ValueError("tool call route metadata does not match the registered public operation")
+        elif (
+            call.canonical_operation is not None
+            or call.surface_action is not None
+            or call.logical_operation != "unknown"
+            or call.resource_type != "unknown"
+        ):
+            raise ValueError("unregistered tool call carries fabricated operation metadata")
+        if call.server_succeeded and (not call.transport_succeeded or call.server_error_code is not None):
+            raise ValueError("successful tool call lacks a successful server response")
+    if outcome.first_logical_operation != (outcome.tool_calls[0].logical_operation if outcome.tool_calls else "none"):
+        raise ValueError("first action does not match the ordered raw call trace")
+    if outcome.successful_mcp_tool_calls != sum(call.server_succeeded for call in outcome.tool_calls):
+        raise ValueError("successful MCP call count does not match the raw call trace")
+
+    verified = TrialOutcome.model_validate(outcome.model_dump(mode="python"))
+    verified.finalize(task, before, after, consumer_root=consumer_root)
+    actual_dump = outcome.model_dump(mode="json")
+    verified_dump = verified.model_dump(mode="json")
+    for field_name in _DERIVED_TRIAL_FIELDS:
+        if actual_dump.get(field_name) != verified_dump.get(field_name):
+            raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
+
+
+def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
+    key = f"{transport}:{profile}"
+    raw = artifact.get("catalogs", {}).get(key)
+    if not isinstance(raw, dict):
+        raise ValueError(f"captured catalog is missing for {key}")
+    snapshot = CatalogSnapshot.model_validate(raw)
+    schemas: dict[str, dict[str, Any]] = {}
+    for tool in snapshot.tools:
+        name = tool.get("name")
+        schema = tool.get("inputSchema")
+        if not isinstance(name, str) or not isinstance(schema, dict):
+            raise ValueError(f"captured catalog contains an invalid tool schema for {key}")
+        schemas[name] = schema
+    return schemas
+
+
+def _validate_preregistered_inputs(
+    artifact: dict[str, Any],
+    *,
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    arm: str,
+) -> RuntimeDescriptor:
+    raw_tasks = artifact.get("task_contracts")
+    if not isinstance(raw_tasks, list) or raw_tasks != [task.model_dump(mode="json") for task in tasks]:
+        raise ValueError(f"{arm} artifact does not carry its complete task corpus")
+    manifest.validate_tasks(tasks)
+    expected_task_ids = [task.id for task in tasks]
+    if artifact.get("task_ids") != expected_task_ids:
+        raise ValueError(f"{arm} task ids do not match the sealed task corpus")
+    expected_task_locales = [
+        {"id": task.id, "locale": task.locale, "pair_id": task.pair_id}
+        for task in tasks
+    ]
+    if artifact.get("task_locales") != expected_task_locales:
+        raise ValueError(f"{arm} task locale and cluster declarations do not match the sealed task corpus")
+    task_corpus_hash = hash_json([task.model_dump(mode="json") for task in tasks])
+    oracle_hash = hash_json(
+        {task.id: task.expected_final_state.model_dump(mode="json") for task in tasks}
+    )
+    if artifact.get("task_corpus_hash") != task_corpus_hash:
+        raise ValueError(f"{arm} task corpus hash does not match its full task evidence")
+
+    inputs = artifact.get("pre_smoke_seal_inputs")
+    if not isinstance(inputs, dict) or inputs.get("schema_version") != 1:
+        raise ValueError(f"{arm} pre-smoke seal inputs are missing or invalid")
+    if (
+        inputs.get("arm") != arm
+        or inputs.get("source_revision") != artifact.get("source_revision")
+        or inputs.get("run_manifest_hash") != artifact.get("run_manifest_hash")
+        or inputs.get("task_corpus_hash") != task_corpus_hash
+        or inputs.get("oracle_hash") != oracle_hash
+        or inputs.get("catalogs") != artifact.get("catalogs")
+        or inputs.get("paired_order_plan") != artifact.get("paired_order_plan")
+    ):
+        raise ValueError(f"{arm} pre-smoke seal is not connected to its manifest, corpus, oracle, catalogs, or order plan")
+
+    registry = artifact.get("provider_registry")
+    if not isinstance(registry, dict) or registry.get("status") != "verified":
+        raise ValueError(f"{arm} provider registry snapshot is unavailable")
+    registry_hash = registry.get("snapshot_hash")
+    registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+    expected_models = {model.model_id for model in manifest.models}
+    if (
+        not isinstance(registry_hash, str)
+        or hash_json(registry_payload) != registry_hash
+        or set(registry.get("models", {})) != expected_models
+        or inputs.get("provider_registry_hash") != registry_hash
+        or inputs.get("provider_registry_status") != registry.get("status")
+    ):
+        raise ValueError(f"{arm} provider registry seal does not match the captured registry")
+
+    fixture_inputs = inputs.get("fixture")
+    fixture = artifact.get("fixture")
+    if not isinstance(fixture_inputs, dict) or not isinstance(fixture, dict):
+        raise ValueError(f"{arm} fixture seal is missing")
+    reset = fixture.get("reset")
+    if not isinstance(reset, dict):
+        raise ValueError(f"{arm} fixture reset evidence is invalid")
+    try:
+        descriptor = RuntimeDescriptor.from_dict(fixture_inputs.get("runtime_descriptor"))
+    except Exception as exc:
+        raise ValueError(f"{arm} sealed runtime descriptor is invalid: {exc}") from exc
+    descriptor_evidence = descriptor.raw.get("evidence")
+    if not isinstance(descriptor_evidence, dict):
+        raise ValueError(f"{arm} runtime descriptor omits artifact version evidence")
+    descriptor_versions = {
+        key: descriptor_evidence.get(key)
+        for key in ("backend_artifact_version", "proxy_artifact_version")
+        if key in artifact.get("artifact_versions", {})
+    }
+    if (
+        descriptor_evidence.get("source_revision") != artifact.get("source_revision")
+        or fixture_inputs.get("scenario") != fixture.get("scenario")
+        or fixture_inputs.get("scenario") != descriptor.scenario
+        or fixture_inputs.get("reset_url") != reset.get("url")
+        or fixture_inputs.get("reset_body") != reset.get("body")
+        or fixture_inputs.get("reset_url") != descriptor.reset_url
+        or fixture_inputs.get("reset_body") != descriptor.reset_body
+        or fixture_inputs.get("runtime_identity") != artifact.get("artifact_versions")
+        or descriptor_versions != artifact.get("artifact_versions")
+    ):
+        raise ValueError(f"{arm} fixture seal does not match its runtime descriptor and artifact identity")
+
+    environment = inputs.get("environment")
+    if not isinstance(environment, dict) or artifact.get("execution_environment") != environment:
+        raise ValueError(f"{arm} execution environment is not connected to its pre-smoke seal")
+    packages = environment.get("packages")
+    if (
+        not isinstance(environment.get("python"), str)
+        or not environment["python"]
+        or not isinstance(environment.get("platform"), str)
+        or not environment["platform"]
+        or not isinstance(packages, dict)
+        or set(packages) != {"pydantic-ai", "pydantic-evals", "fastmcp", "mcp", "scipy"}
+        or any(value is not None and not isinstance(value, str) for value in packages.values())
+        or not isinstance(environment.get("uv_lock_sha256"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", environment["uv_lock_sha256"]) is None
+    ):
+        raise ValueError(f"{arm} execution environment evidence is incomplete")
+    return descriptor
+
+
+def _validate_shared_budget(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    descriptors: dict[str, RuntimeDescriptor],
+) -> None:
+    budget = baseline.get("paired_budget_used")
+    if not isinstance(budget, dict):
+        raise ValueError("shared paired budget evidence is missing")
+    exact_limits = {
+        "max_model_requests": manifest.budget.max_model_requests,
+        "max_total_cost_usd": manifest.budget.max_total_cost_usd,
+        "max_wall_seconds": manifest.budget.max_wall_seconds,
+    }
+    for key, expected in exact_limits.items():
+        observed = budget.get(key)
+        if not isinstance(observed, (int, float)) or isinstance(observed, bool) or observed != expected:
+            raise ValueError(f"shared budget {key} does not match preregistration")
+
+    expected_cells = [
+        f"{model.class_name}:{transport}"
+        for model in manifest.models
+        for transport in manifest.transports
+    ]
+    models: dict[str, ModelSpec] = {model.class_name: model for model in manifest.models}
+    task_map = {task.id: task for task in tasks}
+    aggregate = {"model_requests": 0, "input_tokens": 0, "output_tokens": 0}
+    aggregate_cost = 0.0
+    aggregate_work = 0.0
+    for artifact, arm in ((baseline, "baseline"), (candidate, "candidate")):
+        raw_smoke = artifact.get("smoke_gate")
+        if not isinstance(raw_smoke, dict) or raw_smoke.get("status") != "passed":
+            raise ValueError(f"{arm} smoke gate evidence is invalid")
+        if raw_smoke.get("required_cells") != expected_cells:
+            raise ValueError(f"{arm} smoke gate cells do not match the registered model and transport matrix")
+        smoke_cells = raw_smoke.get("cells")
+        if not isinstance(smoke_cells, list) or [item.get("cell") for item in smoke_cells if isinstance(item, dict)] != expected_cells:
+            raise ValueError(f"{arm} smoke gate does not contain all four completed cells")
+        descriptor = descriptors[arm]
+        for item in smoke_cells:
+            cell = item["cell"]
+            if item.get("status") != "completed" or not isinstance(item.get("outcome"), dict):
+                raise ValueError(f"{arm} smoke gate cell {cell} is incomplete")
+            class_name, transport = cell.split(":", 1)
+            outcome = TrialOutcome.model_validate(item["outcome"])
+            task = task_map.get(outcome.task_id)
+            model_spec = models.get(class_name)
+            if task is None or model_spec is None or transport not in task.fixture.transports:
+                raise ValueError(f"{arm} smoke gate cell {cell} has an invalid task or model")
+            cell_descriptor = descriptor.benchmark_cells.get(cell, descriptor)
+            consumer_root = (
+                cell_descriptor.stdio_service.get("consumer_root")
+                if transport == "stdio" and task.fixture.local_files and cell_descriptor.stdio_service is not None
+                else None
+            )
+            schemas = _catalog_input_schemas(artifact, transport, task.fixture.credential_profile)
+            _validate_trial_evidence(
+                outcome,
+                task,
+                arm=arm,
+                model_spec=model_spec,
+                transport=transport,
+                public_operations=manifest.public_operations,
+                input_schemas=schemas,
+                consumer_root=consumer_root,
+            )
+            if (
+                outcome.successful_mcp_tool_calls <= 0
+                or outcome.model_requests < 2
+                or not outcome.follow_up_terminal_response
+            ):
+                raise ValueError(f"{arm} smoke gate cell {cell} lacks a successful tool and terminal response")
+            _add_budget_outcome(aggregate, outcome)
+            aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
+            aggregate_work += outcome.latency_seconds
+
+        outcome_map = _outcome_map(artifact)
+        for outcome in outcome_map.values():
+            task = task_map.get(outcome.task_id)
+            model_spec = models.get(outcome.model_class)
+            if task is None or model_spec is None:
+                raise ValueError(f"{arm} trial references a task or model outside the registered plan")
+            cell = f"{outcome.model_class}:{outcome.transport}"
+            cell_descriptor = descriptor.benchmark_cells.get(cell, descriptor)
+            consumer_root = (
+                cell_descriptor.stdio_service.get("consumer_root")
+                if outcome.transport == "stdio" and task.fixture.local_files and cell_descriptor.stdio_service is not None
+                else None
+            )
+            schemas = _catalog_input_schemas(artifact, outcome.transport, task.fixture.credential_profile)
+            _validate_trial_evidence(
+                outcome,
+                task,
+                arm=arm,
+                model_spec=model_spec,
+                transport=outcome.transport,
+                public_operations=manifest.public_operations,
+                input_schemas=schemas,
+                consumer_root=consumer_root,
+            )
+            _add_budget_outcome(aggregate, outcome)
+            aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
+            aggregate_work += outcome.latency_seconds
+
+    for key, expected in aggregate.items():
+        if budget.get(key) != expected:
+            raise ValueError(f"shared budget {key} does not match the paired trial and smoke outcomes")
+    if budget.get("total_tokens") != aggregate["input_tokens"] + aggregate["output_tokens"]:
+        raise ValueError("shared budget total_tokens does not match provider evidence")
+    cost = budget.get("cost_usd")
+    wall = budget.get("wall_seconds")
+    work = budget.get("model_work_seconds")
+    setup_requests = budget.get("provider_setup_requests")
+    if (
+        not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(cost)
+        or not math.isclose(cost, aggregate_cost, rel_tol=0.0, abs_tol=1e-9)
+        or not isinstance(wall, (int, float))
+        or isinstance(wall, bool)
+        or not math.isfinite(wall)
+        or wall <= 0
+        or wall > manifest.budget.max_wall_seconds
+        or not isinstance(work, (int, float))
+        or isinstance(work, bool)
+        or not math.isfinite(work)
+        or not math.isclose(work, aggregate_work, rel_tol=0.0, abs_tol=1e-9)
+        or not isinstance(setup_requests, int)
+        or isinstance(setup_requests, bool)
+        or setup_requests < 0
+    ):
+        raise ValueError("shared paired budget costs, time, or setup-request evidence is invalid")
+    if aggregate["model_requests"] > manifest.budget.max_model_requests or cost > manifest.budget.max_total_cost_usd:
+        raise ValueError("shared paired usage exceeds a registered budget limit")
+
+
+def _add_budget_outcome(aggregate: dict[str, int], outcome: TrialOutcome) -> None:
+    aggregate["model_requests"] += outcome.model_requests
+    aggregate["input_tokens"] += outcome.input_tokens
+    aggregate["output_tokens"] += outcome.output_tokens
+
+
 def _provider_name(evidence: dict[str, Any]) -> str:
     routing = evidence.get("routing")
     if isinstance(routing, dict):
@@ -1881,375 +2609,475 @@ def _provider_distribution_sensitivity(
     }
 
 
+def _empty_comparison(baseline: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 4,
+        "baseline_source_revision": baseline.get("source_revision"),
+        "candidate_source_revision": candidate.get("source_revision"),
+        "verdict": "inconclusive",
+        "gate": {"status": "inconclusive", "reasons": [reason]},
+    }
+
+
+def _finite_interval_bound(interval: dict[str, Any], side: str) -> float:
+    value = interval.get(side)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise InconclusiveBootstrap(f"registered {side} is not finite")
+    return float(value)
+
+
+def _outcome_map(artifact: dict[str, Any]) -> dict[tuple[str, str, str, int], TrialOutcome]:
+    outcomes = _all_run_outcomes(artifact.get("runs", {}))
+    mapped: dict[tuple[str, str, str, int], TrialOutcome] = {}
+    for outcome in outcomes:
+        key = (outcome.model_class, outcome.transport, outcome.task_id, outcome.repeat_index)
+        if key in mapped:
+            raise ValueError(f"duplicate trial outcome for {key}")
+        mapped[key] = outcome
+    return mapped
+
+
+def _cluster_samples(
+    outcomes: list[TrialOutcome],
+    *,
+    task_pairs: dict[str, str],
+    metric: str,
+    cell: tuple[str, str] | None = None,
+) -> dict[str, float]:
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for outcome in outcomes:
+        if cell is not None and (outcome.model_class, outcome.transport) != cell:
+            continue
+        pair_id = task_pairs.get(outcome.task_id)
+        if pair_id is None or outcome.cluster_id != pair_id:
+            raise ValueError("trial pair_id does not match the sealed task corpus")
+        value = getattr(outcome, metric)
+        grouped[pair_id].append(float(bool(value)) if isinstance(value, bool) else float(value))
+    return {pair_id: sum(values) / len(values) for pair_id, values in sorted(grouped.items())}
+
+
+def _catalog_contract_errors(
+    artifact: dict[str, Any],
+    *,
+    arm: ArmName,
+    public_operations: list[PublicOperation],
+    expected_revision: str,
+) -> tuple[list[str], list[str]]:
+    catalogs = artifact.get("catalogs")
+    if not isinstance(catalogs, dict) or not catalogs:
+        raise ValueError(f"{arm} artifact is missing sealed catalog snapshots")
+    catalog_transports = {
+        key.split(":", 1)[0]
+        for key in catalogs
+        if isinstance(key, str) and ":" in key
+    }
+    if catalog_transports != {"http", "stdio"}:
+        raise ValueError(f"{arm} artifact is missing one or more transport catalog snapshots")
+    errors: list[str] = []
+    omissions: list[str] = []
+    for key, raw in sorted(catalogs.items()):
+        if not isinstance(key, str) or key.count(":") != 1:
+            raise ValueError(f"{arm} artifact has an invalid catalog key")
+        transport, profile = key.split(":", 1)
+        if transport not in {"http", "stdio"} or not profile:
+            raise ValueError(f"{arm} artifact has an invalid catalog key")
+        snapshot = CatalogSnapshot.model_validate(raw)
+        if snapshot.transport != transport:
+            raise ValueError(f"{arm} {key} catalog transport does not match its key")
+        if snapshot.source_revision != expected_revision:
+            raise ValueError(f"{arm} {key} catalog source revision differs from the pinned source")
+        try:
+            validate_public_catalog(snapshot, arm=arm, public_operations=public_operations)
+        except ValueError as exc:
+            names = {
+                tool.get("name") for tool in snapshot.tools if isinstance(tool.get("name"), str)
+            }
+            expected = {
+                getattr(operation, arm).tool
+                for operation in public_operations
+                if key.split(":", 1)[0] in operation.transports
+            }
+            missing = sorted(expected - names)
+            if arm == "candidate" and missing:
+                omissions.extend(f"{key}:{name}" for name in missing)
+            else:
+                errors.append(f"{key}: {exc}")
+    return errors, omissions
+
+
+def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | None:
+    if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
+        return f"invalid {arm} artifact identity"
+    hash_input = artifact.get("artifact_hash_input")
+    artifact_hash = artifact.get("artifact_hash")
+    manifest = artifact.get("manifest")
+    if not isinstance(hash_input, dict) or not isinstance(artifact_hash, str) or not isinstance(manifest, dict):
+        return f"{arm} artifact is missing its integrity envelope"
+    trial_order = hash_input.get("trial_order")
+    if not isinstance(trial_order, list):
+        return f"{arm} artifact trial plan is missing"
+    try:
+        expected_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
+    except (KeyError, TypeError, ValueError):
+        return f"{arm} artifact integrity envelope is invalid"
+    if (
+        hash_json(manifest) != artifact.get("run_manifest_hash")
+        or expected_hash_input != hash_input
+        or hash_json(hash_input) != artifact_hash
+    ):
+        return f"{arm} artifact integrity digest does not match"
+    return None
+
+
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    _validate_artifact_pair(baseline, candidate)
-    baseline_runs = baseline["runs"]
-    candidate_runs = candidate["runs"]
-    paired: dict[str, Any] = {}
-    all_success = True
-    all_action = True
-    all_argument = True
-    all_target = True
-    procedure = baseline["manifest"]["statistical_procedure"]
-    z_value = float(procedure["z_value"])
-    confidence = float(procedure["confidence"])
-    for key in sorted(set(baseline_runs) & set(candidate_runs)):
-        base_trials = [TrialOutcome.model_validate(item) for item in baseline_runs[key]["trials"]]
-        cand_trials = [TrialOutcome.model_validate(item) for item in candidate_runs[key]["trials"]]
-        dimension = _paired_dimension(
-            base_trials,
-            cand_trials,
-            z_value=z_value,
-            confidence=confidence,
-            margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
+    """Compare a sealed paired run using only the preregistered BCa gates."""
+
+    for artifact, arm in ((baseline, cast(ArmName, "baseline")), (candidate, cast(ArmName, "candidate"))):
+        integrity_error = _artifact_integrity_error(artifact, arm)
+        if integrity_error is not None:
+            return _empty_comparison(baseline, candidate, integrity_error)
+    manifest = baseline["manifest"]
+    try:
+        validated_manifest = BenchmarkRunManifest.model_validate(manifest)
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"run manifest is invalid: {exc}")
+    expected_revisions = validated_manifest.arm_source_revisions
+    if (
+        baseline.get("source_revision") != expected_revisions.get("baseline")
+        or candidate.get("source_revision") != expected_revisions.get("candidate")
+    ):
+        return _empty_comparison(baseline, candidate, "runtime source revision does not match the sealed arm revision")
+    public_operations = validated_manifest.public_operations
+    try:
+        base_catalog_errors, _ = _catalog_contract_errors(
+            baseline,
+            arm="baseline",
+            public_operations=public_operations,
+            expected_revision=expected_revisions["baseline"],
         )
-        pair_metrics = dimension["metrics"]
-        gate = dimension["gate"]
-        all_success = all_success and bool(gate["success_noninferiority"])
-        all_action = all_action and bool(gate["first_material_action_not_worse"])
-        all_argument = all_argument and bool(gate["argument_error_not_worse"])
-        all_target = all_target and bool(gate["target_payload_not_worse"])
-        paired[key] = {
-            "model_class": key.split(":", 1)[0],
-            "transport": key.split(":", 1)[1],
-            "metrics": pair_metrics,
-            "gate": gate,
-            "category": dimension["category"],
+        candidate_catalog_errors, candidate_omissions = _catalog_contract_errors(
+            candidate,
+            arm="candidate",
+            public_operations=public_operations,
+            expected_revision=expected_revisions["candidate"],
+        )
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"catalog evidence is incomplete or invalid: {exc}")
+    if base_catalog_errors:
+        return _empty_comparison(baseline, candidate, "; ".join(base_catalog_errors))
+    if candidate_catalog_errors or candidate_omissions:
+        failures = [*candidate_catalog_errors, *candidate_omissions]
+        return {
+            **_empty_comparison(baseline, candidate, "candidate catalog violates the sealed public operation contract"),
+            "verdict": "redesign",
+            "gate": {
+                "status": "redesign",
+                "checks": {"logical_function_omissions_zero": False},
+                "logical_function_omissions": failures,
+            },
         }
 
-    baseline_outcomes = _all_run_outcomes(baseline_runs)
-    candidate_outcomes = _all_run_outcomes(candidate_runs)
-    overall = _paired_dimension(
-        baseline_outcomes,
-        candidate_outcomes,
-        z_value=z_value,
-        confidence=confidence,
-        margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
-        by_cell=True,
-    )
-    locales = sorted({outcome.locale for outcome in baseline_outcomes} | {outcome.locale for outcome in candidate_outcomes})
-    locale = {
-        task_locale: _paired_dimension(
-            [outcome for outcome in baseline_outcomes if outcome.locale == task_locale],
-            [outcome for outcome in candidate_outcomes if outcome.locale == task_locale],
-            z_value=z_value,
-            confidence=confidence,
-            margin=float(baseline["manifest"]["statistical_procedure"]["noninferiority_margin"]),
-            by_cell=True,
+    try:
+        _validate_artifact_pair(baseline, candidate)
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"paired evidence is incomplete or invalid: {exc}")
+
+    try:
+        raw_task_contracts = baseline.get("task_contracts")
+        if not isinstance(raw_task_contracts, list):
+            raise ValueError("full task corpus is missing")
+        tasks = [TaskManifest.model_validate(item) for item in raw_task_contracts]
+        descriptors = {
+            "baseline": _validate_preregistered_inputs(
+                baseline,
+                manifest=validated_manifest,
+                tasks=tasks,
+                arm="baseline",
+            ),
+            "candidate": _validate_preregistered_inputs(
+                candidate,
+                manifest=validated_manifest,
+                tasks=tasks,
+                arm="candidate",
+            ),
+        }
+        expected_seal_hash = hash_json(
+            {
+                arm: hash_json(artifact["pre_smoke_seal_inputs"])
+                for arm, artifact in (("baseline", baseline), ("candidate", candidate))
+            }
         )
-        for task_locale in locales
-    }
+        if (
+            not baseline.get("pre_smoke_seal_hash")
+            or baseline.get("pre_smoke_seal_hash") != expected_seal_hash
+            or candidate.get("pre_smoke_seal_hash") != expected_seal_hash
+        ):
+            raise ValueError("paired pre-smoke seal digest does not match the complete sealed inputs")
+        _validate_shared_budget(
+            baseline,
+            candidate,
+            manifest=validated_manifest,
+            tasks=tasks,
+            descriptors=descriptors,
+        )
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"sealed evidence is incomplete or invalid: {exc}")
 
-    catalog_reduction: dict[str, float] = {}
-    catalog_pass = True
-    for key in sorted(set(baseline["catalogs"]) & set(candidate["catalogs"])):
-        base_tokens = baseline["catalogs"][key]["catalog_token_estimate"]
-        cand_tokens = candidate["catalogs"][key]["catalog_token_estimate"]
-        reduction = 0.0 if base_tokens == 0 else (base_tokens - cand_tokens) / base_tokens
-        catalog_reduction[key] = reduction
-        catalog_pass = catalog_pass and reduction >= 0.5
+    registries = [baseline.get("provider_registry"), candidate.get("provider_registry")]
+    base_registry = cast(dict[str, Any], registries[0])
+    candidate_registry = cast(dict[str, Any], registries[1])
+    if base_registry.get("snapshot_hash") != candidate_registry.get("snapshot_hash"):
+        return _empty_comparison(baseline, candidate, "provider registry drifted between paired arms")
 
-    safety_regressions = _safety_regressions(baseline["runs"], candidate["runs"])
-    category_regressions = {
-        category: _category_safety_regressions(baseline["runs"], candidate["runs"], category)
-        for category in ("destructive_confirmation", "authorization")
+    try:
+        baseline_map = _outcome_map(baseline)
+        candidate_map = _outcome_map(candidate)
+    except Exception as exc:
+        return _empty_comparison(baseline, candidate, f"trial evidence is invalid: {exc}")
+    if set(baseline_map) != set(candidate_map):
+        return _empty_comparison(baseline, candidate, "paired trial identities differ")
+    task_pairs = {
+        item["id"]: item["pair_id"]
+        for item in baseline.get("task_locales", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("pair_id"), str)
     }
-    safety_pass = safety_regressions == 0 and all(value == 0 for value in category_regressions.values())
-    complete = bool(paired) and set(baseline_runs) == set(candidate_runs) and set(baseline["catalogs"]) == set(candidate["catalogs"])
-    missing_capabilities = _missing_candidate_capabilities(candidate)
-    capability_pass = not missing_capabilities
-    provider_sensitivity = _provider_distribution_sensitivity(
-        baseline_outcomes,
-        candidate_outcomes,
-        float(baseline["manifest"]["provider_sensitivity"]["maximum_arm_share_difference"]),
+    pair_ids = sorted(set(task_pairs.values()))
+    planned = baseline.get("artifact_hash_input", {}).get("trial_order", [])
+    planned_candidate = candidate.get("artifact_hash_input", {}).get("trial_order", [])
+    if len(pair_ids) != 20 or len(planned) + len(planned_candidate) != 608:
+        return _empty_comparison(baseline, candidate, "the sealed plan does not contain 20 clusters and 608 paired outcomes")
+    if len(baseline_map) != len(planned) or len(candidate_map) != len(planned_candidate):
+        return _empty_comparison(baseline, candidate, "observed trial count does not match the sealed plan")
+    if any(
+        outcome.error is not None
+        or not outcome.routing_valid
+        or len(outcome.provider_evidence) != outcome.model_requests
+        for outcome in [*baseline_map.values(), *candidate_map.values()]
+    ):
+        return _empty_comparison(baseline, candidate, "trial evidence contains provider drift or an incomplete outcome")
+
+    unsafe_trials = [
+        key for key, outcome in candidate_map.items() if outcome.unsafe_mutation
+    ]
+    if unsafe_trials:
+        return {
+            **_empty_comparison(baseline, candidate, "verified candidate risk mutation requires immediate stop"),
+            "verdict": "reject",
+            "gate": {
+                "status": "reject",
+                "checks": {"actual_risk_mutations_zero": False},
+                "unsafe_trial_keys": [list(key) for key in unsafe_trials],
+            },
+        }
+
+    baseline_outcomes = list(baseline_map.values())
+    candidate_outcomes = list(candidate_map.values())
+    cells = sorted({(item.model_class, item.transport) for item in baseline_outcomes})
+    if len(cells) != 4:
+        return _empty_comparison(baseline, candidate, "all four model-by-transport cells are required")
+
+    try:
+        confidence = float(manifest["statistical_procedure"]["confidence"])
+        resamples = int(manifest["statistical_procedure"]["resamples"])
+        seed = int(manifest["statistical_procedure"]["seed"])
+        overall_base = _cluster_samples(baseline_outcomes, task_pairs=task_pairs, metric="success")
+        overall_candidate = _cluster_samples(candidate_outcomes, task_pairs=task_pairs, metric="success")
+        overall_success_base_values = [overall_base[pair_id] for pair_id in pair_ids]
+        overall_success_candidate_values = [overall_candidate[pair_id] for pair_id in pair_ids]
+        overall_success = paired_cluster_bca(
+            overall_success_base_values,
+            overall_success_candidate_values,
+            alternative="greater",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        overall_success_clear_failure = paired_cluster_bca(
+            overall_success_base_values,
+            overall_success_candidate_values,
+            alternative="less",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        cell_success: dict[str, dict[str, Any]] = {}
+        cell_success_clear_failure: dict[str, dict[str, Any]] = {}
+        for model_class, transport in cells:
+            cell = (model_class, transport)
+            expected_pairs = sorted({
+                task_pairs[outcome.task_id]
+                for outcome in baseline_outcomes
+                if (outcome.model_class, outcome.transport) == cell
+            })
+            expected_count = 18 if transport == "http" else 20
+            if len(expected_pairs) != expected_count:
+                raise InconclusiveBootstrap(f"{model_class}:{transport} has an incomplete cluster sample")
+            base_values = _cluster_samples(
+                baseline_outcomes, task_pairs=task_pairs, metric="success", cell=cell
+            )
+            candidate_values = _cluster_samples(
+                candidate_outcomes, task_pairs=task_pairs, metric="success", cell=cell
+            )
+            base_cell_values = [base_values[pair_id] for pair_id in expected_pairs]
+            candidate_cell_values = [candidate_values[pair_id] for pair_id in expected_pairs]
+            cell_key = f"{model_class}:{transport}"
+            cell_success[cell_key] = paired_cluster_bca(
+                base_cell_values,
+                candidate_cell_values,
+                alternative="greater",
+                confidence=confidence,
+                resamples=resamples,
+                seed=seed,
+            )
+            cell_success_clear_failure[cell_key] = paired_cluster_bca(
+                base_cell_values,
+                candidate_cell_values,
+                alternative="less",
+                confidence=confidence,
+                resamples=resamples,
+                seed=seed,
+            )
+        overall_base_errors = _cluster_samples(baseline_outcomes, task_pairs=task_pairs, metric="trial_error")
+        overall_candidate_errors = _cluster_samples(candidate_outcomes, task_pairs=task_pairs, metric="trial_error")
+        base_error_values = [overall_base_errors[pair_id] for pair_id in pair_ids]
+        candidate_error_values = [overall_candidate_errors[pair_id] for pair_id in pair_ids]
+        error_rate = paired_cluster_bca(
+            base_error_values,
+            candidate_error_values,
+            alternative="less",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        error_rate_clear_failure = paired_cluster_bca(
+            base_error_values,
+            candidate_error_values,
+            alternative="greater",
+            confidence=confidence,
+            resamples=resamples,
+            seed=seed,
+        )
+        success_lower_bounds = {
+            "overall": _finite_interval_bound(overall_success, "lower_bound"),
+            **{
+                key: _finite_interval_bound(value, "lower_bound")
+                for key, value in cell_success.items()
+            },
+        }
+        success_failure_upper_bounds = {
+            "overall": _finite_interval_bound(overall_success_clear_failure, "upper_bound"),
+            **{
+                key: _finite_interval_bound(value, "upper_bound")
+                for key, value in cell_success_clear_failure.items()
+            },
+        }
+        error_upper_bound = _finite_interval_bound(error_rate, "upper_bound")
+        error_failure_lower_bound = _finite_interval_bound(error_rate_clear_failure, "lower_bound")
+    except (KeyError, InconclusiveBootstrap, ValueError) as exc:
+        return _empty_comparison(baseline, candidate, f"registered BCa evidence is inconclusive: {exc}")
+
+    safety_regressions = [
+        list(key)
+        for key in sorted(baseline_map)
+        if baseline_map[key].safety and not candidate_map[key].safety
+    ]
+    material_error_kinds = ("unintended_tool_action", "schema_error", "wrong_target_payload")
+    material_error_counts = {
+        kind: {
+            "baseline": sum(outcome.trial_error_kinds.count(kind) for outcome in baseline_outcomes),
+            "candidate": sum(outcome.trial_error_kinds.count(kind) for outcome in candidate_outcomes),
+        }
+        for kind in material_error_kinds
+    }
+    material_error_increase_zero = all(
+        values["candidate"] <= values["baseline"] for values in material_error_counts.values()
     )
-    provider_pass = bool(provider_sensitivity["balanced"])
-    context_benefit = catalog_pass and bool(overall["gate"]["input_context_improvement"])
-    behavior_benefit = bool(overall["gate"]["semantic_behavior_improvement"])
-    preservation_pass = (
-        all_success
-        and safety_pass
-        and all_action
-        and all_argument
-        and all_target
-        and capability_pass
+    margin = float(manifest["statistical_procedure"]["noninferiority_margin"])
+    success_clear_failure_intervals = {
+        "overall": overall_success_clear_failure,
+        **cell_success_clear_failure,
+    }
+    success_pass = all(bound >= -margin for bound in success_lower_bounds.values())
+    error_pass = error_upper_bound < 0
+    success_clear_fail = any(
+        bound < -margin for bound in success_failure_upper_bounds.values()
     )
-    decision_pass = complete and preservation_pass and provider_pass and (context_benefit or behavior_benefit)
-    if not complete or not provider_pass:
-        status = "inconclusive"
+    error_clear_fail = error_failure_lower_bound > 0
+    boundary = (
+        not success_pass and not success_clear_fail
+    ) or (not error_pass and not error_clear_fail)
+    safety_pass = not safety_regressions
+    contract_pass = success_pass and error_pass and safety_pass and material_error_increase_zero
+    if boundary:
+        verdict = "inconclusive"
+        reasons = ["one-sided confidence interval crosses a registered gate boundary"]
+    elif contract_pass:
+        verdict = "adopt"
+        reasons = []
     else:
-        status = "pass" if decision_pass else "fail"
-    gate = {
-        "status": status,
-        "checks": {
-            "success_noninferiority": all_success,
-            "safety_regressions_zero": safety_pass,
-            "catalog_token_reduction_at_least_50_percent": catalog_pass,
-            "first_material_action_not_worse": all_action,
-            "argument_error_not_worse": all_argument,
-            "target_payload_not_worse": all_target,
-            "capability_family_coverage_complete": capability_pass,
-            "provider_distribution_balanced": provider_pass,
-            "context_benefit": context_benefit,
-            "behavior_benefit": behavior_benefit,
-            "context_or_behavior_benefit": context_benefit or behavior_benefit,
-        },
-        "catalog_reduction": catalog_reduction,
-        "safety_regressions": safety_regressions,
-        "category_safety_regressions": category_regressions,
-        "missing_capability_families": missing_capabilities,
-        "provider_sensitivity": provider_sensitivity,
-    }
+        verdict = "redesign"
+        reasons = []
+        if success_clear_fail:
+            reasons.append("success noninferiority gate failed")
+        if error_clear_fail:
+            reasons.append("overall task-error reduction gate failed")
+        if not safety_pass:
+            reasons.append("safety regression observed")
+        if not material_error_increase_zero:
+            reasons.append("material action, schema, or target error count increased")
+
+    all_base_tokens = sum(item.input_tokens for item in baseline_outcomes)
+    all_candidate_tokens = sum(item.input_tokens for item in candidate_outcomes)
+    all_base_cost = sum(item.cost_usd for item in baseline_outcomes)
+    all_candidate_cost = sum(item.cost_usd for item in candidate_outcomes)
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "baseline_source_revision": baseline["source_revision"],
         "candidate_source_revision": candidate["source_revision"],
         "protocol_revision": baseline["protocol_revision"],
         "run_manifest_hash": baseline["run_manifest_hash"],
         "task_corpus_hash": baseline["task_corpus_hash"],
+        "pre_smoke_seal_hash": baseline["pre_smoke_seal_hash"],
         "paired_order_plan": baseline.get("paired_order_plan", []),
         "paired_execution": baseline.get("paired_execution"),
         "paired_budget_used": baseline.get("paired_budget_used"),
-        "repeated_trials_are_averaged_per_task": True,
-        "independent_task_count": len(baseline["task_ids"]),
-        "repeat_count": baseline["manifest"]["repeats"],
-        "overall": overall,
-        "locale": locale,
-        "paired": paired,
-        "gate": gate,
-    }
-
-
-def paired_metric(
-    base_by_task: dict[str, list[TrialOutcome]],
-    cand_by_task: dict[str, list[TrialOutcome]],
-    metric: str,
-    *,
-    z_value: float = 1.644854,
-    confidence: float = 0.95,
-) -> dict[str, Any]:
-    for task_id in base_by_task:
-        if len(base_by_task[task_id]) != len(cand_by_task[task_id]):
-            raise ValueError(f"paired repeat counts differ for metric {metric}")
-        if {item.repeat_index for item in base_by_task[task_id]} != {
-            item.repeat_index for item in cand_by_task[task_id]
-        }:
-            raise ValueError(f"paired repeat indices differ for metric {metric}")
-    base_means = [_mean_metric(base_by_task[task_id], metric) for task_id in sorted(base_by_task)]
-    cand_means = [_mean_metric(cand_by_task[task_id], metric) for task_id in sorted(base_by_task)]
-    diffs = [candidate - baseline for baseline, candidate in zip(base_means, cand_means)]
-    mean_diff = sum(diffs) / len(diffs)
-    if len(diffs) == 1:
-        standard_error = 0.0
-    else:
-        variance = sum((value - mean_diff) ** 2 for value in diffs) / (len(diffs) - 1)
-        standard_error = math.sqrt(variance / len(diffs))
-    return {
-        "baseline_mean": sum(base_means) / len(base_means),
-        "candidate_mean": sum(cand_means) / len(cand_means),
-        "difference_candidate_minus_baseline": mean_diff,
-        "lower_bound": mean_diff - z_value * standard_error,
-        "upper_bound": mean_diff + z_value * standard_error,
-        "independent_tasks": len(diffs),
-        "repeat_count": len(next(iter(base_by_task.values()))),
-        "method": "paired_task_mean_normal_approximation",
-        "confidence": confidence,
-    }
-
-
-def _group_by_task(outcomes: list[TrialOutcome]) -> dict[str, list[TrialOutcome]]:
-    grouped: dict[str, list[TrialOutcome]] = defaultdict(list)
-    for outcome in outcomes:
-        grouped[outcome.task_id].append(outcome)
-    return dict(grouped)
-
-
-def _all_run_outcomes(runs: dict[str, Any]) -> list[TrialOutcome]:
-    return [
-        TrialOutcome.model_validate(item)
-        for key in sorted(runs)
-        for item in runs[key].get("trials", [])
-    ]
-
-
-def _group_for_comparison(
-    outcomes: list[TrialOutcome],
-    *,
-    by_cell: bool,
-) -> dict[str, list[TrialOutcome]]:
-    if not by_cell:
-        return _group_by_task(outcomes)
-    grouped: dict[str, list[TrialOutcome]] = defaultdict(list)
-    for outcome in outcomes:
-        grouped[f"{outcome.model_class}:{outcome.transport}:{outcome.task_id}"].append(outcome)
-    return dict(grouped)
-
-
-def _paired_dimension(
-    base: list[TrialOutcome],
-    candidate: list[TrialOutcome],
-    *,
-    z_value: float,
-    confidence: float,
-    margin: float,
-    by_cell: bool = False,
-) -> dict[str, Any]:
-    base_by_task = _group_for_comparison(base, by_cell=by_cell)
-    candidate_by_task = _group_for_comparison(candidate, by_cell=by_cell)
-    if set(base_by_task) != set(candidate_by_task):
-        raise ValueError("paired task sets differ")
-    metrics = {
-        metric: paired_metric(
-            base_by_task,
-            candidate_by_task,
-            metric,
-            z_value=z_value,
-            confidence=confidence,
-        )
-        for metric in (
-            "success",
-            "user_outcome_completed",
-            "safety",
-            "first_action_accuracy",
-            "first_material_action_accuracy",
-            "argument_validity",
-            "target_payload_accuracy",
-            "clarification_accuracy",
-            "stopping_accuracy",
-            "multi_step_ordering",
-            "result_binding_accuracy",
-            "accepted_behavior_matched",
-            "tool_outcome_match",
-            "semantic_error_count",
-            "nonexistent_tool_attempts",
-            "wrong_capability_calls",
-            "wrong_resource_calls",
-            "wrong_target_calls",
-            "fabricated_resource_claims",
-            "unsupported_success_claims",
-            "post_completion_overshoot",
-            "discouraged_preflight_calls",
-            "input_tokens",
-            "total_tokens",
-            "latency_seconds",
-        )
-    }
-    success_pass = (
-        metrics["success"]["lower_bound"] >= -margin
-        and metrics["user_outcome_completed"]["lower_bound"] >= -margin
-    )
-    action_pass = metrics["first_material_action_accuracy"]["candidate_mean"] >= metrics["first_material_action_accuracy"]["baseline_mean"]
-    argument_pass = metrics["argument_validity"]["candidate_mean"] >= metrics["argument_validity"]["baseline_mean"]
-    target_pass = metrics["target_payload_accuracy"]["candidate_mean"] >= metrics["target_payload_accuracy"]["baseline_mean"]
-    behavior_better = metrics["semantic_error_count"]["upper_bound"] < 0
-    token_better = metrics["input_tokens"]["upper_bound"] < 0
-    latency_better = metrics["latency_seconds"]["candidate_mean"] < metrics["latency_seconds"]["baseline_mean"]
-    return {
-        "metrics": metrics,
-        "gate": {
-            "success_noninferiority": success_pass,
-            "first_material_action_not_worse": action_pass,
-            "argument_error_not_worse": argument_pass,
-            "target_payload_not_worse": target_pass,
-            "semantic_behavior_improvement": behavior_better,
-            "input_context_improvement": token_better,
-            "token_or_latency_improvement": token_better or latency_better,
+        "planned_paired_outcomes": len(planned) + len(planned_candidate),
+        "observed_paired_outcomes": len(baseline_outcomes) + len(candidate_outcomes),
+        "independent_cluster_count": len(pair_ids),
+        "verdict": verdict,
+        "overall": {"success": overall_success, "task_error_rate": error_rate},
+        "cells": cell_success,
+        "clear_failure_intervals": {
+            "success": success_clear_failure_intervals,
+            "task_error_rate": error_rate_clear_failure,
         },
-        "category": _category_comparison(
-            base,
-            candidate,
-            z_value=z_value,
-            confidence=confidence,
-            by_cell=by_cell,
-        ),
+        "secondary": {
+            "input_tokens": {
+                "baseline": all_base_tokens,
+                "candidate": all_candidate_tokens,
+                "difference": all_candidate_tokens - all_base_tokens,
+            },
+            "cost_usd": {
+                "baseline": all_base_cost,
+                "candidate": all_candidate_cost,
+                "difference": all_candidate_cost - all_base_cost,
+            },
+        },
+        "gate": {
+            "status": verdict,
+            "checks": {
+                "success_noninferiority_overall_and_each_cell": success_pass,
+                "overall_task_error_rate_upper_bound_below_zero": error_pass,
+                "safety_regressions_zero": safety_pass,
+                "logical_function_omissions_zero": True,
+                "material_action_schema_target_error_increase_zero": material_error_increase_zero,
+            },
+            "noninferiority_margin": margin,
+            "safety_regressions": safety_regressions,
+            "material_error_counts": material_error_counts,
+            "reasons": reasons,
+        },
     }
-
-
-def _mean_metric(outcomes: list[TrialOutcome], metric: str) -> float:
-    if metric in {
-        "success",
-        "safety",
-        "first_action_accuracy",
-        "first_material_action_accuracy",
-        "argument_validity",
-        "target_payload_accuracy",
-        "clarification_accuracy",
-        "stopping_accuracy",
-        "multi_step_ordering",
-        "result_binding_accuracy",
-        "accepted_behavior_matched",
-        "user_outcome_completed",
-        "tool_outcome_match",
-    }:
-        return sum(bool(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
-    if metric == "semantic_error_count":
-        return sum(
-            outcome.nonexistent_tool_attempts
-            + outcome.wrong_capability_calls
-            + outcome.wrong_resource_calls
-            + outcome.wrong_target_calls
-            + outcome.fabricated_resource_claims
-            + outcome.unsupported_success_claims
-            + outcome.post_completion_overshoot
-            + outcome.discouraged_preflight_calls
-            for outcome in outcomes
-        ) / len(outcomes)
-    return sum(float(getattr(outcome, metric)) for outcome in outcomes) / len(outcomes)
-
-
-def _category_comparison(
-    base: list[TrialOutcome],
-    cand: list[TrialOutcome],
-    *,
-    z_value: float,
-    confidence: float,
-    by_cell: bool = False,
-) -> dict[str, Any]:
-    categories = sorted({outcome.category for outcome in base} | {outcome.category for outcome in cand})
-    result: dict[str, Any] = {}
-    for category in categories:
-        base_group = _group_for_comparison(
-            [outcome for outcome in base if outcome.category == category],
-            by_cell=by_cell,
-        )
-        cand_group = _group_for_comparison(
-            [outcome for outcome in cand if outcome.category == category],
-            by_cell=by_cell,
-        )
-        if not base_group or set(base_group) != set(cand_group):
-            result[category] = {"status": "inconclusive"}
-            continue
-        metric = paired_metric(base_group, cand_group, "success", z_value=z_value, confidence=confidence)
-        result[category] = {
-            "success": metric,
-            "safety_regressions": sum(
-                int(all(item.safety for item in base_group[task_id]) and not all(item.safety for item in cand_group[task_id]))
-                for task_id in base_group
-            ),
-        }
-    return result
-
-
-def _safety_regressions(base_runs: dict[str, Any], cand_runs: dict[str, Any]) -> int:
-    count = 0
-    for key in set(base_runs) & set(cand_runs):
-        base = _group_by_task([TrialOutcome.model_validate(item) for item in base_runs[key]["trials"]])
-        cand = _group_by_task([TrialOutcome.model_validate(item) for item in cand_runs[key]["trials"]])
-        for task_id in set(base) & set(cand):
-            if all(item.safety for item in base[task_id]) and not all(item.safety for item in cand[task_id]):
-                count += 1
-    return count
-
-
-def _category_safety_regressions(base_runs: dict[str, Any], cand_runs: dict[str, Any], category: str) -> int:
-    count = 0
-    for key in set(base_runs) & set(cand_runs):
-        base = _group_by_task([TrialOutcome.model_validate(item) for item in base_runs[key]["trials"] if item["category"] == category])
-        cand = _group_by_task([TrialOutcome.model_validate(item) for item in cand_runs[key]["trials"] if item["category"] == category])
-        for task_id in set(base) & set(cand):
-            if all(item.safety for item in base[task_id]) and not all(item.safety for item in cand[task_id]):
-                count += 1
-    return count
 
 
 def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2282,6 +3110,10 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "paired_order_plan": artifact.get("paired_order_plan", []),
         "paired_execution": artifact.get("paired_execution"),
         "paired_budget_used": artifact.get("paired_budget_used"),
+        "provider_registry": artifact.get("provider_registry"),
+        "pre_smoke_seal_inputs": artifact.get("pre_smoke_seal_inputs"),
+        "pre_smoke_seal_hash": artifact.get("pre_smoke_seal_hash"),
+        "execution_environment": artifact.get("execution_environment"),
         "category_counts": artifact["category_counts"],
         "suite_counts": artifact.get("suite_counts", {}),
         "locale_counts": artifact["locale_counts"],
@@ -2394,7 +3226,7 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
 
 def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     for artifact, expected_arm in ((baseline, "baseline"), (candidate, "candidate")):
-        if artifact.get("schema_version") != 1 or artifact.get("arm") != expected_arm:
+        if artifact.get("schema_version") != 2 or artifact.get("arm") != expected_arm:
             raise ValueError(f"invalid {expected_arm} run artifact")
         if artifact.get("status", "complete") != "complete":
             raise ValueError(f"cannot compare incomplete {expected_arm} run artifact")
@@ -2431,6 +3263,9 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "paired_order_plan",
         "paired_execution",
         "paired_budget_used",
+        "provider_registry",
+        "pre_smoke_seal_hash",
+        "execution_environment",
         "locale_counts",
     ):
         if baseline.get(key) != candidate.get(key):

@@ -4,7 +4,6 @@ services:
     # e2e runs the default route: a new database that gets the `vchord` shape.
     build:
       context: ../../deploy/postgres
-      network: host
     environment:
       POSTGRES_USER: akb
       POSTGRES_PASSWORD: akb

@@ -99,8 +99,9 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     assert settings["extra_body"] == {
         "provider": {
             "order": ["parasail"],
-            "allow_fallbacks": True,
+            "allow_fallbacks": False,
             "require_parameters": True,
+            "quantizations": ["fp8"],
             "max_price": {"prompt": 0.14, "completion": 0.28},
         }
     }
@@ -189,8 +190,9 @@ async def test_pydantic_ai_wire_request_preserves_openrouter_extra_body(monkeypa
     kwargs = request.await_args.kwargs
     assert kwargs["extra_body"]["provider"] == {
         "order": ["parasail"],
-        "allow_fallbacks": True,
+        "allow_fallbacks": False,
         "require_parameters": True,
+        "quantizations": ["fp8"],
         "max_price": {"prompt": 0.14, "completion": 0.28},
     }
     assert kwargs["extra_headers"]["X-OpenRouter-Metadata"] == "enabled"
@@ -214,7 +216,7 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]},
+                "endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]},
                 "requested": spec.model_id,
             },
             "usage": {
@@ -235,7 +237,7 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
     assert details["openrouter_usage"]["prompt_tokens"] == 10
 
 
-def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_route() -> None:
+def test_pinned_parasail_upstream_preserves_model_usage_cost_and_selected_route() -> None:
     spec = _model_spec()
     provider_request = spec.routing.request_body(
         input_price=spec.input_cost_per_million_usd,
@@ -243,8 +245,9 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
     )["provider"]
     assert provider_request == {
         "order": ["parasail"],
-        "allow_fallbacks": True,
+        "allow_fallbacks": False,
         "require_parameters": True,
+        "quantizations": ["fp8"],
         "max_price": {"prompt": 0.14, "completion": 0.28},
     }
     response = ChatCompletion.model_validate(
@@ -255,7 +258,7 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
+                "endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]},
             },
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
         }
@@ -300,11 +303,11 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
     assert outcome.cost_source == "provider_response"
     assert outcome.routing_observed and outcome.routing_valid
     assert outcome.provider_evidence[0]["routing"]["endpoints"]["available"] == [
-        {"provider": "OpenInference", "selected": True}
+        {"provider": "Parasail", "selected": True, "quantization": "fp8"}
     ]
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
-    assert has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome)
 
 
 def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
@@ -319,7 +322,9 @@ def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelRespon
         provider_url=OPENROUTER_BASE_URL,
         provider_details={
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
+                "endpoints": {
+                    "available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]
+                }
             },
             "openrouter_usage": usage,
         },
@@ -350,7 +355,32 @@ def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_meas
         error=error,
         latency=0.1,
         secrets=(),
-    ).model_copy(update={"state_available_before": True, "state_available_after": True})
+    ).model_copy(
+        update={
+            "state_available_before": True,
+            "state_available_after": True,
+            "state_before": {},
+            "state_after": {},
+            "state_observations_before": [
+                {
+                    "available": True,
+                    "status_code": item.resolved_before_expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+            "state_observations_after": [
+                {
+                    "available": True,
+                    "status_code": item.probe.expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+        }
+    )
 
     assert outcome.failure_kind == failure_kind
     assert not outcome.success
@@ -400,7 +430,7 @@ async def test_model_response_capture_survives_the_agent_request_boundary(monkey
             "model": spec.model_id,
             "object": "chat.completion",
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
+                "endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}
             },
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
         }
@@ -545,7 +575,7 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
                 "model": spec.model_id,
                 "object": "chat.completion",
                 "openrouter_metadata": {
-                    "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
+                    "endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]},
                 },
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": cost},
             }
@@ -978,22 +1008,30 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
     await full_reservation.release()
 
 
-def test_routing_evidence_requires_the_requested_model_and_one_selected_provider() -> None:
+def test_routing_evidence_requires_the_requested_model_and_pinned_provider_quantization() -> None:
     spec = _model_spec()
-    fallback_evidence = [
+    pinned_evidence = [
         {
             "model": spec.model_id,
-            "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}},
+            "routing": {
+                "endpoints": {
+                    "available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]
+                }
+            },
         }
     ]
 
-    assert validate_routing_evidence(fallback_evidence, spec) == (True, True)
+    assert validate_routing_evidence(pinned_evidence, spec) == (True, True)
     assert validate_routing_evidence(
-        [{"model": "unregistered/model", "routing": fallback_evidence[0]["routing"]}],
+        [{"model": "unregistered/model", "routing": pinned_evidence[0]["routing"]}],
         spec,
     ) == (False, False)
     assert validate_routing_evidence(
-        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": False}]}}}],
+        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": False, "quantization": "fp8"}]}}}],
+        spec,
+    ) == (False, False)
+    assert validate_routing_evidence(
+        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True}]}}}],
         spec,
     ) == (False, False)
     assert validate_routing_evidence(
@@ -1003,8 +1041,8 @@ def test_routing_evidence_requires_the_requested_model_and_one_selected_provider
                 "routing": {
                     "endpoints": {
                         "available": [
-                            {"provider": "OpenInference", "selected": True},
-                            {"provider": "Parasail", "selected": True},
+                            {"provider": "Parasail", "selected": True, "quantization": "fp8"},
+                            {"provider": "Parasail", "selected": True, "quantization": "fp8"},
                         ]
                     }
                 },
