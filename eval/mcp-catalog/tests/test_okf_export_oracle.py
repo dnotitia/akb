@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,29 @@ EXPECTED_OKF_DOCUMENT = {
 
 def _traces() -> list[dict[str, object]]:
     return json.loads((ROOT / "tests/fixtures/okf-import-export-actual-traces.json").read_text(encoding="utf-8"))
+
+
+def _browse_rows() -> list[dict[str, Any]]:
+    fixture = json.loads((ROOT / "tests/fixtures/attempt03-import-export-browse.json").read_text(encoding="utf-8"))
+    return fixture["rows"]
+
+
+def _browse_trace_for_cell(cell: str) -> dict[str, Any]:
+    arm, model_class, transport = cell.split(":")
+    candidates = [
+        row
+        for row in _browse_rows()
+        if row["arm"] == arm
+        and row["model_class"] == model_class
+        and row["transport"] == transport
+        and row["repeat_index"] == 1
+        and row["state_available_after"]
+        and row["browse_available"]
+        and row["browse_status_code"] == 200
+        and any(item.get("type") == "document" and item.get("path") == "notes/imported.md" for item in row["items"])
+    ]
+    assert candidates, f"no successful attempt03 browse observation for {cell}"
+    return next((row for row in candidates if row["task_id"] == "import-export-en"), candidates[0])
 
 
 def _okf_expectation() -> StateExpectation:
@@ -47,6 +71,14 @@ def test_import_export_contract_accepts_all_four_recorded_exports_and_document_r
         assert trace["document_path"] == "/api/v1/documents/catalog-bench-io/notes/imported.md"
         assert trace["document_content"] == EXPECTED_BODY
         assert trace["revision_nonempty"] is True
+        browse_trace = _browse_trace_for_cell(str(trace["cell"]))
+        imported_item = next(item for item in browse_trace["items"] if item.get("path") == "notes/imported.md")
+        assert imported_item == {
+            "name": "imported",
+            "type": "document",
+            "path": "notes/imported.md",
+            "uri": CANONICAL_URI,
+        }
         before = [
             StateObservation(True, item.resolved_before_expected_status, {})
             for item in contract.observation_sets
@@ -60,16 +92,7 @@ def test_import_export_contract_accepts_all_four_recorded_exports_and_document_r
             for item, payload in zip(
                 contract.observation_sets,
                 [
-                    {
-                        "items": [
-                            {
-                                "name": "imported.md",
-                                "type": "document",
-                                "path": "notes/imported.md",
-                                "uri": CANONICAL_URI,
-                            }
-                        ]
-                    },
+                    {"items": browse_trace["items"]},
                     {"files": {"notes/imported.md": trace["exported_document"]}},
                     {
                         "path": "notes/imported.md",

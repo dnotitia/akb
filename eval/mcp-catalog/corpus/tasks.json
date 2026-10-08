@@ -1069,7 +1069,6 @@
               "operator": "contains",
               "value": {
                 "type": "document",
-                "name": "imported.md",
                 "path": "notes/imported.md",
                 "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
               }

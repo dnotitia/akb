@@ -250,7 +250,6 @@ def test_task_state_probes_use_observed_absence_and_supported_read_paths() -> No
         browse = observations[0]
         assert ("/items", "contains", {
             "type": "document",
-            "name": "imported.md",
             "path": "notes/imported.md",
             "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
         }) in [(item.pointer, item.operator, item.value) for item in browse.must]
