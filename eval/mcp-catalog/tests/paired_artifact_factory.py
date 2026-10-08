@@ -44,18 +44,30 @@ def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
         for model in manifest_model.models
     ]
     model_list_snapshot = {"data": model_rows}
+    models: dict[str, Any] = {}
+    endpoint_snapshots: dict[str, Any] = {}
+    for model, model_row in zip(manifest_model.models, model_rows, strict=True):
+        selected_endpoint = {
+            "model_id": model.model_id,
+            "name": f"Parasail | {model_row['canonical_slug']}",
+            "provider_name": "Parasail",
+            "tag": "parasail/fp8",
+            "quantization": "fp8",
+        }
+        endpoint_snapshot = {"data": {"endpoints": [selected_endpoint]}}
+        models[model.model_id] = {
+            "manifest_version": model.version,
+            "model_record": model_row,
+            "endpoint_snapshot": endpoint_snapshot,
+            "selected_endpoint": selected_endpoint,
+        }
+        endpoint_snapshots[model.model_id] = endpoint_snapshot
     payload = {
         "status": "verified",
         "model_list_snapshot": model_list_snapshot,
         "model_list_hash": hash_json(model_list_snapshot),
-        "models": {
-            model.model_id: {
-                "manifest_version": model.version,
-                "model_record": model_row,
-                "selected_endpoint": {"provider_name": "Parasail", "quantization": "fp8"},
-            }
-            for model, model_row in zip(manifest_model.models, model_rows, strict=True)
-        },
+        "models": models,
+        "endpoint_snapshots": endpoint_snapshots,
     }
     return {**payload, "snapshot_hash": hash_json(payload)}
 
@@ -444,9 +456,14 @@ def _make_outcome(
         {
             "model": model.model_id,
             "routing": {
+                "requested": model.model_id,
                 "endpoints": {
                     "available": [
-                        {"provider": "parasail", "selected": True, "quantization": "fp8"}
+                        {
+                            "model": _expected_openrouter_canonical_slug(model),
+                            "provider": "Parasail",
+                            "selected": True,
+                        }
                     ]
                 }
             },

@@ -11,6 +11,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, PairedArmCoordinator, planned_arm_order
 from mcp_catalog.runtime import RuntimeContractError
+from paired_artifact_factory import provider_registry_snapshot
 
 
 ROOT = Path(__file__).parents[1]
@@ -103,6 +104,7 @@ async def test_runner_applies_counterbalanced_order_to_real_evaluation_calls(
             arm=arm,
             paired_coordinator=coordinator,
         )
+        runner.provider_registry = provider_registry_snapshot(manifest)
         runner._resolver = resolver  # type: ignore[assignment]
         await runner._run_cell(
             run_key=f"{model_spec.class_name}:http",

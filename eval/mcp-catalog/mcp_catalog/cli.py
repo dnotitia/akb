@@ -274,10 +274,15 @@ async def run_paired(args: argparse.Namespace) -> int:
         "candidate": asyncio.create_task(candidate_runner.run(), name="catalog-benchmark-candidate"),
     }
     done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
-    primary_failure = next(
-        (exception for task in done if (exception := task.exception()) is not None),
-        None,
-    )
+    primary_failure: BaseException | None = None
+    for task in done:
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError as exc:
+            exception = exc
+        if exception is not None:
+            primary_failure = exception
+            break
     if primary_failure is not None:
         for task in pending:
             task.cancel()
@@ -291,6 +296,16 @@ async def run_paired(args: argparse.Namespace) -> int:
             artifacts[arm] = result.artifact
             failures.append(result)
         elif isinstance(result, BaseException):
+            checkpoints = {
+                "baseline": args.baseline_checkpoint,
+                "candidate": args.candidate_checkpoint,
+            }
+            artifacts[arm] = _paired_arm_failure_artifact(
+                arm,
+                result,
+                baseline_manifest,
+                checkpoints[arm],
+            )
             failures.append(result)
         else:
             artifacts[arm] = result
@@ -312,7 +327,11 @@ async def run_paired(args: argparse.Namespace) -> int:
     runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
     for arm, artifact in artifacts.items():
-        attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
+        if isinstance(artifact.get("artifact_hash_input"), dict):
+            attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
+        else:
+            artifact["paired_execution"] = evidence
+            artifact["paired_budget_used"] = paired_budget
         write_json(outputs[arm], artifact, runners[arm].secrets)
     comparison = compare_artifacts(
         artifacts.get("baseline", {}),
@@ -333,6 +352,32 @@ async def run_paired(args: argparse.Namespace) -> int:
         )
     )
     return 0 if comparison["verdict"] == "adopt" and not failures else 1
+
+
+def _paired_arm_failure_artifact(
+    arm: str,
+    error: BaseException,
+    manifest: Any,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    cancelled = isinstance(error, asyncio.CancelledError)
+    return {
+        "schema_version": 2,
+        "status": "incomplete",
+        "arm": arm,
+        "source_revision": manifest.arm_source_revisions[arm],
+        "checkpoint_path": str(checkpoint_path),
+        "failure": {
+            "stage": "paired_execution",
+            "type": type(error).__name__,
+            "message": (
+                "paired arm was stopped after its peer failed before this arm produced a run artifact"
+                if cancelled
+                else "paired arm terminated before producing a run artifact"
+            ),
+        },
+        "incomplete_reasons": ["paired arm did not produce a benchmark artifact"],
+    }
 
 
 def compare(args: argparse.Namespace) -> int:

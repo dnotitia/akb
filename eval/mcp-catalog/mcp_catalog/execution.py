@@ -1828,6 +1828,7 @@ class TrialExecutor:
         *,
         arm: str,
         model_spec: ModelSpec,
+        registered_model: dict[str, Any],
         model: OpenAIChatModel,
         transport: str,
         fixture: RuntimeFixture,
@@ -1841,6 +1842,7 @@ class TrialExecutor:
         self.manifest = manifest
         self.arm = arm
         self.model_spec = model_spec
+        self.registered_model = registered_model
         self.model = model
         self.transport = transport
         self.fixture = fixture
@@ -1968,6 +1970,7 @@ class TrialExecutor:
                 task=task,
                 arm=self.arm,
                 model_spec=self.model_spec,
+                registered_model=self.registered_model,
                 transport=self.transport,
                 result=result,
                 recorder=recorder,
@@ -2012,6 +2015,7 @@ async def execute_smoke(
     manifest: BenchmarkRunManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     model: OpenAIChatModel,
     transport: str,
     fixture: RuntimeFixture,
@@ -2104,6 +2108,7 @@ async def execute_smoke(
         task=task,
         arm=arm,
         model_spec=model_spec,
+        registered_model=registered_model,
         transport=transport,
         result=result,
         recorder=recorder,
@@ -2199,6 +2204,7 @@ def outcome_from_run(
     task: TaskManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     transport: str,
     result: Any,
     recorder: ToolCallRecorder,
@@ -2241,7 +2247,11 @@ def outcome_from_run(
     provider_cost = provider_response_cost(provider_evidence)
     cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
     cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
-    routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
+    routing_observed, routing_valid = validate_routing_evidence(
+        provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if error is None and not routing_observed:
         error = "OpenRouter routing evidence was not returned"
     elif error is None and not routing_valid:
@@ -2385,15 +2395,73 @@ def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
     return sum(costs) if costs else None
 
 
-def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelSpec) -> tuple[bool, bool]:
+def registered_route_target(
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return the canonical model and provider pinned by one registry snapshot."""
+
+    expected_routing = {
+        "order": ["parasail"],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+        "quantizations": ["fp8"],
+    }
+    if model_spec.routing.model_dump(mode="json") != expected_routing:
+        return None
+    model_record = registered_model.get("model_record")
+    endpoint_snapshot = registered_model.get("endpoint_snapshot")
+    data = endpoint_snapshot.get("data") if isinstance(endpoint_snapshot, dict) else None
+    endpoints = data.get("endpoints") if isinstance(data, dict) else None
+    selected_endpoint = registered_model.get("selected_endpoint")
+    if (
+        not isinstance(model_record, dict)
+        or model_record.get("id") != model_spec.model_id
+        or not isinstance(model_record.get("canonical_slug"), str)
+        or not isinstance(endpoints, list)
+        or not isinstance(selected_endpoint, dict)
+    ):
+        return None
+
+    candidates = [
+        endpoint
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+        and isinstance(endpoint.get("provider_name"), str)
+        and endpoint["provider_name"].casefold() == "parasail"
+        and endpoint.get("quantization") == "fp8"
+    ]
+    canonical_slug = model_record["canonical_slug"]
+    if (
+        len(candidates) != 1
+        or selected_endpoint != candidates[0]
+        or selected_endpoint.get("model_id") != model_spec.model_id
+        or selected_endpoint.get("provider_name") != "Parasail"
+        or selected_endpoint.get("tag") != "parasail/fp8"
+        or selected_endpoint.get("quantization") != "fp8"
+        or selected_endpoint.get("name") != f"Parasail | {canonical_slug}"
+    ):
+        return None
+    return canonical_slug, selected_endpoint["provider_name"]
+
+
+def validate_routing_evidence(
+    evidence: list[dict[str, Any]],
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[bool, bool]:
     if not evidence:
         return False, False
+    route_target = registered_route_target(model_spec, registered_model)
+    if route_target is None:
+        return False, False
+    canonical_model, provider_name = route_target
     observed = False
     for item in evidence:
         if item.get("model") != model_spec.model_id:
             return observed, False
         routing = item.get("routing")
-        if not isinstance(routing, dict):
+        if not isinstance(routing, dict) or routing.get("requested") != model_spec.model_id:
             return observed, False
         endpoints = routing.get("endpoints")
         available = endpoints.get("available") if isinstance(endpoints, dict) else None
@@ -2404,9 +2472,8 @@ def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelS
         ] if isinstance(available, list) else []
         if (
             len(selected) != 1
-            or not isinstance(selected[0].get("provider"), str)
-            or selected[0]["provider"].casefold() != "parasail"
-            or selected[0].get("quantization") != "fp8"
+            or selected[0].get("model") != canonical_model
+            or selected[0].get("provider") != provider_name
         ):
             return observed, False
         observed = True

@@ -131,7 +131,16 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         provider_evidence=[
             {
                 "model": model_spec.model_id,
-                "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}},
+                "routing": {
+                    "requested": model_spec.model_id,
+                    "endpoints": {
+                        "available": [{
+                            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+                            "provider": "Parasail",
+                            "selected": True,
+                        }]
+                    },
+                },
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
             for _ in range(2)

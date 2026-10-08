@@ -206,6 +206,18 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
     assert "provider_registry" in result["gate"]["reasons"][0]
 
 
+def test_compare_recomputes_response_route_against_the_sealed_provider_registry() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    evidence = candidate["runs"]["primary:http"]["trials"][0]["provider_evidence"][0]
+    evidence["routing"]["endpoints"]["available"][0]["model"] = evidence["model"]
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert any("trial routing flags" in reason for reason in result["gate"]["reasons"])
+
+
 def test_resealed_provider_canonical_identity_drift_is_not_admitted() -> None:
     baseline, candidate = complete_paired_artifacts()
     model_id = "deepseek/deepseek-v4-flash-0731"

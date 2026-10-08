@@ -26,7 +26,9 @@ outcomes; task prompts do not name MCP tools.
   quantization, no fallback, required parameter support, temperature 0, and an
   8,192-token output limit. Model aliases and versions are pinned in
   `config/run.json`. A provider model/endpoint registry snapshot is captured
-  before sealing; observed model or route drift makes the result inconclusive.
+  before sealing. Every response's selected canonical model and provider must
+  match its unique registered Parasail fp8 endpoint; compare recomputes that
+  binding from the sealed snapshot, and route drift makes the result inconclusive.
 - SciPy `1.18.1` performs the registered paired, equal-weight cluster BCa
   bootstrap: 20,000 resamples, seed 358, one-sided 95% intervals. A degenerate
   or non-finite interval is inconclusive; no alternate interval is substituted.

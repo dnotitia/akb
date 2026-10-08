@@ -59,6 +59,7 @@ from .execution import (
     has_measured_evidence,
     provider_response_cost,
     provider_token_totals,
+    registered_route_target,
     summarize_outcomes,
     summarize_outcomes_by_locale,
     validate_routing_evidence,
@@ -1084,6 +1085,17 @@ class BenchmarkRunner:
                 else None
             )
             if cached is not None:
+                registered_model = self.provider_registry["models"][model_spec.model_id]
+                route_observed, route_valid = validate_routing_evidence(
+                    cached.provider_evidence,
+                    model_spec,
+                    registered_model,
+                )
+                if (cached.routing_observed, cached.routing_valid) != (route_observed, route_valid) or not route_valid:
+                    raise RuntimeContractError(
+                        f"cached smoke gate cell {cell_key} does not match its registered provider route",
+                        stage="smoke_gate",
+                    )
                 return {
                     "cell": cell_key,
                     "status": "completed",
@@ -1156,6 +1168,7 @@ class BenchmarkRunner:
                         manifest=self.manifest,
                         arm=self.arm,
                         model_spec=model_spec,
+                        registered_model=self.provider_registry["models"][model_spec.model_id],
                         model=model,
                         transport=transport,
                         fixture=cell_fixture,
@@ -1174,6 +1187,7 @@ class BenchmarkRunner:
                             manifest=self.manifest,
                             arm=self.arm,
                             model_spec=model_spec,
+                            registered_model=self.provider_registry["models"][model_spec.model_id],
                             model=model,
                             transport=transport,
                             fixture=cell_fixture,
@@ -1210,10 +1224,18 @@ class BenchmarkRunner:
                 await request_guard.release()
 
             assert outcome is not None
+            registered_model = self.provider_registry["models"][model_spec.model_id]
+            route_observed, route_valid = validate_routing_evidence(
+                outcome.provider_evidence,
+                model_spec,
+                registered_model,
+            )
             identity_matches = (
                 outcome.model_class == model_spec.class_name
                 and outcome.model_id == model_spec.model_id
                 and outcome.transport == transport
+                and (outcome.routing_observed, outcome.routing_valid) == (route_observed, route_valid)
+                and route_valid
                 and all(
                     item.get("model") == model_spec.model_id
                     for item in outcome.provider_evidence
@@ -1222,7 +1244,7 @@ class BenchmarkRunner:
             valid = identity_matches and valid_smoke_outcome(outcome)
             if not valid and outcome.error is None:
                 if not identity_matches:
-                    outcome.error = "smoke gate outcome did not match the requested model and transport"
+                    outcome.error = "smoke gate outcome did not match the requested model, provider route, and transport"
                     outcome.failure_kind = "provider"
                 elif outcome.successful_mcp_tool_calls == 0:
                     outcome.error = "smoke gate did not observe a successful MCP tool call"
@@ -1432,12 +1454,18 @@ class BenchmarkRunner:
                                 f"pinned Parasail fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
                                 stage="provider_registry",
                             )
-                        registry_models[spec.model_id] = {
+                        registered_model = {
                             "manifest_version": spec.version,
                             "model_record": row,
                             "endpoint_snapshot": endpoints_response,
                             "selected_endpoint": selected[0],
                         }
+                        if registered_route_target(spec, registered_model) is None:
+                            raise RuntimeContractError(
+                                f"provider registry endpoint identity drifted for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        registry_models[spec.model_id] = registered_model
                         endpoint_snapshots[spec.model_id] = endpoints_response
                 payload = {
                     "status": "verified",
@@ -1547,6 +1575,7 @@ class BenchmarkRunner:
             self.manifest,
             arm=self.arm,
             model_spec=model_spec,
+            registered_model=self.provider_registry["models"][model_spec.model_id],
             model=model,
             transport=transport,
             fixture=fixture,
@@ -2193,6 +2222,7 @@ def _validate_trial_evidence(
     *,
     arm: str,
     model_spec: Any,
+    registered_model: dict[str, Any],
     transport: str,
     public_operations: list[PublicOperation],
     input_schemas: dict[str, dict[str, Any]],
@@ -2215,7 +2245,11 @@ def _validate_trial_evidence(
         raise ValueError("trial outcome contains an execution error")
     if not all(math.isfinite(value) for value in (outcome.cost_usd, outcome.latency_seconds)):
         raise ValueError("trial usage contains a non-finite cost or latency")
-    observed_routing, valid_routing = validate_routing_evidence(outcome.provider_evidence, model_spec)
+    observed_routing, valid_routing = validate_routing_evidence(
+        outcome.provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if (outcome.routing_observed, outcome.routing_valid) != (observed_routing, valid_routing) or not valid_routing:
         raise ValueError("trial routing flags do not match its provider responses")
     input_tokens, output_tokens = provider_token_totals(outcome.provider_evidence)
@@ -2322,8 +2356,14 @@ def _validate_provider_registry_identity(
         raise ValueError(f"{arm} provider model-list snapshot is missing or invalid")
 
     registered_models = registry.get("models")
+    endpoint_snapshots = registry.get("endpoint_snapshots")
     expected_aliases = {spec.model_id for spec in manifest.models}
-    if not isinstance(registered_models, dict) or set(registered_models) != expected_aliases:
+    if (
+        not isinstance(registered_models, dict)
+        or set(registered_models) != expected_aliases
+        or not isinstance(endpoint_snapshots, dict)
+        or set(endpoint_snapshots) != expected_aliases
+    ):
         raise ValueError(f"{arm} provider registry does not cover the pinned model aliases")
 
     for spec in manifest.models:
@@ -2345,8 +2385,11 @@ def _validate_provider_registry_identity(
             not isinstance(captured_model, dict)
             or captured_model.get("manifest_version") != spec.version
             or captured_model.get("model_record") != model_record
+            or captured_model.get("endpoint_snapshot") != endpoint_snapshots.get(spec.model_id)
         ):
             raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
+        if registered_route_target(spec, captured_model) is None:
+            raise ValueError(f"{arm} provider registry endpoint evidence differs from the pinned Parasail fp8 route")
 
 
 def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
@@ -2538,6 +2581,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
@@ -2572,6 +2616,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=outcome.transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
