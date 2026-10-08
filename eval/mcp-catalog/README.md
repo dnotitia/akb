@@ -138,10 +138,14 @@ interrupted continuation.
 The registered manifest remains at its $50 total cap. The continuation ledger
 restores the parent's $4.63290984 spend and applies a $46.763351 run ceiling,
 leaving $42.13044116 for new provider responses under the approved account
-budget. No request-count or wall-time ceiling is restored. The runtime seal and
-smoke records remain bound to the parent; a continuation proceeds only when
-current runtime and catalog evidence match the parent apart from the budget
-manifest hash.
+budget. No request-count or wall-time ceiling is restored. The parent runtime
+seal and smoke records remain unchanged. A continuation records the fresh
+descriptor and readiness/source-version observations separately, then compares
+its semantic inputs with the parent. Only process PIDs, dependency
+container/network/volume identities, fixture namespaces, and stdio consumer-root
+paths may be reallocated; ports, source and artifact versions, catalogs,
+provider snapshot, credentials, reset contract, environment, oracle, and paired
+order must still match.
 
 The operator file is stored outside the repository and has this shape:
 

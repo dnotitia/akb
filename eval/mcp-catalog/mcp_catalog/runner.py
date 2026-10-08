@@ -1031,9 +1031,12 @@ class BenchmarkRunner:
                 "error": redact_text(reason, self.secrets),
                 "cleanup_errors": [],
             }
-        safe_artifact = safe_json(artifact, self.secrets)
         if self.continuation is not None:
-            safe_artifact["continuation_lineage"] = self.continuation.lineage
+            artifact["continuation_lineage"] = self.continuation.lineage
+            runtime_provenance = self.continuation.runtime_provenance_for(cast(ArmName, self.arm))
+            if runtime_provenance is not None:
+                artifact["continuation_runtime_provenance"] = runtime_provenance
+        safe_artifact = safe_json(artifact, self.secrets)
         trial_order = [key.model_dump(mode="json") for key in self._planned_keys(runtime["source_revision"]).values()]
         hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
         safe_hash_input = safe_json(hash_input, self.secrets)
@@ -1576,7 +1579,13 @@ class BenchmarkRunner:
         continued_seal_hash: str | None = None
         if self.continuation is not None:
             arm = cast(ArmName, self.arm)
-            self.continuation.validate_pre_smoke_inputs(arm, local_inputs)
+            self.continuation.validate_pre_smoke_inputs(
+                arm,
+                local_inputs,
+                current_descriptor_raw=self.descriptor.raw,
+                runtime=runtime,
+                secrets=self.secrets,
+            )
             continued_seal_hash = str(self.continuation.lineage["source_pre_smoke_seal_hash"])
             self.pre_smoke_seal_inputs = self.continuation.parent_pre_smoke_inputs(arm)
         else:
@@ -3320,6 +3329,8 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
     }
     if "continuation_lineage" in artifact:
         hash_input["continuation_lineage"] = artifact["continuation_lineage"]
+    if "continuation_runtime_provenance" in artifact:
+        hash_input["continuation_runtime_provenance"] = artifact["continuation_runtime_provenance"]
     return hash_input
 
 

@@ -17,6 +17,34 @@ from test_runtime_contract import descriptor_dict
 ROOT = Path(__file__).parents[1]
 
 
+def test_run_paired_accepts_the_akb361_amendment_operator() -> None:
+    args = cli_module.build_parser().parse_args(
+        [
+            "run-paired",
+            "--baseline-descriptor",
+            "baseline-descriptor.json",
+            "--candidate-descriptor",
+            "candidate-descriptor.json",
+            "--baseline-output",
+            "baseline.json",
+            "--candidate-output",
+            "candidate.json",
+            "--comparison-output",
+            "comparison.json",
+            "--baseline-checkpoint",
+            "baseline.checkpoint.json",
+            "--candidate-checkpoint",
+            "candidate.checkpoint.json",
+            "--amendment",
+            "operator.json",
+        ]
+    )
+
+    assert args.command == "run-paired"
+    assert args.amendment == Path("operator.json")
+    assert args.resume is False
+
+
 @pytest.mark.asyncio
 async def test_paired_first_exception_writes_artifact_for_cancelled_preflight_peer(
     monkeypatch: pytest.MonkeyPatch,
