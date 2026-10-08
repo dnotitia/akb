@@ -749,7 +749,13 @@ def has_measured_evidence(outcome: TrialOutcome, task: TaskManifest) -> bool:
         return False
     if not _has_provider_usage_evidence(outcome):
         return False
-    before_required = [item.check_before for item in task.expected_final_state.observation_sets]
+    observation_sets = task.expected_final_state.observation_sets
+    if (
+        len(outcome.state_observations_before) != len(observation_sets)
+        or len(outcome.state_observations_after) != len(observation_sets)
+    ):
+        return False
+    before_required = [item.check_before for item in observation_sets]
     before_payload, before_valid = _measured_state_payload(
         outcome.state_observations_before,
         optional={index for index, required in enumerate(before_required) if not required},

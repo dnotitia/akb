@@ -163,6 +163,71 @@ def test_registered_skipped_before_observation_is_measured_but_required_null_sta
     assert not has_measured_evidence(missing_after, task)
 
 
+def test_measured_evidence_requires_exact_task_observation_cardinality() -> None:
+    task = next(
+        task
+        for task in load_task_corpus(ROOT / "corpus" / "tasks.json")
+        if task.id == "collection-relation-lifecycle-ko"
+    )
+    before = [
+        StateObservation(True, item.resolved_before_expected_status, {})
+        if item.check_before
+        else StateObservation(True, None, None)
+        for item in task.expected_final_state.observation_sets
+    ]
+    after = [StateObservation(True, item.probe.expected_status, {}) for item in task.expected_final_state.observation_sets]
+    outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        locale=task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="deepseek/deepseek-v4-flash-0731",
+        transport="http",
+        tool_calls=[],
+        input_tokens=10,
+        output_tokens=2,
+        total_tokens=12,
+        model_requests=1,
+        cost_usd=0.00001,
+        provider_evidence=[{"usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001}}],
+        provider_cost_usd=0.00001,
+        cost_source="provider_response",
+        routing_observed=True,
+        routing_valid=True,
+    )
+    outcome.finalize(task, before, after)
+    assert has_measured_evidence(outcome, task)
+
+    missing_before = outcome.model_copy(deep=True)
+    missing_before.state_observations_before = missing_before.state_observations_before[:1]
+    missing_before.state_before = missing_before.state_observations_before[0]["payload"]
+    assert not has_measured_evidence(missing_before, task)
+
+    missing_after = outcome.model_copy(deep=True)
+    missing_after.state_observations_after = missing_after.state_observations_after[:1]
+    missing_after.state_after = missing_after.state_observations_after[0]["payload"]
+    assert not has_measured_evidence(missing_after, task)
+
+    extra_before = outcome.model_copy(deep=True)
+    extra_before.state_observations_before.append(extra_before.state_observations_before[0].copy())
+    extra_before.state_before = [item["payload"] for item in extra_before.state_observations_before]
+    assert not has_measured_evidence(extra_before, task)
+
+    extra_after = outcome.model_copy(deep=True)
+    extra_after.state_observations_after.append(extra_after.state_observations_after[0].copy())
+    extra_after.state_after = [item["payload"] for item in extra_after.state_observations_after]
+    assert not has_measured_evidence(extra_after, task)
+
+    moved_skip = outcome.model_copy(deep=True)
+    moved_skip.state_observations_before[0], moved_skip.state_observations_before[-1] = (
+        moved_skip.state_observations_before[-1],
+        moved_skip.state_observations_before[0],
+    )
+    moved_skip.state_before = [item["payload"] for item in moved_skip.state_observations_before]
+    assert not has_measured_evidence(moved_skip, task)
+
+
 def test_expected_json_404_remains_a_passing_state_and_checkpoint_contract() -> None:
     contract = _contract(
         expected_status=404,
