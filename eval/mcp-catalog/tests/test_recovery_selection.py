@@ -13,9 +13,11 @@ import pytest
 import mcp_catalog.cli as cli_module
 import mcp_catalog.recovery as recovery_module
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
-from mcp_catalog.recovery import RecoverySelection, build_recovery_summary
+from mcp_catalog.execution import TrialOutcome, has_measured_evidence
+from mcp_catalog.recovery import RecoverySelection, RecoveryTrial, build_recovery_summary
 from mcp_catalog.runner import BenchmarkRunner, PairedArmCoordinator, compare_artifacts, planned_arm_order
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import _make_outcome
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -142,6 +144,186 @@ def test_selection_filters_trials_but_keeps_full_smoke_seal_and_paired_order(
     changed_runner = BenchmarkRunner(manifest, tasks, descriptor, recovery_selection=changed_selection)
     changed_seal = changed_runner._local_pre_smoke_seal(runtime, {})
     assert hash_json(seal) != hash_json(changed_seal)
+
+
+def _measured_outcome(manifest: Any, tasks: list[Any], trial: RecoveryTrial, arm: str) -> TrialOutcome:
+    task = next(item for item in tasks if item.id == trial.task_id)
+    model = next(item for item in manifest.models if item.class_name == trial.model_class)
+    order = planned_arm_order(task.id, trial.repeat_index, manifest.paired_order_seed)
+    return _make_outcome(
+        task,
+        manifest,
+        arm=arm,
+        model=model,
+        transport=trial.transport,
+        repeat_index=trial.repeat_index,
+        paired_order_position=order.index(arm),
+        paired_execution_sequence=order.index(arm) + 1,
+        request_count=2,
+    )
+
+
+def _complete_summary_inputs(
+    manifest: Any,
+    tasks: list[Any],
+    selection: RecoverySelection,
+    outcomes: dict[str, TrialOutcome],
+    *,
+    artifact_statuses: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    trial = selection.selected_trials[0]
+    task = next(item for item in tasks if item.id == trial.task_id)
+    arms_in_order = planned_arm_order(task.id, trial.repeat_index, manifest.paired_order_seed)
+    events = [
+        {
+            "sequence": index,
+            "cell": f"{trial.model_class}:{trial.transport}",
+            "task_id": trial.task_id,
+            "repeat_index": trial.repeat_index,
+            "arm": arm,
+            "order_position": arms_in_order.index(arm),
+        }
+        for index, arm in enumerate(arms_in_order, start=1)
+    ]
+    required_cells = [
+        f"{model.class_name}:{transport}"
+        for model in manifest.models
+        for transport in manifest.transports
+    ]
+    metadata = selection.artifact_metadata()
+    artifact_statuses = artifact_statuses or {"baseline": "complete", "candidate": "complete"}
+    return {
+        arm: {
+            "status": artifact_statuses[arm],
+            "recovery_selection": metadata,
+            "runs": {
+                f"{trial.model_class}:{trial.transport}": {
+                    "trials": [outcomes[arm].model_dump(mode="json")],
+                }
+            },
+            "smoke_gate": {
+                "status": "passed",
+                "required_cells": required_cells,
+                "cells": [
+                    {"cell": cell, "status": "completed", "outcome": {"model_requests": 1}}
+                    for cell in required_cells
+                ],
+            },
+            "paired_execution": {
+                "complete": True,
+                "events": events,
+            },
+        }
+        for arm in ("baseline", "candidate")
+    }
+
+
+def test_measured_tool_error_is_not_counted_as_unmeasured_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, tasks, selection = _recovery_fixture(tmp_path, monkeypatch)
+    baseline = _measured_outcome(manifest, tasks, selection.selected_trials[0], "baseline")
+    candidate = _measured_outcome(manifest, tasks, selection.selected_trials[0], "candidate")
+    candidate.error = "a measured tool operation failed"
+    candidate.failure_kind = "tool"
+    candidate.success = False
+    assert has_measured_evidence(candidate, next(task for task in tasks if task.id == candidate.task_id))
+    artifacts = _complete_summary_inputs(
+        manifest,
+        tasks,
+        selection,
+        {"baseline": baseline, "candidate": candidate},
+        artifact_statuses={"baseline": "complete", "candidate": "incomplete"},
+    )
+
+    summary = build_recovery_summary(
+        selection,
+        artifacts,
+        {"verdict": "inconclusive"},
+        manifest=manifest,
+        tasks=tasks,
+    )
+
+    candidate_summary = summary["arms"]["candidate"]
+    assert summary["status"] == "complete"
+    assert candidate_summary["run_artifact_status"] == "incomplete"
+    assert candidate_summary["measured_selected_trials"] == 1
+    assert candidate_summary["unmeasured_trials"] == 0
+    assert candidate_summary["measured_error_trials"] == 1
+    assert candidate_summary["measured_task_failures"] == 1
+
+
+def test_incomplete_tool_error_is_counted_as_unmeasured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, tasks, selection = _recovery_fixture(tmp_path, monkeypatch)
+    baseline = _measured_outcome(manifest, tasks, selection.selected_trials[0], "baseline")
+    candidate = _measured_outcome(manifest, tasks, selection.selected_trials[0], "candidate")
+    candidate.error = "tool operation failed before usage was recorded"
+    candidate.failure_kind = "tool"
+    candidate.model_requests = 0
+    assert not has_measured_evidence(candidate, next(task for task in tasks if task.id == candidate.task_id))
+    artifacts = _complete_summary_inputs(
+        manifest,
+        tasks,
+        selection,
+        {"baseline": baseline, "candidate": candidate},
+    )
+
+    summary = build_recovery_summary(
+        selection,
+        artifacts,
+        {"verdict": "inconclusive"},
+        manifest=manifest,
+        tasks=tasks,
+    )
+
+    candidate_summary = summary["arms"]["candidate"]
+    assert summary["status"] == "incomplete"
+    assert candidate_summary["measured_selected_trials"] == 0
+    assert candidate_summary["unmeasured_trials"] == 1
+    assert candidate_summary["measured_error_trials"] == 0
+
+
+def test_observed_negative_task_result_remains_measured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, tasks, selection = _recovery_fixture(tmp_path, monkeypatch)
+    negative_task = next(
+        task
+        for task in tasks
+        if "http" in task.fixture.transports
+        and any(item.outcome == "permission_denied" for item in task.expected_material_outcomes)
+    )
+    negative_trial = RecoveryTrial(
+        model_class="primary",
+        transport="http",
+        task_id=negative_task.id,
+        repeat_index=1,
+    )
+    selection = dataclasses.replace(selection, selected_trials=(negative_trial,))
+    outcomes = {
+        arm: _measured_outcome(manifest, tasks, negative_trial, arm)
+        for arm in ("baseline", "candidate")
+    }
+    assert outcomes["candidate"].expected_error_match
+    assert has_measured_evidence(outcomes["candidate"], negative_task)
+    artifacts = _complete_summary_inputs(manifest, tasks, selection, outcomes)
+
+    summary = build_recovery_summary(
+        selection,
+        artifacts,
+        {"verdict": "inconclusive"},
+        manifest=manifest,
+        tasks=tasks,
+    )
+
+    assert summary["status"] == "complete"
+    assert summary["arms"]["candidate"]["measured_selected_trials"] == 1
+    assert summary["arms"]["candidate"]["unmeasured_trials"] == 0
 
 
 def test_recovery_comparison_is_always_inconclusive_and_summary_requires_smoke_and_pairing(

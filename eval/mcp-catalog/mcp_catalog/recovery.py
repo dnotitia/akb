@@ -332,7 +332,7 @@ def build_recovery_summary(
     ]
     arms: dict[str, Any] = {}
     observed: dict[str, set[RecoveryIdentity]] = {}
-    complete = True
+    complete = comparison.get("verdict") == "inconclusive"
     smoke_requests = 0
     paired_events = 0
     paired_complete = True
@@ -340,9 +340,9 @@ def build_recovery_summary(
     for arm in ("baseline", "candidate"):
         artifact = artifacts.get(arm, {})
         complete = complete and artifact.get("recovery_selection") == selection.artifact_metadata()
-        complete = complete and artifact.get("status") == "complete"
         counts: Counter[RecoveryIdentity] = Counter()
-        selected_requests = unselected_requests = measured = errors = 0
+        selected_requests = unselected_requests = measured = unmeasured = 0
+        measured_error_trials = measured_task_failures = malformed_trial_records = 0
         cost = Decimal("0")
         all_identities: set[RecoveryIdentity] = set()
         runs = artifact.get("runs", {})
@@ -364,6 +364,7 @@ def build_recovery_summary(
                     or not isinstance(identity[2], str)
                     or not isinstance(identity[3], int)
                 ):
+                    malformed_trial_records += 1
                     continue
                 typed_identity = (identity[0], identity[1], identity[2], identity[3])
                 all_identities.add(typed_identity)
@@ -376,21 +377,27 @@ def build_recovery_summary(
                 cost += Decimal(str(row.get("cost_usd", 0)))
                 try:
                     outcome = TrialOutcome.model_validate(row)
-                    if (
-                        outcome.error is None
-                        and outcome.routing_valid
-                        and has_measured_evidence(outcome, task_by_id[outcome.task_id])
-                    ):
+                    has_measurement = has_measured_evidence(outcome, task_by_id[outcome.task_id])
+                    if has_measurement:
                         measured += 1
+                        measured_error_trials += int(outcome.error is not None)
+                        measured_task_failures += int(not outcome.success)
                     else:
-                        errors += 1
+                        unmeasured += 1
                 except (KeyError, ValueError):
-                    errors += 1
+                    unmeasured += 1
         observed[arm] = all_identities & expected
         missing = sorted(expected - observed[arm])
         duplicates = sorted(key for key in expected if counts[key] > 1)
         extra = sorted(all_identities - expected)
-        arm_complete = not missing and not duplicates and not extra and errors == 0 and measured == len(expected)
+        arm_complete = (
+            not missing
+            and not duplicates
+            and not extra
+            and malformed_trial_records == 0
+            and unmeasured == 0
+            and measured == len(expected)
+        )
         complete = complete and arm_complete
         smoke_gate = artifact.get("smoke_gate", {})
         smoke = smoke_gate.get("cells", []) if isinstance(smoke_gate, dict) else []
@@ -422,16 +429,20 @@ def build_recovery_summary(
         else:
             paired_complete = False
         arms[arm] = {
+            "run_artifact_status": artifact.get("status"),
             "selected_trial_records": sum(counts[key] for key in expected),
             "expected_selected_trial_records": len(expected),
             "measured_selected_trials": measured,
+            "unmeasured_trials": unmeasured,
+            "measured_error_trials": measured_error_trials,
+            "measured_task_failures": measured_task_failures,
+            "malformed_trial_records": malformed_trial_records,
             "selected_trial_model_requests": selected_requests,
             "unselected_trial_model_requests": unselected_requests,
             "selected_trial_cost_usd": str(cost),
             "missing_identities": [list(key) for key in missing],
             "duplicate_identities": [list(key) for key in duplicates],
             "unexpected_identities": [list(key) for key in extra],
-            "error_or_unmeasured_trials": errors,
         }
     complete = complete and observed.get("baseline") == expected and observed.get("candidate") == expected
     expected_events = {
@@ -468,7 +479,7 @@ def build_recovery_summary(
     else:
         complete = False
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "work_item": WORK_ITEM,
         "selection": selection.artifact_metadata(),
         "status": "complete" if complete else "incomplete",
