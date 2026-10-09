@@ -67,6 +67,7 @@ from .execution import (
     validate_model_configuration,
     worst_case_cost,
 )
+from .recovery import RecoverySelection
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
 from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
@@ -374,9 +375,11 @@ class PairedArmCoordinator:
         tasks: list[TaskManifest],
         *,
         initial_events: list[dict[str, Any]] | None = None,
+        recovery_selection: RecoverySelection | None = None,
     ) -> None:
         self.manifest = manifest
         self.tasks = tasks
+        self.recovery_selection = recovery_selection
         self._schedule: dict[str, list[tuple[str, int, ArmName]]] = {}
         for model in manifest.models:
             for transport in manifest.transports:
@@ -386,6 +389,10 @@ class PairedArmCoordinator:
                     for repeat_index in range(1, manifest.repeats + 1)
                     for task in tasks
                     if transport in task.fixture.transports
+                    and (
+                        recovery_selection is None
+                        or recovery_selection.contains(model.class_name, transport, task.id, repeat_index)
+                    )
                     for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)
                 ]
         self._positions = {cell: 0 for cell in self._schedule}
@@ -592,6 +599,7 @@ class BenchmarkRunner:
         paired_coordinator: PairedArmCoordinator | None = None,
         shared_ledger: BudgetLedger | None = None,
         continuation: AmendmentPlan | None = None,
+        recovery_selection: RecoverySelection | None = None,
     ) -> None:
         if checkpoint_path is not None and resume_path is not None and checkpoint_path != resume_path:
             raise ValueError("--checkpoint and --resume must reference the same path")
@@ -604,6 +612,9 @@ class BenchmarkRunner:
         self.paired_coordinator = paired_coordinator
         self.shared_ledger = shared_ledger
         self.continuation = continuation
+        self.recovery_selection = recovery_selection
+        if continuation is not None and recovery_selection is not None:
+            raise ValueError("AKB-361 selection cannot reuse amendment continuation inputs")
         if continuation is not None and paired_coordinator is None:
             raise ValueError("AKB-361 continuation requires the paired execution coordinator")
         self.secrets: tuple[str, ...] = ()
@@ -685,6 +696,13 @@ class BenchmarkRunner:
                     if transport not in task.fixture.transports:
                         continue
                     for repeat_index in range(1, self.manifest.repeats + 1):
+                        if self.recovery_selection is not None and not self.recovery_selection.contains(
+                            model_spec.class_name,
+                            transport,
+                            task.id,
+                            repeat_index,
+                        ):
+                            continue
                         key = CheckpointKey(
                             source_revision=source_revision,
                             run_manifest_hash=manifest_hash,
@@ -826,13 +844,17 @@ class BenchmarkRunner:
             }
         completed_trials = sum(len(outcomes) for outcomes in source_trials.values())
         all_outcomes = [outcome for outcomes in source_trials.values() for outcome in outcomes]
-        expected_trials = sum(
-            1
-            for model_spec in self.manifest.models
-            for transport in self.manifest.transports
-            for task in self.tasks
-            if transport in task.fixture.transports
-            for _repeat_index in range(1, self.manifest.repeats + 1)
+        expected_trials = (
+            len(self.recovery_selection.selected_trials)
+            if self.recovery_selection is not None
+            else sum(
+                1
+                for model_spec in self.manifest.models
+                for transport in self.manifest.transports
+                for task in self.tasks
+                if transport in task.fixture.transports
+                for _repeat_index in range(1, self.manifest.repeats + 1)
+            )
         )
         if completed_trials != expected_trials:
             incomplete_reasons.add(
@@ -1021,6 +1043,8 @@ class BenchmarkRunner:
                 "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
+        if self.recovery_selection is not None:
+            artifact["recovery_selection"] = self.recovery_selection.artifact_metadata()
         if failure is not None:
             cleanup = cleanup_errors or []
             stage = failure_stage or _exception_stage(failure, "run")
@@ -1542,7 +1566,7 @@ class BenchmarkRunner:
                 package_versions[package] = None
         lock_path = Path(__file__).parents[1] / "uv.lock"
         lock_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
-        return {
+        seal = {
             "schema_version": 1,
             "arm": self.arm,
             "source_revision": runtime["source_revision"],
@@ -1575,6 +1599,9 @@ class BenchmarkRunner:
             "provider_registry_hash": self.provider_registry.get("snapshot_hash"),
             "provider_registry_status": self.provider_registry.get("status"),
         }
+        if self.recovery_selection is not None:
+            seal["recovery_selection"] = self.recovery_selection.artifact_metadata()
+        return seal
 
     async def _bind_pre_smoke_seal(
         self,
@@ -2530,6 +2557,11 @@ def _validate_preregistered_inputs(
         if continuation_lineage is not None
         else artifact.get("run_manifest_hash")
     )
+    recovery_selection = artifact.get("recovery_selection")
+    if recovery_selection is not None and inputs.get("recovery_selection") != recovery_selection:
+        raise ValueError(f"{arm} recovery selection differs from its pre-smoke seal")
+    if recovery_selection is None and "recovery_selection" in inputs:
+        raise ValueError(f"{arm} pre-smoke seal contains an unbound recovery selection")
     if (
         inputs.get("arm") != arm
         or inputs.get("source_revision") != artifact.get("source_revision")
@@ -2948,6 +2980,12 @@ def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | N
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """Compare a sealed paired run using only the preregistered BCa gates."""
 
+    if "recovery_selection" in baseline or "recovery_selection" in candidate:
+        return _empty_comparison(
+            baseline,
+            candidate,
+            "selected recovery evidence cannot support the full benchmark adoption verdict",
+        )
     for artifact, arm in ((baseline, cast(ArmName, "baseline")), (candidate, cast(ArmName, "candidate"))):
         integrity_error = _artifact_integrity_error(artifact, arm)
         if integrity_error is not None:
@@ -3353,6 +3391,8 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         hash_input["continuation_lineage"] = artifact["continuation_lineage"]
     if "continuation_runtime_provenance" in artifact:
         hash_input["continuation_runtime_provenance"] = artifact["continuation_runtime_provenance"]
+    if "recovery_selection" in artifact:
+        hash_input["recovery_selection"] = artifact["recovery_selection"]
     return hash_input
 
 

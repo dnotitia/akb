@@ -180,6 +180,37 @@ The operator file is stored outside the repository and has this shape:
 Pass it with `run-paired --amendment /private/run/akb-361-continuation.json`.
 Paths may be absolute or relative to the operator file.
 
+AKB-361 provider recovery is a separate, selection-bound run. Supply the
+authorized `recovery-selection.json` and a new summary path with
+`--selection` and `--recovery-summary-output`. The selection pins 65 paired
+identities (130 fresh model trials) and both immutable parent artifact hashes;
+the runner validates those inputs, the 90 source provider failures, and the
+unchanged full corpus before starting. It keeps the original repeat and arm
+order, runs the full four-cell smoke gate for each arm, and writes new arm
+artifacts and checkpoints. Parent outcomes are not copied into or merged with
+the recovery results. The canonical comparison remains inconclusive; the
+separate recovery summary reports whether all selected trials completed.
+
+The new shared ledger starts at zero and stops at `$41.89781216`, calculated
+from the `$50` registered cap less the larger `$8.10218784` prior account
+observation (the provider receipt total is `$8.04371078`). The `$0.10` per-trial
+cap and 300-second request timeout remain in force. There is no total request
+count or overall wall-time limit on this recovery run.
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench run-paired \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline-recovery.json \
+  --candidate-output /private/run/candidate-recovery.json \
+  --comparison-output /private/run/recovery-comparison.json \
+  --baseline-checkpoint /private/run/baseline-recovery.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate-recovery.checkpoint.json \
+  --selection /private/run/recovery-selection.json \
+  --recovery-summary-output /private/run/recovery-summary.json
+```
+
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.
 Incomplete, drifted, or undersampled runs still write a comparison artifact
