@@ -451,12 +451,13 @@ class RuntimeFixture:
                 response = await self.client.post(url, headers=headers, json=probe.body or {})
         except httpx.HTTPError:
             return StateObservation(False, None, error="state probe request failed")
-        if response.status_code != probe.expected_status:
-            return StateObservation(False, response.status_code, error=f"state probe returned HTTP {response.status_code}")
         try:
             payload = response.json()
         except ValueError:
             return StateObservation(False, response.status_code, error="state probe returned non-JSON content")
+        # Availability means that a JSON response was observed at the declared
+        # origin. The state contract evaluates whether its HTTP status was the
+        # expected one; an unexpected JSON 404 is still measured task evidence.
         return StateObservation(True, response.status_code, payload=payload)
 
     @property

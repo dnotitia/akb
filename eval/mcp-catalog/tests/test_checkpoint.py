@@ -14,6 +14,7 @@ from mcp_catalog.checkpoint import (
 )
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
+from paired_artifact_factory import provider_name_for_model
 
 ROOT = Path(__file__).parents[1]
 
@@ -46,6 +47,8 @@ def _inputs() -> tuple[object, list[object], CheckpointHeader, CheckpointKey, di
 
 def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
     task = next(task for task in _inputs()[1] if task.id == key.task_id)
+    manifest = _inputs()[0]
+    model_spec = next(model for model in manifest.models if model.model_id == key.model_id)
     return TrialOutcome(
         task_id=key.task_id,
         category="single_operation",
@@ -67,7 +70,7 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
                 "model": key.model_id,
                 "routing": {
                     "endpoints": {
-                        "available": [{"provider": "parasail", "selected": True}]
+                        "available": [{"provider": provider_name_for_model(model_spec), "selected": True}]
                     }
                 },
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
@@ -104,12 +107,13 @@ def _outcome(key: CheckpointKey, *, error: str | None = None) -> TrialOutcome:
 
 
 def _store(path: Path, *, resume: bool = False, secrets: tuple[str, ...] = ()) -> tuple[CheckpointStore, CheckpointKey]:
-    _manifest, _tasks, header, key, expected = _inputs()
+    _manifest, tasks, header, key, expected = _inputs()
     return (
         CheckpointStore(
             path,
             header=header,
             expected_keys=expected,
+            expected_tasks={task.id: task for task in tasks},
             expected_smoke_cells={
                 "primary:http": ("primary", key.model_id, "http"),
                 "primary:stdio": ("primary", key.model_id, "stdio"),
@@ -136,6 +140,39 @@ def test_trial_checkpoint_is_atomic_redacted_and_reusable(tmp_path: Path) -> Non
     reused = resumed.completed_outcome_for(key)
     assert reused is not None
     assert resumed.document.spent.model_requests == 1
+
+
+def test_resume_rejects_checkpoint_from_a_prior_task_corpus_seal(tmp_path: Path) -> None:
+    manifest, tasks, current_header, current_key, current_expected = _inputs()
+    old_hash = hash_json({"prior_task_corpus": current_header.task_corpus_hash})
+    old_header = current_header.model_copy(update={"task_corpus_hash": old_hash})
+    old_key = current_key.model_copy(update={"task_corpus_hash": old_hash})
+    old_expected = {hash_json(old_key.model_dump(mode="json")): old_key}
+    path = tmp_path / "prior-seal.checkpoint.json"
+    smoke_cells = {
+        "primary:http": ("primary", manifest.models[0].model_id, "http"),
+        "primary:stdio": ("primary", manifest.models[0].model_id, "stdio"),
+        "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+        "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+    }
+    old_store = CheckpointStore(
+        path,
+        header=old_header,
+        expected_keys=old_expected,
+        expected_tasks={task.id: task for task in tasks},
+        expected_smoke_cells=smoke_cells,
+    )
+    old_store.record_trial(old_key, _outcome(old_key), status="completed")
+
+    with pytest.raises(CheckpointError):
+        CheckpointStore(
+            path,
+            header=current_header,
+            expected_keys=current_expected,
+            expected_tasks={task.id: task for task in tasks},
+            expected_smoke_cells=smoke_cells,
+            resume=True,
+        )
 
 
 @pytest.mark.parametrize("record_as_smoke", [False, True])
@@ -244,6 +281,60 @@ def test_failed_checkpoint_trial_is_not_reused_but_spent_is_preserved(tmp_path: 
     assert resumed.completed_outcome_for(key) is None
     assert resumed.status_for(key) == "failed"
     assert resumed.document.spent.model_requests == 1
+
+
+def test_explicit_continuation_reuses_failed_parent_outcomes_without_retry(tmp_path: Path) -> None:
+    path = tmp_path / "continuation.checkpoint.json"
+    lineage = {"schema_version": 1, "work_item": "AKB-361"}
+    manifest, tasks, header, key, expected = _inputs()
+    store = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=expected,
+        expected_tasks={task.id: task for task in tasks},
+        expected_smoke_cells={
+            "primary:http": ("primary", key.model_id, "http"),
+            "primary:stdio": ("primary", key.model_id, "stdio"),
+            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+        },
+        continuation=lineage,
+    )
+    failed = _outcome(key, error="recorded parent failure")
+    store.record_trial(key, failed, status="failed")
+
+    resumed = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=expected,
+        expected_tasks={task.id: task for task in tasks},
+        expected_smoke_cells={
+            "primary:http": ("primary", key.model_id, "http"),
+            "primary:stdio": ("primary", key.model_id, "stdio"),
+            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
+            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
+        },
+        continuation=lineage,
+        resume=True,
+    )
+
+    assert resumed.completed_outcome_for(key) is None
+    assert resumed.reusable_outcome_for(key) == failed
+    assert resumed.status_for(key) == "failed"
+    assert resumed.document.continuation == lineage
+    assert manifest.budget.max_cost_per_trial_usd > 0
+
+
+def test_request_limit_failure_kind_remains_parseable_as_stored_evidence() -> None:
+    from mcp_catalog.execution import classify_failure
+
+    raw = _outcome(_inputs()[3], error="benchmark incomplete: max_model_requests exceeded").model_dump(mode="json")
+    raw["failure_kind"] = "request_limit"
+
+    restored = TrialOutcome.model_validate(raw)
+
+    assert restored.failure_kind == "request_limit"
+    assert classify_failure("max_model_requests exceeded", result=None, final_answer="") != "request_limit"
 
 
 def test_checkpoint_outcome_without_call_trace_is_not_reusable(tmp_path: Path) -> None:
@@ -407,7 +498,16 @@ def test_smoke_checkpoint_requires_a_successful_call_and_follow_up_response(tmp_
                 "provider_evidence": [
                     {
                         "model": model_id,
-                        "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                        "routing": {
+                            "endpoints": {
+                                "available": [{
+                                    "provider": provider_name_for_model(
+                                        next(model for model in _inputs()[0].models if model.model_id == model_id)
+                                    ),
+                                    "selected": True,
+                                }]
+                            }
+                        },
                         "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
                     }
                     for _ in range(2)

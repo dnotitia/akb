@@ -20,6 +20,7 @@ from mcp_catalog.execution import (
 )
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
 from mcp_catalog.runtime import StateObservation
+from paired_artifact_factory import provider_name_for_model
 from paired_artifact_factory import complete_paired_artifacts
 
 
@@ -920,7 +921,17 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         total_tokens=12,
         model_requests=1,
         cost_usd=0.00001,
-        provider_evidence=[{"routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}}, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001}}],
+        provider_evidence=[{
+            "routing": {
+                "endpoints": {
+                    "available": [{
+                        "provider": provider_name_for_model(manifest.models[0]),
+                        "selected": True,
+                    }]
+                }
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+        }],
         provider_cost_usd=0.00001,
         cost_source="provider_response",
         routing_observed=True,
@@ -952,6 +963,7 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         tmp_path / "checkpoint.json",
         header=header,
         expected_keys={hash_json(key.model_dump(mode="json")): key},
+        expected_tasks={task.id: task for task in tasks},
         expected_smoke_cells={},
     )
     store.record_trial(key, outcome, status="completed")
@@ -964,6 +976,7 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
             tmp_path / "checkpoint.json",
             header=header,
             expected_keys={hash_json(key.model_dump(mode="json")): key},
+            expected_tasks={task.id: task for task in tasks},
             expected_smoke_cells={},
             resume=True,
         )

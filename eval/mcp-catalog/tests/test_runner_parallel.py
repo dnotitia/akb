@@ -11,9 +11,9 @@ import pytest
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, TrialOutcome
-from mcp_catalog.runner import BenchmarkRunFailure, BenchmarkRunner
+from mcp_catalog.runner import BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor
-from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
+from paired_artifact_factory import _catalog_snapshot, provider_name_for_model, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -105,6 +105,7 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_spec.model_id,
@@ -131,7 +132,16 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
         provider_evidence=[
             {
                 "model": model_spec.model_id,
-                "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}},
+                "routing": {
+                    "requested": model_spec.model_id,
+                    "endpoints": {
+                        "available": [{
+                            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+                            "provider": provider_name_for_model(model_spec),
+                            "selected": True,
+                        }]
+                    },
+                },
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
             for _ in range(2)
@@ -251,7 +261,7 @@ async def test_registered_cells_run_in_parallel_and_keep_deterministic_hash_inpu
 
 
 @pytest.mark.asyncio
-async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finalization(
+async def test_request_timeout_allows_sibling_lanes_and_finalizes_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -259,7 +269,7 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     descriptor = _parallel_descriptor()
     resolver = _ParallelResolver()
-    settled: list[str] = []
+    completed_lanes: list[str] = []
     failed_once = True
     checkpoint = tmp_path / "timeout.checkpoint.json"
 
@@ -305,29 +315,30 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
                 }
             )
             await checkpoint_sink(timeout, "failed")
-            return _ParallelReport([timeout])
-        try:
-            await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            if run_key in {"primary:stdio", "lightweight:http"}:
-                task = tasks_for_repeat[0]
-                sibling = _outcome(
-                    task,
+            outcomes = [timeout]
+            for remaining_task in tasks_for_repeat[1:]:
+                outcome = _outcome(
+                    remaining_task,
                     executor.model_spec,
                     executor.transport,
-                    repeat_indices[task.id],
-                ).model_copy(update={"locale": task.locale})
-                await checkpoint_sink(sibling, "completed")
-            settled.append(run_key)
-            raise
-        return _ParallelReport(
-            [
+                    repeat_indices[remaining_task.id],
+                ).model_copy(update={"locale": remaining_task.locale})
+                await checkpoint_sink(outcome, "completed")
+                outcomes.append(outcome)
+            completed_lanes.append(run_key)
+            return _ParallelReport(outcomes)
+
+        await asyncio.sleep(0.2)
+        outcomes = [
                 _outcome(task, executor.model_spec, executor.transport, repeat_indices[task.id]).model_copy(
                     update={"locale": task.locale}
                 )
                 for task in tasks_for_repeat
-            ]
-        )
+        ]
+        for outcome in outcomes:
+            await checkpoint_sink(outcome, "completed")
+        completed_lanes.append(run_key)
+        return _ParallelReport(outcomes)
 
     monkeypatch.setattr(runner_module, "RuntimeFixture", _ParallelFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
@@ -343,20 +354,19 @@ async def test_timeout_cancels_and_joins_sibling_lanes_before_checkpoint_finaliz
     monkeypatch.setattr(runner_module, "serialize_report", lambda *_args, **_kwargs: {})
 
     runner = BenchmarkRunner(manifest, tasks, descriptor, arm="baseline", checkpoint_path=checkpoint)
-    with pytest.raises(BenchmarkRunFailure) as raised:
-        await runner.run()
+    artifact = await runner.run()
 
     raw = json.loads(checkpoint.read_text(encoding="utf-8"))
-    artifact = raised.value.artifact
-    assert artifact["failure_stage"] == "model_request"
-    assert len(settled) == 3
+    assert artifact["status"] == "incomplete"
+    assert len(completed_lanes) == len(manifest.models) * len(manifest.transports) * manifest.repeats
+    assert set(completed_lanes) == {"primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio"}
     assert raw["lifecycle"] == "finalized"
     assert raw["timing"]["active_attempt"] is None
     assert len(raw["timing"]["attempts"]) == 1
-    assert len(raw["records"]) == 3
+    assert len(raw["records"]) == artifact["completed_trials"]
     assert raw["reserved_cost_usd"] == 0
     assert artifact["checkpoint"]["lifecycle"] == "finalized"
-    assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"]) == 3
+    assert artifact["checkpoint"]["record_count"] == artifact["completed_trials"] == len(raw["records"])
     assert artifact["checkpoint"]["timing"] == raw["timing"]
     assert artifact["budget_used"]["reserved_cost_usd"] == 0
     for field in ("model_requests", "input_tokens", "output_tokens", "cost_usd", "wall_seconds", "model_work_seconds"):

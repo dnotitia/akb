@@ -7,9 +7,12 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.models.openrouter import OpenRouterProviderConfig
 
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 2
@@ -17,8 +20,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
 OPENROUTER_PRICE_CEILINGS = {
-    "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
-    "qwen/qwen3.8-27b": (0.24, 2.20),
+    "deepseek/deepseek-v4-flash-0731": (0.06, 0.18),
+    "qwen/qwen3.8-27b": (0.225, 1.98),
 }
 OPENROUTER_CLASSES = {
     "primary": "deepseek/deepseek-v4-flash-0731",
@@ -181,13 +184,31 @@ class StateProbe(ContractModel):
 
 class StateExpectation(ContractModel):
     pointer: str = Field(pattern=JSON_POINTER_RE.pattern)
-    operator: Literal["equals", "contains", "not_contains", "exists"]
+    operator: Literal["equals", "contains", "not_contains", "exists", "nonempty", "okf_document"]
     value: JsonValue = None
 
     @model_validator(mode="after")
     def validate_value(self) -> StateExpectation:
         if self.operator == "exists" and not isinstance(self.value, bool):
             raise ValueError("exists expectations require a boolean value")
+        if self.operator == "nonempty" and self.value is not None:
+            raise ValueError("nonempty expectations do not accept a value")
+        if self.operator == "okf_document":
+            fields = {"type", "resource_uri", "body"}
+            if not isinstance(self.value, dict) or set(self.value) != fields:
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            document_type = self.value["type"]
+            resource_uri = self.value["resource_uri"]
+            body = self.value["body"]
+            if (
+                not isinstance(document_type, str)
+                or not document_type
+                or not isinstance(resource_uri, str)
+                or not resource_uri.startswith("akb://")
+                or not isinstance(body, str)
+            ):
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            return self
         if self.operator in {"equals", "contains", "not_contains"} and self.value is None:
             raise ValueError(f"{self.operator} expectations require value")
         return self
@@ -428,20 +449,34 @@ class ExpectedResultBinding(ContractModel):
 
 
 class ProviderRouting(ContractModel):
-    order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
+    order: list[str] = Field(min_length=1, max_length=1)
     allow_fallbacks: Literal[False] = False
     require_parameters: Literal[True] = True
     quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
-    def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
-        return {
-            "provider": {
-                "order": ["parasail"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-                "quantizations": ["fp8"],
+    @field_validator("order")
+    @classmethod
+    def validate_provider_slug(cls, value: list[str]) -> list[str]:
+        if len(value) != 1 or re.fullmatch(
+            r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*",
+            value[0],
+        ) is None:
+            raise ValueError("provider routing order must contain one lowercase OpenRouter provider slug")
+        return value
+
+    def request_body(self, *, input_price: float, output_price: float) -> dict[str, Any]:
+        provider = cast(
+            OpenRouterProviderConfig,
+            {
+                "order": self.order,
+                "allow_fallbacks": self.allow_fallbacks,
+                "require_parameters": self.require_parameters,
+                "quantizations": self.quantizations,
                 "max_price": {"prompt": input_price, "completion": output_price},
-            }
+            },
+        )
+        return {
+            "provider": provider,
         }
 
 
@@ -793,20 +828,9 @@ class ModelSpec(ContractModel):
 
 
 class Budget(ContractModel):
-    max_model_requests: int = Field(gt=0)
-    max_total_cost_usd: float = Field(gt=0)
-    max_wall_seconds: int = Field(gt=0)
+    max_total_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     request_timeout_seconds: int = Field(gt=0)
-    max_requests_per_trial: int = Field(gt=0)
-    max_cost_per_trial_usd: float = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_limits(self) -> Budget:
-        if self.max_requests_per_trial > self.max_model_requests:
-            raise ValueError("per-trial request cap cannot exceed global request cap")
-        if self.request_timeout_seconds > self.max_wall_seconds:
-            raise ValueError("request timeout cannot exceed the global wall limit")
-        return self
+    max_cost_per_trial_usd: float = Field(gt=0, allow_inf_nan=False)
 
 
 class StatisticalProcedure(ContractModel):
@@ -1134,11 +1158,6 @@ class BenchmarkRunManifest(ContractModel):
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
-        required_trials = trials_per_arm * len(self.arms)
-        smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
-        if self.budget.max_model_requests < required_trials + smoke_cells:
-            raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         if len(self.pair_categories) != 20 or len(tasks) != 40:
             raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
         if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:
@@ -1279,13 +1298,48 @@ def validate_public_catalog(
             continue
         tool = by_name.get(route.tool, {})
         schema = tool.get("inputSchema", tool.get("input_schema", {}))
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        action_schema = properties.get("action", {}) if isinstance(properties, dict) else {}
-        allowed = action_schema.get("enum") if isinstance(action_schema, dict) else None
-        if not isinstance(allowed, list) or route.action not in allowed:
+        if not isinstance(schema, dict) or not _input_schema_exposes_action(schema, route.action):
             raise ValueError(
                 f"{arm} catalog action {route.tool}:{route.action} is missing from the public input schema"
             )
+
+
+def _input_schema_exposes_action(schema: dict[str, Any], action: str) -> bool:
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+
+    properties = schema.get("properties")
+    action_schema = properties.get("action") if isinstance(properties, dict) else None
+    enum_declared = isinstance(action_schema, dict) and "enum" in action_schema
+    if enum_declared and not validator_type(action_schema).is_valid(action):
+        return False
+
+    if "oneOf" not in schema:
+        return enum_declared
+
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or not branches:
+        return False
+    matching_branches = 0
+    for branch in branches:
+        if not isinstance(branch, dict) or branch.get("type") != "object":
+            return False
+        required = branch.get("required")
+        branch_properties = branch.get("properties")
+        branch_action = branch_properties.get("action") if isinstance(branch_properties, dict) else None
+        if (
+            not isinstance(required, list)
+            or "action" not in required
+            or not isinstance(branch_action, dict)
+            or "const" not in branch_action
+        ):
+            return False
+        if validator_type(branch_action).is_valid(action):
+            matching_branches += 1
+    return matching_branches == 1
 
 
 def canonical_json(value: Any) -> str:

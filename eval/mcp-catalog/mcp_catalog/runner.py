@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 import httpx
 
 from .catalog import capture_catalog, input_schemas_from_catalog
+from .amendment import AmendmentPlan, validate_artifact_lineage
 from .checkpoint import (
     CheckpointHeader,
     CheckpointDocument,
@@ -59,15 +60,38 @@ from .execution import (
     has_measured_evidence,
     provider_response_cost,
     provider_token_totals,
+    registered_route_target,
     summarize_outcomes,
     summarize_outcomes_by_locale,
     validate_routing_evidence,
     validate_model_configuration,
     worst_case_cost,
 )
+from .recovery import RecoverySelection
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
 from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
+
+
+_OPENROUTER_CANONICAL_IDENTITIES = {
+    ("deepseek/deepseek-v4-flash-0731", "20260731"): "deepseek/deepseek-v4-flash-20260731",
+    ("qwen/qwen3.8-27b", "20260814"): "qwen/qwen3.8-27b-20260814",
+}
+
+
+def _expected_openrouter_canonical_slug(spec: ModelSpec) -> str:
+    canonical_slug = _OPENROUTER_CANONICAL_IDENTITIES.get((spec.model_id, spec.version))
+    if canonical_slug is None:
+        raise ValueError(f"provider model alias/version is not pinned for {spec.class_name}")
+    return canonical_slug
+
+
+def _validate_openrouter_model_identity(spec: ModelSpec, model_record: dict[str, Any]) -> None:
+    if model_record.get("id") != spec.model_id:
+        raise ValueError(f"provider model alias drifted for {spec.class_name}")
+    canonical_slug = model_record.get("canonical_slug")
+    if canonical_slug != _expected_openrouter_canonical_slug(spec):
+        raise ValueError(f"provider model canonical identity drifted for {spec.class_name}")
 
 
 class NeedsUserInput(RuntimeError):
@@ -345,9 +369,17 @@ class PairedExecutionTurn:
 class PairedArmCoordinator:
     """Gate real trial execution by the preregistered per-cell arm order."""
 
-    def __init__(self, manifest: BenchmarkRunManifest, tasks: list[TaskManifest]) -> None:
+    def __init__(
+        self,
+        manifest: BenchmarkRunManifest,
+        tasks: list[TaskManifest],
+        *,
+        initial_events: list[dict[str, Any]] | None = None,
+        recovery_selection: RecoverySelection | None = None,
+    ) -> None:
         self.manifest = manifest
         self.tasks = tasks
+        self.recovery_selection = recovery_selection
         self._schedule: dict[str, list[tuple[str, int, ArmName]]] = {}
         for model in manifest.models:
             for transport in manifest.transports:
@@ -357,6 +389,10 @@ class PairedArmCoordinator:
                     for repeat_index in range(1, manifest.repeats + 1)
                     for task in tasks
                     if transport in task.fixture.transports
+                    and (
+                        recovery_selection is None
+                        or recovery_selection.contains(model.class_name, transport, task.id, repeat_index)
+                    )
                     for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)
                 ]
         self._positions = {cell: 0 for cell in self._schedule}
@@ -365,13 +401,21 @@ class PairedArmCoordinator:
             "baseline": set(),
             "candidate": set(),
         }
-        self._events: list[dict[str, Any]] = []
-        self._sequence = 0
+        self._events = [dict(event) for event in (initial_events or [])]
+        sequences = [event.get("sequence") for event in self._events]
+        if sequences != list(range(1, len(self._events) + 1)):
+            raise RuntimeContractError("paired continuation history must have a contiguous execution sequence")
+        self._sequence = len(self._events)
+        self._historical_identities = {
+            (event["cell"], event["task_id"], event["repeat_index"], event["arm"])
+            for event in self._events
+        }
         self._condition = asyncio.Condition()
         self._provider_registry: dict[str, Any] | None = None
         self._provider_registry_lock = asyncio.Lock()
         self._pre_smoke_seals: dict[ArmName, str] = {}
         self._pre_smoke_ready: set[ArmName] = set()
+        self._continued_seal_hash: str | None = None
 
     async def register_arm(
         self,
@@ -421,14 +465,26 @@ class PairedArmCoordinator:
                 self._provider_registry = await loader()
             return dict(self._provider_registry)
 
-    async def register_pre_smoke_seal(self, arm: ArmName, seal_hash: str) -> str:
+    async def register_pre_smoke_seal(
+        self,
+        arm: ArmName,
+        seal_hash: str,
+        *,
+        continued_seal_hash: str | None = None,
+    ) -> str:
         async with self._condition:
             previous = self._pre_smoke_seals.get(arm)
             if previous is not None and previous != seal_hash:
                 raise RuntimeContractError("paired arm changed its pre-smoke seal during resume")
             self._pre_smoke_seals[arm] = seal_hash
+            if continued_seal_hash is not None:
+                if self._continued_seal_hash is not None and self._continued_seal_hash != continued_seal_hash:
+                    raise RuntimeContractError("paired continuation changed the immutable parent seal")
+                self._continued_seal_hash = continued_seal_hash
             self._condition.notify_all()
             await self._condition.wait_for(lambda: set(self._pre_smoke_seals) == {"baseline", "candidate"})
+            if self._continued_seal_hash is not None:
+                return self._continued_seal_hash
             return hash_json(dict(sorted(self._pre_smoke_seals.items())))
 
     async def mark_pre_smoke_ready(self, arm: ArmName) -> None:
@@ -520,6 +576,7 @@ class PairedArmCoordinator:
                 }
                 for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate"))
                 for cell, task_id, repeat_index in sorted(self._reused[arm])
+                if (cell, task_id, repeat_index, arm) not in self._historical_identities
             ],
         }
 
@@ -541,6 +598,8 @@ class BenchmarkRunner:
         resume_path: Path | None = None,
         paired_coordinator: PairedArmCoordinator | None = None,
         shared_ledger: BudgetLedger | None = None,
+        continuation: AmendmentPlan | None = None,
+        recovery_selection: RecoverySelection | None = None,
     ) -> None:
         if checkpoint_path is not None and resume_path is not None and checkpoint_path != resume_path:
             raise ValueError("--checkpoint and --resume must reference the same path")
@@ -552,6 +611,12 @@ class BenchmarkRunner:
         self.resume_path = resume_path
         self.paired_coordinator = paired_coordinator
         self.shared_ledger = shared_ledger
+        self.continuation = continuation
+        self.recovery_selection = recovery_selection
+        if continuation is not None and recovery_selection is not None:
+            raise ValueError("AKB-361 selection cannot reuse amendment continuation inputs")
+        if continuation is not None and paired_coordinator is None:
+            raise ValueError("AKB-361 continuation requires the paired execution coordinator")
         self.secrets: tuple[str, ...] = ()
         self._completed_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         self._checkpoint_store: CheckpointStore | None = None
@@ -631,6 +696,13 @@ class BenchmarkRunner:
                     if transport not in task.fixture.transports:
                         continue
                     for repeat_index in range(1, self.manifest.repeats + 1):
+                        if self.recovery_selection is not None and not self.recovery_selection.contains(
+                            model_spec.class_name,
+                            transport,
+                            task.id,
+                            repeat_index,
+                        ):
+                            continue
                         key = CheckpointKey(
                             source_revision=source_revision,
                             run_manifest_hash=manifest_hash,
@@ -670,8 +742,10 @@ class BenchmarkRunner:
             self.checkpoint_path,
             header=header,
             expected_keys=planned_keys,
+            expected_tasks={task.id: task for task in self.tasks},
             expected_smoke_cells=expected_smoke,
             secrets=resolver.secret_values(),
+            continuation=(self.continuation.checkpoint_lineage[cast(ArmName, self.arm)] if self.continuation else None),
             resume=self.resume_path is not None,
         )
 
@@ -717,6 +791,7 @@ class BenchmarkRunner:
         smoke_gate: dict[str, Any] | None = None,
         checkpoint_snapshot: CheckpointDocument | None = None,
     ) -> dict[str, Any]:
+        tasks_by_id = {task.id: task for task in self.tasks}
         snapshot_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         snapshot_statuses: dict[str, list[dict[str, Any]]] = defaultdict(list)
         if checkpoint_snapshot is not None:
@@ -741,7 +816,11 @@ class BenchmarkRunner:
                 quality_reasons.append(reason)
         for run_key, outcomes in source_trials.items():
             for outcome in outcomes:
-                if outcome.error and not valid_completed_outcome(outcome):
+                task = tasks_by_id.get(outcome.task_id)
+                if task is None:
+                    incomplete_reasons.add(f"benchmark incomplete: trial {outcome.task_id} is not registered")
+                    continue
+                if outcome.error and not valid_completed_outcome(outcome, task):
                     reason = (
                         f"benchmark incomplete: {run_key} trial {outcome.task_id} "
                         f"repeat {outcome.repeat_index} failed: {redact_text(outcome.error, self.secrets)}"
@@ -765,13 +844,17 @@ class BenchmarkRunner:
             }
         completed_trials = sum(len(outcomes) for outcomes in source_trials.values())
         all_outcomes = [outcome for outcomes in source_trials.values() for outcome in outcomes]
-        expected_trials = sum(
-            1
-            for model_spec in self.manifest.models
-            for transport in self.manifest.transports
-            for task in self.tasks
-            if transport in task.fixture.transports
-            for _repeat_index in range(1, self.manifest.repeats + 1)
+        expected_trials = (
+            len(self.recovery_selection.selected_trials)
+            if self.recovery_selection is not None
+            else sum(
+                1
+                for model_spec in self.manifest.models
+                for transport in self.manifest.transports
+                for task in self.tasks
+                if transport in task.fixture.transports
+                for _repeat_index in range(1, self.manifest.repeats + 1)
+            )
         )
         if completed_trials != expected_trials:
             incomplete_reasons.add(
@@ -828,14 +911,15 @@ class BenchmarkRunner:
                 sum(
                     1
                     for record in checkpoint_snapshot.records.values()
-                    if record.status == "completed" and valid_completed_outcome(record.outcome)
+                    if record.status == "completed"
+                    and valid_completed_outcome(record.outcome, tasks_by_id[record.key.task_id])
                 )
                 if checkpoint_snapshot is not None
                 else sum(
                     1
                     for outcomes in self._completed_trials.values()
                     for outcome in outcomes
-                    if valid_completed_outcome(outcome)
+                    if valid_completed_outcome(outcome, tasks_by_id[outcome.task_id])
                 )
             ),
         }
@@ -865,6 +949,11 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
             if checkpoint_doc.reserved_cost_usd != 0:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
+            if self.continuation is not None:
+                parent_count = self.continuation.parent_trial_count(cast(ArmName, self.arm))
+                checkpoint_evidence["reused_trials"] = parent_count
+                checkpoint_evidence["new_trials"] = max(0, checkpoint_record_count - parent_count)
+                checkpoint_evidence["rerun_trials"] = 0
         if ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
@@ -954,6 +1043,8 @@ class BenchmarkRunner:
                 "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
+        if self.recovery_selection is not None:
+            artifact["recovery_selection"] = self.recovery_selection.artifact_metadata()
         if failure is not None:
             cleanup = cleanup_errors or []
             stage = failure_stage or _exception_stage(failure, "run")
@@ -971,6 +1062,11 @@ class BenchmarkRunner:
                 "error": redact_text(reason, self.secrets),
                 "cleanup_errors": [],
             }
+        if self.continuation is not None:
+            artifact["continuation_lineage"] = self.continuation.lineage
+            runtime_provenance = self.continuation.runtime_provenance_for(cast(ArmName, self.arm))
+            if runtime_provenance is not None:
+                artifact["continuation_runtime_provenance"] = runtime_provenance
         safe_artifact = safe_json(artifact, self.secrets)
         trial_order = [key.model_dump(mode="json") for key in self._planned_keys(runtime["source_revision"]).values()]
         hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
@@ -1063,6 +1159,17 @@ class BenchmarkRunner:
                 else None
             )
             if cached is not None:
+                registered_model = self.provider_registry["models"][model_spec.model_id]
+                route_observed, route_valid = validate_routing_evidence(
+                    cached.provider_evidence,
+                    model_spec,
+                    registered_model,
+                )
+                if (cached.routing_observed, cached.routing_valid) != (route_observed, route_valid) or not route_valid:
+                    raise RuntimeContractError(
+                        f"cached smoke gate cell {cell_key} does not match its registered provider route",
+                        stage="smoke_gate",
+                    )
                 return {
                     "cell": cell_key,
                     "status": "completed",
@@ -1124,24 +1231,20 @@ class BenchmarkRunner:
                 self._resolver = resolver
                 token = await self._refresh_token(cell_fixture, task.fixture.credential_profile)
                 self._refresh_secrets(resolver)
-                remaining_wall_seconds = ledger.remaining_wall_seconds()
-                request_timeout_seconds = min(
-                    float(self.manifest.budget.request_timeout_seconds),
-                    remaining_wall_seconds,
-                )
+                request_timeout_seconds = ledger.request_timeout_seconds()
                 if self._timing is None:
                     outcome = await execute_smoke(
                         task,
                         manifest=self.manifest,
                         arm=self.arm,
                         model_spec=model_spec,
+                        registered_model=self.provider_registry["models"][model_spec.model_id],
                         model=model,
                         transport=transport,
                         fixture=cell_fixture,
                         token=token,
                         secrets=self.secrets,
                         request_timeout_seconds=request_timeout_seconds,
-                        remaining_wall_seconds=remaining_wall_seconds,
                         request_guard=request_guard,
                         input_schemas=input_schemas,
                         timing_sink=self._timing.record if self._timing is not None else None,
@@ -1153,13 +1256,13 @@ class BenchmarkRunner:
                             manifest=self.manifest,
                             arm=self.arm,
                             model_spec=model_spec,
+                            registered_model=self.provider_registry["models"][model_spec.model_id],
                             model=model,
                             transport=transport,
                             fixture=cell_fixture,
                             token=token,
                             secrets=self.secrets,
                             request_timeout_seconds=request_timeout_seconds,
-                            remaining_wall_seconds=remaining_wall_seconds,
                             request_guard=request_guard,
                             input_schemas=input_schemas,
                             timing_sink=self._timing.record if self._timing is not None else None,
@@ -1189,19 +1292,27 @@ class BenchmarkRunner:
                 await request_guard.release()
 
             assert outcome is not None
+            registered_model = self.provider_registry["models"][model_spec.model_id]
+            route_observed, route_valid = validate_routing_evidence(
+                outcome.provider_evidence,
+                model_spec,
+                registered_model,
+            )
             identity_matches = (
                 outcome.model_class == model_spec.class_name
                 and outcome.model_id == model_spec.model_id
                 and outcome.transport == transport
+                and (outcome.routing_observed, outcome.routing_valid) == (route_observed, route_valid)
+                and route_valid
                 and all(
                     item.get("model") == model_spec.model_id
                     for item in outcome.provider_evidence
                 )
             )
-            valid = identity_matches and valid_smoke_outcome(outcome)
+            valid = identity_matches and valid_smoke_outcome(outcome, task)
             if not valid and outcome.error is None:
                 if not identity_matches:
-                    outcome.error = "smoke gate outcome did not match the requested model and transport"
+                    outcome.error = "smoke gate outcome did not match the requested model, provider route, and transport"
                     outcome.failure_kind = "provider"
                 elif outcome.successful_mcp_tool_calls == 0:
                     outcome.error = "smoke gate did not observe a successful MCP tool call"
@@ -1381,12 +1492,13 @@ class BenchmarkRunner:
                                 stage="provider_registry",
                             )
                         row = matches[0]
-                        canonical_slug = row.get("canonical_slug", row.get("id"))
-                        if canonical_slug != spec.model_id:
+                        try:
+                            _validate_openrouter_model_identity(spec, row)
+                        except ValueError as exc:
                             raise RuntimeContractError(
-                                f"provider model alias drifted for {spec.class_name}",
+                                str(exc),
                                 stage="provider_registry",
-                            )
+                            ) from exc
                         author, slug = spec.model_id.split("/", 1)
                         endpoints_response = await get_json(
                             f"{base_url}/models/{author}/{slug}/endpoints"
@@ -1402,20 +1514,26 @@ class BenchmarkRunner:
                             endpoint
                             for endpoint in endpoints
                             if isinstance(endpoint, dict)
-                            and str(endpoint.get("provider_name", "")).casefold() == "parasail"
+                            and str(endpoint.get("provider_name", "")).casefold() == spec.routing.order[0].casefold()
                             and endpoint.get("quantization") == "fp8"
                         ]
                         if len(selected) != 1:
                             raise RuntimeContractError(
-                                f"pinned Parasail fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
+                                f"pinned {spec.routing.order[0]} fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
                                 stage="provider_registry",
                             )
-                        registry_models[spec.model_id] = {
+                        registered_model = {
                             "manifest_version": spec.version,
                             "model_record": row,
                             "endpoint_snapshot": endpoints_response,
                             "selected_endpoint": selected[0],
                         }
+                        if registered_route_target(spec, registered_model) is None:
+                            raise RuntimeContractError(
+                                f"provider registry endpoint identity drifted for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        registry_models[spec.model_id] = registered_model
                         endpoint_snapshots[spec.model_id] = endpoints_response
                 payload = {
                     "status": "verified",
@@ -1448,7 +1566,7 @@ class BenchmarkRunner:
                 package_versions[package] = None
         lock_path = Path(__file__).parents[1] / "uv.lock"
         lock_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
-        return {
+        seal = {
             "schema_version": 1,
             "arm": self.arm,
             "source_revision": runtime["source_revision"],
@@ -1481,16 +1599,37 @@ class BenchmarkRunner:
             "provider_registry_hash": self.provider_registry.get("snapshot_hash"),
             "provider_registry_status": self.provider_registry.get("status"),
         }
+        if self.recovery_selection is not None:
+            seal["recovery_selection"] = self.recovery_selection.artifact_metadata()
+        return seal
 
     async def _bind_pre_smoke_seal(
         self,
         runtime: dict[str, Any],
         catalogs: dict[str, CatalogSnapshot],
     ) -> None:
-        self.pre_smoke_seal_inputs = self._local_pre_smoke_seal(runtime, catalogs)
-        local_hash = hash_json(self.pre_smoke_seal_inputs)
+        local_inputs = self._local_pre_smoke_seal(runtime, catalogs)
+        local_hash = hash_json(local_inputs)
+        continued_seal_hash: str | None = None
+        if self.continuation is not None:
+            arm = cast(ArmName, self.arm)
+            self.continuation.validate_pre_smoke_inputs(
+                arm,
+                local_inputs,
+                current_descriptor_raw=self.descriptor.raw,
+                runtime=runtime,
+                secrets=self.secrets,
+            )
+            continued_seal_hash = str(self.continuation.lineage["source_pre_smoke_seal_hash"])
+            self.pre_smoke_seal_inputs = self.continuation.parent_pre_smoke_inputs(arm)
+        else:
+            self.pre_smoke_seal_inputs = local_inputs
         self.pre_smoke_seal_hash = (
-            await self.paired_coordinator.register_pre_smoke_seal(cast(ArmName, self.arm), local_hash)
+            await self.paired_coordinator.register_pre_smoke_seal(
+                cast(ArmName, self.arm),
+                local_hash,
+                continued_seal_hash=continued_seal_hash,
+            )
             if self.paired_coordinator is not None
             else hash_json({self.arm: local_hash})
         )
@@ -1525,6 +1664,7 @@ class BenchmarkRunner:
             self.manifest,
             arm=self.arm,
             model_spec=model_spec,
+            registered_model=self.provider_registry["models"][model_spec.model_id],
             model=model,
             transport=transport,
             fixture=fixture,
@@ -1642,7 +1782,9 @@ class BenchmarkRunner:
                     (
                         outcome
                         for outcome in outcomes
-                        if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
+                        if outcome.failure_kind in {"interrupted", "budget"}
+                        or outcome.unsafe_mutation
+                        or (outcome.provider_evidence and not outcome.routing_valid)
                     ),
                     None,
                 )
@@ -1736,7 +1878,7 @@ class BenchmarkRunner:
             assert initial_timing is not None
             await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
             for planned_key in planned_keys.values():
-                outcome = self._checkpoint_store.completed_outcome_for(planned_key)
+                outcome = self._checkpoint_store.reusable_outcome_for(planned_key)
                 if outcome is not None:
                     self._record_trial(f"{planned_key.model_class}:{planned_key.transport}", outcome)
                     self._checkpoint_reused_trials += 1
@@ -1747,7 +1889,7 @@ class BenchmarkRunner:
                 (f"{key.model_class}:{key.transport}", key.task_id, key.repeat_index): outcome
                 for key in planned_keys.values()
                 if self._checkpoint_store is not None
-                and (outcome := self._checkpoint_store.completed_outcome_for(key)) is not None
+                and (outcome := self._checkpoint_store.reusable_outcome_for(key)) is not None
             }
             await self.paired_coordinator.register_arm(cast(ArmName, self.arm), reused)
             await self.paired_coordinator.wait_until_registered()
@@ -1756,7 +1898,7 @@ class BenchmarkRunner:
             run_key: [
                 (task, repeat_index, key)
                 for task, repeat_index, key in trials
-                if self._checkpoint_store is None or self._checkpoint_store.completed_outcome_for(key) is None
+                if self._checkpoint_store is None or self._checkpoint_store.reusable_outcome_for(key) is None
             ]
             for run_key, trials in planned_by_run.items()
         }
@@ -1784,7 +1926,10 @@ class BenchmarkRunner:
                 await resolver.prepare(fixture, profiles)
             self._refresh_secrets(resolver)
             current_stage = "provider_registry"
-            await self._capture_provider_registry(ledger)
+            if self.continuation is not None:
+                self.provider_registry = self.continuation.parent_provider_registry()
+            else:
+                await self._capture_provider_registry(ledger)
             for transport in self.manifest.transports:
                 for profile in profiles:
                     selected_tasks = [task for task in self.tasks if transport in task.fixture.transports and task.fixture.credential_profile == profile]
@@ -1919,8 +2064,12 @@ class BenchmarkRunner:
                         await asyncio.to_thread(self._checkpoint_store.set_reserved_cost, 0.0)
                         await asyncio.to_thread(
                             self._checkpoint_store.set_run_counters,
-                            reused_trials=self._checkpoint_reused_trials,
-                            rerun_trials=self._checkpoint_rerun_trials,
+                            reused_trials=(
+                                self.continuation.parent_trial_count(cast(ArmName, self.arm))
+                                if self.continuation is not None
+                                else self._checkpoint_reused_trials
+                            ),
+                            rerun_trials=(0 if self.continuation is not None else self._checkpoint_rerun_trials),
                         )
                         await asyncio.to_thread(self._checkpoint_store.begin_closing)
             except Exception as exc:
@@ -2141,19 +2290,34 @@ def _state_observations(
         error = raw["error"]
         if not isinstance(available, bool):
             raise ValueError(f"{label}-state availability is invalid")
-        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+        if status_code is not None and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
-        expected_status = (
-            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
-        )
-        if available and status_code != expected_status:
-            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if before and not expectation.check_before and raw == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
+        if available and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
+            raise ValueError(f"{label}-state HTTP status is missing or invalid")
         if available and error is not None:
             raise ValueError(f"{label}-state observation reports an error despite being available")
         if not available and not error:
             raise ValueError(f"{label}-state observation is unavailable without an error")
+        if before and not expectation.check_before and not available:
+            raise ValueError("unchecked before-state observations must be omitted explicitly")
         observations.append(
             StateObservation(
                 available=available,
@@ -2171,6 +2335,7 @@ def _validate_trial_evidence(
     *,
     arm: str,
     model_spec: Any,
+    registered_model: dict[str, Any],
     transport: str,
     public_operations: list[PublicOperation],
     input_schemas: dict[str, dict[str, Any]],
@@ -2187,13 +2352,17 @@ def _validate_trial_evidence(
         or outcome.transport != transport
     ):
         raise ValueError("trial identity differs from its registered task, model, transport, or arm")
-    if not has_measured_evidence(outcome):
+    if not has_measured_evidence(outcome, task):
         raise ValueError("trial is missing provider, state, or raw call evidence")
     if outcome.error is not None:
         raise ValueError("trial outcome contains an execution error")
     if not all(math.isfinite(value) for value in (outcome.cost_usd, outcome.latency_seconds)):
         raise ValueError("trial usage contains a non-finite cost or latency")
-    observed_routing, valid_routing = validate_routing_evidence(outcome.provider_evidence, model_spec)
+    observed_routing, valid_routing = validate_routing_evidence(
+        outcome.provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if (outcome.routing_observed, outcome.routing_valid) != (observed_routing, valid_routing) or not valid_routing:
         raise ValueError("trial routing flags do not match its provider responses")
     input_tokens, output_tokens = provider_token_totals(outcome.provider_evidence)
@@ -2285,6 +2454,57 @@ def _validate_trial_evidence(
             raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
 
 
+def _validate_provider_registry_identity(
+    registry: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+    *,
+    arm: str,
+) -> None:
+    model_list_snapshot = registry.get("model_list_snapshot")
+    model_rows = model_list_snapshot.get("data") if isinstance(model_list_snapshot, dict) else None
+    if (
+        not isinstance(model_rows, list)
+        or registry.get("model_list_hash") != hash_json(model_list_snapshot)
+    ):
+        raise ValueError(f"{arm} provider model-list snapshot is missing or invalid")
+
+    registered_models = registry.get("models")
+    endpoint_snapshots = registry.get("endpoint_snapshots")
+    expected_aliases = {spec.model_id for spec in manifest.models}
+    if (
+        not isinstance(registered_models, dict)
+        or set(registered_models) != expected_aliases
+        or not isinstance(endpoint_snapshots, dict)
+        or set(endpoint_snapshots) != expected_aliases
+    ):
+        raise ValueError(f"{arm} provider registry does not cover the pinned model aliases")
+
+    for spec in manifest.models:
+        matches = [
+            row
+            for row in model_rows
+            if isinstance(row, dict) and row.get("id") == spec.model_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{arm} provider registry does not contain exactly one pinned alias for {spec.class_name}")
+        model_record = matches[0]
+        try:
+            _validate_openrouter_model_identity(spec, model_record)
+        except ValueError as exc:
+            raise ValueError(f"{arm} provider registry identity is invalid: {exc}") from exc
+
+        captured_model = registered_models[spec.model_id]
+        if (
+            not isinstance(captured_model, dict)
+            or captured_model.get("manifest_version") != spec.version
+            or captured_model.get("model_record") != model_record
+            or captured_model.get("endpoint_snapshot") != endpoint_snapshots.get(spec.model_id)
+        ):
+            raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
+        if registered_route_target(spec, captured_model) is None:
+            raise ValueError(f"{arm} provider registry endpoint evidence differs from the pinned {spec.routing.order[0]} fp8 route")
+
+
 def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
     key = f"{transport}:{profile}"
     raw = artifact.get("catalogs", {}).get(key)
@@ -2331,10 +2551,21 @@ def _validate_preregistered_inputs(
     inputs = artifact.get("pre_smoke_seal_inputs")
     if not isinstance(inputs, dict) or inputs.get("schema_version") != 1:
         raise ValueError(f"{arm} pre-smoke seal inputs are missing or invalid")
+    continuation_lineage = artifact.get("continuation_lineage")
+    sealed_manifest_hash = (
+        validate_artifact_lineage(artifact)
+        if continuation_lineage is not None
+        else artifact.get("run_manifest_hash")
+    )
+    recovery_selection = artifact.get("recovery_selection")
+    if recovery_selection is not None and inputs.get("recovery_selection") != recovery_selection:
+        raise ValueError(f"{arm} recovery selection differs from its pre-smoke seal")
+    if recovery_selection is None and "recovery_selection" in inputs:
+        raise ValueError(f"{arm} pre-smoke seal contains an unbound recovery selection")
     if (
         inputs.get("arm") != arm
         or inputs.get("source_revision") != artifact.get("source_revision")
-        or inputs.get("run_manifest_hash") != artifact.get("run_manifest_hash")
+        or inputs.get("run_manifest_hash") != sealed_manifest_hash
         or inputs.get("task_corpus_hash") != task_corpus_hash
         or inputs.get("oracle_hash") != oracle_hash
         or inputs.get("catalogs") != artifact.get("catalogs")
@@ -2347,15 +2578,18 @@ def _validate_preregistered_inputs(
         raise ValueError(f"{arm} provider registry snapshot is unavailable")
     registry_hash = registry.get("snapshot_hash")
     registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+    registry_models = registry.get("models")
     expected_models = {model.model_id for model in manifest.models}
     if (
         not isinstance(registry_hash, str)
         or hash_json(registry_payload) != registry_hash
-        or set(registry.get("models", {})) != expected_models
+        or not isinstance(registry_models, dict)
+        or set(registry_models) != expected_models
         or inputs.get("provider_registry_hash") != registry_hash
         or inputs.get("provider_registry_status") != registry.get("status")
     ):
         raise ValueError(f"{arm} provider registry seal does not match the captured registry")
+    _validate_provider_registry_identity(registry, manifest, arm=arm)
 
     fixture_inputs = inputs.get("fixture")
     fixture = artifact.get("fixture")
@@ -2419,10 +2653,23 @@ def _validate_shared_budget(
     budget = baseline.get("paired_budget_used")
     if not isinstance(budget, dict):
         raise ValueError("shared paired budget evidence is missing")
+    if candidate.get("paired_budget_used") != budget:
+        raise ValueError("paired artifacts do not share identical budget evidence")
+    expected_budget_fields = {
+        "model_requests",
+        "provider_setup_requests",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
+        "wall_seconds",
+        "model_work_seconds",
+        "max_total_cost_usd",
+    }
+    if set(budget) != expected_budget_fields:
+        raise ValueError("shared paired budget evidence has unexpected fields")
     exact_limits = {
-        "max_model_requests": manifest.budget.max_model_requests,
         "max_total_cost_usd": manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": manifest.budget.max_wall_seconds,
     }
     for key, expected in exact_limits.items():
         observed = budget.get(key)
@@ -2471,6 +2718,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
@@ -2505,6 +2753,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=outcome.transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
@@ -2532,7 +2781,6 @@ def _validate_shared_budget(
         or isinstance(wall, bool)
         or not math.isfinite(wall)
         or wall <= 0
-        or wall > manifest.budget.max_wall_seconds
         or not isinstance(work, (int, float))
         or isinstance(work, bool)
         or not math.isfinite(work)
@@ -2542,7 +2790,7 @@ def _validate_shared_budget(
         or setup_requests < 0
     ):
         raise ValueError("shared paired budget costs, time, or setup-request evidence is invalid")
-    if aggregate["model_requests"] > manifest.budget.max_model_requests or cost > manifest.budget.max_total_cost_usd:
+    if cost > manifest.budget.max_total_cost_usd:
         raise ValueError("shared paired usage exceeds a registered budget limit")
 
 
@@ -2732,6 +2980,12 @@ def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | N
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """Compare a sealed paired run using only the preregistered BCa gates."""
 
+    if "recovery_selection" in baseline or "recovery_selection" in candidate:
+        return _empty_comparison(
+            baseline,
+            candidate,
+            "selected recovery evidence cannot support the full benchmark adoption verdict",
+        )
     for artifact, arm in ((baseline, cast(ArmName, "baseline")), (candidate, cast(ArmName, "candidate"))):
         integrity_error = _artifact_integrity_error(artifact, arm)
         if integrity_error is not None:
@@ -3098,7 +3352,7 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         }
     if not isinstance(smoke_gate, dict):
         raise ValueError("artifact smoke gate is invalid")
-    return {
+    hash_input = {
         "schema_version": artifact["schema_version"],
         "status": artifact.get("status", "complete"),
         "arm": artifact["arm"],
@@ -3133,6 +3387,13 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "locale_metrics": artifact["locale_metrics"],
         "smoke_gate_status": smoke_gate.get("status"),
     }
+    if "continuation_lineage" in artifact:
+        hash_input["continuation_lineage"] = artifact["continuation_lineage"]
+    if "continuation_runtime_provenance" in artifact:
+        hash_input["continuation_runtime_provenance"] = artifact["continuation_runtime_provenance"]
+    if "recovery_selection" in artifact:
+        hash_input["recovery_selection"] = artifact["recovery_selection"]
+    return hash_input
 
 
 def attach_paired_execution_evidence(
@@ -3263,6 +3524,7 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "paired_order_plan",
         "paired_execution",
         "paired_budget_used",
+        "continuation_lineage",
         "provider_registry",
         "pre_smoke_seal_hash",
         "execution_environment",

@@ -1,0 +1,770 @@
+{
+  "source": "attempt03 baseline/candidate raw run state_observations_after[0]",
+  "rows": [
+    {
+      "arm": "baseline",
+      "model_class": "lightweight",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "lightweight",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "lightweight",
+      "transport": "stdio",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "lightweight",
+      "transport": "stdio",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 2,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 2,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "stdio",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "baseline",
+      "model_class": "primary",
+      "transport": "stdio",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "lightweight",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "lightweight",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "lightweight",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 2,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "lightweight",
+      "transport": "stdio",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "lightweight",
+      "transport": "stdio",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 2,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "http",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 2,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "stdio",
+      "task_id": "import-export-en",
+      "locale": "en-US",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    },
+    {
+      "arm": "candidate",
+      "model_class": "primary",
+      "transport": "stdio",
+      "task_id": "import-export-ko",
+      "locale": "ko-KR",
+      "repeat_index": 1,
+      "state_available_after": true,
+      "browse_available": true,
+      "browse_status_code": 200,
+      "items": [
+        {
+          "name": "notes",
+          "type": "collection",
+          "path": "notes",
+          "uri": "akb://catalog-bench-io/coll/notes"
+        },
+        {
+          "name": "overview",
+          "type": "collection",
+          "path": "overview",
+          "uri": "akb://catalog-bench-io/coll/overview"
+        },
+        {
+          "name": "imported",
+          "type": "document",
+          "path": "notes/imported.md",
+          "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+        },
+        {
+          "name": "catalog-bench-io Guide",
+          "type": "document",
+          "path": "overview/vault-skill.md",
+          "uri": "akb://catalog-bench-io/coll/overview/doc/vault-skill.md"
+        }
+      ]
+    }
+  ]
+}

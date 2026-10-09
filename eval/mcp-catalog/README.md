@@ -22,19 +22,26 @@ outcomes; task prompts do not name MCP tools.
   ordinary permission refusals, and a valid vault-skill acknowledgement retry
   are excluded. Harmless extra reads are recorded as overshoot. Forbidden
   mutation attempts and verified state-changing risk mutations are separate.
-- Provider routing is pinned to OpenRouter's `parasail` provider with `fp8`
-  quantization, no fallback, required parameter support, temperature 0, and an
-  8,192-token output limit. Model aliases and versions are pinned in
-  `config/run.json`. A provider model/endpoint registry snapshot is captured
-  before sealing; observed model or route drift makes the result inconclusive.
+- Provider routing is pinned per model in OpenRouter: `deepinfra` for the
+  primary model and `akashml` for the lightweight model. Both require `fp8`
+  quantization, disable fallback, and require support for tools, tool choice,
+  temperature, and max tokens. Model aliases and versions remain pinned in
+  `config/run.json`; the registered prompt/completion price ceilings are
+  `$0.06/$0.18` per million tokens for primary and `$0.225/$1.98` for
+  lightweight. A model/endpoint registry snapshot is captured before sealing.
+  Each response's selected canonical model and provider must match its unique
+  registered endpoint and usage receipt; compare recomputes that binding from
+  the sealed snapshot, and route drift makes the result inconclusive. Provider
+  slugs and fallback behavior follow OpenRouter's
+  [provider selection contract](https://openrouter.ai/docs/guides/routing/provider-selection).
 - SciPy `1.18.1` performs the registered paired, equal-weight cluster BCa
   bootstrap: 20,000 resamples, seed 358, one-sided 95% intervals. A degenerate
   or non-finite interval is inconclusive; no alternate interval is substituted.
-- The shared ledger caps the run at 3,000 provider requests, $50, and three
-  hours. Each trial is limited to 24 requests, $0.10, and 300 seconds. Provider
-  registry setup requests, smoke, failed requests, and resumed work count in
-  the shared request ledger. Arm order uses `akb-358-v1`; a completed paired
-  trial is reused on resume without retrying or selecting around outcomes.
+- The shared ledger enforces a $50 run ceiling and a $0.10 per-trial ceiling
+  with atomic worst-case reservations. Each individual provider request has a
+  300-second timeout. Request counts and elapsed time remain recorded as usage
+  evidence. Arm order uses `akb-358-v1`; a completed paired trial is reused on
+  resume without retrying or selecting around outcomes.
 
 ## Adoption gate and verdicts
 
@@ -121,6 +128,88 @@ Each arm has its own checkpoint. Resume with the same checkpoint paths and
 evidence is reused. Only complete outcomes with provider usage, cost, selected
 route, and state evidence are reused. The coordinator enforces the registered
 arm order and adds both checkpoints' prior usage to the shared ledger.
+
+AKB-361 has one source-bound continuation for the approved budget amendment.
+Its operator JSON names the immutable parent artifact and checkpoint paths and
+their SHA-256 digests, plus the authorized issue revision and content hash. The
+CLI accepts only the pinned AKB-361 source pair and derives the exact 13 missing
+identities from its 595-event prefix. It copies the 595 parent outcomes and
+four-cell smoke evidence to new child checkpoints, resumes their paired event
+sequence, and does not retry a recorded parent failure. Parent files must remain
+read-only; all three artifact outputs and both child checkpoints need distinct,
+new paths. `--resume` applies only to those child checkpoints after an
+interrupted continuation.
+
+The registered manifest remains at its $50 total cap. The continuation ledger
+restores the parent's $4.63290984 spend and applies a $46.763351 run ceiling,
+leaving $42.13044116 for new provider responses under the approved account
+budget. No request-count or wall-time ceiling is restored. The parent runtime
+seal and smoke records remain unchanged. A continuation records the fresh
+descriptor and readiness/source-version observations separately, then compares
+its semantic inputs with the parent. Only process PIDs, dependency
+container/network/volume identities, fixture namespaces, and stdio consumer-root
+paths may be reallocated; ports, source and artifact versions, catalogs,
+provider snapshot, credentials, reset contract, environment, oracle, and paired
+order must still match.
+
+The operator file is stored outside the repository and has this shape:
+
+```json
+{
+  "schema_version": 1,
+  "work_item": "AKB-361",
+  "authorization_revision": "<approved issue revision>",
+  "authorization_content_hash": "<approved issue content hash>",
+  "parents": {
+    "baseline": {
+      "artifact_path": "<parent baseline artifact>",
+      "artifact_sha256": "<pinned digest>",
+      "checkpoint_path": "<parent baseline checkpoint>",
+      "checkpoint_sha256": "<pinned digest>"
+    },
+    "candidate": {
+      "artifact_path": "<parent candidate artifact>",
+      "artifact_sha256": "<pinned digest>",
+      "checkpoint_path": "<parent candidate checkpoint>",
+      "checkpoint_sha256": "<pinned digest>"
+    }
+  }
+}
+```
+
+Pass it with `run-paired --amendment /private/run/akb-361-continuation.json`.
+Paths may be absolute or relative to the operator file.
+
+AKB-361 provider recovery is a separate, selection-bound run. Supply the
+authorized `recovery-selection.json` and a new summary path with
+`--selection` and `--recovery-summary-output`. The selection pins 65 paired
+identities (130 fresh model trials) and both immutable parent artifact hashes;
+the runner validates those inputs, the 90 source provider failures, and the
+unchanged full corpus before starting. It keeps the original repeat and arm
+order, runs the full four-cell smoke gate for each arm, and writes new arm
+artifacts and checkpoints. Parent outcomes are not copied into or merged with
+the recovery results. The canonical comparison remains inconclusive; the
+separate recovery summary reports whether all selected trials completed.
+
+The new shared ledger starts at zero and stops at `$41.89781216`, calculated
+from the `$50` registered cap less the larger `$8.10218784` prior account
+observation (the provider receipt total is `$8.04371078`). The `$0.10` per-trial
+cap and 300-second request timeout remain in force. There is no total request
+count or overall wall-time limit on this recovery run.
+
+```bash
+uv run --locked --project eval/mcp-catalog \
+  mcp-catalog-bench run-paired \
+  --baseline-descriptor /private/run/baseline-descriptor.json \
+  --candidate-descriptor /private/run/candidate-descriptor.json \
+  --baseline-output /private/run/baseline-recovery.json \
+  --candidate-output /private/run/candidate-recovery.json \
+  --comparison-output /private/run/recovery-comparison.json \
+  --baseline-checkpoint /private/run/baseline-recovery.checkpoint.json \
+  --candidate-checkpoint /private/run/candidate-recovery.checkpoint.json \
+  --selection /private/run/recovery-selection.json \
+  --recovery-summary-output /private/run/recovery-summary.json
+```
 
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.

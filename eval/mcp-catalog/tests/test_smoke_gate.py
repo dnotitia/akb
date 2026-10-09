@@ -4,6 +4,7 @@ import asyncio
 import json
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,9 +13,16 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import provider_name_for_model, provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+
+
+def _runner(manifest: Any, tasks: Any, descriptor: RuntimeDescriptor, **kwargs: Any) -> BenchmarkRunner:
+    runner = BenchmarkRunner(manifest, tasks, descriptor, **kwargs)
+    runner.provider_registry = provider_registry_snapshot(manifest)
+    return runner
 
 
 class _SmokeResolver:
@@ -49,6 +57,7 @@ def _smoke_outcome(
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_id or model_spec.model_id,
@@ -75,7 +84,14 @@ def _smoke_outcome(
             {
                 "model": model_spec.model_id,
                 "routing": {
-                    "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
+                    "requested": model_spec.model_id,
+                    "endpoints": {
+                        "available": [{
+                            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+                            "provider": provider_name_for_model(model_spec),
+                            "selected": True,
+                        }]
+                    },
                 },
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
@@ -121,7 +137,7 @@ def _parallel_descriptor() -> RuntimeDescriptor:
 async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     fixture = _SmokeFixture()
     calls: list[tuple[str, str]] = []
 
@@ -154,7 +170,11 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
         assert outcome["cost_source"] == "provider_response"
         assert outcome["provider_cost_usd"] > 0
         selected_provider = outcome["provider_evidence"][0]["routing"]["endpoints"]["available"][0]
-        assert selected_provider == {"provider": "OpenInference", "selected": True}
+        assert selected_provider == {
+            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+            "provider": provider_name_for_model(model_spec),
+            "selected": True,
+        }
 
 
 @pytest.mark.asyncio
@@ -163,7 +183,7 @@ async def test_smoke_gate_rejects_outcome_for_a_different_requested_model(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def mismatched_smoke(task, *, model_spec, transport, **_kwargs):
@@ -190,7 +210,7 @@ async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def missing_terminal_request_evidence(task, *, model_spec, transport, **_kwargs):
@@ -221,7 +241,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def incomplete_usage_smoke(task, *, model_spec, transport, **_kwargs):
@@ -244,7 +264,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def failed_smoke(task, *, model_spec, transport, **_kwargs):
@@ -284,7 +304,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
         for transport in manifest.transports
     ]
 
-    first_runner = BenchmarkRunner(
+    first_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),
@@ -387,7 +407,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     assert first_store.document.reserved_cost_usd == 0
     assert first_ledger.reserved_cost_usd == Decimal("0")
 
-    resumed_runner = BenchmarkRunner(
+    resumed_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),

@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote, unquote, urlsplit
 
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 from pydantic_evals import Case, Dataset
@@ -74,24 +76,16 @@ class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
 
 
-class ProviderRequestTimeout(TimeoutError):
-    """A single provider request exceeded its registered timeout."""
-
-
-class GlobalWallDeadlineExceeded(TimeoutError):
-    """The run's monotonic wall deadline expired while work was in flight."""
-
-
 FailureKind = Literal[
     "none",
     "provider",
     "output_limit",
-    "request_limit",
     "terminal_response",
     "tool",
     "budget",
     "request_timeout",
-    "global_deadline",
+    # Retained only to parse the hash-pinned AKB-361 source outcomes; classifiers never emit it.
+    "request_limit",
     "interrupted",
     "unknown",
 ]
@@ -103,8 +97,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
     lowered = error.casefold()
     if "provider request timeout" in lowered:
         return "request_timeout"
-    if "global wall deadline" in lowered:
-        return "global_deadline"
     if "benchmark interrupted" in lowered:
         return "interrupted"
     if any(
@@ -126,11 +118,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in ("429", "rate limit", "modelhttperror", "ratelimiterror", "provider usage/cost")
     ):
         return "provider"
-    if any(
-        marker in lowered
-        for marker in ("request_limit", "request limit", "maximum number of requests", "too many requests per trial")
-    ):
-        return "request_limit"
     if any(marker in lowered for marker in ("terminal response", "final response", "no final", "empty response")):
         return "terminal_response"
     if any(marker in lowered for marker in ("unknown tool", "toolfailed", "tool error", "modelretry", "mcp tool")):
@@ -140,8 +127,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in (
             "max_cost",
             "cost_limit",
-            "max_model_requests",
-            "max_wall",
             "benchmark incomplete",
         )
     ):
@@ -753,14 +738,28 @@ def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> l
     return matched
 
 
-def has_measured_evidence(outcome: TrialOutcome) -> bool:
+def has_measured_evidence(outcome: TrialOutcome, task: TaskManifest) -> bool:
     """Return whether a trial has real provider and lifecycle evidence to keep."""
 
-    if "tool_calls" not in outcome.model_fields_set:
+    if (
+        outcome.task_id != task.id
+        or outcome.locale != task.locale
+        or "tool_calls" not in outcome.model_fields_set
+    ):
         return False
     if not _has_provider_usage_evidence(outcome):
         return False
-    before_payload, before_valid = _measured_state_payload(outcome.state_observations_before)
+    observation_sets = task.expected_final_state.observation_sets
+    if (
+        len(outcome.state_observations_before) != len(observation_sets)
+        or len(outcome.state_observations_after) != len(observation_sets)
+    ):
+        return False
+    before_required = [item.check_before for item in observation_sets]
+    before_payload, before_valid = _measured_state_payload(
+        outcome.state_observations_before,
+        optional={index for index, required in enumerate(before_required) if not required},
+    )
     after_payload, after_valid = _measured_state_payload(outcome.state_observations_after)
     if (
         not before_valid
@@ -794,19 +793,32 @@ def has_measured_evidence(outcome: TrialOutcome) -> bool:
         return True
     if outcome.expected_error_match:
         return True
-    if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
+    if outcome.failure_kind not in {"output_limit", "terminal_response", "tool"}:
         return False
     return True
 
 
-def _measured_state_payload(records: list[dict[str, Any]]) -> tuple[Any, bool]:
+def _measured_state_payload(
+    records: list[dict[str, Any]],
+    *,
+    optional: set[int] | None = None,
+) -> tuple[Any, bool]:
     if not records:
         return None, False
+    optional = optional or set()
     observations: list[StateObservation] = []
-    for record in records:
+    for index, record in enumerate(records):
         if not isinstance(record, dict) or set(record) != {"available", "status_code", "payload", "error"}:
             return None, False
         status_code = record["status_code"]
+        if index in optional and record == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
         if (
             record["available"] is not True
             or not isinstance(status_code, int)
@@ -1400,7 +1412,9 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             # one final cleanup reset after the dataset, so teardown never
             # performs a duplicate reset between adjacent cases.
             if self.checkpoint_sink is not None and self.output is not None:
-                status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
+                status: Literal["completed", "failed"] = (
+                    "completed" if has_measured_evidence(self.output, self.case.inputs) else "failed"
+                )
                 await self.checkpoint_sink(self.output, status)
         finally:
             if self.context is not None and self.context.context_token is not None:
@@ -1442,6 +1456,22 @@ class BudgetLedger:
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _restored_wall_offset: float = field(default=0.0, repr=False)
+    total_cost_limit_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        registered_limit = Decimal(str(self.manifest.budget.max_total_cost_usd))
+        if self.total_cost_limit_usd is None:
+            self.total_cost_limit_usd = registered_limit
+            return
+        self.total_cost_limit_usd = Decimal(str(self.total_cost_limit_usd))
+        if not self.total_cost_limit_usd.is_finite() or self.total_cost_limit_usd <= 0:
+            raise ValueError("total cost limit must be a positive finite amount")
+        if self.total_cost_limit_usd > registered_limit:
+            raise ValueError("total cost limit cannot exceed the registered manifest cap")
+
+    def _cost_limit(self) -> Decimal:
+        assert self.total_cost_limit_usd is not None
+        return self.total_cost_limit_usd
 
     @property
     def reserved_cost_usd(self) -> Decimal:
@@ -1468,12 +1498,7 @@ class BudgetLedger:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if self._open_reservations:
             raise BudgetExceeded("cannot restore budget accounting while reservations are open")
-        budget = self.manifest.budget
-        if (
-            model_requests > budget.max_model_requests
-            or restored_cost > Decimal(str(budget.max_total_cost_usd))
-            or wall_seconds > budget.max_wall_seconds
-        ):
+        if restored_cost > self._cost_limit():
             raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
         self.requests = model_requests
         self.provider_setup_requests = provider_setup_requests
@@ -1507,17 +1532,11 @@ class BudgetLedger:
         async with self._lock:
             if self._open_reservations:
                 raise BudgetExceeded("cannot restore paired budget while reservations are open")
-            next_requests = self.requests + model_requests
             next_cost = self.cost_usd + restored_cost
             next_wall = max(self.wall_seconds, wall_seconds)
-            budget = self.manifest.budget
-            if (
-                next_requests > budget.max_model_requests
-                or next_cost > Decimal(str(budget.max_total_cost_usd))
-                or next_wall > budget.max_wall_seconds
-            ):
+            if next_cost > self._cost_limit():
                 raise BudgetExceeded("paired checkpoint totals already exceed the registered run limits")
-            self.requests = next_requests
+            self.requests += model_requests
             self.provider_setup_requests += provider_setup_requests
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -1529,12 +1548,9 @@ class BudgetLedger:
             self._assert_reservation_invariant()
 
     async def record_provider_setup_request(self) -> None:
-        """Count a non-completion provider lookup against the paired request cap."""
+        """Record a non-completion provider lookup for artifact reporting."""
 
         async with self._lock:
-            if self.requests >= self.manifest.budget.max_model_requests:
-                self._budget_failure = "max_model_requests exceeded"
-                raise BudgetExceeded("max_model_requests exceeded")
             self.requests += 1
             self.provider_setup_requests += 1
 
@@ -1552,14 +1568,8 @@ class BudgetLedger:
         self.wall_seconds = self.current_wall_seconds()
         return self.wall_seconds
 
-    def remaining_wall_seconds(self) -> float:
-        return max(0.0, self.manifest.budget.max_wall_seconds - self.current_wall_seconds())
-
     def request_timeout_seconds(self) -> float:
-        remaining = self.remaining_wall_seconds()
-        if remaining <= 0:
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-        return min(float(self.manifest.budget.request_timeout_seconds), remaining)
+        return float(self.manifest.budget.request_timeout_seconds)
 
     def _assert_reservation_invariant(self) -> None:
         if any(
@@ -1594,14 +1604,9 @@ class BudgetLedger:
         if not reservation.is_finite() or reservation < 0:
             raise BudgetExceeded("preregistered worst-case trial cost cannot be negative")
         async with self._lock:
-            budget = self.manifest.budget
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"{self._budget_failure}; no further provider requests are allowed")
-            if self.requests >= budget.max_model_requests:
-                raise BudgetExceeded("max_model_requests exceeded")
-            if self.current_wall_seconds() >= budget.max_wall_seconds:
-                raise BudgetExceeded("max_wall_seconds exceeded")
-            if self.cost_usd + self.reserved_cost_usd + reservation > Decimal(str(budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd + reservation > self._cost_limit():
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
             guard = ProviderRequestGuard(self, reservation)
             self._open_reservations.add(guard)
@@ -1621,16 +1626,11 @@ class BudgetLedger:
                 raise BudgetExceeded("provider request reservation is not open")
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
-            if guard.requests >= self.manifest.budget.max_requests_per_trial:
-                raise BudgetExceeded("benchmark incomplete: max_requests_per_trial exceeded")
             if (
                 guard.reserved_cost_usd <= 0
                 or guard.provider_cost_usd >= Decimal(str(self.manifest.budget.max_cost_per_trial_usd))
             ):
                 raise BudgetExceeded("benchmark incomplete: max_cost_per_trial_usd exceeded")
-            if self.requests >= self.manifest.budget.max_model_requests:
-                self._budget_failure = "max_model_requests exceeded"
-                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
             request_id = guard._next_request_id
             guard._next_request_id += 1
             guard._pending_requests.add(request_id)
@@ -1666,7 +1666,7 @@ class BudgetLedger:
 
             global_failure: str | None = None
             trial_failure: str | None = None
-            if self.cost_usd + self.reserved_cost_usd > Decimal(str(self.manifest.budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd > self._cost_limit():
                 self._budget_failure = "max_total_cost_usd exceeded"
                 global_failure = self._budget_failure
             if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
@@ -1693,7 +1693,6 @@ class BudgetLedger:
             if guard.requests > self.requests:
                 raise BudgetExceeded("provider request accounting is inconsistent")
 
-            trial_requests = max(outcome.model_requests, guard.requests)
             next_requests = self.requests + max(0, outcome.model_requests - guard.requests)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
@@ -1713,17 +1712,13 @@ class BudgetLedger:
             budget = self.manifest.budget
             trial_failure: str | None = None
             global_failure: str | None = None
-            if trial_requests > budget.max_requests_per_trial:
-                trial_failure = "max_requests_per_trial exceeded"
-            elif guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
+            if guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
                 trial_failure = "max_cost_per_trial_usd exceeded"
-            elif next_requests > budget.max_model_requests:
-                global_failure = "max_model_requests exceeded"
             remaining_reserved = sum(
                 (owner.reserved_cost_usd for owner in self._open_reservations if owner is not guard),
                 Decimal("0"),
             )
-            if next_cost + remaining_reserved > Decimal(str(budget.max_total_cost_usd)):
+            if next_cost + remaining_reserved > self._cost_limit():
                 global_failure = "max_total_cost_usd exceeded"
 
             self.requests = next_requests
@@ -1779,7 +1774,7 @@ class ProviderRequestGuard:
         return await self.ledger.release_reservation(self)
 
 
-async def run_agent_with_deadline(
+async def run_agent_with_timeout(
     agent: Any,
     prompt: str,
     *,
@@ -1787,36 +1782,22 @@ async def run_agent_with_deadline(
     model_settings: Any,
     usage_limits: Any,
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
 ) -> Any:
-    """Run one agent turn under both request and global monotonic deadlines."""
-    if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
-        raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-    effective_timeout = min(request_timeout_seconds, remaining_wall_seconds)
+    """Set the provider's per-request timeout and run the full agent turn."""
+    if request_timeout_seconds <= 0:
+        raise ValueError("provider request timeout must be positive")
     settings = dict(model_settings or {})
-    settings["timeout"] = effective_timeout
+    settings["timeout"] = request_timeout_seconds
     guard_token = PROVIDER_REQUEST_GUARD.set(request_guard)
-    global_deadline = asyncio.timeout(remaining_wall_seconds)
     try:
-        async with global_deadline:
-            try:
-                async with asyncio.timeout(effective_timeout):
-                    return await agent.run(
-                        prompt,
-                        toolsets=toolsets,
-                        model_settings=cast(Any, settings),
-                        usage_limits=usage_limits,
-                        infer_name=False,
-                    )
-            except TimeoutError as exc:
-                if global_deadline.expired():
-                    raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-                raise ProviderRequestTimeout("provider request timeout") from exc
-    except TimeoutError as exc:
-        if global_deadline.expired():
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-        raise
+        return await agent.run(
+            prompt,
+            toolsets=toolsets,
+            model_settings=cast(Any, settings),
+            usage_limits=usage_limits,
+            infer_name=False,
+        )
     finally:
         PROVIDER_REQUEST_GUARD.reset(guard_token)
 
@@ -1828,6 +1809,7 @@ class TrialExecutor:
         *,
         arm: str,
         model_spec: ModelSpec,
+        registered_model: dict[str, Any],
         model: OpenAIChatModel,
         transport: str,
         fixture: RuntimeFixture,
@@ -1841,6 +1823,7 @@ class TrialExecutor:
         self.manifest = manifest
         self.arm = arm
         self.model_spec = model_spec
+        self.registered_model = registered_model
         self.model = model
         self.transport = transport
         self.fixture = fixture
@@ -1936,23 +1919,18 @@ class TrialExecutor:
                     if input_schemas is None:
                         recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
-                    result = await run_agent_with_deadline(
+                    result = await run_agent_with_timeout(
                         agent,
                         render_task_prompt(task, context.local_file_paths),
                         toolsets=cast(Any, [toolset]),
                         model_settings=self.model.settings,
                         usage_limits=UsageLimits(
-                            request_limit=self.manifest.budget.max_requests_per_trial,
+                            request_limit=None,
                             cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
                         ),
                         request_timeout_seconds=self.ledger.request_timeout_seconds(),
-                        remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
                         request_guard=request_guard,
                     )
-            except ProviderRequestTimeout:
-                error = "benchmark incomplete: provider request timeout"
-            except GlobalWallDeadlineExceeded:
-                error = "benchmark incomplete: global wall deadline exceeded"
             except asyncio.CancelledError:
                 error = "benchmark incomplete: benchmark interrupted"
             except Exception as exc:
@@ -1968,6 +1946,7 @@ class TrialExecutor:
                 task=task,
                 arm=self.arm,
                 model_spec=self.model_spec,
+                registered_model=self.registered_model,
                 transport=self.transport,
                 result=result,
                 recorder=recorder,
@@ -1983,7 +1962,7 @@ class TrialExecutor:
             self._tag_paired_turn(outcome)
             if self.timing_sink is not None and (
                 is_provider_wait_failure(outcome.error)
-                or outcome.failure_kind in {"request_timeout", "global_deadline"}
+                or outcome.failure_kind == "request_timeout"
             ):
                 self.timing_sink("provider_wait", started, started + latency)
             try:
@@ -2012,13 +1991,13 @@ async def execute_smoke(
     manifest: BenchmarkRunManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     model: OpenAIChatModel,
     transport: str,
     fixture: RuntimeFixture,
     token: str,
     secrets: tuple[str, ...],
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
     input_schemas: dict[str, dict[str, Any]] | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
@@ -2073,23 +2052,18 @@ async def execute_smoke(
             if input_schemas is None:
                 recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
-            result = await run_agent_with_deadline(
+            result = await run_agent_with_timeout(
                 agent,
                 f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
                 model_settings=model.settings,
                 usage_limits=UsageLimits(
-                    request_limit=manifest.budget.max_requests_per_trial,
+                    request_limit=None,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
                 request_timeout_seconds=request_timeout_seconds,
-                remaining_wall_seconds=remaining_wall_seconds,
                 request_guard=request_guard,
             )
-    except ProviderRequestTimeout:
-        error = "benchmark incomplete: provider request timeout"
-    except GlobalWallDeadlineExceeded:
-        error = "benchmark incomplete: global wall deadline exceeded"
     except asyncio.CancelledError:
         error = "benchmark incomplete: benchmark interrupted"
     except Exception as exc:
@@ -2104,6 +2078,7 @@ async def execute_smoke(
         task=task,
         arm=arm,
         model_spec=model_spec,
+        registered_model=registered_model,
         transport=transport,
         result=result,
         recorder=recorder,
@@ -2137,7 +2112,7 @@ async def execute_smoke(
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)
-        or outcome.failure_kind in {"request_timeout", "global_deadline"}
+        or outcome.failure_kind == "request_timeout"
     ):
         timing_sink("provider_wait", started, started + (time.perf_counter() - started))
     return outcome
@@ -2177,12 +2152,20 @@ def build_model(spec: ModelSpec) -> OpenRouterChatModel:
         input_price=spec.input_cost_per_million_usd,
         output_price=spec.output_cost_per_million_usd,
     )
-    settings = dict(spec.settings)
-    settings["extra_body"] = request_body
-    settings["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
+    settings = cast(
+        OpenRouterModelSettings,
+        {
+            **spec.settings,
+            "extra_body": request_body,
+            "extra_headers": {"X-OpenRouter-Metadata": "enabled"},
+        },
+    )
     return OpenRouterChatModel(
         spec.model_id,
-        provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+        provider=OpenAIProvider(
+            # The ledger admits one wire request per model call; SDK retries would bypass that accounting.
+            openai_client=AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        ),
         profile=cast(
             Any,
             {
@@ -2199,6 +2182,7 @@ def outcome_from_run(
     task: TaskManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     transport: str,
     result: Any,
     recorder: ToolCallRecorder,
@@ -2241,7 +2225,11 @@ def outcome_from_run(
     provider_cost = provider_response_cost(provider_evidence)
     cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
     cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
-    routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
+    routing_observed, routing_valid = validate_routing_evidence(
+        provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if error is None and not routing_observed:
         error = "OpenRouter routing evidence was not returned"
     elif error is None and not routing_valid:
@@ -2385,15 +2373,81 @@ def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
     return sum(costs) if costs else None
 
 
-def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelSpec) -> tuple[bool, bool]:
+def registered_route_target(
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return the canonical model and provider pinned by one registry snapshot."""
+
+    provider_slug = model_spec.routing.order[0]
+    expected_routing = {
+        "order": [provider_slug],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+        "quantizations": ["fp8"],
+    }
+    if model_spec.routing.model_dump(mode="json") != expected_routing:
+        return None
+    model_record = registered_model.get("model_record")
+    endpoint_snapshot = registered_model.get("endpoint_snapshot")
+    data = endpoint_snapshot.get("data") if isinstance(endpoint_snapshot, dict) else None
+    endpoints = data.get("endpoints") if isinstance(data, dict) else None
+    selected_endpoint = registered_model.get("selected_endpoint")
+    if (
+        not isinstance(model_record, dict)
+        or model_record.get("id") != model_spec.model_id
+        or not isinstance(model_record.get("canonical_slug"), str)
+        or not isinstance(endpoints, list)
+        or not isinstance(selected_endpoint, dict)
+    ):
+        return None
+
+    candidates = [
+        endpoint
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+        and isinstance(endpoint.get("provider_name"), str)
+        and endpoint["provider_name"].casefold() == provider_slug.casefold()
+        and endpoint.get("quantization") == "fp8"
+    ]
+    canonical_slug = model_record["canonical_slug"]
+    selected_provider = selected_endpoint.get("provider_name")
+    supported_parameters = selected_endpoint.get("supported_parameters")
+    required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
+    if (
+        len(candidates) != 1
+        or selected_endpoint != candidates[0]
+        or selected_endpoint.get("model_id") != model_spec.model_id
+        or not isinstance(selected_provider, str)
+        or selected_provider.casefold() != provider_slug.casefold()
+        or selected_endpoint.get("tag") != f"{provider_slug}/fp8"
+        or selected_endpoint.get("quantization") != "fp8"
+        or selected_endpoint.get("name") != f"{selected_provider} | {canonical_slug}"
+        or not isinstance(supported_parameters, list)
+        or not all(isinstance(parameter, str) for parameter in supported_parameters)
+        or not required_parameters.issubset(set(supported_parameters))
+    ):
+        return None
+    return canonical_slug, selected_provider
+
+
+def validate_routing_evidence(
+    evidence: list[dict[str, Any]],
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[bool, bool]:
     if not evidence:
         return False, False
+    route_target = registered_route_target(model_spec, registered_model)
+    if route_target is None:
+        return False, False
+    canonical_model, provider_name = route_target
     observed = False
     for item in evidence:
         if item.get("model") != model_spec.model_id:
             return observed, False
         routing = item.get("routing")
-        if not isinstance(routing, dict):
+        if not isinstance(routing, dict) or routing.get("requested") != model_spec.model_id:
             return observed, False
         endpoints = routing.get("endpoints")
         available = endpoints.get("available") if isinstance(endpoints, dict) else None
@@ -2404,9 +2458,8 @@ def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelS
         ] if isinstance(available, list) else []
         if (
             len(selected) != 1
-            or not isinstance(selected[0].get("provider"), str)
-            or selected[0]["provider"].casefold() != "parasail"
-            or selected[0].get("quantization") != "fp8"
+            or selected[0].get("model") != canonical_model
+            or selected[0].get("provider") != provider_name
         ):
             return observed, False
         observed = True
