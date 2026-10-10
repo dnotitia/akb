@@ -266,6 +266,10 @@ function findUnescaped(value: string, character: string, start: number): number 
   return -1
 }
 
+function decodeBracedReferenceId(value: string): string {
+  return value.replace(/\\([\\}])/gu, '$1')
+}
+
 function parseReferenceAt(
   value: string,
   start: number,
@@ -281,7 +285,7 @@ function parseReferenceAt(
     if (value[start + 1] === '{') {
       const close = findUnescaped(value, '}', start + 2)
       if (close === -1) return null
-      const id = value.slice(start + 2, close)
+      const id = decodeBracedReferenceId(value.slice(start + 2, close))
       if (!id || /[\r\n]/u.test(id)) return null
       return {
         kind: 'person',

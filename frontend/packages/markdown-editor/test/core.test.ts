@@ -286,6 +286,38 @@ describe('Markdown conformance core', () => {
     expect(linkLabel?.marks?.some(mark => mark.type === 'markdownReference')).toBe(false)
   })
 
+  it('preserves escaped braced person identity and canonical spelling in both profiles', () => {
+    const personToken = (id: string) =>
+      '@{' + id.replace(/[\\}]/gu, character => '\\' + character) + '}'
+    const reportedUsername = String.raw`team@ops\blue}`
+    const reportedToken = String.raw`@{team@ops\\blue\}}`
+    const people = [
+      { id: 'team\\ops', value: personToken('team\\ops') },
+      { id: 'brace}name', value: personToken('brace}name') },
+      { id: 'team\\ops}name', value: personToken('team\\ops}name') },
+      { id: '한글42', value: '@{한글42}' },
+      { id: 'Alice Smith', value: '@{Alice Smith}' },
+      { id: 'alice', value: '@alice' },
+      { id: reportedUsername, value: reportedToken },
+    ]
+
+    for (const profile of ['preserve', 'structured'] as const) {
+      for (const person of people) {
+        const body = `before ${person.value} after`
+        const expected = { kind: 'person', id: person.id, value: person.value }
+        expect(parseMarkdownReferenceToken(person.value)).toEqual(expected)
+        expect(extractMarkdownReferences(body)).toContainEqual(expected)
+
+        let roundTrip = body
+        for (let index = 0; index < 3; index += 1) {
+          roundTrip = serializeMarkdown(parseMarkdown(roundTrip, { profile }), { profile })
+          expect(roundTrip).toBe(body)
+        }
+        expect(canonicalizeMarkdown(body, { profile })).toBe(body)
+      }
+    }
+  })
+
   it('keeps reference runtime resolution outside canonical Markdown', async () => {
     const references = extractMarkdownReferences('@alice REEF-123')
     const adapter = {

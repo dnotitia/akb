@@ -89,7 +89,50 @@ export function serializeMarkdown(
   document: MarkdownDocument,
   options: MarkdownParseOptions = {},
 ): string {
-  return managerFor(options).serialize(document as JSONContent)
+  const replacements = new Map<string, string>()
+  const source = JSON.stringify(document)
+  let markerIndex = 0
+
+  const visit = (node: MarkdownNode, excluded = false): MarkdownNode => {
+    const excludedNode =
+      excluded ||
+      node.type === 'codeBlock' ||
+      node.type === 'rawMarkdownBlock' ||
+      node.marks?.some(mark => mark.type === 'link' || mark.type === 'code') === true
+
+    if (
+      !excludedNode &&
+      node.type === 'text' &&
+      typeof node.text === 'string' &&
+      node.marks?.some(mark => mark.type === 'markdownReference')
+    ) {
+      const reference = parseMarkdownReferenceToken(node.text)
+      if (reference) {
+        let marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
+        while (source.includes(marker) || replacements.has(marker)) {
+          marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
+        }
+        replacements.set(marker, reference.value)
+        return { ...node, text: marker }
+      }
+    }
+
+    if (!node.content) return node
+    const content = node.content.map(child => visit(child, excludedNode))
+    return content.every((child, index) => child === node.content?.[index])
+      ? node
+      : { ...node, content }
+  }
+
+  const serializable = document.content
+    ? { ...document, content: document.content.map(node => visit(node)) }
+    : document
+  let markdown = managerFor(options).serialize(serializable as JSONContent)
+  for (const [marker, value] of replacements) {
+    // Use a callback so dollar sequences in usernames are copied literally.
+    markdown = markdown.replace(marker, () => value)
+  }
+  return markdown
 }
 
 /**

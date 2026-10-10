@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.1
+
+- Decode escaped braced person identities for exact resolver lookup and preserve
+  authored canonical reference tokens through repeated parse/serialize cycles.
+- Serialize current token text after edits so stale reference attributes do not
+  replace user input or undo/redo history.
+
 ## 0.17.0
 
 - Expose revision- and session-checked Source range updates with stale-target,
