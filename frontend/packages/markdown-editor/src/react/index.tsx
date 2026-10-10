@@ -102,6 +102,7 @@ import { markdownTableState } from '../table.js'
 import {
   createMarkdownEditorHandle,
   getMarkdownEditor,
+  getMarkdownEditorProfile,
 } from './editor-handle.js'
 import {
   getMarkdownSourceSession,
@@ -301,12 +302,12 @@ export function useMarkdownEditor({
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
-        createMarkdownEditorHandle(editor),
+        createMarkdownEditorHandle(editor, profile),
       ),
   })
 
   if (!editor) return null
-  const handle = createMarkdownEditorHandle(editor)
+  const handle = createMarkdownEditorHandle(editor, profile)
   if (!getMarkdownSourceSession(handle)) {
     getOrCreateMarkdownSourceSession(handle, serializeEditorMarkdown(editor, { profile }))
   }
@@ -376,17 +377,26 @@ export function useMarkdownCommands(handle: MarkdownEditorHandle | null): Markdo
   )
 }
 
-const stateMarkdown = new WeakMap<Editor['state']['doc'], string>()
+const stateMarkdown = new WeakMap<
+  Editor['state']['doc'],
+  Map<MarkdownProfile, string>
+>()
 
 function readState(
   editor: Editor,
   sourceSession: ReturnType<typeof getMarkdownSourceSession>,
+  profile: MarkdownProfile,
 ): MarkdownState {
   const doc = editor.state.doc
-  let editorMarkdown = stateMarkdown.get(doc)
+  let profiles = stateMarkdown.get(doc)
+  let editorMarkdown = profiles?.get(profile)
   if (editorMarkdown === undefined) {
-    editorMarkdown = editor.getMarkdown()
-    stateMarkdown.set(doc, editorMarkdown)
+    editorMarkdown = serializeEditorMarkdown(editor, { profile })
+    if (!profiles) {
+      profiles = new Map()
+      stateMarkdown.set(doc, profiles)
+    }
+    profiles.set(profile, editorMarkdown)
   }
   const sourceSnapshot = sourceSession?.getSnapshot()
   const source = sourceSnapshot ? {
@@ -443,8 +453,9 @@ function readState(
 export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownState | null {
   const editor = getMarkdownEditor(handle)
   const sourceSession = getMarkdownSourceSession(handle)
+  const profile = getMarkdownEditorProfile(handle)
   const [state, setState] = useState<MarkdownState | null>(() => (
-    editor ? readState(editor, sourceSession) : null
+    editor ? readState(editor, sourceSession, profile) : null
   ))
 
   useEffect(() => {
@@ -452,7 +463,7 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
       return
     }
 
-    const update = () => setState(readState(editor, sourceSession))
+    const update = () => setState(readState(editor, sourceSession, profile))
     update()
     editor.on('transaction', update)
     const unsubscribeSource = sourceSession?.subscribe(update)
@@ -461,7 +472,7 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
       editor.off('transaction', update)
       unsubscribeSource?.()
     }
-  }, [editor, sourceSession])
+  }, [editor, profile, sourceSession])
 
   return editor ? state : null
 }

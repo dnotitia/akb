@@ -271,6 +271,7 @@ describe('React surfaces', () => {
         editable,
       })
       const commands = useMarkdownCommands(handle)
+      const state = useMarkdownState(handle)
       const resolutions = useMarkdownReferenceResolutions(currentMarkdown, adapter)
       useEffect(() => {
         activeHandle = handle
@@ -280,6 +281,7 @@ describe('React surfaces', () => {
       return (
         <>
           <output data-testid="reference-body">{currentMarkdown}</output>
+          <output data-testid="markdown-state">{state?.markdown}</output>
           <MarkdownSurface
             editor={handle}
             editable={editable}
@@ -301,6 +303,7 @@ describe('React surfaces', () => {
       expect(resolvedIds).not.toContain('link')
       expect(resolvedIds).not.toContain('inline')
       expect(resolvedIds).not.toContain('escaped')
+      expect(screen.getByTestId('markdown-state').textContent).toBe(markdown)
     })
 
     const editorSurface = container.querySelector<HTMLElement>('.ProseMirror[contenteditable="true"]')!
@@ -323,6 +326,7 @@ describe('React surfaces', () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId('reference-body')).toHaveTextContent(editedToken)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(editedMarkdown)
       expect(onChange.mock.lastCall?.[0]).toBe(editedMarkdown)
       expect(resolvedIds).toContain(editedUsername)
     })
@@ -332,11 +336,13 @@ describe('React surfaces', () => {
     await act(async () => { activeCommands?.undo() })
     await waitFor(() => {
       expect(screen.getByTestId('reference-body')).toHaveTextContent(token)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(markdown)
       expect(onChange.mock.lastCall?.[0]).toBe(markdown)
     })
     await act(async () => { activeCommands?.redo() })
     await waitFor(() => {
       expect(screen.getByTestId('reference-body')).toHaveTextContent(editedToken)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(editedMarkdown)
       expect(onChange.mock.lastCall?.[0]).toBe(editedMarkdown)
     })
 

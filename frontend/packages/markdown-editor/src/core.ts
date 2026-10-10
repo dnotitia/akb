@@ -90,7 +90,7 @@ export function serializeMarkdown(
   options: MarkdownParseOptions = {},
 ): string {
   const replacements = new Map<string, string>()
-  const source = JSON.stringify(document)
+  let source: string | undefined
   let markerIndex = 0
 
   const visit = (node: MarkdownNode, excluded = false): MarkdownNode => {
@@ -108,8 +108,9 @@ export function serializeMarkdown(
     ) {
       const reference = parseMarkdownReferenceToken(node.text)
       if (reference) {
+        source ??= JSON.stringify(document)
         let marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
-        while (source.includes(marker) || replacements.has(marker)) {
+        while (source?.includes(marker) || replacements.has(marker)) {
           marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
         }
         replacements.set(marker, reference.value)
@@ -304,7 +305,7 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
-        createMarkdownEditorHandle(editor),
+        createMarkdownEditorHandle(editor, profile),
       ),
   })
 }
@@ -416,8 +417,4 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
     redo: () => editor.commands.redo(),
     focus: position => editor.commands.focus(position),
   }
-}
-
-export function editorMarkdown(editor: Editor): string {
-  return editor.getMarkdown()
 }

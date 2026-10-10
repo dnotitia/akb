@@ -4,8 +4,8 @@
 
 - Decode escaped braced person identities for exact resolver lookup and preserve
   authored canonical reference tokens through repeated parse/serialize cycles.
-- Serialize current token text after edits so stale reference attributes do not
-  replace user input or undo/redo history.
+- Serialize current token text in callbacks and React state so stale reference
+  attributes do not replace user input or undo/redo history.
 
 ## 0.17.0
 

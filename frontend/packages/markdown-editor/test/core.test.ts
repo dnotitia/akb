@@ -14,7 +14,7 @@ import {
   uploadMarkdownBatch,
 } from '../src/index.js'
 import { createMarkdownEditor, markdownCommands, serializeEditorMarkdown } from '../src/core.js'
-import type { MarkdownAdapters } from '../src/index.js'
+import type { MarkdownAdapters, MarkdownDocument } from '../src/index.js'
 
 const fixture = `# 공통 문법
 
@@ -295,6 +295,8 @@ describe('Markdown conformance core', () => {
       { id: 'team\\ops', value: personToken('team\\ops') },
       { id: 'brace}name', value: personToken('brace}name') },
       { id: 'team\\ops}name', value: personToken('team\\ops}name') },
+      { id: 'cash$&x', value: personToken('cash$&x') },
+      { id: "cash$'x", value: personToken("cash$'x") },
       { id: '한글42', value: '@{한글42}' },
       { id: 'Alice Smith', value: '@{Alice Smith}' },
       { id: 'alice', value: '@alice' },
@@ -316,6 +318,24 @@ describe('Markdown conformance core', () => {
         expect(canonicalizeMarkdown(body, { profile })).toBe(body)
       }
     }
+  })
+
+  it('restores dollar replacement patterns literally in marked reference values', () => {
+    const token = "@{cash$&$'$$}"
+    const document: MarkdownDocument = {
+      type: 'doc',
+      content: [{
+        type: 'paragraph',
+        content: [{
+          type: 'text',
+          text: token,
+          marks: [{ type: 'markdownReference' }],
+        }],
+      }],
+    }
+
+    expect(parseMarkdownReferenceToken(token)?.id).toBe("cash$&$'$$")
+    expect(serializeMarkdown(document)).toBe(token)
   })
 
   it('keeps reference runtime resolution outside canonical Markdown', async () => {
