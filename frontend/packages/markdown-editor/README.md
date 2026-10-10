@@ -237,6 +237,9 @@ URL is keyboard-focusable as a link but does not navigate; viewers use the
 runtime URL. The editor's embedded keyboard order also includes regular links,
 task checkboxes, and scrollable code blocks. A product can put the resolver on
 `MarkdownAdapters.reference` when composing the lower-level `/react` surface.
+Braced person usernames escape literal backslashes and closing braces as `\\`
+and `\}`. `MarkdownReferenceToken.id` is the decoded, exact-case username for
+roster lookup, while `value` remains the authored canonical Markdown token.
 AKB keeps its existing document/file search adapter and does not enable person
 mentions or issue suggestions.
 

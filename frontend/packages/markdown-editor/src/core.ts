@@ -89,7 +89,51 @@ export function serializeMarkdown(
   document: MarkdownDocument,
   options: MarkdownParseOptions = {},
 ): string {
-  return managerFor(options).serialize(document as JSONContent)
+  const replacements = new Map<string, string>()
+  let source: string | undefined
+  let markerIndex = 0
+
+  const visit = (node: MarkdownNode, excluded = false): MarkdownNode => {
+    const excludedNode =
+      excluded ||
+      node.type === 'codeBlock' ||
+      node.type === 'rawMarkdownBlock' ||
+      node.marks?.some(mark => mark.type === 'link' || mark.type === 'code') === true
+
+    if (
+      !excludedNode &&
+      node.type === 'text' &&
+      typeof node.text === 'string' &&
+      node.marks?.some(mark => mark.type === 'markdownReference')
+    ) {
+      const reference = parseMarkdownReferenceToken(node.text)
+      if (reference) {
+        source ??= JSON.stringify(document)
+        let marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
+        while (source?.includes(marker) || replacements.has(marker)) {
+          marker = `AKBMARKDOWNREFERENCE${markerIndex++}TOKEN`
+        }
+        replacements.set(marker, reference.value)
+        return { ...node, text: marker }
+      }
+    }
+
+    if (!node.content) return node
+    const content = node.content.map(child => visit(child, excludedNode))
+    return content.every((child, index) => child === node.content?.[index])
+      ? node
+      : { ...node, content }
+  }
+
+  const serializable = document.content
+    ? { ...document, content: document.content.map(node => visit(node)) }
+    : document
+  let markdown = managerFor(options).serialize(serializable as JSONContent)
+  for (const [marker, value] of replacements) {
+    // Use a callback so dollar sequences in usernames are copied literally.
+    markdown = markdown.replace(marker, () => value)
+  }
+  return markdown
 }
 
 /**
@@ -255,23 +299,32 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
   return new Editor({
     element: resolvedElement,
     extensions: createMarkdownExtensions({ profile, image }),
-    content: initialMarkdown,
-    contentType: 'markdown',
+    content: parseMarkdown(initialMarkdown, { profile }) as JSONContent,
+    contentType: 'json',
     editable,
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
-        createMarkdownEditorHandle(editor),
+        createMarkdownEditorHandle(editor, profile),
       ),
   })
 }
 
-export function markdownCommands(editor: Editor): MarkdownCommands {
+export function markdownCommands(
+  editor: Editor,
+  options: MarkdownParseOptions = {},
+): MarkdownCommands {
   return {
     ...markdownTableCommands(editor),
-    setMarkdown: markdown => editor.commands.setContent(markdown, { contentType: 'markdown' }),
+    setMarkdown: markdown =>
+      editor.commands.setContent(parseMarkdown(markdown, options) as JSONContent, {
+        contentType: 'json',
+      }),
     insertMarkdown: markdown =>
-      editor.commands.insertContent(markdown, { contentType: 'markdown' }),
+      editor.commands.insertContent(
+        (parseMarkdown(markdown, options).content ?? []) as JSONContent[],
+        { contentType: 'json' },
+      ),
     insertImage: (target, alt = '', title) =>
       editor.commands.insertContent({
         type: 'image',
@@ -373,8 +426,4 @@ export function markdownCommands(editor: Editor): MarkdownCommands {
     redo: () => editor.commands.redo(),
     focus: position => editor.commands.focus(position),
   }
-}
-
-export function editorMarkdown(editor: Editor): string {
-  return editor.getMarkdown()
 }

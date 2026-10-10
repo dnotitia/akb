@@ -42,6 +42,7 @@ import {
   extractMarkdownTargets,
   markdownCommands,
   markdownReferenceKey,
+  parseMarkdown,
   parseMarkdownReferenceToken,
   serializeEditorMarkdown,
 } from '../core.js'
@@ -102,6 +103,7 @@ import { markdownTableState } from '../table.js'
 import {
   createMarkdownEditorHandle,
   getMarkdownEditor,
+  getMarkdownEditorProfile,
 } from './editor-handle.js'
 import {
   getMarkdownSourceSession,
@@ -293,20 +295,20 @@ export function useMarkdownEditor({
 
   const editor = useEditor({
     extensions,
-    content: initialMarkdown,
-    contentType: 'markdown',
+    content: parseMarkdown(initialMarkdown, { profile }),
+    contentType: 'json',
     editable,
     immediatelyRender: false,
     shouldRerenderOnTransaction: false,
     onUpdate: ({ editor }) =>
       onChange?.(
         serializeEditorMarkdown(editor, { profile }),
-        createMarkdownEditorHandle(editor),
+        createMarkdownEditorHandle(editor, profile),
       ),
   })
 
   if (!editor) return null
-  const handle = createMarkdownEditorHandle(editor)
+  const handle = createMarkdownEditorHandle(editor, profile)
   if (!getMarkdownSourceSession(handle)) {
     getOrCreateMarkdownSourceSession(handle, serializeEditorMarkdown(editor, { profile }))
   }
@@ -315,7 +317,11 @@ export function useMarkdownEditor({
 
 export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownEditingCommands {
   const editor = getMarkdownEditor(handle)
-  const baseCommands = useMemo(() => (editor ? markdownCommands(editor) : null), [editor])
+  const profile = getMarkdownEditorProfile(handle)
+  const baseCommands = useMemo(
+    () => (editor ? markdownCommands(editor, { profile }) : null),
+    [editor, profile],
+  )
   return useMemo(
     () => {
       if (!baseCommands) {
@@ -376,17 +382,26 @@ export function useMarkdownCommands(handle: MarkdownEditorHandle | null): Markdo
   )
 }
 
-const stateMarkdown = new WeakMap<Editor['state']['doc'], string>()
+const stateMarkdown = new WeakMap<
+  Editor['state']['doc'],
+  Map<MarkdownProfile, string>
+>()
 
 function readState(
   editor: Editor,
   sourceSession: ReturnType<typeof getMarkdownSourceSession>,
+  profile: MarkdownProfile,
 ): MarkdownState {
   const doc = editor.state.doc
-  let editorMarkdown = stateMarkdown.get(doc)
+  let profiles = stateMarkdown.get(doc)
+  let editorMarkdown = profiles?.get(profile)
   if (editorMarkdown === undefined) {
-    editorMarkdown = editor.getMarkdown()
-    stateMarkdown.set(doc, editorMarkdown)
+    editorMarkdown = serializeEditorMarkdown(editor, { profile })
+    if (!profiles) {
+      profiles = new Map()
+      stateMarkdown.set(doc, profiles)
+    }
+    profiles.set(profile, editorMarkdown)
   }
   const sourceSnapshot = sourceSession?.getSnapshot()
   const source = sourceSnapshot ? {
@@ -443,8 +458,9 @@ function readState(
 export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownState | null {
   const editor = getMarkdownEditor(handle)
   const sourceSession = getMarkdownSourceSession(handle)
+  const profile = getMarkdownEditorProfile(handle)
   const [state, setState] = useState<MarkdownState | null>(() => (
-    editor ? readState(editor, sourceSession) : null
+    editor ? readState(editor, sourceSession, profile) : null
   ))
 
   useEffect(() => {
@@ -452,7 +468,7 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
       return
     }
 
-    const update = () => setState(readState(editor, sourceSession))
+    const update = () => setState(readState(editor, sourceSession, profile))
     update()
     editor.on('transaction', update)
     const unsubscribeSource = sourceSession?.subscribe(update)
@@ -461,7 +477,7 @@ export function useMarkdownState(handle: MarkdownEditorHandle | null): MarkdownS
       editor.off('transaction', update)
       unsubscribeSource?.()
     }
-  }, [editor, sourceSession])
+  }, [editor, profile, sourceSession])
 
   return editor ? state : null
 }
@@ -1681,8 +1697,8 @@ export function MarkdownEditingSurface({
     ) return
 
     if (externalValueChanged && serializeEditorMarkdown(editor, { profile }) !== markdown) {
-      editor.commands.setContent(markdown, {
-        contentType: 'markdown',
+      editor.commands.setContent(parseMarkdown(markdown, { profile }), {
+        contentType: 'json',
         emitUpdate: false,
       })
       normalizeEditorBody(editor)
@@ -1732,8 +1748,8 @@ export function MarkdownEditingSurface({
       const applySource = sourceSession.hasPendingChanges &&
         serializeEditorMarkdown(editor, { profile }) !== sourceMarkdown
       if (applySource) {
-        editor.commands.setContent(sourceMarkdown, {
-          contentType: 'markdown',
+        editor.commands.setContent(parseMarkdown(sourceMarkdown, { profile }), {
+          contentType: 'json',
           emitUpdate: false,
         })
         normalizeEditorBody(editor)
@@ -2003,7 +2019,7 @@ export function MarkdownViewer({
       return
     }
 
-    rawEditor.commands.setContent(markdown, { contentType: 'markdown' })
+    rawEditor.commands.setContent(parseMarkdown(markdown, { profile }), { contentType: 'json' })
     normalizeEditorBody(rawEditor)
   }, [markdown, profile, rawEditor])
 

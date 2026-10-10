@@ -217,6 +217,276 @@ describe('React surfaces', () => {
     expect(onChange).not.toHaveBeenCalled()
   })
 
+  it.each(['preserve', 'structured'] as const)(
+    'keeps person mentions inside link labels as plain text in %s profile',
+    async profile => {
+      const target = 'https://example.invalid'
+      const markdown = `@alice\n\n[Label @alice](${target})`
+      const changedMarkdown = `Updated @alice\n\n[Label @alice](${target})`
+      const resolvedIds: string[] = []
+      const adapter: MarkdownReferenceAdapter = {
+        search: async () => [],
+        resolve: async reference => {
+          resolvedIds.push(reference.id)
+          return {
+            ...reference,
+            status: 'available' as const,
+            title: 'Alice',
+            runtimeUrl: '/people/alice',
+          }
+        },
+      }
+      const onChange = vi.fn()
+
+      const { container, rerender } = render(
+        <>
+          <MarkdownEditor
+            markdown={markdown}
+            profile={profile}
+            onChange={onChange}
+            reference={{ adapter }}
+          />
+          <MarkdownViewer markdown={markdown} profile={profile} reference={{ adapter }} />
+        </>,
+      )
+
+      const expectLinkLabelsToStayPlain = () => {
+        const editorSurface = container.querySelector<HTMLElement>(
+          '.ProseMirror[contenteditable="true"]',
+        )!
+        const viewerSurface = container.querySelector<HTMLElement>(
+          '.ProseMirror[contenteditable="false"]',
+        )!
+        for (const surface of [editorSurface, viewerSurface]) {
+          const people = surface.querySelectorAll<HTMLElement>(
+            '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+          )
+          const link = surface.querySelector<HTMLAnchorElement>(`a[href="${target}"]`)
+          expect(people).toHaveLength(1)
+          expect(people[0]).toHaveAttribute('data-markdown-reference-id', 'alice')
+          expect(link).toHaveTextContent('Label @alice')
+          expect(link?.querySelector('a, [data-markdown-reference-kind="person"]')).toBeNull()
+        }
+
+        expect(editorSurface.querySelector(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveAttribute('data-markdown-reference-runtime-url', '/people/alice')
+        expect(viewerSurface.querySelector(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveAttribute('href', '/people/alice')
+      }
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+          .toHaveLength(2)
+        expectLinkLabelsToStayPlain()
+      })
+      expect(new Set(resolvedIds)).toEqual(new Set(['alice']))
+      expect(onChange).not.toHaveBeenCalled()
+
+      rerender(
+        <>
+          <MarkdownEditor
+            markdown={changedMarkdown}
+            profile={profile}
+            onChange={onChange}
+            reference={{ adapter }}
+          />
+          <MarkdownViewer markdown={changedMarkdown} profile={profile} reference={{ adapter }} />
+        </>,
+      )
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+          .toHaveLength(2)
+        expectLinkLabelsToStayPlain()
+      })
+      expect(onChange).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['preserve', 'structured'] as const)(
+    'excludes link-label mentions through %s-profile Markdown commands',
+    async profile => {
+      const target = 'https://example.invalid'
+      const markdown = `@alice\n\n[Label @alice](${target})`
+      function CommandProbe() {
+        const handle = useMarkdownEditor({ initialMarkdown: '초안', profile })
+        const commands = useMarkdownCommands(handle)
+        return (
+          <>
+            <EditorContent editor={getMarkdownEditor(handle)} />
+            <button type="button" onClick={() => commands.setMarkdown(markdown)}>Set</button>
+            <button type="button" onClick={() => commands.insertMarkdown(`[Label @alice](${target})`)}>
+              Insert
+            </button>
+          </>
+        )
+      }
+
+      const view = render(<CommandProbe />)
+      const editorSurface = view.container.querySelector<HTMLElement>('.ProseMirror')!
+      const expectPlainLinkLabels = (linkCount: number) => {
+        const links = editorSurface.querySelectorAll<HTMLAnchorElement>(`a[href="${target}"]`)
+        expect(links).toHaveLength(linkCount)
+        for (const link of links) {
+          expect(link).toHaveTextContent('Label @alice')
+          expect(link.querySelector('a, [data-markdown-reference="true"]')).toBeNull()
+        }
+        expect(editorSurface.querySelectorAll(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveLength(1)
+      }
+
+      await userEvent.setup().click(view.getByRole('button', { name: 'Set' }))
+      await waitFor(() => expectPlainLinkLabels(1))
+      await userEvent.setup().click(view.getByRole('button', { name: 'Insert' }))
+      await waitFor(() => expectPlainLinkLabels(2))
+    },
+  )
+
+  it('resolves escaped person identity exactly and keeps the latest React edit in history', async () => {
+    const username = String.raw`team@ops\blue}`
+    const token = String.raw`@{team@ops\\blue\}}`
+    const editedUsername = String.raw`team@ops\blue2}`
+    const editedToken = String.raw`@{team@ops\\blue2\}}`
+    const markdown = [
+      `Before ${token} and @{unknown} REEF-123`,
+      '[@link](https://example.com) and `@inline`',
+      String.raw`\@escaped after`,
+    ].join('\n\n')
+    const editedMarkdown = markdown.replace(token, editedToken)
+    const resolvedIds: string[] = []
+    const adapter: MarkdownReferenceAdapter = {
+      search: async () => [],
+      resolve: async reference => {
+        resolvedIds.push(reference.id)
+        if (reference.kind === 'person' && reference.id === username) {
+          return {
+            ...reference,
+            status: 'available' as const,
+            title: 'Exact roster person',
+            runtimeUrl: '/people/exact',
+          }
+        }
+        if (reference.kind === 'person' && reference.id === editedUsername) {
+          return {
+            ...reference,
+            status: 'available' as const,
+            title: 'Edited roster person',
+            runtimeUrl: '/people/edited',
+          }
+        }
+        return { ...reference, status: 'unavailable' as const, reason: 'unknown' as const }
+      },
+    }
+    const reference = { adapter }
+    const onChange = vi.fn()
+    const user = userEvent.setup()
+    let activeHandle: ReturnType<typeof useMarkdownEditor> = null
+    let activeCommands: ReturnType<typeof useMarkdownCommands> | null = null
+
+    function ReferenceSurface() {
+      const [editable, setEditable] = useState(true)
+      const [currentMarkdown, setCurrentMarkdown] = useState(markdown)
+      const handle = useMarkdownEditor({
+        initialMarkdown: markdown,
+        onChange: next => {
+          onChange(next)
+          setCurrentMarkdown(next)
+        },
+        reference,
+        editable,
+      })
+      const commands = useMarkdownCommands(handle)
+      const state = useMarkdownState(handle)
+      const resolutions = useMarkdownReferenceResolutions(currentMarkdown, adapter)
+      useEffect(() => {
+        activeHandle = handle
+        activeCommands = commands
+      }, [commands, handle])
+
+      return (
+        <>
+          <output data-testid="reference-body">{currentMarkdown}</output>
+          <output data-testid="markdown-state">{state?.markdown}</output>
+          <MarkdownSurface
+            editor={handle}
+            editable={editable}
+            referenceResolutions={resolutions}
+            resolvingReferences
+          />
+          <MarkdownViewer markdown={currentMarkdown} reference={reference} />
+          <button type="button" onClick={() => setEditable(false)}>Make read only</button>
+        </>
+      )
+    }
+
+    const { container } = render(<ReferenceSurface />)
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+        .toHaveLength(2)
+      expect(resolvedIds).toContain(username)
+      expect(resolvedIds).toContain('unknown')
+      expect(resolvedIds).not.toContain('link')
+      expect(resolvedIds).not.toContain('inline')
+      expect(resolvedIds).not.toContain('escaped')
+      expect(screen.getByTestId('markdown-state').textContent).toBe(markdown)
+    })
+
+    const editorSurface = container.querySelector<HTMLElement>('.ProseMirror[contenteditable="true"]')!
+    const viewerSurface = container.querySelector<HTMLElement>('.ProseMirror[contenteditable="false"]')!
+    const editorPerson = editorSurface.querySelector<HTMLElement>('[data-markdown-reference-kind="person"]')!
+    const viewerPerson = viewerSurface.querySelector<HTMLElement>('[data-markdown-reference-kind="person"]')!
+    expect(editorPerson).toHaveAttribute('data-markdown-reference-id', username)
+    expect(editorPerson).toHaveAttribute('data-markdown-reference-value', token)
+    expect(editorPerson).toHaveAttribute('data-markdown-reference-title', 'Exact roster person')
+    expect(viewerPerson).toHaveAttribute('data-markdown-reference-id', username)
+    expect(viewerPerson).toHaveAttribute('href', '/people/exact')
+    expect(onChange).not.toHaveBeenCalled()
+
+    const editor = getMarkdownEditor(activeHandle)!
+    const tokenOffset = markdown.indexOf(token)
+    const editPosition = 1 + tokenOffset + token.indexOf('blue') + 'blue'.length
+    await act(async () => {
+      editor.commands.setTextSelection(editPosition)
+      editor.commands.insertContent('2')
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-body')).toHaveTextContent(editedToken)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(editedMarkdown)
+      expect(onChange.mock.lastCall?.[0]).toBe(editedMarkdown)
+      expect(resolvedIds).toContain(editedUsername)
+    })
+    expect(onChange.mock.lastCall?.[0]).not.toContain('Exact roster person')
+    expect(onChange.mock.lastCall?.[0]).not.toContain('/people/exact')
+
+    await act(async () => { activeCommands?.undo() })
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-body')).toHaveTextContent(token)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(markdown)
+      expect(onChange.mock.lastCall?.[0]).toBe(markdown)
+    })
+    await act(async () => { activeCommands?.redo() })
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-body')).toHaveTextContent(editedToken)
+      expect(screen.getByTestId('markdown-state').textContent).toBe(editedMarkdown)
+      expect(onChange.mock.lastCall?.[0]).toBe(editedMarkdown)
+    })
+
+    const changeCount = onChange.mock.calls.length
+    await user.click(screen.getByRole('button', { name: 'Make read only' }))
+    await waitFor(() => expect(container.querySelector('.ProseMirror[contenteditable="false"]'))
+      .toBeTruthy())
+    const readOnlyEditor = container.querySelector<HTMLElement>(
+      '[data-markdown-surface="editor"] .ProseMirror',
+    )!
+    await user.click(readOnlyEditor)
+    await user.keyboard(' blocked')
+    expect(screen.getByTestId('reference-body')).toHaveTextContent(editedToken)
+    expect(onChange).toHaveBeenCalledTimes(changeCount)
+  })
+
   it('keeps resolved reference display outside saved Markdown after editing inline code', async () => {
     const markdown = 'AKB-359 @person\n\n`inline code`'
     const adapter: MarkdownReferenceAdapter = {

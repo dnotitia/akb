@@ -14,7 +14,7 @@ import {
   uploadMarkdownBatch,
 } from '../src/index.js'
 import { createMarkdownEditor, markdownCommands, serializeEditorMarkdown } from '../src/core.js'
-import type { MarkdownAdapters } from '../src/index.js'
+import type { MarkdownAdapters, MarkdownDocument } from '../src/index.js'
 
 const fixture = `# 공통 문법
 
@@ -56,6 +56,32 @@ describe('Markdown conformance core', () => {
     expect(extractMarkdownReferences(markdown).map(item => item.value)).toEqual(['@alice'])
     expect(parse.mock.calls.every(([source]) => source !== markdown)).toBe(true)
   })
+
+  it.each(['preserve', 'structured'] as const)(
+    'excludes person mentions in link labels during %s-profile editor initialization',
+    profile => {
+      const target = 'https://example.invalid'
+      const editor = createMarkdownEditor({
+        initialMarkdown: `@alice\n\n[Label @alice](${target})`,
+        profile,
+      })
+      editors.push(editor)
+
+      const linkedTextMarks: string[][] = []
+      editor.state.doc.descendants(node => {
+        if (node.isText && node.text?.includes('@alice') && node.marks.some(mark => mark.type.name === 'link')) {
+          linkedTextMarks.push(node.marks.map(mark => mark.type.name))
+        }
+      })
+
+      expect(linkedTextMarks).toHaveLength(1)
+      expect(linkedTextMarks[0]).toContain('link')
+      expect(linkedTextMarks[0]).not.toContain('markdownReference')
+      expect(extractMarkdownReferences(serializeEditorMarkdown(editor, { profile })))
+        .toEqual([{ kind: 'person', id: 'alice', value: '@alice' }])
+    },
+  )
+
   it('resolves freshly typed references the same way before and after metadata cache eviction', () => {
     const editor = createMarkdownEditor({ initialMarkdown: 'Hello ' })
     editors.push(editor)
@@ -284,6 +310,58 @@ describe('Markdown conformance core', () => {
 
     const linkLabel = parseMarkdown(markdown).content?.[1]?.content?.[0]
     expect(linkLabel?.marks?.some(mark => mark.type === 'markdownReference')).toBe(false)
+  })
+
+  it('preserves escaped braced person identity and canonical spelling in both profiles', () => {
+    const personToken = (id: string) =>
+      '@{' + id.replace(/[\\}]/gu, character => '\\' + character) + '}'
+    const reportedUsername = String.raw`team@ops\blue}`
+    const reportedToken = String.raw`@{team@ops\\blue\}}`
+    const people = [
+      { id: 'team\\ops', value: personToken('team\\ops') },
+      { id: 'brace}name', value: personToken('brace}name') },
+      { id: 'team\\ops}name', value: personToken('team\\ops}name') },
+      { id: 'cash$&x', value: personToken('cash$&x') },
+      { id: "cash$'x", value: personToken("cash$'x") },
+      { id: '한글42', value: '@{한글42}' },
+      { id: 'Alice Smith', value: '@{Alice Smith}' },
+      { id: 'alice', value: '@alice' },
+      { id: reportedUsername, value: reportedToken },
+    ]
+
+    for (const profile of ['preserve', 'structured'] as const) {
+      for (const person of people) {
+        const body = `before ${person.value} after`
+        const expected = { kind: 'person', id: person.id, value: person.value }
+        expect(parseMarkdownReferenceToken(person.value)).toEqual(expected)
+        expect(extractMarkdownReferences(body)).toContainEqual(expected)
+
+        let roundTrip = body
+        for (let index = 0; index < 3; index += 1) {
+          roundTrip = serializeMarkdown(parseMarkdown(roundTrip, { profile }), { profile })
+          expect(roundTrip).toBe(body)
+        }
+        expect(canonicalizeMarkdown(body, { profile })).toBe(body)
+      }
+    }
+  })
+
+  it('restores dollar replacement patterns literally in marked reference values', () => {
+    const token = "@{cash$&$'$$}"
+    const document: MarkdownDocument = {
+      type: 'doc',
+      content: [{
+        type: 'paragraph',
+        content: [{
+          type: 'text',
+          text: token,
+          marks: [{ type: 'markdownReference' }],
+        }],
+      }],
+    }
+
+    expect(parseMarkdownReferenceToken(token)?.id).toBe("cash$&$'$$")
+    expect(serializeMarkdown(document)).toBe(token)
   })
 
   it('keeps reference runtime resolution outside canonical Markdown', async () => {
