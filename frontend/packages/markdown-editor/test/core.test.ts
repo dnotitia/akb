@@ -56,6 +56,32 @@ describe('Markdown conformance core', () => {
     expect(extractMarkdownReferences(markdown).map(item => item.value)).toEqual(['@alice'])
     expect(parse.mock.calls.every(([source]) => source !== markdown)).toBe(true)
   })
+
+  it.each(['preserve', 'structured'] as const)(
+    'excludes person mentions in link labels during %s-profile editor initialization',
+    profile => {
+      const target = 'https://example.invalid'
+      const editor = createMarkdownEditor({
+        initialMarkdown: `@alice\n\n[Label @alice](${target})`,
+        profile,
+      })
+      editors.push(editor)
+
+      const linkedTextMarks: string[][] = []
+      editor.state.doc.descendants(node => {
+        if (node.isText && node.text?.includes('@alice') && node.marks.some(mark => mark.type.name === 'link')) {
+          linkedTextMarks.push(node.marks.map(mark => mark.type.name))
+        }
+      })
+
+      expect(linkedTextMarks).toHaveLength(1)
+      expect(linkedTextMarks[0]).toContain('link')
+      expect(linkedTextMarks[0]).not.toContain('markdownReference')
+      expect(extractMarkdownReferences(serializeEditorMarkdown(editor, { profile })))
+        .toEqual([{ kind: 'person', id: 'alice', value: '@alice' }])
+    },
+  )
+
   it('resolves freshly typed references the same way before and after metadata cache eviction', () => {
     const editor = createMarkdownEditor({ initialMarkdown: 'Hello ' })
     editors.push(editor)

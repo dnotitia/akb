@@ -217,6 +217,134 @@ describe('React surfaces', () => {
     expect(onChange).not.toHaveBeenCalled()
   })
 
+  it.each(['preserve', 'structured'] as const)(
+    'keeps person mentions inside link labels as plain text in %s profile',
+    async profile => {
+      const target = 'https://example.invalid'
+      const markdown = `@alice\n\n[Label @alice](${target})`
+      const changedMarkdown = `Updated @alice\n\n[Label @alice](${target})`
+      const resolvedIds: string[] = []
+      const adapter: MarkdownReferenceAdapter = {
+        search: async () => [],
+        resolve: async reference => {
+          resolvedIds.push(reference.id)
+          return {
+            ...reference,
+            status: 'available' as const,
+            title: 'Alice',
+            runtimeUrl: '/people/alice',
+          }
+        },
+      }
+      const onChange = vi.fn()
+
+      const { container, rerender } = render(
+        <>
+          <MarkdownEditor
+            markdown={markdown}
+            profile={profile}
+            onChange={onChange}
+            reference={{ adapter }}
+          />
+          <MarkdownViewer markdown={markdown} profile={profile} reference={{ adapter }} />
+        </>,
+      )
+
+      const expectLinkLabelsToStayPlain = () => {
+        const editorSurface = container.querySelector<HTMLElement>(
+          '.ProseMirror[contenteditable="true"]',
+        )!
+        const viewerSurface = container.querySelector<HTMLElement>(
+          '.ProseMirror[contenteditable="false"]',
+        )!
+        for (const surface of [editorSurface, viewerSurface]) {
+          const people = surface.querySelectorAll<HTMLElement>(
+            '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+          )
+          const link = surface.querySelector<HTMLAnchorElement>(`a[href="${target}"]`)
+          expect(people).toHaveLength(1)
+          expect(people[0]).toHaveAttribute('data-markdown-reference-id', 'alice')
+          expect(link).toHaveTextContent('Label @alice')
+          expect(link?.querySelector('a, [data-markdown-reference-kind="person"]')).toBeNull()
+        }
+
+        expect(editorSurface.querySelector(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveAttribute('data-markdown-reference-runtime-url', '/people/alice')
+        expect(viewerSurface.querySelector(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveAttribute('href', '/people/alice')
+      }
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+          .toHaveLength(2)
+        expectLinkLabelsToStayPlain()
+      })
+      expect(new Set(resolvedIds)).toEqual(new Set(['alice']))
+      expect(onChange).not.toHaveBeenCalled()
+
+      rerender(
+        <>
+          <MarkdownEditor
+            markdown={changedMarkdown}
+            profile={profile}
+            onChange={onChange}
+            reference={{ adapter }}
+          />
+          <MarkdownViewer markdown={changedMarkdown} profile={profile} reference={{ adapter }} />
+        </>,
+      )
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-markdown-reference-resolution="available"]'))
+          .toHaveLength(2)
+        expectLinkLabelsToStayPlain()
+      })
+      expect(onChange).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['preserve', 'structured'] as const)(
+    'excludes link-label mentions through %s-profile Markdown commands',
+    async profile => {
+      const target = 'https://example.invalid'
+      const markdown = `@alice\n\n[Label @alice](${target})`
+      function CommandProbe() {
+        const handle = useMarkdownEditor({ initialMarkdown: '초안', profile })
+        const commands = useMarkdownCommands(handle)
+        return (
+          <>
+            <EditorContent editor={getMarkdownEditor(handle)} />
+            <button type="button" onClick={() => commands.setMarkdown(markdown)}>Set</button>
+            <button type="button" onClick={() => commands.insertMarkdown(`[Label @alice](${target})`)}>
+              Insert
+            </button>
+          </>
+        )
+      }
+
+      const view = render(<CommandProbe />)
+      const editorSurface = view.container.querySelector<HTMLElement>('.ProseMirror')!
+      const expectPlainLinkLabels = (linkCount: number) => {
+        const links = editorSurface.querySelectorAll<HTMLAnchorElement>(`a[href="${target}"]`)
+        expect(links).toHaveLength(linkCount)
+        for (const link of links) {
+          expect(link).toHaveTextContent('Label @alice')
+          expect(link.querySelector('a, [data-markdown-reference="true"]')).toBeNull()
+        }
+        expect(editorSurface.querySelectorAll(
+          '[data-markdown-reference="true"][data-markdown-reference-kind="person"]',
+        )).toHaveLength(1)
+      }
+
+      await userEvent.setup().click(view.getByRole('button', { name: 'Set' }))
+      await waitFor(() => expectPlainLinkLabels(1))
+      await userEvent.setup().click(view.getByRole('button', { name: 'Insert' }))
+      await waitFor(() => expectPlainLinkLabels(2))
+    },
+  )
+
   it('resolves escaped person identity exactly and keeps the latest React edit in history', async () => {
     const username = String.raw`team@ops\blue}`
     const token = String.raw`@{team@ops\\blue\}}`

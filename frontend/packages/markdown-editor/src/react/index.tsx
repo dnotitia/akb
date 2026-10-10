@@ -42,6 +42,7 @@ import {
   extractMarkdownTargets,
   markdownCommands,
   markdownReferenceKey,
+  parseMarkdown,
   parseMarkdownReferenceToken,
   serializeEditorMarkdown,
 } from '../core.js'
@@ -294,8 +295,8 @@ export function useMarkdownEditor({
 
   const editor = useEditor({
     extensions,
-    content: initialMarkdown,
-    contentType: 'markdown',
+    content: parseMarkdown(initialMarkdown, { profile }),
+    contentType: 'json',
     editable,
     immediatelyRender: false,
     shouldRerenderOnTransaction: false,
@@ -316,7 +317,11 @@ export function useMarkdownEditor({
 
 export function useMarkdownCommands(handle: MarkdownEditorHandle | null): MarkdownEditingCommands {
   const editor = getMarkdownEditor(handle)
-  const baseCommands = useMemo(() => (editor ? markdownCommands(editor) : null), [editor])
+  const profile = getMarkdownEditorProfile(handle)
+  const baseCommands = useMemo(
+    () => (editor ? markdownCommands(editor, { profile }) : null),
+    [editor, profile],
+  )
   return useMemo(
     () => {
       if (!baseCommands) {
@@ -1692,8 +1697,8 @@ export function MarkdownEditingSurface({
     ) return
 
     if (externalValueChanged && serializeEditorMarkdown(editor, { profile }) !== markdown) {
-      editor.commands.setContent(markdown, {
-        contentType: 'markdown',
+      editor.commands.setContent(parseMarkdown(markdown, { profile }), {
+        contentType: 'json',
         emitUpdate: false,
       })
       normalizeEditorBody(editor)
@@ -1743,8 +1748,8 @@ export function MarkdownEditingSurface({
       const applySource = sourceSession.hasPendingChanges &&
         serializeEditorMarkdown(editor, { profile }) !== sourceMarkdown
       if (applySource) {
-        editor.commands.setContent(sourceMarkdown, {
-          contentType: 'markdown',
+        editor.commands.setContent(parseMarkdown(sourceMarkdown, { profile }), {
+          contentType: 'json',
           emitUpdate: false,
         })
         normalizeEditorBody(editor)
@@ -2014,7 +2019,7 @@ export function MarkdownViewer({
       return
     }
 
-    rawEditor.commands.setContent(markdown, { contentType: 'markdown' })
+    rawEditor.commands.setContent(parseMarkdown(markdown, { profile }), { contentType: 'json' })
     normalizeEditorBody(rawEditor)
   }, [markdown, profile, rawEditor])
 

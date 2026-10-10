@@ -299,8 +299,8 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
   return new Editor({
     element: resolvedElement,
     extensions: createMarkdownExtensions({ profile, image }),
-    content: initialMarkdown,
-    contentType: 'markdown',
+    content: parseMarkdown(initialMarkdown, { profile }) as JSONContent,
+    contentType: 'json',
     editable,
     onUpdate: ({ editor }) =>
       onChange?.(
@@ -310,12 +310,21 @@ export function createMarkdownEditor(options: MarkdownEditorConfig = {}): Editor
   })
 }
 
-export function markdownCommands(editor: Editor): MarkdownCommands {
+export function markdownCommands(
+  editor: Editor,
+  options: MarkdownParseOptions = {},
+): MarkdownCommands {
   return {
     ...markdownTableCommands(editor),
-    setMarkdown: markdown => editor.commands.setContent(markdown, { contentType: 'markdown' }),
+    setMarkdown: markdown =>
+      editor.commands.setContent(parseMarkdown(markdown, options) as JSONContent, {
+        contentType: 'json',
+      }),
     insertMarkdown: markdown =>
-      editor.commands.insertContent(markdown, { contentType: 'markdown' }),
+      editor.commands.insertContent(
+        (parseMarkdown(markdown, options).content ?? []) as JSONContent[],
+        { contentType: 'json' },
+      ),
     insertImage: (target, alt = '', title) =>
       editor.commands.insertContent({
         type: 'image',
