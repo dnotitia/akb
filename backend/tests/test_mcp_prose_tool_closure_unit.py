@@ -215,6 +215,51 @@ def test_prose_never_names_a_nonexistent_akb_tool() -> None:
     )
 
 
+def test_generated_candidate_catalog_descriptions_use_public_group_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real HTTP catalog and nested schemas must not teach retired call names."""
+    from types import SimpleNamespace
+
+    from mcp_server import tools as tools_module
+
+    monkeypatch.setattr(
+        tools_module,
+        "get_vault_creation_capabilities",
+        lambda: SimpleNamespace(templates=True, external_git=True),
+    )
+    catalog = [tool.model_dump(mode="json", by_alias=True) for tool in tools_module.available_tools()]
+    assert len(catalog) == 33
+
+    descriptions: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "description" and isinstance(item, str):
+                    descriptions.append(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(catalog)
+    stale = sorted(
+        {
+            name
+            for description in descriptions
+            for name in re.findall(
+                r"\bakb_(?:browse|vault_info|search|get|history|activity)\b",
+                description,
+            )
+        }
+    )
+    assert stale == []
+    combined = " ".join(descriptions)
+    assert "akb_discover" in combined
+    assert "akb_document_read" in combined
+
+
 def test_inline_image_guidance_is_safe_and_matches_bounded_lifecycle() -> None:
     """Agent prose must not turn image insertion into a body-truncating update."""
     topics = _help_topics()

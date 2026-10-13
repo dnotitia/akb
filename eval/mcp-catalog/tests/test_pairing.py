@@ -6,6 +6,8 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
 from mcp_catalog.statistics import InconclusiveBootstrap, paired_cluster_bca
@@ -19,6 +21,48 @@ def _seal(artifact: dict) -> None:
     trial_order = current.get("trial_order", []) if isinstance(current, dict) else []
     artifact["artifact_hash_input"] = deepcopy(_build_artifact_hash_input(artifact, trial_order=trial_order))
     artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
+
+
+def _attach_selection_metadata(baseline: dict, candidate: dict) -> None:
+    selection = {
+        "selection_sha256": "a" * 64,
+        "selected_trials": [{
+            "model_class": "primary",
+            "transport": "http",
+            "task_id": "read-vaults-en",
+            "repeat_index": 1,
+        }],
+    }
+    for artifact in (baseline, candidate):
+        artifact["selection"] = deepcopy(selection)
+        artifact["pre_smoke_seal_inputs"]["selection"] = deepcopy(selection)
+    seal_hash = hash_json({
+        arm: hash_json(artifact["pre_smoke_seal_inputs"])
+        for arm, artifact in (("baseline", baseline), ("candidate", candidate))
+    })
+    for artifact in (baseline, candidate):
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _seal(artifact)
+
+
+def _reseal_provider_registry_pair(baseline: dict, candidate: dict) -> None:
+    artifacts = {"baseline": baseline, "candidate": candidate}
+    for artifact in artifacts.values():
+        registry = artifact["provider_registry"]
+        registry["model_list_hash"] = hash_json(registry["model_list_snapshot"])
+        registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+        registry["snapshot_hash"] = hash_json(registry_payload)
+        artifact["pre_smoke_seal_inputs"]["provider_registry_hash"] = registry["snapshot_hash"]
+
+    seal_hash = hash_json(
+        {
+            arm: hash_json(artifact["pre_smoke_seal_inputs"])
+            for arm, artifact in artifacts.items()
+        }
+    )
+    for artifact in artifacts.values():
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _seal(artifact)
 
 
 def test_preregistered_arm_order_is_counterbalanced_across_repeats() -> None:
@@ -52,6 +96,96 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
         and interval["seed"] == 358
         for interval in [result["overall"]["success"], result["overall"]["task_error_rate"], *result["cells"].values()]
     )
+
+
+def test_selected_artifacts_keep_the_full_corpus_verdict_inconclusive() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert result["gate"]["reasons"] == [
+        "selected trial evidence cannot support the full benchmark adoption verdict"
+    ]
+    diagnostics = result["observed_selected_diagnostics"]
+    assert diagnostics["classification"] == "diagnostic_only"
+    assert diagnostics["adoption_eligible"] is False
+    assert diagnostics["arms"]["baseline"]["observed_trials"] == 1
+    assert diagnostics["arms"]["candidate"]["observed_trials"] == 1
+    assert diagnostics["combined"]["observed_trials"] == 2
+    assert diagnostics["combined"]["efficiency_metrics"]["trials"] == 2
+    assert "cost_usd" in diagnostics["combined"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["instructions", "selection_repeat", "source_revision", "execution_event", "artifact_hash"],
+)
+def test_selected_artifact_tampering_is_rejected_before_partial_verdict(mutation: str) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+
+    if mutation == "instructions":
+        candidate["catalogs"]["http:default"]["server_discover"]["instructions"] += " tampered"
+    elif mutation == "selection_repeat":
+        candidate["selection"]["selected_trials"][0]["repeat_index"] = 2
+    elif mutation == "source_revision":
+        candidate["source_revision"] = "tampered-source-revision"
+    elif mutation == "execution_event":
+        candidate["paired_execution"]["events"][0]["sequence"] += 1
+    else:
+        candidate["artifact_hash"] = "0" * 64
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert result["gate"]["reasons"] == ["candidate artifact integrity digest does not match"]
+    assert result["observed_selected_diagnostics"]["classification"] == "diagnostic_only"
+
+
+def test_complete_artifacts_over_retired_request_and_wall_caps_still_compare() -> None:
+    baseline, candidate = complete_paired_artifacts(request_count=25)
+    for artifact in (baseline, candidate):
+        artifact["paired_budget_used"]["wall_seconds"] = 10801.0
+        _seal(artifact)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert baseline["paired_budget_used"]["model_requests"] > 3000
+    assert baseline["paired_budget_used"]["wall_seconds"] > 10800
+    assert result["observed_paired_outcomes"] == 608
+    assert result["verdict"] == "adopt"
+
+
+def test_missing_one_of_action_branch_is_rejected_by_compare_admission() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    catalog_key = "http:default"
+    catalog = CatalogSnapshot.model_validate(candidate["catalogs"][catalog_key])
+    tools = deepcopy(catalog.tools)
+    identity_tool = next(tool for tool in tools if tool.get("name") == "akb_identity")
+    identity_tool["inputSchema"]["oneOf"] = [
+        branch
+        for branch in identity_tool["inputSchema"]["oneOf"]
+        if branch["properties"]["action"]["const"] != "whoami"
+    ]
+    updated_catalog = CatalogSnapshot.model_validate(
+        {
+            **catalog.model_dump(mode="json"),
+            "tools": tools,
+            "catalog_hash": hash_json(tools),
+            "catalog_token_estimate": token_estimate(tools),
+        }
+    ).model_dump(mode="json")
+    candidate["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    candidate["pre_smoke_seal_inputs"]["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "redesign"
+    assert result["gate"]["checks"]["logical_function_omissions_zero"] is False
+    assert any("candidate catalog action akb_identity:whoami" in item for item in result["gate"]["logical_function_omissions"])
 
 
 def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() -> None:
@@ -132,6 +266,18 @@ def test_mutated_or_incomplete_artifacts_produce_inconclusive_verdicts() -> None
     assert "incomplete baseline" in incomplete["gate"]["reasons"][0]
 
 
+def test_compare_rejects_resealed_artifact_with_model_input_hash_drift() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    evidence = candidate["runs"]["primary:http"]["trials"][0]["model_input_evidence"][0]
+    evidence["model_input_canonical_json"] += " "
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "model input evidence integrity" in result["gate"]["reasons"][0]
+
+
 def test_independent_arm_evidence_cannot_be_adopted() -> None:
     baseline, candidate = complete_paired_artifacts()
     baseline.pop("paired_execution")
@@ -154,6 +300,47 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "provider_registry" in result["gate"]["reasons"][0]
+
+
+def test_different_model_routes_between_arms_are_not_paired() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    candidate["manifest"] = deepcopy(candidate["manifest"])
+    candidate["manifest"]["models"][0]["routing"]["order"] = ["akashml"]
+    candidate["run_manifest_hash"] = hash_json(candidate["manifest"])
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "paired artifacts differ in run_manifest_hash" in result["gate"]["reasons"][0]
+
+
+def test_compare_recomputes_response_route_against_the_sealed_provider_registry() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    evidence = candidate["runs"]["primary:http"]["trials"][0]["provider_evidence"][0]
+    evidence["routing"]["endpoints"]["available"][0]["model"] = evidence["model"]
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert any("trial routing flags" in reason for reason in result["gate"]["reasons"])
+
+
+def test_resealed_provider_canonical_identity_drift_is_not_admitted() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    model_id = "deepseek/deepseek-v4-flash-0731"
+
+    for artifact in (baseline, candidate):
+        model_row = artifact["provider_registry"]["model_list_snapshot"]["data"][0]
+        model_row["canonical_slug"] = "deepseek/deepseek-v4-flash-20260831"
+        artifact["provider_registry"]["models"][model_id]["model_record"] = deepcopy(model_row)
+    _reseal_provider_registry_pair(baseline, candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "canonical identity" in result["gate"]["reasons"][0]
 
 
 def test_missing_state_or_raw_call_evidence_is_rejected_after_resealing() -> None:
@@ -219,6 +406,20 @@ def test_resealed_shared_budget_mismatch_is_rejected() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "budget" in result["gate"]["reasons"][0]
+
+
+@pytest.mark.parametrize("retired_limit", ("max_model_requests", "max_wall_seconds"))
+def test_resealed_shared_budget_rejects_retired_limits(retired_limit: str) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    baseline["paired_budget_used"][retired_limit] = 3000
+    candidate["paired_budget_used"][retired_limit] = 3000
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "unexpected fields" in result["gate"]["reasons"][0]
 
 
 def test_external_compare_cli_writes_all_four_verdicts(tmp_path: Path) -> None:

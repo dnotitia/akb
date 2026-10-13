@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from collections import Counter, defaultdict
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +14,24 @@ from mcp_catalog.contracts import (
     load_task_corpus,
     token_estimate,
 )
-from mcp_catalog.execution import ToolCallRecord, TrialOutcome
-from mcp_catalog.runner import _build_artifact_hash_input, planned_arm_order
+from mcp_catalog.evidence import canonical_json
+from mcp_catalog.execution import (
+    ModelInputEvidence,
+    ToolCallRecord,
+    TrialOutcome,
+    _material_attempt_positions_by_stage,
+)
+from mcp_catalog.runner import (
+    _build_artifact_hash_input,
+    _expected_openrouter_canonical_slug,
+    planned_arm_order,
+)
 from mcp_catalog.runtime import StateObservation
 
 ROOT = Path(__file__).parents[1]
 FIXTURE_ROOT = ROOT / "fixtures"
+OPENROUTER_PROVIDER_NAMES = {"deepinfra": "DeepInfra", "akashml": "AkashML"}
+SYNTHETIC_SERVER_INSTRUCTIONS = "Synthetic server instructions."
 ARTIFACT_VERSIONS = {"backend_artifact_version": "1.0.0", "proxy_artifact_version": "1.0.0"}
 EXECUTION_ENVIRONMENT = {
     "python": "3.14.0 synthetic fixture",
@@ -33,17 +47,68 @@ EXECUTION_ENVIRONMENT = {
 }
 
 
+def synthetic_model_input_evidence(request_count: int) -> list[ModelInputEvidence]:
+    instructions_sha256 = hashlib.sha256(SYNTHETIC_SERVER_INSTRUCTIONS.encode("utf-8")).hexdigest()
+    evidence = []
+    for index in range(1, request_count + 1):
+        model_input = canonical_json(
+            {"instructions": SYNTHETIC_SERVER_INSTRUCTIONS, "request_index": index}
+        )
+        evidence.append(
+            ModelInputEvidence(
+                request_index=index,
+                model_input_sha256=hashlib.sha256(model_input.encode("utf-8")).hexdigest(),
+                model_input_canonical_json=model_input,
+                server_instructions_sha256=instructions_sha256,
+                server_instructions_text=SYNTHETIC_SERVER_INSTRUCTIONS,
+                server_instructions_present=True,
+            )
+        )
+    return evidence
+
+
+def provider_name_for_model(model: Any) -> str:
+    return OPENROUTER_PROVIDER_NAMES[model.routing.order[0]]
+
+
 def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
     manifest_model = manifest or load_run_manifest(ROOT / "config" / "run.json")
+    model_rows = [
+        {"id": model.model_id, "canonical_slug": _expected_openrouter_canonical_slug(model)}
+        for model in manifest_model.models
+    ]
+    model_list_snapshot = {"data": model_rows}
+    models: dict[str, Any] = {}
+    endpoint_snapshots: dict[str, Any] = {}
+    for model, model_row in zip(manifest_model.models, model_rows, strict=True):
+        provider_name = provider_name_for_model(model)
+        provider_slug = model.routing.order[0]
+        selected_endpoint = {
+            "model_id": model.model_id,
+            "name": f"{provider_name} | {model_row['canonical_slug']}",
+            "provider_name": provider_name,
+            "tag": f"{provider_slug}/fp8",
+            "quantization": "fp8",
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
+            "pricing": {
+                "prompt": str(Decimal(str(model.input_cost_per_million_usd)) / Decimal(1_000_000)),
+                "completion": str(Decimal(str(model.output_cost_per_million_usd)) / Decimal(1_000_000)),
+            },
+        }
+        endpoint_snapshot = {"data": {"endpoints": [selected_endpoint]}}
+        models[model.model_id] = {
+            "manifest_version": model.version,
+            "model_record": model_row,
+            "endpoint_snapshot": endpoint_snapshot,
+            "selected_endpoint": selected_endpoint,
+        }
+        endpoint_snapshots[model.model_id] = endpoint_snapshot
     payload = {
         "status": "verified",
-        "models": {
-            model.model_id: {
-                "manifest_version": model.version,
-                "selected_endpoint": {"provider_name": "Parasail", "quantization": "fp8"},
-            }
-            for model in manifest_model.models
-        },
+        "model_list_snapshot": model_list_snapshot,
+        "model_list_hash": hash_json(model_list_snapshot),
+        "models": models,
+        "endpoint_snapshots": endpoint_snapshots,
     }
     return {**payload, "snapshot_hash": hash_json(payload)}
 
@@ -53,6 +118,7 @@ def complete_paired_artifacts(
     baseline_failure_pairs: set[str] | None = None,
     candidate_failure_pairs: set[str] | None = None,
     mirror_baseline_failures: bool = False,
+    request_count: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Create sealed synthetic evidence with recomputable state and call traces."""
 
@@ -68,10 +134,10 @@ def complete_paired_artifacts(
     for model in manifest_model.models:
         for transport in manifest_model.transports:
             cell = f"{model.class_name}:{transport}"
-            for task in tasks:
-                if transport not in task.fixture.transports:
-                    continue
-                for repeat_index in range(1, manifest_model.repeats + 1):
+            for repeat_index in range(1, manifest_model.repeats + 1):
+                for task in tasks:
+                    if transport not in task.fixture.transports:
+                        continue
                     order = planned_arm_order(task.id, repeat_index, manifest_model.paired_order_seed)
                     for order_position, arm in enumerate(order):
                         sequence += 1
@@ -138,6 +204,7 @@ def complete_paired_artifacts(
                             paired_order_position=order.index(arm),
                             paired_execution_sequence=event_sequence[identity],
                             forced_failure=forced_failure,
+                            request_count=request_count,
                         )
                         all_usage.append(outcome)
                         run_trials[cell].append(outcome.model_dump(mode="json"))
@@ -347,14 +414,15 @@ def _make_outcome(
 ) -> TrialOutcome:
     material_calls: list[ToolCallRecord] = []
     if task.expected_material_attempts:
+        material_calls_by_stage: dict[str, ToolCallRecord] = {}
         for index, expected in enumerate(task.expected_material_attempts, start=1):
             arguments = deepcopy(expected.arguments)
             for argument, filename in expected.local_file_arguments.items():
                 arguments[argument] = str(FIXTURE_ROOT / filename)
             for binding in task.expected_result_bindings:
-                if binding.target_attempt != index:
+                if binding.target_stage != expected.stage_id:
                     continue
-                source = material_calls[binding.source_attempt - 1].result_fields[binding.source_field]
+                source = material_calls_by_stage[binding.source_stage].result_fields[binding.source_field]
                 arguments[binding.target_argument] = (
                     source if binding.relation == "equals" else f"reference:{source}:complete"
                 )
@@ -378,13 +446,15 @@ def _make_outcome(
                             *(
                                 binding.source_field
                                 for binding in task.expected_result_bindings
-                                if binding.source_attempt == index
+                                if binding.source_stage == expected.stage_id
                             ),
                         }
                     },
                     order=index,
+                    stage_id=expected.stage_id,
                 )
             )
+            material_calls_by_stage[expected.stage_id] = material_calls[-1]
     else:
         for index, expected in enumerate(task.expected_material_outcomes, start=1):
             material_calls.append(
@@ -432,9 +502,14 @@ def _make_outcome(
         {
             "model": model.model_id,
             "routing": {
+                "requested": model.model_id,
                 "endpoints": {
                     "available": [
-                        {"provider": "parasail", "selected": True, "quantization": "fp8"}
+                        {
+                            "model": _expected_openrouter_canonical_slug(model),
+                            "provider": provider_name_for_model(model),
+                            "selected": True,
+                        }
                     ]
                 }
             },
@@ -473,9 +548,11 @@ def _make_outcome(
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        server_instructions_sha256=hashlib.sha256(SYNTHETIC_SERVER_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        model_input_evidence=synthetic_model_input_evidence(request_count),
     )
     before, after = _state_observations(task.expected_final_state)
-    outcome.state_checkpoint_observations = _checkpoint_observations(task)
+    outcome.state_checkpoint_observations = _checkpoint_observations(task, calls)
     outcome.finalize(
         task,
         before,
@@ -500,6 +577,7 @@ def _tool_call(
     error_code: str | None,
     result_fields: dict[str, str],
     order: int,
+    stage_id: str | None = None,
 ) -> ToolCallRecord:
     route = _route_for(
         task,
@@ -534,6 +612,7 @@ def _tool_call(
             error="server call was not observed",
             result_preview=None,
             result_fields={},
+            stage_id=stage_id,
         )
     route_spec = getattr(route, arm)
     if route_spec.action is not None:
@@ -560,6 +639,7 @@ def _tool_call(
         error=None if succeeded else "synthetic expected server error",
         result_preview="synthetic confirmed result",
         result_fields=result_fields,
+        stage_id=stage_id,
     )
 
 
@@ -676,17 +756,43 @@ def _state_observations(contract: Any) -> tuple[list[StateObservation], list[Sta
     return before, after
 
 
-def _checkpoint_observations(task: Any) -> list[dict[str, Any]]:
+def _checkpoint_observations(task: Any, tool_calls: list[ToolCallRecord]) -> list[dict[str, Any]]:
     observations = []
+    material_positions = _material_attempt_positions_by_stage(tool_calls)
+    stage_positions = {attempt.stage_id: index for index, attempt in enumerate(task.expected_material_attempts)}
     for checkpoint in task.expected_final_state.checkpoints:
+        stage_id = task.expected_material_attempts[checkpoint.after_attempt - 1].stage_id
         payload: dict[str, Any] = {}
         for expectation in checkpoint.must:
             _apply_expectation(payload, expectation, satisfied=True)
         for expectation in checkpoint.must_not:
             _apply_expectation(payload, expectation, satisfied=False)
+        checkpoint_index = checkpoint.after_attempt - 1
+        publications = payload.get("publications")
+        if isinstance(publications, list) and publications and isinstance(publications[0], dict):
+            for binding in task.expected_result_bindings:
+                source_index = stage_positions.get(binding.source_stage)
+                target_index = stage_positions.get(binding.target_stage)
+                if (
+                    binding.relation == "equals"
+                    and source_index is not None
+                    and target_index is not None
+                    and source_index < checkpoint_index < target_index
+                ):
+                    value = next(
+                        (
+                            call.result_fields[binding.source_field]
+                            for call in tool_calls
+                            if call.stage_id == binding.source_stage
+                            and binding.source_field in call.result_fields
+                        ),
+                        None,
+                    )
+                    if value is not None:
+                        publications[0][binding.source_field] = value
         observations.append(
             {
-                "after_attempt": checkpoint.after_attempt,
+                "after_attempt": material_positions[stage_id],
                 "available": True,
                 "status_code": checkpoint.probe.expected_status,
                 "payload": payload,
@@ -702,6 +808,16 @@ def _apply_expectation(payload: dict[str, Any], expectation: Any, *, satisfied: 
             _remove_pointer(payload, expectation.pointer)
         elif expectation.operator == "exists":
             _set_pointer(payload, expectation.pointer, "synthetic-present")
+        elif expectation.operator == "nonempty":
+            _set_pointer(payload, expectation.pointer, "synthetic-present")
+        elif expectation.operator == "okf_document":
+            value = expectation.value
+            _set_pointer(
+                payload,
+                expectation.pointer,
+                f"---\ntype: {value['type']}\nresource: {value['resource_uri']}\n"
+                f"akb_uri: {value['resource_uri']}\n---\n\n{value['body']}\n",
+            )
         elif expectation.operator == "contains":
             _set_pointer(payload, expectation.pointer, [deepcopy(expectation.value)])
         elif expectation.operator == "not_contains":
@@ -713,6 +829,10 @@ def _apply_expectation(payload: dict[str, Any], expectation: Any, *, satisfied: 
         _remove_pointer(payload, expectation.pointer)
     elif expectation.operator == "exists":
         _set_pointer(payload, expectation.pointer, "synthetic-present")
+    elif expectation.operator == "nonempty":
+        _set_pointer(payload, expectation.pointer, "")
+    elif expectation.operator == "okf_document":
+        _set_pointer(payload, expectation.pointer, "---\ntype: invalid\n---\n\nwrong body\n")
     elif expectation.operator == "not_contains":
         _set_pointer(payload, expectation.pointer, deepcopy(expectation.value))
     else:
@@ -808,9 +928,8 @@ def _paired_budget(outcomes: list[TrialOutcome], manifest: Any) -> dict[str, Any
         "cost_usd": cost,
         "wall_seconds": 120.0,
         "model_work_seconds": sum(item.latency_seconds for item in outcomes),
-        "max_model_requests": manifest.budget.max_model_requests,
         "max_total_cost_usd": manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": manifest.budget.max_wall_seconds,
+        "final_reserved_cost_usd": "0",
     }
 
 
@@ -828,7 +947,18 @@ def _catalog_snapshot(manifest: Any, arm: str, transport: str) -> CatalogSnapsho
     for name, selectors in sorted(actions.items()):
         schema: dict[str, Any] = {"type": "object", "properties": {}}
         if selectors:
-            schema["properties"]["action"] = {"type": "string", "enum": sorted(selectors)}
+            schema = {
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"action": {"type": "string", "const": action}},
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    }
+                    for action in sorted(selectors)
+                ],
+            }
         tools.append({"name": name, "description": "synthetic catalog contract fixture", "inputSchema": schema})
     revision = manifest.arm_source_revisions[arm]
     return CatalogSnapshot(
@@ -838,5 +968,10 @@ def _catalog_snapshot(manifest: Any, arm: str, transport: str) -> CatalogSnapsho
         tool_count=len(tools),
         catalog_hash=hash_json(tools),
         catalog_token_estimate=token_estimate(tools),
+        server_discover={
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "instructions": SYNTHETIC_SERVER_INSTRUCTIONS,
+        },
         tools=tools,
     )

@@ -51,7 +51,8 @@ _REL_LIST = ", ".join(LINK_RELATION_TYPES)
 
 # A column's name is the SQL identifier `akb_sql` uses as written, so a header
 # taken from a document often cannot be one (akb#433). The header is not lost:
-# it goes in `description`, which akb_vault_info shows and search indexes.
+# it goes in `description`, which `akb_discover` with the `vault_info` action
+# shows and search indexes.
 _COLUMN_NAME_FIELD = {
     "type": "string",
     "description": (
@@ -65,7 +66,8 @@ _COLUMN_DESCRIPTION_FIELD = {
     "type": "string",
     "description": (
         "What the column holds. When the table comes from a document, put the "
-        "original header here (e.g. `분류`) — akb_vault_info shows it and "
+        "original header here (e.g. `분류`) — `akb_discover` with the "
+        "`vault_info` action shows it and "
         "search indexes it."
     ),
 }
@@ -158,7 +160,8 @@ _SOURCE_TOOLS = [
                         "collection. When given, the doc is placed there and "
                         "`vault`/`collection` are derived from the URI. Use "
                         "this in drill-down chains: paste the `uri` from an "
-                        "`akb_browse` response straight back in."
+                        "`akb_discover` response with the `browse` action "
+                        "straight back in."
                     ),
                 },
                 "vault": {"type": "string", "description": "Target vault name. Required unless `parent` is given."},
@@ -202,14 +205,19 @@ _SOURCE_TOOLS = [
         name="akb_get",
         description=(
             "Retrieve a document by its URI. Returns full content with metadata. "
-            "Use akb_browse or akb_search first to obtain the URI. "
-            "Optionally pass a commit hash (from akb_history) to read a previous version."
+            "Use `akb_discover` with the `browse` or `search` action first to "
+            "obtain the URI. This operation is the `get` action on `akb_document_read`. "
+            "Optionally pass a commit hash (from `akb_document_read` with the "
+            "`history` action) to read a previous version."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"},
-                "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_history)"},
+                "version": {
+                    "type": "string",
+                    "description": "Git commit hash for a specific version (from `akb_document_read` with the `history` action)",
+                },
             },
             "required": ["uri"],
         },
@@ -278,7 +286,7 @@ _SOURCE_TOOLS = [
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "base_commit": {
                     "type": "string",
-                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after akb_get to fail-fast on concurrent writers.",
+                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after `akb_document_read` with the `get` action to fail-fast on concurrent writers.",
                 },
             },
             "required": ["uri", "old_string", "new_string"],
@@ -416,7 +424,8 @@ _SOURCE_TOOLS = [
             "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
             "`collection_summary` and `vault_description` describe the hit's parent "
             "context but do not affect matching or ranking. "
-            "Use akb_drill_down or akb_get with that URI for full content. "
+            "Use `akb_document_read` with the `section` or `get` action and "
+            "that URI for full content. "
             "Response reports `returned` (in `results`) and `total_matches` (size of the "
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
@@ -465,8 +474,9 @@ _SOURCE_TOOLS = [
                     "items": {"type": "string"},
                     "description": (
                         "Restrict the search to a specific set of already-known resources "
-                        "by their canonical akb:// URIs (e.g. from a previous akb_search / "
-                        "akb_browse). Hybrid retrieval (dense + BM25 + ranking) runs only "
+                        "by their canonical akb:// URIs (e.g. from a previous "
+                        "`akb_discover` call with the `search` or `browse` action). "
+                        "Hybrid retrieval (dense + BM25 + ranking) runs only "
                         "inside this set, intersected with the other filters and your access. "
                         "Omit for the normal whole-vault search."
                     ),
@@ -482,7 +492,8 @@ _SOURCE_TOOLS = [
             "On a native Document backend, optionally include admitted "
             "searchable text Files with `include_text_files=true`; binary "
             "Files remain excluded. "
-            "Unlike akb_search (semantic/meaning-based), this finds exact string matches — "
+            "Unlike `akb_discover` with the `search` action (semantic/meaning-based), "
+            "this finds exact string matches — "
             "use it for specific terms, URLs, code snippets, version numbers, etc. "
             "Native matching and replacement use per-line Python regex semantics; "
             "case-insensitive literals use the same Unicode rules as replacement. "
@@ -611,13 +622,17 @@ _SOURCE_TOOLS = [
         description=(
             "Get the content diff for a document at a specific commit. "
             "Shows what was added/removed/modified. "
-            "Use akb_history or akb_activity to find commit hashes first."
+            "Use `akb_document_read` with the `history` or `activity` action to "
+            "find commit hashes first."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
-                "commit": {"type": "string", "description": "Commit hash (from akb_history or akb_activity)"},
+                "commit": {
+                    "type": "string",
+                    "description": "Commit hash (from `akb_document_read` with the `history` or `activity` action)",
+                },
             },
             "required": ["uri", "commit"],
         },
@@ -658,7 +673,7 @@ _SOURCE_TOOLS = [
                     "maximum": 5,
                     "description": (
                         "BFS traversal radius in edge hops. Disambiguated from "
-                        "`akb_browse.depth` (which is collection-tree depth) — "
+                        "the `browse` action on `akb_discover` (which is collection-tree depth) — "
                         "hops here counts relations followed, not folder levels."
                     ),
                 },
@@ -733,7 +748,8 @@ _SOURCE_TOOLS = [
             "same permissions. Define columns with name and type (text, number, "
             "boolean, date, json). Optional `collection` (e.g. 'sessions/learnings') "
             "groups the table under that collection so it appears beside the documents "
-            "and files there in akb_browse; omit for vault root."
+            "and files there through `akb_discover` with the `browse` action; "
+            "omit for vault root."
         ),
         input_schema={
             "type": "object",
@@ -1316,7 +1332,8 @@ _SOURCE_TOOLS = [
         name="akb_history",
         description=(
             "Get version history of a document — who changed it, when, and why. "
-            "Each entry is a Git commit. Use the commit hash with akb_get to read a previous version."
+            "Each entry is a Git commit. Use the commit hash with `akb_document_read` "
+            "and the `get` action to read a previous version."
         ),
         input_schema={
             "type": "object",
@@ -1343,7 +1360,7 @@ _SOURCE_TOOLS = [
                     "description": (
                         "What to get help on. Options: "
                         "categories (quickstart, documents, search, tables, files, access, history, publishing, relations), "
-                        "tool names (akb_put, akb_search, etc.), "
+                        "tool names (akb_put, akb_discover, etc.), "
                         "or workflow names (link-resources, research, onboarding, data-tracking, vault-skill)"
                     ),
                 },

@@ -122,6 +122,24 @@ it("envelope adds kind without breaking legacy fields", () => {
   }
 });
 
+it("tools/list distinguishes Markdown document input from standalone File upload", () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const backendTools = ["akb_put", "akb_update"].map((name) => ({
+    name,
+    description: `${name} backend description`,
+    inputSchema: { type: "object", properties: { content: { type: "string" } } },
+  }));
+  const decorated = proxy._decorateTools({ tools: backendTools });
+  const tools = new Map(decorated.tools.map((tool) => [tool.name, tool]));
+
+  assert.equal(decorated.tools.length, backendTools.length + 6);
+  assert.match(tools.get("akb_put").description, /Markdown document body/);
+  assert.match(tools.get("akb_put").inputSchema.properties.file.description, /Local text-file path/);
+  assert.match(tools.get("akb_update").inputSchema.properties.file.description, /replacement Markdown document body/);
+  assert.match(tools.get("akb_put_file").description, /original local file as a standalone File resource/);
+  assert.match(tools.get("akb_put_file").description, /pass that exact URI to akb_delete_file/);
+});
+
 itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical confirm shape", async () => {
   const directory = await mkdtemp(join(tmpdir(), "akb-mcp-contract-"));
   const filePath = join(directory, "proxy.bin");

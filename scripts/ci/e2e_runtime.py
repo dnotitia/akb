@@ -2211,6 +2211,15 @@ class E2ERuntime:
                         SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
                           INTO table_list
                           FROM pg_tables
+                         WHERE schemaname = 'public'
+                           AND tablename ~ '^vt_catalog_bench_[a-z0-9_]+$';
+                        IF table_list IS NOT NULL THEN
+                            EXECUTE format('DROP TABLE %s CASCADE', table_list);
+                        END IF;
+
+                        SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+                          INTO table_list
+                          FROM pg_tables
                          WHERE schemaname NOT LIKE 'pg_%'
                            AND schemaname <> 'information_schema'
                            AND tablename NOT IN (

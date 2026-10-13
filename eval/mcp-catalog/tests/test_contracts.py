@@ -7,6 +7,7 @@ import pytest
 
 from mcp_catalog.contracts import (
     BenchmarkRunManifest,
+    Budget,
     CatalogSnapshot,
     OPENROUTER_BASE_URL_ENV,
     OPENROUTER_PROVIDER_KEY_ENV,
@@ -16,9 +17,94 @@ from mcp_catalog.contracts import (
     load_tool_coverage,
     source_blind_violations_for,
     token_estimate,
+    validate_public_catalog,
 )
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_budget_contract_contains_only_cost_and_request_timeout_limits() -> None:
+    budget = {
+        "max_total_cost_usd": 50.0,
+        "max_cost_per_trial_usd": 0.1,
+        "request_timeout_seconds": 300,
+    }
+    assert Budget.model_validate(budget).model_dump() == budget
+
+    for retired_limit in ("max_model_requests", "max_wall_seconds", "max_requests_per_trial"):
+        with pytest.raises(ValueError):
+            Budget.model_validate({**budget, retired_limit: 1})
+
+    raw_manifest = json.loads((ROOT / "config" / "run.json").read_text(encoding="utf-8"))
+    assert raw_manifest["budget"] == budget
+
+
+@pytest.mark.parametrize("field", ("max_total_cost_usd", "max_cost_per_trial_usd"))
+@pytest.mark.parametrize("value", (float("inf"), float("-inf"), float("nan"), 0, -1))
+def test_budget_cost_limits_must_be_finite_and_positive(field: str, value: float) -> None:
+    budget = {
+        "max_total_cost_usd": 50.0,
+        "max_cost_per_trial_usd": 0.1,
+        "request_timeout_seconds": 300,
+    }
+
+    with pytest.raises(ValueError):
+        Budget.model_validate({**budget, field: value})
+
+
+def _public_catalog_with_action_selectors(
+    *,
+    selector_form: str,
+    missing_action: tuple[str, str] | None = None,
+) -> CatalogSnapshot:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    arm = "candidate"
+    transport = "http"
+    grouped_routes: dict[str, list[str | None]] = {}
+    for operation in manifest.public_operations:
+        if transport not in operation.transports:
+            continue
+        route = getattr(operation, arm)
+        grouped_routes.setdefault(route.tool, []).append(route.action)
+
+    tools = []
+    for name, actions in sorted(grouped_routes.items()):
+        registered_actions = [action for action in actions if action is not None]
+        if not registered_actions:
+            schema = {"type": "object", "properties": {}}
+        elif selector_form == "enum":
+            schema = {
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": registered_actions}},
+            }
+        else:
+            branches = [
+                {
+                    "type": "object",
+                    "properties": {"action": {"type": "string", "const": action}},
+                    "required": ["action"],
+                    "additionalProperties": False,
+                }
+                for action in registered_actions
+                if missing_action != (name, action)
+            ]
+            schema = {"type": "object", "oneOf": branches}
+        tools.append({"name": name, "inputSchema": schema})
+
+    return CatalogSnapshot(
+        transport=transport,
+        source_revision=manifest.arm_source_revisions[arm],
+        artifact_version="test",
+        tool_count=len(tools),
+        catalog_hash=hash_json(tools),
+        catalog_token_estimate=token_estimate(tools),
+        server_discover={
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "instructions": "Synthetic server instructions.",
+        },
+        tools=tools,
+    )
 
 
 def test_registered_manifest_and_corpus_cover_every_category() -> None:
@@ -56,15 +142,16 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
             input_price=model.input_cost_per_million_usd,
             output_price=model.output_cost_per_million_usd,
         )["provider"]
-        assert provider["order"] == ["parasail"]
+        assert provider["order"] == model.routing.order
         assert provider["allow_fallbacks"] is False
         assert provider["require_parameters"] is True
         assert provider["quantizations"] == ["fp8"]
         assert "models" not in provider
-    assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.14, 0.28)
-    assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.24, 2.2)
+    assert [model.routing.order for model in manifest.models] == [["deepinfra"], ["akashml"]]
+    assert (manifest.models[0].input_cost_per_million_usd, manifest.models[0].output_cost_per_million_usd) == (0.06, 0.18)
+    assert (manifest.models[1].input_cost_per_million_usd, manifest.models[1].output_cost_per_million_usd) == (0.225, 1.98)
     assert manifest.budget.max_cost_per_trial_usd == 0.1
-    assert manifest.budget.max_requests_per_trial == 24
+    assert manifest.budget.request_timeout_seconds == 300
     assert {model.settings["max_tokens"] for model in manifest.models} == {8192}
 
     absent_before_pairs = {
@@ -98,12 +185,17 @@ def test_registered_manifest_and_corpus_cover_every_category() -> None:
         imported_files = import_attempt.arguments["files"]
         assert isinstance(imported_files, dict)
         imported_text = imported_files["notes/imported.md"]
-        exported_text = task.expected_final_state.additional_observations[0].must[0].value
+        export = task.expected_final_state.additional_observations[0].must[0]
+        exported_text = export.value
         assert isinstance(imported_text, str)
-        assert isinstance(exported_text, str)
-        assert exported_text == imported_text
-        assert "\n" in exported_text
-        assert "\\n" not in exported_text
+        assert isinstance(exported_text, dict)
+        assert imported_text == "---\ntype: note\n---\n# Imported\nportable"
+        assert export.operator == "okf_document"
+        assert exported_text == {
+            "type": "note",
+            "resource_uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+            "body": "# Imported\nportable",
+        }
 
 
 def test_manifest_rejects_expanded_public_operation_drift() -> None:
@@ -114,14 +206,24 @@ def test_manifest_rejects_expanded_public_operation_drift() -> None:
         BenchmarkRunManifest.model_validate(raw)
 
 
-def test_manifest_rejects_provider_or_price_drift() -> None:
+def test_manifest_treats_configured_model_prices_as_finite_ceilings() -> None:
     raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
     raw["models"][0]["input_cost_per_million_usd"] = 0.15
+    raw["models"][0]["output_cost_per_million_usd"] = 0.3
 
-    with pytest.raises(ValueError, match="price ceiling"):
-        BenchmarkRunManifest.model_validate(raw)
+    manifest = BenchmarkRunManifest.model_validate(raw)
+    assert manifest.models[0].input_cost_per_million_usd == 0.15
+    assert manifest.models[0].output_cost_per_million_usd == 0.3
 
-    raw["models"][0]["input_cost_per_million_usd"] = 0.14
+    for price in (0.0, -0.1, float("nan"), float("inf"), float("-inf")):
+        invalid = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+        invalid["models"][0]["input_cost_per_million_usd"] = price
+        with pytest.raises(ValueError):
+            BenchmarkRunManifest.model_validate(invalid)
+
+
+def test_manifest_rejects_provider_or_output_limit_drift() -> None:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
     raw["models"][0]["routing"]["allow_fallbacks"] = True
     with pytest.raises(ValueError):
         BenchmarkRunManifest.model_validate(raw)
@@ -129,6 +231,18 @@ def test_manifest_rejects_provider_or_price_drift() -> None:
     raw["models"][0]["routing"]["allow_fallbacks"] = False
     raw["models"][0]["settings"]["max_tokens"] = 2048
     with pytest.raises(ValueError, match="output limits"):
+        BenchmarkRunManifest.model_validate(raw)
+
+
+def test_manifest_rejects_multiple_or_invalid_provider_slugs() -> None:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    raw["models"][0]["routing"]["order"] = ["deepinfra", "akashml"]
+
+    with pytest.raises(ValueError):
+        BenchmarkRunManifest.model_validate(raw)
+
+    raw["models"][0]["routing"]["order"] = ["DeepInfra"]
+    with pytest.raises(ValueError, match="lowercase OpenRouter provider slug"):
         BenchmarkRunManifest.model_validate(raw)
 
 
@@ -162,6 +276,11 @@ def test_catalog_hash_and_schema_preservation_are_deterministic() -> None:
         tool_count=1,
         catalog_hash=hash_json(tools),
         catalog_token_estimate=token_estimate(tools),
+        server_discover={
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "instructions": "Synthetic server instructions.",
+        },
         tools=tools,
     )
 
@@ -181,5 +300,35 @@ def test_catalog_snapshot_rejects_tampered_hash() -> None:
             tool_count=1,
             catalog_hash="0" * 64,
             catalog_token_estimate=token_estimate(tools),
+            server_discover={
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {},
+                "instructions": "Synthetic server instructions.",
+            },
             tools=tools,
         )
+
+
+def test_public_catalog_accepts_grouped_one_of_const_actions() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(selector_form="oneOf")
+
+    validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_public_catalog_rejects_missing_grouped_one_of_action_branch() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(
+        selector_form="oneOf",
+        missing_action=("akb_identity", "whoami"),
+    )
+
+    with pytest.raises(ValueError, match="candidate catalog action akb_identity:whoami"):
+        validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_public_catalog_still_accepts_top_level_action_enum() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    snapshot = _public_catalog_with_action_selectors(selector_form="enum")
+
+    validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)

@@ -7,19 +7,18 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.models.openrouter import OpenRouterProviderConfig
 
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 2
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
-OPENROUTER_PRICE_CEILINGS = {
-    "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
-    "qwen/qwen3.8-27b": (0.24, 2.20),
-}
 OPENROUTER_CLASSES = {
     "primary": "deepseek/deepseek-v4-flash-0731",
     "lightweight": "qwen/qwen3.8-27b",
@@ -150,7 +149,7 @@ class ContractModel(BaseModel):
 
 
 class StateProbeResultBinding(ContractModel):
-    source_attempt: int = Field(ge=1)
+    source_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
     transform: Literal["document_asset_id_from_url", "publication_slug", "uri_query"]
 
@@ -181,13 +180,31 @@ class StateProbe(ContractModel):
 
 class StateExpectation(ContractModel):
     pointer: str = Field(pattern=JSON_POINTER_RE.pattern)
-    operator: Literal["equals", "contains", "not_contains", "exists"]
+    operator: Literal["equals", "contains", "not_contains", "exists", "nonempty", "okf_document"]
     value: JsonValue = None
 
     @model_validator(mode="after")
     def validate_value(self) -> StateExpectation:
         if self.operator == "exists" and not isinstance(self.value, bool):
             raise ValueError("exists expectations require a boolean value")
+        if self.operator == "nonempty" and self.value is not None:
+            raise ValueError("nonempty expectations do not accept a value")
+        if self.operator == "okf_document":
+            fields = {"type", "resource_uri", "body"}
+            if not isinstance(self.value, dict) or set(self.value) != fields:
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            document_type = self.value["type"]
+            resource_uri = self.value["resource_uri"]
+            body = self.value["body"]
+            if (
+                not isinstance(document_type, str)
+                or not document_type
+                or not isinstance(resource_uri, str)
+                or not resource_uri.startswith("akb://")
+                or not isinstance(body, str)
+            ):
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            return self
         if self.operator in {"equals", "contains", "not_contains"} and self.value is None:
             raise ValueError(f"{self.operator} expectations require value")
         return self
@@ -367,6 +384,7 @@ class ExpectedMaterialOutcome(ContractModel):
 
 
 class ExpectedMaterialAttempt(ContractModel):
+    stage_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     logical_operation: str
     tool_name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
     resource_type: ResourceType | None = None
@@ -414,34 +432,41 @@ class ExpectedMaterialAttempt(ContractModel):
 
 
 class ExpectedResultBinding(ContractModel):
-    source_attempt: int = Field(ge=1)
+    source_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
-    target_attempt: int = Field(ge=1)
+    target_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     target_argument: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
-    relation: Literal["equals", "contains"] = "contains"
-
-    @model_validator(mode="after")
-    def validate_binding_order(self) -> ExpectedResultBinding:
-        if self.source_attempt >= self.target_attempt:
-            raise ValueError("material result bindings must reference an earlier attempt")
-        return self
-
+    relation: Literal["equals", "contains", "collection_uri"] = "contains"
 
 class ProviderRouting(ContractModel):
-    order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
+    order: list[str] = Field(min_length=1, max_length=1)
     allow_fallbacks: Literal[False] = False
     require_parameters: Literal[True] = True
     quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
-    def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
-        return {
-            "provider": {
-                "order": ["parasail"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-                "quantizations": ["fp8"],
+    @field_validator("order")
+    @classmethod
+    def validate_provider_slug(cls, value: list[str]) -> list[str]:
+        if len(value) != 1 or re.fullmatch(
+            r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*",
+            value[0],
+        ) is None:
+            raise ValueError("provider routing order must contain one lowercase OpenRouter provider slug")
+        return value
+
+    def request_body(self, *, input_price: float, output_price: float) -> dict[str, Any]:
+        provider = cast(
+            OpenRouterProviderConfig,
+            {
+                "order": self.order,
+                "allow_fallbacks": self.allow_fallbacks,
+                "require_parameters": self.require_parameters,
+                "quantizations": self.quantizations,
                 "max_price": {"prompt": input_price, "completion": output_price},
-            }
+            },
+        )
+        return {
+            "provider": provider,
         }
 
 
@@ -577,6 +602,10 @@ class TaskManifest(ContractModel):
         expected_attempt_operations = [item.logical_operation for item in self.expected_material_attempts]
         if not set(expected_attempt_operations) <= set(self.allowed_material_operations):
             raise ValueError("expected material attempts must be material operations")
+        stage_ids = [item.stage_id for item in self.expected_material_attempts]
+        if len(set(stage_ids)) != len(stage_ids):
+            raise ValueError("expected material stage identifiers must be unique")
+        stage_positions = {stage_id: index for index, stage_id in enumerate(stage_ids, start=1)}
         accepted_operations = set(self.allowed_preparatory_operations) | set(self.allowed_material_operations)
         if any(
             not set(behavior.required_operations) <= accepted_operations
@@ -610,23 +639,25 @@ class TaskManifest(ContractModel):
         ]
         if Counter(attempted_local_files) != Counter(self.fixture.local_files):
             raise ValueError("every fixture local file must be used by exactly one expected material attempt")
-        binding_targets: set[tuple[int, str]] = set()
+        binding_targets: set[tuple[str, str]] = set()
         for binding in self.expected_result_bindings:
-            if binding.target_attempt > len(self.expected_material_attempts) or binding.source_attempt > len(self.expected_material_attempts):
-                raise ValueError("material result binding attempt is outside the expected attempt sequence")
-            target = self.expected_material_attempts[binding.target_attempt - 1]
+            if binding.source_stage not in stage_positions or binding.target_stage not in stage_positions:
+                raise ValueError("material result binding references an unknown stage")
+            if stage_positions[binding.source_stage] >= stage_positions[binding.target_stage]:
+                raise ValueError("material result bindings must reference an earlier stage")
+            target = self.expected_material_attempts[stage_positions[binding.target_stage] - 1]
             if binding.target_argument in target.arguments or binding.target_argument in target.local_file_arguments:
                 raise ValueError("bound target arguments cannot also have static expected values")
-            target_key = (binding.target_attempt, binding.target_argument)
+            target_key = (binding.target_stage, binding.target_argument)
             if target_key in binding_targets:
                 raise ValueError("material result binding targets must be unique")
             binding_targets.add(target_key)
         captured_fields = {
-            (index, field_name)
-            for index, attempt in enumerate(self.expected_material_attempts, start=1)
+            (attempt.stage_id, field_name)
+            for attempt in self.expected_material_attempts
             for field_name in attempt.capture_result_fields
         } | {
-            (binding.source_attempt, binding.source_field)
+            (binding.source_stage, binding.source_field)
             for binding in self.expected_result_bindings
         }
         for observation in self.expected_final_state.observation_sets:
@@ -634,17 +665,19 @@ class TaskManifest(ContractModel):
             if probe_binding is not None and observation.check_before:
                 raise ValueError("result-bound state probes can only be checked after their source attempt")
             if probe_binding is not None and (
-                probe_binding.source_attempt > len(self.expected_material_attempts)
-                or (probe_binding.source_attempt, probe_binding.source_field) not in captured_fields
+                probe_binding.source_stage not in stage_positions
+                or (probe_binding.source_stage, probe_binding.source_field) not in captured_fields
             ):
                 raise ValueError("dynamic state probes must bind a captured result from an expected material attempt")
         for checkpoint in self.expected_final_state.checkpoints:
             checkpoint_binding = checkpoint.probe.result_binding
-            if checkpoint_binding is not None and checkpoint_binding.source_attempt > checkpoint.after_attempt:
+            if checkpoint_binding is not None and (
+                checkpoint_binding.source_stage not in stage_positions
+                or stage_positions[checkpoint_binding.source_stage] > checkpoint.after_attempt
+            ):
                 raise ValueError("state checkpoint bindings must reference an earlier material result")
             if checkpoint_binding is not None and (
-                checkpoint_binding.source_attempt > len(self.expected_material_attempts)
-                or (checkpoint_binding.source_attempt, checkpoint_binding.source_field) not in captured_fields
+                (checkpoint_binding.source_stage, checkpoint_binding.source_field) not in captured_fields
             ):
                 raise ValueError("dynamic state checkpoints must bind a captured material result")
         checkpoint_attempts = [item.after_attempt for item in self.expected_final_state.checkpoints]
@@ -761,8 +794,8 @@ class ModelSpec(ContractModel):
     provider_key_env: str = Field(min_length=1, max_length=100)
     routing: ProviderRouting
     settings: dict[str, JsonValue] = Field(default_factory=dict)
-    input_cost_per_million_usd: float = Field(gt=0)
-    output_cost_per_million_usd: float = Field(gt=0)
+    input_cost_per_million_usd: float = Field(gt=0, allow_inf_nan=False)
+    output_cost_per_million_usd: float = Field(gt=0, allow_inf_nan=False)
 
     @field_validator("base_url_env", "provider_key_env")
     @classmethod
@@ -779,9 +812,6 @@ class ModelSpec(ContractModel):
             raise ValueError(f"{self.class_name} alias/version must be pinned to {expected_model}@{expected_version}")
         if self.base_url_env != OPENROUTER_BASE_URL_ENV or self.provider_key_env != OPENROUTER_PROVIDER_KEY_ENV:
             raise ValueError("OpenRouter model credentials must use the declared environment names")
-        expected_prices = OPENROUTER_PRICE_CEILINGS[self.model_id]
-        if (self.input_cost_per_million_usd, self.output_cost_per_million_usd) != expected_prices:
-            raise ValueError(f"price ceiling for {self.model_id} does not match the registered model contract")
         if set(self.settings) != {"temperature", "max_tokens"}:
             raise ValueError("model settings must contain only temperature and max_tokens")
         max_tokens = self.settings.get("max_tokens")
@@ -793,20 +823,9 @@ class ModelSpec(ContractModel):
 
 
 class Budget(ContractModel):
-    max_model_requests: int = Field(gt=0)
-    max_total_cost_usd: float = Field(gt=0)
-    max_wall_seconds: int = Field(gt=0)
+    max_total_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     request_timeout_seconds: int = Field(gt=0)
-    max_requests_per_trial: int = Field(gt=0)
-    max_cost_per_trial_usd: float = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_limits(self) -> Budget:
-        if self.max_requests_per_trial > self.max_model_requests:
-            raise ValueError("per-trial request cap cannot exceed global request cap")
-        if self.request_timeout_seconds > self.max_wall_seconds:
-            raise ValueError("request timeout cannot exceed the global wall limit")
-        return self
+    max_cost_per_trial_usd: float = Field(gt=0, allow_inf_nan=False)
 
 
 class StatisticalProcedure(ContractModel):
@@ -1032,7 +1051,8 @@ class BenchmarkRunManifest(ContractModel):
             or supplied_by_operation != derived_by_operation
         ):
             raise ValueError("expanded public_operations do not match the derived execution contract")
-        object.__setattr__(self, "public_operations", derived_operations)
+        if not self.public_operations:
+            object.__setattr__(self, "public_operations", derived_operations)
         expected_transport_counts = {"http": {"baseline": 45, "candidate": 33}, "stdio": {"baseline": 51, "candidate": 39}}
         for arm in ("baseline", "candidate"):
             for transport in ("http", "stdio"):
@@ -1134,11 +1154,6 @@ class BenchmarkRunManifest(ContractModel):
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
-        required_trials = trials_per_arm * len(self.arms)
-        smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
-        if self.budget.max_model_requests < required_trials + smoke_cells:
-            raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
         if len(self.pair_categories) != 20 or len(tasks) != 40:
             raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
         if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:
@@ -1215,7 +1230,7 @@ class BenchmarkRunManifest(ContractModel):
 
 
 class CatalogSnapshot(ContractModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     source: Literal["server_tools_list"] = "server_tools_list"
     protocol_revision: Literal["2026-07-28"] = "2026-07-28"
     transport: Transport
@@ -1226,6 +1241,7 @@ class CatalogSnapshot(ContractModel):
     catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     catalog_token_estimate: int = Field(ge=0)
     token_estimator: Literal["utf8_bytes_div_4_ceiling"] = "utf8_bytes_div_4_ceiling"
+    server_discover: dict[str, JsonValue]
     tools: list[dict[str, JsonValue]]
     harness_filtering: Literal[False] = False
     lazy_discovery: Literal[False] = False
@@ -1233,6 +1249,12 @@ class CatalogSnapshot(ContractModel):
 
     @model_validator(mode="after")
     def validate_catalog(self) -> CatalogSnapshot:
+        versions = self.server_discover.get("supportedVersions")
+        instructions = self.server_discover.get("instructions")
+        if not isinstance(versions, list) or self.protocol_revision not in versions:
+            raise ValueError("server_discover does not confirm the pinned protocol revision")
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ValueError("server_discover must include the actual non-empty server instructions")
         if self.tool_count != len(self.tools):
             raise ValueError("tool_count must match tools length")
         expected_hash = hash_json(self.tools)
@@ -1279,13 +1301,48 @@ def validate_public_catalog(
             continue
         tool = by_name.get(route.tool, {})
         schema = tool.get("inputSchema", tool.get("input_schema", {}))
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        action_schema = properties.get("action", {}) if isinstance(properties, dict) else {}
-        allowed = action_schema.get("enum") if isinstance(action_schema, dict) else None
-        if not isinstance(allowed, list) or route.action not in allowed:
+        if not isinstance(schema, dict) or not _input_schema_exposes_action(schema, route.action):
             raise ValueError(
                 f"{arm} catalog action {route.tool}:{route.action} is missing from the public input schema"
             )
+
+
+def _input_schema_exposes_action(schema: dict[str, Any], action: str) -> bool:
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+
+    properties = schema.get("properties")
+    action_schema = properties.get("action") if isinstance(properties, dict) else None
+    enum_declared = isinstance(action_schema, dict) and "enum" in action_schema
+    if enum_declared and not validator_type(action_schema).is_valid(action):
+        return False
+
+    if "oneOf" not in schema:
+        return enum_declared
+
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or not branches:
+        return False
+    matching_branches = 0
+    for branch in branches:
+        if not isinstance(branch, dict) or branch.get("type") != "object":
+            return False
+        required = branch.get("required")
+        branch_properties = branch.get("properties")
+        branch_action = branch_properties.get("action") if isinstance(branch_properties, dict) else None
+        if (
+            not isinstance(required, list)
+            or "action" not in required
+            or not isinstance(branch_action, dict)
+            or "const" not in branch_action
+        ):
+            return False
+        if validator_type(branch_action).is_valid(action):
+            matching_branches += 1
+    return matching_branches == 1
 
 
 def canonical_json(value: Any) -> str:

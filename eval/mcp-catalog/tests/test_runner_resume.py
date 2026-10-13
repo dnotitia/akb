@@ -1,20 +1,95 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import mcp_catalog.runner as runner_module
-from mcp_catalog.contracts import load_run_manifest, load_task_corpus
+from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import ToolCallRecord, TrialOutcome
-from mcp_catalog.runner import BenchmarkRunner
+from mcp_catalog.runner import (
+    BenchmarkRunner,
+    CredentialResolver,
+    _provider_registry_invariant_hash,
+)
 from mcp_catalog.runtime import RuntimeDescriptor
-from paired_artifact_factory import _catalog_snapshot, provider_registry_snapshot
+from paired_artifact_factory import (
+    SYNTHETIC_SERVER_INSTRUCTIONS,
+    _catalog_snapshot,
+    provider_name_for_model,
+    provider_registry_snapshot,
+    synthetic_model_input_evidence,
+)
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_credential_resolver_supplies_the_complete_secret_set_for_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    descriptor = SimpleNamespace(
+        pat_env="MCP_BENCH_PAT",
+        username_env="MCP_BENCH_USERNAME",
+        password_env="MCP_BENCH_PASSWORD",  # pragma: allowlist secret
+    )
+    monkeypatch.setenv("MCP_BENCH_USERNAME", "synthetic-user")
+    monkeypatch.setenv("MCP_BENCH_PASSWORD", "synthetic-password")
+    monkeypatch.setenv("MCP_BENCH_PAT", "environment-pat")
+    resolver = CredentialResolver(manifest, descriptor, ("model-api-key",))
+    resolver.tokens = {"default": "active-pat"}
+    resolver.issued_tokens.add("other-issued-token")
+
+    supplied = set(resolver.secrets_for("default"))
+
+    assert {
+        "model-api-key",
+        "active-pat",
+        "other-issued-token",
+        "synthetic-user",
+        "synthetic-password",
+        "environment-pat",
+    } <= supplied
+
+
+def test_provider_registry_resume_ignores_dynamic_metrics_and_pins_route_parameters() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    frozen = provider_registry_snapshot(manifest)
+    current = deepcopy(frozen)
+    for registered in current["models"].values():
+        for entry in (registered["model_record"], registered["selected_endpoint"]):
+            entry.update(
+                {
+                    "throughput": 2.0,
+                    "latency": 0.4,
+                    "uptime": 0.999,
+                    "request_count": 20,
+                    "perf_last_30m_by_workload": {
+                        "tool_calls": {"request_count": 20, "latency": 0.4}
+                    },
+                }
+            )
+    current["snapshot_hash"] = hash_json(
+        {key: value for key, value in current.items() if key != "snapshot_hash"}
+    )
+
+    assert _provider_registry_invariant_hash(frozen, manifest) == _provider_registry_invariant_hash(
+        current,
+        manifest,
+    )
+
+    drifted = deepcopy(frozen)
+    first_model = manifest.models[0].model_id
+    drifted["models"][first_model]["selected_endpoint"]["supported_parameters"].append(
+        "response_format"
+    )
+    assert _provider_registry_invariant_hash(frozen, manifest) != _provider_registry_invariant_hash(
+        drifted,
+        manifest,
+    )
 
 
 class _RunResolver:
@@ -111,7 +186,16 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         provider_evidence=[
             {
                 "model": model_id,
-                "routing": {"endpoints": {"available": [{"provider": "Parasail", "selected": True, "quantization": "fp8"}]}},
+                "routing": {
+                    "requested": model_id,
+                    "endpoints": {
+                        "available": [{
+                            "model": runner_module._expected_openrouter_canonical_slug(executor.model_spec),
+                            "provider": provider_name_for_model(executor.model_spec),
+                            "selected": True,
+                        }]
+                    },
+                },
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
             for _ in range(2)
@@ -120,6 +204,8 @@ def _valid_outcome(task, executor, repeat_index: int) -> TrialOutcome:
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        server_instructions_sha256=hashlib.sha256(SYNTHETIC_SERVER_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        model_input_evidence=synthetic_model_input_evidence(2),
         state_available_before=True,
         state_available_after=True,
         state_before=_empty_state_payload(task),
@@ -165,6 +251,7 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     resolver = _RunResolver()
     smoke_calls: list[str] = []
     evaluation_calls: list[str] = []
+    provider_capture_calls: list[str] = []
 
     async def fake_preflight(_self):
         return {
@@ -211,6 +298,7 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     monkeypatch.setattr(runner_module, "RuntimeFixture", _RunFixture)
     monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
     async def fake_provider_registry(self, _ledger):
+        provider_capture_calls.append(self.arm)
         self.provider_registry = provider_registry_snapshot(manifest)
         return self.provider_registry
 
@@ -233,6 +321,9 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     assert first_artifact["runs"]["primary:http"]["locale_metrics"]
     assert len(smoke_calls) == 4
     assert len(evaluation_calls) == 8
+    assert provider_capture_calls == ["baseline"]
+    first_registry_hash = first_artifact["checkpoint"]["provider_registry_hash"]
+    assert first_registry_hash is not None
 
     smoke_calls.clear()
     evaluation_calls.clear()
@@ -246,6 +337,8 @@ async def test_runner_resume_reuses_completed_trials_and_preserves_hash_input(
     assert second_artifact["checkpoint"]["rerun_trials"] == 0
     assert smoke_calls == []
     assert evaluation_calls == []
+    assert provider_capture_calls == ["baseline"]
+    assert second_artifact["checkpoint"]["provider_registry_hash"] == first_registry_hash
     assert first_artifact["artifact_hash"] == second_artifact["artifact_hash"]
     assert first_artifact["artifact_hash_input"] == second_artifact["artifact_hash_input"]
     assert second_artifact["end_to_end_wall_seconds"] > first_artifact["end_to_end_wall_seconds"]
