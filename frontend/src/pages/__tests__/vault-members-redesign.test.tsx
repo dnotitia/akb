@@ -37,25 +37,34 @@ const getVaultMembersMock = getVaultMembers as unknown as ReturnType<
 
 const MEMBERS = [
   {
+    id: "user-owner",
     username: "kwoo",
     display_name: "Vault Owner",
     email: "owner@example.com",
     role: "owner",
     since: "2026-03-14T00:00:00Z",
+    account_kind: "human",
+    account_status: "active",
   },
   {
+    id: "user-mina",
     username: "mina",
     display_name: "Mina Park",
     email: "mina@example.com",
     role: "writer",
     since: "2026-04-02T00:00:00Z",
+    account_kind: "human",
+    account_status: "active",
   },
   {
+    id: "user-dana",
     username: "dana",
     display_name: "Dana Lee",
     email: "dana@example.com",
     role: "reader",
     since: "2026-06-20T00:00:00Z",
+    account_kind: "human",
+    account_status: "active",
   },
 ] as const;
 
@@ -71,7 +80,7 @@ function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  getMeMock.mockResolvedValue({ username: "kwoo" });
+  getMeMock.mockResolvedValue({ user_id: "user-owner", username: "kwoo" });
   getVaultInfoMock.mockResolvedValue({
     name: "platform-docs",
     role: "owner",
@@ -155,9 +164,12 @@ describe("Vault Members redesign", () => {
       members: [
         ...MEMBERS,
         ...Array.from({ length: 8 }, (_, i) => ({
+          id: `user-${i}`,
           username: `user-${i}`,
           email: `user${i}@example.com`,
           role: "reader",
+          account_kind: "human",
+          account_status: "active",
         })),
       ],
     });
@@ -216,7 +228,7 @@ describe("Vault Members redesign", () => {
     ).toBeInTheDocument();
 
     await user.click(screen.getByRole("menuitem", { name: "Revoke access" }));
-    expect(await screen.findByText("Revoke mina?")).toBeInTheDocument();
+    expect(await screen.findByText("Revoke Mina Park (@mina)?")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Revoke access" }),
     ).toBeInTheDocument();
@@ -229,7 +241,7 @@ describe("Vault Members redesign", () => {
       role_source: "member",
       public_access: "none",
     });
-    getMeMock.mockResolvedValue({ username: "dana" });
+    getMeMock.mockResolvedValue({ user_id: "user-dana", username: "dana" });
     renderPage();
 
     await waitFor(() =>
@@ -256,11 +268,15 @@ describe("Vault Members redesign", () => {
       await screen.findByRole("button", { name: "Change role for mina" }),
     );
     await user.click(screen.getByRole("menuitemradio", { name: "admin" }));
-    expect(grantAccess).toHaveBeenCalledWith("platform-docs", "mina", "admin");
+    expect(grantAccess).toHaveBeenCalledWith(
+      "platform-docs",
+      { id: "user-mina", username: "mina" },
+      "admin",
+    );
     await user.click(await screen.findByRole("button", { name: "Undo" }));
     expect(grantAccess).toHaveBeenLastCalledWith(
       "platform-docs",
-      "mina",
+      { id: "user-mina", username: "mina" },
       "writer",
     );
     await waitFor(() =>
@@ -286,7 +302,10 @@ describe("Vault Members redesign", () => {
       await user.click(
         within(screen.getByRole("dialog")).getByRole("button", { name: label }),
       );
-      expect(api).toHaveBeenCalledWith("platform-docs", "mina");
+      expect(api).toHaveBeenCalledWith("platform-docs", {
+        id: "user-mina",
+        username: "mina",
+      });
       await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
       expect(getVaultMembers).toHaveBeenCalledTimes(2);
     },
@@ -311,7 +330,7 @@ describe("Vault Members redesign", () => {
       role_source: "member",
       public_access: "reader",
     });
-    getMeMock.mockResolvedValue({ username: "admin-user" });
+    getMeMock.mockResolvedValue({ user_id: "user-admin", username: "admin-user" });
     renderPage();
 
     expect(

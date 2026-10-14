@@ -74,7 +74,10 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
     }
   }
 
-  const label = user?.display_name || user?.username || "Account";
+  const label = user?.display_name?.trim() || user?.username || "Account";
+  const identityLabel = user?.username
+    ? `${label} (@${user.username})${user.email ? `, ${user.email}` : ""}`
+    : label;
   // Glyph casing is CSS-only (`uppercase` on the avatar), not a JS transform of
   // the user-supplied display name (§8).
   const initials = initialsFor(label);
@@ -93,8 +96,8 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
       <DropdownMenu.Trigger
         ref={trigger}
         id="account-menu-trigger"
-        aria-label={`Account menu — ${label}`}
-        title={label}
+        aria-label={`Account menu — ${identityLabel}`}
+        title={identityLabel}
         className="group inline-flex h-9 min-w-9 shrink-0 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] bg-transparent p-1 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:bg-surface-selected sm:max-w-52 sm:pr-1.5"
       >
         <span
@@ -132,6 +135,11 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
               <TooltipText as="div" className="truncate text-sm font-semibold text-foreground">
                 {label}
               </TooltipText>
+              {user?.username && (
+                <TooltipText as="div" className="truncate text-xs text-foreground-muted">
+                  @{user.username}
+                </TooltipText>
+              )}
               {user?.email && (
                 <TooltipText as="div" className="truncate text-xs text-foreground-muted">
                   {user.email}

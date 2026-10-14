@@ -147,15 +147,24 @@ export default function AuthPage() {
       focusField(FIELD_IDS[firstInvalid]);
       return;
     }
-    const username = (mode === "login" ? login.username : register.username).trim();
+    let username = (mode === "login" ? login.username : register.username).trim();
     const password = mode === "login" ? login.password : register.password;
     setLoading(true);
     try {
       if (mode === "register") {
-        const reg = await authRegister(username, register.email.trim(), password, register.displayName || undefined);
+        const displayName = register.displayName.trim();
+        const reg = await authRegister(
+          username,
+          register.email.trim(),
+          password,
+          displayName || undefined,
+        );
         if (reg.error) {
           setMessage({ kind: "error", text: reg.error });
           return;
+        }
+        if (typeof reg.username === "string" && reg.username) {
+          username = reg.username;
         }
       }
       const r = await authLogin(username, password);
@@ -369,14 +378,23 @@ function confirmError(draft: RegisterDraft): string | undefined {
 
 function validateLogin(draft: LoginDraft): FieldErrors {
   return {
-    username: draft.username.trim() ? undefined : "Enter your username.",
+    username: draft.username.trim() ? undefined : "Enter your username or email.",
     password: draft.password ? undefined : "Enter your password.",
   };
 }
 
 function validateRegister(draft: RegisterDraft): FieldErrors {
+  const username = draft.username.trim();
+  const usernameLength = Array.from(username).length;
+  const validUsername = /^[\p{L}\p{N}](?:[\p{L}\p{N}._-]*[\p{L}\p{N}])?$/u;
   return {
-    username: draft.username.trim() ? undefined : "Enter a username.",
+    username: !username
+      ? "Enter a username."
+      : usernameLength < 3 || usernameLength > 32
+        ? "Use 3–32 characters."
+        : validUsername.test(username)
+          ? undefined
+          : "Use letters, numbers, periods, underscores, or hyphens; start and end with a letter or number.",
     email: !draft.email.trim()
       ? "Enter your email address."
       : /^[^\s@]+@[^\s@]+$/.test(draft.email.trim()) ? undefined : "Enter a valid email address.",
@@ -418,12 +436,30 @@ function AuthForm({ mode, focusId, onFocused, values, onChange, onBlurConfirm, f
     <form ref={formRef} onSubmit={onSubmit} noValidate className="space-y-4">
       {message?.kind === "info" && <Alert variant="info" id="auth-message">{message.text}</Alert>}
 
-      <Field label="Username" {...field("username")} autoComplete="username" name="username" autoFocus />
+      <Field
+        label={register ? "Username" : "Username or email"}
+        {...field("username")}
+        autoComplete="username"
+        name="username"
+        autoFocus
+        hint={
+          register
+            ? "Used to sign in and identify you when sharing Vaults. Use 3–32 letters, numbers, periods, underscores, or hyphens."
+            : undefined
+        }
+      />
 
       {register && (
         <>
           <Field label="Email" {...field("email")} type="email" autoComplete="email" name="email" />
-          <Field label="Display name" {...field("displayName")} autoComplete="name" name="display_name" optional />
+          <Field
+            label="Display name"
+            {...field("displayName")}
+            autoComplete="name"
+            name="display_name"
+            optional
+            hint="Shown to collaborators. It does not need to be unique and can be changed later."
+          />
         </>
       )}
 

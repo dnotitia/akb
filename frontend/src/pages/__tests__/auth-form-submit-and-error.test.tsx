@@ -91,7 +91,7 @@ describe("AuthPage · login happy path", () => {
     mockedLogin.mockResolvedValue({ token: "tok-xyz" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText(/^Username(?: or email)?$/), "alice");
     await u.type(screen.getByLabelText("Password"), "pw-1234");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await waitFor(() =>
@@ -104,12 +104,12 @@ describe("AuthPage · login happy path", () => {
 
 describe("AuthPage · register flow", () => {
   it("calls authRegister with (username, email, password, displayName), then logs in", async () => {
-    mockedRegister.mockResolvedValue({});
+    mockedRegister.mockResolvedValue({ username: "bob" });
     mockedLogin.mockResolvedValue({ token: "tok-new" });
     const u = userEvent.setup();
     renderAuth();
     await u.click(await screen.findByRole("tab", { name: "Create account" }));
-    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
     // 8+ chars — register enforces a client-side minimum (matching the
     // backend change_password rule) so accounts can't get an unchangeable pw.
@@ -129,6 +129,24 @@ describe("AuthPage · register flow", () => {
     );
     expect(mockedSetToken).toHaveBeenCalledWith("tok-new");
   });
+
+  it("uses the canonical username returned by registration for automatic login", async () => {
+    mockedRegister.mockResolvedValue({ username: "mixed.case" });
+    mockedLogin.mockResolvedValue({ token: "tok-canonical" });
+    const u = userEvent.setup();
+    renderAuth();
+    await u.click(await screen.findByRole("tab", { name: "Create account" }));
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "Mixed.Case");
+    await u.type(screen.getByLabelText("Email"), "mixed@example.test");
+    await u.type(screen.getByLabelText("Password"), "pw-12345");
+    await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
+    await u.click(screen.getByRole("button", { name: /create account/i }));
+
+    await waitFor(() =>
+      expect(mockedLogin).toHaveBeenCalledWith("mixed.case", "pw-12345"),
+    );
+    expect(mockedSetToken).toHaveBeenCalledWith("tok-canonical");
+  });
 });
 
 describe("AuthPage · error surface", () => {
@@ -136,7 +154,7 @@ describe("AuthPage · error surface", () => {
     mockedLogin.mockResolvedValue({ error: "Bad credentials" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText(/^Username(?: or email)?$/), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");
@@ -149,7 +167,7 @@ describe("AuthPage · error surface", () => {
     mockedLogin.mockResolvedValue({ error: "Bad credentials" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText(/^Username(?: or email)?$/), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await screen.findByRole("alert");
@@ -171,7 +189,7 @@ describe("AuthPage · guards & validation", () => {
     const u = userEvent.setup();
     renderAuth();
     await u.click(await screen.findByRole("tab", { name: "Create account" }));
-    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "bob");
     await u.type(screen.getByLabelText("Email"), "not-an-email");
     await u.type(screen.getByLabelText("Password"), "short");
     await u.type(screen.getByLabelText("Confirm password"), "shorter");
@@ -181,7 +199,7 @@ describe("AuthPage · guards & validation", () => {
     expect(email).toHaveAccessibleDescription("Enter a valid email address.");
     expect(screen.getByLabelText("Password")).toHaveAccessibleDescription(/at least 8 characters/i);
     expect(screen.getByLabelText("Confirm password")).toHaveAccessibleDescription("Doesn't match the password.");
-    expect(screen.getByLabelText("Username")).not.toHaveAttribute("aria-invalid");
+    expect(screen.getByLabelText(/^Username(?: or email)?$/)).not.toHaveAttribute("aria-invalid");
     await waitFor(() => expect(email).toHaveFocus());
     expect(mockedRegister).not.toHaveBeenCalled();
   });
@@ -190,10 +208,10 @@ describe("AuthPage · guards & validation", () => {
     const u = userEvent.setup();
     renderAuth();
     await u.click(await screen.findByRole("tab", { name: "Create account" }));
-    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "bob");
     await u.type(screen.getByLabelText("Password"), "half");
     await u.click(screen.getByRole("tab", { name: "Sign in" }));
-    expect(screen.getByLabelText("Username")).toHaveValue("");
+    expect(screen.getByLabelText(/^Username(?: or email)?$/)).toHaveValue("");
     expect(screen.getByLabelText("Password")).toHaveValue("");
   });
 
@@ -201,11 +219,11 @@ describe("AuthPage · guards & validation", () => {
     mockedLogin.mockResolvedValue({ error: "Invalid credentials" });
     const u = userEvent.setup();
     renderAuth();
-    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText(/^Username(?: or email)?$/), "alice");
     await u.type(screen.getByLabelText("Password"), "wrong-pw");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     await screen.findByRole("alert");
-    expect(screen.getByLabelText("Username")).toHaveValue("alice");
+    expect(screen.getByLabelText(/^Username(?: or email)?$/)).toHaveValue("alice");
     expect(screen.getByLabelText("Password")).toHaveValue("");
     await waitFor(() => expect(screen.getByLabelText("Password")).toHaveFocus());
   });
@@ -216,15 +234,15 @@ describe("AuthPage · guards & validation", () => {
     const u = userEvent.setup();
     renderAuth();
     await u.click(await screen.findByRole("tab", { name: "Create account" }));
-    await u.type(screen.getByLabelText("Username"), "bob");
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "bob");
     await u.type(screen.getByLabelText("Email"), "bob@x.test");
     await u.type(screen.getByLabelText("Password"), "pw-12345");
     await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
     await u.click(screen.getByRole("button", { name: /create account/i }));
     expect(await screen.findByText("Account created. Sign in to continue.")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Sign in" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByLabelText("Username")).toHaveValue("bob");
-    expect(screen.getByLabelText("Username")).not.toHaveAttribute("aria-invalid");
+    expect(screen.getByLabelText(/^Username(?: or email)?$/)).toHaveValue("bob");
+    expect(screen.getByLabelText(/^Username(?: or email)?$/)).not.toHaveAttribute("aria-invalid");
     await waitFor(() => expect(screen.getByLabelText("Password")).toHaveFocus());
   });
 
@@ -246,7 +264,7 @@ describe("AuthPage · guards & validation", () => {
     const u = userEvent.setup();
     renderAuth();
     await u.click(await screen.findByRole("tab", { name: "Create account" }));
-    await u.type(screen.getByLabelText("Username"), "  bob ");
+    await u.type(screen.getByLabelText(/^Username(?: or email)?$/), "  bob ");
     await u.type(screen.getByLabelText("Email"), "bob@intranet");
     await u.type(screen.getByLabelText("Password"), "pw-12345");
     await u.type(screen.getByLabelText("Confirm password"), "pw-12345");
@@ -271,7 +289,7 @@ describe("AuthPage · guards & validation", () => {
     mockedLogin.mockResolvedValue({});
     const u = userEvent.setup();
     renderAuth();
-    await u.type(await screen.findByLabelText("Username"), "alice");
+    await u.type(await screen.findByLabelText(/^Username(?: or email)?$/), "alice");
     await u.type(screen.getByLabelText("Password"), "pw-1234");
     await u.click(screen.getByRole("button", { name: /sign in/i }));
     const alert = await screen.findByRole("alert");

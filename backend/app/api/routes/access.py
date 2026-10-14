@@ -73,7 +73,10 @@ router = APIRouter()
 
 
 class GrantRequest(NFCModel):
-    user: str
+    # ``user`` remains for MCP and older REST clients. New browser clients
+    # send the durable UUID and keep the handle only as a readable snapshot.
+    user: str | None = None
+    user_id: str | None = None
     role: str  # reader, writer, admin
     # The basis on which the role is held. Omit it and the grant is `direct`,
     # which is what every grant was before bases could coexist. A rule-driven
@@ -86,7 +89,8 @@ class GrantRequest(NFCModel):
 
 
 class RevokeRequest(NFCModel):
-    user: str
+    user: str | None = None
+    user_id: str | None = None
     # Omit it and the person is out of the vault — every basis goes, which is
     # what this endpoint has always meant. Name one and only that basis is
     # withdrawn, so the user may be downgraded rather than removed.
@@ -95,7 +99,8 @@ class RevokeRequest(NFCModel):
 
 
 class TransferRequest(NFCModel):
-    new_owner: str
+    new_owner: str | None = None
+    new_owner_id: str | None = None
 
 
 class VaultPatchRequest(NFCModel):
@@ -269,7 +274,15 @@ async def grant(vault: str, req: GrantRequest, user: AuthenticatedUser = Depends
     kwargs = {} if req.source_key is None else {"source_key": req.source_key}
     return await _audited_access(
         "akb_grant", {"vault": vault, **req.model_dump(exclude_none=True)}, user,
-        grant_access(user.user_id, vault, req.user, req.role, revision=req.revision, **kwargs),
+        grant_access(
+            user.user_id,
+            vault,
+            req.user,
+            req.role,
+            target_user_id=req.user_id,
+            revision=req.revision,
+            **kwargs,
+        ),
     )
 
 
@@ -277,7 +290,14 @@ async def grant(vault: str, req: GrantRequest, user: AuthenticatedUser = Depends
 async def revoke(vault: str, req: RevokeRequest, user: AuthenticatedUser = Depends(get_current_user)):
     return await _audited_access(
         "akb_revoke", {"vault": vault, **req.model_dump()}, user,
-        revoke_access(user.user_id, vault, req.user, source_key=req.source_key, revision=req.revision),
+        revoke_access(
+            user.user_id,
+            vault,
+            req.user,
+            target_user_id=req.user_id,
+            source_key=req.source_key,
+            revision=req.revision,
+        ),
     )
 
 
@@ -317,10 +337,16 @@ async def transfer(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     target = (req.new_owner if req else None) or new_owner
-    if not target:
+    target_id = req.new_owner_id if req else None
+    if not target and not target_id:
         from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="new_owner is required")
-    return await transfer_ownership(user.user_id, vault, target)
+        raise HTTPException(status_code=422, detail="new_owner or new_owner_id is required")
+    return await transfer_ownership(
+        user.user_id,
+        vault,
+        target,
+        new_owner_user_id=target_id,
+    )
 
 
 @router.post("/vaults/{vault}/archive", summary="Archive vault (read-only)")

@@ -43,9 +43,12 @@ import { ROLE_ICONS, type Role } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
 
 interface Member {
+  id: string;
   username: string;
   display_name?: string | null;
   email: string;
+  account_kind: "human" | "service";
+  account_status: string;
   role: Role;
   since?: string | null;
 }
@@ -84,10 +87,11 @@ export default function VaultMembersPage() {
   const [inviteOpen, setInviteOpen] = useState(false);
   const [pendingRevoke, setPendingRevoke] = useState<Member | null>(null);
   const [pendingTransfer, setPendingTransfer] = useState<Member | null>(null);
-  const [currentUser, setCurrentUser] = useState<{ username: string } | null>(
+  const [currentUser, setCurrentUser] = useState<{ id: string; username: string } | null>(
     null,
   );
   const [undoTarget, setUndoTarget] = useState<{
+    id: string;
     username: string;
     prev: string;
     next: string;
@@ -96,7 +100,7 @@ export default function VaultMembersPage() {
 
   useEffect(() => {
     getMe()
-      .then((user) => setCurrentUser({ username: user.username }))
+      .then((user) => setCurrentUser({ id: user.user_id, username: user.username }))
       .catch(() => setCurrentUser(null));
   }, []);
 
@@ -134,8 +138,8 @@ export default function VaultMembersPage() {
     };
   }, [name]);
 
-  const existingUsernames = useMemo(
-    () => new Set((members || []).map((member) => member.username)),
+  const existingUserIds = useMemo(
+    () => new Set((members || []).map((member) => member.id)),
     [members],
   );
   const canManage = info?.role === "owner" || info?.role === "admin";
@@ -154,13 +158,19 @@ export default function VaultMembersPage() {
 
   async function confirmRevoke() {
     if (!name || !pendingRevoke) return;
-    await revokeAccess(name, pendingRevoke.username);
+    await revokeAccess(name, {
+      id: pendingRevoke.id,
+      username: pendingRevoke.username,
+    });
     await refresh();
   }
 
   async function confirmTransfer() {
     if (!name || !pendingTransfer) return;
-    await transferOwnership(name, pendingTransfer.username);
+    await transferOwnership(name, {
+      id: pendingTransfer.id,
+      username: pendingTransfer.username,
+    });
     await refresh();
   }
 
@@ -168,16 +178,16 @@ export default function VaultMembersPage() {
     setMembers((current) =>
       current
         ? current.map((entry) =>
-            entry.username === member.username
+            entry.id === member.id
               ? { ...entry, role: next as Member["role"] }
               : entry,
           )
         : current,
     );
-    setUndoTarget({ username: member.username, prev: previous, next });
+    setUndoTarget({ id: member.id, username: member.username, prev: previous, next });
     setTimeout(() => {
       setUndoTarget((current) =>
-        current && current.username === member.username && current.next === next
+        current && current.id === member.id && current.next === next
           ? null
           : current,
       );
@@ -187,11 +197,11 @@ export default function VaultMembersPage() {
 
   async function handleUndo() {
     if (!undoTarget || !name) return;
-    const { username, prev } = undoTarget;
+    const { id, username, prev } = undoTarget;
     setUndoTarget(null);
     setUndoError(null);
     try {
-      await grantAccess(name, username, prev);
+      await grantAccess(name, { id, username }, prev);
       await refresh();
     } catch (caught: unknown) {
       setUndoError(errorMessage(caught, "Undo failed"));
@@ -386,7 +396,7 @@ export default function VaultMembersPage() {
                 </thead>
                 <tbody className="divide-y divide-border">
                   {filtered.map((member) => {
-                    const isCurrent = currentUser?.username === member.username;
+                    const isCurrent = currentUser?.id === member.id;
                     const canChangeRole =
                       canManage &&
                       member.role !== "owner" &&
@@ -394,7 +404,7 @@ export default function VaultMembersPage() {
                       !isCurrent;
                     return (
                       <tr
-                        key={member.username}
+                        key={member.id}
                         className="transition-token hover:bg-surface-hover"
                       >
                         <td className="min-w-0 px-3 py-3 align-middle @lg/members:px-4">
@@ -412,9 +422,18 @@ export default function VaultMembersPage() {
                                   <Badge variant="info-outline">You</Badge>
                                 )}
                               </div>
-                              <p className="mt-0.5 break-words text-xs leading-relaxed text-foreground-muted [overflow-wrap:anywhere]">
-                                {member.email || `@${member.username}`}
-                              </p>
+                              <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs leading-relaxed text-foreground-muted">
+                                <span className="break-all">@{member.username}</span>
+                                {member.email && (
+                                  <>
+                                    <span aria-hidden>·</span>
+                                    <span className="break-all">{member.email}</span>
+                                  </>
+                                )}
+                                {member.account_kind === "service" && (
+                                  <Badge variant="default">Service account</Badge>
+                                )}
+                              </div>
                             </div>
                           </div>
                         </td>
@@ -492,16 +511,16 @@ export default function VaultMembersPage() {
         open={inviteOpen}
         onOpenChange={setInviteOpen}
         vault={name}
-        existingUsernames={existingUsernames}
+        existingUserIds={existingUserIds}
         onInvited={refresh}
       />
       <ConfirmDialog
         open={pendingRevoke !== null}
         onOpenChange={(open) => !open && setPendingRevoke(null)}
-        title={pendingRevoke ? `Revoke ${pendingRevoke.username}?` : ""}
+        title={pendingRevoke ? `Revoke ${memberIdentity(pendingRevoke)}?` : ""}
         description={
           pendingRevoke
-            ? `${pendingRevoke.username} will lose access to ${name} immediately.\nThis can be re-granted later.`
+            ? `${memberIdentity(pendingRevoke)} will lose access to ${name} immediately.\nThis can be re-granted later.`
             : ""
         }
         confirmLabel="Revoke access"
@@ -513,12 +532,12 @@ export default function VaultMembersPage() {
         onOpenChange={(open) => !open && setPendingTransfer(null)}
         title={
           pendingTransfer
-            ? `Transfer ownership to ${pendingTransfer.username}?`
+            ? `Transfer ownership to ${memberIdentity(pendingTransfer)}?`
             : ""
         }
         description={
           pendingTransfer
-            ? `You will become an admin and ${pendingTransfer.username} becomes the new owner.\nOnly the new owner can transfer ownership again.\nThis cannot be undone by you alone.`
+            ? `You will become an admin and ${memberIdentity(pendingTransfer)} becomes the new owner.\nOnly the new owner can transfer ownership again.\nThis cannot be undone by you alone.`
             : ""
         }
         confirmLabel="Transfer ownership"
@@ -527,6 +546,11 @@ export default function VaultMembersPage() {
       />
     </>
   );
+}
+
+function memberIdentity(member: Member): string {
+  const displayName = member.display_name?.trim();
+  return displayName ? `${displayName} (@${member.username})` : `@${member.username}`;
 }
 
 function MemberAvatar({ member }: { member: Member }) {

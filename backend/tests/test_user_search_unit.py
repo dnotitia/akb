@@ -39,6 +39,8 @@ def _row(username: str, *, uid: uuid.UUID | None = None) -> dict:
         "username": username,
         "display_name": username.title(),
         "email": f"{username}@example.invalid",
+        "account_kind": "human",
+        "account_status": "active",
     }
 
 
@@ -54,6 +56,8 @@ async def test_search_projects_the_canonical_id(monkeypatch):
             "username": "minji",
             "display_name": "Minji",
             "email": "minji@example.invalid",
+            "account_kind": "human",
+            "account_status": "active",
         }
     ]
 

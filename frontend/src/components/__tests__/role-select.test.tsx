@@ -9,6 +9,7 @@ vi.mock("@/lib/api", () => ({ grantAccess: vi.fn() }));
 afterEach(cleanup);
 
 const baseMember = {
+  id: "user-alice",
   username: "alice",
   display_name: "Alice",
   email: "alice@t.dev",
@@ -43,7 +44,11 @@ describe("RoleSelect", () => {
     render(<RoleSelect vault="v" member={baseMember} onChanged={onChanged} />);
     const user = await openRoleMenu();
     await user.click(await screen.findByRole("menuitemradio", { name: /writer/i }));
-    await waitFor(() => expect(api.grantAccess).toHaveBeenCalledWith("v", "alice", "writer"));
+    await waitFor(() => expect(api.grantAccess).toHaveBeenCalledWith(
+      "v",
+      { id: "user-alice", username: "alice" },
+      "writer",
+    ));
     expect(onChanged).toHaveBeenCalledWith("reader", "writer");
   });
 

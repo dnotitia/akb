@@ -1043,6 +1043,7 @@ export interface CurrentUser {
   display_name: string | null;
   is_admin: boolean;
   auth_method: string;
+  account_kind?: "human" | "service";
   key_class: string | null;
 }
 
@@ -1157,13 +1158,54 @@ export const createVault = (
   return api<any>(`/vaults?${params}`, { method: "POST" });
 };
 export const getVaultInfo = (vault: string) => sharedRead<any>(`/vaults/${vault}/info`);
-export const getVaultMembers = (vault: string) => api<{ members: any[] }>(`/vaults/${vault}/members`);
-export const grantAccess = (vault: string, user: string, role: string) =>
-  api<any>(`/vaults/${vault}/grant`, { method: "POST", body: JSON.stringify({ user, role }) });
-export const revokeAccess = (vault: string, user: string) =>
-  api<any>(`/vaults/${vault}/revoke`, { method: "POST", body: JSON.stringify({ user }) });
-export const transferOwnership = (vault: string, new_owner: string) =>
-  api<any>(`/vaults/${vault}/transfer`, { method: "POST", body: JSON.stringify({ new_owner }) });
+export interface UserIdentityRef {
+  id: string;
+  username: string;
+}
+
+export interface DirectoryUser extends UserIdentityRef {
+  display_name: string | null;
+  email: string;
+  account_kind: "human" | "service";
+  account_status: string;
+}
+
+export interface VaultMember extends DirectoryUser {
+  role: "reader" | "writer" | "admin" | "owner";
+  since?: string | null;
+}
+
+const userReferenceBody = (user: UserIdentityRef | string) =>
+  typeof user === "string"
+    ? { user }
+    : { user: user.username, user_id: user.id };
+
+export const getVaultMembers = (vault: string) =>
+  api<{ members: VaultMember[] }>(`/vaults/${vault}/members`);
+export const grantAccess = (
+  vault: string,
+  user: UserIdentityRef | string,
+  role: string,
+) =>
+  api<any>(`/vaults/${vault}/grant`, {
+    method: "POST",
+    body: JSON.stringify({ ...userReferenceBody(user), role }),
+  });
+export const revokeAccess = (vault: string, user: UserIdentityRef | string) =>
+  api<any>(`/vaults/${vault}/revoke`, {
+    method: "POST",
+    body: JSON.stringify(userReferenceBody(user)),
+  });
+export const transferOwnership = (vault: string, user: UserIdentityRef | string) => {
+  const reference = userReferenceBody(user);
+  return api<any>(`/vaults/${vault}/transfer`, {
+    method: "POST",
+    body: JSON.stringify({
+      new_owner: reference.user,
+      new_owner_id: "user_id" in reference ? reference.user_id : undefined,
+    }),
+  });
+};
 export const archiveVault = (vault: string) =>
   api<any>(`/vaults/${vault}/archive`, { method: "POST" });
 export const unarchiveVault = (vault: string) =>
@@ -2669,7 +2711,7 @@ export const previewTablePublicationQuery = (vault: string, sql: string) =>
   });
 
 export const searchUsers = (query?: string) =>
-  api<{ users: any[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);
+  api<{ users: DirectoryUser[] }>(`/users/search${query ? `?q=${encodeURIComponent(query)}` : ""}`);
 
 // Agent memory is just another vault (`agent-memory-{username}`)
 // since v0.5.0 — read/write via the standard documents+browse API.

@@ -55,6 +55,14 @@ from app.services.auth_verifier_profiles import (
 )
 from app.services.role_sync import get_role_sync
 from app.services.service_authority_service import resolve_service_authority
+from app.services.user_identity import (
+    display_name_from_external,
+    normalize_display_name,
+    normalize_email,
+    normalize_username,
+    stable_username_candidate,
+    username_base_from_external,
+)
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
 ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
@@ -278,6 +286,9 @@ async def register(username: str, email: str, password: str, display_name: str |
     require_local_auth_enabled()
     if violation := _password_rule_violation(password):
         raise ValidationError(violation)
+    username = normalize_username(username)
+    email = normalize_email(email)
+    display_name = normalize_display_name(display_name)
     pool = await get_pool()
     pw_hash = await hash_password_async(password)
     user_id = uuid.uuid4()
@@ -291,8 +302,16 @@ async def register(username: str, email: str, password: str, display_name: str |
         # lower(email) (migration 109) is the race-proof backstop; this
         # check is the friendly 409 before it.
         async with role_authority_transaction(conn):
+            # The database's historical TEXT UNIQUE constraint is exact-case.
+            # New handles are canonical lowercase, and this lock makes the
+            # friendly case-insensitive check race-safe without rewriting any
+            # pre-existing mixed-case usernames during a rolling upgrade.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"user-handle:{username}",
+            )
             existing = await conn.fetchrow(
-                "SELECT id FROM users WHERE username = $1 OR lower(email) = lower($2)",
+                "SELECT id FROM users WHERE lower(username) = $1 OR lower(email) = $2",
                 username,
                 email,
             )
@@ -325,12 +344,20 @@ async def register(username: str, email: str, password: str, display_name: str |
         "user_id": str(user_id),
         "username": username,
         "email": email,
+        "display_name": display_name,
         "is_admin": is_admin,
     }
 
 
 async def login(username: str, password: str) -> dict:
     require_local_auth_enabled()
+    username = username.strip()
+    try:
+        canonical_username = normalize_username(username)
+    except ValidationError:
+        # Login accepts an e-mail address and legacy handles that predate the
+        # current validation rules. Do not turn an auth attempt into a 422.
+        canonical_username = username
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -339,10 +366,18 @@ async def login(username: str, password: str) -> dict:
                 SELECT id, username, email, password_hash, display_name, is_admin,
                        tokens_revoked_before, session_generation, auth_provider,
                        account_status, account_kind
-                  FROM users WHERE username = $1 OR email = $1
+                  FROM users
+                 WHERE username = $1 OR username = $2 OR lower(email) = lower($1)
+                 ORDER BY CASE
+                              WHEN username = $1 THEN 0
+                              WHEN username = $2 THEN 1
+                              ELSE 2
+                          END
+                 LIMIT 1
                    FOR SHARE
                 """,
                 username,
+                canonical_username,
             )
             if row and row["account_status"] != "active" and row["account_kind"] == "human":
                 raise AccountSuspendedError()
@@ -383,21 +418,37 @@ async def login(username: str, password: str) -> dict:
 _SSO_SENTINEL_HASH = "!keycloak-sso:no-local-login!"
 
 
-async def _unique_username(conn, base: str | None) -> str:
-    """Allocate a username for explicit administrative provisioning.
+async def _unique_username(
+    conn,
+    base: str | None,
+    *,
+    stable_key: str | None = None,
+) -> str:
+    """Allocate a portable handle without treating it as account identity.
 
-    Canonical SSO projection deliberately does not call this helper: a claimed
-    username collision must reject instead of silently selecting another AKB
-    account name. Account-governance services retain it for explicit creates.
+    ``issuer + subject`` remains the only identity key for SSO.  A claimed
+    handle collision therefore gets a distinct handle; it never links to the
+    existing account and no longer prevents the new identity from signing in.
     """
-    base = (base or "").strip() or "user"
-    candidate = base
-    for _ in range(8):
-        taken = await conn.fetchval("SELECT 1 FROM users WHERE username = $1", candidate)
+    base = username_base_from_external(base)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        f"user-handle:{base}",
+    )
+    for attempt in range(16):
+        if attempt == 0:
+            candidate = base
+        elif stable_key is not None:
+            candidate = stable_username_candidate(base, stable_key, attempt - 1)
+        else:
+            suffix = secrets.token_hex(2)
+            candidate = f"{base[:27].rstrip('._-')}-{suffix}"
+        taken = await conn.fetchval(
+            "SELECT 1 FROM users WHERE lower(username) = lower($1)", candidate
+        )
         if not taken:
             return candidate
-        candidate = f"{base}-{secrets.token_hex(2)}"
-    return f"{base}-{secrets.token_hex(4)}"
+    raise ConflictError("Unable to allocate a unique username")
 
 
 def _external_identity_key(claims: dict) -> tuple[str, str]:
@@ -461,7 +512,10 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
         claims.get("email_verified") is True or not settings.keycloak_require_verified_email
     )
     email_snapshot = claimed_email if email_is_trusted else None
-    display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
+    display_name = display_name_from_external(
+        _optional_external_string(claims, "name")
+        or _optional_external_string(claims, "preferred_username")
+    )
     try:
         async with conn.transaction():
             await conn.execute(
@@ -554,7 +608,10 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
     """
     if settings.keycloak_require_verified_email and claims.get("email_verified") is not True:
         raise AuthenticationError("Identity provider has not verified this email address")
-    display_name = _optional_external_string(claims, "name") or _optional_external_string(claims, "preferred_username")
+    display_name = display_name_from_external(
+        _optional_external_string(claims, "name")
+        or _optional_external_string(claims, "preferred_username")
+    )
     async with role_authority_transaction(conn):
         targets = await conn.fetch(
             """
@@ -759,12 +816,14 @@ async def _resolve_unbound_keycloak_user(
         raise AuthenticationError("Identity provider has not verified this email address")
 
     raw_preferred_username = _optional_external_string(claims, "preferred_username")
-    preferred_username = (
-        raw_preferred_username.strip()
-        if isinstance(raw_preferred_username, str) and raw_preferred_username.strip()
-        else email.split("@", 1)[0]
+    preferred_username = await _unique_username(
+        conn,
+        raw_preferred_username or email.split("@", 1)[0],
+        stable_key=f"{issuer}\0{subject}",
     )
-    display_name = _optional_external_string(claims, "name") or raw_preferred_username
+    display_name = display_name_from_external(
+        _optional_external_string(claims, "name") or raw_preferred_username
+    )
     user_id = uuid.uuid4()
     try:
         async with role_authority_transaction(conn):
@@ -1111,11 +1170,11 @@ async def update_profile(
     idx = 1
     if display_name is not None:
         sets.append(f"display_name = ${idx}")
-        params.append(display_name)
+        params.append(normalize_display_name(display_name))
         idx += 1
     if email is not None:
         sets.append(f"email = ${idx}")
-        params.append(email)
+        params.append(normalize_email(email))
         idx += 1
     if not sets:
         raise ValidationError("Nothing to update — pass display_name or email")

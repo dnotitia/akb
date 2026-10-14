@@ -40,7 +40,7 @@ async def resolve_display_names(
         rows = await conn.fetch(
             """
             SELECT id::text AS id, username,
-                   COALESCE(display_name, username) AS name
+                   COALESCE(NULLIF(BTRIM(display_name), ''), username) AS name
               FROM users
              WHERE id::text = ANY($1) OR username = ANY($1)
             """,

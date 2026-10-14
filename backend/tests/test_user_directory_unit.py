@@ -74,3 +74,12 @@ async def test_deduplicates_repeated_tokens(monkeypatch):
     assert out["bob"] == "Bob B"
     keys = conn.fetch.call_args.args[1]
     assert keys == ["bob"]
+
+
+async def test_query_falls_back_when_display_name_is_only_whitespace(monkeypatch):
+    conn = _patch_pool(monkeypatch, fetch_rows=[])
+
+    await user_directory.resolve_display_names(["blank-name"])
+
+    statement = " ".join(conn.fetch.call_args.args[0].split())
+    assert "COALESCE(NULLIF(BTRIM(display_name), ''), username)" in statement

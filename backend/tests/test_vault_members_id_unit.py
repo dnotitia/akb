@@ -23,7 +23,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.services import access_service
+from app.exceptions import ConflictError
 
 
 def _patch_pool(monkeypatch, *, fetchrow=None, fetch=()):
@@ -54,6 +57,8 @@ def _owner_row(uid: uuid.UUID) -> dict:
         "username": "owner",
         "display_name": "Owner",
         "email": "owner@example.invalid",
+        "account_kind": "human",
+        "account_status": "active",
     }
 
 
@@ -63,6 +68,8 @@ def _member_row(username: str, uid: uuid.UUID) -> dict:
         "username": username,
         "display_name": username.title(),
         "email": f"{username}@example.invalid",
+        "account_kind": "human",
+        "account_status": "active",
         "role": "reader",
         "created_at": datetime(2026, 8, 27, tzinfo=timezone.utc),
     }
@@ -123,7 +130,7 @@ async def test_all_three_statements_select_the_id(monkeypatch):
         for call in conn.fetchrow.await_args_list + conn.fetch.await_args_list
     ]
     assert any(
-        "SELECT id, username, display_name, email FROM users WHERE id" in s
+        "SELECT id, username, display_name, email, account_kind" in s
         for s in statements
     )
     assert any("SELECT u.id, u.username" in s for s in statements)
@@ -177,3 +184,38 @@ async def test_roster_without_an_owner_row_stays_well_formed(monkeypatch):
     out = await access_service.list_vault_members(str(uuid.uuid4()), "v")
 
     assert [(m["username"], m["id"]) for m in out] == [("minji", str(member_id))]
+
+
+async def test_user_reference_prefers_uuid_and_verifies_handle_snapshot():
+    uid = uuid.uuid4()
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(
+        return_value={"id": uid, "username": "minji", "is_admin": False}
+    )
+
+    target = await access_service._resolve_user_reference(
+        conn,
+        username="minji",
+        user_id=str(uid),
+    )
+
+    assert target["id"] == uid
+    statement = " ".join(conn.fetchrow.call_args.args[0].split())
+    assert "WHERE id = $1" in statement
+
+
+async def test_stale_username_snapshot_cannot_mutate_uuid_target():
+    uid = uuid.uuid4()
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(
+        return_value={"id": uid, "username": "renamed", "is_admin": False}
+    )
+
+    with pytest.raises(ConflictError) as exc_info:
+        await access_service._resolve_user_reference(
+            conn,
+            username="old-name",
+            user_id=str(uid),
+        )
+
+    assert exc_info.value.code == "user_reference_mismatch"

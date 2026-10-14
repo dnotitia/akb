@@ -45,6 +45,7 @@ describe("UserMenu", () => {
   it("Settings item is present and links to /settings", async () => {
     await open();
     await waitFor(() => expect(screen.getByText("Settings")).toBeTruthy());
+    expect(screen.getByText("@alice")).toBeInTheDocument();
   });
 
   it("opens without locking the document scrollbar", async () => {

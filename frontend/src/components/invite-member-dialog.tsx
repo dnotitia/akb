@@ -13,6 +13,7 @@ import {
 import { searchUsers, grantAccess } from "@/lib/api";
 import { useDebounce } from "@/hooks/use-debounce";
 import { Alert } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -28,17 +29,20 @@ import { cn } from "@/lib/utils";
 type Role = "reader" | "writer" | "admin";
 
 interface UserHit {
+  id: string;
   username: string;
   display_name?: string | null;
   email: string;
+  account_kind: "human" | "service";
+  account_status: string;
 }
 
 interface InviteMemberDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   vault: string;
-  /** Usernames already in the vault — hidden from search results. */
-  existingUsernames: Set<string>;
+  /** Durable IDs already in the vault — hidden from search results. */
+  existingUserIds: Set<string>;
   onInvited: () => void;
 }
 
@@ -77,7 +81,7 @@ export function InviteMemberDialog({
   open,
   onOpenChange,
   vault,
-  existingUsernames,
+  existingUserIds,
   onInvited,
 }: InviteMemberDialogProps) {
   const [query, setQuery] = useState("");
@@ -93,8 +97,8 @@ export function InviteMemberDialog({
   // otherwise every parent render produces a fresh Set ref and the search
   // effect refires unnecessarily.
   const exclusionKey = useMemo(
-    () => Array.from(existingUsernames).sort().join(","),
-    [existingUsernames],
+    () => Array.from(existingUserIds).sort().join(","),
+    [existingUserIds],
   );
 
   // Reset on open/close so a stale picked user from a previous invite doesn't
@@ -119,7 +123,7 @@ export function InviteMemberDialog({
       .then((result) => {
         if (cancelled) return;
         setHits(
-          (result.users || []).filter((user) => !existingUsernames.has(user.username)),
+          (result.users || []).filter((user) => !existingUserIds.has(user.id)),
         );
       })
       .catch((caught: unknown) => {
@@ -133,7 +137,7 @@ export function InviteMemberDialog({
     return () => {
       cancelled = true;
     };
-    // existingUsernames identity may change across parent renders even when
+    // existingUserIds identity may change across parent renders even when
     // contents are stable — gate on the canonical key instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQuery, open, exclusionKey]);
@@ -143,7 +147,7 @@ export function InviteMemberDialog({
     setGranting(true);
     setError("");
     try {
-      await grantAccess(vault, selected.username, role);
+      await grantAccess(vault, { id: selected.id, username: selected.username }, role);
       onInvited();
       onOpenChange(false);
     } catch (caught: unknown) {
@@ -180,7 +184,7 @@ export function InviteMemberDialog({
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <h3 id="invite-person-heading" className="text-sm font-semibold text-foreground">
-                    Find a person
+                    Find an account
                   </h3>
                   <p className="mt-0.5 text-xs text-foreground-muted">
                     Existing vault members are hidden.
@@ -227,15 +231,15 @@ export function InviteMemberDialog({
                     {debouncedQuery ? "No matching accounts" : "No accounts available"}
                   </p>
                   <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                    Only people with an AKB account can be invited.
+                    Only active AKB accounts can be invited.
                   </p>
                 </div>
               ) : (
                 <ul role="listbox" aria-label="AKB accounts" className="divide-y divide-border">
                   {hits.map((user) => {
-                    const active = selected?.username === user.username;
+                    const active = selected?.id === user.id;
                     return (
-                      <li key={user.username} role="none">
+                      <li key={user.id} role="none">
                         <button
                           type="button"
                           role="option"
@@ -250,17 +254,18 @@ export function InviteMemberDialog({
                         >
                           <UserAvatar user={user} />
                           <span className="min-w-0 flex-1">
-                            <span className="flex min-w-0 items-center gap-2">
-                              <span className="truncate text-sm font-semibold text-foreground">
+                            <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+                              <span className="break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
                                 {user.display_name?.trim() || user.username}
                               </span>
-                              {user.display_name?.trim() && (
-                                <span className="shrink-0 text-xs text-foreground-muted">
-                                  @{user.username}
-                                </span>
+                              <span className="break-all text-xs text-foreground-muted">
+                                @{user.username}
+                              </span>
+                              {user.account_kind === "service" && (
+                                <Badge variant="default">Service account</Badge>
                               )}
                             </span>
-                            <span className="mt-0.5 block truncate text-xs text-foreground-muted">
+                            <span className="mt-0.5 block break-all text-xs text-foreground-muted">
                               {user.email}
                             </span>
                           </span>
@@ -297,10 +302,10 @@ export function InviteMemberDialog({
                 <div className="flex min-w-0 items-center gap-3">
                   <UserAvatar user={selected} />
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-foreground">
+                    <p className="break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
                       {selected.display_name?.trim() || selected.username}
                     </p>
-                    <p className="truncate text-xs text-foreground-muted">@{selected.username}</p>
+                    <p className="break-all text-xs text-foreground-muted">@{selected.username}</p>
                   </div>
                 </div>
               ) : (
@@ -308,7 +313,7 @@ export function InviteMemberDialog({
                   <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2">
                     <UserRound className="h-4 w-4" aria-hidden />
                   </span>
-                  <p className="text-xs leading-relaxed">Select a person from the account list.</p>
+                  <p className="text-xs leading-relaxed">Select an account from the list.</p>
                 </div>
               )}
             </div>
@@ -381,7 +386,7 @@ export function InviteMemberDialog({
                 will join as {ROLE_LABELS[role]}.
               </>
             ) : (
-              "Select a person to continue."
+              "Select an account to continue."
             )}
           </p>
           <div className="flex shrink-0 items-center justify-end gap-2">

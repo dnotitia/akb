@@ -122,6 +122,34 @@ describe("settings — profile edit", () => {
     expect(api.updateProfile as any).not.toHaveBeenCalled();
   });
 
+  it("does not mark formatting-only surrounding whitespace as unsaved", async () => {
+    const onDirtyChange = vi.fn();
+    render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} />);
+    const name = await screen.findByDisplayValue("Alice Original");
+
+    fireEvent.change(name, { target: { value: "  Alice Original  " } });
+
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
+    expect(screen.getByRole("button", { name: /save profile/i })).toBeDisabled();
+    expect(api.updateProfile as any).not.toHaveBeenCalled();
+  });
+
+  it("does not mark legacy stored whitespace as an edit when settings opens", async () => {
+    const onDirtyChange = vi.fn();
+    const legacyUser = {
+      ...USER,
+      display_name: "  Alice Original  ",
+      email: "  alice@example.com  ",
+    };
+
+    render(<ProfileSection user={legacyUser} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} />);
+
+    expect(await screen.findByDisplayValue("Alice Original")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("alice@example.com")).toBeInTheDocument();
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
+    expect(screen.getByRole("button", { name: /save profile/i })).toBeDisabled();
+  });
+
   it("sends only the changed fields and refreshes local state on success", async () => {
     renderSettings();
     const name = (await screen.findByDisplayValue("Alice Original")) as HTMLInputElement;
@@ -255,7 +283,7 @@ describe("settings — profile edit", () => {
   it("keeps the compact profile identity once and omits outer cards", () => {
     const { container } = render(<ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} />);
     expect(screen.getAllByText("@alice")).toHaveLength(1);
-    expect(screen.getByRole("region", { name: "Public profile" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Profile" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Change password" })).toBeInTheDocument();
     expect(container.querySelector('[data-slot="panel"]')).toBeNull();
     expect(screen.getByLabelText("New password")).toHaveAccessibleDescription("Use at least 8 characters.");

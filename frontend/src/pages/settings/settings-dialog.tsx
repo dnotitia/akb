@@ -86,7 +86,7 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onRest
   }
   const localPasswordEnabled = authConfig?.available === true &&
     (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") && authConfig.local_auth.enabled;
-  function updateUser(patch: { display_name?: string; email?: string }) {
+  function updateUser(patch: { display_name?: string | null; email?: string }) {
     setUser(current => current ? { ...current, ...patch } : current);
     // Refresh the shared identity without remounting the underlying workspace.
     window.dispatchEvent(new Event("akb:revalidate-access"));

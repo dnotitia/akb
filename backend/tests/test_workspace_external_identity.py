@@ -162,6 +162,42 @@ async def test_exact_binding_does_not_require_email_claim(pool, monkeypatch):
     assert resolved["user_id"] == user_id
 
 
+async def test_bound_identity_sanitizes_upstream_display_name_without_blocking_login(
+    pool, monkeypatch
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    subject = f"long-name-{uuid.uuid4().hex[:8]}"
+    user_id = await _insert_bound_user(
+        pool,
+        subject=subject,
+        email=f"wsg-{subject}@example.com",
+    )
+    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
+    claims = _claims(subject)
+    claims["name"] = "  Alice\n" + ("A" * 120)
+
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["user_id"] == user_id
+    assert len(resolved["display_name"]) == 100
+    assert "\n" not in resolved["display_name"]
+
+
+async def test_jit_provisioning_sanitizes_upstream_display_name(pool):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    subject = f"jit-long-name-{uuid.uuid4().hex[:8]}"
+    claims = _claims(subject, f"wsg-{subject}@example.com")
+    claims["name"] = "  Alice\n" + ("B" * 120)
+
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert len(resolved["display_name"]) == 100
+    assert "\n" not in resolved["display_name"]
+
+
 @pytest.mark.parametrize("auth_provider", ["local", "keycloak"])
 async def test_open_mode_never_adopts_existing_user_by_email(
     pool,
@@ -442,7 +478,7 @@ async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
         await _resolve_or_provision_keycloak_user(_claims("subject-two", email))
 
 
-async def test_open_mode_rejects_username_collision_instead_of_suffixing(pool):
+async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
     username = f"wsg-username-{uuid.uuid4().hex[:8]}"
@@ -459,8 +495,17 @@ async def test_open_mode_rejects_username_collision_instead_of_suffixing(pool):
 
     claims = _claims("username-collision", f"{username}-new@example.com")
     claims["preferred_username"] = username
-    with pytest.raises(ExternalIdentityConflictError):
-        await _resolve_or_provision_keycloak_user(claims)
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert resolved["username"] != username
+    assert resolved["username"].startswith(f"{username}-")
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE username IN ($1, $2)",
+            username,
+            resolved["username"],
+        ) == 2
 
 
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):

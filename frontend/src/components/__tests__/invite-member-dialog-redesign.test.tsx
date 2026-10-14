@@ -19,12 +19,15 @@ const searchUsersMock = searchUsers as unknown as ReturnType<typeof vi.fn>;
 const grantAccessMock = grantAccess as unknown as ReturnType<typeof vi.fn>;
 
 const USERS = [
-  { username: "mina", display_name: "Mina Park", email: "mina@example.com" },
-  { username: "dana", display_name: "Dana Lee", email: "dana@example.com" },
+  { id: "user-mina", username: "mina", display_name: "Mina Park", email: "mina@example.com", account_kind: "human", account_status: "active" },
+  { id: "user-dana", username: "dana", display_name: "Dana Lee", email: "dana@example.com", account_kind: "human", account_status: "active" },
   {
+    id: "user-existing",
     username: "already-here",
     display_name: "Already Member",
     email: "member@example.com",
+    account_kind: "human",
+    account_status: "active",
   },
 ];
 
@@ -47,7 +50,7 @@ describe("InviteMemberDialog redesign", () => {
         open
         onOpenChange={onOpenChange}
         vault="platform-docs"
-        existingUsernames={new Set(["already-here"])}
+        existingUserIds={new Set(["user-existing"])}
         onInvited={onInvited}
       />,
     );
@@ -74,7 +77,11 @@ describe("InviteMemberDialog redesign", () => {
 
     await user.click(within(dialog).getByRole("button", { name: "Invite as Writer" }));
     await waitFor(() => {
-      expect(grantAccessMock).toHaveBeenCalledWith("platform-docs", "mina", "writer");
+      expect(grantAccessMock).toHaveBeenCalledWith(
+        "platform-docs",
+        { id: "user-mina", username: "mina" },
+        "writer",
+      );
     });
     expect(onInvited).toHaveBeenCalledTimes(1);
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -96,7 +103,7 @@ describe("InviteMemberDialog redesign", () => {
         open
         onOpenChange={onOpenChange}
         vault="platform-docs"
-        existingUsernames={new Set()}
+        existingUserIds={new Set()}
         onInvited={vi.fn()}
       />,
     );

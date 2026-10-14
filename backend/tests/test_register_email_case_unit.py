@@ -30,7 +30,11 @@ def _patch_pool(monkeypatch, *, existing=None):
     conn.fetch = AsyncMock(return_value=[])
     async def execute(query, *args):
         assert "pg_advisory_xact_lock" in query
-        assert args == ("akb:role-sync:reconcile",)
+        assert args[0] in {
+            "akb:role-sync:reconcile",
+            "user-handle:attacker",
+            "user-handle:newbie",
+        }
     conn.execute = AsyncMock(side_effect=execute)
 
     @asynccontextmanager
@@ -57,7 +61,7 @@ async def test_register_refuses_case_variant_email(monkeypatch):
         await auth_service.register("attacker", "victim@corp.example", "pw12345678", None)
 
     statement = " ".join(conn.fetchrow.await_args_list[-1].args[0].split())
-    assert "lower(email) = lower($2)" in statement
+    assert "lower(username) = $1 OR lower(email) = $2" in statement
 
 
 async def test_register_still_accepts_unrelated_email(monkeypatch):
@@ -67,11 +71,60 @@ async def test_register_still_accepts_unrelated_email(monkeypatch):
         lambda: MagicMock(on_user_create=AsyncMock()),
     )
 
-    out = await auth_service.register("newbie", "newbie@corp.example", "pw12345678", None)
+    out = await auth_service.register(
+        "  NewBie  ",
+        "  NewBie@Corp.Example  ",
+        "pw12345678",
+        "   ",
+    )
 
+    assert out["username"] == "newbie"
     assert out["email"] == "newbie@corp.example"
+    assert out["display_name"] is None
     statement = " ".join(conn.fetchrow.await_args_list[-1].args[0].split())
-    assert "lower(email) = lower($2)" in statement
+    assert "lower(username) = $1 OR lower(email) = $2" in statement
+
+
+async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch):
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "id": __import__("uuid").uuid4(),
+            "username": "newbie",
+            "email": "newbie@example.com",
+            "password_hash": "hash",
+            "display_name": None,
+            "is_admin": False,
+            "tokens_revoked_before": None,
+            "session_generation": 0,
+            "auth_provider": "local",
+            "account_status": "active",
+            "account_kind": "human",
+        }
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    conn.transaction = transaction
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    pool = MagicMock()
+    pool.acquire = acquire
+    monkeypatch.setattr(auth_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(auth_service, "verify_password_async", AsyncMock(return_value=True))
+    monkeypatch.setattr(auth_service, "create_jwt", lambda *_args, **_kwargs: "token")
+
+    result = await auth_service.login("  NewBie  ", "pw12345678")
+
+    assert result["user"]["username"] == "newbie"
+    assert conn.fetchrow.await_args.args[-2:] == ("NewBie", "newbie")
+    statement = " ".join(conn.fetchrow.await_args.args[0].split())
+    assert "username = $1 OR username = $2" in statement
 
 
 def test_migration_109_is_registered_in_the_runtime_applier():

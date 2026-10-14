@@ -22,7 +22,7 @@ interface Props {
   user: User;
   localPasswordEnabled: boolean;
   localProfileEditingEnabled: boolean;
-  onUserUpdate: (patch: { display_name?: string; email?: string }) => void;
+  onUserUpdate: (patch: { display_name?: string | null; email?: string }) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onBusyChange?: (busy: boolean) => void;
 }
@@ -35,8 +35,10 @@ export function ProfileSection({
   onDirtyChange,
   onBusyChange,
 }: Props) {
-  const [profileDisplayName, setProfileDisplayName] = useState(user.display_name ?? "");
-  const [profileEmail, setProfileEmail] = useState(user.email ?? "");
+  const [profileDisplayName, setProfileDisplayName] = useState(
+    (user.display_name ?? "").trim(),
+  );
+  const [profileEmail, setProfileEmail] = useState((user.email ?? "").trim());
   const [profileError, setProfileError] = useState("");
   // Benign "nothing to save" message — kept off the red error channel so a
   // no-op submit doesn't read as a failure.
@@ -59,12 +61,13 @@ export function ProfileSection({
 
   // Sync local edit state when user payload arrives.
   useEffect(() => {
-    setProfileDisplayName(user.display_name ?? "");
-    setProfileEmail(user.email ?? "");
+    setProfileDisplayName((user.display_name ?? "").trim());
+    setProfileEmail((user.email ?? "").trim());
   }, [user.user_id, user.display_name, user.email]);
 
   const profileDirty =
-    (user.display_name ?? "") !== profileDisplayName || (user.email ?? "") !== profileEmail;
+    (user.display_name ?? "").trim() !== profileDisplayName.trim()
+    || (user.email ?? "").trim() !== profileEmail.trim();
   const dirty = (localProfileEditingEnabled && profileDirty)
     || (localPasswordEnabled && Boolean(pwCurrent || pwNew || pwConfirm));
 
@@ -91,16 +94,21 @@ export function ProfileSection({
     setProfileError("");
     setProfileNotice("");
     const patch: { display_name?: string; email?: string } = {};
-    if ((user.display_name ?? "") !== profileDisplayName) patch.display_name = profileDisplayName;
-    if (user.email !== profileEmail) patch.email = profileEmail;
+    const displayName = profileDisplayName.trim();
+    if ((user.display_name ?? "") !== displayName) patch.display_name = displayName;
+    if (user.email !== profileEmail.trim()) patch.email = profileEmail.trim();
     if (!Object.keys(patch).length) {
+      setProfileDisplayName((user.display_name ?? "").trim());
+      setProfileEmail((user.email ?? "").trim());
       setProfileNotice("No changes to save");
       return;
     }
     setProfileBusy(true);
     try {
       const res = await updateProfile(patch);
-      onUserUpdate({ display_name: res.display_name ?? undefined, email: res.email });
+      setProfileDisplayName(res.display_name ?? "");
+      setProfileEmail(res.email);
+      onUserUpdate({ display_name: res.display_name, email: res.email });
       profileFlash.setFlash("Saved");
     } catch (err) {
       setProfileError(err instanceof Error ? err.message : "Failed to save");
@@ -140,8 +148,8 @@ export function ProfileSection({
     <div className="@container/profile min-w-0 space-y-8">
       <section aria-labelledby="profile-heading">
         <header className="border-b border-border pb-4">
-          <h2 id="profile-heading" className="text-base font-semibold text-foreground">Public profile</h2>
-          <p className="mt-1 text-sm text-foreground-muted">Your name and contact details.</p>
+          <h2 id="profile-heading" className="text-base font-semibold text-foreground">Profile</h2>
+          <p className="mt-1 text-sm text-foreground-muted">Your display name and AKB account identity.</p>
         </header>
 
         <div className="flex items-center gap-3 py-5" data-testid="profile-identity">
@@ -151,7 +159,6 @@ export function ProfileSection({
           <div className="min-w-0">
             <p className="break-words text-sm font-semibold text-foreground">{user.display_name?.trim() || user.username}</p>
             <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
-              <span className="break-all">@{user.username}</span>
               <RoleBadge role={user.is_admin ? "admin" : "user"} />
             </div>
           </div>
@@ -159,15 +166,33 @@ export function ProfileSection({
         <form onSubmit={handleSaveProfile} aria-busy={profileBusy || undefined}>
           <div className="space-y-4">
             <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
+              <span className="text-sm font-medium @min-[28rem]/profile:pt-2">Username</span>
+              <div>
+                <p className="min-h-10 break-all rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-sm text-foreground">
+                  @{user.username}
+                </p>
+                <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                  Used for sign-in and Vault sharing. Your username cannot currently be changed.
+                </p>
+              </div>
+            </div>
+            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
               <Label htmlFor="profile-display-name" className="@min-[28rem]/profile:pt-3">Display name</Label>
-              <Input
-                id="profile-display-name"
-                autoComplete="name"
-                value={profileDisplayName}
-                onChange={(e) => setProfileDisplayName(e.target.value)}
-                placeholder="—"
-                disabled={!localProfileEditingEnabled || profileBusy}
-              />
+              <div>
+                <Input
+                  id="profile-display-name"
+                  autoComplete="name"
+                  value={profileDisplayName}
+                  onChange={(e) => setProfileDisplayName(e.target.value)}
+                  placeholder="—"
+                  maxLength={100}
+                  aria-describedby="profile-display-name-help"
+                  disabled={!localProfileEditingEnabled || profileBusy}
+                />
+                <p id="profile-display-name-help" className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
+                  Shown to collaborators. Display names do not need to be unique.
+                </p>
+              </div>
             </div>
             <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
               <Label htmlFor="profile-email" className="@min-[28rem]/profile:pt-3">Email address</Label>

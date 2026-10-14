@@ -6,6 +6,7 @@ import { grantAccess } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 export interface MemberLike {
+  id?: string;
   username: string;
   role: "reader" | "writer" | "admin" | "owner";
 }
@@ -29,7 +30,11 @@ export function RoleSelect({ vault, member, onChanged, className }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await grantAccess(vault, member.username, next);
+      await grantAccess(
+        vault,
+        member.id ? { id: member.id, username: member.username } : member.username,
+        next,
+      );
       onChanged(prev, next);
     } catch (err: any) {
       setError(err?.message || "Failed to change role");

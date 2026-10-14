@@ -54,6 +54,45 @@ VALID_PUBLIC_ACCESS = {"none", "reader", "writer"}
 # broadly, the scope bounds WRITES).
 _MUTATING_ROLES = frozenset({"writer", "admin", "owner"})
 
+
+async def _resolve_user_reference(
+    conn,
+    *,
+    username: str | None,
+    user_id: str | None,
+):
+    """Resolve an API compatibility handle to one canonical user UUID.
+
+    New clients send ``user_id`` and may include ``username`` as a readable
+    snapshot.  Older MCP/REST clients keep working with username alone.  When
+    both are present they must describe the same row, preventing a stale UI
+    from mutating a different account after a future handle rename.
+    """
+    if user_id is not None:
+        try:
+            parsed_id = uuid.UUID(user_id)
+        except (TypeError, ValueError):
+            raise ValidationError("user_id must be a UUID") from None
+        target = await conn.fetchrow(
+            "SELECT id, username, is_admin FROM users WHERE id = $1", parsed_id
+        )
+        if target is None:
+            raise NotFoundError("User", user_id)
+        if username is not None and target["username"] != username:
+            raise ConflictError(
+                "User reference is stale. Refresh the member list and try again.",
+                code="user_reference_mismatch",
+            )
+        return target
+    if not username:
+        raise ValidationError("user or user_id is required")
+    target = await conn.fetchrow(
+        "SELECT id, username, is_admin FROM users WHERE username = $1", username
+    )
+    if target is None:
+        raise NotFoundError("User", username)
+    return target
+
 WRITE_ACTION_WILDCARD = "*"
 FILE_UPLOAD_WRITE_ACTION = "file_upload"
 VALID_WRITE_ACTIONS = frozenset({WRITE_ACTION_WILDCARD, FILE_UPLOAD_WRITE_ACTION})
@@ -518,8 +557,9 @@ async def get_user_role(user_id: str, vault_name: str) -> str | None:
 # ── Grant / Revoke ───────────────────────────────────────────
 
 async def grant_access(
-    granter_id: str, vault_name: str, target_username: str, role: str,
-    *, source_key: str = DIRECT_SOURCE_KEY, revision: int | None = None,
+    granter_id: str, vault_name: str, target_username: str | None, role: str,
+    *, target_user_id: str | None = None,
+    source_key: str = DIRECT_SOURCE_KEY, revision: int | None = None,
 ) -> dict:
     """Grant vault access to a user. Granter must be owner or admin.
 
@@ -571,11 +611,12 @@ async def grant_access(
                         raise ForbiddenError(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
-            target = await conn.fetchrow(
-                "SELECT id, username, is_admin FROM users WHERE username = $1", target_username,
+            target = await _resolve_user_reference(
+                conn,
+                username=target_username,
+                user_id=target_user_id,
             )
-            if not target:
-                raise NotFoundError("User", target_username)
+            resolved_username = target["username"]
             outcome = await apply_contribution(
                 conn, vault["id"], target["id"], role,
                 source_key=source_key, granted_by=granter_uid, revision=revision,
@@ -591,7 +632,7 @@ async def grant_access(
                 actor_id=str(granter_uid),
                 payload={
                     "vault": vault_name,
-                    "user": target_username,
+                    "user": resolved_username,
                     "role": role,
                     "target_user_id": str(target["id"]),
                     "target_is_owner": vault["owner_id"] == target["id"],
@@ -605,10 +646,11 @@ async def grant_access(
             )
             await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
-    logger.info("Granted %s role to %s on vault %s", role, target_username, vault_name)
+    logger.info("Granted %s role to %s on vault %s", role, resolved_username, vault_name)
     return {
         "vault": vault_name,
-        "user": target_username,
+        "user": resolved_username,
+        "user_id": str(target["id"]),
         "role": role,
         "source_key": source_key,
         "effective_role": outcome.effective_role,
@@ -620,8 +662,9 @@ async def grant_access(
 
 
 async def revoke_access(
-    revoker_id: str, vault_name: str, target_username: str,
-    *, source_key: str | None = None, revision: int | None = None,
+    revoker_id: str, vault_name: str, target_username: str | None,
+    *, target_user_id: str | None = None,
+    source_key: str | None = None, revision: int | None = None,
 ) -> dict:
     """Revoke vault access from a user. Revoker must be owner or admin.
 
@@ -668,11 +711,12 @@ async def revoke_access(
                         raise ForbiddenError(
                             f"Requires 'admin' role on vault '{vault_name}'"
                         )
-            target = await conn.fetchrow(
-                "SELECT id, is_admin FROM users WHERE username = $1", target_username,
+            target = await _resolve_user_reference(
+                conn,
+                username=target_username,
+                user_id=target_user_id,
             )
-            if not target:
-                raise NotFoundError("User", target_username)
+            resolved_username = target["username"]
             if vault["owner_id"] == target["id"]:
                 raise ForbiddenError(
                     "Cannot revoke owner's access. Use transfer_ownership instead."
@@ -700,7 +744,7 @@ async def revoke_access(
                 actor_id=str(revoker_uid),
                 payload={
                     "vault": vault_name,
-                    "user": target_username,
+                    "user": resolved_username,
                     "source_key": source_key,
                     "target_user_id": str(target["id"]),
                     "target_is_admin": bool(target.get("is_admin")),
@@ -713,10 +757,11 @@ async def revoke_access(
             )
             await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
-    logger.info("Revoked access for %s on vault %s", target_username, vault_name)
+    logger.info("Revoked access for %s on vault %s", resolved_username, vault_name)
     return {
         "vault": vault_name,
-        "user": target_username,
+        "user": resolved_username,
+        "user_id": str(target["id"]),
         "source_key": source_key,
         "effective_role": outcome.effective_role,
         "applied": outcome.applied,
@@ -743,7 +788,12 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
         vault = await conn.fetchrow("SELECT id, owner_id FROM vaults WHERE name = $1", vault_name)
 
         # Get owner
-        owner = await conn.fetchrow("SELECT id, username, display_name, email FROM users WHERE id = $1", vault["owner_id"])
+        owner = await conn.fetchrow(
+            """SELECT id, username, display_name, email, account_kind,
+                      account_status
+                 FROM users WHERE id = $1""",
+            vault["owner_id"],
+        )
         members = []
         if owner:
             members.append({
@@ -751,13 +801,16 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
                 "username": owner["username"],
                 "display_name": owner["display_name"],
                 "email": owner["email"],
+                "account_kind": owner["account_kind"],
+                "account_status": owner["account_status"],
                 "role": "owner",
             })
 
         # Get other members
         rows = await conn.fetch(
             """
-            SELECT u.id, u.username, u.display_name, u.email, va.role, va.created_at
+            SELECT u.id, u.username, u.display_name, u.email,
+                   u.account_kind, u.account_status, va.role, va.created_at
             FROM vault_access va
             JOIN users u ON va.user_id = u.id
             WHERE va.vault_id = $1
@@ -771,6 +824,8 @@ async def list_vault_members(user_id: str, vault_name: str) -> list[dict]:
                 "username": r["username"],
                 "display_name": r["display_name"],
                 "email": r["email"],
+                "account_kind": r["account_kind"],
+                "account_status": r["account_status"],
                 "role": r["role"],
                 "since": r["created_at"].isoformat() if r["created_at"] else None,
             })
@@ -1136,7 +1191,13 @@ def _coerce_example(v):
 
 # ── Transfer ownership ──────────────────────────────────────
 
-async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username: str) -> dict:
+async def transfer_ownership(
+    owner_id: str,
+    vault_name: str,
+    new_owner_username: str | None,
+    *,
+    new_owner_user_id: str | None = None,
+) -> dict:
     """Transfer vault ownership. The current owner or a system admin can do this.
 
     All three mutations (owner update, old-owner-to-admin grant, new-owner
@@ -1174,12 +1235,12 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 raise ConflictError(
                     "owner_id moved during transfer (another transfer won the race)"
                 )
-            new_owner = await conn.fetchrow(
-                "SELECT id, username FROM users WHERE username = $1",
-                new_owner_username,
+            new_owner = await _resolve_user_reference(
+                conn,
+                username=new_owner_username,
+                user_id=new_owner_user_id,
             )
-            if not new_owner:
-                raise NotFoundError("User", new_owner_username)
+            resolved_username = new_owner["username"]
 
             await conn.execute(
                 "UPDATE vaults SET owner_id = $1 WHERE id = $2",
@@ -1204,15 +1265,20 @@ async def transfer_ownership(owner_id: str, vault_name: str, new_owner_username:
                 payload={
                     "vault": vault_name,
                     "from_user_id": str(vault["owner_id"]),
-                    "to_username": new_owner_username,
+                    "to_username": resolved_username,
                     "to_user_id": str(new_owner["id"]),
                 },
             )
             await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
             await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
 
-    logger.info("Transferred ownership of %s to %s", vault_name, new_owner_username)
-    return {"vault": vault_name, "new_owner": new_owner_username, "transferred": True}
+    logger.info("Transferred ownership of %s to %s", vault_name, resolved_username)
+    return {
+        "vault": vault_name,
+        "new_owner": resolved_username,
+        "new_owner_id": str(new_owner["id"]),
+        "transferred": True,
+    }
 
 
 # ── User search ──────────────────────────────────────────────
@@ -1241,17 +1307,32 @@ async def search_users(query: str | None = None, limit: int = 20) -> list[dict]:
         if query:
             rows = await conn.fetch(
                 """
-                SELECT id, username, display_name, email
+                SELECT id, username, display_name, email,
+                       account_kind, account_status
                 FROM users
-                WHERE username ILIKE $1 OR display_name ILIKE $1 OR email ILIKE $1
-                ORDER BY username
+                WHERE account_status = 'active'
+                  AND (username ILIKE $1 OR display_name ILIKE $1 OR email ILIKE $1)
+                ORDER BY
+                    CASE
+                        WHEN lower(username) = lower($3) THEN 0
+                        WHEN lower(username) LIKE lower($3) || '%' THEN 1
+                        WHEN lower(email) = lower($3) THEN 2
+                        WHEN display_name ILIKE $1 THEN 3
+                        ELSE 4
+                    END,
+                    username
                 LIMIT $2
                 """,
-                f"%{query}%", limit,
+                f"%{query}%", limit, query,
             )
         else:
             rows = await conn.fetch(
-                "SELECT id, username, display_name, email FROM users ORDER BY username LIMIT $1",
+                """SELECT id, username, display_name, email,
+                          account_kind, account_status
+                     FROM users
+                    WHERE account_status = 'active'
+                    ORDER BY username
+                    LIMIT $1""",
                 limit,
             )
 
@@ -1261,6 +1342,8 @@ async def search_users(query: str | None = None, limit: int = 20) -> list[dict]:
             "username": r["username"],
             "display_name": r["display_name"],
             "email": r["email"],
+            "account_kind": r["account_kind"],
+            "account_status": r["account_status"],
         }
         for r in rows
     ]
