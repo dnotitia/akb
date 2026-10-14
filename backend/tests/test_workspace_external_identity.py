@@ -508,6 +508,39 @@ async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
         ) == 2
 
 
+async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
+    pool,
+):
+    from app.services.auth_service import _resolve_or_provision_keycloak_user
+
+    existing_id = uuid.uuid4()
+    legacy_username = f"wsg-Straße-{uuid.uuid4().hex[:6]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            existing_id,
+            legacy_username,
+            f"{uuid.uuid4().hex}@example.com",
+            "unused",
+        )
+
+    claims = _claims(
+        f"unicode-collision-{uuid.uuid4().hex[:8]}",
+        f"wsg-unicode-{uuid.uuid4().hex[:8]}@example.com",
+    )
+    claims["preferred_username"] = legacy_username
+    resolved = await _resolve_or_provision_keycloak_user(claims)
+
+    assert resolved["newly_provisioned"] is True
+    assert resolved["user_id"] != existing_id
+    assert resolved["username"] != legacy_username.lower()
+
+
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 

@@ -18,6 +18,14 @@ def test_username_normalizes_case_and_preserves_unicode_letters():
     assert normalize_username("  한글_사용자  ") == "한글_사용자"
 
 
+def test_username_uses_database_lowercase_semantics_not_python_casefold():
+    # PostgreSQL 16 lower('Straße') is 'straße', not 'strasse'. Keeping
+    # the application rule aligned prevents the duplicate check from missing
+    # a legacy mixed-case Unicode handle.
+    assert normalize_username("Straße") == "straße"
+    assert username_base_from_external("Straße") == "straße"
+
+
 @pytest.mark.parametrize(
     "value",
     ["ab", "-alice", "alice-", "alice smith", "alice@example.com"],

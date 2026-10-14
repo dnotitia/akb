@@ -23,7 +23,11 @@ _HANDLE_PUNCTUATION = frozenset("._-")
 
 def normalize_username(value: str) -> str:
     """Return the canonical local username or raise a user-facing 422."""
-    username = unicodedata.normalize("NFC", value).strip().casefold()
+    # PostgreSQL is the uniqueness backstop for both local and SSO handles.
+    # Use the same lowercase equivalence as ``lower(username)`` rather than
+    # Python's broader ``casefold()`` (for example, ``ß`` casefolds to
+    # ``ss`` while PostgreSQL 16 lower() keeps it as ``ß``).
+    username = unicodedata.normalize("NFC", value).strip().lower()
     if not (USERNAME_MIN_LENGTH <= len(username) <= USERNAME_MAX_LENGTH):
         raise ValidationError(
             f"Username must be {USERNAME_MIN_LENGTH}-{USERNAME_MAX_LENGTH} characters"
@@ -48,7 +52,7 @@ def username_base_from_external(value: str | None) -> str:
     existing product contract includes Hangul handles) while replacing unsafe
     separators with one portable dash.
     """
-    raw = unicodedata.normalize("NFKC", value or "").strip().casefold()
+    raw = unicodedata.normalize("NFKC", value or "").strip().lower()
     if "@" in raw:
         raw = raw.split("@", 1)[0]
     pieces: list[str] = []
