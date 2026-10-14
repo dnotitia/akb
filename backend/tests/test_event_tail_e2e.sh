@@ -15,8 +15,8 @@ ERRORS=()
 TMP_DIR=$(mktemp -d)
 VAULT="event-tail-$(date +%s)-$RANDOM"
 BUSY_VAULT="event-tail-busy-$(date +%s)-$RANDOM"
-USER="event-tail-user-$(date +%s)-$RANDOM"
-OTHER="event-tail-other-$(date +%s)-$RANDOM"
+USER="evt-user-$(date +%s)-$RANDOM"
+OTHER="evt-other-$(date +%s)-$RANDOM"
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }

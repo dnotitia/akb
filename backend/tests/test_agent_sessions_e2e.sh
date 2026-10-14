@@ -330,16 +330,17 @@ echo "$R" | grep -q "한글유저" \
   || fail "CJK description" "label missing: ${R:0:200}"
 
 # ── 14. Legacy adoption is owner-scoped (no cross-user hijack) ──
-# Two usernames that slugify to the SAME legacy name (case-fold
-# collision). User A owns a pre-migration vault under that slug; user B
+# Two distinct canonical usernames that slugify to the SAME legacy name
+# (the frozen legacy slug strips accents). User A owns a pre-migration vault
+# under that slug; user B
 # must NOT adopt it — B falls through to its own user_id-keyed vault.
 echo ""
 echo "▸ 14. Legacy adoption refuses a vault owned by another user"
 
 SLUG="collide-${TS}"
 LEGACY_NAME="agent-memory-${SLUG}"
-A_USER="Collide-${TS}"   # slug → collide-${TS}
-B_USER="COLLIDE-${TS}"   # slug → collide-${TS}  (same)
+A_USER="Collidé-${TS}"   # slug → collide-${TS}
+B_USER="Collide-${TS}"   # slug → collide-${TS}  (same)
 
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" -H "$H_JSON" \
   -d "{\"username\":\"$A_USER\",\"email\":\"a-${TS}@t.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
