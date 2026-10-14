@@ -59,7 +59,7 @@ from app.services.user_identity import (
     display_name_from_external,
     normalize_display_name,
     normalize_email,
-    normalize_username,
+    prepare_username,
     stable_username_candidate,
     username_base_from_external,
 )
@@ -286,7 +286,7 @@ async def register(username: str, email: str, password: str, display_name: str |
     require_local_auth_enabled()
     if violation := _password_rule_violation(password):
         raise ValidationError(violation)
-    username = normalize_username(username)
+    prepared_username = prepare_username(username)
     email = normalize_email(email)
     display_name = normalize_display_name(display_name)
     pool = await get_pool()
@@ -302,6 +302,11 @@ async def register(username: str, email: str, password: str, display_name: str |
         # lower(email) (migration 109) is the race-proof backstop; this
         # check is the friendly 409 before it.
         async with role_authority_transaction(conn):
+            # PostgreSQL owns both the comparison and stored lowercase form.
+            # Python lower()/casefold() differ for valid Unicode handles such
+            # as contextual Greek sigma, so computing this outside the DB can
+            # admit a duplicate of an existing legacy mixed-case username.
+            username = await conn.fetchval("SELECT lower($1::text)", prepared_username)
             # The database's historical TEXT UNIQUE constraint is exact-case.
             # New handles are canonical lowercase, and this lock makes the
             # friendly case-insensitive check race-safe without rewriting any
@@ -352,12 +357,6 @@ async def register(username: str, email: str, password: str, display_name: str |
 async def login(username: str, password: str) -> dict:
     require_local_auth_enabled()
     username = username.strip()
-    try:
-        canonical_username = normalize_username(username)
-    except ValidationError:
-        # Login accepts an e-mail address and legacy handles that predate the
-        # current validation rules. Do not turn an auth attempt into a 422.
-        canonical_username = username
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -367,17 +366,18 @@ async def login(username: str, password: str) -> dict:
                        tokens_revoked_before, session_generation, auth_provider,
                        account_status, account_kind
                   FROM users
-                 WHERE username = $1 OR username = $2 OR lower(email) = lower($1)
+                 WHERE username = $1
+                    OR lower(username) = lower($1)
+                    OR lower(email) = lower($1)
                  ORDER BY CASE
                               WHEN username = $1 THEN 0
-                              WHEN username = $2 THEN 1
+                              WHEN lower(username) = lower($1) THEN 1
                               ELSE 2
                           END
                  LIMIT 1
                    FOR SHARE
                 """,
                 username,
-                canonical_username,
             )
             if row and row["account_status"] != "active" and row["account_kind"] == "human":
                 raise AccountSuspendedError()
@@ -430,7 +430,10 @@ async def _unique_username(
     handle collision therefore gets a distinct handle; it never links to the
     existing account and no longer prevents the new identity from signing in.
     """
-    base = username_base_from_external(base)
+    prepared_base = username_base_from_external(base)
+    # See register(): collision checks and the stored handle must share the
+    # database's own Unicode lowercase implementation.
+    base = await conn.fetchval("SELECT lower($1::text)", prepared_base)
     await conn.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         f"user-handle:{base}",

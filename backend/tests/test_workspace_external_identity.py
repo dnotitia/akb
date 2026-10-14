@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -13,6 +14,7 @@ from app.config import settings
 from app.config import AuthModeConfigurationError
 from app.exceptions import (
     AccountSuspendedError,
+    ConflictError,
     ExternalIdentityConflictError,
     MembershipRequiredError,
 )
@@ -508,13 +510,14 @@ async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
         ) == 2
 
 
+@pytest.mark.parametrize("legacy_stem", ["Straße", "ΑΟΣ"])
 async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
-    pool,
+    pool, legacy_stem
 ):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
     existing_id = uuid.uuid4()
-    legacy_username = f"wsg-Straße-{uuid.uuid4().hex[:6]}"
+    legacy_username = f"wsg-{legacy_stem}-{uuid.uuid4().hex[:6]}"
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -528,6 +531,7 @@ async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
             f"{uuid.uuid4().hex}@example.com",
             "unused",
         )
+        database_lower = await conn.fetchval("SELECT lower($1::text)", legacy_username)
 
     claims = _claims(
         f"unicode-collision-{uuid.uuid4().hex[:8]}",
@@ -538,7 +542,40 @@ async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
 
     assert resolved["newly_provisioned"] is True
     assert resolved["user_id"] != existing_id
-    assert resolved["username"] != legacy_username.lower()
+    assert resolved["username"] != database_lower
+    assert resolved["username"].startswith(f"{database_lower}-")
+
+
+async def test_local_registration_rejects_exact_legacy_greek_handle(
+    pool, monkeypatch
+):
+    from app.services import auth_service
+
+    legacy_username = f"wsg-ΑΟΣ-{uuid.uuid4().hex[:6]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            uuid.uuid4(),
+            legacy_username,
+            f"{uuid.uuid4().hex}@example.com",
+            "unused",
+        )
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    monkeypatch.setattr(
+        auth_service, "hash_password_async", AsyncMock(return_value="unused")
+    )
+    with pytest.raises(ConflictError):
+        await auth_service.register(
+            legacy_username,
+            f"wsg-register-{uuid.uuid4().hex}@example.com",
+            "password123",
+        )
 
 
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):

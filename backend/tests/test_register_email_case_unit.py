@@ -26,7 +26,12 @@ from app.services import auth_service
 def _patch_pool(monkeypatch, *, existing=None):
     conn = MagicMock()
     conn.fetchrow = AsyncMock(return_value=existing)
-    conn.fetchval = AsyncMock(return_value=False)
+    async def fetchval(query, *args):
+        if "SELECT lower" in query:
+            return str(args[0]).lower()
+        return False
+
+    conn.fetchval = AsyncMock(side_effect=fetchval)
     conn.fetch = AsyncMock(return_value=[])
     async def execute(query, *args):
         assert "pg_advisory_xact_lock" in query
@@ -122,9 +127,9 @@ async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch
     result = await auth_service.login("  NewBie  ", "pw12345678")
 
     assert result["user"]["username"] == "newbie"
-    assert conn.fetchrow.await_args.args[-2:] == ("NewBie", "newbie")
+    assert conn.fetchrow.await_args.args[-1:] == ("NewBie",)
     statement = " ".join(conn.fetchrow.await_args.args[0].split())
-    assert "username = $1 OR username = $2" in statement
+    assert "username = $1 OR lower(username) = lower($1)" in statement
 
 
 def test_migration_109_is_registered_in_the_runtime_applier():

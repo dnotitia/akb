@@ -7,23 +7,20 @@ from app.services.user_identity import (
     display_name_from_external,
     normalize_display_name,
     normalize_email,
-    normalize_username,
+    prepare_username,
     stable_username_candidate,
     username_base_from_external,
 )
 
 
-def test_username_normalizes_case_and_preserves_unicode_letters():
-    assert normalize_username("  GNU.Team  ") == "gnu.team"
-    assert normalize_username("  한글_사용자  ") == "한글_사용자"
+def test_username_prepares_case_for_database_and_preserves_unicode_letters():
+    assert prepare_username("  GNU.Team  ") == "GNU.Team"
+    assert prepare_username("  한글_사용자  ") == "한글_사용자"
 
 
-def test_username_uses_database_lowercase_semantics_not_python_casefold():
-    # PostgreSQL 16 lower('Straße') is 'straße', not 'strasse'. Keeping
-    # the application rule aligned prevents the duplicate check from missing
-    # a legacy mixed-case Unicode handle.
-    assert normalize_username("Straße") == "straße"
-    assert username_base_from_external("Straße") == "straße"
+def test_username_preserves_contextual_case_until_database_transaction():
+    assert prepare_username("ΑΟΣ") == "ΑΟΣ"
+    assert username_base_from_external("ΑΟΣ") == "ΑΟΣ"
 
 
 @pytest.mark.parametrize(
@@ -32,11 +29,11 @@ def test_username_uses_database_lowercase_semantics_not_python_casefold():
 )
 def test_username_rejects_ambiguous_or_unsafe_handles(value):
     with pytest.raises(ValidationError):
-        normalize_username(value)
+        prepare_username(value)
 
 
 def test_external_handle_is_safe_and_keeps_unicode_contract():
-    assert username_base_from_external("Alice Smith@example.com") == "alice-smith"
+    assert username_base_from_external("Alice Smith@example.com") == "Alice-Smith"
     assert username_base_from_external("홍 길동") == "홍-길동"
     assert username_base_from_external("@@@") == "user"
 
