@@ -616,7 +616,9 @@ async def test_login_prefers_exact_database_canonical_handle_among_legacy_varian
     monkeypatch.setattr(
         auth_service,
         "verify_password_async",
-        AsyncMock(side_effect=lambda _password, password_hash: password_hash == "canonical-hash"),
+        AsyncMock(  # pragma: allowlist secret
+            side_effect=lambda _password, password_hash: password_hash == "canonical-hash"
+        ),
     )
     monkeypatch.setattr(auth_service, "create_jwt", lambda *_args, **_kwargs: "token")
 

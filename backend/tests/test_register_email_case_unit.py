@@ -98,7 +98,7 @@ async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch
             "id": __import__("uuid").uuid4(),
             "username": "newbie",
             "email": "newbie@example.com",
-            "password_hash": "hash",
+            "password_hash": "hash",  # pragma: allowlist secret
             "display_name": None,
             "is_admin": False,
             "tokens_revoked_before": None,
