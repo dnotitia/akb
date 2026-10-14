@@ -94,7 +94,10 @@ test("agent connection deep links preserve all three setup phases", async ({ pag
 test("account menu opens settings in place and outside dismissal restores focus without layout shift", async ({ page }) => {
   await setup(page);
   await page.goto("/search?q=retained");
-  const account = page.getByRole("button", { name: "Account menu — Settings reviewer" });
+  const account = page.getByRole("button", {
+    name: "Account menu — Settings reviewer (@reader), reader@example.invalid",
+    exact: true,
+  });
   const before = (await account.boundingBox())!;
   await account.click();
   await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
@@ -257,6 +260,9 @@ test("saving a profile refreshes the global identity without leaving the workspa
   await dialog.getByRole("button", { name: "Save profile" }).click();
   await expect(dialog.getByRole("status").filter({ hasText: /^Saved$/ })).toBeVisible();
   await dialog.getByRole("button", { name: "Close settings" }).click();
-  await expect(page.getByRole("button", { name: "Account menu — Updated reviewer" })).toBeVisible();
+  await expect(page.getByRole("button", {
+    name: "Account menu — Updated reviewer (@reader), reader@example.invalid",
+    exact: true,
+  })).toBeVisible();
   await expect(page).toHaveURL(/\/search\?q=retained$/);
 });

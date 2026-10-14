@@ -486,7 +486,10 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     const header = page.getByRole("banner");
     const search = header.getByRole("button", { name: "Search knowledge", exact: true });
     const notifications = header.getByRole("button", { name: /^Notifications,/ });
-    const account = header.getByRole("button", { name: "Account menu — Reading reviewer", exact: true });
+    const account = header.getByRole("button", {
+      name: "Account menu — Reading reviewer (@fixture), reader@example.invalid",
+      exact: true,
+    });
     for (const control of [search, notifications, account]) {
       await expect(control).toBeInViewport({ ratio: 1 });
       expect((await control.boundingBox())!.height).toBe(36);
@@ -1189,7 +1192,10 @@ for (const width of [640, 768]) {
     const mobileNavigation = header.getByRole("navigation", { name: "Primary mobile navigation", exact: true });
     const logo = header.getByRole("link", { name: /^AKB home\b/ });
     const search = header.getByRole("button", { name: "Search knowledge", exact: true });
-    const account = header.getByRole("button", { name: `Account menu — ${displayName}`, exact: true });
+    const account = header.getByRole("button", {
+      name: `Account menu — ${displayName} (@fixture), reader@example.invalid`,
+      exact: true,
+    });
     await expect(logo).toContainText("AKB");
     const controls = [
       logo,

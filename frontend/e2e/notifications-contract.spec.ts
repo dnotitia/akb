@@ -50,7 +50,10 @@ for (const width of [1440, 1024, 640, 375]) for (const dark of [false, true]) {
     await page.goto("/notifications?state=all");
     await page.evaluate(value => document.documentElement.classList.toggle("dark", value), dark);
     const bell = page.getByRole("button", { name: "Notifications, 1 unread" });
-    const account = page.getByRole("button", { name: "Account menu — 테스터" });
+    const account = page.getByRole("button", {
+      name: "Account menu — 테스터 (@fixture), fixture@example.invalid",
+      exact: true,
+    });
     await expect(account).toBeVisible();
     if (width >= 640) {
       const name = account.getByText("테스터", { exact: true });

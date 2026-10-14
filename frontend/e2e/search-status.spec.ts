@@ -37,7 +37,10 @@ for (const width of [375, 768, 1024, 1440, 2560]) for (const dark of [false, tru
     const state = await fixtures(page, dark);
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Your vaults", exact: true })).toBeVisible();
-    const profile = page.getByRole("button", { name: "Account menu — 임근우" });
+    const profile = page.getByRole("button", {
+      name: "Account menu — 임근우 (@reviewer), review@example.invalid",
+      exact: true,
+    });
     const before = await profile.boundingBox();
     const badge = page.getByTestId("header-indexing-status");
     await expect(badge).toBeEmpty();
