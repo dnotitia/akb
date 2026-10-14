@@ -613,12 +613,13 @@ async def test_login_prefers_exact_database_canonical_handle_among_legacy_varian
         )
 
     monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    def matches_fixture_hash(_password: str, password_hash: str) -> bool:
+        return password_hash == "canonical-hash"  # pragma: allowlist secret
+
     monkeypatch.setattr(
         auth_service,
         "verify_password_async",
-        AsyncMock(  # pragma: allowlist secret
-            side_effect=lambda _password, password_hash: password_hash == "canonical-hash"
-        ),
+        AsyncMock(side_effect=matches_fixture_hash),
     )
     monkeypatch.setattr(auth_service, "create_jwt", lambda *_args, **_kwargs: "token")
 
