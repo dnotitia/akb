@@ -578,6 +578,53 @@ async def test_local_registration_rejects_exact_legacy_greek_handle(
         )
 
 
+async def test_login_prefers_exact_database_canonical_handle_among_legacy_variants(
+    pool, monkeypatch
+):
+    from app.services import auth_service
+
+    suffix = uuid.uuid4().hex[:6]
+    mixed_username = f"wsg-Alice-{suffix}"
+    canonical_username = f"wsg-alice-{suffix}"
+    mixed_id = uuid.uuid4()
+    canonical_id = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO users (
+                id, username, email, password_hash, auth_provider,
+                account_status, account_kind
+            ) VALUES ($1, $2, $3, $4, 'local', 'active', 'human')
+            """,
+            [
+                (
+                    mixed_id,
+                    mixed_username,
+                    f"{uuid.uuid4().hex}@example.com",
+                    "mixed-hash",
+                ),
+                (
+                    canonical_id,
+                    canonical_username,
+                    f"{uuid.uuid4().hex}@example.com",
+                    "canonical-hash",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(auth_service, "require_local_auth_enabled", lambda: None)
+    monkeypatch.setattr(
+        auth_service,
+        "verify_password_async",
+        AsyncMock(side_effect=lambda _password, password_hash: password_hash == "canonical-hash"),
+    )
+    monkeypatch.setattr(auth_service, "create_jwt", lambda *_args, **_kwargs: "token")
+
+    result = await auth_service.login(canonical_username.upper(), "password123")
+
+    assert result["user"]["id"] == str(canonical_id)
+
+
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 

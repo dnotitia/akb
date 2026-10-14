@@ -360,24 +360,28 @@ async def login(username: str, password: str) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            canonical_username = await conn.fetchval(
+                "SELECT lower($1::text)", username
+            )
             row = await conn.fetchrow(
                 """
                 SELECT id, username, email, password_hash, display_name, is_admin,
                        tokens_revoked_before, session_generation, auth_provider,
                        account_status, account_kind
-                  FROM users
+                 FROM users
                  WHERE username = $1
-                    OR lower(username) = lower($1)
+                    OR username = $2
                     OR lower(email) = lower($1)
                  ORDER BY CASE
                               WHEN username = $1 THEN 0
-                              WHEN lower(username) = lower($1) THEN 1
+                              WHEN username = $2 THEN 1
                               ELSE 2
                           END
                  LIMIT 1
                    FOR SHARE
                 """,
                 username,
+                canonical_username,
             )
             if row and row["account_status"] != "active" and row["account_kind"] == "human":
                 raise AccountSuspendedError()
