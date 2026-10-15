@@ -1,6 +1,15 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   ArrowDown,
@@ -40,6 +49,13 @@ import { TooltipText } from "@/components/ui/tooltip-text";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { PublicationSuccessBanner } from "@/components/publication-success-banner";
+import { TableCellExpanded } from "@/components/table-cell-expanded";
+import {
+  TableColumnResize,
+  TableColumnResizeGuide,
+  TableColumnResizeHandle,
+  TableColumnResizeSeparator,
+} from "@/components/table-column-resize";
 import { TablePublishDialog } from "@/components/table-publish-dialog";
 import { TableRowDialog } from "@/components/table-row-dialog";
 import {
@@ -50,6 +66,7 @@ import {
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { usePublishResourceLocation } from "@/contexts/resource-location-context";
+import { useTableColumnWidths } from "@/hooks/use-table-column-widths";
 import {
   ApiError,
   deleteVaultTable,
@@ -114,10 +131,36 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
   const [selectedRow, setSelectedRow] = useState<Record<string, unknown> | null>(null);
   const [rowToDelete, setRowToDelete] = useState<Record<string, unknown> | null>(null);
   const [rowNotice, setRowNotice] = useState("");
+  const [wrapText, setWrapText] = useState(readWrapTextPreference);
+  // A view preference, like Wrap text: readers resize columns too.
+  const {
+    widths: columnWidths,
+    setWidth: setColumnWidth,
+    resetWidth: resetColumnWidth,
+  } = useTableColumnWidths(vault, table);
   const schemaToggleRef = useRef<HTMLButtonElement | null>(null);
   const schemaCloseRef = useRef<HTMLButtonElement | null>(null);
+  const recordsRef = useRef<HTMLDivElement | null>(null);
   const loadedAccessRevision = useRef(accessRevision);
   const queryState = useMemo(() => parseTableQueryState(searchParams), [searchParams]);
+
+  // Cells showing their full value in place, keyed by tableCellKey(). Several
+  // can be open at once. They belong to the records on screen: another page,
+  // page size, sort or filter set collapses them all, while a refresh or a row
+  // edit of the same view keeps them open.
+  const recordView = JSON.stringify([
+    queryState.pageIndex,
+    queryState.pageSize,
+    queryState.sort,
+    queryState.filters,
+  ]);
+  const [expandedCells, setExpandedCells] = useState<ReadonlySet<string>>(NO_EXPANDED_CELLS);
+  const [expandedCellsView, setExpandedCellsView] = useState(recordView);
+  if (expandedCellsView !== recordView) {
+    setExpandedCellsView(recordView);
+    setExpandedCells(NO_EXPANDED_CELLS);
+  }
+  const focusRecords = useCallback(() => recordsRef.current?.focus({ preventScroll: true }), []);
 
   const setQueryState = useCallback(
     (next: TableQueryState) => {
@@ -282,6 +325,11 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
     setQueryState({ ...queryState, pageIndex: 0, sort: next });
   }
 
+  function updateWrapText(next: boolean) {
+    setWrapText(next);
+    writeWrapTextPreference(next);
+  }
+
   return (
     <ResourceWorkspace label="Table workspace" variant="reading">
       <h1 className="sr-only">{info?.name || "Table"}</h1>
@@ -397,6 +445,8 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                 onClear={() => setQueryState({ ...queryState, pageIndex: 0, filters: [] })}
                 onRefresh={() => void refreshTableData()}
                 refreshing={rowsQuery.isFetching}
+                wrapText={wrapText}
+                onWrapTextChange={updateWrapText}
               />
               {queryError && rowsQuery.data && (
                 <div className="shrink-0 border-b border-border p-3">
@@ -451,12 +501,14 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                   ) : null}
                 </div>
               ) : (
+                <TableColumnResize onResize={setColumnWidth} onReset={resetColumnWidth}>
                 <div
+                  ref={recordsRef}
                   role="region"
                   aria-label={`Records for ${table}`}
                   aria-busy={rowsQuery.isFetching || undefined}
                   tabIndex={0}
-                  className="min-h-0 flex-1 overflow-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                  className="relative min-h-0 flex-1 overflow-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                 >
                   <table className="min-w-full border-separate border-spacing-0 text-sm">
                     <thead>
@@ -467,17 +519,22 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                         >
                           #
                         </th>
-                        {cols.map((columnName) => {
+                        {cols.map((columnName, columnIndex) => {
                           const sorted = activeSort.column === columnName;
                           const SortIcon = sorted
                             ? activeSort.direction === "asc"
                               ? ArrowUp
                               : ArrowDown
                             : ArrowUpDown;
+                          const width = columnWidths.get(columnName);
                           return (
+                            // Named after the column alone. Named from its
+                            // content, the header would also read out its sort
+                            // button and resize separator, which have their own names.
                             <th
                               key={columnName}
                               scope="col"
+                              aria-label={columnName}
                               aria-sort={
                                 sorted
                                   ? activeSort.direction === "asc"
@@ -485,6 +542,7 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                                     : "descending"
                                   : "none"
                               }
+                              style={columnWidthStyle(width)}
                               className="sticky top-0 z-[var(--z-raised)] min-w-36 border-b border-r border-border bg-surface-2 p-0 text-left last:border-r-0"
                             >
                               <button
@@ -495,12 +553,19 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                                   sorted ? activeSort.direction : "not currently sorted"
                                 }`}
                               >
+                                {/* A narrowed column truncates the name and the type; the sort
+                                    icon stays. A cut name shows in full on hover, portaled so
+                                    the tooltip never lands inside the sort button. */}
                                 <span className="min-w-0">
-                                  <span className="block truncate whitespace-nowrap font-mono text-xs font-medium text-foreground">
+                                  <TooltipText
+                                    tip={columnName}
+                                    portal
+                                    className="block truncate whitespace-nowrap font-mono text-xs font-medium text-foreground"
+                                  >
                                     {columnName}
-                                  </span>
+                                  </TooltipText>
                                   {columnByName.get(columnName)?.type && (
-                                    <span className="mt-0.5 block whitespace-nowrap text-xs font-normal text-foreground-muted">
+                                    <span className="mt-0.5 block truncate whitespace-nowrap text-xs font-normal text-foreground-muted">
                                       {columnByName.get(columnName)?.type}
                                     </span>
                                   )}
@@ -513,6 +578,15 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                                   aria-hidden
                                 />
                               </button>
+                              {/* Siblings of the sort button, so a press on a border never sorts. */}
+                              <TableColumnResizeSeparator
+                                column={columnName}
+                                width={width}
+                                rowEnd={columnIndex === cols.length - 1 && !canManageRows}
+                              />
+                              {columnIndex > 0 && (
+                                <TableColumnResizeHandle column={cols[columnIndex - 1]} edge="start" />
+                              )}
                             </th>
                           );
                         })}
@@ -527,51 +601,93 @@ function TablePageContent({ accountScope, accessChecking, accessRevision }: {
                       </tr>
                     </thead>
                     <tbody>
-                      {rows.map((row, rowIndex) => (
-                        <tr
-                          key={typeof row.id === "string" ? row.id : rowIndex}
-                          className="group transition-colors hover:bg-surface-hover"
-                        >
-                          <td className="sticky left-0 z-[var(--z-raised)] border-b border-r border-border bg-surface px-3 py-2 text-xs text-foreground-muted tabular-nums group-hover:bg-surface-hover">
-                            {displayPageIndex * displayPageSize + rowIndex + 1}
-                          </td>
-                          {cols.map((columnName) => {
-                            const value = row[columnName];
-                            const numeric =
-                              typeof value === "number" ||
-                              isNumericColumnType(columnByName.get(columnName)?.type);
-                            return (
-                              <TooltipText key={columnName} asChild tip={formatCellFull(value)}>
-                                <td
-                                  className={cn(
-                                    "max-w-md truncate whitespace-nowrap border-b border-r border-border px-3 py-2 text-foreground last:border-r-0",
-                                    numeric && "text-right tabular-nums",
-                                    value !== null && typeof value === "object" && "font-mono text-xs",
-                                    value === null && "italic text-foreground-muted",
-                                  )}
-                                >
-                                  {formatCell(value)}
-                                </td>
-                              </TooltipText>
-                            );
-                          })}
-                          {canManageRows && (
-                            <td className="sticky right-0 z-[var(--z-raised)] border-b border-l border-border bg-surface px-1 py-1 text-center group-hover:bg-surface-hover">
-                              <RowActionsMenu
-                                rowNumber={displayPageIndex * displayPageSize + rowIndex + 1}
-                                onEdit={() => {
-                                  setSelectedRow(row);
-                                  setRowDialogMode("edit");
-                                }}
-                                onDelete={() => setRowToDelete(row)}
-                              />
+                      {rows.map((row, rowIndex) => {
+                        const rowNumber = displayPageIndex * displayPageSize + rowIndex + 1;
+                        const rowKey = typeof row.id === "string" ? row.id : `#${rowIndex}`;
+                        const rowExpanded =
+                          expandedCells.size > 0 &&
+                          cols.some((columnName) => expandedCells.has(tableCellKey(rowKey, columnName)));
+                        // Wrapped rows, and rows holding an expanded cell, grow.
+                        const alignTop = wrapText || rowExpanded;
+                        return (
+                          <tr
+                            key={typeof row.id === "string" ? row.id : rowIndex}
+                            className="group transition-colors hover:bg-surface-hover"
+                          >
+                            {/* A row that grows moves the row number and the actions to
+                                the top, centered on the values' first line, a 20px line
+                                box 8px down: leading-5 gives the number that box. */}
+                            <td
+                              className={cn(
+                                "sticky left-0 z-[var(--z-raised)] border-b border-r border-border bg-surface px-3 py-2 text-xs text-foreground-muted tabular-nums group-hover:bg-surface-hover",
+                                alignTop && "align-top leading-5",
+                              )}
+                            >
+                              {rowNumber}
                             </td>
-                          )}
-                        </tr>
-                      ))}
+                            {cols.map((columnName, columnIndex) => {
+                              const value = row[columnName];
+                              const columnType = columnByName.get(columnName)?.type;
+                              const cellKey = tableCellKey(rowKey, columnName);
+                              return (
+                                <TableDataCell
+                                  key={columnName}
+                                  value={value}
+                                  columnName={columnName}
+                                  rowNumber={rowNumber}
+                                  numeric={typeof value === "number" || isNumericColumnType(columnType)}
+                                  width={columnWidths.get(columnName)}
+                                  resizeHandle={
+                                    <TableColumnResizeHandle
+                                      column={columnName}
+                                      edge="end"
+                                      rowEnd={columnIndex === cols.length - 1 && !canManageRows}
+                                    />
+                                  }
+                                  wrap={wrapText}
+                                  alignTop={alignTop}
+                                  expanded={expandedCells.has(cellKey)}
+                                  onExpand={() =>
+                                    setExpandedCells((current) => new Set(current).add(cellKey))
+                                  }
+                                  onCollapse={() =>
+                                    setExpandedCells((current) => {
+                                      const next = new Set(current);
+                                      next.delete(cellKey);
+                                      return next;
+                                    })
+                                  }
+                                  focusRecords={focusRecords}
+                                />
+                              );
+                            })}
+                            {canManageRows && (
+                              <td
+                                className={cn(
+                                  "sticky right-0 z-[var(--z-raised)] border-b border-l border-border bg-surface px-1 text-center group-hover:bg-surface-hover",
+                                  // The 32px menu button centers on that line; the cell
+                                  // keeps its single-line height.
+                                  alignTop ? "pb-1.5 pt-0.5 align-top" : "py-1",
+                                )}
+                              >
+                                <RowActionsMenu
+                                  rowNumber={rowNumber}
+                                  onEdit={() => {
+                                    setSelectedRow(row);
+                                    setRowDialogMode("edit");
+                                  }}
+                                  onDelete={() => setRowToDelete(row)}
+                                />
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
+                  <TableColumnResizeGuide />
                 </div>
+                </TableColumnResize>
               )}
               {rowsQuery.data && total > 0 && (
                 <TablePagination
@@ -1023,14 +1139,264 @@ function TablePageLoading() {
   );
 }
 
+const WRAP_TEXT_STORAGE_KEY = "akb.tableWrapText";
+
+/** The saved Wrap text choice for this browser; off when storage is unavailable. */
+function readWrapTextPreference(): boolean {
+  try {
+    return localStorage.getItem(WRAP_TEXT_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeWrapTextPreference(next: boolean) {
+  try {
+    localStorage.setItem(WRAP_TEXT_STORAGE_KEY, String(next));
+  } catch {
+    /* Storage is optional: the choice then lasts until the page unmounts. */
+  }
+}
+
+const NO_EXPANDED_CELLS: ReadonlySet<string> = new Set();
+
+/** Identifies a cell of the records on screen; rows without a string id use their position. */
+function tableCellKey(rowKey: string, columnName: string): string {
+  return `${rowKey}\u0000${columnName}`;
+}
+
+const CELL_DISPLAY_LIMIT = 120;
+/**
+ * Wrapped cells show up to six lines. The cap sits above what six lines of the
+ * widest column hold for ordinary text, so the line clamp, not the cap,
+ * decides what shows.
+ */
+const CELL_WRAP_DISPLAY_LIMIT = 600;
+const LINE_BREAK = /[\r\n]/;
+
+/**
+ * One data cell. While part of its value is hidden, the content is a button
+ * that expands the cell in place: the full value, Copy value and Collapse
+ * appear inside the cell and the row grows. Only those cells are buttons and
+ * tab stops, so a large grid does not become one tab stop per cell, and a
+ * fully visible value stays plain, selectable text. Hidden means cut by the
+ * display limit, or by the column as TooltipText measures it: its width on a
+ * single line, and also the six-line clamp when wrapped. A single line also
+ * collapses line breaks, so a multi-line string never shows in full there.
+ * The tooltip is portaled so it never becomes part of the button. Every
+ * variant positions the column's resize handle on the cell's right border.
+ */
+function TableDataCell({
+  value,
+  columnName,
+  rowNumber,
+  numeric,
+  width,
+  resizeHandle,
+  wrap,
+  alignTop,
+  expanded,
+  onExpand,
+  onCollapse,
+  focusRecords,
+}: {
+  value: unknown;
+  columnName: string;
+  /** 1-based row number as shown in the grid's `#` column. */
+  rowNumber: number;
+  numeric: boolean;
+  /** The width chosen for the column; undefined keeps the automatic width. */
+  width: number | undefined;
+  /** The column's resize handle. It comes last, after the cell's content box. */
+  resizeHandle: ReactNode;
+  /** Wrap the value onto up to six lines instead of truncating one line. */
+  wrap: boolean;
+  /** The row grows (wrapped, or it holds an expanded cell): align to the top. */
+  alignTop: boolean;
+  /** Show the full value inside the cell. */
+  expanded: boolean;
+  onExpand: () => void;
+  onCollapse: () => void;
+  /** Focuses the records region, for a collapsed cell left without a button. */
+  focusRecords: () => void;
+}) {
+  const [overflow, setOverflow] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const valueRef = useRef<HTMLDivElement | null>(null);
+  // Where focus goes once this cell's own control has toggled it. Set only by
+  // those controls, so a sort or page change that collapses every cell at once
+  // moves focus nowhere. "cell" waits for the collapsed text to be measured;
+  // "measured cell" has been.
+  const focusAfterToggle = useRef<"value" | "cell" | "measured cell" | null>(null);
+  // Counts the measurements a waiting "cell" received, so the focus effect
+  // runs once the button or plain box that measurement leaves is in place,
+  // even when the measurement matches the last one.
+  const [collapseMeasurements, setCollapseMeasurements] = useState(0);
+  const reportOverflow = useCallback((next: boolean) => {
+    setOverflow(next);
+    if (focusAfterToggle.current !== "cell") return;
+    focusAfterToggle.current = "measured cell";
+    setCollapseMeasurements((count) => count + 1);
+  }, []);
+  const full = formatCellFull(value);
+  const limit = wrap ? CELL_WRAP_DISPLAY_LIMIT : CELL_DISPLAY_LIMIT;
+  const capped = full.length > limit;
+  const display = capped ? `${full.slice(0, limit)}…` : full;
+  const collapsedLines = !wrap && typeof value === "string" && LINE_BREAK.test(value);
+  // Cut whatever the column's width: the cell is a button without measuring.
+  const cutAtAnyWidth = capped || collapsedLines;
+  const truncated = cutAtAnyWidth || overflow;
+  const valueTypography = cn(
+    numeric && "text-right tabular-nums",
+    value !== null && typeof value === "object" && "font-mono text-xs",
+    value === null && "italic text-foreground-muted",
+  );
+
+  // The control the person used is replaced, so focus would fall to the page:
+  // expanding moves it to the value, collapsing back to the cell. Nothing is
+  // measured while the cell is expanded, so by the time it collapses the last
+  // measurement may be out of date (a refresh shortened the value, the column
+  // was widened). Unless the cell is cut at any width, collapsing therefore
+  // waits for the collapsed text's own measurement, then focuses the button it
+  // leaves, or the records region when the value now shows in full.
+  useLayoutEffect(() => {
+    const target = focusAfterToggle.current;
+    if (target === "value") {
+      focusAfterToggle.current = null;
+      valueRef.current?.focus({ preventScroll: true });
+    } else if (target === "measured cell" || (target === "cell" && cutAtAnyWidth)) {
+      focusAfterToggle.current = null;
+      if (buttonRef.current) buttonRef.current.focus({ preventScroll: true });
+      else focusRecords();
+    }
+  }, [expanded, collapseMeasurements, cutAtAnyWidth, focusRecords]);
+
+  function expand() {
+    focusAfterToggle.current = "value";
+    onExpand();
+  }
+
+  if (expanded) {
+    return (
+      <td
+        data-wrap={wrap ? "true" : "false"}
+        style={columnWidthStyle(width)}
+        className="relative h-px max-w-md border-b border-r border-border p-0 align-top last:border-r-0"
+      >
+        <TableCellExpanded
+          ref={valueRef}
+          value={value}
+          columnName={columnName}
+          rowNumber={rowNumber}
+          onCollapse={() => {
+            focusAfterToggle.current = "cell";
+            onCollapse();
+          }}
+        />
+        {/* Holds the column at the width of the collapsed text, so showing a
+            value in a narrower shape (indented JSON, the lines of a note)
+            never narrows its column. Never painted or announced. */}
+        <div
+          aria-hidden
+          className={cn(
+            "invisible h-0 overflow-hidden px-3",
+            wrap ? "whitespace-pre" : "whitespace-nowrap",
+            valueTypography,
+          )}
+        >
+          {display}
+        </div>
+        {resizeHandle}
+      </td>
+    );
+  }
+
+  // The button and the plain container share this box exactly, so turning one
+  // into the other cannot change the width the text is measured in. A growing
+  // row aligns to the top, and the vertical padding moves to the box so a
+  // clamped text box ends at its last shown line: padding inside it would
+  // expose the top of the next, hidden line.
+  const box = cn("flex min-h-full w-full text-start", alignTop ? "items-start py-2" : "items-center");
+  const content = (
+    <>
+      <TooltipText
+        tip={full}
+        onOverflowChange={reportOverflow}
+        overflowAxis={wrap ? "both" : "x"}
+        portal
+        className={cn(
+          "min-w-0 flex-1 px-3 text-foreground",
+          // Wrapped: w-max still sizes the column from the value's single-line
+          // width, as truncation does, and max-w-full wraps it inside that
+          // column. Wrapping alone would let every column shrink to its minimum.
+          wrap
+            ? "w-max max-w-full line-clamp-6 whitespace-pre-wrap [overflow-wrap:anywhere]"
+            : cn("block truncate whitespace-nowrap", !alignTop && "py-2"),
+          valueTypography,
+        )}
+      >
+        {display}
+      </TooltipText>
+      {display === "" && <span className="sr-only">Empty</span>}
+    </>
+  );
+  return (
+    // h-px gives the cell a specified height, so the min-h-full box can fill a
+    // row made taller by another cell; without it the box keeps its own height.
+    // Firefox resolves the percentage against that 1px instead: there the box
+    // keeps its own height (h-full would shrink it below its text), and a press
+    // on the rest of a cut cell lands on the <td> itself, which therefore
+    // expands it too. Pointer only: the button stays the cell's one tab stop.
+    <td
+      data-wrap={wrap ? "true" : "false"}
+      style={columnWidthStyle(width)}
+      onClick={(event) => {
+        if (truncated && event.target === event.currentTarget) expand();
+      }}
+      className={cn(
+        "relative h-px max-w-md border-b border-r border-border p-0 last:border-r-0",
+        // In a row that grows, Firefox's box keeps its own height (see above),
+        // so the cell itself must sit at the top, level with the row number.
+        alignTop && "align-top",
+        truncated && "cursor-pointer",
+      )}
+    >
+      {truncated ? (
+        <button
+          ref={buttonRef}
+          type="button"
+          tabIndex={0}
+          aria-expanded={false}
+          onClick={expand}
+          className={cn(
+            box,
+            "cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          )}
+        >
+          {content}
+          {/* The space is its own text node: name computation trims element text. */}
+          {" "}<span className="sr-only">(show full value)</span>
+        </button>
+      ) : (
+        <div className={box}>{content}</div>
+      )}
+      {resizeHandle}
+    </td>
+  );
+}
+
+/**
+ * A chosen width fixes the column at exactly that size: the inline styles
+ * override the automatic sizing classes (the header's min-w-36, the cells'
+ * max-w-md), and narrower content still truncates or wraps inside it.
+ */
+function columnWidthStyle(width: number | undefined): CSSProperties | undefined {
+  return width === undefined ? undefined : { width, minWidth: width, maxWidth: width };
+}
+
 function formatCellFull(value: unknown): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "number" && !Number.isFinite(value)) return "—";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
-}
-
-function formatCell(value: unknown): string {
-  const full = formatCellFull(value);
-  return full.length > 120 ? `${full.slice(0, 120)}…` : full;
 }

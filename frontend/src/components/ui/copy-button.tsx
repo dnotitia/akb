@@ -17,6 +17,7 @@ export function CopyButton({
   label = "Copy",
   className,
   size = 14,
+  "aria-describedby": describedBy,
 }: {
   value: string;
   /** Accessible label / tooltip verb. Defaults to "Copy". */
@@ -24,6 +25,8 @@ export function CopyButton({
   className?: string;
   /** Icon px size. */
   size?: number;
+  /** Id of the element that says what is copied, when several copy buttons share one label. */
+  "aria-describedby"?: string;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -45,6 +48,7 @@ export function CopyButton({
       type="button"
       onClick={copy}
       aria-label={copied ? `${label}: copied` : label}
+      aria-describedby={describedBy}
       className={cn(
         "inline-flex items-center justify-center shrink-0 cursor-pointer transition-colors rounded-[var(--radius-sm)]",
         "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",

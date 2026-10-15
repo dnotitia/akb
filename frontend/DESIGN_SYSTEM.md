@@ -1126,7 +1126,24 @@ an `sr-only` summary, never the only signal.
   single flat data surface fills the remaining height and owns both horizontal
   and vertical scrolling; its header and row-index column remain sticky, while
   cell values use sans/tabular typography unless the value itself is structured
-  data. Responsive layouts preserve the grid via a focusable horizontal-scroll
+  data. Cell values never hide content behind hover alone, and reading one never
+  covers the grid: a cell whose value is partly hidden is a button that expands
+  it in place. The cell then shows the full value (indented JSON, or text with
+  its line breaks), selectable, with Copy value and Collapse, and scrolls inside
+  itself past about half the viewport; the row grows and the column keeps its
+  width. Several cells may stay expanded; Collapse or Escape returns focus to
+  the cell. Only partly hidden cells are buttons and keyboard tab stops, so the
+  grid never becomes one tab stop per cell and fully visible values stay
+  selectable text. The records bar's Wrap text toggle, remembered per browser,
+  switches cells from one truncated line to at most six wrapped, top-aligned
+  lines; wrapping alone never widens a column. Every data column's right border
+  is a resize handle along its whole height, header and body alike: hovering
+  shows a teal guide line, dragging moves the guide and applies the width on
+  release (80–960px), and a double-click restores the automatic width. Widths
+  are remembered per table and browser, and each header border is a focusable
+  separator that arrow keys resize (Enter restores). The row-number and
+  row-action columns keep fixed widths.
+  Responsive layouts preserve the grid via a focusable horizontal-scroll
   region rather than converting records into unrelated cards. Schema opens as a
   right overlay inspector and never reduces data width; it returns focus on
   Close, backdrop click, or Escape. The inspector reads as a compact data

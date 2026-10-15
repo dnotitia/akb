@@ -202,10 +202,11 @@ describe("table row management", () => {
     const user = userEvent.setup();
     const { beginAccessCheck, reverifyAccess } = renderTable();
     await user.click(await screen.findByRole("button", { name: "Add row" }));
-    await user.type(screen.getByLabelText("title"), "Draft to retain");
+    // In the dialog: the grid's title column header carries the same name.
+    await user.type(within(screen.getByRole("dialog", { name: "Add row" })).getByLabelText("title"), "Draft to retain");
     beginAccessCheck();
     expect(screen.getByTestId("resource-location")).toHaveTextContent("No resource");
-    expect(screen.getByLabelText("title")).toHaveValue("Draft to retain");
+    expect(within(screen.getByRole("dialog", { name: "Add row" })).getByLabelText("title")).toHaveValue("Draft to retain");
     reverifyAccess();
     const dialog = await screen.findByRole("dialog", { name: "Add row" });
     expect(within(dialog).getByLabelText("title")).toHaveValue("Draft to retain");
@@ -246,7 +247,7 @@ describe("table row management", () => {
     const user = userEvent.setup();
     const { beginAccessCheck, reverifyAccess } = renderTable();
     await user.click(await screen.findByRole("button", { name: "Add row" }));
-    await user.type(screen.getByLabelText("title"), "Draft to retain");
+    await user.type(within(screen.getByRole("dialog", { name: "Add row" })).getByLabelText("title"), "Draft to retain");
     beginAccessCheck();
     vaultInfoMock.mockRejectedValue(new Error("Access denied"));
     reverifyAccess();
@@ -282,6 +283,12 @@ describe("table row management", () => {
     expect(refetchTree).toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Actions for row 1" }));
+    // The row-actions cell is not a data cell: its menu neither expands a
+    // cell nor opens anything but the menu itself.
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /, row 1$/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await user.click(screen.getByRole("menuitem", { name: "Edit row" }));
     dialog = screen.getByRole("dialog");
     const severity = within(dialog).getByLabelText("severity");

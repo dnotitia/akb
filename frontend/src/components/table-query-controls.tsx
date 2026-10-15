@@ -6,6 +6,7 @@ import {
   ChevronsRight,
   Filter,
   RefreshCw,
+  WrapText,
   X,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +23,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { VaultTableColumnInput } from "@/lib/api";
 import {
   TABLE_PAGE_SIZES,
@@ -34,6 +36,7 @@ import {
   type TableFilterOperator,
   type TablePageSize,
 } from "@/lib/table-query-state";
+import { cn } from "@/lib/utils";
 
 const SYSTEM_COLUMN_NAMES = new Set(["id", "created_by", "created_at", "updated_at"]);
 
@@ -229,6 +232,8 @@ export function TableFilterBar({
   onClear,
   onRefresh,
   refreshing = false,
+  wrapText = false,
+  onWrapTextChange,
 }: {
   filters: TableFilter[];
   onOpen: () => void;
@@ -236,7 +241,24 @@ export function TableFilterBar({
   onClear: () => void;
   onRefresh: () => void;
   refreshing?: boolean;
+  /** Whether the grid currently wraps long values onto several lines. */
+  wrapText?: boolean;
+  /** Adds the Wrap text toggle beside Refresh; without it the bar has no toggle. */
+  onWrapTextChange?: (next: boolean) => void;
 }) {
+  const refresh = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className={cn(!onWrapTextChange && "ml-auto", "h-8 w-8")}
+      onClick={onRefresh}
+      disabled={refreshing}
+      aria-label="Refresh records"
+    >
+      <RefreshCw className={refreshing ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} aria-hidden />
+    </Button>
+  );
   return (
     <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-surface px-3 py-1.5">
       <Button type="button" variant="outline" size="sm" onClick={onOpen}>
@@ -271,17 +293,35 @@ export function TableFilterBar({
       ) : (
         <span className="text-xs text-foreground-muted">All records</span>
       )}
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        className="ml-auto h-8 w-8"
-        onClick={onRefresh}
-        disabled={refreshing}
-        aria-label="Refresh records"
-      >
-        <RefreshCw className={refreshing ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} aria-hidden />
-      </Button>
+      {onWrapTextChange ? (
+        // One group, so the toggle and Refresh stay together when the bar wraps.
+        <div className="ml-auto flex items-center gap-1">
+          <TooltipProvider delayDuration={250}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Wrap text"
+                  aria-pressed={wrapText}
+                  onClick={() => onWrapTextChange(!wrapText)}
+                  // Pressed: the selected surface plus an underline bar, so the state
+                  // does not rest on the tint alone. Styled from aria-pressed itself so
+                  // the visible and announced states cannot diverge.
+                  className="relative h-8 w-8 after:absolute after:inset-x-2 after:bottom-1 after:h-0.5 after:rounded-[var(--radius-full)] aria-pressed:bg-surface-selected aria-pressed:text-surface-selected-foreground aria-pressed:after:bg-link aria-pressed:hover:bg-surface-selected"
+                >
+                  <WrapText className="h-3.5 w-3.5" aria-hidden />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Wrap text</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          {refresh}
+        </div>
+      ) : (
+        refresh
+      )}
     </div>
   );
 }
