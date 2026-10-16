@@ -352,6 +352,8 @@ jobs:
             tests/test_native_document_events_postgres.py
             tests/test_notification_unwatch_postgres.py
             tests/test_recent_watching_postgres.py
+            tests/test_native_recent_index_postgres.py
+            tests/test_table_catalog_counts_postgres.py
             tests/test_search_update_status_pg.py
             tests/test_event_tail_postgres.py
             tests/test_search_file_cutover_receipt_postgres.py

@@ -291,19 +291,27 @@ export function TablePagination({
   pageSize,
   total,
   itemCount,
+  hasNext,
+  busy = false,
+  counting = false,
+  onCountRows,
   onPageChange,
   onPageSizeChange,
 }: {
   pageIndex: number;
   pageSize: TablePageSize;
-  total: number;
+  total: number | null;
   itemCount: number;
+  hasNext: boolean;
+  busy?: boolean;
+  counting?: boolean;
+  onCountRows: () => void;
   onPageChange: (pageIndex: number) => void;
   onPageSizeChange: (pageSize: TablePageSize) => void;
 }) {
-  const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const start = total === 0 ? 0 : pageIndex * pageSize + 1;
-  const end = total === 0 ? 0 : Math.min(pageIndex * pageSize + itemCount, total);
+  const pageCount = total === null ? null : Math.max(1, Math.ceil(total / pageSize));
+  const start = itemCount === 0 ? 0 : pageIndex * pageSize + 1;
+  const end = itemCount === 0 ? 0 : pageIndex * pageSize + itemCount;
   const [pageDraft, setPageDraft] = useState(String(pageIndex + 1));
 
   useEffect(() => setPageDraft(String(pageIndex + 1)), [pageIndex]);
@@ -311,7 +319,9 @@ export function TablePagination({
   function commitPage(event?: FormEvent) {
     event?.preventDefault();
     const parsed = Number(pageDraft);
-    const next = Number.isSafeInteger(parsed) ? Math.min(Math.max(parsed, 1), pageCount) : pageIndex + 1;
+    // A count describes an earlier snapshot. It must not prevent reaching
+    // newer rows inserted by another writer after that observation.
+    const next = Number.isSafeInteger(parsed) ? Math.max(parsed, 1) : pageIndex + 1;
     setPageDraft(String(next));
     onPageChange(next - 1);
   }
@@ -319,8 +329,11 @@ export function TablePagination({
   return (
     <div className="flex min-h-12 shrink-0 flex-wrap items-center gap-3 border-t border-border bg-surface-2 px-3 py-1.5 text-xs text-foreground-muted">
       <span className="min-w-32 tabular-nums" aria-live="polite">
-        {start}–{end} of {total}
+        {start}–{end}{total === null ? " · total not counted" : ` · ${total.toLocaleString()} ${total === 1 ? "row" : "rows"} counted`}
       </span>
+      <Button type="button" variant="ghost" size="sm" onClick={onCountRows} loading={counting} disabled={busy}>
+        {total === null ? "Count rows" : "Recount rows"}
+      </Button>
       <div className="ml-auto flex items-center gap-2">
         <Label htmlFor="table-page-size" className="hidden text-xs font-normal sm:inline">
           Rows per page
@@ -340,7 +353,7 @@ export function TablePagination({
             size="icon"
             className="hidden h-9 w-9 sm:inline-flex"
             onClick={() => onPageChange(0)}
-            disabled={pageIndex === 0}
+            disabled={busy || pageIndex === 0}
             aria-label="First page"
           >
             <ChevronsLeft className="h-4 w-4" aria-hidden />
@@ -351,7 +364,7 @@ export function TablePagination({
             size="icon"
             className="h-9 w-9"
             onClick={() => onPageChange(Math.max(0, pageIndex - 1))}
-            disabled={pageIndex === 0}
+            disabled={busy || pageIndex === 0}
             aria-label="Previous page"
           >
             <ChevronLeft className="h-4 w-4" aria-hidden />
@@ -364,38 +377,38 @@ export function TablePagination({
               id="table-page-number"
               type="number"
               min={1}
-              max={pageCount}
+              disabled={busy}
               inputMode="numeric"
               value={pageDraft}
               onChange={(event) => setPageDraft(event.target.value)}
               onBlur={() => commitPage()}
               className="h-9 w-14 px-2 text-center tabular-nums"
-              aria-label={`Page number, ${pageCount} pages total`}
+              aria-label={pageCount === null ? "Page number, total not counted" : `Page number, ${pageCount} pages at last count`}
             />
-            <span className="hidden whitespace-nowrap tabular-nums sm:inline">of {pageCount}</span>
+            {pageCount !== null && <span className="hidden whitespace-nowrap tabular-nums sm:inline">of {pageCount} counted</span>}
           </form>
           <Button
             type="button"
             variant="outline"
             size="icon"
             className="h-9 w-9"
-            onClick={() => onPageChange(Math.min(pageCount - 1, pageIndex + 1))}
-            disabled={pageIndex >= pageCount - 1}
+            onClick={() => onPageChange(pageIndex + 1)}
+            disabled={busy || !hasNext}
             aria-label="Next page"
           >
             <ChevronRight className="h-4 w-4" aria-hidden />
           </Button>
-          <Button
+          {pageCount !== null && <Button
             type="button"
             variant="outline"
             size="icon"
             className="hidden h-9 w-9 sm:inline-flex"
             onClick={() => onPageChange(pageCount - 1)}
-            disabled={pageIndex >= pageCount - 1}
-            aria-label="Last page"
+            disabled={busy || pageIndex >= pageCount - 1}
+            aria-label="Last counted page"
           >
             <ChevronsRight className="h-4 w-4" aria-hidden />
-          </Button>
+          </Button>}
         </div>
       </div>
     </div>

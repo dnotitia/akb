@@ -29,7 +29,7 @@ export function ResourceDeleteDialog({
   onOpenChange,
   kind,
   name,
-  rowCount = 0,
+  rowCount,
   onConfirm,
 }: ResourceDeleteDialogProps) {
   const label = LABELS[kind];
@@ -38,7 +38,7 @@ export function ResourceDeleteDialog({
       ? "The document, search index entries, relationships, and publication links will be removed. Git history is preserved, but this cannot be undone from the UI."
       : kind === "file"
         ? "The file record, preview, search index entries, relationships, and publication links will be removed. Stored content is cleaned up asynchronously. This cannot be undone."
-        : `The physical table and all ${rowCount.toLocaleString()} ${rowCount === 1 ? "row" : "rows"}, search index entries, and relationships will be permanently removed. References from another table will block deletion.`;
+        : `The physical table and all ${rowCount === undefined ? "its rows" : `${rowCount.toLocaleString()} ${rowCount === 1 ? "row" : "rows"}`}, search index entries, and relationships will be permanently removed. References from another table will block deletion.`;
 
   return (
     <ConfirmDialog

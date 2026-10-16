@@ -1173,7 +1173,12 @@ from app.util.text import normalize_collection_path as _normalize_collection_pat
 _TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
-async def list_tables(vault_id: uuid.UUID) -> list[dict]:
+async def list_tables(vault_id: uuid.UUID, *, include_row_counts: bool = True) -> list[dict]:
+    """Return the catalog, optionally avoiding a full scan of every table.
+
+    Counts stay exact and enabled by default. Schema-only consumers opt out;
+    an omitted row_count means unmeasured, never zero or a planner estimate.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
@@ -1185,7 +1190,6 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
         results: list[dict] = []
         for r in rows:
             pg_name = table_data_repo.pg_table_name(vault["name"], r["name"])
-            count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
                 "kind": "table",
                 "uri": table_uri(vault["name"], r["name"], collection=r["collection"]),
@@ -1200,7 +1204,8 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "columns": table_registry_repo.parse_columns(r["columns"]),
                 "unique_keys": table_registry_repo.parse_json_list(r.get("unique_keys")),
                 "indexes": table_registry_repo.parse_json_list(r.get("indexes")),
-                "row_count": count,
+                **({"row_count": await table_data_repo.count_rows(conn, pg_name)}
+                   if include_row_counts else {}),
                 "created_at": r["created_at"].isoformat(),
             })
     return results

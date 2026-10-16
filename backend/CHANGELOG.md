@@ -7,6 +7,15 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Bound routine Table browsing to a page plus one row, with an explicit exact
+  count action and a schema-only catalog option. Existing counted API defaults
+  and row/ACL contracts are unchanged; unknown counts are no longer rendered
+  as zero in Table deletion warnings.
+- Index live document updates and the default stable Table page order, including
+  existing registered tables (migrations 116–117). This avoids catalog-wide
+  sorting and large-table sorts during ordinary navigation. Initial index builds
+  can block writes; schedule large upgrades accordingly.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
