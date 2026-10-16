@@ -269,16 +269,16 @@ def _replacement_final_key(
     vault_name: str,
     collection: str,
     filename: str,
-    replacement_id: uuid.UUID,
+    candidate_id: uuid.UUID,
 ) -> str:
     """Non-presigned destination for one certified replacement.
 
-    Unlike the legacy create key, this uses the full replacement UUID.  A
+    Unlike the legacy create key, this uses a full per-confirmation UUID. A
     collision must never overwrite another file before PostgreSQL can reject
     the duplicate key.
     """
     safe_name = filename.replace("/", "_")
-    prefix = replacement_id.hex
+    prefix = candidate_id.hex
     if collection:
         return f"{vault_name}/{collection}/{prefix}_{safe_name}"
     return f"{vault_name}/{prefix}_{safe_name}"
@@ -846,13 +846,13 @@ class FileService:
             raise
 
         # The presigned staging URL remains valid until its TTL elapses.  Copy
-        # to a fresh, non-presigned key and certify THAT immutable candidate;
-        # a later reuse of the staging URL therefore cannot mutate live bytes.
+        # to a fresh, non-presigned key on EVERY confirmation attempt. A retry
+        # must not overwrite or discard the object an earlier attempt published.
         final_key = _replacement_final_key(
             vault_name,
             row.get("collection") or "",
             row["name"],
-            rid,
+            uuid.uuid4(),
         )
         # The candidate has no owning vault_files row until the metadata swap
         # commits.  Schedule a durable fallback cleanup before creating it,
@@ -1352,6 +1352,11 @@ class FileService:
         content-addressed key, and deletes the row. The route uses this to
         keep the body away from storage in that case.
 
+        A replacement names its intent's staging key, not the confirmed live
+        object. It must remain writable. Conversely, an ordinary capability
+        whose File has moved to a new key is obsolete: its old key may now
+        belong to another File and must not become writable again.
+
         A row without `object_key` belongs to the measurement lane, which
         carries its bytes in the database and addresses no object store. It is
         refused rather than having a key inferred for it — and like every
@@ -1370,17 +1375,24 @@ class FileService:
         async with pool.acquire() as conn:
             grant = await conn.fetchrow(
                 """
-                SELECT i.file_id, i.vault_id, i.object_key, i.mime_type,
-                       f.upload_state
+                SELECT i.id AS intent_id, i.file_id, i.vault_id,
+                       i.object_key, i.mime_type, f.upload_state, f.s3_key,
+                       v.name AS vault_name
                   FROM m1_file_transfer_intents AS i
                   JOIN vault_files AS f
                     ON f.id = i.file_id AND f.vault_id = i.vault_id
+                  JOIN vaults AS v ON v.id = i.vault_id
                  WHERE i.token_digest = $1 AND i.method = 'PUT'
                    AND i.object_key IS NOT NULL AND i.expires_at > NOW()
                 """,
                 _capability_digest(token),
             )
         if grant is None:
+            raise NotFoundError("File", "capability")
+        targets_live_object = grant["object_key"] == grant["s3_key"]
+        if not targets_live_object and grant["object_key"] != _replacement_staging_key(
+            grant["vault_name"], grant["file_id"], grant["intent_id"],
+        ):
             raise NotFoundError("File", "capability")
         return {
             "file_id": grant["file_id"],
@@ -1390,10 +1402,9 @@ class FileService:
             # one AKB normalized when the capability was issued, not one the
             # uploading client restates at PUT time.
             "mime_type": _normalize_content_type(grant["mime_type"]),
-            # Whether this reservation adopted a File that is already
-            # confirmed. It changes what the route may do with the body —
-            # see `upload_by_capability`.
-            "already_confirmed": grant["upload_state"] == "confirmed",
+            # Only a grant to the confirmed live object is a deduplicated
+            # replay. A replacement's isolated staging key is still writable.
+            "already_confirmed": targets_live_object and grant["upload_state"] == "confirmed",
         }
 
     async def list_files(

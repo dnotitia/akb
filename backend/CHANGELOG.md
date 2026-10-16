@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- File replacement upload capabilities now write to their own staging object
+  instead of being mistaken for a confirmed-file replay. Obsolete original
+  upload capabilities are rejected after a replacement, and every confirmation
+  uses a fresh candidate so retries cannot overwrite or delete published bytes.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
