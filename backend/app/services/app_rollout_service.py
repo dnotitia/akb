@@ -1138,8 +1138,54 @@ async def request_rollout_as_app(
 
 
 async def get_rollout_as_app(principal: AppPrincipal, job_id: uuid.UUID | str, *, correlation_id: str) -> dict[str, Any]:
-    await authorize_app_capability(principal, capability="rollout:read", correlation_id=correlation_id)
-    return await get_rollout(principal.app_id, job_id)
+    job_uuid = _as_uuid(job_id, field="rollout_id")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _authorize_rollout_job(conn, principal, job_uuid, capability="rollout:read", correlation_id=correlation_id)
+        return await _load_public_job(conn, principal.app_id, job_uuid)
+
+
+async def _authorize_rollout_job(
+    conn: Any, principal: AppPrincipal, job_id: uuid.UUID, *, capability: str, correlation_id: str,
+) -> None:
+    """Authorize only this job, including its non-active live installations.
+
+    A rollout moves its own installations out of `active`. Observing or
+    recovering it must not require another unrelated active installation.
+    Authority still comes from a current live grant, never the old snapshot.
+    General inventory and data authorization remain active-only.
+    """
+    allowed = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM app_rollout_jobs AS job
+              JOIN app_rollout_targets AS target ON target.job_id = job.id
+              JOIN vault_app_installations AS installation
+                ON installation.id = target.installation_id
+               AND installation.vault_id = target.vault_id
+               AND installation.app_id = job.app_id
+              JOIN installation_grants AS grant_row
+                ON grant_row.installation_id = installation.id
+               AND grant_row.generation = installation.grant_generation
+               AND grant_row.status = 'active'
+             WHERE job.id = $1 AND job.app_id = $2
+               AND installation.lifecycle IN ('active', 'installing', 'upgrading', 'blocked')
+               AND $3 = ANY(grant_row.capabilities)
+        )
+        """,
+        job_id, principal.app_id, capability,
+    )
+    record_app_audit(
+        "app.capability.authorized" if allowed else "app.capability.denied",
+        correlation_id=correlation_id, outcome="ok" if allowed else "error",
+        reason="rollout_target_grant" if allowed else "capability_not_granted",
+        actor=f"app:{principal.app_id}", actor_id=str(principal.app_id),
+        app_id=principal.app_id, deployment=principal.deployment,
+        generation=principal.credential_generation,
+    )
+    if not allowed:
+        raise ForbiddenError("App request denied")
 
 
 async def resume_rollout(
@@ -1153,6 +1199,7 @@ async def resume_rollout(
     correlation_id: str,
     actor: str,
     actor_id: str,
+    _principal: AppPrincipal | None = None,
 ) -> dict[str, Any]:
     """Create a new rollout attempt from a blocked immutable source job.
 
@@ -1167,6 +1214,8 @@ async def resume_rollout(
     checksum = _hex(manifest_checksum_value, field="manifest checksum")
     if requested_by_kind not in {"admin", "app"}:
         raise ValidationError("requested_by_kind is invalid")
+    if requested_by_kind == "app" and (_principal is None or _principal.app_id != app_uuid):
+        raise ForbiddenError("App request denied")
     pool = await get_pool()
     try:
         async with pool.acquire() as conn:
@@ -1175,6 +1224,10 @@ async def resume_rollout(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     f"app-rollout-resume:{source_uuid}",
                 )
+                if _principal is not None:
+                    await _authorize_rollout_job(
+                        conn, _principal, source_uuid, capability="rollout:request", correlation_id=correlation_id,
+                    )
                 existing = await conn.fetchrow(
                     """
                     SELECT new_rollout_id, release_id, manifest_checksum
@@ -1569,7 +1622,6 @@ async def resume_rollout_as_app(
     idempotency_key: str,
     correlation_id: str,
 ) -> dict[str, Any]:
-    await authorize_app_capability(principal, capability="rollout:request", correlation_id=correlation_id)
     return await resume_rollout(
         principal.app_id,
         source_rollout_id,
@@ -1580,4 +1632,5 @@ async def resume_rollout_as_app(
         correlation_id=correlation_id,
         actor=f"app:{principal.app_id}",
         actor_id=str(principal.app_id),
+        _principal=principal,
     )

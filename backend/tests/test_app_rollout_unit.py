@@ -8,9 +8,23 @@ import uuid
 
 import pytest
 
-from app.exceptions import ValidationError
+from app.exceptions import ForbiddenError, ValidationError
 from app.services import app_rollout_service as rollout
 from app.services import app_rollout_worker as worker
+
+
+@pytest.mark.asyncio
+async def test_app_mode_resume_requires_a_bound_principal_before_database_access(monkeypatch):
+    async def no_database():
+        pytest.fail("unauthenticated app-mode resume reached the database")
+
+    monkeypatch.setattr(rollout, "get_pool", no_database)
+    with pytest.raises(ForbiddenError):
+        await rollout.resume_rollout(
+            uuid.uuid4(), uuid.uuid4(), release_id=uuid.uuid4(),
+            manifest_checksum_value="a" * 64, idempotency_key=str(uuid.uuid4()),
+            requested_by_kind="app", correlation_id="no-principal", actor="app", actor_id="app",
+        )
 
 
 def _manifest(*, operation: str = "add_column", phase: str = "expand") -> dict:

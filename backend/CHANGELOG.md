@@ -7,6 +7,14 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- Apps can observe and resume their own rollout while its only installation
+  is installing, upgrading, or blocked. Authority is checked against that
+  job's live targets and current grants, including before a resume replay;
+  unrelated active installations no longer confer access to old jobs.
+  Ordinary data and inventory access retain their active-only policy.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
