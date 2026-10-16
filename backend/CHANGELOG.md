@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- Password-protected publications now share their attempt budget across API
+  replicas and process restarts. PostgreSQL atomically reserves each attempt
+  before verification; per-IP and publication-wide backoff retain their
+  existing thresholds and quiet-hour decay. Manager/token access remains
+  available during anonymous lockout. Reservation failures return 503 rather
+  than silently disabling protection; failed refunds retain conservative state
+  without failing an already-verified view. State is bounded per publication
+  and removed with the publication.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
