@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- Table and Vault schema reads omit the optional `enum` field for
+  unconstrained columns instead of returning `null`, matching the published
+  OpenAPI response contract. Declared enum values, table data, constraints,
+  and drift reporting are unchanged.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
