@@ -2199,7 +2199,7 @@ for (const width of [375, 1440]) for (const kind of ["file", "table"] as const) 
     await page.route("**/api/v1/files/fixture/f-reading/download", route => route.fulfill({ json: {
       name: "Reading notes.txt", mime_type: "text/plain", download_url: "/reading-file.txt", size_bytes: 22,
     } }));
-    await page.route("**/api/v1/tables/fixture", route => route.fulfill({ json: { items: [{
+    await page.route(/\/api\/v1\/tables\/fixture(?:\?.*)?$/, route => route.fulfill({ json: { items: [{
       name: "reading_catalog", collection: "guides/team/operations", description: "Reading inventory", row_count: 1,
       columns: [{ name: "title", type: "text", required: true }],
     }] } }));

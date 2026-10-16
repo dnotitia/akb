@@ -1105,9 +1105,16 @@ an `sr-only` summary, never the only signal.
   through the route query string so refresh, Back, and shared links restore the
   same view. Multi-value filters use comma-delimited input; when a declared enum
   choice itself contains a comma, the UI keeps exact `is` matching available and
-  omits the ambiguous multi-value condition. The footer reports the exact
-  visible range and total and provides first/previous/direct-page/next/last
-  navigation. Server pagination—not a
+  omits the ambiguous multi-value condition. The footer reports the visible
+  range and says Total not counted until an explicit Count rows request.
+  Ordinary navigation fetches one extra row to determine whether Next exists,
+  without counting every matching record or every table in the catalog.
+  First/previous/direct-page/next remain available; a successful exact count
+  adds Last and counted page totals. Counts describe that requested snapshot,
+  never a planner estimate; filters, access/account changes, refresh and row
+  mutations clear them. Count failure leaves browsing and retry available.
+  A filtered count must never be shown as the table-deletion row count.
+  Server pagination—not a
   client-side slice or an all-row fetch—is the large-table boundary; prior rows
   stay visible and `aria-busy` during a transition. Every order adds the system
   UUID as a deterministic tie-breaker.
