@@ -367,6 +367,7 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_growing_prefilter_postgres.py
             tests/test_vchord_index_build_postgres.py
             tests/test_vchord_vacuum_postgres.py
             tests/test_vchord_encoding_contract_postgres.py

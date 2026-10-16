@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Search
+
+- The bundled PostgreSQL image applies VChord-BM25's existing snapshot and SQL
+  prefilter to growing-segment candidates before they enter the finite top-k.
+  Invisible or out-of-scope rows no longer displace authorized results and
+  trigger avoidable exact scans of common-term postings. Zero-score and
+  below-threshold candidates still avoid heap checks. Exact completion,
+  operator prefilter opt-out, ranking, timeouts, and ACL enforcement remain
+  unchanged. Deploy the rebuilt PostgreSQL image to apply this fix; a backend
+  restart alone is insufficient. No index rebuild or data migration is needed.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication

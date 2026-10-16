@@ -1885,8 +1885,10 @@ class PgvectorStore:
 
         A finite `bm25_limit` is the size of the extension's internal top-k, and
         a page shorter than `limit` does not prove there is nothing more to find:
-        growing-segment rows are scored without the query's filter and take
-        top-k slots, and so can rows this snapshot cannot see.
+        prefiltering can be disabled, and external extension builds can still
+        admit growing rows without the query's filter/snapshot checks. The
+        bundled image fixes that inconsistency (akb#748), but the fallback is
+        still needed when fewer than `limit` rows really match.
 
         Only `bm25_limit = -1` reads every posting of the query terms and leaves
         visibility and the filter to the executor, so only it is complete.
@@ -1894,9 +1896,9 @@ class PgvectorStore:
         What it costs is the query's own postings plus the growing segment, and
         one heap check per candidate the executor reads before the page fills.
         The corpus size is not the measure, and a short page is no reason to
-        refuse. That page already read every posting it could: pruning only
-        starts once the internal top-k holds more than twice its size. Measured
-        on a 2.1M-chunk corpus, completing ranged from 60 ms to 2.5 s. The
+        refuse. Exact completion can nevertheless cost substantially more than
+        a finite scan: every query-term posting is read and matches are sorted.
+        Measured on a 2.1M-chunk corpus, completing ranged from 60 ms to 2.5 s. The
         widening probes and the refusal this replaces took 0.1-8 s, and marked
         the search degraded (akb#673).
         """
