@@ -7,6 +7,15 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- Native document provenance and graph orphan/name reads now use current,
+  verified Native Heads instead of requiring a legacy document mirror.
+  REST and MCP provenance share the same authorized, stable-identity lookup;
+  deleted documents are excluded and archived documents remain excluded
+  from orphan scans. Graph metadata is read in bounded pages on one
+  connection and snapshot, preserving migrated metadata and graph totals.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication

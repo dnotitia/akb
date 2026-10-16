@@ -708,6 +708,11 @@ class NativeRevisionRepository:
         surface: str,
         path_like: str | None = None,
         max_slashes: int | None = None,
+        paths: list[str] | None = None,
+        excluded_paths: list[str] | None = None,
+        before: tuple[datetime, uuid.UUID] | None = None,
+        limit: int | None = None,
+        conn: asyncpg.Connection | None = None,
     ) -> list[dict]:
         """Read every live Head with its manifest and stored body in one query.
 
@@ -728,6 +733,15 @@ class NativeRevisionRepository:
                 "(length(rs.current_path) - "
                 f"length(replace(rs.current_path, '/', ''))) <= ${len(params)}"
             )
+        if paths is not None:
+            params.append(paths)
+            clauses.append(f"rs.current_path = ANY(${len(params)}::text[])")
+        if excluded_paths:
+            params.append(excluded_paths)
+            clauses.append(f"rs.current_path != ALL(${len(params)}::text[])")
+        if before is not None:
+            params.extend(before)
+            clauses.append(f"(rs.updated_at, rs.resource_id) < (${len(params) - 1}, ${len(params)})")
         sql = f"""
             SELECT rv.*, rs.resource_id AS head_resource_id,
                    rs.head_revision_id, rs.surface, rs.content_profile,
@@ -756,8 +770,14 @@ class NativeRevisionRepository:
              WHERE {" AND ".join(clauses)}
              ORDER BY rs.updated_at DESC, rs.resource_id DESC
         """
-        async with self.pool.acquire() as conn:
+        if limit is not None:
+            params.append(limit)
+            sql += f" LIMIT ${len(params)}"
+        if conn is not None:
             rows = await conn.fetch(sql, *params)
+        else:
+            async with self.pool.acquire() as acquired:
+                rows = await acquired.fetch(sql, *params)
         return [dict(row) for row in rows]
 
     async def list_history(

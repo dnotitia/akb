@@ -1174,11 +1174,8 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_provenance")
 async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
-    await check_vault_access(uid, vault, required_role="reader")
-    doc = await _find_doc(vault, doc_path)
-    if not doc:
-        return err("Document not found", code=NOT_FOUND)
-    return await get_provenance(str(doc["id"]), vault_id=doc["vault_id"])
+    access = await check_vault_access(uid, vault, required_role="reader")
+    return await get_provenance(doc_path, vault_id=access["vault_id"])
 
 
 @_h("akb_create_table")

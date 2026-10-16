@@ -12,7 +12,6 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.deps import get_current_user
-from app.db.postgres import get_pool
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.models.knowledge import (
@@ -306,18 +305,6 @@ async def document_provenance(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     vault, _rtype, doc_path = _parse_resource_uri(uri, expected_type="doc")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT v.id AS vault_id, d.id AS doc_pk
-              FROM documents d JOIN vaults v ON d.vault_id = v.id
-             WHERE v.name = $1 AND d.path = $2
-            """,
-            vault, doc_path,
-        )
-    if not row:
-        raise HTTPException(status_code=404, detail="Document not found")
-    await check_vault_access(user.user_id, vault, required_role="reader")
-    result = await get_provenance(str(row["doc_pk"]), vault_id=row["vault_id"])
-    return {**result, "kind": "provenance"}
+    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    result = await get_provenance(doc_path, vault_id=access["vault_id"])
+    return {**_bridge_service_error(result), "kind": "provenance"}
