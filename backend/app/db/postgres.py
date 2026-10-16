@@ -407,6 +407,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "111_bm25_recompute_resume.py",  # durable BM25 recompute cursor + term accumulator (akb#616)
         "112_edges_resource_identity.py",  # anchor graph edges to native resource identity (akb#654/#655/#656)
         "113_bm25_vocab_epoch.py",  # term-id numbering epoch; writers refuse ids from an earlier one (akb#687)
+        "114_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
     ):
         if filename in applied:
             continue

@@ -7,6 +7,15 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Fixed
+
+- Deleting a Vault no longer fails after a legacy app adoption plan or apply.
+  Adoption plans and immutable audit evidence retain their original Vault and
+  installation UUIDs after deletion. New writes still validate live references;
+  stale plan replays return a conflict rather than recreating installations.
+  Target projections expose `vault_deleted`, and history authorization remains
+  bound to the original UUID even if a Vault name is reused.
+
 ## 0.16.2 — 2026-10-13
 
 ### Authentication
