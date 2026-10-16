@@ -270,6 +270,13 @@ class UserSqlExecutor:
             # hint logic offer fuzzy suggestions for tables in the
             # caller's allowed set.
             raise
+        except Exception as exc:
+            from app.db.transient import transient_error
+
+            mapped = transient_error(exc)
+            if mapped is not None:
+                raise mapped from exc
+            raise
 
 
 # ── Singleton accessor ────────────────────────────────────────

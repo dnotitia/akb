@@ -24,6 +24,24 @@ class AKBError(Exception):
         super().__init__(message)
 
 
+class TransientDependencyError(AKBError):
+    """A dependency failed; this is not evidence that a write did not commit."""
+
+    code: str
+
+    def __init__(self, *, code: str, message: str):
+        super().__init__(
+            message,
+            status_code=503,
+            code=code,
+            hint=(
+                "Retry a read after a brief delay. For writes, check the operation's "
+                "result and use its CAS/idempotency contract before retrying; "
+                "completion may be unknown."
+            ),
+        )
+
+
 class NotFoundError(AKBError):
     def __init__(self, resource: str, identifier: str):
         super().__init__(f"{resource} not found: {identifier}", status_code=404)

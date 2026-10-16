@@ -26,7 +26,7 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError
 from app.models.vault_scope import current_token_uuid, current_vault_scope
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories import vault_write_policy_repo as write_policy_repo
@@ -2074,6 +2074,10 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
+    except TransientDependencyError:
+        # A dependency outage is not invalid SQL. In particular, do not
+        # acquire another connection to enrich a failed/time-limited query.
+        raise
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)
         # Try to enrich column/table-not-exist errors with fuzzy-match

@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,10 +44,12 @@ from app.api.routes import (
 )
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError
+from app.db.transient import transient_error
+from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
 from app.openapi_contract import install_openapi_contract
 from app.process_role import runtime_process_role
+from app.http_middleware import CancelDisconnectedReadMiddleware, NoStorePublicSurfacesMiddleware
 from app.services import (
     asset_gc_worker,
     audit_log,
@@ -81,6 +84,7 @@ from app.util.errors import (
     METHOD_NOT_ALLOWED,
     NOT_FOUND,
     PERMISSION_DENIED,
+    SERVICE_UNAVAILABLE,
 )
 from mcp_server.http_app import mcp_app
 
@@ -190,6 +194,8 @@ async def akb_error_handler(request: Request, exc: AKBError):
     retry_after = getattr(exc, "retry_after_secs", None)
     if retry_after is not None:
         headers = {"Retry-After": str(int(retry_after))}
+    elif isinstance(exc, TransientDependencyError) and request.method in {"GET", "HEAD"}:
+        headers = {"Retry-After": "1"}
     return JSONResponse(
         status_code=exc.status_code,
         content=_error_payload(exc.status_code, detail),
@@ -237,6 +243,18 @@ async def unhandled_error_handler(request: Request, exc: Exception):
         status_code=500,
         content=_error_payload(500, "Internal server error"),
     )
+
+
+@app.exception_handler(asyncpg.PostgresError)
+@app.exception_handler(asyncpg.InterfaceError)
+@app.exception_handler(TimeoutError)
+@app.exception_handler(ConnectionError)
+async def dependency_error_handler(request: Request, exc: Exception):
+    mapped = transient_error(exc)
+    if mapped is None:
+        return await unhandled_error_handler(request, exc)
+    logger.warning("Request dependency failure: code=%s", mapped.code)
+    return await akb_error_handler(request, mapped)
 
 
 def _error_payload(
@@ -297,6 +315,8 @@ def _code_for_status(status_code: int) -> str:
         return GONE
     if status_code == 409:
         return CONFLICT
+    if status_code == 503:
+        return SERVICE_UNAVAILABLE
     return INTERNAL
 
 
@@ -319,42 +339,10 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def _no_store_public_surfaces(request: Request, call_next):
-    """Never let a browser, proxy, or CDN cache a publication surface
-    (publish-hardening M2).
-
-    These responses can carry password-gated content, the short-lived auth
-    token, or presigned file URLs — anything cached here could be replayed to a
-    later, unauthenticated request (e.g. via the back button or a shared cache).
-    `no-store` is the safe default for the whole public + publications surface;
-    the payloads are small and fetched by the SPA, so lost cacheability is a
-    non-issue. `/api/v1/public` also matches `/api/v1/publications/*`.
-    """
-    response = await call_next(request)
-    path = request.url.path
-    # Match on segment boundaries so a hypothetical unrelated `/api/v1/publicX`
-    # route can't accidentally inherit no-store (per Codex M2 review). The two
-    # publication bases are listed explicitly — `/publications/*` is a sibling
-    # of `/public/*`, not a child.
-    for base in ("/api/v1/public", "/api/v1/publications", "/api/v1/oembed"):
-        if path == base or path.startswith(base + "/"):
-            response.headers["Cache-Control"] = "no-store"
-            break
-    if (
-        path == "/api/v1/auth/config"
-        or path == "/api/v1/auth/tokens"
-        or path.startswith("/api/v1/auth/tokens/")
-        or path.startswith("/api/v1/admin/")
-        or path.startswith("/api/v1/app/installations/")
-        or path.startswith("/api/v1/app/rollouts")
-        or (path.startswith("/api/v1/apps/") and "/rollouts" in path)
-        or (path.startswith("/api/v1/apps/") and "/installations/" in path)
-        or (path.startswith("/api/v1/apps/") and "/legacy-adoptions" in path)
-    ):
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Pragma"] = "no-cache"
-    return response
+app.add_middleware(NoStorePublicSurfacesMiddleware)
+# This is deliberately outside the header middleware: one task owns the
+# handler and its transaction cleanup throughout disconnect cancellation.
+app.add_middleware(CancelDisconnectedReadMiddleware)
 
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
@@ -429,8 +417,10 @@ async def _probe_ready() -> tuple[bool, dict]:
         "document_revision_backend": selected_document_revision_backend(),
     }
     try:
-        pool = await get_pool()
-        await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=2.0)
+        # Initialization/reconnection is part of the same probe budget.
+        async with asyncio.timeout(2.0):
+            pool = await get_pool()
+            await pool.fetchval("SELECT 1")
         detail["db"] = "ok"
         # Pool stats help diagnose leaks: if free→0 while size→max we are
         # exhausting the pool and slow callers are holding connections.
@@ -439,14 +429,14 @@ async def _probe_ready() -> tuple[bool, dict]:
             "free": pool.get_idle_size(),
             "max": pool.get_max_size(),
         }
-    except Exception as e:  # noqa: BLE001 — repr() so TimeoutError() shows class
-        detail["db"] = f"error: {e!r}"
+    except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
+        detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
         return False, detail
     try:
         vs_ok = await asyncio.wait_for(get_vector_store().health(), timeout=5.0)
         detail["vector_store"] = "ok" if vs_ok else "degraded:unreachable"
     except Exception as e:  # noqa: BLE001
-        detail["vector_store"] = f"degraded:{e!r}"
+        detail["vector_store"] = "degraded:timeout" if isinstance(e, TimeoutError) else "degraded:unavailable"
     return True, detail
 
 

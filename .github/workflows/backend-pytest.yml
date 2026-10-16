@@ -377,6 +377,7 @@ jobs:
             # Real cancellation/reset, exact scoped scores, and bounded Native
             # source lookups must run on a fresh DB, not skip in both lanes.
             tests/test_pgvector_hybrid_deadline_postgres.py
+            tests/test_transient_recovery_postgres.py
             tests/test_pgvector_scope_routing_postgres.py
             tests/test_native_search_source_scope_postgres.py
             tests/test_bm25_revert_range_postgres.py

@@ -24,6 +24,8 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
+import asyncpg
+
 from app.exceptions import InvalidColumnTypeError, ValidationError
 from app.util.text import fuzzy_hint
 
@@ -681,7 +683,7 @@ async def count_rows(conn, pg_name: str) -> int:
     registry row whose data table was already dropped)."""
     try:
         return int(await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}") or 0)
-    except Exception:  # noqa: BLE001 — table-missing is the usual case here
+    except asyncpg.UndefinedTableError:
         return 0
 
 
