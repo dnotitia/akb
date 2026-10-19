@@ -150,6 +150,8 @@ search_limit_max: 50
 vault_filter_enabled: false
 
 # === S3-compatible object storage (for vault file uploads) ===
+# File replacement cleanup also lists the private __akb_file_replacements__/
+# prefix. See docs/operations/file-storage-cleanup.md for IAM/retention policy.
 # static + blank endpoint disables object storage. default_chain enables native
 # cloud storage even without an endpoint; never set static key fields with it.
 s3_auth_mode: static # static | default_chain

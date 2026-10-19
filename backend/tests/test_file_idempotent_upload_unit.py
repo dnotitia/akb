@@ -440,25 +440,27 @@ async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
 
 
 async def test_confirmation_replay_does_not_rewrite_saved_metadata_or_timestamp(pool, vault_id):
+    key = _s3_key("v", "", "stable.txt")
     async with pool.acquire() as conn:
-        fid = await _put(conn, vault_id, _s3_key("v", "", "stable.txt"))
-        values = dict(size_bytes=7, content_hash=_HASH_A, hash_algorithm="sha256", etag="first", storage_version="v1")
+        fid = await _put(conn, vault_id, key)
+        values = dict(expected_s3_key=key, size_bytes=7, content_hash=_HASH_A, hash_algorithm="sha256", etag="first", storage_version="v1")
         assert await vault_files_repo.confirm_file_upload_metadata(conn, fid, vault_id, **values)
         before = dict(await conn.fetchrow("SELECT * FROM vault_files WHERE id = $1", fid))
         assert not await vault_files_repo.confirm_file_upload_metadata(conn, fid, vault_id, **{**values, "etag": "second"})
         leased = await vault_files_repo.lease_file_upload_confirmation(conn, vault_id, fid)
         after = dict(await conn.fetchrow("SELECT * FROM vault_files WHERE id = $1", fid))
-        assert leased["upload_state"] == "confirmed"
+        assert leased is None
         assert before == after
 
 
 async def test_pending_cancel_waiting_for_confirmation_never_deletes_the_winner(pool, vault_id):
+    key = _s3_key("v", "", "race.txt")
     async with pool.acquire() as conn:
-        fid = await _put(conn, vault_id, _s3_key("v", "", "race.txt"))
+        fid = await _put(conn, vault_id, key)
     async with pool.acquire() as confirming:
         async with confirming.transaction():
             assert await vault_files_repo.confirm_file_upload_metadata(
-                confirming, fid, vault_id, size_bytes=7, content_hash=_HASH_A,
+                confirming, fid, vault_id, expected_s3_key=key, size_bytes=7, content_hash=_HASH_A,
                 hash_algorithm="sha256", etag="first", storage_version="v1",
             )
 

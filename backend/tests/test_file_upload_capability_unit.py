@@ -449,6 +449,7 @@ async def test_a_grant_resolves_to_its_key_and_the_stored_type(monkeypatch):
         "file_id": uuid.uuid4(),
         "vault_id": uuid.uuid4(),
         "object_key": _KEY,
+        "s3_key": _KEY,
         "mime_type": "IMAGE/PNG; charset=utf-8",
         "upload_state": "pending",
     }
@@ -859,6 +860,7 @@ async def test_the_resolver_reports_whether_the_file_is_already_final(monkeypatc
         "file_id": uuid.uuid4(),
         "vault_id": uuid.uuid4(),
         "object_key": _KEY,
+        "s3_key": _KEY,
         "mime_type": "application/pdf",
         "upload_state": "confirmed",
     }

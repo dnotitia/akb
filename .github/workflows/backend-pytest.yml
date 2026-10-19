@@ -322,6 +322,9 @@ jobs:
             # green while the resolver answered for a deleted File and an
             # expired grant. Only a real database can tell those apart.
             tests/test_file_capability_resolution_pg.py
+            # File confirmation/cascade ownership and late staging cleanup
+            # require real transaction and worker/outbox semantics.
+            tests/test_file_lifecycle_pg.py
             tests/test_app_registry_migration_unit.py
             tests/test_app_identity_postgres.py
             tests/test_app_inventory_postgres.py
