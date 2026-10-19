@@ -5,6 +5,7 @@
 # knowing or invoking the internal Redis fan-out.
 #
 set -uo pipefail
+umask 077
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +22,10 @@ OTHER="evt-other-$(date +%s)-$RANDOM"
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
 cleanup() {
+  if [ "$FAIL" -gt 0 ]; then
+    # This bounded JSON survives in the suite log; raw captures are removed.
+    python3 "$EVENT_TAIL_HELPER" failure-artifact "$TMP_DIR" || true
+  fi
   if [ -n "${TOKEN:-}" ]; then
     for vault in "$VAULT" "$BUSY_VAULT"; do
       curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$vault" \
@@ -40,6 +45,19 @@ echo "╚═══════════════════════�
 echo ""
 
 echo "▸ 0. Setup"
+case "${AKB_EVENT_TAIL_EXPECT_NATIVE:-0}" in
+  0|1) ;;
+  *) fail "setup" "AKB_EVENT_TAIL_EXPECT_NATIVE must be 0 or 1"; exit 1 ;;
+esac
+if { [ -n "${AKB_EVENT_TAIL_TOKEN:-}" ] && [ -z "${AKB_EVENT_TAIL_OTHER_TOKEN:-}" ]; } \
+  || { [ -z "${AKB_EVENT_TAIL_TOKEN:-}" ] && [ -n "${AKB_EVENT_TAIL_OTHER_TOKEN:-}" ]; }; then
+  fail "setup" "supply both fixture tokens or neither"
+  exit 1
+fi
+if [ -n "${AKB_EVENT_TAIL_TOKEN:-}" ] && [ -n "${AKB_EVENT_TAIL_OTHER_TOKEN:-}" ]; then
+TOKEN="$AKB_EVENT_TAIL_TOKEN"
+OTHER_TOKEN="$AKB_EVENT_TAIL_OTHER_TOKEN"
+else
 curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"$USER\",\"email\":\"$USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
@@ -53,37 +71,41 @@ curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
 OTHER_TOKEN=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"$OTHER\",\"password\":\"test1234\"}" | json_field token)
+fi
 
 [ -n "$TOKEN" ] && [ -n "$OTHER_TOKEN" ] && pass "two authenticated users" || { fail "setup" "could not obtain both tokens"; exit 1; }
 
 VAULT_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$VAULT" \
   -H "Authorization: Bearer $TOKEN")
 VAULT_ID=$(echo "$VAULT_RESPONSE" | json_field vault_id)
-[ -n "$VAULT_ID" ] && pass "private Vault created" || { fail "vault" "$VAULT_RESPONSE"; exit 1; }
+[ -n "$VAULT_ID" ] && pass "private Vault created" || { fail "vault" "creation did not return an identity"; exit 1; }
 
 BUSY_VAULT_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/vaults?name=$BUSY_VAULT" \
   -H "Authorization: Bearer $TOKEN")
 BUSY_VAULT_ID=$(echo "$BUSY_VAULT_RESPONSE" | json_field vault_id)
-[ -n "$BUSY_VAULT_ID" ] && pass "second Vault created for heartbeat isolation" || { fail "busy vault" "$BUSY_VAULT_RESPONSE"; exit 1; }
+[ -n "$BUSY_VAULT_ID" ] && pass "second Vault created for heartbeat isolation" || { fail "busy vault" "creation did not return an identity"; exit 1; }
 
-DOC_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/documents" \
+FIRST_WRITE="$TMP_DIR/first-write.json"
+FIRST_CODE=$(curl -sk -o "$FIRST_WRITE" -w '%{http_code}' -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"First document\",\"slug\":\"first\",\"content\":\"first\",\"status\":\"active\"}")
-[ "$(echo "$DOC_RESPONSE" | json_field kind)" = "document_write" ] && pass "document producer event" || fail "document" "$DOC_RESPONSE"
+[[ "$FIRST_CODE" = 200 || "$FIRST_CODE" = 201 ]] || { fail "document" "HTTP $FIRST_CODE"; exit 1; }
+python3 "$EVENT_TAIL_HELPER" assert-write "$FIRST_WRITE" "$VAULT" tail/first.md \
+  && pass "document producer event" || { fail "document" "invalid write receipt"; exit 1; }
 
 TABLE_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"name":"items","columns":[{"name":"sku","type":"text"}]}')
-[ "$(echo "$TABLE_RESPONSE" | json_field kind)" = "table" ] && pass "table producer event" || fail "table" "$TABLE_RESPONSE"
+[ "$(echo "$TABLE_RESPONSE" | json_field kind)" = "table" ] && pass "table producer event" || fail "table" "invalid table receipt"
 
 ROW_RESPONSE=$(curl -sk -X POST "$BASE_URL/api/v1/tables/$VAULT/items/rows" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Prefer: return=representation' \
   -H 'Content-Type: application/json' \
   -d '[{"sku":"one"}]')
-[ "$(echo "$ROW_RESPONSE" | json_field kind)" = "table_query" ] && pass "table.rows_changed producer event" || fail "rows_changed" "$ROW_RESPONSE"
+[ "$(echo "$ROW_RESPONSE" | json_field kind)" = "table_query" ] && pass "table.rows_changed producer event" || fail "rows_changed" "invalid row receipt"
 
 echo ""
 echo "▸ 1. start=earliest and exact kind checkpoint"
@@ -92,7 +114,7 @@ curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT?start=earliest&kind=table.rows_changed" \
   -H "Authorization: Bearer $TOKEN" >"$FILTERED" 2>/dev/null || true
 
-python3 "$EVENT_TAIL_HELPER" assert-filtered "$FILTERED"
+python3 "$EVENT_TAIL_HELPER" assert-filtered "$FILTERED" "$VAULT"
 [ $? -eq 0 ] && pass "exact filter emits change plus checkpoint" || fail "filter/checkpoint" "unexpected SSE frames"
 
 echo ""
@@ -102,64 +124,64 @@ curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT?start=earliest" \
   -H "Authorization: Bearer $TOKEN" >"$ALL_EVENTS" 2>/dev/null || true
 
-python3 "$EVENT_TAIL_HELPER" assert-all-events "$ALL_EVENTS"
+python3 "$EVENT_TAIL_HELPER" assert-all-events "$ALL_EVENTS" "$FIRST_WRITE" "$VAULT"
 [ $? -eq 0 ] && pass "all Vault kinds are ordered and Redis-free" || fail "all events" "retained event envelope mismatch"
 
-LAST_CURSOR=$(awk '/^id: / {cursor=$2} END {print cursor}' "$ALL_EVENTS")
+LAST_CURSOR=$(python3 "$EVENT_TAIL_HELPER" last-cursor "$ALL_EVENTS")
 [ -n "$LAST_CURSOR" ] && pass "opaque cursor captured" || fail "cursor" "no SSE id"
 
-curl -sk -X POST "$BASE_URL/api/v1/documents" \
+SECOND_WRITE="$TMP_DIR/second-write.json"
+SECOND_CODE=$(curl -sk -o "$SECOND_WRITE" -w '%{http_code}' -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"Second document\",\"slug\":\"second\",\"content\":\"second\",\"status\":\"active\"}" >/dev/null
+  -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"Second document\",\"slug\":\"second\",\"content\":\"second\",\"status\":\"active\"}")
+[[ "$SECOND_CODE" = 200 || "$SECOND_CODE" = 201 ]] || { fail "second write" "HTTP $SECOND_CODE"; exit 1; }
+python3 "$EVENT_TAIL_HELPER" assert-write "$SECOND_WRITE" "$VAULT" tail/second.md \
+  || { fail "second write" "invalid receipt"; exit 1; }
 RESUMED="$TMP_DIR/resumed.sse"
 curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Last-Event-ID: $LAST_CURSOR" >"$RESUMED" 2>/dev/null || true
 
-python3 "$EVENT_TAIL_HELPER" assert-resumed "$RESUMED"
+python3 "$EVENT_TAIL_HELPER" assert-resumed "$RESUMED" "$SECOND_WRITE" "$VAULT" "$LAST_CURSOR"
 [ $? -eq 0 ] && pass "Last-Event-ID resumes after the retained cursor" || fail "resume" "new event was not delivered"
 
-RESUME_CURSOR=$(awk '/^id: / {cursor=$2} END {print cursor}' "$RESUMED")
-curl -sk -X POST "$BASE_URL/api/v1/documents" \
+RESUME_CURSOR=$(python3 "$EVENT_TAIL_HELPER" last-cursor "$RESUMED")
+THIRD_WRITE="$TMP_DIR/third-write.json"
+THIRD_CODE=$(curl -sk -o "$THIRD_WRITE" -w '%{http_code}' -X POST "$BASE_URL/api/v1/documents" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"Third document\",\"slug\":\"third\",\"content\":\"third\",\"status\":\"active\"}" >/dev/null
+  -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"Third document\",\"slug\":\"third\",\"content\":\"third\",\"status\":\"active\"}")
+[[ "$THIRD_CODE" = 200 || "$THIRD_CODE" = 201 ]] || { fail "third write" "HTTP $THIRD_CODE"; exit 1; }
+python3 "$EVENT_TAIL_HELPER" assert-write "$THIRD_WRITE" "$VAULT" tail/third.md \
+  || { fail "third write" "invalid receipt"; exit 1; }
 QUERY_RESUMED="$TMP_DIR/query-resumed.sse"
 curl -sk --no-buffer --max-time 2 \
   "$BASE_URL/api/v1/events/$VAULT?cursor=$RESUME_CURSOR" \
   -H "Authorization: Bearer $TOKEN" >"$QUERY_RESUMED" 2>/dev/null || true
-grep -q 'Third document' "$QUERY_RESUMED" && pass "cursor query resumes the same tail" || fail "query resume" "new event was not delivered"
+python3 "$EVENT_TAIL_HELPER" assert-resumed "$QUERY_RESUMED" "$THIRD_WRITE" "$VAULT" "$RESUME_CURSOR" \
+  && pass "cursor query resumes the same tail" || fail "query resume" "new event does not match its write"
 
 echo ""
 echo "▸ 3. start-at-tail, invalid cursor, and access isolation"
 LIVE="$TMP_DIR/live.sse"
-curl -sk --no-buffer --max-time 4 \
-  "$BASE_URL/api/v1/events/$VAULT" \
-  -H "Authorization: Bearer $TOKEN" >"$LIVE" 2>/dev/null &
-LIVE_PID=$!
-sleep 0.3
-curl -sk -X POST "$BASE_URL/api/v1/documents" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d "{\"vault\":\"$VAULT\",\"collection\":\"tail\",\"title\":\"Live document\",\"slug\":\"live\",\"content\":\"live\",\"status\":\"active\"}" >/dev/null
-wait "$LIVE_PID" 2>/dev/null || true
-grep -q 'Live document' "$LIVE" && pass "cursor-free connection waits for new tail" || fail "live tail" "post-connect event missing"
+AKB_URL="$BASE_URL" AKB_TOKEN="$TOKEN" AKB_QUIET_VAULT="$VAULT" python3 "$EVENT_TAIL_HELPER" live "$LIVE" \
+  && pass "cursor-free connection waits for new tail" || fail "live tail" "post-connect event does not match its write"
 
 INVALID_CODE=$(curl -sk -o "$TMP_DIR/invalid.json" -w '%{http_code}' \
   "$BASE_URL/api/v1/events/$VAULT?cursor=invalid" \
   -H "Authorization: Bearer $TOKEN")
 INVALID_BODY=$(cat "$TMP_DIR/invalid.json")
 [ "$INVALID_CODE" = "400" ] && echo "$INVALID_BODY" | grep -q 'invalid_event_cursor' \
-  && pass "malformed cursor returns standard 400" || fail "invalid cursor" "code=$INVALID_CODE body=$INVALID_BODY"
+  && pass "malformed cursor returns standard 400" || fail "invalid cursor" "code=$INVALID_CODE"
 
 UNAUTHORIZED_CODE=$(curl -sk -o "$TMP_DIR/unauthorized.json" -w '%{http_code}' \
   "$BASE_URL/api/v1/events/$VAULT?start=earliest" \
   -H "Authorization: Bearer $OTHER_TOKEN")
 UNAUTHORIZED_BODY=$(cat "$TMP_DIR/unauthorized.json")
 [ "$UNAUTHORIZED_CODE" = "403" ] && ! echo "$UNAUTHORIZED_BODY" | grep -q 'document.put' \
-  && pass "non-member cannot observe the tail" || fail "access isolation" "code=$UNAUTHORIZED_CODE body=$UNAUTHORIZED_BODY"
+  && pass "non-member cannot observe the tail" || fail "access isolation" "code=$UNAUTHORIZED_CODE"
 
 echo ""
 echo "▸ 4. quiet and cross-Vault heartbeat deadlines"

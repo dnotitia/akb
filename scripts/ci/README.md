@@ -21,6 +21,30 @@ AKB_URL=http://localhost:8000 bash backend/tests/test_mcp_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_publications_e2e.sh
 ```
 
+The Event Tail suite also supports an authorized disposable Native endpoint:
+
+```bash
+AKB_URL=http://localhost:8000 AKB_EVENT_TAIL_EXPECT_NATIVE=1 \
+  bash backend/tests/test_event_tail_e2e.sh
+```
+
+For an SSO-only test endpoint, export `AKB_EVENT_TAIL_TOKEN` and
+`AKB_EVENT_TAIL_OTHER_TOKEN` through your credential manager before running
+that command. Supply both or neither. The first fixture user must be able to
+create/delete disposable Vaults; the second must not have access to them. With
+neither token the suite creates its usual local test users. These are fixture
+credentials, not a way to bypass the endpoint's authentication policy.
+
+`AKB_EVENT_TAIL_EXPECT_NATIVE=1` requires Native resource/revision fields and
+their title-free payload contract; the default retains the explicitly Legacy
+repository runtime. The oracle checks the successful write receipt's Vault,
+URI, path and opaque revision, not display titles. A live connection observes
+its initial heartbeat before writing, rather than sleeping and assuming the
+connection has opened. On failure, the suite log retains bounded structural
+JSON (frame counts, validity and field-presence flags). Raw captures, content,
+titles, tokens, cursors, identities and resource paths are not printed and the
+private temporary captures are removed on exit.
+
 The shared curated gate is implemented by
 `scripts/ci/e2e_suite_runner.py`. `CURATED_SUITES` is the executable
 list, while `DEFERRED_SUITE_GROUPS` is the explicit opt-out list with reviewed
