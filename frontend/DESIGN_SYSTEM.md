@@ -623,6 +623,9 @@ an `sr-only` summary, never the only signal.
   including links to the already-open document. Escape, backdrop, close button
   and section changes guard unsaved edits or newly generated secrets; pending
   writes block those actions. Nested confirmations close before their parent.
+  Profile/password dirty and busy guards publish in the same layout commit as
+  their edited/saving UI, before another user dismissal. Keep the operation
+  owner outside its hidden Activity so proof-time completion releases the guard.
   Restore focus to the invoking control and never persist token secrets.
   Vault Settings is one compact settings sheet: General, Access, Vault guide,
   then owner-only Danger zone. Do not add category tabs, another navigation

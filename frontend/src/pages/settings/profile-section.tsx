@@ -1,4 +1,4 @@
-import { Activity, useEffect, useRef, useState } from "react";
+import { Activity, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ShieldCheck, UserRound } from "lucide-react";
 import { authSessionSnapshot, beginAccountLifecycle, isCurrentAuthSession, clearCompletedAccountSession, changePassword, getMe, updateProfile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -85,11 +85,14 @@ export function ProfileSection({
   const dirty = (localProfileEditingEnabled && profileDirty)
     || (localPasswordEnabled && Boolean(pwCurrent || pwNew || pwConfirm));
 
-  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
-  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  // Publish guards in the input/save commit. A passive effect can leave the
+  // dialog's close handler seeing the previous state after the UI has changed.
+  // Keep this owner outside Activity so hidden operation completion still runs.
+  useLayoutEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useLayoutEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   const busy = profileBusy || pwBusy;
-  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
-  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
+  useLayoutEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  useLayoutEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   // Protect both profile and password work during refresh / external navigation.
   useEffect(() => {
