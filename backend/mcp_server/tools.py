@@ -33,6 +33,7 @@ URI-addressable.
 """
 
 from mcp.types import Tool
+from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
@@ -218,13 +219,15 @@ TOOLS = [
             "Update an existing document. Only provide fields you want to change. "
             "The `content` field replaces the complete Markdown body; never pass a "
             "partial fragment such as a newly uploaded image. Use a targeted "
-            "akb_edit for inline insertion or replacement."
+            "akb_edit for inline insertion or replacement. Whole-body updates require "
+            "expected_commit or expected_content_hash from the original akb_get read; "
+            "both supplied conditions must match. This also applies to proxy file input."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
-                "content": {"type": "string", "description": "New document body (replaces existing)"},
+                "content": {"type": ["string", "null"], "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."},
                 "title": {"type": "string", "description": "New title"},
                 "type": {"type": "string", "description": "New document type"},
                 "status": {"type": "string", "enum": ["draft", "active", "archived"]},
@@ -235,15 +238,16 @@ TOOLS = [
                 "related_to": {"type": "array", "items": {"type": "string"}, "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."},
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "expected_commit": {
-                    "type": "string",
-                    "description": "Optional OCC pin — reject if the document current_commit moved.",
+                    "type": ["string", "null"], "pattern": REVISION_PATTERN, "minLength": 40, "maxLength": 40,
+                    "description": "Original current_commit, full 40 lowercase hex. Protects the exact revision, including metadata changes.",
                 },
                 "expected_content_hash": {
-                    "type": "string",
-                    "description": "Optional body hash pin — reject if the current document body hash moved.",
+                    "type": ["string", "null"], "pattern": CONTENT_HASH_PATTERN, "minLength": 64, "maxLength": 64,
+                    "description": "Original content_hash, full 64 lowercase hex. Protects body equality only, not metadata or intermediate A-to-B-to-A changes.",
                 },
             },
             "required": ["uri"],
+            "allOf": [BODY_UPDATE_CONDITION],
         },
     ),
     Tool(
@@ -275,8 +279,8 @@ TOOLS = [
                 },
                 "message": {"type": "string", "description": "Commit message describing the change"},
                 "base_commit": {
-                    "type": "string",
-                    "description": "Optional OCC pin — when set, the edit is rejected if the document's current_commit moved. Use after akb_get to fail-fast on concurrent writers.",
+                    "type": ["string", "null"], "pattern": REVISION_PATTERN, "minLength": 40, "maxLength": 40,
+                    "description": "Optional original-read current_commit (full 40 lowercase hex). Without it only exact current text is checked, not the surrounding revision context.",
                 },
             },
             "required": ["uri", "old_string", "new_string"],

@@ -2,6 +2,29 @@
 
 Reference AKB REST client boundary for the hybrid response contract.
 
+## Safe document updates
+
+Replacing a whole body (including `content: ""`) requires a condition from
+the read used to compose it. Metadata-only patches, including `content: null`,
+do not require one. This is a breaking server contract for previously unpinned
+whole-body writers; the SDK input type makes the requirement explicit.
+
+```ts
+const docs = akb.vault("example").docs;
+const original = (await docs.get("guides/readme.md")).throwOnError().data;
+await docs.update("guides/readme.md", {
+  content: `${original.content}\nReviewed additions`,
+  expectedCommit: original.current_commit!,
+});
+```
+
+Use the document API accessor configured for your Vault (as in the examples
+below). `expectedContentHash` is an alternative that protects only body
+equality, not metadata or intermediate A→B→A changes. Both supplied conditions
+must match. On conflict, re-read and deliberately merge/recompose the draft;
+never fetch a newer revision just to submit an older-derived body. The client
+does not automatically fetch versions, retry conflicts or force an overwrite.
+
 AKB HTTP success responses keep the backend envelope:
 
 ```json

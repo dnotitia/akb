@@ -21,6 +21,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from pydantic import ValidationError as ModelValidationError
 
 from app.util.git_refs import HEX_COMMIT_RE
 
@@ -714,20 +715,26 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
     if skill_internal:
         await check_vault_access(uid, vault, required_role="owner")
-    req = DocumentUpdateRequest(
-        content=args.get("content"),
-        title=args.get("title"),
-        type=args.get("type"),
-        status=args.get("status"),
-        tags=args.get("tags"),
-        domain=args.get("domain"),
-        summary=args.get("summary"),
-        depends_on=args.get("depends_on"),
-        related_to=args.get("related_to"),
-        message=args.get("message"),
-        expected_commit=args.get("expected_commit"),
-        expected_content_hash=args.get("expected_content_hash"),
-    )
+    try:
+        req = DocumentUpdateRequest(
+            content=args.get("content"),
+            title=args.get("title"),
+            type=args.get("type"),
+            status=args.get("status"),
+            tags=args.get("tags"),
+            domain=args.get("domain"),
+            summary=args.get("summary"),
+            depends_on=args.get("depends_on"),
+            related_to=args.get("related_to"),
+            message=args.get("message"),
+            expected_commit=args.get("expected_commit"),
+            expected_content_hash=args.get("expected_content_hash"),
+        )
+    except ModelValidationError:
+        return err(
+            "Invalid document update arguments. Version conditions must be full tokens from akb_get.",
+            code=INVALID_ARGUMENT,
+        )
     result = await doc_service.update(
         vault, doc_path, req, agent_id=user.username,
         skill_internal=skill_internal,

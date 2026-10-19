@@ -1081,20 +1081,26 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             assert grant["vault_id"] == vault_id
             adopted_uri = doc_uri(vault_name, "overview.md")
             adopted_vault, adopted_path = split_uri(adopted_uri, expected_type="doc")
-            updated = await DocumentService(git=git).update(
+            documents = DocumentService(git=git)
+            original = await documents.get(adopted_vault, adopted_path)
+            updated = await documents.update(
                 adopted_vault,
                 adopted_path,
-                DocumentUpdateRequest(content="# Overview\n\nCollector-owned update.\n"),
+                DocumentUpdateRequest(
+                    content="# Overview\n\nCollector-owned update.\n",
+                    expected_commit=original.current_commit,
+                ),
                 agent_id="collector-adoption",
             )
             assert updated.uri == adopted_uri
             # A subsequent Collector adoption pass touches each retained
             # document through the ordinary writer so the fresh Native plan
             # has a native public-activity commit at its fixed ref.
-            await DocumentService(git=git).update(
+            original = await documents.get(vault_name, "specs/contract.txt")
+            await documents.update(
                 vault_name,
                 "specs/contract.txt",
-                DocumentUpdateRequest(content="Collector-owned update."),
+                DocumentUpdateRequest(content="Collector-owned update.", expected_commit=original.current_commit),
                 agent_id="collector-adoption",
             )
 

@@ -733,6 +733,17 @@ Only send fields you want to change. Unspecified fields remain unchanged.
 body**. Never pass only a newly uploaded image or another partial fragment as
 `content`; use a targeted `akb_edit` for that.
 
+Any non-null `content`, including an empty string, requires `expected_commit`
+or `expected_content_hash` from the read used to compose it. Both supplied
+conditions must match. Missing/null conditions do not authorize a full rewrite;
+blank or malformed tokens are invalid arguments.
+
+`expected_commit` protects the exact revision. A body hash protects only body
+equality: metadata-only changes and intermediate A→B→A body changes may pass.
+Use the revision for a combined body/metadata change. On conflict, read and
+review/merge the latest document; never fetch a fresh token solely to resend
+an already-composed stale body. No automatic merge or force overwrite occurs.
+
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
@@ -745,11 +756,15 @@ body**. Never pass only a newly uploaded image or another partial fragment as
 | depends_on | | Update same-vault dependency list (akb:// URIs) |
 | related_to | | Update same-vault related list (akb:// URIs) |
 | message | | Git commit message |
-| expected_commit | | Reject if the document moved since it was read |
-| expected_content_hash | | Reject if the current body changed since it was read |
+| expected_commit | One for content | Original-read full revision; rejects any revision change |
+| expected_content_hash | One for content | Original-read body hash; does not protect metadata |
 
 ## Examples
 ```
+doc = akb_get(uri="akb://eng/doc/specs/api.md")
+akb_update(uri=doc.uri, content=doc.content + "\nReviewed additions",
+  expected_commit=doc.current_commit)
+
 akb_update(uri="akb://eng/doc/specs/api.md", tags=["urgent", "reviewed"],
   message="Mark as urgent and reviewed")
 

@@ -9,6 +9,14 @@ specifically; the proxy has its own log in
 
 ### Documents
 
+- **Breaking:** whole-body document updates, including empty bodies and proxy
+  `file` input, now require `expected_commit` or `expected_content_hash` from
+  the original read. Both supplied conditions must match. Metadata-only
+  patches and exact-text edits retain their separate contracts. Empty,
+  malformed and normalized-away version tokens are rejected. REST, MCP,
+  help and SDK types describe the same rules; MCP rejects invalid input
+  without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
+
 - Publish Native document image claims, current references and revision
   retention in the same transaction as the document Head. Concurrent saves,
   moves, deletes and replayed mutations cannot publish an older image set.

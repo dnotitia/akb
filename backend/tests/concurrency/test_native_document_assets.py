@@ -138,11 +138,12 @@ async def test_facade_delayed_save_cannot_overwrite_newer_refs(operation):
                 await resume.wait()
 
         delayed = NativeDocumentService(pool=pool, failpoint=pause)
-        task = asyncio.create_task(delayed.update(vault, created.path, DocumentUpdateRequest(content=_body(first))))
+        task = asyncio.create_task(delayed.update(vault, created.path, DocumentUpdateRequest(content=_body(first), expected_commit=created.current_commit)))
         try:
             await asyncio.wait_for(committed.wait(), 5)
             if operation == "replace":
-                await documents.update(vault, created.path, DocumentUpdateRequest(content=_body(second)))
+                _, current = await documents._current(vault, created.path)
+                await documents.update(vault, created.path, DocumentUpdateRequest(content=_body(second), expected_commit=current.revision_id))
             else:
                 await documents.delete(vault, created.path)
         finally:
@@ -356,7 +357,7 @@ async def test_delete_retry_retains_new_head_not_original_snapshot(monkeypatch):
         async def race(service, **kwargs):
             nonlocal new_head
             if new_head is None:
-                changed = await documents.update(vault, created.path, DocumentUpdateRequest(content=_body(second)))
+                changed = await documents.update(vault, created.path, DocumentUpdateRequest(content=_body(second), expected_commit=created.current_commit))
                 new_head = changed.current_commit
                 async with pool.acquire() as conn:
                     await conn.execute("UPDATE document_asset_revision_refs SET retain_until=NOW()-INTERVAL '1 day' WHERE commit_hash=$1", new_head)

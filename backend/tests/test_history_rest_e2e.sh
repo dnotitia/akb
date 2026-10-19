@@ -122,10 +122,13 @@ pass "vault created, USER2 granted reader"
 
 # Create a doc via the REST write path (author = USER1 username), then
 # update it so the history has >= 2 commits.
-DOCPATH=$(rput "$PAT1" "{\"vault\":\"$VAULT\",\"collection\":\"history-test\",\"title\":\"History Doc\",\"content\":\"## V1\",\"slug\":\"hist-doc\"}" | getpath)
+CREATED=$(rput "$PAT1" "{\"vault\":\"$VAULT\",\"collection\":\"history-test\",\"title\":\"History Doc\",\"content\":\"## V1\",\"slug\":\"hist-doc\"}")
+DOCPATH=$(echo "$CREATED" | getpath)
+BASE_COMMIT=$(echo "$CREATED" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("current_commit", ""))')
 [ -n "$DOCPATH" ] && pass "doc created via POST /documents ($DOCPATH)" || { fail "Doc" "POST /documents returned no path"; exit 1; }
-rpatch "$PAT1" "$VAULT/$DOCPATH" "{\"content\":\"## V2 updated\",\"message\":\"history rest e2e update\"}" >/dev/null
-pass "doc updated (v2)"
+UPDATED=$(rpatch "$PAT1" "$VAULT/$DOCPATH" "{\"content\":\"## V2 updated\",\"expected_commit\":\"$BASE_COMMIT\",\"message\":\"history rest e2e update\"}")
+NEW_COMMIT=$(echo "$UPDATED" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("current_commit", ""))')
+[ -n "$BASE_COMMIT" ] && [ -n "$NEW_COMMIT" ] && [ "$NEW_COMMIT" != "$BASE_COMMIT" ] && pass "doc updated (v2)" || { fail "Update" "PATCH did not publish a new revision"; exit 1; }
 
 # ── 1. Public OpenAPI contract ───────────────────────────────
 echo ""

@@ -248,10 +248,17 @@ const putDoc = await docs.put(documentPutInput);
 putDoc.throwOnError().data.kind satisfies "document_write";
 const updatedDoc = await docs.update("guides/readme.md", {
   summary: "Fresh summary",
-  expectedCommit: "abc1234",
-  expectedContentHash: "hash1234",
+  expectedCommit: "a".repeat(40),
+  expectedContentHash: "b".repeat(64),
 });
 updatedDoc.throwOnError().data.current_commit satisfies string | null | undefined;
+docs.update("guides/readme.md", { content: "new body", expectedCommit: "a".repeat(40) });
+docs.update("guides/readme.md", { content: "", expectedContentHash: "b".repeat(64) });
+docs.update("guides/readme.md", { content: null, title: "metadata only" });
+// @ts-expect-error Whole-body replacement requires a read condition.
+docs.update("guides/readme.md", { content: "unprotected body" });
+// @ts-expect-error Null conditions do not authorize a full replacement.
+docs.update("guides/readme.md", { content: "", expectedCommit: null });
 const deletedDoc = await docs.delete("guides/readme.md");
 deletedDoc.throwOnError().data.deleted satisfies boolean | undefined;
 const historyOptions: AkbDocumentHistoryOptions = { vault: "eng", limit: 20 };

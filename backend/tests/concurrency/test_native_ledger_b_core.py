@@ -570,7 +570,7 @@ async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
         assert [row["occurred_at"] for row in chronological] == sorted(row["occurred_at"] for row in chronological)
 
 
-async def test_public_unpinned_metadata_and_body_updates_recompute_and_serialize():
+async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serialize():
     async with _fresh_database() as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
@@ -615,7 +615,7 @@ async def test_public_unpinned_metadata_and_body_updates_recompute_and_serialize
             document_service.update(
                 vault,
                 created.path,
-                DocumentUpdateRequest(content="second"),
+                DocumentUpdateRequest(content="second", expected_content_hash=created.content_hash),
                 agent_id="second",
             ),
         )
@@ -1583,7 +1583,7 @@ async def test_content_hash_only_update_conflicts_after_concurrent_body_change()
                     await competitor.update(
                         vault,
                         created.path,
-                        DocumentUpdateRequest(content="changed body"),
+                        DocumentUpdateRequest(content="changed body", expected_commit=original.current_commit),
                         agent_id="body-racer",
                     )
                 return await super().replace_text(**kwargs)
@@ -2473,7 +2473,7 @@ async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(
         updated = await documents.update(
             vault,
             created.path,
-            DocumentUpdateRequest(content="second"),
+            DocumentUpdateRequest(content="second", expected_commit=created.current_commit),
             agent_id="seam",
         )
         assert updated.previous_commit == created.commit_hash

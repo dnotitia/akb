@@ -33,6 +33,28 @@ function itAsync(name, fn) {
   ));
 }
 
+itAsync("document file input preserves original-read predicates without a backend read", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "akb-document-predicate-"));
+  try {
+    const file = join(directory, "draft.md");
+    await writeFile(file, "# Draft from the original read\n");
+    const arguments_ = {
+      uri: "akb://example/doc/note.md", file,
+      expected_commit: "a".repeat(40), expected_content_hash: "b".repeat(64),
+    };
+    const resolved = AKBProxy.prototype._resolveFileToContent.call({}, arguments_);
+    assert.equal(resolved.content, "# Draft from the original read\n");
+    assert.equal(resolved.expected_commit, arguments_.expected_commit);
+    assert.equal(resolved.expected_content_hash, arguments_.expected_content_hash);
+    assert.equal(resolved.file, undefined);
+    const unpinned = AKBProxy.prototype._resolveFileToContent.call({}, { file });
+    assert.equal(unpinned.expected_commit, undefined);
+    assert.equal(unpinned.expected_content_hash, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 // ── Fixtures: representative backend envelope responses ──────────
 
 const initiateUploadResp = JSON.stringify({

@@ -70,12 +70,12 @@ async def test_restore_uses_existing_writer_gate_and_patch(monkeypatch, can_writ
     monkeypatch.setattr(documents, "check_vault_access", access)
     monkeypatch.setattr(documents.doc_service, "get", AsyncMock(return_value=SimpleNamespace(path="notes/old.md")))
     monkeypatch.setattr(documents.doc_service, "update", update)
-    request = DocumentUpdateRequest(status="active", expected_commit="head")
+    request = DocumentUpdateRequest(status="active", expected_commit="a" * 40)
     user = SimpleNamespace(user_id="reader-or-writer", username="tester")
     if can_write:
         await documents.update_document("mine", "notes/old.md", request, user)
         assert update.call_args.args[2].status == "active"
-        assert update.call_args.args[2].expected_commit == "head"
+        assert update.call_args.args[2].expected_commit == "a" * 40
     else:
         with pytest.raises(ForbiddenError):
             await documents.update_document("mine", "notes/old.md", request, user)

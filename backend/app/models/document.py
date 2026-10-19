@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.util.text import NFCModel
+from app.models.document_preconditions import BODY_UPDATE_CONDITION, ContentHashToken, RevisionToken, VersionedDocumentRequest
 
 # Allowed document lifecycle statuses. A soft signal:
 #   draft  — default on create; work-in-progress, promote when ready
@@ -69,12 +70,14 @@ class DocumentPutRequest(NFCModel):
     title_conflict_policy: TitleConflictPolicy = "allow"
 
 
-class DocumentUpdateRequest(NFCModel):
+class DocumentUpdateRequest(VersionedDocumentRequest):
     """Request body for akb_update.
 
     Compatibility contract: omitted fields and explicit null retain existing
     values. Send an empty string to clear summary/domain; null is not removal.
     """
+
+    model_config = ConfigDict(json_schema_extra={"allOf": [BODY_UPDATE_CONDITION]})
 
     content: str | None = None
     title: str | None = None
@@ -89,11 +92,15 @@ class DocumentUpdateRequest(NFCModel):
     # Optimistic concurrency: when provided, the update is rejected with
     # 409 unless the document's current_commit matches. Use to detect a
     # concurrent writer between read and write.
-    expected_commit: str | None = None
+    expected_commit: RevisionToken | None = Field(
+        default=None, description="Original-read revision; required with content unless expected_content_hash is provided.",
+    )
     # Optional body-level precondition. Unlike current_commit, this only
     # tracks the document body returned by akb_get; frontmatter-only
     # metadata changes do not change it.
-    expected_content_hash: str | None = None
+    expected_content_hash: ContentHashToken | None = Field(
+        default=None, description="Original-read body hash; protects body equality, not concurrent metadata changes.",
+    )
     title_conflict_policy: TitleConflictPolicy = "allow"
 
 
@@ -106,7 +113,7 @@ class DocumentMoveRequest(NFCModel):
     title_conflict_policy: TitleConflictPolicy = "allow"
 
 
-class DocumentEditRequest(NFCModel):
+class DocumentEditRequest(VersionedDocumentRequest):
     """Request body for akb_edit. Mirrors the MCP tool schema."""
 
     old_string: str
@@ -114,7 +121,7 @@ class DocumentEditRequest(NFCModel):
     replace_all: bool = False
     message: str | None = None
     # Optimistic concurrency — same semantics as DocumentUpdateRequest.expected_commit.
-    base_commit: str | None = None
+    base_commit: RevisionToken | None = None
 
 
 class DocumentResponse(BaseModel):

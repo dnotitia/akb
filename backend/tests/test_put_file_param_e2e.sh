@@ -159,6 +159,7 @@ DOC_URI=$(tool_result "$PUT_RESP" | python3 -c 'import sys,json; print(json.load
 
 # Verify content matches
 GET_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_get\",\"arguments\":{\"uri\":\"$DOC_URI\"}}")
+BASE_COMMIT=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("current_commit", ""))')
 GOT_TITLE=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("title",""))' 2>/dev/null)
 GOT_CONTENT=$(tool_result "$GET_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("content","")[:50])' 2>/dev/null)
 [ "$GOT_TITLE" = "File Param Test" ] && pass "Title matches" || fail "Title" "expected 'File Param Test', got '$GOT_TITLE'"
@@ -179,7 +180,7 @@ Content has been completely replaced via file param on akb_update.
 - Updated Item Y
 CONTENT
 
-UPDATE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_update\",\"arguments\":{\"uri\":\"$DOC_URI\",\"file\":\"$TEST_MD2\",\"message\":\"Update via file param\"}}")
+UPDATE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_update\",\"arguments\":{\"uri\":\"$DOC_URI\",\"file\":\"$TEST_MD2\",\"expected_commit\":\"$BASE_COMMIT\",\"message\":\"Update via file param\"}}")
 UPDATE_COMMIT=$(tool_result "$UPDATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit_hash",""))' 2>/dev/null)
 [ -n "$UPDATE_COMMIT" ] && pass "akb_update with file: commit=$UPDATE_COMMIT" || fail "akb_update file" "no commit — $(tool_result "$UPDATE_RESP")"
 

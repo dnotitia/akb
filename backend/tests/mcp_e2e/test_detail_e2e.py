@@ -45,6 +45,48 @@ def _relation_count(result: dict[str, Any]) -> int:
     return len(result.get("outgoing", [])) + len(result.get("relations", []))
 
 
+async def test_whole_body_update_requires_original_read_predicates(
+    mcp_client: Client, runtime_session: RuntimeContext,
+) -> None:
+    vault = await _create_vault(mcp_client, runtime_session, "write-predicates")
+    original = await _call_json(mcp_client, runtime_session, "akb_put", {
+        "vault": vault, "collection": "notes", "title": "Predicate contract", "content": "body A",
+    })
+    uri = original["uri"]
+    for content in ("stale body", ""):
+        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": content,
+        }, expect_error=True)
+        assert rejected["code"] == "invalid_argument"
+    for token in ("", " ", "a" * 40 + "\x00"):
+        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": "private rejected body", "expected_commit": token,
+        }, expect_error=True)
+        assert rejected["code"] == "invalid_argument"
+        assert "private rejected body" not in str(rejected)
+
+    await _call_json(mcp_client, runtime_session, "akb_update", {
+        "uri": uri, "content": None, "summary": "metadata only",
+    })
+    changed = await _call_json(mcp_client, runtime_session, "akb_update", {
+        "uri": uri, "content": "body B", "expected_content_hash": original["content_hash"],
+    })
+    for conditions in (
+        {"expected_commit": original["current_commit"], "expected_content_hash": changed["content_hash"]},
+        {"expected_commit": changed["current_commit"], "expected_content_hash": original["content_hash"]},
+    ):
+        conflict = await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": "must not publish", **conditions,
+        }, expect_error=True)
+        assert conflict["code"] == "conflict"
+    await _call_json(mcp_client, runtime_session, "akb_update", {
+        "uri": uri, "content": "", "expected_commit": changed["current_commit"],
+        "expected_content_hash": changed["content_hash"],
+    })
+    current = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+    assert current["content"] == "" and current["summary"] == "metadata only"
+
+
 async def test_exact_text_edit_contract_and_permissions(
     mcp_client: Client,
     secondary_mcp_client: SecondaryMcpSession,
