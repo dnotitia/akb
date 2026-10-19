@@ -26,10 +26,14 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 
+from app.config import settings
 from app.db.postgres import get_pool
+from app.repositories import vault_files_repo
+from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.repositories.vault_files_repo import DocumentAssetOwner
-from app.services import asset_service
+from app.services import asset_service, native_document_assets
 
 logger = logging.getLogger("akb.native_asset_ref_backfill")
 
@@ -41,6 +45,8 @@ class NativeAssetRefReport:
     scanned: int = 0
     with_images: int = 0
     refs_written: int = 0
+    stale_refs: int = 0
+    refs_removed: int = 0
     unresolved: int = 0
     failed: int = 0
     complete: bool = True
@@ -84,11 +90,9 @@ async def backfill_native_asset_refs(
     dry_run: bool = False,
 ) -> NativeAssetRefReport:
     """Publish live image references for Native documents that lack them."""
-    from app.services.revision_backend import get_document_service
-
     report = NativeAssetRefReport()
-    documents = get_document_service()
     pool = await get_pool()
+    repository = NativeRevisionRepository(pool)
 
     async with pool.acquire() as conn:
         targets = await _candidate_vaults(conn, vault)
@@ -103,7 +107,11 @@ async def backfill_native_asset_refs(
                       FROM native_resources
                      WHERE namespace_id = $1
                        AND surface = 'document'
-                       AND lifecycle = 'live'
+                       AND (lifecycle = 'live' OR EXISTS (
+                           SELECT 1 FROM document_asset_refs refs
+                            WHERE refs.native_document_id = native_resources.resource_id
+                              AND refs.vault_id = native_resources.namespace_id
+                       ))
                      ORDER BY current_path
                     """,
                     vault_id,
@@ -117,48 +125,62 @@ async def backfill_native_asset_refs(
     for vault_id, vault_name, resource_id, path in rows:
         report.scanned += 1
         try:
-            document = await documents.get(vault_name, path)
-        except Exception as exc:  # noqa: BLE001 — one unreadable document is not the run
-            report.failed += 1
-            report.findings.append(f"{vault_name}:{path}: unreadable ({type(exc).__name__})")
-            continue
-
-        body = document.content or ""
-        wanted = await asset_service.extract_asset_ids_async(body)
-        if not wanted:
-            continue
-        report.with_images += 1
-
-        head = document.current_commit
-        if not head:
-            report.failed += 1
-            report.findings.append(f"{vault_name}:{path}: no head revision")
-            continue
-
-        if dry_run:
-            report.refs_written += len(wanted)
-            continue
-
-        try:
             async with pool.acquire() as conn, conn.transaction():
-                found = await asset_service.claim_document_assets(
-                    conn, vault_id=vault_id, markdown=body, strict=False,
-                )
-                await asset_service.sync_document_assets(
-                    conn,
-                    owner=DocumentAssetOwner(
-                        vault_id=vault_id, native_document_id=resource_id,
-                    ),
-                    document_path=path,
-                    commit_hash=head,
-                    asset_ids=found,
-                )
+                resource = await repository.lock_resource(conn, resource_id)
+                if resource is None:
+                    continue
+                if resource["namespace_id"] != vault_id or resource["surface"] != "document":
+                    raise ValueError("Native document identity changed")
+                path = resource["current_path"]
+                owner = DocumentAssetOwner(vault_id=vault_id, native_document_id=resource_id)
+                current_refs = await vault_files_repo.list_live_document_asset_ids(conn, owner=owner)
+                if resource["lifecycle"] != "live":
+                    report.stale_refs += len(current_refs)
+                    if not dry_run:
+                        await conn.execute(
+                            "DELETE FROM document_asset_refs WHERE vault_id=$1 AND native_document_id=$2",
+                            vault_id, resource_id,
+                        )
+                        report.refs_removed += len(current_refs)
+                    continue
+                wanted = await native_document_assets.locked_head_image_ids(conn, repository, resource_id)
+                report.with_images += bool(wanted)
+                head = await repository.get_resource_head(resource_id=resource_id, conn=conn)
+                if head is None:
+                    raise ValueError("Native document Head is missing")
+                if dry_run:
+                    available = await conn.fetch(
+                        """SELECT id FROM vault_files
+                           WHERE vault_id=$1 AND id=ANY($2::uuid[])
+                             AND kind='attachment' AND upload_state='confirmed'
+                             AND hash_verified_at IS NOT NULL""",
+                        vault_id, list(wanted),
+                    )
+                    found = {row["id"] for row in available}
+                else:
+                    found = await asset_service.claim_document_asset_ids(
+                        conn, vault_id=vault_id, asset_ids=wanted, strict=False,
+                    )
+                    await vault_files_repo.sync_document_asset_references(
+                        conn,
+                        owner=owner,
+                        document_path=path, commit_hash=head["revision_id"], asset_ids=found,
+                        # Repair is not a new revision. Do not restart history's
+                        # retention clock every time an operator repeats it.
+                        retain_until=head["occurred_at"] + timedelta(
+                            days=settings.document_asset_revision_retention_days,
+                        ),
+                    )
+                report.stale_refs += len(current_refs - found)
+                if not dry_run:
+                    report.refs_removed += len(current_refs - found)
         except Exception as exc:  # noqa: BLE001 — report and keep walking
             report.failed += 1
             report.findings.append(f"{vault_name}:{path}: {type(exc).__name__}: {exc}"[:200])
             continue
 
-        report.refs_written += len(found)
+        if not dry_run:
+            report.refs_written += len(found)
         missing = wanted - found
         if missing:
             report.unresolved += len(missing)

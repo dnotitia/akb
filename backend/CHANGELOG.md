@@ -7,6 +7,17 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Documents
+
+- Publish Native document image claims, current references and revision
+  retention in the same transaction as the document Head. Concurrent saves,
+  moves, deletes and replayed mutations cannot publish an older image set.
+  Direct grep writes and seeded documents use the same authority boundary.
+  The existing image-reference repair command now locks resource identity,
+  clears stale references on empty/deleted documents and reports missing
+  images without continually extending history retention. See
+  `docs/operations/native-document-images.md` before repairing existing data.
+
 ### Authentication
 
 - Complete a workspace SSO login after the person selects an enabled upstream

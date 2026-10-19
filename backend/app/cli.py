@@ -926,7 +926,7 @@ async def _native_asset_refs_backfill(args: list[str]) -> int:
         print(json.dumps(report.to_dict(), sort_keys=True))
         # A run that stopped at --limit has not seen the population, so it
         # must not read as a clean result.
-        return 0 if report.complete and not report.failed else 1
+        return 0 if report.complete and not report.failed and not report.unresolved else 1
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2

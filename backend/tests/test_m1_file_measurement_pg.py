@@ -65,6 +65,7 @@ async def pool():
             "057_native_revision_m1_payload_placement.py",
             "059_native_file_searchable_derived.py",
             "089_native_file_projection_outbox.py",
+            "107_native_document_asset_refs.py",
         ):
             await _migration(filename).migrate(conn)
     try:

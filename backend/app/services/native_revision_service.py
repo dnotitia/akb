@@ -22,6 +22,7 @@ import asyncpg
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.repositories.events_repo import emit_event
 from app.repositories.native_revision_repo import NativeRevisionRepository
+from app.services import native_document_assets
 from app.services.m1_reference_payload_store import (
     M1ReferencePayloadStore,
     PreparedReferencePayload,
@@ -191,6 +192,7 @@ class NativeRevisionService:
         summary: str | None,
         requested_resource_id: uuid.UUID | None = None,
         expected_resource_id: uuid.UUID | None = None,
+        allow_unavailable_asset_refs: bool = False,
     ) -> str:
         canonical = json.dumps(
             {
@@ -209,6 +211,7 @@ class NativeRevisionService:
                     str(requested_resource_id) if requested_resource_id is not None else None
                 ),
                 "expected_resource_id": str(expected_resource_id) if expected_resource_id is not None else None,
+                **({"allow_unavailable_asset_refs": True} if allow_unavailable_asset_refs else {}),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -230,6 +233,7 @@ class NativeRevisionService:
         subject: str | None,
         summary: str | None,
         expected_resource_id: uuid.UUID | None = None,
+        retain_document_assets: bool = True,
     ) -> str:
         canonical = json.dumps(
             {
@@ -244,6 +248,7 @@ class NativeRevisionService:
                 "subject": subject,
                 "summary": summary,
                 "expected_resource_id": str(expected_resource_id) if expected_resource_id is not None else None,
+                **({"retain_document_assets": False} if not retain_document_assets else {}),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -412,6 +417,7 @@ class NativeRevisionService:
         summary: str | None = None,
         expected_digest: str | None = None,
         expected_size: int | None = None,
+        allow_unavailable_asset_refs: bool = False,
     ) -> NativeMutationResult:
         self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
         if resource_id is not None and not isinstance(resource_id, uuid.UUID):
@@ -434,6 +440,8 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
             prepared=prepared,
+            asset_ids=await native_document_assets.image_ids(payload) if surface == "document" else set(),
+            allow_unavailable_asset_refs=allow_unavailable_asset_refs,
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -454,6 +462,7 @@ class NativeRevisionService:
         summary: str | None = None,
         expected_digest: str | None = None,
         expected_size: int | None = None,
+        allow_unavailable_asset_refs: bool = False,
     ) -> NativeMutationResult:
         """Create text within an existing caller-owned PostgreSQL transaction."""
         if not conn.is_in_transaction():
@@ -483,6 +492,8 @@ class NativeRevisionService:
             summary=summary,
             prepared=prepared,
             conn=conn,
+            asset_ids=await native_document_assets.image_ids(payload) if surface == "document" else set(),
+            allow_unavailable_asset_refs=allow_unavailable_asset_refs,
         )
 
     async def _create_prepared_text(
@@ -498,6 +509,8 @@ class NativeRevisionService:
         subject: str | None,
         summary: str | None,
         prepared: PreparedReferencePayload,
+        asset_ids: set[uuid.UUID],
+        allow_unavailable_asset_refs: bool,
         conn: asyncpg.Connection | None = None,
     ) -> NativeMutationResult:
         await self._hit("payload.after_verified")
@@ -513,6 +526,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
             requested_resource_id=resource_id,
+            allow_unavailable_asset_refs=allow_unavailable_asset_refs,
         )
         await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_create(
@@ -528,6 +542,8 @@ class NativeRevisionService:
             fingerprint=fingerprint,
             resource_id=resource_id,
             conn=conn,
+            asset_ids=asset_ids,
+            allow_unavailable_asset_refs=allow_unavailable_asset_refs,
         )
         return result
 
@@ -545,6 +561,8 @@ class NativeRevisionService:
         prepared: PreparedReferencePayload,
         fingerprint: str,
         resource_id: uuid.UUID | None,
+        asset_ids: set[uuid.UUID],
+        allow_unavailable_asset_refs: bool,
         conn: asyncpg.Connection | None = None,
     ) -> NativeMutationResult:
         resource_id = resource_id or uuid.uuid4()
@@ -622,6 +640,12 @@ class NativeRevisionService:
                     occurred_at=occurred_at,
                 )
                 await self._hit("authority.after_head")
+                if surface == "document":
+                    await native_document_assets.publish(
+                        conn, namespace_id=namespace_id, resource_id=resource_id,
+                        path=path, revision_id=revision_id, asset_ids=asset_ids,
+                        allow_unavailable=allow_unavailable_asset_refs,
+                    )
                 await self._hit("authority.after_path")
                 if reused_alias is not None:
                     await self.repository.retire_live_alias(
@@ -734,6 +758,7 @@ class NativeRevisionService:
             summary=summary,
             prepared=prepared,
             fingerprint=fingerprint,
+            asset_ids=await native_document_assets.image_ids(payload) if surface == "document" else set(),
             notification_previous_status=notification_previous_status,
             notification_status=notification_status,
         )
@@ -755,6 +780,7 @@ class NativeRevisionService:
         summary: str | None,
         prepared: PreparedReferencePayload,
         fingerprint: str,
+        asset_ids: set[uuid.UUID],
         notification_previous_status: str | None = None,
         notification_status: str | None = None,
     ) -> NativeMutationResult:
@@ -786,6 +812,11 @@ class NativeRevisionService:
                         f"{expected_revision_id}, current Head is {parent_revision_id}"
                     )
                 resource_id = resource["resource_id"]
+
+                previous_ids = (
+                    await native_document_assets.locked_head_image_ids(conn, self.repository, resource_id)
+                    if surface == "document" else set()
+                )
 
                 occurred_at = datetime.now(UTC)
                 await self.repository.insert_manifest(
@@ -828,6 +859,12 @@ class NativeRevisionService:
                     occurred_at=occurred_at,
                 )
                 await self._hit("authority.after_head")
+                if surface == "document":
+                    await native_document_assets.publish(
+                        conn, namespace_id=namespace_id, resource_id=resource_id,
+                        path=current_path, revision_id=revision_id, asset_ids=asset_ids,
+                        previous_ids=previous_ids, previous_revision_id=parent_revision_id,
+                    )
                 await self._hit("authority.after_path")
                 await self.repository.insert_activity(
                     conn,
@@ -934,6 +971,7 @@ class NativeRevisionService:
             summary=summary,
             prepared=prepared,
             fingerprint=fingerprint,
+            asset_ids=await native_document_assets.image_ids(payload) if surface == "document" else set(),
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -953,6 +991,7 @@ class NativeRevisionService:
         summary: str | None,
         prepared: PreparedReferencePayload,
         fingerprint: str,
+        asset_ids: set[uuid.UUID],
     ) -> NativeMutationResult:
         revision_id = await self._allocate_revision_id()
         manifest_id = uuid.uuid4()
@@ -1045,6 +1084,11 @@ class NativeRevisionService:
                         occurred_at=occurred_at,
                     )
                     await self._hit("authority.after_head")
+                    if surface == "document":
+                        await native_document_assets.publish(
+                            conn, namespace_id=namespace_id, resource_id=expected_resource_id,
+                            path=path, revision_id=revision_id, asset_ids=asset_ids,
+                        )
                     await self._hit("authority.after_path")
                     if reused_alias is not None:
                         await self.repository.retire_live_alias(
@@ -1228,6 +1272,10 @@ class NativeRevisionService:
                     )
                     if head is None or head["payload_manifest_id"] is None:
                         raise ReferencePayloadIntegrityError("Live native Head does not pin a payload manifest")
+                    asset_ids = (
+                        await native_document_assets.locked_head_image_ids(conn, self.repository, resource_id)
+                        if surface == "document" else set()
+                    )
                     occurred_at = datetime.now(UTC)
                     await self.repository.copy_manifest(
                         conn,
@@ -1288,6 +1336,13 @@ class NativeRevisionService:
                         occurred_at=occurred_at,
                     )
                     await self._hit("authority.after_alias")
+                    if surface == "document":
+                        await native_document_assets.publish(
+                            conn, namespace_id=namespace_id, resource_id=resource_id,
+                            path=path_to, revision_id=revision_id, asset_ids=asset_ids,
+                            previous_ids=asset_ids, previous_revision_id=parent_revision_id,
+                            previous_path=old_path,
+                        )
                     await self.repository.insert_activity(
                         conn,
                         activity_event_id=activity_id,
@@ -1349,6 +1404,7 @@ class NativeRevisionService:
         message: str | None = None,
         subject: str | None = None,
         summary: str | None = None,
+        retain_document_assets: bool = True,
     ) -> NativeMutationResult:
         self._validate_common(
             surface=surface,
@@ -1369,6 +1425,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
             expected_resource_id=expected_resource_id,
+            retain_document_assets=retain_document_assets,
         )
         result = await self._publish_delete(
             namespace_id=namespace_id,
@@ -1382,6 +1439,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
             fingerprint=fingerprint,
+            retain_document_assets=retain_document_assets,
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -1400,6 +1458,7 @@ class NativeRevisionService:
         subject: str | None,
         summary: str | None,
         fingerprint: str,
+        retain_document_assets: bool,
     ) -> NativeMutationResult:
         revision_id = await self._allocate_revision_id()
         activity_id = uuid.uuid4()
@@ -1451,6 +1510,12 @@ class NativeRevisionService:
                     invalidation_intent_id=intent_id,
                 )
                 await self._hit("authority.after_revision")
+                if surface == "document" and retain_document_assets:
+                    asset_ids = await native_document_assets.locked_head_image_ids(conn, self.repository, resource_id)
+                    await native_document_assets.retain_for_delete(
+                        conn, namespace_id=namespace_id, resource_id=resource_id,
+                        path=current_path, revision_id=parent_revision_id, asset_ids=asset_ids,
+                    )
                 await self.repository.set_head(
                     conn,
                     resource_id=resource_id,

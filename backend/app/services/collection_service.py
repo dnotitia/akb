@@ -391,6 +391,7 @@ class CollectionService:
                             mutation_id=uuid.uuid4(),
                             expected_revision_id=current.revision_id,
                             expected_resource_id=current.resource_id,
+                            retain_document_assets=False,
                             message=f"[delete-collection] {norm}\n\nagent: {agent_id or 'unknown'}\naction: delete-collection",
                             subject=f"[delete-collection] {norm}",
                         )

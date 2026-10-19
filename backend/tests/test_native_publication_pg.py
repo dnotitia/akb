@@ -45,6 +45,7 @@ async def native_publications(monkeypatch):
             "055_native_revision_m1_file_storage.py",
             "057_native_revision_m1_payload_placement.py",
             "106_native_document_publications.py",
+            "107_native_document_asset_refs.py",
         ):
             spec = importlib.util.spec_from_file_location(
                 f"publication_fixture_{filename}", _BACKEND / "app/db/migrations" / filename,
@@ -120,8 +121,18 @@ async def test_native_publication_reads_current_body_without_legacy_document(nat
 
 
 async def test_native_publication_section_assets_and_missing_section_fail_closed(native_publications):
-    _, vault_id, _, service = native_publications
+    pool, vault_id, _, service = native_publications
     visible, hidden = uuid.uuid4(), uuid.uuid4()
+    async with pool.acquire() as conn:
+        for asset_id in (visible, hidden):
+            await conn.execute(
+                """INSERT INTO vault_files
+                   (id, vault_id, kind, upload_state, name, s3_key,
+                    mime_type, size_bytes, content_hash, hash_verified_at)
+                   VALUES ($1, $2, 'attachment', 'confirmed', 'image.png', $3,
+                           'image/png', 1, $4, NOW())""",
+                asset_id, vault_id, f"publication-images/{asset_id}", "a" * 64,
+            )
     await _create(service, vault_id,
         f"# Public\n![visible](/api/assets/{visible})\n\n# Private\n![hidden](/api/assets/{hidden})\nsecret\n")
     publication = await _publish(section_filter="Public")

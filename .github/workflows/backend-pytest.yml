@@ -304,6 +304,7 @@ jobs:
             tests/test_native_revision_cutover_pg.py
             tests/test_native_revision_shadow_reader.py
             tests/concurrency/test_native_ledger_b_core.py
+            tests/concurrency/test_native_document_assets.py
             tests/concurrency/test_native_derived_pipeline.py
             tests/test_m1_file_measurement_pg.py
             tests/test_native_revision_m1_payload_placement_migration.py

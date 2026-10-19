@@ -152,6 +152,16 @@ async def test_native_publication_enqueues_before_commit_on_authority_connection
         "current_path": "renamed.md", "head_revision_id": "r-old", "resource_id": resource_id,
     }))
 
+    async def asset_participant(connection, *args, **kwargs):
+        assert connection is conn and in_transaction
+        return set()
+
+    # Image atomicity has its own real-PG suite. Isolate its persistence here
+    # while still checking that publication uses the authority connection.
+    monkeypatch.setattr(native.native_document_assets, "locked_head_image_ids", asset_participant)
+    monkeypatch.setattr(native.native_document_assets, "publish", asset_participant)
+    monkeypatch.setattr(native.native_document_assets, "retain_for_delete", asset_participant)
+
     async def enqueue(connection, kind, **kwargs):
         assert connection is conn and in_transaction
         observed.append((kind, kwargs))
@@ -172,7 +182,9 @@ async def test_native_publication_enqueues_before_commit_on_authority_connection
                   mutation_id=uuid.uuid4(), expected_revision_id="r-old", expected_resource_id=resource_id,
                   message=None, subject=None, summary=None, fingerprint="fingerprint")
     if operation == "replace":
-        kwargs.update(prepared=object(), notification_previous_status="active", notification_status="archived")
+        kwargs.update(prepared=object(), asset_ids=set(), notification_previous_status="active", notification_status="archived")
+    else:
+        kwargs.update(retain_document_assets=True)
     await getattr(service, f"_publish_{operation}")(**kwargs)
     assert not in_transaction
     if surface == "file":

@@ -434,7 +434,7 @@ test.describe("document edit recovery mock contract", () => {
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Draft retained after a retryable server failure");
 
-    const input = page.locator('input[type="file"]');
+    const input = page.getByTestId("markdown-editor").locator('input[type="file"]');
     await operate(request, recovery.operations!.retryable_upload_failure);
     await input.setInputFiles({
       name: "recovery.png",

@@ -661,6 +661,27 @@ async def sync_document_asset_references(
         )
 
 
+async def retain_document_asset_ids(
+    conn, *, vault_id: uuid.UUID, document_path: str, commit_hash: str,
+    asset_ids: set[uuid.UUID], retain_until: datetime,
+) -> None:
+    """Retain a verified immutable body manifest, not the mutable live cache."""
+    if not asset_ids:
+        return
+    await conn.execute(
+        """
+        INSERT INTO document_asset_revision_refs
+            (vault_id, document_path, commit_hash, asset_id, retain_until)
+        SELECT $1, $2, $3, asset_id, $5 FROM unnest($4::uuid[]) AS asset_id
+        ON CONFLICT (vault_id, document_path, commit_hash, asset_id)
+        DO UPDATE SET retain_until = GREATEST(
+            document_asset_revision_refs.retain_until, EXCLUDED.retain_until
+        )
+        """,
+        vault_id, document_path, commit_hash, list(asset_ids), retain_until,
+    )
+
+
 async def list_live_document_asset_ids(
     conn,
     *,
