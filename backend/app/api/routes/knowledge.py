@@ -74,7 +74,8 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
 # surfaces must accept and reject identically. `RelationType` is the
 # single-source `LinkRelationType` from kg_service (which the MCP
 # akb_link tool schema also derives from), so a relation one surface
-# rejects can never sneak in through the other.
+# rejects can never sneak in through the other. `edge_type` follows the same
+# rule: `EdgeType` is defined once in kg_service and both surfaces take it.
 
 
 # kg_service.link_resources returns an err()-envelope dict instead of
@@ -166,7 +167,7 @@ async def create_relation(
     await check_vault_access(user.user_id, vault, required_role="writer")
     result = await link_resources(
         vault, req.source, req.target, req.relation,
-        created_by=user.username, metadata=req.metadata,
+        created_by=user.username, metadata=req.metadata, edge_type=req.edge_type,
     )
     return {**_bridge_service_error(result), "kind": "relation_link"}
 

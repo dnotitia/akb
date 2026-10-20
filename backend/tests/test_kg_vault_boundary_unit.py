@@ -129,12 +129,16 @@ async def test_relation_projection_omits_foreign_uri_and_exposes_edge_kind(monke
                             "target_uri": TARGET,
                             "target_type": "doc",
                             "kind": "explicit",
+                            # No stored strength: an explicit edge made before
+                            # `edge_type` existed. It must read as strong.
+                            "stored_edge_type": None,
                         },
                         {
                             "relation_type": "related_to",
                             "target_uri": FOREIGN,
                             "target_type": "doc",
                             "kind": "implicit",
+                            "stored_edge_type": None,
                         },
                     ]
                 return []
@@ -161,6 +165,7 @@ async def test_relation_projection_omits_foreign_uri_and_exposes_edge_kind(monke
             "uri": TARGET,
             "resource_type": "doc",
             "kind": "explicit",
+            "edge_type": "strong",
             "name": "Visible target",
         }
     ]
@@ -185,6 +190,7 @@ async def test_bfs_never_materializes_foreign_endpoint():
                             "target_type": "doc",
                             "relation_type": "references",
                             "kind": "explicit",
+                            "stored_edge_type": None,
                         },
                         {
                             "source_uri": SOURCE,
@@ -192,6 +198,7 @@ async def test_bfs_never_materializes_foreign_endpoint():
                             "target_type": "doc",
                             "relation_type": "related_to",
                             "kind": "implicit",
+                            "stored_edge_type": None,
                         },
                     ]
                 return []

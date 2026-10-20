@@ -7,6 +7,35 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+### Relations carry a strength: `edge_type` is strong or weak
+
+- How strongly two resources are connected is now its own attribute, separate
+  from the relation name (`related_to`, `derived_from`, … say what a link means
+  and are too ambiguous to imply strength) and from `kind` (`implicit` = derived
+  from a document's frontmatter or body, `explicit` = made with `akb_link`). An
+  explicit relation is `strong` by default; `akb_link` and `POST /relations`
+  take an optional `edge_type` of `strong` or `weak`, and any other value is
+  rejected with `invalid_argument` (REST: 422). An implicit edge is always
+  `weak`; that value is computed when the edge is served and never stored.
+- `akb_relations`, `akb_graph`, `akb_provenance` and the REST `/relations`,
+  `/graph`, `/graph/overview` and `/provenance` routes return `edge_type` on every
+  edge, next to `kind`, and the link result echoes the value it stored. The
+  OpenAPI contract and the `@akb/client` types declare it, and the SDK's
+  `graph.link` forwards it.
+- No migration and no backfill. An explicit edge keeps the value in
+  `edges.metadata->>'edge_type'`; a row without the key, which is every
+  `akb_link` edge made before this change, reads as `strong`.
+- Linking an edge that already exists updates it in place, `edge_type` included.
+  A re-link that names no `edge_type` states the default again, so it makes the
+  edge `strong`. The stored metadata object is now merged with the one sent,
+  the new keys winning, instead of being replaced; this is what keeps a REST
+  caller's `metadata` when only the strength changes. The reserved `edge_type`
+  key in a request's `metadata` is overridden by the `edge_type` argument.
+- Rolling back to an earlier backend leaves the stored key unused, and that
+  backend replaces an edge's whole metadata object when it re-links the edge.
+  A weak edge re-linked there loses its key and reads as strong again once this
+  version returns.
+
 ## 0.17.0 — 2026-10-19
 
 ### Accounts

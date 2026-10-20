@@ -623,6 +623,8 @@ async def test_unicode_graph_grep_and_ownership(
         {"source": first["uri"], "target": second["uri"], "relation": "depends_on"},
     )
     assert linked.get("linked") or linked.get("created") or linked.get("edge_id")
+    # An explicit link is strong unless the caller says weak.
+    assert linked["edge_type"] == "strong"
     relations = await _call_json(
         mcp_client,
         runtime_session,
@@ -630,6 +632,7 @@ async def test_unicode_graph_grep_and_ownership(
         {"uri": first["uri"]},
     )
     assert _relation_count(relations) >= 1
+    assert [(row["kind"], row["edge_type"]) for row in relations["relations"]] == [("explicit", "strong")]
     graph = await _call_json(
         mcp_client,
         runtime_session,
@@ -638,6 +641,30 @@ async def test_unicode_graph_grep_and_ownership(
     )
     assert len(graph.get("nodes", [])) >= 2
     assert len(graph.get("edges", [])) >= 1
+    assert {(edge["kind"], edge["edge_type"]) for edge in graph["edges"]} == {("explicit", "strong")}
+    # Linking the same edge again updates it, edge_type included.
+    relinked = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_link",
+        {"source": first["uri"], "target": second["uri"], "relation": "depends_on", "edge_type": "weak"},
+    )
+    assert relinked["edge_type"] == "weak"
+    weak_relations = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_relations",
+        {"uri": first["uri"]},
+    )
+    assert [(row["kind"], row["edge_type"]) for row in weak_relations["relations"]] == [("explicit", "weak")]
+    invalid_edge_type = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_link",
+        {"source": first["uri"], "target": second["uri"], "relation": "depends_on", "edge_type": "medium"},
+        expect_error=True,
+    )
+    assert invalid_edge_type.get("code") == "invalid_argument"
     unlinked = await _call_json(
         mcp_client,
         runtime_session,

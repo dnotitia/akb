@@ -2266,6 +2266,10 @@ export const grepDocs = (query: string, vaults?: string[] | string, limit = 20, 
 };
 
 // ── Graph ──
+// Connection strength, separate from the relation name and from `kind`: an
+// implicit edge is always weak; an explicit (akb_link) edge is strong unless it
+// was made weak. Optional on the wire types so an older server stays valid.
+export type EdgeType = "strong" | "weak";
 export interface GraphApiNode {
   uri: string;
   name?: string;
@@ -2280,6 +2284,7 @@ export interface GraphApiEdge {
   // 'implicit' (parsed from doc body) vs 'explicit' (akb_link). Present on
   // overview + BFS responses; optional so legacy callers stay valid.
   kind?: "implicit" | "explicit";
+  edge_type?: EdgeType;
 }
 // Build the canonical URI from (vault, path) before calling REST so
 // every call site presents the unified shape to the backend.
@@ -2364,6 +2369,7 @@ export interface RelationRow {
   uri: string;          // the "other" side
   resource_type?: string;
   kind: "implicit" | "explicit";
+  edge_type?: EdgeType;
   name?: string;
 }
 export const getRelations = (vault: string, docPath: string) => {

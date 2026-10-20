@@ -1,5 +1,6 @@
 import {
   createClient,
+  type AkbEdgeType,
   type AkbGraphRelationsOptions,
   type AkbProvenanceEnvelope,
   type AkbRelation,
@@ -18,6 +19,7 @@ const relations: AkbRelationsEnvelope = (await client.graph.relations("akb://pro
 const row: AkbRelation | undefined = relations.relations[0];
 row?.relation satisfies AkbRelationType | undefined;
 row?.name satisfies string | null | undefined;
+row?.edge_type satisfies AkbEdgeType | undefined;
 
 const linked: AkbRelationLinkEnvelope = (await client.graph.link({
   source: "akb://proof/doc/a",
@@ -26,6 +28,15 @@ const linked: AkbRelationLinkEnvelope = (await client.graph.link({
   metadata: { proof: true },
 })).throwOnError().data;
 linked.kind satisfies "relation_link";
+linked.edge_type satisfies AkbEdgeType;
+
+const weakLinked: AkbRelationLinkEnvelope = (await client.graph.link({
+  source: "akb://proof/doc/a",
+  target: "akb://proof/doc/b",
+  relation: writeRelation,
+  edge_type: "weak",
+})).throwOnError().data;
+weakLinked.edge_type satisfies AkbEdgeType;
 
 const unlinked: AkbRelationUnlinkEnvelope = (await client.graph.unlink({
   source: "akb://proof/doc/a",
@@ -41,6 +52,8 @@ provenance.relations satisfies AkbRelation[];
 
 // @ts-expect-error links_to is read-only and cannot be explicitly linked.
 client.graph.link({ source: "akb://proof/doc/a", target: "akb://proof/doc/b", relation: "links_to" });
+// @ts-expect-error edge_type is strong or weak.
+client.graph.link({ source: "akb://proof/doc/a", target: "akb://proof/doc/b", relation: "references", edge_type: "medium" });
 // @ts-expect-error links_to cannot be a named unlink relation; omit relation to remove all edges.
 client.graph.unlink({ source: "akb://proof/doc/a", target: "akb://proof/doc/b", relation: "links_to" });
 // @ts-expect-error links_to is outside the writable relation vocabulary.

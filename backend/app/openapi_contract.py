@@ -575,7 +575,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
         },
         "AkbGraphEdge": {
             "type": "object",
-            "required": ["source", "target", "relation", "kind"],
+            "required": ["source", "target", "relation", "kind", "edge_type"],
             "properties": {
                 "source": {"type": "string"},
                 "target": {"type": "string"},
@@ -592,12 +592,13 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                     ],
                 },
                 "kind": {"type": "string", "enum": ["implicit", "explicit"]},
+                "edge_type": _edge_type_property(),
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
         },
         "AkbRelation": {
             "type": "object",
-            "required": ["direction", "relation", "uri", "resource_type", "kind"],
+            "required": ["direction", "relation", "uri", "resource_type", "kind", "edge_type"],
             "properties": {
                 "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
                 "relation": {
@@ -615,6 +616,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "uri": {"type": "string"},
                 "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
                 "kind": {"type": "string", "enum": ["implicit", "explicit"]},
+                "edge_type": _edge_type_property(),
                 "name": _nullable_string(),
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
@@ -709,9 +711,10 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                         "derived_from",
                     ],
                 },
+                "edge_type": _edge_type_property(),
             },
             "Relation link result.",
-            required=("kind", "linked", "source", "target", "relation"),
+            required=("kind", "linked", "source", "target", "relation", "edge_type"),
         ),
         "AkbRelationUnlinkEnvelope": _kind_schema(
             "relation_unlink",
@@ -1138,6 +1141,22 @@ def _kind_property(kind: str) -> dict[str, Any]:
         "type": "string",
         "enum": [kind],
         "description": "Success envelope discriminator.",
+    }
+
+
+def _edge_type_property() -> dict[str, Any]:
+    """Edge strength, the vocabulary of ``kg_service.EdgeType``.
+
+    Spelled out here, as the relation vocabulary is, so this module stays free
+    of service imports; a unit test pins it to ``kg_service.EDGE_TYPES``.
+    """
+    return {
+        "type": "string",
+        "enum": ["strong", "weak"],
+        "description": (
+            "Connection strength, separate from the relation name and from `kind`. "
+            "An implicit edge is always weak; an explicit edge is strong unless made weak."
+        ),
     }
 
 

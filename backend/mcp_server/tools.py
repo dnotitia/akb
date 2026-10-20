@@ -37,14 +37,16 @@ from mcp.types import Tool
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
-from app.services.kg_service import LINK_RELATION_TYPES
+from app.services.kg_service import DEFAULT_EDGE_TYPE, EDGE_TYPES, LINK_RELATION_TYPES
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
 # `RelationType` model can never drift. `_REL_LIST` is the human-readable
-# spelling reused across descriptions.
+# spelling reused across descriptions. The edge-strength vocabulary
+# (`akb_link.edge_type`) follows the same rule.
 _REL_ENUM = list(LINK_RELATION_TYPES)
 _REL_LIST = ", ".join(LINK_RELATION_TYPES)
+_EDGE_TYPE_ENUM = list(EDGE_TYPES)
 
 
 # A column's name is the SQL identifier `akb_sql` uses as written, so a header
@@ -670,6 +672,7 @@ TOOLS = [
             "Create a relation between any two resources (documents, tables, files). "
             "Source and target are AKB URIs in the same vault. "
             f"Relation types: {_REL_LIST}. "
+            "Optional `edge_type`: strong (default) or weak; body links are always weak. "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
         input_schema={
@@ -681,6 +684,12 @@ TOOLS = [
                     "type": "string",
                     "description": "Relation type",
                     "enum": _REL_ENUM,
+                },
+                "edge_type": {
+                    "type": "string",
+                    "description": "Connection strength: strong (default) or weak; body links are always weak.",
+                    "enum": _EDGE_TYPE_ENUM,
+                    "default": DEFAULT_EDGE_TYPE,
                 },
             },
             "required": ["source", "target", "relation"],

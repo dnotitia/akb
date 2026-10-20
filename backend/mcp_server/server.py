@@ -44,7 +44,14 @@ from app.services.document_service import EditError
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS
 from app.services.revision_backend import get_revision_backend
 from app.services.search_service import SearchService
-from app.services.kg_service import get_resource_relations, get_graph, get_provenance, link_resources, unlink_resources
+from app.services.kg_service import (
+    DEFAULT_EDGE_TYPE,
+    get_graph,
+    get_provenance,
+    get_resource_relations,
+    link_resources,
+    unlink_resources,
+)
 from app.services.uri_service import doc_uri, parse_uri, split_uri
 from app.services.access_service import (
     authorized_vault, authorized_vault_id, check_vault_access, check_vault_scope, grant_access,
@@ -1147,10 +1154,15 @@ async def _handle_link(args: dict, uid: str, user: _MCPUser) -> dict:
         return err("source and target must belong to the same vault", code=INVALID_ARGUMENT)
     vault = src_parsed.vault
     await check_vault_access(uid, vault, required_role="writer")
+    edge_type = args.get("edge_type")
     return await link_resources(
         vault,
         args["source"], args["target"], args["relation"],
         created_by=user.username,
+        # An omitted or null `edge_type` is "not specified" and takes the
+        # default; any other value — including an empty string — is validated
+        # by the service, never coerced to the default here.
+        edge_type=DEFAULT_EDGE_TYPE if edge_type is None else edge_type,
     )
 
 

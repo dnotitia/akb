@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from itertools import zip_longest
-from typing import Literal, NamedTuple, get_args
+from typing import Literal, NamedTuple, cast, get_args
 
 from markdown_it import MarkdownIt
 
@@ -67,6 +67,52 @@ LinkRelationType = Literal[
     "derived_from",
 ]
 LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
+
+# ── Edge strength — single source of truth ───────────────────
+#
+# How strongly two resources are connected is its own attribute. It is neither
+# the relation name (`related_to`, `derived_from`, … say what a link MEANS and
+# are too ambiguous to imply strength) nor the provenance in `edges.kind`
+# (`implicit` = computed from a document's frontmatter / body, `explicit` =
+# made with `akb_link`).
+#
+#   - an explicit edge is `strong` unless its creator said `weak`;
+#   - an implicit edge is ALWAYS `weak`. It is derived, so the value is
+#     computed when an edge is served and never stored.
+#
+# Only explicit edges keep a value, under the `edge_type` key of
+# `edges.metadata` — no column, no migration. A row without the key, which is
+# every `akb_link` edge made before this attribute existed, therefore reads as
+# `strong` with no backfill.
+#
+# `resolve_edge_type` is the one place that turns stored state into the served
+# value. The REST models, the OpenAPI contract and the MCP `akb_link` schema
+# derive their vocabulary from `EdgeType`, like `LinkRelationType` above.
+EdgeType = Literal["strong", "weak"]
+EDGE_TYPES: tuple[str, ...] = get_args(EdgeType)
+DEFAULT_EDGE_TYPE: EdgeType = "strong"  # what an explicit edge reads as unless said otherwise
+IMPLICIT_EDGE_TYPE: EdgeType = "weak"  # what an implicit edge is, always
+EDGE_TYPE_METADATA_KEY = "edge_type"
+# Selected next to `kind` by every query that serves an edge. The raw value is
+# only an input to `resolve_edge_type`; it is never served as it is.
+_STORED_EDGE_TYPE_COLUMN = f"metadata->>'{EDGE_TYPE_METADATA_KEY}' AS stored_edge_type"
+
+
+def resolve_edge_type(kind: str | None, stored: str | None) -> EdgeType:
+    """The ``edge_type`` served for an edge row.
+
+    ``kind`` is ``edges.kind`` and ``stored`` is ``edges.metadata->>'edge_type'``
+    (NULL when the key is absent). Anything but an explicit edge is weak
+    whatever its metadata says, so a stray key on an implicit row can never
+    promote it. An explicit edge reads its stored value; a missing or
+    unrecognised one reads as the default, so no row is served outside the
+    vocabulary.
+    """
+    if kind != "explicit":
+        return IMPLICIT_EDGE_TYPE
+    if stored in EDGE_TYPES:
+        return cast(EdgeType, stored)
+    return DEFAULT_EDGE_TYPE
 
 
 def validate_new_structured_relation_refs(
@@ -536,6 +582,7 @@ async def link_resources(
     relation_type: str,
     created_by: str | None = None,
     metadata: dict | None = None,
+    edge_type: str = DEFAULT_EDGE_TYPE,
 ) -> dict:
     """Create an explicit edge between any two resources.
 
@@ -544,7 +591,20 @@ async def link_resources(
     The ``edges.target_type`` CHECK constraint enforces the same
     invariant at the DB layer; this surface-level reject gives the
     caller a clear error instead of a Postgres failure.
+
+    ``edge_type`` ("strong" by default, or "weak") is the connection's
+    strength. It is stored in ``edges.metadata`` under the reserved
+    ``edge_type`` key, merged with the caller's ``metadata`` so neither
+    replaces the other; a same-named key inside ``metadata`` is overridden by
+    this argument. Linking an edge that already exists is an update, and it
+    states the strength again — a bare re-link restores the default.
     """
+    if edge_type not in EDGE_TYPES:
+        return err(
+            f"edge_type must be one of {list(EDGE_TYPES)}, got {edge_type!r}",
+            code=INVALID_ARGUMENT,
+        )
+
     source_parsed = parse_uri(source_uri)
     target_parsed = parse_uri(target_uri)
     if not source_parsed:
@@ -643,6 +703,12 @@ async def link_resources(
             elif not await _resource_exists(conn, vault_id, target_type, target_id):
                 return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
 
+            # The strength is stored in `metadata` beside whatever the caller
+            # supplied. On a re-link the stored object and this call's object
+            # are merged key by key, this call winning a collision: changing
+            # `edge_type` keeps the caller's other keys, and the caller's keys
+            # cannot drop the strength.
+            edge_metadata = {**(metadata or {}), EDGE_TYPE_METADATA_KEY: edge_type}
             await conn.execute(
                 """
                 INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
@@ -650,17 +716,26 @@ async def link_resources(
                                    source_resource_id, target_resource_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'explicit', $10, $11)
                 ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
-                SET metadata = $8, created_by = $9, kind = 'explicit',
+                SET metadata = CASE WHEN jsonb_typeof(edges.metadata) = 'object'
+                                    THEN edges.metadata ELSE '{}'::jsonb END
+                               || EXCLUDED.metadata,
+                    created_by = $9, kind = 'explicit',
                     source_resource_id = EXCLUDED.source_resource_id,
                     target_resource_id = EXCLUDED.target_resource_id
                 """,
                 uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
-                source_type, target_type, json.dumps(metadata or {}), created_by,
+                source_type, target_type, json.dumps(edge_metadata), created_by,
                 source_resource_id, target_resource_id,
             )
 
-    logger.info("Linked %s → %s (%s)", source_uri, target_uri, relation_type)
-    return {"linked": True, "source": source_uri, "target": target_uri, "relation": relation_type}
+    logger.info("Linked %s → %s (%s, %s)", source_uri, target_uri, relation_type, edge_type)
+    return {
+        "linked": True,
+        "source": source_uri,
+        "target": target_uri,
+        "relation": relation_type,
+        "edge_type": edge_type,
+    }
 
 
 async def unlink_resources(
@@ -769,6 +844,9 @@ async def get_resource_relations(
     ``vault_id`` and both endpoint URI authorities must identify ``vault``.
     Legacy cross-vault rows are omitted completely: neither their raw URI nor
     their contribution to a count is part of the reader-visible graph.
+
+    Every row carries ``kind`` (provenance: implicit | explicit) and
+    ``edge_type`` (strength: strong | weak — see :func:`resolve_edge_type`).
     """
     if not uri_is_in_vault(resource_uri, vault):
         return []
@@ -785,7 +863,8 @@ async def get_resource_relations(
             if relation_type:
                 rows = await conn.fetch(
                     f"""
-                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind
+                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind,
+                           e.{_STORED_EDGE_TYPE_COLUMN}
                     FROM edges e
                     WHERE e.source_uri = $1 AND {scoped} AND e.relation_type = $4
                     """,
@@ -794,7 +873,8 @@ async def get_resource_relations(
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind
+                    SELECT e.relation_type, e.target_uri, e.target_type, e.kind,
+                           e.{_STORED_EDGE_TYPE_COLUMN}
                     FROM edges e
                     WHERE e.source_uri = $1 AND {scoped}
                     """,
@@ -809,6 +889,7 @@ async def get_resource_relations(
                     "uri": r["target_uri"],
                     "resource_type": r["target_type"],
                     "kind": r["kind"],
+                    "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                 })
                 uris_to_resolve.append((r["target_uri"], r["target_type"]))
 
@@ -817,7 +898,8 @@ async def get_resource_relations(
             if relation_type:
                 rows = await conn.fetch(
                     f"""
-                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind
+                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind,
+                           e.{_STORED_EDGE_TYPE_COLUMN}
                     FROM edges e
                     WHERE e.target_uri = $1 AND {scoped} AND e.relation_type = $4
                     """,
@@ -826,7 +908,8 @@ async def get_resource_relations(
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind
+                    SELECT e.relation_type, e.source_uri, e.source_type, e.kind,
+                           e.{_STORED_EDGE_TYPE_COLUMN}
                     FROM edges e
                     WHERE e.target_uri = $1 AND {scoped}
                     """,
@@ -841,6 +924,7 @@ async def get_resource_relations(
                     "uri": r["source_uri"],
                     "resource_type": r["source_type"],
                     "kind": r["kind"],
+                    "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                 })
                 uris_to_resolve.append((r["source_uri"], r["source_type"]))
 
@@ -866,7 +950,8 @@ async def get_graph(
     """Get a subgraph centered on a resource, or the full vault graph.
 
     Returns { nodes: [...], edges: [...] } suitable for visualization.
-    Nodes include all resource types (doc, table, file).
+    Nodes include all resource types (doc, table, file). Every edge carries
+    ``kind`` (implicit | explicit) and ``edge_type`` (strong | weak).
 
     ``hops`` is the BFS traversal radius in edge hops — distinct from
     ``akb_browse.depth`` which counts collection-tree levels. 0.3.0
@@ -1093,7 +1178,8 @@ async def get_overview(
             # node it didn't include.
             edge_rows = await conn.fetch(
                 f"""
-                SELECT source_uri, target_uri, relation_type, kind
+                SELECT source_uri, target_uri, relation_type, kind,
+                       {_STORED_EDGE_TYPE_COLUMN}
                 FROM edges
                 WHERE {scoped}
                   AND source_uri = ANY($3::text[])
@@ -1107,6 +1193,7 @@ async def get_overview(
                     "target": r["target_uri"],
                     "relation": r["relation_type"],
                     "kind": r["kind"],
+                    "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                 })
 
         names = await _batch_resolve_names(
@@ -1739,12 +1826,14 @@ async def _bfs_collect(
             break
 
         outgoing = await conn.fetch(
-            "SELECT source_uri, target_uri, target_type, relation_type, kind "
+            "SELECT source_uri, target_uri, target_type, relation_type, kind, "
+            f"{_STORED_EDGE_TYPE_COLUMN} "
             f"FROM edges WHERE source_uri = ANY($1::text[]) AND {scoped}",
             unvisited, vault_id, prefix,
         )
         incoming = await conn.fetch(
-            "SELECT source_uri, source_type, target_uri, relation_type, kind "
+            "SELECT source_uri, source_type, target_uri, relation_type, kind, "
+            f"{_STORED_EDGE_TYPE_COLUMN} "
             f"FROM edges WHERE target_uri = ANY($1::text[]) AND {scoped}",
             unvisited, vault_id, prefix,
         )
@@ -1797,6 +1886,7 @@ async def _bfs_collect(
                         "target": r["target_uri"],
                         "relation": r["relation_type"],
                         "kind": r["kind"],
+                        "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                     })
                 if r["target_uri"] not in visited:
                     next_queue.append(r["target_uri"])
@@ -1810,6 +1900,7 @@ async def _bfs_collect(
                         "target": uri,
                         "relation": r["relation_type"],
                         "kind": r["kind"],
+                        "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                     })
                 if r["source_uri"] not in visited:
                     next_queue.append(r["source_uri"])

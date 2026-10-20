@@ -102,3 +102,17 @@ def test_relation_tool_descriptions_match_the_vault_boundary():
     assert "explicit" in relations and "implicit" in relations
     unlink = tools["akb_unlink"].description.lower()
     assert "explicit" in unlink and "implicit" in unlink
+
+
+def test_akb_link_advertises_edge_type_from_the_shared_vocabulary():
+    from app.services.kg_service import DEFAULT_EDGE_TYPE, EDGE_TYPES
+
+    link = next(tool for tool in TOOLS if tool.name == "akb_link")
+    edge_type = link.input_schema["properties"]["edge_type"]
+
+    assert edge_type["enum"] == list(EDGE_TYPES)
+    assert edge_type["default"] == DEFAULT_EDGE_TYPE == "strong"
+    assert "edge_type" not in link.input_schema["required"]
+    # One short sentence on the tool, and the same words on the parameter.
+    assert "strong (default) or weak; body links are always weak" in link.description
+    assert "strong (default) or weak; body links are always weak" in edge_type["description"]

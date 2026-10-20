@@ -844,6 +844,16 @@
               }
             ],
             "title": "Metadata"
+          },
+          "edge_type": {
+            "type": "string",
+            "enum": [
+              "strong",
+              "weak"
+            ],
+            "title": "Edge Type",
+            "description": "Connection strength: strong (default) or weak; body links are always weak. Stored under the reserved `edge_type` key of `metadata`.",
+            "default": "strong"
           }
         },
         "type": "object",
@@ -870,12 +880,13 @@
       },
       "AkbGraphEdge": {
         "type": "object",
-        "required": ["source", "target", "relation", "kind"],
+        "required": ["source", "target", "relation", "kind", "edge_type"],
         "properties": {
           "source": { "type": "string" },
           "target": { "type": "string" },
           "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from", "links_to"] },
-          "kind": { "type": "string", "enum": ["implicit", "explicit"] }
+          "kind": { "type": "string", "enum": ["implicit", "explicit"] },
+          "edge_type": { "type": "string", "enum": ["strong", "weak"] }
         },
         "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
       },
@@ -934,12 +945,13 @@
       },
       "AkbRelation": {
         "type": "object",
-        "required": ["direction", "relation", "uri", "resource_type"],
+        "required": ["direction", "relation", "uri", "resource_type", "edge_type"],
         "properties": {
           "direction": { "type": "string", "enum": ["incoming", "outgoing"] },
           "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from", "links_to"] },
           "uri": { "type": "string" },
           "resource_type": { "type": "string", "enum": ["doc", "table", "file"] },
+          "edge_type": { "type": "string", "enum": ["strong", "weak"] },
           "name": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
         },
         "additionalProperties": { "$ref": "#/components/schemas/AkbJsonValue" }
@@ -955,13 +967,14 @@
       },
       "AkbRelationLinkEnvelope": {
         "type": "object",
-        "required": ["kind", "linked", "source", "target", "relation"],
+        "required": ["kind", "linked", "source", "target", "relation", "edge_type"],
         "properties": {
           "kind": { "type": "string", "const": "relation_link" },
           "linked": { "type": "boolean" },
           "source": { "type": "string" },
           "target": { "type": "string" },
-          "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from"] }
+          "relation": { "type": "string", "enum": ["depends_on", "related_to", "implements", "references", "attached_to", "derived_from"] },
+          "edge_type": { "type": "string", "enum": ["strong", "weak"] }
         }
       },
       "AkbRelationUnlinkEnvelope": {

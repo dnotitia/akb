@@ -362,6 +362,11 @@ jobs:
             tests/test_tool_usage_e2e.py
             tests/test_table_if_not_exists_e2e.py
             tests/test_kg_document_ref_postgres.py
+            # Edge strength lives in a JSONB key that a re-link must merge with
+            # the caller's metadata, and legacy rows must read through. Both are
+            # facts about the SQL, so a fake would agree with itself; off this
+            # list the file skips in both lanes.
+            tests/test_edge_type_postgres.py
             tests/test_search_covering_indexes_e2e.py
             # Needs the vchord service, not the postgres one. It skips rather
             # than failing where the extension is absent, so it has to be on a

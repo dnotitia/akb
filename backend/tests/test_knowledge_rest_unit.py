@@ -42,6 +42,7 @@ def _overview_payload():
             "target": f"akb://{VAULT}/doc/specs/b.md",
             "relation": "references",
             "kind": "explicit",
+            "edge_type": "strong",
         }],
         "nodes_total": 2,
         "edges_total": 1,
@@ -72,6 +73,29 @@ def test_graph_uri_and_legacy_vault_select_distinct_union_branches(client, monke
     assert set(_overview_payload()).issubset(overview)
 
 
+def test_graph_neighbors_edges_carry_edge_type_next_to_kind(client, monkeypatch):
+    async def _graph(_vault, resource_uri=None, **_kwargs):
+        return {
+            "nodes": [{"uri": URI, "name": "A", "resource_type": "doc", "depth": 0}],
+            "edges": [
+                {"source": URI, "target": f"akb://{VAULT}/doc/specs/b.md",
+                 "relation": "references", "kind": "explicit", "edge_type": "weak"},
+                {"source": URI, "target": f"akb://{VAULT}/doc/specs/c.md",
+                 "relation": "links_to", "kind": "implicit", "edge_type": "weak"},
+                {"source": f"akb://{VAULT}/doc/specs/d.md", "target": URI,
+                 "relation": "depends_on", "kind": "explicit", "edge_type": "strong"},
+            ],
+        }
+
+    monkeypatch.setattr(knowledge, "get_graph", _graph)
+    body = client.get("/api/v1/graph", params={"uri": URI}).json()
+
+    assert body["kind"] == "graph_neighbors"
+    assert [(e["kind"], e["edge_type"]) for e in body["edges"]] == [
+        ("explicit", "weak"), ("implicit", "weak"), ("explicit", "strong"),
+    ]
+
+
 def test_graph_rejects_collection_uri_before_response_validation(client):
     response = client.get("/api/v1/graph", params={"uri": COLLECTION_URI})
     assert response.status_code == 400
@@ -98,6 +122,7 @@ def test_overview_and_health_keep_existing_nested_shape(client, monkeypatch):
 
     assert overview["kind"] == "graph_overview"
     assert overview["edges"][0]["kind"] == "explicit"
+    assert overview["edges"][0]["edge_type"] == "strong"
     assert health["kind"] == "graph_health"
     assert health["orphans"]["count"] == 1
     assert "degree" not in health["orphans"]["sample"][0]

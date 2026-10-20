@@ -1790,6 +1790,28 @@ test("graph relation and provenance facade preserves backend 4xx result behavior
   assert.throws(() => denied.throwOnError(), AkbError);
 });
 
+test("graph link facade sends edge_type only when the caller sets it", async () => {
+  const bodies = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(init.body));
+      return responseJson({ kind: "relation_link", linked: true, edge_type: bodies.at(-1).edge_type ?? "strong" });
+    },
+  });
+  const input = { source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "related_to" };
+
+  const omitted = await client.graph.link(input);
+  const weak = await client.graph.link({ ...input, edge_type: "weak" });
+  const strong = await client.graph.link({ ...input, edge_type: "strong" });
+
+  assert.deepEqual(bodies[0], input);
+  assert.deepEqual(bodies[1], { ...input, edge_type: "weak" });
+  assert.deepEqual(bodies[2], { ...input, edge_type: "strong" });
+  assert.equal(omitted.throwOnError().data.edge_type, "strong");
+  assert.equal(weak.throwOnError().data.edge_type, "weak");
+  assert.equal(strong.throwOnError().data.edge_type, "strong");
+});
+
 test("storage upload sends contentHash to presign so the same bytes are not stored twice", async () => {
   const contentHash = "a".repeat(64);
   const seen = [];

@@ -16,6 +16,7 @@ settings.git_storage_path = tempfile.mkdtemp(prefix="akb-rest-openapi-")
 
 from app.api.routes.tables import _raise_service_error
 from app.main import app
+from app.services.kg_service import EDGE_TYPES
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
@@ -423,6 +424,16 @@ def test_graph_rest_openapi_contract_is_codegen_typed():
     assert relation["properties"]["direction"]["enum"] == ["incoming", "outgoing"]
     assert "links_to" in relation["properties"]["relation"]["enum"]
 
+    # Edge strength is its own attribute beside `kind`; every surface that lists
+    # an edge, and the link result, advertises the one vocabulary kg_service owns.
+    edge_types = list(EDGE_TYPES)
+    for name in ("AkbGraphEdge", "AkbRelation", "AkbRelationLinkEnvelope"):
+        assert schemas[name]["properties"]["edge_type"]["enum"] == edge_types, name
+        assert "edge_type" in schemas[name]["required"], name
+    for name in ("GraphEdge", "RelationItem", "RelationLinkResponse"):
+        assert schemas[name]["properties"]["edge_type"]["enum"] == edge_types, name
+        assert "edge_type" in schemas[name]["required"], name
+
     get_relations = paths["/api/v1/relations"]["get"]
     params = {param["name"]: param for param in get_relations["parameters"]}
     assert set(params["direction"]["schema"]["enum"]) == {"incoming", "outgoing", "both"}
@@ -432,6 +443,10 @@ def test_graph_rest_openapi_contract_is_codegen_typed():
 
     link_schema = schemas["LinkRequest"]
     assert "links_to" not in link_schema["properties"]["relation"]["enum"]
+    link_edge_type = link_schema["properties"]["edge_type"]
+    assert link_edge_type["enum"] == edge_types
+    assert link_edge_type["default"] == "strong"
+    assert "edge_type" not in link_schema["required"]
 
 
 def test_document_openapi_contract_is_codegen_typed():

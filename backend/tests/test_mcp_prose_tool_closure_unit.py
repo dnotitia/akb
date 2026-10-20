@@ -228,6 +228,11 @@ def test_relation_help_matches_the_vault_boundary_and_graph_schema() -> None:
     assert "relations never cross vaults" in relations
     assert "explicit" in relations and "implicit" in relations
 
+    # Edge strength is documented where the edges are written and read.
+    for topic in ("relations", "akb_link", "akb_relations", "akb_graph"):
+        assert "edge_type" in topics[topic], topic
+    assert "weak" in topics["akb_link"] and "strong" in topics["akb_link"]
+
 
 def test_help_root_table_topics_are_real_help_topics() -> None:
     """Every drill-down topic the root help table points at exists as a key.

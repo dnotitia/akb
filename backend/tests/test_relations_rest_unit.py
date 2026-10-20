@@ -126,13 +126,63 @@ def test_reader_forbidden_403(client, monkeypatch):
 
 def test_post_success_passthrough_200(client, monkeypatch):
     async def _ok(*_a, **_k):
-        return {"linked": True, "source": DOC_A, "target": DOC_B, "relation": "references"}
+        return {
+            "linked": True, "source": DOC_A, "target": DOC_B,
+            "relation": "references", "edge_type": "strong",
+        }
     monkeypatch.setattr(knowledge, "link_resources", _ok)
     r = client.post("/api/v1/relations",
                     json={"source": DOC_A, "target": DOC_B, "relation": "references"})
     assert r.status_code == 200
     assert r.json()["linked"] is True
     assert r.json()["kind"] == "relation_link"
+    assert r.json()["edge_type"] == "strong"
+
+
+# ── POST /relations — edge_type ──────────────────────────────────────
+
+@pytest.fixture
+def linked_kwargs(monkeypatch):
+    """Capture what the route hands to the service, and answer like it would."""
+    seen: dict = {}
+
+    async def _link(vault, source, target, relation, **kwargs):
+        seen.update(kwargs)
+        return {
+            "linked": True, "source": source, "target": target,
+            "relation": relation, "edge_type": kwargs["edge_type"],
+        }
+
+    monkeypatch.setattr(knowledge, "link_resources", _link)
+    return seen
+
+
+def test_post_edge_type_defaults_to_strong(client, linked_kwargs):
+    r = client.post("/api/v1/relations",
+                    json={"source": DOC_A, "target": DOC_B, "relation": "references"})
+    assert r.status_code == 200
+    assert linked_kwargs["edge_type"] == "strong"
+    assert r.json()["edge_type"] == "strong"
+
+
+@pytest.mark.parametrize("edge_type", ["strong", "weak"])
+def test_post_forwards_an_explicit_edge_type(client, linked_kwargs, edge_type):
+    r = client.post("/api/v1/relations",
+                    json={"source": DOC_A, "target": DOC_B, "relation": "references",
+                          "edge_type": edge_type, "metadata": {"note": "n"}})
+    assert r.status_code == 200
+    assert linked_kwargs["edge_type"] == edge_type
+    assert linked_kwargs["metadata"] == {"note": "n"}
+    assert r.json()["edge_type"] == edge_type
+
+
+@pytest.mark.parametrize("bad", ["medium", "", "STRONG", None, 1, ["weak"]])
+def test_post_rejects_an_edge_type_outside_the_vocabulary_422(client, linked_kwargs, bad):
+    r = client.post("/api/v1/relations",
+                    json={"source": DOC_A, "target": DOC_B, "relation": "references",
+                          "edge_type": bad})
+    assert r.status_code == 422
+    assert linked_kwargs == {}, "the service must not be reached with an invalid edge_type"
 
 
 def test_get_invalid_direction_and_relation_are_422(client):
@@ -159,6 +209,7 @@ def test_get_relation_exposes_implicit_or_explicit_ownership(client, monkeypatch
             "uri": DOC_B,
             "resource_type": "doc",
             "kind": "implicit",
+            "edge_type": "weak",
             "name": "B",
         }]
 
@@ -167,6 +218,25 @@ def test_get_relation_exposes_implicit_or_explicit_ownership(client, monkeypatch
 
     assert response.status_code == 200
     assert response.json()["relations"][0]["kind"] == "implicit"
+
+
+def test_get_relation_serves_edge_type_next_to_kind(client, monkeypatch):
+    async def _relations(*_a, **_kwargs):
+        return [
+            {"direction": "outgoing", "relation": "references", "uri": DOC_B,
+             "resource_type": "doc", "kind": "explicit", "edge_type": "weak", "name": "B"},
+            {"direction": "incoming", "relation": "references", "uri": DOC_B,
+             "resource_type": "doc", "kind": "explicit", "edge_type": "strong", "name": "B"},
+            {"direction": "outgoing", "relation": "links_to", "uri": DOC_B,
+             "resource_type": "doc", "kind": "implicit", "edge_type": "weak", "name": "B"},
+        ]
+
+    monkeypatch.setattr(knowledge, "get_resource_relations", _relations)
+    rows = client.get("/api/v1/relations", params={"uri": DOC_A}).json()["relations"]
+
+    assert [(row["kind"], row["edge_type"]) for row in rows] == [
+        ("explicit", "weak"), ("explicit", "strong"), ("implicit", "weak"),
+    ]
 
 
 # ── _bridge_service_error unit behaviour (dict guard + unmapped code) ─

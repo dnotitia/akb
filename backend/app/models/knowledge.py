@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.kg_service import LinkRelationType
+from app.services.kg_service import DEFAULT_EDGE_TYPE, EdgeType, LinkRelationType
 from app.util.text import NFCModel
 
 
@@ -29,6 +29,13 @@ class LinkRequest(NFCModel):
     target: str
     relation: LinkRelationType
     metadata: dict | None = None
+    edge_type: EdgeType = Field(
+        default=DEFAULT_EDGE_TYPE,
+        description=(
+            "Connection strength: strong (default) or weak; body links are always weak. "
+            "Stored under the reserved `edge_type` key of `metadata`."
+        ),
+    )
 
 
 class KnowledgeResponse(BaseModel):
@@ -50,6 +57,7 @@ class GraphEdge(KnowledgeResponse):
     target: str
     relation: ReadRelationType
     kind: EdgeKind
+    edge_type: EdgeType
 
 
 class RelationItem(KnowledgeResponse):
@@ -58,6 +66,7 @@ class RelationItem(KnowledgeResponse):
     uri: str
     resource_type: ResourceType
     kind: EdgeKind
+    edge_type: EdgeType
     name: str | None = None
 
 
@@ -108,6 +117,7 @@ class RelationLinkResponse(KnowledgeResponse):
     source: str
     target: str
     relation: LinkRelationType
+    edge_type: EdgeType
 
 
 class RelationUnlinkResponse(KnowledgeResponse):

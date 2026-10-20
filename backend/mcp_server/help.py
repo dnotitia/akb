@@ -454,6 +454,11 @@ akb_link(
   relation="attached_to")
 ```
 
+An explicit link is `strong` by default. Pass `edge_type="weak"` for a looser
+connection; linking the same edge again with another `edge_type` updates it.
+Links AKB derives from document metadata or Markdown body content are always
+`weak`.
+
 **When creating a document (doc→doc only):**
 ```
 akb_put(..., depends_on=["akb://eng/doc/specs/spec1.md"], related_to=["akb://eng/doc/notes/note2.md"])
@@ -482,7 +487,8 @@ akb_relations(uri="akb://eng/doc/specs/api.md")
 akb_relations(uri="akb://eng/table/experiments", direction="incoming")
 ```
 Each returned row has `kind="explicit"` for an `akb_link` edge or
-`kind="implicit"` when it is managed by document metadata/body content.
+`kind="implicit"` when it is managed by document metadata/body content, and an
+`edge_type` of `strong` or `weak` (implicit rows are always `weak`).
 Remove explicit rows with `akb_unlink`; edit the source document to remove an
 implicit row.
 
@@ -1149,7 +1155,9 @@ akb_relations(uri="akb://eng/table/experiments", direction="incoming")
 
 Every returned row includes `kind`: `explicit` rows are removable with
 `akb_unlink`; `implicit` rows must be removed by editing the document metadata
-or Markdown link that generated them. Relations never cross vaults.""",
+or Markdown link that generated them. Each row also includes `edge_type`
+(`strong` or `weak`): implicit rows are always `weak`, and an explicit row is
+`strong` unless it was linked as `weak`. Relations never cross vaults.""",
 
     "akb_graph": """# akb_graph — Knowledge Graph (Cross-Type)
 
@@ -1164,6 +1172,9 @@ Shows nodes (documents, tables, files) and edges (all relation types).
 | limit | | Max nodes (1-200, default 50) |
 
 Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource).
+
+Each edge carries `kind` (`explicit` | `implicit`) and `edge_type` (`strong` |
+`weak`; implicit edges are always `weak`).
 
 ## Examples
 ```
@@ -1791,6 +1802,7 @@ The vault is inferred from the URIs — no separate `vault` arg.
 | source | ✓ | Source AKB URI |
 | target | ✓ | Target AKB URI |
 | relation | ✓ | depends_on, related_to, implements, references, attached_to, derived_from |
+| edge_type | | strong (default) or weak; body links are always weak |
 
 ## URI Format
 - `akb://{vault}/doc/{path}` — document
@@ -1816,7 +1828,17 @@ akb_link(
   source="akb://eng/table/summary-stats",
   target="akb://eng/table/raw-data",
   relation="derived_from")
+
+# A looser connection
+akb_link(
+  source="akb://eng/doc/specs/api.md",
+  target="akb://eng/doc/notes/ideas.md",
+  relation="related_to",
+  edge_type="weak")
 ```
+
+Linking an edge that already exists updates it, including its `edge_type`; an
+omitted `edge_type` means `strong`.
 
 💡 Browse results include `uri` for each item — use those directly.""",
 

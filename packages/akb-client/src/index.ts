@@ -38,6 +38,7 @@ export type {
   AkbDocumentHistoryEnvelope,
   AkbDocumentHistoryEntry,
   AkbDrillDownEnvelope,
+  AkbEdgeType,
   AkbGrepEnvelope,
   AkbGraphEdge,
   AkbGraphEnvelope,
@@ -482,6 +483,8 @@ export interface AkbGraphLinkInput {
   target: string;
   relation: import("./core/schema.gen.js").AkbWritableRelationType;
   metadata?: Record<string, AkbJsonValue>;
+  /** Connection strength; the server treats an omitted value as "strong". */
+  edge_type?: import("./core/schema.gen.js").AkbEdgeType;
 }
 
 export interface AkbGraphUnlinkInput {
@@ -1118,6 +1121,7 @@ function makeGraphFacade(
         target: input.target,
         relation: input.relation,
         ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+        ...(input.edge_type === undefined ? {} : { edge_type: input.edge_type }),
       };
       return request<import("./core/schema.gen.js").AkbRelationLinkEnvelope>("/relations", {
         method: "POST",

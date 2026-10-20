@@ -369,6 +369,7 @@ export interface AkbGraphEdge {
   target: string;
   relation: AkbRelationType;
   kind: "implicit" | "explicit";
+  edge_type: AkbEdgeType;
   [key: string]: unknown;
 }
 
@@ -415,11 +416,15 @@ export type AkbWritableRelationType =
 
 export type AkbRelationType = AkbWritableRelationType | "links_to";
 
+/** Connection strength. An implicit edge is always weak; an explicit edge is strong unless made weak. */
+export type AkbEdgeType = "strong" | "weak";
+
 export interface AkbRelation {
   direction: "incoming" | "outgoing";
   relation: AkbRelationType;
   uri: string;
   resource_type: "doc" | "table" | "file";
+  edge_type: AkbEdgeType;
   name?: string | null;
   [key: string]: unknown;
 }
@@ -437,6 +442,7 @@ export interface AkbRelationLinkEnvelope {
   source: string;
   target: string;
   relation: AkbWritableRelationType;
+  edge_type: AkbEdgeType;
   [key: string]: unknown;
 }
 
@@ -490,7 +496,7 @@ export type AkbSuccessEnvelope =
   | AkbRelationUnlinkEnvelope
   | AkbProvenanceEnvelope;
 
-export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null };
+export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null; edge_type?: "strong" | "weak" };
 
 export type CreateCollectionRequest = { path: string; summary?: string | null };
 
