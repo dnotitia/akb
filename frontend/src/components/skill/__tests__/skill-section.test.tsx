@@ -7,16 +7,21 @@ import { SkillSection } from "../skill-section";
 import { ResourceNavigationProvider, useResourceNavigation } from "@/contexts/resource-navigation-context";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
+import { ApiError } from "@/lib/api";
 
 const getSkillTemplate = vi.fn();
 const getVaultSkillPreview = vi.fn();
 const updateDocument = vi.fn();
+const getDocument = vi.fn();
+const getDocumentHead = vi.fn();
 
 vi.mock("@/lib/api", async original => ({
   ...await original<typeof import("@/lib/api")>(),
-  getSkillTemplate: (...a: any[]) => getSkillTemplate(...a),
-  getVaultSkillPreview: (...a: any[]) => getVaultSkillPreview(...a),
-  updateDocument: (...a: any[]) => updateDocument(...a),
+  getSkillTemplate: (...a: unknown[]) => getSkillTemplate(...a),
+  getVaultSkillPreview: (...a: unknown[]) => getVaultSkillPreview(...a),
+  updateDocument: (...a: unknown[]) => updateDocument(...a),
+  getDocument: (...a: unknown[]) => getDocument(...a),
+  getDocumentHead: (...a: unknown[]) => getDocumentHead(...a),
 }));
 
 function wrap(ui: React.ReactNode) {
@@ -34,8 +39,16 @@ const DOC = {
   current_commit: "abc123def456", // pragma: allowlist secret — synthetic Git commit
 };
 
+function headAt(commit: string) {
+  return { kind: "document_head", uri: "akb://my-v/coll/overview/doc/vault-skill.md", vault: "my-v", path: VAULT_SKILL_PATH,
+    current_commit: commit, updated_at: DOC.updated_at };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  updateDocument.mockReset();
+  getDocument.mockReset().mockResolvedValue({ content: "New remote guide", current_commit: "new-remote-revision" });
+  getDocumentHead.mockReset().mockResolvedValue(headAt(DOC.current_commit));
   getVaultSkillPreview.mockResolvedValue("composed agent text");
 });
 
@@ -45,6 +58,68 @@ async function openGuideOption(user: ReturnType<typeof userEvent.setup>, name: s
 }
 
 describe("SkillSection", () => {
+  it("preserves a reviewed guide and its revision through same-owner access verification", async () => {
+    const user = userEvent.setup();
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const account = { user_id: "a", username: "a", email: "a@x.test", display_name: null, is_admin: false, auth_method: "local", key_class: null };
+    const view = (checking = false, revision = 0, canManage = !checking) => <QueryClientProvider client={client}><MemoryRouter><CurrentUserProvider user={account} checking={checking} revision={revision}><SkillSection vault="my-v" doc={DOC} canManage={canManage} /></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
+    const rendered = render(view());
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Compare changes" }));
+    await user.type(await screen.findByRole("textbox", { name: "Combined document body" }), " manually composed guide");
+    rendered.rerender(view(true));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    rendered.rerender(view(false, 1, false));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    rendered.rerender(view(false, 1));
+    expect(await screen.findByRole("textbox", { name: "Combined document body" })).toHaveValue("New remote guide manually composed guide");
+    expect(getDocument).toHaveBeenCalledOnce();
+    updateDocument.mockResolvedValueOnce({ current_commit: "saved-revision" });
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("my-v", VAULT_SKILL_PATH, {
+      content: "New remote guide manually composed guide", expected_commit: "new-remote-revision",
+    });
+  });
+
+  it("keeps a write denial through reader-head success until a new owner proof", async () => {
+    const user = userEvent.setup();
+    const recheck = vi.fn();
+    window.addEventListener("akb:revalidate-access", recheck);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const account = { user_id: "a", username: "a", email: "a@x.test", display_name: null, is_admin: false, auth_method: "local", key_class: null };
+    const view = (checking = false, revision = 0, canManage = !checking) => <QueryClientProvider client={client}><MemoryRouter><CurrentUserProvider user={account} checking={checking} revision={revision}><SkillSection vault="my-v" doc={DOC} canManage={canManage} /></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
+    const rendered = render(view());
+    try {
+      await user.click(screen.getByRole("button", { name: "Edit guide" }));
+      await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+      updateDocument.mockRejectedValueOnce(new ApiError("Owner permission required", 403, null));
+      let finishHead!: (head: ReturnType<typeof headAt>) => void;
+      getDocumentHead.mockReturnValueOnce(new Promise(resolve => { finishHead = resolve; }));
+      await user.click(screen.getByRole("button", { name: "Save guide" }));
+      await screen.findByText("Guide unavailable");
+      await act(async () => { finishHead(headAt(DOC.current_commit)); });
+      expect(screen.getByRole("button", { name: "Save guide" })).toBeDisabled();
+      expect(recheck).toHaveBeenCalledOnce();
+      expect(updateDocument).toHaveBeenCalledOnce();
+      // A role prop update alone cannot stand in for a new access proof.
+      rendered.rerender(view(false, 0, false));
+      rendered.rerender(view(false, 0));
+      expect(screen.getByRole("button", { name: "Save guide" })).toBeDisabled();
+      rendered.rerender(view(true));
+      rendered.rerender(view(false, 1, false));
+      expect(screen.queryByRole("button", { name: "Save guide" })).not.toBeInTheDocument();
+      rendered.rerender(view(false, 2));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled());
+      expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+      expect(updateDocument).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("akb:revalidate-access", recheck);
+    }
+  });
+
   it.each(["success", "failure"])("accepts the same-account save %s across access proof revisions", async result => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const account = { user_id: "a", username: "a", email: "a@x.test", display_name: null, is_admin: false, auth_method: "local", key_class: null };
@@ -84,9 +159,11 @@ describe("SkillSection", () => {
     expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
     expect(screen.getByText("Guide changed elsewhere")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Save guide" }));
-    expect(updateDocument).toHaveBeenCalledWith("my-v", "overview/vault-skill.md", {
-      content: `${DOC.content} local draft`, expected_commit: DOC.current_commit,
-    });
+    expect(updateDocument).not.toHaveBeenCalled();
+    const comparison = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(within(comparison).getByText(DOC.content, { selector: "pre", normalizer: text => text })).toBeVisible();
+    expect(within(comparison).getByText(`${DOC.content} local draft`, { selector: "pre", normalizer: text => text })).toBeVisible();
+    expect(await within(comparison).findByText("New remote guide", { selector: "pre" })).toBeVisible();
   });
 
   it("asks before Cancel discards a dirty draft and lets the user keep editing", async () => {
@@ -230,9 +307,256 @@ describe("SkillSection", () => {
     );
   });
 
+  it("observes only the open editor and requires body review before saving against the displayed latest commit", async () => {
+    const user = userEvent.setup();
+    updateDocument.mockResolvedValue({ current_commit: "saved-combination" });
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    expect(getDocumentHead).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Preview guide" }));
+    expect(getDocumentHead).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    expect(getDocumentHead).toHaveBeenCalledWith("my-v", VAULT_SKILL_PATH, expect.any(AbortSignal));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    await user.click(screen.getByRole("button", { name: "Check for changes" }));
+    expect(await screen.findByText("Guide changed elsewhere")).toBeVisible();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    expect(getDocument).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(updateDocument).not.toHaveBeenCalled();
+    expect(getDocument).toHaveBeenCalledWith("my-v", VAULT_SKILL_PATH, undefined,
+      expect.objectContaining({ preserveSession: true, signal: expect.any(AbortSignal) }));
+    expect(await within(dialog).findByText("New remote guide", { selector: "pre" })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    const result = within(dialog).getByRole("textbox", { name: "Combined document body" });
+    expect(result).toHaveValue("New remote guide");
+    await user.clear(result);
+    await user.type(result, "New remote guide with my local draft");
+    await user.click(within(dialog).getByRole("button", { name: "Apply combined changes" }));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue("New remote guide with my local draft");
+    expect(updateDocument).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("my-v", VAULT_SKILL_PATH, {
+      content: "New remote guide with my local draft", expected_commit: "new-remote-revision",
+    });
+  });
+
+  it("preserves the draft when loading the comparison fails and supports an explicit retry", async () => {
+    const user = userEvent.setup();
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    getDocument.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(await within(dialog).findByText(/latest guide could not be loaded/i)).toBeVisible();
+    expect(within(dialog).getByText(`${DOC.content} local draft`, { selector: "pre", normalizer: text => text })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    expect(updateDocument).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole("button", { name: "Try loading latest" }));
+    expect(await screen.findByRole("textbox", { name: "Combined document body" })).toHaveValue("New remote guide");
+    expect(getDocument).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403, 404])("blocks saving after a head check returns %s and keeps the draft for recovery", async status => {
+    const user = userEvent.setup();
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    getDocumentHead.mockRejectedValueOnce(new ApiError("Unavailable", status, null));
+    await user.click(screen.getByRole("button", { name: "Check for changes" }));
+    expect(await screen.findByText(/draft is preserved; saving is disabled/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save guide" })).toBeDisabled();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    expect(updateDocument).not.toHaveBeenCalled();
+
+    getDocumentHead.mockRejectedValueOnce(new ApiError("Unavailable", 503, null));
+    await user.click(screen.getByRole("button", { name: "Check for changes" }));
+    expect(screen.getByRole("button", { name: "Save guide" })).toBeDisabled();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    await user.click(screen.getByRole("button", { name: "Check for changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled());
+    expect(screen.queryByText("Guide unavailable")).not.toBeInTheDocument();
+  });
+
+  it.each([401, 403, 404])("preserves a combined guide through head status %s and rechecks access before applying", async status => {
+    const user = userEvent.setup();
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    updateDocument.mockResolvedValue({ current_commit: "saved-revision" });
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Compare changes" }));
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    const body = await within(dialog).findByRole("textbox", { name: "Combined document body" });
+    await user.type(body, " combined guide");
+    getDocumentHead.mockRejectedValueOnce(new ApiError("Unavailable", status, null));
+    await act(async () => { window.dispatchEvent(new Event("online")); });
+    expect(body).toHaveValue("New remote guide combined guide");
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save guide", hidden: true })).toBeDisabled();
+    getDocumentHead.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await user.click(within(dialog).getByRole("button", { name: "Check access" }));
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "Check access" }));
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeEnabled());
+    expect(body).toHaveValue("New remote guide combined guide");
+    await user.click(within(dialog).getByRole("button", { name: "Apply combined changes" }));
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("my-v", VAULT_SKILL_PATH, {
+      content: "New remote guide combined guide", expected_commit: "new-remote-revision",
+    });
+  });
+
+  it("allows a conditional save after a transient head failure", async () => {
+    const user = userEvent.setup();
+    updateDocument.mockResolvedValue({ current_commit: "saved-revision" });
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    getDocumentHead.mockRejectedValueOnce(new ApiError("Unavailable", 503, null));
+    await user.click(screen.getByRole("button", { name: "Check for changes" }));
+    expect(await screen.findByText("Could not check for changes")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("my-v", VAULT_SKILL_PATH, {
+      content: `${DOC.content} local draft`, expected_commit: DOC.current_commit,
+    });
+  });
+
+  it("keeps the displayed server snapshot immutable while polling sees another revision", async () => {
+    const user = userEvent.setup();
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Compare changes" }));
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    const result = await within(dialog).findByRole("textbox", { name: "Combined document body" });
+    await user.clear(result);
+    await user.type(result, "Reviewed combined guide");
+    getDocumentHead.mockResolvedValue(headAt("newer-racing-revision"));
+    act(() => window.dispatchEvent(new Event("online")));
+    expect(await within(dialog).findByText(/server changed again/i)).toBeVisible();
+    expect(result).toHaveValue("Reviewed combined guide");
+    expect(within(dialog).getByText("new-remote-revision")).toBeVisible();
+    expect(within(dialog).queryByText("newer-racing-revision")).not.toBeInTheDocument();
+
+    // The new base starts a fresh observation. A racing writer is still caught
+    // by the conditional write against exactly the displayed revision.
+    getDocumentHead.mockReturnValueOnce(new Promise(() => {}));
+    await user.click(within(dialog).getByRole("button", { name: "Apply combined changes" }));
+    updateDocument.mockRejectedValueOnce(new ApiError("Revision conflict", 409, { code: "conflict" }));
+    getDocument.mockResolvedValueOnce({ content: "Another remote guide", current_commit: "newer-racing-revision" });
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("my-v", VAULT_SKILL_PATH, {
+      content: "Reviewed combined guide", expected_commit: "new-remote-revision",
+    });
+    const next = await screen.findByRole("dialog", { name: "Review document changes" });
+    expect(await within(next).findByText("Another remote guide", { selector: "pre" })).toBeVisible();
+    expect(within(next).getByText("Reviewed combined guide")).toBeVisible();
+    expect(updateDocument).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards a late comparison response after the user keeps editing", async () => {
+    const user = userEvent.setup();
+    let finish!: (value: { content: string; current_commit: string }) => void;
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    getDocument.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    const signal = getDocument.mock.calls[0][3].signal as AbortSignal;
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish({ content: "Ignored late body", current_commit: "ignored-revision" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it("discards a comparison read across an access-proof revision without discarding the draft", async () => {
+    const user = userEvent.setup();
+    const account = { user_id: "a", username: "a", email: "a@x.test", display_name: null, is_admin: false, auth_method: "local", key_class: null };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = (checking = false, revision = 0) => <QueryClientProvider client={client}><MemoryRouter>
+      <CurrentUserProvider user={account} checking={checking} revision={revision}>
+        <SkillSection vault="my-v" doc={DOC} canManage={!checking} />
+      </CurrentUserProvider>
+    </MemoryRouter></QueryClientProvider>;
+    let finish!: (value: { content: string; current_commit: string }) => void;
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    getDocument.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const { rerender } = render(view());
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Compare changes" }));
+    expect(screen.getByRole("dialog", { name: "Review document changes" })).toBeVisible();
+    const signal = getDocument.mock.calls[0][3].signal as AbortSignal;
+
+    rerender(view(true));
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish({ content: "Ignored old proof body", current_commit: "old-proof-revision" }));
+    rerender(view(false, 1));
+    const comparison = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(within(comparison).queryByText("Ignored old proof body")).not.toBeInTheDocument();
+    expect(within(comparison).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    expect(within(comparison).getByRole("button", { name: "Try loading latest" })).toBeEnabled();
+    await user.click(within(comparison).getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+    expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it("blocks a terminal comparison failure until an explicit retry verifies the latest guide", async () => {
+    const user = userEvent.setup();
+    getDocumentHead.mockResolvedValue(headAt("new-remote-revision"));
+    getDocument.mockRejectedValueOnce(new ApiError("Forbidden", 403, null));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Compare changes" }));
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(await within(dialog).findByText(/latest guide could not be loaded/i)).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Try loading latest" })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "Check access" }));
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Try loading latest" })).toBeEnabled());
+    await user.click(within(dialog).getByRole("button", { name: "Try loading latest" }));
+    const result = await screen.findByRole("textbox", { name: "Combined document body" });
+    await user.clear(result);
+    await user.type(result, "Reviewed after access recovered");
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Reviewed after access recovered");
+    expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled();
+    expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a title conflict as a revision conflict", async () => {
+    const user = userEvent.setup();
+    updateDocument.mockRejectedValueOnce(new ApiError("Duplicate title", 409, { code: "title_conflict" }));
+    render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
+    await user.click(screen.getByRole("button", { name: "Edit guide" }));
+    await user.type(screen.getByLabelText("Vault guide body"), " local draft");
+    await user.click(screen.getByRole("button", { name: "Save guide" }));
+    expect(await screen.findByText("Duplicate title")).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(getDocument).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} local draft`);
+  });
+
   it("keeps the draft when a concurrent update rejects the commit pin", async () => {
     updateDocument.mockRejectedValue(
-      new Error("current_commit moved: expected abc123, actual def456"),
+      new ApiError("current_commit moved: expected abc123, actual def456", 409, { code: "conflict" }),
     );
     const u = userEvent.setup();
     render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
@@ -245,10 +569,10 @@ describe("SkillSection", () => {
     await u.click(screen.getByRole("button", { name: /save guide/i }));
 
     expect(await screen.findByText(/guide changed elsewhere/i)).toBeTruthy();
-    expect(screen.getByText(/your draft is still here/i)).toBeTruthy();
+    expect(await screen.findByRole("dialog", { name: "Review document changes" })).toBeVisible();
     expect(screen.queryByText(/current_commit moved/i)).toBeNull();
-    expect(screen.queryByText(/abc123|def456/i)).toBeNull();
     expect(editor.value).toBe(`${DOC.content} local draft`);
+    await u.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled();
   });
 

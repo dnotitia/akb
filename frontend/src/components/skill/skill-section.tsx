@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { History, MoreHorizontal, RotateCcw, Save } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { AgentPreview } from "./agent-preview";
+import { DocumentConflictNotice } from "@/components/document-conflict-notice";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -12,17 +13,41 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Textarea } from "@/components/ui/textarea";
 import { SettingRow, SettingsSection } from "@/components/ui/settings-section";
-import { authSessionSnapshot, getSkillTemplate, isCurrentAuthSession, updateDocument } from "@/lib/api";
+import { ApiError, authSessionSnapshot, getDocument, getSkillTemplate, isCurrentAuthSession, updateDocument } from "@/lib/api";
+import type { DocumentConflictResolution, DocumentConflictResult, DocumentConflictSnapshot } from "@/lib/document-conflict";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { timeAgo } from "@/lib/utils";
 import { useResourceNavigation, useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
+import { useDocumentHead } from "@/hooks/use-document-head";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 
 interface SkillDoc {
   content?: string;
   updated_at?: string;
   current_commit?: string | null;
+}
+
+interface GuideComparison {
+  scope: string;
+  base: DocumentConflictSnapshot;
+  local: DocumentConflictSnapshot;
+  latest: DocumentConflictSnapshot | null;
+  latestError?: string;
+  observedCommit: string | null;
+  resolution?: DocumentConflictResolution;
+}
+
+function validRevision(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function terminalFailure(error: unknown): error is ApiError {
+  return error instanceof ApiError && [401, 403, 404].includes(error.status);
+}
+
+function guideSnapshot(label: string, commit: string | null, body: string): DocumentConflictSnapshot {
+  return { label, commit, title: "Vault guide", body };
 }
 
 function guideExcerpt(content = "") {
@@ -76,9 +101,13 @@ export function SkillSection({
   navigationManaged = false,
   onDraftStateChange,
 }: Props) {
-  const { checking } = useAccessVerification();
+  const { checking, revision: accessRevision } = useAccessVerification();
   const user = useCurrentUser();
   const ownerScope = JSON.stringify([vault, user?.user_id]);
+  const observerScope = JSON.stringify([user?.user_id, accessRevision]);
+  const comparisonScope = JSON.stringify([vault, observerScope]);
+  const latestComparisonScope = useRef(comparisonScope);
+  latestComparisonScope.current = comparisonScope;
   const latestScope = useRef(ownerScope);
   latestScope.current = ownerScope;
   const latestChecking = useRef(checking);
@@ -101,13 +130,57 @@ export function SkillSection({
   const [resetOpen, setResetOpen] = useState(false);
   const [baseCommit, setBaseCommit] = useState<string | null>(null);
   const [baseBody, setBaseBody] = useState<string | null>(null);
+  const [comparison, setComparison] = useState<GuideComparison | null>(null);
+  const [loadingComparison, setLoadingComparison] = useState(false);
+  const comparisonGeneration = useRef(0);
+  const comparisonController = useRef<AbortController | null>(null);
+  const [guideUnavailable, setGuideUnavailable] = useState<{
+    scope: string;
+    verificationScope: string;
+    operation: "read" | "write";
+    error: ApiError;
+  } | null>(null);
+  // A static parent snapshot can lag behind the server snapshot the user just
+  // reviewed. Ignore that exact old prop revision after applying the result.
+  const [comparedBase, setComparedBase] = useState<{ priorCommit: string | null; commit: string } | null>(null);
   const [resetBaseCommit, setResetBaseCommit] = useState<string | null>(null);
   const [pendingExit, setPendingExit] = useState<
     { kind: "cancel" } | { kind: "navigation"; href: string; options?: NavigateOptions } | { kind: "history"; proceed: () => void } | null
   >(null);
   const dirty = baseBody !== null && draft !== baseBody;
   useEffect(() => { onDraftStateChange?.({ dirty, saving }); }, [dirty, saving, onDraftStateChange]);
-  const changedElsewhere = dirty && baseCommit !== (doc?.current_commit || null);
+  const observedHead = useDocumentHead({
+    vault, document: VAULT_SKILL_PATH, scope: observerScope, baseCommit,
+    enabled: expanded && tab === "edit" && canManage && !checking && !busy && !saving,
+  });
+  const unavailable = terminalFailure(observedHead.error) ? observedHead.error
+    : guideUnavailable?.scope === ownerScope ? guideUnavailable.error : null;
+  const propCommit = doc?.current_commit || null;
+  const documentCommit = comparedBase?.priorCommit === propCommit ? comparedBase.commit : propCommit;
+  const remoteCommit = observedHead.head?.current_commit && observedHead.head.current_commit !== baseCommit
+    ? observedHead.head.current_commit : documentCommit;
+  const changedElsewhere = saveConflict || (baseBody !== null && validRevision(baseCommit) && validRevision(remoteCommit) && baseCommit !== remoteCommit);
+  const activeComparison = comparison?.scope === ownerScope ? comparison : null;
+
+  useEffect(() => {
+    comparisonGeneration.current += 1;
+    comparisonController.current?.abort();
+    comparisonController.current = null;
+    setLoadingComparison(false);
+    return () => { comparisonController.current?.abort(); };
+  }, [comparisonScope, checking, canManage]);
+  useEffect(() => { setComparison(null); }, [ownerScope]);
+  useEffect(() => {
+    if (observedHead.head && !observedHead.error && !observedHead.checking) {
+      // A reader-authorized head proves availability, never owner capability.
+      setGuideUnavailable(current => current?.operation === "write" ? current : null);
+    }
+  }, [observedHead.head, observedHead.error, observedHead.checking]);
+  useEffect(() => {
+    if (checking || !canManage) return;
+    setGuideUnavailable(current => current?.scope === ownerScope && current.operation === "write" &&
+      current.verificationScope !== comparisonScope ? null : current);
+  }, [ownerScope, comparisonScope, checking, canManage]);
   const guardNavigation = useCallback((href: string, options?: NavigateOptions) => {
     // Settings anchors retain this mounted editor and its draft.
     if (new URL(href, window.location.origin).pathname === location.pathname) return true;
@@ -142,6 +215,7 @@ export function SkillSection({
       setBaseCommit(doc?.current_commit || null);
       setSaveError("");
       setSaveConflict(false);
+      setComparedBase(null);
       setSaved(false);
     }
     setTab(next);
@@ -149,11 +223,18 @@ export function SkillSection({
   }
 
   function discardDraft() {
+    comparisonGeneration.current += 1;
+    comparisonController.current?.abort();
+    comparisonController.current = null;
+    setComparison(null);
+    setLoadingComparison(false);
     setDraft("");
     setBaseBody(null);
     setBaseCommit(null);
     setSaveError("");
     setSaveConflict(false);
+    setComparedBase(null);
+    setGuideUnavailable(null);
   }
 
   function confirmExit() {
@@ -171,8 +252,82 @@ export function SkillSection({
     requestAnimationFrame(() => { if (mounted.current) editButtonRef.current?.focus(); });
   }
 
+  async function loadComparison() {
+    const generation = ++comparisonGeneration.current;
+    comparisonController.current?.abort();
+    const controller = new AbortController();
+    comparisonController.current = controller;
+    const scope = comparisonScope;
+    const session = authSessionSnapshot();
+    const currentOperation = () => mounted.current && !controller.signal.aborted && generation === comparisonGeneration.current &&
+      latestComparisonScope.current === scope && !latestChecking.current && isCurrentAuthSession(session);
+    setLoadingComparison(true);
+    setComparison(current => current ? { ...current, latestError: undefined } : null);
+    try {
+      const latest = await getDocument(vault, VAULT_SKILL_PATH, undefined, { preserveSession: true, signal: controller.signal });
+      if (!currentOperation()) return;
+      if (!validRevision(latest.current_commit)) throw new Error("The latest guide has no valid revision. Reload it before saving.");
+      setGuideUnavailable(current => current?.operation === "write" ? current : null);
+      setComparison(current => current ? {
+        ...current,
+        latest: guideSnapshot("Latest server version", latest.current_commit, latest.content || ""),
+        latestError: undefined,
+        observedCommit: remoteCommit,
+        resolution: undefined,
+      } : null);
+    } catch (caught) {
+      if (!currentOperation()) return;
+      if (terminalFailure(caught)) setGuideUnavailable({ scope: ownerScope, verificationScope: scope, operation: "read", error: caught });
+      setComparison(current => current ? {
+        ...current, latest: null,
+        latestError: "The latest guide could not be loaded. Your draft is preserved; try loading it again.",
+      } : null);
+    } finally {
+      if (currentOperation()) setLoadingComparison(false);
+      if (comparisonController.current === controller) comparisonController.current = null;
+    }
+  }
+
+  async function openComparison() {
+    if (!canManage || checking || latestChecking.current || busy || saving || unavailable) return;
+    setComparison({
+      scope: ownerScope,
+      base: guideSnapshot("Original base", baseCommit, baseBody ?? ""),
+      local: guideSnapshot("Your draft", baseCommit, draft),
+      latest: null,
+      observedCommit: remoteCommit,
+    });
+    await loadComparison();
+  }
+
+  function applyCombinedChanges(result: DocumentConflictResult) {
+    const reviewed = activeComparison?.latest;
+    if (!reviewed || !validRevision(reviewed.commit) || !canManage || checking || busy || saving || unavailable) return;
+    // Advance the base only to the immutable snapshot actually displayed in
+    // the comparison, even if polling discovered another revision meanwhile.
+    setBaseBody(reviewed.body);
+    setBaseCommit(reviewed.commit);
+    setDraft(result.body);
+    setComparedBase({ priorCommit: propCommit, commit: reviewed.commit });
+    setSaveError("");
+    setSaveConflict(false);
+    comparisonGeneration.current += 1;
+    comparisonController.current?.abort();
+    comparisonController.current = null;
+    setComparison(null);
+    setLoadingComparison(false);
+  }
+
   async function handleSave() {
-    if (!canManage || checking || busy) return;
+    if (!canManage || checking || busy || saving || unavailable) return;
+    if (changedElsewhere) {
+      await openComparison();
+      return;
+    }
+    if (!validRevision(baseCommit)) {
+      setSaveError("This guide has no valid revision. Reload it before saving.");
+      return;
+    }
     const scope = ownerScope;
     const session = authSessionSnapshot();
     const currentOperation = () => mounted.current && latestScope.current === scope && isCurrentAuthSession(session);
@@ -182,7 +337,7 @@ export function SkillSection({
     try {
       const saved = await updateDocument(vault, VAULT_SKILL_PATH, {
         content: draft,
-        expected_commit: baseCommit || undefined,
+        expected_commit: baseCommit,
       });
       if (!currentOperation()) return;
       queryClient.setQueryData(queryKey, {
@@ -199,16 +354,17 @@ export function SkillSection({
     } catch (e: unknown) {
       if (!currentOperation()) return;
       const message = e instanceof Error ? e.message : "Save failed";
-      if (/^current_commit moved:/i.test(message)) {
-        // Keep the local buffer and stale OCC pin intact: silently rebasing a
-        // full-body save would overwrite the other editor's changes. Refresh
-        // the read surfaces so History points at the newest commit instead.
-        invalidate();
+      if (e instanceof ApiError && e.status === 409 && (e.detail as { code?: unknown } | null)?.code === "conflict") {
         setSaveConflict(true);
-        setSaveError(
-          "The guide changed in another session. Your draft is still here and was not saved. Copy it and compare with History. Cancel and discard only when you are ready to start from the latest version.",
-        );
+        void openComparison();
       } else {
+        if (terminalFailure(e)) {
+          const writeDenied = e.status === 403;
+          setGuideUnavailable({ scope, verificationScope: latestComparisonScope.current, operation: writeDenied ? "write" : "read", error: e });
+          // Reuse the foreground proof flow: identity, then the parent's fresh
+          // vault-role read. A successful Head alone cannot restore writing.
+          if (writeDenied) window.dispatchEvent(new Event("akb:revalidate-access"));
+        }
         setSaveError(message);
       }
     } finally {
@@ -338,25 +494,58 @@ export function SkillSection({
                   <Textarea aria-label="Vault guide body" value={draft} onChange={event => setDraft(event.target.value)}
                     disabled={saving || busy} rows={16} placeholder="Instructions for agents using this vault."
                     className="resize-y font-mono text-sm leading-relaxed" spellCheck={false} />
-                  {(saveError || changedElsewhere) && <Alert
-                    variant={saveConflict || changedElsewhere ? "warning" : "destructive"}
-                    title={saveConflict || changedElsewhere ? "Guide changed elsewhere" : undefined} className="mt-3">
-                    {saveError || "The saved guide changed while you were editing. Your draft and original revision are preserved; compare with History before saving."}
+                  {saveError && <Alert variant="destructive" className="mt-3">{saveError}</Alert>}
+                  {(unavailable || changedElsewhere || observedHead.error) && <Alert variant={unavailable ? "destructive" : "warning"}
+                    title={unavailable ? "Guide unavailable" : changedElsewhere ? "Guide changed elsewhere" : "Could not check for changes"}
+                    role="status" aria-live="polite" className="mt-3">
+                    <p>{unavailable
+                      ? unavailable.status === 404 ? "This guide is no longer available. Your draft is preserved; saving is disabled."
+                        : "Guide access could not be verified. Your draft is preserved; saving is disabled."
+                      : changedElsewhere ? "Your draft and original revision are preserved. Compare changes before saving."
+                        : "Your draft is preserved. Saving still checks its original version."}</p>
+                    {changedElsewhere && !unavailable && <Button variant="outline" size="sm" className="mt-2 min-h-10 sm:min-h-8"
+                      disabled={busy || saving} onClick={() => void openComparison()}>Compare changes</Button>}
                   </Alert>}
-                  <div className="mt-3 flex items-center gap-2">
-                    <Button size="sm" className="min-h-10 sm:min-h-8" onClick={handleSave} loading={saving} disabled={!dirty || busy}>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <Button size="sm" className="min-h-10 sm:min-h-8" onClick={handleSave} loading={saving} disabled={!dirty || busy || checking || !!unavailable}>
                       {!saving && <Save className="h-3.5 w-3.5" aria-hidden />}{saving ? "Saving…" : "Save guide"}
                     </Button>
                     <Button variant="outline" size="sm" className="min-h-10 sm:min-h-8" disabled={saving || busy} onClick={() => {
                       if (dirty) setPendingExit({ kind: "cancel" });
                       else { discardDraft(); setTab("preview"); setExpanded(false); restoreEditFocus(); }
                     }}>Cancel</Button>
+                    <Button variant="ghost" size="sm" className="min-h-10 sm:min-h-8" onClick={() => void observedHead.check()}
+                      loading={observedHead.checking} disabled={saving || busy || checking}>Check for changes</Button>
                   </div>
                 </div>
               )}
             </>
           )}
       </SettingRow>
+
+      {activeComparison && !checking && canManage && expanded && tab === "edit" && <DocumentConflictNotice
+        key={activeComparison.latest?.commit ?? "loading-guide-comparison"}
+        base={activeComparison.base}
+        local={activeComparison.local}
+        latest={activeComparison.latest}
+        latestError={activeComparison.latestError}
+        loading={loadingComparison}
+        accessError={unavailable ? "Guide access could not be verified." : undefined}
+        checkingAccess={observedHead.checking}
+        onCheckAccess={() => void observedHead.check()}
+        resolution={activeComparison.resolution}
+        onResolutionChange={(resolution) => setComparison(current => current ? { ...current, resolution } : null)}
+        newerRevision={remoteCommit !== activeComparison.observedCommit ? remoteCommit : null}
+        onApply={applyCombinedChanges}
+        onRetryLatest={() => void loadComparison()}
+        onCancel={() => {
+          comparisonGeneration.current += 1;
+          comparisonController.current?.abort();
+          comparisonController.current = null;
+          setComparison(null);
+          setLoadingComparison(false);
+        }}
+      />}
 
       <ConfirmDialog
         open={!checking && pendingExit !== null}

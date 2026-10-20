@@ -363,9 +363,7 @@ test.describe("document edit recovery mock contract", () => {
     const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
     await expect(editor).toContainText("Local draft before another editor saves");
     await page.getByRole("button", { name: "Save changes" }).click();
-    const conflict = page
-      .getByRole("alert")
-      .filter({ hasText: "This document changed on the server" });
+    const conflict = page.getByRole("dialog", { name: "Review document changes" });
     await expect(conflict).toBeVisible();
     const snapshots = conflict.locator("[data-conflict-snapshot]");
     await expect(snapshots).toHaveCount(3);
@@ -389,7 +387,7 @@ test.describe("document edit recovery mock contract", () => {
           textOverflow !== "ellipsis" && whiteSpace !== "nowrap",
       ),
     ).toBe(true);
-    const actionStyles = await conflict.getByRole("button").evaluateAll((buttons) =>
+    const actionStyles = await conflict.locator('[data-slot="document-conflict-actions"] button').evaluateAll((buttons) =>
       buttons.map((button) => getComputedStyle(button).whiteSpace),
     );
     expect(actionStyles.every((whiteSpace) => whiteSpace === "nowrap")).toBe(true);
@@ -404,11 +402,11 @@ test.describe("document edit recovery mock contract", () => {
         .toBe(true);
     }
     await page.setViewportSize({ width: 1280, height: 900 });
-    await expectInstantKeyboardFocus(
-      conflict.getByRole("button", { name: "Apply draft to latest" }),
-    );
+    await expect(conflict.getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    await conflict.getByRole("textbox", { name: "Combined document body" }).fill("Remote editor body\nLocal draft before another editor saves");
+    await expectInstantKeyboardFocus(conflict.getByRole("button", { name: "Apply combined changes" }));
 
-    await page.getByRole("button", { name: "Apply draft to latest" }).click();
+    await page.getByRole("button", { name: "Apply combined changes" }).click();
     await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByRole("button", { name: "Save changes" })).toHaveCount(0);
     await expect(page.getByText("This document changed on the server")).toHaveCount(0);

@@ -12,9 +12,14 @@ whole-body writers; the SDK input type makes the requirement explicit.
 ```ts
 const docs = akb.vault("example").docs;
 const original = (await docs.get("guides/readme.md")).throwOnError().data;
-await docs.update("guides/readme.md", {
-  content: `${original.content}\nReviewed additions`,
-  expectedCommit: original.current_commit!,
+const originalCommit = original.current_commit;
+if (!originalCommit || typeof original.content !== "string") {
+  throw new Error("The original read needs a complete body and revision token.");
+}
+const draft = `${original.content}\nReviewed additions`;
+const saved = await docs.update("guides/readme.md", {
+  content: draft,
+  expectedCommit: originalCommit,
 });
 ```
 
@@ -24,6 +29,68 @@ equality, not metadata or intermediate A→B→A changes. Both supplied conditio
 must match. On conflict, re-read and deliberately merge/recompose the draft;
 never fetch a newer revision just to submit an older-derived body. The client
 does not automatically fetch versions, retry conflicts or force an overwrite.
+
+### Recovering a conflict
+
+Keep `original` and `draft` when `saved.error?.code === "conflict"`, then read
+the complete latest document with `docs.get`. Compare all three versions:
+the original base, your draft, and the latest stored document. A latest read
+does not merge the draft or authorize resending it with a newer token. The
+SDK has no global URI-to-revision cache; each write uses the condition passed
+by its caller.
+
+For a concrete example, suppose your intent was to change `Owner: TBD` to
+`Owner: Mina`. Your original base and retained draft are:
+
+```ts
+const original = (await docs.get("guides/readme.md")).throwOnError().data;
+const originalCommit = original.current_commit;
+if (!originalCommit || typeof original.content !== "string") {
+  throw new Error("The original read needs a complete body and revision token.");
+}
+const oldText = "Owner: TBD";
+const newText = "Owner: Mina";
+if (original.content.split(oldText).length !== 2) {
+  throw new Error("Review the intended owner change before composing a draft.");
+}
+const draft = original.content.replace(oldText, newText);
+const saved = await docs.update("guides/readme.md", {
+  content: draft,
+  expectedCommit: originalCommit,
+});
+```
+
+If that save conflicts, retain those values and fetch the recovery snapshot:
+
+```ts
+const latest = (await docs.get("guides/readme.md")).throwOnError().data;
+if (typeof latest.content !== "string") throw new Error("Read the complete latest body.");
+// Present these three versions for review; do not save again yet.
+console.log({ base: original.content, draft, latest: latest.content });
+```
+
+Suppose review confirms that another writer added a notes section while the
+owner line and its meaning stayed unchanged. As a separate action after that
+review, reapply only the intended owner change to `latest.content`. This keeps
+the notes section. If the owner line or its context changed, resolve that
+overlap manually before composing the replacement body.
+
+```ts
+const reviewedCommit = latest.current_commit;
+if (!reviewedCommit || latest.content.split(oldText).length !== 2) {
+  throw new Error("Review the latest owner line and revision before saving.");
+}
+const composedDraft = latest.content.replace(oldText, newText);
+const resolved = await docs.update("guides/readme.md", {
+  content: composedDraft,
+  expectedCommit: reviewedCommit,
+});
+resolved.throwOnError();
+```
+
+Send only metadata fields you intend to change. If the final save conflicts
+again, keep this composed draft and repeat review against a new latest read;
+do not loop automatically or replace only `expectedCommit`.
 
 AKB HTTP success responses keep the backend envelope:
 

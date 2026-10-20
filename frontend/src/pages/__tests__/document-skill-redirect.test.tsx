@@ -6,7 +6,8 @@ import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 import DocumentPage from "@/pages/document";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
   authenticatedFetch: vi.fn(),
   getDocument: vi.fn(),
   getDocumentHistoryWithFallback: vi.fn(),

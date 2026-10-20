@@ -390,7 +390,10 @@ interface AkbDocumentUpdateFields {
 
 /** Whole-body replacements require a condition from the original read.
  * A hash protects body equality only; use a revision for metadata context.
- * Never fetch a newer token just to submit a body derived from an older read.
+ * On conflict retain the original base and draft, read latest, and reapply
+ * the intended changes while preserving concurrent changes. Save the reviewed
+ * composed draft with that latest read's token; never replace only the token.
+ * The client does not cache revisions or automatically retry conflicts.
  */
 export type AkbDocumentUpdateInput = AkbDocumentUpdateFields & (
   | { content?: null }

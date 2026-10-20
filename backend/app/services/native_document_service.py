@@ -36,6 +36,7 @@ from app.models.document import (
     BrowseContext,
     BrowseItem,
     BrowseResponse,
+    DocumentHeadResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
@@ -748,6 +749,24 @@ class NativeDocumentService(DocumentService):
             action="created",
             chunks_indexed=0,
             entities_found=0,
+        )
+
+    async def get_head(self, vault: str, doc_ref: str) -> DocumentHeadResponse:
+        """Resolve the live ledger Head without opening its payload or history."""
+        vault_id = await self._vault_id(vault)
+        resource = await NativeRevisionRepository(await self._pool()).resolve_live_reference(
+            namespace_id=vault_id,
+            surface="document",
+            reference=to_nfc(doc_ref),
+        )
+        if resource is None:
+            raise NotFoundError("Native Resource", doc_ref)
+        return DocumentHeadResponse(
+            uri=doc_uri(vault, resource["current_path"]),
+            vault=vault,
+            path=resource["current_path"],
+            current_commit=resource["head_revision_id"],
+            updated_at=resource["updated_at"],
         )
 
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
