@@ -143,26 +143,37 @@ def test_post_success_passthrough_200(client, monkeypatch):
 
 @pytest.fixture
 def linked_kwargs(monkeypatch):
-    """Capture what the route hands to the service, and answer like it would."""
+    """Capture what the route hands to the service, and answer like it would:
+    the strength it was given, else the stored one (here: a weak edge)."""
     seen: dict = {}
 
     async def _link(vault, source, target, relation, **kwargs):
         seen.update(kwargs)
         return {
             "linked": True, "source": source, "target": target,
-            "relation": relation, "edge_type": kwargs["edge_type"],
+            "relation": relation, "edge_type": kwargs["edge_type"] or "weak",
         }
 
     monkeypatch.setattr(knowledge, "link_resources", _link)
     return seen
 
 
-def test_post_edge_type_defaults_to_strong(client, linked_kwargs):
+def test_post_without_edge_type_reaches_the_service_as_not_specified(client, linked_kwargs):
+    """The route must not fill in a strength: a missing field means "keep what is
+    stored" (strong for a new edge), which only the service can know."""
     r = client.post("/api/v1/relations",
                     json={"source": DOC_A, "target": DOC_B, "relation": "references"})
     assert r.status_code == 200
-    assert linked_kwargs["edge_type"] == "strong"
-    assert r.json()["edge_type"] == "strong"
+    assert linked_kwargs["edge_type"] is None
+    assert r.json()["edge_type"] == "weak"  # whatever the service says is stored
+
+
+def test_post_null_edge_type_is_the_same_as_leaving_it_out(client, linked_kwargs):
+    r = client.post("/api/v1/relations",
+                    json={"source": DOC_A, "target": DOC_B, "relation": "references",
+                          "edge_type": None})
+    assert r.status_code == 200
+    assert linked_kwargs["edge_type"] is None
 
 
 @pytest.mark.parametrize("edge_type", ["strong", "weak"])
@@ -176,7 +187,7 @@ def test_post_forwards_an_explicit_edge_type(client, linked_kwargs, edge_type):
     assert r.json()["edge_type"] == edge_type
 
 
-@pytest.mark.parametrize("bad", ["medium", "", "STRONG", None, 1, ["weak"]])
+@pytest.mark.parametrize("bad", ["medium", "", "STRONG", 1, ["weak"]])
 def test_post_rejects_an_edge_type_outside_the_vocabulary_422(client, linked_kwargs, bad):
     r = client.post("/api/v1/relations",
                     json={"source": DOC_A, "target": DOC_B, "relation": "references",
@@ -237,6 +248,22 @@ def test_get_relation_serves_edge_type_next_to_kind(client, monkeypatch):
     assert [(row["kind"], row["edge_type"]) for row in rows] == [
         ("explicit", "weak"), ("explicit", "strong"), ("implicit", "weak"),
     ]
+
+
+def test_get_relation_serves_updated_at_when_known_and_leaves_it_out_when_not(client, monkeypatch):
+    async def _relations(*_a, **_kwargs):
+        return [
+            {"direction": "outgoing", "relation": "references", "uri": DOC_B, "resource_type": "doc",
+             "kind": "explicit", "edge_type": "strong", "name": "B", "updated_at": "2026-10-20T13:08:25Z"},
+            {"direction": "incoming", "relation": "references", "uri": DOC_B, "resource_type": "doc",
+             "kind": "explicit", "edge_type": "strong", "name": "gone"},
+        ]
+
+    monkeypatch.setattr(knowledge, "get_resource_relations", _relations)
+    rows = client.get("/api/v1/relations", params={"uri": DOC_A}).json()["relations"]
+
+    assert rows[0]["updated_at"] == "2026-10-20T13:08:25Z"
+    assert "updated_at" not in rows[1]
 
 
 # ── _bridge_service_error unit behaviour (dict guard + unmapped code) ─

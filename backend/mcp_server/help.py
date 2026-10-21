@@ -454,8 +454,9 @@ akb_link(
   relation="attached_to")
 ```
 
-An explicit link is `strong` by default. Pass `edge_type="weak"` for a looser
-connection; linking the same edge again with another `edge_type` updates it.
+A new explicit link is `strong` unless you pass `edge_type="weak"` for a looser
+connection. Linking the same edge again with an `edge_type` sets it; linking it
+again with none leaves its strength as it is.
 Links AKB derives from document metadata or Markdown body content are always
 `weak`.
 
@@ -496,6 +497,7 @@ implicit row.
 ```
 akb_graph(vault="eng")                           # Full vault graph (all types)
 akb_graph(uri="akb://eng/doc/specs/api.md", hops=2)
+akb_graph(uri="akb://eng/doc/specs/api.md", direction="outward")   # Outgoing edges + what was derived from it and what depends on it
 ```
 
 ## Provenance
@@ -1157,7 +1159,13 @@ Every returned row includes `kind`: `explicit` rows are removable with
 `akb_unlink`; `implicit` rows must be removed by editing the document metadata
 or Markdown link that generated them. Each row also includes `edge_type`
 (`strong` or `weak`): implicit rows are always `weak`, and an explicit row is
-`strong` unless it was linked as `weak`. Relations never cross vaults.""",
+`strong` unless it was linked as `weak`. Relations never cross vaults.
+
+Each row names the resource at the other end: `name` is its title when it has
+one (a document without a title is named by its path). A document row also
+carries `title` (only when it has a real one), `doc_type`, `tags` and `path`; a
+table or file row carries `title`. Each row also has `updated_at` (UTC, e.g.
+`2026-10-20T13:08:25Z`): when that resource last changed; absent if unknown.""",
 
     "akb_graph": """# akb_graph — Knowledge Graph (Cross-Type)
 
@@ -1170,17 +1178,48 @@ Shows nodes (documents, tables, files) and edges (all relation types).
 | uri | | Center node AKB URI (use to anchor on a specific resource) |
 | hops | | BFS traversal radius (1-5, default 2) |
 | limit | | Max nodes (1-200, default 50) |
+| edge_type | | `strong` or `weak`, with `uri` only: walk and return just edges of that strength (default: every edge) |
+| direction | | `both` (default) or `outward`, with `uri` only: `outward` follows each node's outgoing edges plus incoming `derived_from` and `depends_on` edges |
 
 Pass either `vault` (full vault graph) or `uri` (graph anchored on one resource).
 
 Each edge carries `kind` (`explicit` | `implicit`) and `edge_type` (`strong` |
 `weak`; implicit edges are always `weak`).
 
+Each node's `name` is its title when it has one (a document without a title is
+named by its path). A document node also carries `title` (only when it has a
+real one), `doc_type`, `tags` and `path`; a table or file node carries `title`.
+Each node also has `updated_at` (UTC, e.g. `2026-10-20T13:08:25Z`): when its
+resource last changed; absent when unknown.
+
+`edge_type` restricts the walk itself: a neighbour reachable only through an
+edge of the other strength is not visited, so `limit` is spent on the
+neighbours you asked for. The vault graph (`vault`, no `uri`) always returns
+every edge; combining it with `edge_type` is refused. A `uri` result reports
+`truncated: true` when `limit` cut the walk short.
+
+`direction` chooses which edges of a reached node the walk follows. `both`
+takes every edge touching it, so a hub (a cluster many documents point at)
+pulls in everything that points at it. `outward` takes its outgoing edges, its
+own context (the cluster, node, service or owner it names), plus two kinds of
+incoming edge: `derived_from` (what was derived from it, such as a postmortem
+derived from an incident) and `depends_on` (what depends on it and so is
+affected by it: from a service, the services that depend on it, then the ones
+that depend on those, a level per hop). Any other incoming edge (`related_to`,
+`references`, `links_to`, ...) is some other resource's context, and the walk
+stops there instead of fanning out through it. A resource many others depend on
+still pulls those dependents in; `limit` and `truncated` apply as usual. It
+combines with `edge_type`, and only the edges the walk followed are returned.
+With `vault` and no `uri`, `outward` is refused.
+
 ## Examples
 ```
 akb_graph(vault="eng")                                            # Full vault graph
 akb_graph(uri="akb://eng/table/experiments", hops=2)              # From a table
 akb_graph(uri="akb://eng/doc/specs/api.md", hops=3)               # 3-hop from doc
+akb_graph(uri="akb://eng/doc/specs/api.md", edge_type="strong")   # Strong links only
+akb_graph(uri="akb://eng/doc/incidents/inc-42.md",
+  edge_type="strong", direction="outward")                        # Its own context + what was derived from it and what depends on it
 ```""",
 
     "akb_provenance": """# akb_provenance — Document Provenance
@@ -1802,7 +1841,7 @@ The vault is inferred from the URIs — no separate `vault` arg.
 | source | ✓ | Source AKB URI |
 | target | ✓ | Target AKB URI |
 | relation | ✓ | depends_on, related_to, implements, references, attached_to, derived_from |
-| edge_type | | strong (default) or weak; body links are always weak |
+| edge_type | | strong or weak; body links are always weak. Omit it to keep an existing link's strength (a new link is strong) |
 
 ## URI Format
 - `akb://{vault}/doc/{path}` — document
@@ -1837,8 +1876,9 @@ akb_link(
   edge_type="weak")
 ```
 
-Linking an edge that already exists updates it, including its `edge_type`; an
-omitted `edge_type` means `strong`.
+Linking an edge that already exists updates it. A given `edge_type` sets its
+strength, up or down; an omitted one leaves the stored strength as it is (a new
+edge is `strong`), so a link that only adds metadata cannot promote a weak edge.
 
 💡 Browse results include `uri` for each item — use those directly.""",
 

@@ -16,7 +16,7 @@ settings.git_storage_path = tempfile.mkdtemp(prefix="akb-rest-openapi-")
 
 from app.api.routes.tables import _raise_service_error
 from app.main import app
-from app.services.kg_service import EDGE_TYPES
+from app.services.kg_service import EDGE_TYPES, GRAPH_DIRECTIONS
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
@@ -434,6 +434,48 @@ def test_graph_rest_openapi_contract_is_codegen_typed():
         assert schemas[name]["properties"]["edge_type"]["enum"] == edge_types, name
         assert "edge_type" in schemas[name]["required"], name
 
+    # A graph node and a relation row name the resource by its title and carry
+    # the parts a client needs to draw it. All optional: they are set only when
+    # the resource resolves in the vault, and a document without a title states
+    # no `title`.
+    label_fields = {"title", "doc_type", "tags", "path", "updated_at"}
+    for name in ("AkbGraphNode", "AkbRelation", "GraphNode", "RelationItem"):
+        assert label_fields.issubset(schemas[name]["properties"]), name
+        assert not label_fields & set(schemas[name].get("required", [])), name
+        tags_schema = schemas[name]["properties"]["tags"]
+        assert any(option.get("type") == "array" for option in tags_schema.get("anyOf") or [tags_schema]), name
+        # The time a resource last changed is a string stamp, never required: a
+        # resource whose store has no time for it states none.
+        stamp_schema = schemas[name]["properties"]["updated_at"]
+        assert any(option.get("type") == "string" for option in stamp_schema.get("anyOf") or [stamp_schema]), name
+    for name in ("AkbGraphNode", "AkbRelation"):
+        assert schemas[name]["properties"]["updated_at"]["format"] == "date-time", name
+
+    # The neighbourhood walk says whether `limit` cut it short, like the overview.
+    assert schemas["AkbGraphNeighborsEnvelope"]["properties"]["truncated"]["type"] == "boolean"
+    assert "truncated" not in schemas["AkbGraphNeighborsEnvelope"]["required"]
+    assert "truncated" in schemas["GraphNeighborsResponse"]["properties"]
+
+    # `edge_type` selects which edges the neighbourhood walk follows, with the
+    # same vocabulary as the edges it returns.
+    graph_params = {param["name"]: param for param in paths["/api/v1/graph"]["get"]["parameters"]}
+    walk_edge_type = graph_params["edge_type"]
+    assert walk_edge_type["required"] is False
+    walk_options = walk_edge_type["schema"].get("anyOf") or [walk_edge_type["schema"]]
+    assert next(option["enum"] for option in walk_options if "enum" in option) == edge_types
+    assert "edge_type" not in {param["name"] for param in paths["/api/v1/graph/overview"]["get"]["parameters"]}
+
+    # `direction` selects which edges of a reached node the walk takes (both, or
+    # outgoing plus incoming `derived_from` and `depends_on`). It is not the relations
+    # route's `direction`, whose vocabulary is incoming / outgoing / both, and it is a
+    # parameter of the neighbourhood walk only.
+    walk_direction = graph_params["direction"]
+    assert walk_direction["required"] is False
+    direction_options = walk_direction["schema"].get("anyOf") or [walk_direction["schema"]]
+    assert next(option["enum"] for option in direction_options if "enum" in option) == list(GRAPH_DIRECTIONS)
+    assert "derived_from" in walk_direction["description"] and "depends_on" in walk_direction["description"]
+    assert "direction" not in {param["name"] for param in paths["/api/v1/graph/overview"]["get"]["parameters"]}
+
     get_relations = paths["/api/v1/relations"]["get"]
     params = {param["name"]: param for param in get_relations["parameters"]}
     assert set(params["direction"]["schema"]["enum"]) == {"incoming", "outgoing", "both"}
@@ -444,9 +486,16 @@ def test_graph_rest_openapi_contract_is_codegen_typed():
     link_schema = schemas["LinkRequest"]
     assert "links_to" not in link_schema["properties"]["relation"]["enum"]
     link_edge_type = link_schema["properties"]["edge_type"]
-    assert link_edge_type["enum"] == edge_types
-    assert link_edge_type["default"] == "strong"
+    link_options = link_edge_type.get("anyOf") or [link_edge_type]
+    assert next(option["enum"] for option in link_options if "enum" in option) == edge_types
+    # `null` reads as "not specified", like leaving the field out.
+    assert any(option.get("type") == "null" for option in link_options)
+    # No advertised default and not required: a field left out keeps an existing
+    # edge's strength (strong for a new one), and a client or generator that
+    # materialised a default into the request would turn that into a promotion.
+    assert link_edge_type.get("default") is None
     assert "edge_type" not in link_schema["required"]
+    assert "keep" in link_edge_type["description"]
 
 
 def test_document_openapi_contract_is_codegen_typed():

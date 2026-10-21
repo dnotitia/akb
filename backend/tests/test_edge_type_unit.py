@@ -8,7 +8,9 @@ Connection strength is its own attribute: not the relation name (``related_to``,
 * an implicit edge is always ``weak`` — computed when served, never stored;
 * an explicit edge keeps the value in ``edges.metadata->>'edge_type'``, and a row
   without the key (every ``akb_link`` edge that predates the attribute) reads as
-  ``strong``.
+  ``strong``;
+* a link that names no ``edge_type`` says nothing about strength: it is strong on
+  a new edge and leaves the stored value alone on an existing one.
 
 This file pins the pieces that need no database: the resolution rule, the write
 parameters ``link_resources`` hands to PostgreSQL, the shape of every edge-listing
@@ -124,7 +126,7 @@ def test_resolve_edge_type(kind, stored, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", ["medium", "", "Strong", "WEAK", None, 1, True, ["weak"], {"weak": 1}])
+@pytest.mark.parametrize("bad", ["medium", "", "Strong", "WEAK", 1, True, ["weak"], {"weak": 1}])
 async def test_link_rejects_an_edge_type_outside_the_vocabulary(monkeypatch, bad):
     _forbid_pool(monkeypatch)
 
@@ -139,43 +141,54 @@ async def test_link_rejects_an_edge_type_outside_the_vocabulary(monkeypatch, bad
 
 
 class _LinkConnection:
-    """Answers just enough of ``link_resources``' SQL to reach the upsert."""
+    """Answers just enough of ``link_resources``' SQL to reach the upsert.
 
-    def __init__(self) -> None:
+    ``stored`` is what the upsert's ``RETURNING`` hands back: the strength now on
+    the edge. Left unset, the edge is new and takes the strength it was given, else
+    strong; set to ``"weak"``, the edge already existed as a weak one.
+    """
+
+    def __init__(self, stored: str | None = None) -> None:
         self.upserts: list[tuple[str, tuple]] = []
+        self.stored = stored
 
     def transaction(self):
         return _Transaction()
 
-    async def fetchrow(self, query: str, *_args):
+    async def fetchrow(self, query: str, *args):
+        if "INSERT INTO edges" in query:
+            self.upserts.append((query, args))
+            return {"stored_edge_type": self.stored or args[11] or "strong"}
         assert "FROM vaults" in query, query
         return {"id": VAULT_ID}
 
     async def fetchval(self, _query: str, *_args):
         return 1  # every endpoint exists
 
-    async def execute(self, query: str, *args):
-        if "INSERT INTO edges" in query:
-            self.upserts.append((query, args))
-        return "INSERT 0 1"
+    async def execute(self, query: str, *_args):
+        assert "pg_advisory_xact_lock" in query, query  # the doc endpoints' path lock
+        return "SELECT 1"
 
 
-async def _link(monkeypatch, **kwargs) -> tuple[dict, dict[str, Any]]:
-    """Link A -> B and return (result, the metadata object written for the edge)."""
-    conn = _LinkConnection()
+async def _link(monkeypatch, *, stored: str | None = None, **kwargs) -> tuple[dict, dict[str, Any], str | None]:
+    """Link A -> B. Returns (result, the caller's metadata object handed to the
+    upsert, the strength handed to it: ``None`` when the call named none)."""
+    conn = _LinkConnection(stored)
     _use_connection(monkeypatch, conn)
 
     result = await kg_service.link_resources(VAULT, A, B, "related_to", **kwargs)
 
     ((_query, args),) = conn.upserts
-    return result, json.loads(args[7])  # $8 is the metadata parameter
+    return result, json.loads(args[7]), args[11]  # $8 is the metadata, $12 the requested strength
 
 
 @pytest.mark.asyncio
-async def test_link_is_strong_by_default_and_says_so(monkeypatch):
-    result, stored = await _link(monkeypatch)
+async def test_a_link_naming_no_strength_asks_for_none_and_says_what_was_stored(monkeypatch):
+    result, metadata, requested = await _link(monkeypatch)
 
-    assert stored == {"edge_type": "strong"}
+    # Nothing is assumed here: "not specified" reaches PostgreSQL as a null, which
+    # keeps an existing edge's strength and makes a new edge strong.
+    assert (metadata, requested) == ({}, None)
     assert result == {
         "linked": True, "source": A, "target": B,
         "relation": "related_to", "edge_type": "strong",
@@ -183,37 +196,49 @@ async def test_link_is_strong_by_default_and_says_so(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("edge_type", EDGE_TYPES)
-async def test_link_stores_the_requested_edge_type(monkeypatch, edge_type):
-    result, stored = await _link(monkeypatch, edge_type=edge_type)
+async def test_a_link_naming_no_strength_reports_the_strength_the_edge_kept(monkeypatch):
+    """The answer is what is stored, not what the call assumed: a bare re-link of a
+    weak edge says `weak`."""
+    result, _metadata, requested = await _link(monkeypatch, stored="weak")
 
-    assert stored == {"edge_type": edge_type}
+    assert requested is None
+    assert result["edge_type"] == "weak"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edge_type", EDGE_TYPES)
+async def test_link_hands_over_the_requested_edge_type(monkeypatch, edge_type):
+    result, metadata, requested = await _link(monkeypatch, edge_type=edge_type)
+
+    assert (metadata, requested) == ({}, edge_type)
     assert result["edge_type"] == edge_type
 
 
 @pytest.mark.asyncio
-async def test_link_keeps_the_callers_metadata_next_to_the_edge_type(monkeypatch):
+async def test_link_keeps_the_callers_metadata_beside_the_edge_type(monkeypatch):
     caller = {"note": "x", "confidence": 0.5}
 
-    _result, stored = await _link(monkeypatch, metadata=caller, edge_type="weak")
+    _result, metadata, requested = await _link(monkeypatch, metadata=caller, edge_type="weak")
 
-    assert stored == {"note": "x", "confidence": 0.5, "edge_type": "weak"}
+    assert (metadata, requested) == ({"note": "x", "confidence": 0.5}, "weak")
     assert caller == {"note": "x", "confidence": 0.5}, "the caller's dict must not be mutated"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("metadata", "edge_type", "expected"),
+    ("metadata", "edge_type"),
     [
-        ({"edge_type": "weak"}, "strong", "strong"),
-        ({"edge_type": "strong"}, "weak", "weak"),
-        ({"edge_type": "medium"}, "strong", "strong"),
+        ({"edge_type": "weak"}, "strong"),
+        ({"edge_type": "strong"}, "weak"),
+        ({"edge_type": "medium"}, "strong"),
+        ({"edge_type": "weak"}, None),  # naming nothing does not hand the key its say either
     ],
 )
-async def test_the_argument_owns_the_reserved_metadata_key(monkeypatch, metadata, edge_type, expected):
-    _result, stored = await _link(monkeypatch, metadata=metadata, edge_type=edge_type)
+async def test_the_argument_owns_the_reserved_metadata_key(monkeypatch, metadata, edge_type):
+    _result, handed, requested = await _link(monkeypatch, metadata=metadata, edge_type=edge_type)
 
-    assert stored == {"edge_type": expected}
+    assert handed == {}
+    assert requested == edge_type
 
 
 @pytest.mark.asyncio
@@ -225,6 +250,17 @@ async def test_link_marks_the_edge_explicit(monkeypatch):
 
     ((query, _args),) = conn.upserts
     assert "'explicit'" in query
+
+
+def test_the_upsert_hands_back_the_stored_strength_and_reads_it_only_from_an_explicit_edge():
+    """A guard on the statement itself, for what the fakes above cannot see: the
+    answer comes from the row, and an implicit row's key (meaningless, since an
+    implicit edge is derived) is never the strength a bare link keeps."""
+    query = kg_service._LINK_UPSERT_SQL
+
+    assert "RETURNING " + kg_service._STORED_EDGE_TYPE_COLUMN in query
+    assert "$12::text" in query
+    assert "edges.kind = 'explicit'" in query
 
 
 # ── Every edge listing serves edge_type ──────────────────────────────────
@@ -419,15 +455,17 @@ def test_the_mcp_argument_gate_accepts_edge_type_on_akb_link_only():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("extra", "expected"),
+    ("extra", "forwarded"),
     [
-        ({}, "strong"),
-        ({"edge_type": None}, "strong"),  # null means "not specified"
+        ({}, None),
+        ({"edge_type": None}, None),  # null means "not specified", the same as leaving it out
         ({"edge_type": "strong"}, "strong"),
         ({"edge_type": "weak"}, "weak"),
     ],
 )
-async def test_akb_link_forwards_edge_type_and_defaults_to_strong(monkeypatch, extra, expected):
+async def test_akb_link_forwards_edge_type_and_names_none_when_it_is_not_given(monkeypatch, extra, forwarded):
+    """The handler fills in no strength: what a link that names none means (keep
+    the stored one, strong for a new edge) is decided where the edge is stored."""
     seen: dict[str, Any] = {}
 
     async def _writer(*_args, **_kwargs):
@@ -436,7 +474,7 @@ async def test_akb_link_forwards_edge_type_and_defaults_to_strong(monkeypatch, e
     async def _link_resources(vault, source, target, relation, **kwargs):
         seen.update(kwargs)
         return {"linked": True, "source": source, "target": target,
-                "relation": relation, "edge_type": kwargs["edge_type"]}
+                "relation": relation, "edge_type": kwargs["edge_type"] or "weak"}
 
     monkeypatch.setattr(server, "check_vault_access", _writer)
     monkeypatch.setattr(server, "link_resources", _link_resources)
@@ -445,13 +483,13 @@ async def test_akb_link_forwards_edge_type_and_defaults_to_strong(monkeypatch, e
         "akb_link", {"source": A, "target": B, "relation": "related_to", **extra}, _mcp_user(),
     )
 
-    assert seen["edge_type"] == expected
-    assert result["edge_type"] == expected
+    assert seen["edge_type"] == forwarded
+    assert result["edge_type"] == (forwarded or "weak")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["medium", "", "Weak", 0, ["weak"]])
-async def test_akb_link_refuses_an_invalid_edge_type_rather_than_defaulting(monkeypatch, bad):
+async def test_akb_link_refuses_an_invalid_edge_type_rather_than_ignoring_it(monkeypatch, bad):
     async def _writer(*_args, **_kwargs):
         return {"vault_id": VAULT_ID, "role": "writer"}
 

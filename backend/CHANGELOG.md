@@ -12,8 +12,8 @@ specifically; the proxy has its own log in
 - How strongly two resources are connected is now its own attribute, separate
   from the relation name (`related_to`, `derived_from`, … say what a link means
   and are too ambiguous to imply strength) and from `kind` (`implicit` = derived
-  from a document's frontmatter or body, `explicit` = made with `akb_link`). An
-  explicit relation is `strong` by default; `akb_link` and `POST /relations`
+  from a document's frontmatter or body, `explicit` = made with `akb_link`). A
+  new explicit relation is `strong` by default; `akb_link` and `POST /relations`
   take an optional `edge_type` of `strong` or `weak`, and any other value is
   rejected with `invalid_argument` (REST: 422). An implicit edge is always
   `weak`; that value is computed when the edge is served and never stored.
@@ -21,20 +21,143 @@ specifically; the proxy has its own log in
   `/graph`, `/graph/overview` and `/provenance` routes return `edge_type` on every
   edge, next to `kind`, and the link result echoes the value it stored. The
   OpenAPI contract and the `@akb/client` types declare it, and the SDK's
-  `graph.link` forwards it.
+  `graph.link` forwards it. The server always sends it; the `@akb/client` types
+  mark it optional on the edges, relation rows and link result they read,
+  because the SDK hands back a response unchanged and a server that predates
+  this change omits it.
 - No migration and no backfill. An explicit edge keeps the value in
   `edges.metadata->>'edge_type'`; a row without the key, which is every
   `akb_link` edge made before this change, reads as `strong`.
-- Linking an edge that already exists updates it in place, `edge_type` included.
-  A re-link that names no `edge_type` states the default again, so it makes the
-  edge `strong`. The stored metadata object is now merged with the one sent,
-  the new keys winning, instead of being replaced; this is what keeps a REST
-  caller's `metadata` when only the strength changes. The reserved `edge_type`
-  key in a request's `metadata` is overridden by the `edge_type` argument.
+- Linking an edge that already exists updates it in place. A re-link that names
+  an `edge_type` sets it, up or down. One that names none (the field left out, or
+  `null`) says nothing about strength and leaves the stored value as it is, so a
+  REST client that predates the field, an older MCP proxy, or a caller that only
+  updates `metadata` cannot promote a weak edge by omission; a new edge that
+  names none is `strong`. The link result reports the strength now stored, not
+  the one asked for. For the same reason the REST `LinkRequest` and the
+  `akb_link` tool schema advertise no default for `edge_type` and describe the
+  omission instead: a client that fills schema defaults into a call would
+  otherwise send `strong` every time. `edge_type` is nullable in the OpenAPI
+  `LinkRequest` and the `@akb/client` type, and a REST `null`, which was a 422
+  before, now means "not specified", as it always did for `akb_link`. Linking
+  over an implicit edge makes a new explicit edge, which is `strong` unless
+  named. The stored metadata object is now merged with the one sent, the new
+  keys winning, instead of being replaced; this is what keeps a REST caller's
+  `metadata` when only the strength changes. The reserved `edge_type` key in a
+  request's `metadata` is ignored in favour of the `edge_type` argument.
 - Rolling back to an earlier backend leaves the stored key unused, and that
   backend replaces an edge's whole metadata object when it re-links the edge.
   A weak edge re-linked there loses its key and reads as strong again once this
   version returns.
+
+### Graph nodes and relation rows are named by their title
+
+- Fix: `/graph` (neighbourhood and vault overview), `/graph/overview`, `akb_graph`,
+  `/relations`, `akb_relations` and `/graph/health` named a document by its
+  collection path and file name even when it had a title. The lookup read only
+  the legacy `documents` catalog. A document written by the native ledger has no
+  row there, so on a `postgres_native` installation every document missed and
+  fell back to its path; bare-Git installations were never affected. The lookup
+  now follows the installation's document authority: on a native installation it
+  reads the title (and type and tags) from the head revision's frontmatter, lets
+  the catalog row a document kept at cutover fill only what its preserved body
+  does not say, and still resolves a pre-cutover document only the catalog holds.
+- A node and a relation row now carry the label, not just a name: `name` is the
+  title when the document has one (else its path, exactly as before), and a
+  document also gets `title` (only when it has a real one), `doc_type` (`note`
+  when none is stated), `tags` and `path`. A table or file keeps its `name` and
+  repeats it as `title`. All of these are optional additions to the OpenAPI
+  contract, the `@akb/client` types and the bundled web app's types; no existing
+  field changes. Orphan nodes in the overview and the hubs in `/graph/health`
+  carry the same fields.
+- One batched statement per resource type serves a whole graph, as before: a
+  200-node neighbourhood is not 200 lookups. On a native installation the
+  document statement reads at most an 8 KiB window of each head body; a
+  document whose frontmatter does not close inside it (a hub that lists hundreds
+  of relations) gets one wider read, capped at 128 KiB and 50 documents per
+  call. A document the wider read does not reach, or whose frontmatter outgrows
+  it, is named by its path (or by the title of the catalog row it kept at
+  cutover) and still carries `path` and the `updated_at` the first read fetched.
+- Not changed: the overview's orphan nodes and `/graph/health`'s orphan sample are
+  still enumerated from the legacy `documents` catalog, so a native installation
+  does not list its unlinked documents there; `/provenance` and `akb_provenance`
+  still look the document up in that catalog.
+- A node and a relation row also carry `updated_at`, when their resource last
+  changed, so a client can offer a "changed in the last 1 / 7 / 30 days" view
+  without asking per node. It is ISO 8601 in UTC to the second
+  (`2026-10-20T13:08:25Z`, truncated, never rounded up), an optional addition to
+  the OpenAPI contract, the `@akb/client` types and the bundled web app's types,
+  and left out (never `null`) when the store has no time for the resource: the
+  far end of a dangling edge, a resource the vault does not hold. It rides in the
+  statements that already name the nodes, so it costs no statement, and the
+  server filters nothing by it. Whose time it is depends on the resource:
+  - a document on a native installation: the moment its head revision was
+    published by a create, edit, restore or move (`native_resources.updated_at`).
+    Every native write sets it together with the head revision's `occurred_at`,
+    and it is the value the native document API reports as `updated_at`. The row a
+    document kept at cutover and any `updated_at` its body states do not date it; a
+    pre-cutover document only the catalog holds is dated by its catalog row;
+  - a document on a legacy installation: `documents.updated_at` (create, update,
+    edit and move);
+  - a table: `vault_tables.updated_at`, set at creation and by every schema change
+    (columns, unique keys, indexes). Writing rows does not move it, so a table whose
+    rows change every day can read as old;
+  - a file: `vault_files.updated_at` (upload confirmation, replaced bytes, size or
+    integrity-metadata updates).
+- The overview's orphan nodes carry it too, from the rows that enumerate them; on a
+  native installation a catalog row that survived cutover is dated by the resource
+  that shares its id, in the same statement. `/graph/health`'s orphan sample is
+  unchanged.
+
+### The graph neighbourhood can follow one strength
+
+- `GET /graph?uri=…` and `akb_graph(uri=…)` take an optional `edge_type` of
+  `strong` or `weak`. The walk then follows, and returns, only edges of that
+  strength, in whichever directions it follows (both, unless `direction` below
+  says otherwise): a neighbour reachable only through an edge of the other
+  strength is not visited, so the `limit` node cap is spent on the neighbours
+  that were asked for rather than on edges that would be filtered away.
+  Omitted, the walk is exactly what it was. Strength is the one `edge_type`
+  already served on every edge (an implicit edge is always weak; an explicit
+  edge is strong unless stored as weak, including every edge made before the
+  attribute existed).
+- The vault overview is not strength-aware and is unchanged. Pairing `edge_type`
+  with a `vault` and no `uri` is refused (`invalid_argument`, REST 400) rather
+  than answered with every edge. An `edge_type` outside `strong` / `weak` is
+  rejected (REST 422).
+- The neighbourhood response now carries `truncated`, true when the `limit`
+  cap cut the walk short (more nodes qualified within `hops` than were
+  returned), like the overview's. Reaching `hops`, or a result that fits `limit`
+  exactly, is not a cut.
+- No migration. The `@akb/client` `graph.neighbors` option is `edgeType`. A
+  server without this change ignores the parameter, and its response has no
+  `truncated`.
+- The same two routes also take an optional `direction`: `both` (the default, and
+  exactly the walk described above) or `outward`. An `outward` walk takes, from
+  each node it reaches, that node's outgoing edges plus what was derived from it
+  and what depends on it: its incoming `derived_from` edges (such as a postmortem
+  derived from an incident) and its incoming `depends_on` edges (the services that
+  depend on a failed service are affected by it, and so, a level per hop, are the
+  ones that depend on those: the blast radius an incident review needs two or
+  three hops out). No other incoming edge is taken. It therefore ends at shared
+  context instead of fanning out through a hub: from an incident it reaches the
+  cluster, node, service and owner it names, the postmortems derived from it and
+  whatever depends on any of them, not every other incident that merely points at
+  the same cluster (`related_to`, `references`, `links_to`, …), which with
+  `edge_type=strong` and `both` filled the 200-node cap. A node many others
+  depend on is still walked through, since those dependents are what the relation
+  is followed for; `limit` and `truncated` apply to them as to any node.
+  `direction` composes with `edge_type`, each narrowing what the other leaves.
+  The edges returned are the ones the walk followed, so an edge between two
+  returned nodes that the walk did not follow is not in the result. `truncated`
+  means what it meant: a node the walk would have taken did not fit.
+- `direction=outward` without `uri` is refused the way `edge_type` is
+  (`invalid_argument`, REST 400), because the vault overview has no direction to
+  restrict; `both` is what the overview does anyway and is accepted there. A value
+  outside `both` / `outward` is rejected (REST 422). The `@akb/client`
+  `graph.neighbors` option is `direction`; a server without this change ignores
+  the parameter and walks both ways. This `direction` is not the one `akb_relations`
+  and `GET /relations` take, whose values are `incoming` / `outgoing` / `both`.
 
 ## 0.17.0 — 2026-10-19
 

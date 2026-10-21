@@ -27,6 +27,8 @@ from app.models.knowledge import (
     RelationUnlinkResponse,
 )
 from app.services.kg_service import (
+    EdgeType,
+    GraphDirection,
     LinkRelationType as RelationType,
     get_resource_relations,
     get_graph,
@@ -219,6 +221,26 @@ async def vault_graph(
         ),
     ),
     limit: int = Query(50, ge=1, le=200),
+    edge_type: EdgeType | None = Query(
+        None,
+        description=(
+            "Neighbourhood walk only (needs `uri`): follow and return only edges of "
+            "this strength, in the directions `direction` allows, so `limit` is spent on "
+            "matching neighbours. Omit for every edge. The vault overview is not "
+            "strength-aware; `edge_type` without `uri` is refused with 400."
+        ),
+    ),
+    direction: GraphDirection | None = Query(
+        None,
+        description=(
+            "Neighbourhood walk only: `both` (default) follows every edge of a reached node; "
+            "`outward` follows its outgoing edges plus what was derived from it (incoming "
+            "`derived_from` edges) and what depends on it (incoming `depends_on` edges), so the "
+            "walk stops at shared context (any other incoming relation, such as `related_to`, "
+            "`references` or `links_to`) instead of fanning out through hubs. Composes with "
+            "`edge_type`. `outward` without `uri` is refused with 400."
+        ),
+    ),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     if uri:
@@ -238,10 +260,10 @@ async def vault_graph(
     access = await check_vault_access(user.user_id, vault_name, required_role="reader")
     result = await get_graph(
         vault_name, resource_uri=uri, hops=hops, limit=limit,
-        vault_id=access["vault_id"],
+        vault_id=access["vault_id"], edge_type=edge_type, direction=direction,
     )
     kind = "graph_neighbors" if uri else "graph_overview"
-    return {**result, "kind": kind}
+    return {**_bridge_service_error(result), "kind": kind}
 
 
 @router.get(

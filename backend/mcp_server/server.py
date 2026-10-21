@@ -45,7 +45,6 @@ from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS
 from app.services.revision_backend import get_revision_backend
 from app.services.search_service import SearchService
 from app.services.kg_service import (
-    DEFAULT_EDGE_TYPE,
     get_graph,
     get_provenance,
     get_resource_relations,
@@ -1139,6 +1138,11 @@ async def _handle_graph(args: dict, uid: str, user: _MCPUser) -> dict:
         hops=args.get("hops", 2),
         limit=args.get("limit", 50),
         vault_id=access["vault_id"],
+        # Omitted or null = every edge. Anything else, an empty string
+        # included, is validated by the service rather than coerced.
+        edge_type=args.get("edge_type"),
+        # Omitted or null = `both`; validated by the service the same way.
+        direction=args.get("direction"),
     )
 
 
@@ -1154,15 +1158,15 @@ async def _handle_link(args: dict, uid: str, user: _MCPUser) -> dict:
         return err("source and target must belong to the same vault", code=INVALID_ARGUMENT)
     vault = src_parsed.vault
     await check_vault_access(uid, vault, required_role="writer")
-    edge_type = args.get("edge_type")
     return await link_resources(
         vault,
         args["source"], args["target"], args["relation"],
         created_by=user.username,
-        # An omitted or null `edge_type` is "not specified" and takes the
-        # default; any other value — including an empty string — is validated
-        # by the service, never coerced to the default here.
-        edge_type=DEFAULT_EDGE_TYPE if edge_type is None else edge_type,
+        # An omitted or null `edge_type` is "not specified" and goes through as
+        # None: the service keeps an existing edge's strength and makes a new
+        # edge strong. Any other value — including an empty string — is
+        # validated there, never coerced to a default here.
+        edge_type=args.get("edge_type"),
     )
 
 

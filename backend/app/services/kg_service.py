@@ -13,10 +13,12 @@ Two auto-extraction sources for documents:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import uuid
+from datetime import UTC, datetime
 from itertools import zip_longest
 from typing import Literal, NamedTuple, cast, get_args
 
@@ -113,6 +115,87 @@ def resolve_edge_type(kind: str | None, stored: str | None) -> EdgeType:
     if stored in EDGE_TYPES:
         return cast(EdgeType, stored)
     return DEFAULT_EDGE_TYPE
+
+
+def edge_strength_sql(edge_type: str | None, *, alias: str = "") -> str:
+    """SQL predicate for the edges whose served ``edge_type`` is ``edge_type``.
+
+    The SQL twin of :func:`resolve_edge_type`, for a query that has to *choose*
+    edges by strength rather than label the ones it fetched — the strength-aware
+    neighbourhood walk. It is the same rule written once more, so a test pins
+    the two together over every kind / stored-value shape:
+
+    * weak   — an implicit edge, or an explicit one that stored ``weak``;
+    * strong — an explicit edge that did not store ``weak`` (no key, a
+      non-object ``metadata``, an unrecognised value: all the cases
+      :func:`resolve_edge_type` serves as the default).
+
+    ``None`` means "no restriction" and yields an empty string; any other value
+    outside the vocabulary raises, because the fragment is interpolated into
+    SQL and must only ever be built from the constants above.
+    """
+    if edge_type is None:
+        return ""
+    if edge_type not in EDGE_TYPES:
+        raise ValueError(f"edge_type must be one of {list(EDGE_TYPES)}, got {edge_type!r}")
+    col = f"{alias}." if alias else ""
+    stored = f"{col}metadata->>'{EDGE_TYPE_METADATA_KEY}'"
+    if edge_type == "weak":
+        return f"({col}kind <> 'explicit' OR {stored} = 'weak')"
+    return f"({col}kind = 'explicit' AND {stored} IS DISTINCT FROM 'weak')"
+
+
+# ── Neighbourhood walk direction — single source of truth ────
+#
+# The BFS behind `GET /graph?uri=…` and `akb_graph(uri=…)` can take the edges of
+# a node it has reached in two ways:
+#
+#   - `both` (the default): every edge touching the node, whichever way it
+#     points. Through a hub — a cluster forty incidents point at — the walk fans
+#     out to everything that points at the hub.
+#   - `outward`: the node's own context, which is its OUTGOING edges (the
+#     cluster, node, service and owner it names), plus two kinds of INCOMING
+#     edge, which say what hangs off the node rather than what it names:
+#     `derived_from` (what was derived from it: a postmortem derived_from the
+#     incident) and `depends_on` (what depends on it, and so is affected by
+#     it: a service that depends_on the failed one, then the services that
+#     depend on that one, a dependency level per hop). Any other incoming
+#     edge (`related_to`, `references`, `links_to`, …) is some other
+#     resource's context, so the walk stops there instead of fanning out
+#     through it. A node many others depend on is therefore still walked
+#     through: those dependents are what the relation is followed for.
+#
+# The vocabulary and the relations `outward` still follows against the arrow
+# are defined here; the REST route, the MCP `akb_graph` schema and the tests
+# derive from them, like `EdgeType` above.
+GraphDirection = Literal["both", "outward"]
+GRAPH_DIRECTIONS: tuple[str, ...] = get_args(GraphDirection)
+DEFAULT_GRAPH_DIRECTION: GraphDirection = "both"
+# A tuple, not a set: the SQL fragment below is built from it, and its text must
+# not depend on hash order. Every member is a relation `akb_link` can write.
+OUTWARD_INCOMING_RELATIONS: tuple[LinkRelationType, ...] = ("derived_from", "depends_on")
+
+
+def incoming_walk_sql(direction: str | None) -> str:
+    """SQL predicate narrowing the walk's *incoming* edge fetch for ``direction``.
+
+    ``both`` (and ``None``, an omitted parameter) adds nothing: the walk takes
+    every incoming edge. ``outward`` keeps the incoming edges whose relation is
+    one of :data:`OUTWARD_INCOMING_RELATIONS` and no others. Only the incoming
+    fetch is ever narrowed — an outgoing edge is followed in every direction
+    mode.
+
+    Like :func:`edge_strength_sql`, the fragment is interpolated into SQL, so
+    it is built only from the constants above (a constant ``IN`` list, so the
+    fetch binds the same arguments in every mode) and any value outside the
+    vocabulary raises.
+    """
+    if direction is None or direction == "both":
+        return ""
+    if direction not in GRAPH_DIRECTIONS:
+        raise ValueError(f"direction must be one of {list(GRAPH_DIRECTIONS)}, got {direction!r}")
+    relations = ", ".join(f"'{relation}'" for relation in OUTWARD_INCOMING_RELATIONS)
+    return f"relation_type IN ({relations})"
 
 
 def validate_new_structured_relation_refs(
@@ -575,6 +658,50 @@ def canonicalize_resource_uri(parsed) -> str | None:
     return None
 
 
+# The write behind `link_resources`: one atomic upsert, so two links of the same
+# edge cannot interleave a read of its strength with a write of it.
+#
+# `$12` is the strength the caller named, or NULL when it named none. NULL is not
+# "strong"; it is "said nothing about it", and what that means depends on the row:
+#
+#   - a new edge is strong;
+#   - an existing explicit edge keeps the strength it holds (a value outside the
+#     vocabulary, a missing key or a non-object `metadata` reads as strong, as
+#     `resolve_edge_type` serves it, and is written out as strong);
+#   - an existing implicit edge has no stored strength to keep: it is derived,
+#     always weak, and whatever its `metadata` says means nothing. Linking over it
+#     makes a new explicit edge, which is strong.
+#
+# A strength that was named always wins, up or down. The reserved key is written
+# last, so neither the caller's `metadata` (`$8`) nor the stored object can
+# override it. `RETURNING` hands back the strength now stored, which is what the
+# link answers with. Every fragment spliced in below is a module constant.
+_EDGE_TYPE_VOCABULARY_SQL = ", ".join(f"'{value}'" for value in EDGE_TYPES)
+_LINK_UPSERT_SQL = f"""
+    INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
+                       source_type, target_type, metadata, created_by, kind,
+                       source_resource_id, target_resource_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7,
+            $8::jsonb || jsonb_build_object(
+                '{EDGE_TYPE_METADATA_KEY}', COALESCE($12::text, '{DEFAULT_EDGE_TYPE}')),
+            $9, 'explicit', $10, $11)
+    ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
+    SET metadata = (CASE WHEN jsonb_typeof(edges.metadata) = 'object'
+                         THEN edges.metadata ELSE '{{}}'::jsonb END)
+                   || $8::jsonb
+                   || jsonb_build_object('{EDGE_TYPE_METADATA_KEY}', COALESCE($12::text,
+                          CASE WHEN edges.kind = 'explicit'
+                                AND edges.metadata->>'{EDGE_TYPE_METADATA_KEY}'
+                                    IN ({_EDGE_TYPE_VOCABULARY_SQL})
+                               THEN edges.metadata->>'{EDGE_TYPE_METADATA_KEY}'
+                               ELSE '{DEFAULT_EDGE_TYPE}' END)),
+        created_by = $9, kind = 'explicit',
+        source_resource_id = EXCLUDED.source_resource_id,
+        target_resource_id = EXCLUDED.target_resource_id
+    RETURNING {_STORED_EDGE_TYPE_COLUMN}
+"""
+
+
 async def link_resources(
     vault_name: str,
     source_uri: str,
@@ -582,7 +709,7 @@ async def link_resources(
     relation_type: str,
     created_by: str | None = None,
     metadata: dict | None = None,
-    edge_type: str = DEFAULT_EDGE_TYPE,
+    edge_type: str | None = None,
 ) -> dict:
     """Create an explicit edge between any two resources.
 
@@ -592,14 +719,18 @@ async def link_resources(
     invariant at the DB layer; this surface-level reject gives the
     caller a clear error instead of a Postgres failure.
 
-    ``edge_type`` ("strong" by default, or "weak") is the connection's
-    strength. It is stored in ``edges.metadata`` under the reserved
-    ``edge_type`` key, merged with the caller's ``metadata`` so neither
-    replaces the other; a same-named key inside ``metadata`` is overridden by
-    this argument. Linking an edge that already exists is an update, and it
-    states the strength again — a bare re-link restores the default.
+    ``edge_type`` ("strong" or "weak") is the connection's strength. It is
+    stored in ``edges.metadata`` under the reserved ``edge_type`` key, merged
+    with the caller's ``metadata`` so neither replaces the other; a same-named
+    key inside ``metadata`` is ignored in favour of this argument.
+
+    ``None`` (the default) names no strength. A new edge is then strong, and
+    linking an edge that already exists leaves its strength as it is: a caller
+    that predates the attribute, or one that only updates ``metadata``, cannot
+    promote a weak edge by leaving the field out. A value that is given sets the
+    strength, up or down. The result's ``edge_type`` is the strength now stored.
     """
-    if edge_type not in EDGE_TYPES:
+    if edge_type is not None and edge_type not in EDGE_TYPES:
         return err(
             f"edge_type must be one of {list(EDGE_TYPES)}, got {edge_type!r}",
             code=INVALID_ARGUMENT,
@@ -703,38 +834,33 @@ async def link_resources(
             elif not await _resource_exists(conn, vault_id, target_type, target_id):
                 return err(f"Target resource not found: {target_uri}", code=NOT_FOUND)
 
-            # The strength is stored in `metadata` beside whatever the caller
-            # supplied. On a re-link the stored object and this call's object
-            # are merged key by key, this call winning a collision: changing
-            # `edge_type` keeps the caller's other keys, and the caller's keys
-            # cannot drop the strength.
-            edge_metadata = {**(metadata or {}), EDGE_TYPE_METADATA_KEY: edge_type}
-            await conn.execute(
-                """
-                INSERT INTO edges (id, vault_id, source_uri, target_uri, relation_type,
-                                   source_type, target_type, metadata, created_by, kind,
-                                   source_resource_id, target_resource_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'explicit', $10, $11)
-                ON CONFLICT (source_uri, target_uri, relation_type) DO UPDATE
-                SET metadata = CASE WHEN jsonb_typeof(edges.metadata) = 'object'
-                                    THEN edges.metadata ELSE '{}'::jsonb END
-                               || EXCLUDED.metadata,
-                    created_by = $9, kind = 'explicit',
-                    source_resource_id = EXCLUDED.source_resource_id,
-                    target_resource_id = EXCLUDED.target_resource_id
-                """,
+            # The strength travels beside the caller's `metadata`, not inside
+            # it: the statement merges the stored object with this call's keys
+            # (this call winning a collision), so changing `edge_type` keeps the
+            # caller's other keys and the caller's keys cannot drop or set the
+            # strength. The reserved key is dropped from what the caller sent;
+            # the statement would override it anyway.
+            caller_metadata = {
+                key: value for key, value in (metadata or {}).items()
+                if key != EDGE_TYPE_METADATA_KEY
+            }
+            written = await conn.fetchrow(
+                _LINK_UPSERT_SQL,
                 uuid.uuid4(), vault_id, source_uri, target_uri, relation_type,
-                source_type, target_type, json.dumps(edge_metadata), created_by,
-                source_resource_id, target_resource_id,
+                source_type, target_type, json.dumps(caller_metadata), created_by,
+                source_resource_id, target_resource_id, edge_type,
             )
 
-    logger.info("Linked %s → %s (%s, %s)", source_uri, target_uri, relation_type, edge_type)
+    # What the edge holds now, which is the strength asked for or, when none was
+    # asked for, the one it already had (strong for a new edge).
+    stored_edge_type = resolve_edge_type("explicit", written["stored_edge_type"])
+    logger.info("Linked %s → %s (%s, %s)", source_uri, target_uri, relation_type, stored_edge_type)
     return {
         "linked": True,
         "source": source_uri,
         "target": target_uri,
         "relation": relation_type,
-        "edge_type": edge_type,
+        "edge_type": stored_edge_type,
     }
 
 
@@ -847,6 +973,13 @@ async def get_resource_relations(
 
     Every row carries ``kind`` (provenance: implicit | explicit) and
     ``edge_type`` (strength: strong | weak — see :func:`resolve_edge_type`).
+
+    A row also names the resource at its other end: ``name`` is its title when
+    it has one, and a document additionally carries ``title`` / ``doc_type`` /
+    ``tags`` / ``path`` (see :func:`_batch_resolve_labels`, one batch for the
+    whole result — never a lookup per row). Any resolved resource also carries
+    ``updated_at``, when it last changed (UTC); a row whose resource has no time
+    to give states none.
     """
     if not uri_is_in_vault(resource_uri, vault):
         return []
@@ -928,13 +1061,11 @@ async def get_resource_relations(
                 })
                 uris_to_resolve.append((r["source_uri"], r["source_type"]))
 
-        names = await _batch_resolve_names(
+        labels = await _batch_resolve_labels(
             conn, uris_to_resolve, vault_id=vault_id, vault_name=vault,
         )
         for entry in results:
-            name = names.get(entry["uri"])
-            if name:
-                entry["name"] = name
+            entry.update(labels.get(entry["uri"], {}))
 
     return results
 
@@ -946,17 +1077,44 @@ async def get_graph(
     limit: int = 50,
     *,
     vault_id: uuid.UUID | None = None,
+    edge_type: str | None = None,
+    direction: str | None = None,
 ) -> dict:
     """Get a subgraph centered on a resource, or the full vault graph.
 
     Returns { nodes: [...], edges: [...] } suitable for visualization.
     Nodes include all resource types (doc, table, file). Every edge carries
-    ``kind`` (implicit | explicit) and ``edge_type`` (strong | weak).
+    ``kind`` (implicit | explicit) and ``edge_type`` (strong | weak). Every
+    node is named by its title when it has one (``name``); a document also
+    carries ``title`` / ``doc_type`` / ``tags`` / ``path`` — see
+    :func:`_batch_resolve_labels`. A node also carries ``updated_at``, when its
+    resource last changed (UTC), and states none when that is unknown.
 
     ``hops`` is the BFS traversal radius in edge hops — distinct from
     ``akb_browse.depth`` which counts collection-tree levels. 0.3.0
     renamed the parameter to make the difference visible at every
     call site.
+
+    ``edge_type`` ("strong" or "weak"; ``None`` = every edge, the default)
+    restricts the walk to edges of that strength, in whichever directions
+    ``direction`` follows. The restriction is part of the *traversal*, not a
+    filter on its result: a neighbour reachable only through an excluded edge
+    is never visited, so the ``limit`` node cap is spent on the neighbours the
+    caller asked for. It belongs to the neighbourhood walk, so it needs
+    ``resource_uri``; the whole-vault overview is not strength-aware and a
+    request that pairs it with ``edge_type`` is refused instead of silently
+    returning every edge. A neighbourhood result also says whether ``limit``
+    cut it short (``truncated``).
+
+    ``direction`` ("both", the default and what ``None`` means, or "outward")
+    chooses which edges of a reached node the walk follows. ``both`` takes
+    every edge touching it; ``outward`` takes its outgoing edges plus what was
+    derived from it and what depends on it (its incoming ``derived_from`` and
+    ``depends_on`` edges), so the walk ends at shared context instead of
+    fanning out through a hub. It composes with ``edge_type`` (each narrows
+    what the other leaves) and, like it, belongs to the neighbourhood walk:
+    ``outward`` without ``resource_uri`` is refused. ``both`` is what the
+    overview already does, so it is accepted there as the no-op it is.
 
     `vault_id` scopes the graph to one vault: both the BFS edge fetch
     and the name resolution refuse to look outside it. Caller must
@@ -972,10 +1130,39 @@ async def get_graph(
     the overview's node ``top_k`` (a node cap is a cleaner visualization
     safety net than an edge cap).
     """
+    if edge_type is not None:
+        # Checked before anything else, so a bad value never reaches SQL and a
+        # request the overview cannot honour is refused rather than ignored.
+        if edge_type not in EDGE_TYPES:
+            return err(
+                f"edge_type must be one of {list(EDGE_TYPES)}, got {edge_type!r}",
+                code=INVALID_ARGUMENT,
+            )
+        if not resource_uri:
+            return err(
+                "edge_type restricts the neighbourhood walk, so it needs `uri`; "
+                "the vault overview always returns every edge",
+                code=INVALID_ARGUMENT,
+                hint="Pass `uri` for a strength-aware subgraph, or drop `edge_type` for the vault overview.",
+            )
+    if direction is not None:
+        # Same order as `edge_type`: the value is checked before the pairing.
+        if direction not in GRAPH_DIRECTIONS:
+            return err(
+                f"direction must be one of {list(GRAPH_DIRECTIONS)}, got {direction!r}",
+                code=INVALID_ARGUMENT,
+            )
+        if direction != DEFAULT_GRAPH_DIRECTION and not resource_uri:
+            return err(
+                f"direction={direction} restricts the neighbourhood walk, so it needs `uri`; "
+                "the vault overview always returns every edge",
+                code=INVALID_ARGUMENT,
+                hint="Pass `uri` for a directional subgraph, or drop `direction` for the vault overview.",
+            )
     if not resource_uri:
         return await get_overview(vault, vault_id=vault_id, top_k=limit)
     if not uri_is_in_vault(resource_uri, vault):
-        return {"nodes": [], "edges": []}
+        return {"nodes": [], "edges": [], "truncated": False}
 
     pool = await get_pool()
     nodes: dict[str, dict] = {}
@@ -985,15 +1172,40 @@ async def get_graph(
         if vault_id is None:
             vault_row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault)
             if not vault_row:
-                return {"nodes": [], "edges": []}
+                return {"nodes": [], "edges": [], "truncated": False}
             vault_id = vault_row["id"]
 
-        await _bfs_collect(conn, vault_id, vault, resource_uri, hops, limit, nodes, edge_list)
+        truncated = await _bfs_collect(
+            conn, vault_id, vault, resource_uri, hops, limit, nodes, edge_list,
+            edge_type=edge_type, direction=direction,
+        )
 
     return {
         "nodes": list(nodes.values()),
         "edges": edge_list,
+        "truncated": truncated,
     }
+
+
+# The overview's orphan documents are enumerated from the `documents` catalog on
+# either authority (see the CHANGELOG), so their time is the catalog row's — except
+# on a native installation, where a row that survived cutover is no longer written
+# by document edits: the resource that shares its id holds the newer, true time.
+# Nothing native is read on a legacy installation.
+_ORPHAN_DOCS_LEGACY_SQL = (
+    "SELECT path, title, doc_type, tags, updated_at FROM documents "
+    "WHERE vault_id = $1 AND status != 'archived' AND path != ALL($2::text[]) "
+    "ORDER BY created_at DESC LIMIT $3"
+)
+_ORPHAN_DOCS_NATIVE_SQL = (
+    "SELECT d.path, d.title, d.doc_type, d.tags, "
+    "COALESCE(r.updated_at, d.updated_at) AS updated_at "
+    "FROM documents d LEFT JOIN native_resources r "
+    "ON r.resource_id = d.id AND r.namespace_id = d.vault_id "
+    "AND r.surface = 'document' AND r.lifecycle = 'live' "
+    "WHERE d.vault_id = $1 AND d.status != 'archived' AND d.path != ALL($2::text[]) "
+    "ORDER BY d.created_at DESC LIMIT $3"
+)
 
 
 async def _fetch_orphan_nodes(
@@ -1021,21 +1233,21 @@ async def _fetch_orphan_nodes(
     orphan docs never starves orphan tables/files (the motivating case).
     """
     per = max(0, limit)
+    from app.services.document_counters import native_documents_are_authoritative
+
     doc_rows = await conn.fetch(
-        "SELECT path, title FROM documents "
-        "WHERE vault_id = $1 AND status != 'archived' AND path != ALL($2::text[]) "
-        "ORDER BY created_at DESC LIMIT $3",
+        _ORPHAN_DOCS_NATIVE_SQL if native_documents_are_authoritative() else _ORPHAN_DOCS_LEGACY_SQL,
         vault_id, list(doc_paths), per,
     )
     tbl_rows = await conn.fetch(
-        "SELECT t.name, t.description, c.path AS coll "
+        "SELECT t.name, t.description, t.updated_at, c.path AS coll "
         "FROM vault_tables t LEFT JOIN collections c ON t.collection_id = c.id "
         "WHERE t.vault_id = $1 AND t.name != ALL($2::text[]) "
         "ORDER BY t.created_at DESC LIMIT $3",
         vault_id, list(table_names), per,
     )
     file_rows = await conn.fetch(
-        "SELECT f.id::text AS id, f.name, c.path AS coll "
+        "SELECT f.id::text AS id, f.name, f.updated_at, c.path AS coll "
         "FROM vault_files f LEFT JOIN collections c ON f.collection_id = c.id "
         "WHERE f.vault_id = $1 AND " + confirmed_file_predicate("f") + " "
         "AND f.id::text != ALL($2::text[]) "
@@ -1043,12 +1255,18 @@ async def _fetch_orphan_nodes(
         vault_id, list(file_ids), per,
     )
 
-    docs = [{"uri": doc_uri(vault, r["path"]), "resource_type": "doc",
-             "name": r["title"] or doc_uri(vault, r["path"]), "degree": 0} for r in doc_rows]
-    tables = [{"uri": table_uri(vault, r["name"], r["coll"]), "resource_type": "table",
-               "name": r["description"] or r["name"], "degree": 0} for r in tbl_rows]
-    files = [{"uri": file_uri(vault, r["id"], r["coll"]), "resource_type": "file",
-              "name": r["name"] or file_uri(vault, r["id"], r["coll"]), "degree": 0} for r in file_rows]
+    # Labelled exactly like a connected node (`_batch_resolve_labels`), from the
+    # rows already in hand — an orphan costs no extra query.
+    docs = [{"uri": doc_uri(vault, r["path"]), "resource_type": "doc", "degree": 0,
+             **_doc_label(
+                 r["path"], title=r["title"], doc_type=r["doc_type"], tags=r["tags"],
+                 updated_at=r.get("updated_at"),
+             )}
+            for r in doc_rows]
+    tables = [{"uri": table_uri(vault, r["name"], r["coll"]), "resource_type": "table", "degree": 0,
+               **_table_label(r["name"], r["description"], r.get("updated_at"))} for r in tbl_rows]
+    files = [{"uri": file_uri(vault, r["id"], r["coll"]), "resource_type": "file", "degree": 0,
+              **_file_label(r["id"], r["name"], r.get("updated_at"))} for r in file_rows]
 
     # Round-robin interleave, then cap at `limit` so each type is represented.
     merged = [n for trio in zip_longest(docs, tables, files) for n in trio if n is not None]
@@ -1196,12 +1414,12 @@ async def get_overview(
                     "edge_type": resolve_edge_type(r["kind"], r["stored_edge_type"]),
                 })
 
-        names = await _batch_resolve_names(
+        labels = await _batch_resolve_labels(
             conn, [(u, n["resource_type"]) for u, n in nodes.items()],
             vault_id=vault_id, vault_name=vault,
         )
         for uri, node in nodes.items():
-            node["name"] = names.get(uri) or uri
+            node.update(labels.get(uri, {}))
 
         connected_count = len(nodes)
 
@@ -1354,16 +1572,17 @@ async def get_health(
 
         hubs: list[dict] = []
         if hub_rows:
-            hub_names = await _batch_resolve_names(
+            hub_labels = await _batch_resolve_labels(
                 conn, [(r["uri"], r["rtype"]) for r in hub_rows],
                 vault_id=vault_id, vault_name=vault,
             )
             hubs = [
                 {
                     "uri": r["uri"],
-                    "name": hub_names.get(r["uri"]) or r["uri"],
+                    "name": r["uri"],
                     "resource_type": r["rtype"],
                     "degree": r["degree"],
+                    **hub_labels.get(r["uri"], {}),
                 }
                 for r in hub_rows
             ]
@@ -1414,15 +1633,303 @@ async def get_provenance(doc_id: str, *, vault_id: uuid.UUID) -> dict:
         }
 
 
-# ── Batch name resolution ────────────────────────────────────
+# ── Batch label resolution ───────────────────────────────────
+#
+# A graph node and a relation row both name the resource at an endpoint. The
+# label is looked up once per call, in a batch of at most one query per
+# resource type — never one per node — and carries more than a name:
+#
+#   document   name   its title when it has one, else its vault path (the
+#                     value every caller already got for an unresolved one)
+#              title  the real title; absent when the document has none
+#              doc_type, tags, path
+#   table/file name   unchanged: a table's description (else its name), a
+#                     file's name. ``title`` repeats it, so a consumer can read
+#                     ``title`` on any resolved resource.
+#
+# Every resolved resource may also carry ``updated_at``: when it last changed,
+# as UTC to the second (``YYYY-MM-DDTHH:MM:SSZ``). It comes out of the same
+# batched statement as the rest of the label, from the store that owns the
+# resource, and is left out when that store has no time for it:
+#
+#   document, native authority   `native_resources.updated_at`, the moment the head
+#                     revision was published by a create, replace, restore or
+#                     move. Every writer sets it together with the head revision's
+#                     `occurred_at` (`NativeRevisionRepository.set_head`), so the
+#                     two are one value, and it is what the native document API
+#                     serves as the document's `updated_at`. A document only the
+#                     catalog holds (never copied into the ledger) is dated by its
+#                     catalog row instead.
+#   document, legacy authority   `documents.updated_at`: set by create, update,
+#                     edit and move, and by the metadata worker's backfill.
+#   table             `vault_tables.updated_at`: set at creation and by every
+#                     schema change (columns, unique keys, indexes). Writing rows
+#                     does not touch it; the registry keeps no row-level time.
+#   file              `vault_files.updated_at`: set when the upload is confirmed
+#                     and by every later replacement of the stored bytes and
+#                     every size or integrity-metadata update.
+#
+# A resource the vault does not hold gets its identifier as ``name`` (and, for a
+# document, as ``path``) and nothing the catalog would have told: the label never
+# invents a fact, a time included. A URI from another vault gets no label at all.
+#
+# WHERE a document's title lives depends on the installation's document
+# authority (`document_counters.native_documents_are_authoritative`):
+#
+#   * legacy — the `documents` catalog row (`title`, `doc_type`, `tags`);
+#   * native — the head revision's frontmatter. The native ledger deliberately
+#     keeps no mutable title projection ("title lives in immutable revision
+#     frontmatter": `NativeDocumentService._find_native_title_conflict`), and a
+#     document written by it gets no `documents` row (`_resolve_document_endpoint`
+#     below: the native arm "writes `native_resources` and never touches" the
+#     catalog). A lookup that only asks the catalog therefore misses every such
+#     document and falls back to its path — which is what the graph, `akb_graph`
+#     and `akb_relations` showed for a native vault.
+#     A document migrated at cutover can still lean on its retained catalog row
+#     for the fields its preserved frontmatter lacks, exactly as
+#     `NativeDocumentService._document_frontmatter` fills them.
 
-async def _batch_resolve_names(
+# Second read window for a document whose frontmatter does not close inside the
+# first one (a hub that lists hundreds of relations). Bounded in size and in
+# rows: a label is decoration, and a reader must not be able to turn it into an
+# unbounded read by writing wide frontmatter. A document past either bound is
+# labelled from the first statement alone (its path or retained catalog title,
+# and its time), never left without a label.
+_LABEL_RETRY_WINDOW_BYTES = 128 * 1024
+_LABEL_RETRY_MAX_ROWS = 50
+
+# One batch for every requested path, native head and retained catalog row
+# together. Both catalog joins are index lookups (primary key / the
+# `(vault_id, path)` unique key); the second only applies when no native
+# resource holds the path, so a document the native ledger owns is never labelled
+# from a stale catalog row that happens to share its path.
+#
+# `updated_at` follows the same rule: the native resource's own time when the
+# ledger holds the path, and the catalog row's (`dp`, which joins only when no
+# resource does) when it does not. The retained row `dn` never dates a native
+# document: it is frozen at cutover, and the resource row is not.
+_NATIVE_DOC_LABELS_SQL = """
+    SELECT req.path AS path,
+           r.resource_id AS resource_id,
+           COALESCE(r.updated_at, dp.updated_at) AS updated_at,
+           p.byte_size AS body_size,
+           substring(p.canonical_bytes FROM 1 FOR $3::int) AS body_slice,
+           COALESCE(dn.id, dp.id) AS legacy_id,
+           COALESCE(dn.title, dp.title) AS legacy_title,
+           COALESCE(dn.doc_type, dp.doc_type) AS legacy_doc_type,
+           COALESCE(dn.tags, dp.tags) AS legacy_tags
+      FROM unnest($2::text[]) AS req(path)
+      LEFT JOIN native_resources r
+        ON r.namespace_id = $1
+       AND r.surface = 'document'
+       AND r.lifecycle = 'live'
+       AND r.current_path = req.path
+      LEFT JOIN native_revisions nr
+        ON nr.resource_id = r.resource_id
+       AND nr.revision_id = r.head_revision_id
+      LEFT JOIN native_payload_manifests pm
+        ON pm.payload_manifest_id = nr.payload_manifest_id
+      LEFT JOIN m1_reference_payloads p
+        ON p.payload_id = pm.private_locator
+      LEFT JOIN documents dn
+        ON dn.vault_id = $1
+       AND dn.id = r.resource_id
+      LEFT JOIN documents dp
+        ON dp.vault_id = $1
+       AND r.resource_id IS NULL
+       AND dp.path = req.path
+"""
+
+
+def _non_blank(value: object) -> str | None:
+    """``value`` as text when it says something; None for null, blank or a container."""
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value)
+    return text if text.strip() else None
+
+
+def _tag_list(value: object) -> list[str]:
+    """Tags as a list of non-blank strings (a lone string is one tag)."""
+    if isinstance(value, str):
+        items: list | tuple = [value]
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return []
+    return [tag for tag in map(_non_blank, items) if tag is not None]
+
+
+# What asyncpg decodes a timestamptz of `infinity` / `-infinity` as. Neither names
+# a moment, so neither dates anything.
+_PG_INFINITIES = (datetime.max, datetime.min)
+
+
+def _utc_stamp(value: object) -> str | None:
+    """A catalog time as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC, to the second).
+
+    None when there is no usable time, so the label states none: absent means
+    unknown, never "long ago". Truncated rather than rounded, so a stamp is never
+    later than the change it dates. A naive value is read as UTC (a TIMESTAMPTZ
+    column never yields one; this only keeps a stray value from being read as
+    local time).
+    """
+    if not isinstance(value, datetime) or value.replace(tzinfo=None) in _PG_INFINITIES:
+        return None
+    try:
+        moment = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return moment.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except (OverflowError, ValueError):
+        # An offset can push a value near either end of the range out of it.
+        return None
+
+
+def _doc_label(
+    path: str, *, title: object, doc_type: object, tags: object, updated_at: object = None,
+) -> dict:
+    """The label of a document the vault holds."""
+    real_title = _non_blank(title)
+    label: dict = {"name": real_title or path}
+    if real_title is not None:
+        label["title"] = real_title
+    label["doc_type"] = _non_blank(doc_type) or "note"
+    label["tags"] = _tag_list(tags)
+    label["path"] = path
+    _stamp_label(label, updated_at)
+    return label
+
+
+def _table_label(name: str, description: str | None, updated_at: object = None) -> dict:
+    shown = description or name
+    label = {"name": shown, "title": shown}
+    _stamp_label(label, updated_at)
+    return label
+
+
+def _file_label(file_id: str, name: str | None, updated_at: object = None) -> dict:
+    shown = name or file_id
+    label = {"name": shown, "title": shown}
+    _stamp_label(label, updated_at)
+    return label
+
+
+def _stamp_label(label: dict, updated_at: object) -> None:
+    """Add ``updated_at`` to a label when the catalog row had a time to give."""
+    stamp = _utc_stamp(updated_at)
+    if stamp is not None:
+        label["updated_at"] = stamp
+
+
+def _label_native_row(row, metadata: dict | None) -> dict:
+    """One document's label from the joined native / catalog row.
+
+    ``metadata`` is the parsed frontmatter of the head revision, or None when it
+    could not be read. A native resource's own frontmatter wins; the retained
+    catalog row fills only a field the frontmatter does not state, mirroring
+    `native_document_service._fill_from_legacy`. With no native resource the
+    catalog row is the whole answer, and with neither the document is unknown.
+    """
+    path = row["path"]
+    has_catalog_row = row["legacy_id"] is not None
+    # The time is the row's own, never the frontmatter's: a body kept byte for
+    # byte from Git states whatever it stated, and a revision's body is not the
+    # moment it was published.
+    updated_at = row.get("updated_at")
+    if row["resource_id"] is None:
+        if not has_catalog_row:
+            return {"name": path, "path": path}
+        return _doc_label(
+            path,
+            title=row["legacy_title"],
+            doc_type=row["legacy_doc_type"],
+            tags=row["legacy_tags"],
+            updated_at=updated_at,
+        )
+    fm = metadata or {}
+
+    def stated(key: str, catalog_column: str) -> object:
+        value = fm.get(key)
+        if value is None and has_catalog_row:
+            return row[catalog_column]
+        return value
+
+    return _doc_label(
+        path,
+        title=stated("title", "legacy_title"),
+        doc_type=stated("type", "legacy_doc_type"),
+        tags=stated("tags", "legacy_tags"),
+        updated_at=updated_at,
+    )
+
+
+def _label_native_rows(rows, *, final: bool) -> tuple[dict[str, dict], list[str]]:
+    """Parse every row's frontmatter window and label its document.
+
+    CPU-bound (YAML), so it runs on a worker thread as one hop for the whole
+    batch. Returns ``(labels by path, paths whose frontmatter outgrew the
+    window)``; the second list is only filled when a later window exists.
+
+    Every row gets a label, a retry candidate included. Such a document is
+    labelled from what the row itself holds (its path, the time of the resource,
+    and the retained catalog row if it kept one) and queued for a wider read that
+    may replace the label. The wider read is capped in rows, so a candidate past
+    the cap is never read again and keeps this label: leaving it out would drop
+    the time the statement already fetched.
+    """
+    from app.services.search_service import _filtered_native_metadata
+
+    labels: dict[str, dict] = {}
+    retry: list[str] = []
+    for row in rows:
+        metadata: dict | None = None
+        if row["resource_id"] is not None and row["body_slice"] is not None:
+            metadata = _filtered_native_metadata(row)
+            # None means the envelope opens but does not close inside the
+            # window. Worth a wider read only when the body goes on past it.
+            if metadata is None and not final and (row["body_size"] or 0) > len(row["body_slice"]):
+                retry.append(row["path"])
+        labels[row["path"]] = _label_native_row(row, metadata)
+    return labels, retry
+
+
+async def _native_doc_labels(conn, vault_id: uuid.UUID, paths: list[str]) -> dict[str, dict]:
+    """Labels for documents on an installation whose document authority is native.
+
+    One query for the whole batch; a second, bounded one only for the rare
+    document whose frontmatter does not fit the first read window. The second
+    read replaces a label and never creates one: a document it does not reach
+    keeps the label the first read gave it (`_label_native_rows`).
+    """
+    from app.services.search_service import NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES
+
+    # The candidate-filter window, +1 so a closing delimiter that ends exactly on
+    # its boundary is still seen — one definition of "the leading envelope".
+    windows = (NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1, _LABEL_RETRY_WINDOW_BYTES)
+    labels: dict[str, dict] = {}
+    pending = list(paths)
+    for stage, window in enumerate(windows):
+        if not pending:
+            break
+        rows = await conn.fetch(_NATIVE_DOC_LABELS_SQL, vault_id, pending, window)
+        found, pending = await asyncio.to_thread(
+            _label_native_rows, rows, final=stage == len(windows) - 1,
+        )
+        labels.update(found)
+        pending = pending[:_LABEL_RETRY_MAX_ROWS]
+    return labels
+
+
+async def _batch_resolve_labels(
     conn, uris: list[tuple[str, str]],
     *,
     vault_id: uuid.UUID,
     vault_name: str,
-) -> dict[str, str]:
-    """Resolve multiple URIs to display names in batch (3 queries max, not N).
+) -> dict[str, dict]:
+    """Resolve multiple URIs to display labels in batch (3 queries max, not N).
+
+    Returns ``{uri: label}``; see the block comment above for what a label
+    holds and where each field comes from. Every label has a non-empty
+    ``name``, so a caller can ``node.update(label)`` without a fallback.
 
     Scoped to both ``vault_id`` and ``vault_name``. A URI from another vault is
     ignored rather than receiving an identifier fallback; callers must not be
@@ -1431,13 +1938,10 @@ async def _batch_resolve_names(
     if not uris:
         return {}
 
-    doc_uris: dict[str, str] = {}
-    table_uris: dict[str, str] = {}
-    file_uris: dict[str, str] = {}
-
-    doc_paths: list[str] = []
-    table_names: list[str] = []
-    file_ids: list[str] = []
+    # identifier -> every URI spelling that names it
+    doc_uris: dict[str, list[str]] = {}
+    table_uris: dict[str, list[str]] = {}
+    file_uris: dict[str, list[str]] = {}
 
     for uri, rtype in uris:
         parsed = parse_uri(uri)
@@ -1447,63 +1951,65 @@ async def _batch_resolve_names(
         if identifier is None:
             continue
         if rtype == "doc":
-            doc_paths.append(identifier)
-            doc_uris[identifier] = uri
+            doc_uris.setdefault(identifier, []).append(uri)
         elif rtype == "table":
-            table_names.append(identifier)
-            table_uris[identifier] = uri
+            table_uris.setdefault(identifier, []).append(uri)
         elif rtype == "file":
-            file_ids.append(identifier)
-            file_uris[identifier] = uri
+            file_uris.setdefault(identifier, []).append(uri)
 
-    names: dict[str, str] = {}
+    labels: dict[str, dict] = {}
 
-    if doc_paths:
+    if doc_uris:
+        from app.services.document_counters import native_documents_are_authoritative
+
+        found: dict[str, dict]
+        if native_documents_are_authoritative():
+            found = await _native_doc_labels(conn, vault_id, list(doc_uris))
+        else:
+            rows = await conn.fetch(
+                "SELECT path, title, doc_type, tags, updated_at FROM documents "
+                "WHERE path = ANY($1::text[]) AND vault_id = $2",
+                list(doc_uris), vault_id,
+            )
+            found = {
+                r["path"]: _doc_label(
+                    r["path"], title=r["title"], doc_type=r.get("doc_type"), tags=r.get("tags"),
+                    updated_at=r.get("updated_at"),
+                )
+                for r in rows
+            }
+        # Unresolved (cross-vault or genuinely missing): fall back to the path
+        # so the visualization still renders something.
+        for path, spellings in doc_uris.items():
+            for uri in spellings:
+                labels[uri] = found.get(path) or {"name": path, "path": path}
+
+    if table_uris:
         rows = await conn.fetch(
-            "SELECT path, title FROM documents "
-            "WHERE path = ANY($1::text[]) AND vault_id = $2",
-            doc_paths, vault_id,
-        )
-        for r in rows:
-            doc_uri_opt = doc_uris.get(r["path"])
-            if doc_uri_opt:
-                names[doc_uri_opt] = r["title"]
-        # Fallback for unresolved (cross-vault or genuinely missing): use
-        # the path/identifier so the visualization still renders something.
-        for path, uri in doc_uris.items():
-            if uri not in names:
-                names[uri] = path
-
-    if table_names:
-        rows = await conn.fetch(
-            "SELECT name, description FROM vault_tables "
+            "SELECT name, description, updated_at FROM vault_tables "
             "WHERE name = ANY($1::text[]) AND vault_id = $2",
-            table_names, vault_id,
+            list(table_uris), vault_id,
         )
-        for r in rows:
-            tbl_uri_opt = table_uris.get(r["name"])
-            if tbl_uri_opt:
-                names[tbl_uri_opt] = r["description"] if r["description"] else r["name"]
-        for tname, uri in table_uris.items():
-            if uri not in names:
-                names[uri] = tname
+        tables = {
+            r["name"]: _table_label(r["name"], r["description"], r.get("updated_at")) for r in rows
+        }
+        for tname, spellings in table_uris.items():
+            for uri in spellings:
+                labels[uri] = tables.get(tname) or {"name": tname}
 
-    if file_ids:
+    if file_uris:
         rows = await conn.fetch(
-            "SELECT id::text, name FROM vault_files f "
+            "SELECT id::text, name, updated_at FROM vault_files f "
             "WHERE id::text = ANY($1::text[]) AND vault_id = $2 "
             "AND " + confirmed_file_predicate("f"),
-            file_ids, vault_id,
+            list(file_uris), vault_id,
         )
-        for r in rows:
-            file_uri_opt = file_uris.get(r["id"])
-            if file_uri_opt:
-                names[file_uri_opt] = r["name"]
-        for fid, uri in file_uris.items():
-            if uri not in names:
-                names[uri] = fid
+        files = {r["id"]: _file_label(r["id"], r["name"], r.get("updated_at")) for r in rows}
+        for fid, spellings in file_uris.items():
+            for uri in spellings:
+                labels[uri] = files.get(fid) or {"name": fid}
 
-    return names
+    return labels
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -1800,29 +2306,68 @@ async def _bfs_collect(
     conn, vault_id: uuid.UUID, vault_name: str, start_uri: str,
     depth: int, limit: int,
     nodes: dict[str, dict], edges: list[dict],
-) -> None:
+    *, edge_type: str | None = None, direction: str | None = None,
+) -> bool:
     """BFS traversal from a starting resource URI, scoped to one vault.
 
     Edge ownership and both endpoint URI authorities must match the requested
     vault. A legacy cross-vault edge therefore contributes no node, row, or
     traversal seed.
+
+    ``edge_type`` ("strong" / "weak", ``None`` = every edge) is applied in the
+    edge fetch itself, to the outgoing and the incoming query alike, so the walk
+    never crosses an edge of the other strength: a neighbour reachable only
+    through one is not visited, and the ``limit`` node cap is spent on the
+    neighbours that qualify.
+
+    ``direction`` ("both" or ``None`` = every edge of a node; "outward" = its
+    outgoing edges plus the incoming ``derived_from`` and ``depends_on`` ones,
+    :data:`OUTWARD_INCOMING_RELATIONS`) narrows the *incoming* fetch the same
+    way, so a node that is only pointed at by other relations — a hub — is
+    never walked through and never spends the cap. Edges are emitted as the
+    walk follows them: with ``outward`` they are the outgoing edges and the
+    incoming ``derived_from`` / ``depends_on`` edges of the nodes it expanded,
+    and an edge it did not follow is absent even when both its ends were
+    visited.
+
+    Returns whether ``limit`` cut the walk short — True when a node that
+    qualified and lies within ``depth`` hops could not be added because the cap
+    was already spent. Reaching ``depth`` is not truncation, and neither is a
+    result that fits ``limit`` exactly.
     """
     queue = [start_uri]
     visited: set[str] = set()
+    truncated = False
     # Track emitted edges so an edge A→B doesn't appear twice when both
     # A and B are processed in the same BFS wave.
     emitted: set[tuple[str, str, str]] = set()
     prefix = vault_uri_prefix(vault_name)
     scoped = edge_scope_sql(vault_param=2, prefix_param=3)
+    strength = edge_strength_sql(edge_type)
+    if strength:
+        scoped = f"{scoped} AND {strength}"
+    # The direction narrows only the incoming fetch; an outgoing edge is
+    # followed in every mode. Built after the strength so a bad `direction`
+    # raises before the first query, like a bad `edge_type`.
+    scoped_incoming = scoped
+    inward = incoming_walk_sql(direction)
+    if inward:
+        scoped_incoming = f"{scoped} AND {inward}"
 
     for current_depth in range(depth + 1):
-        if not queue or len(nodes) >= limit:
+        if not queue:
             break
 
         next_queue: list[str] = []
 
-        unvisited = [u for u in queue if u not in visited]
+        # `dict.fromkeys` keeps discovery order and drops repeats: a node
+        # reached from two parents in one wave is queued once per parent.
+        unvisited = [u for u in dict.fromkeys(queue) if u not in visited]
         if not unvisited:
+            break
+        if len(nodes) >= limit:
+            # The cap is spent and these are still waiting to be added.
+            truncated = True
             break
 
         outgoing = await conn.fetch(
@@ -1834,7 +2379,7 @@ async def _bfs_collect(
         incoming = await conn.fetch(
             "SELECT source_uri, source_type, target_uri, relation_type, kind, "
             f"{_STORED_EDGE_TYPE_COLUMN} "
-            f"FROM edges WHERE target_uri = ANY($1::text[]) AND {scoped}",
+            f"FROM edges WHERE target_uri = ANY($1::text[]) AND {scoped_incoming}",
             unvisited, vault_id, prefix,
         )
         outgoing = [
@@ -1857,8 +2402,9 @@ async def _bfs_collect(
             in_by_uri.setdefault(r["target_uri"], []).append(r)
 
         for uri in unvisited:
-            if uri in visited or len(nodes) >= limit:
-                continue
+            if len(nodes) >= limit:
+                truncated = True
+                break
             visited.add(uri)
 
             parsed = parse_uri(uri)
@@ -1914,11 +2460,12 @@ async def _bfs_collect(
     edges[:] = [e for e in edges if e["source"] in nodes and e["target"] in nodes]
 
     uris_to_resolve = [(uri, n["resource_type"]) for uri, n in nodes.items()]
-    names = await _batch_resolve_names(
+    labels = await _batch_resolve_labels(
         conn, uris_to_resolve, vault_id=vault_id, vault_name=vault_name,
     )
     for uri, node in nodes.items():
-        node["name"] = names.get(uri) or uri
+        node.update(labels.get(uri, {}))
+    return truncated
 
 
 # ── URI builder helpers for callers ──────────────────────────

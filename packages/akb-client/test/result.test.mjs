@@ -1634,6 +1634,65 @@ test("graph facade maps typed methods to graph URLs and preserves auth envelopes
   assert.equal(health.throwOnError().data.orphans.count, 3);
 });
 
+test("graph neighbors sends edge_type only when the caller sets it, and serves titles and truncated", async () => {
+  const urls = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input) => {
+      urls.push(new URL(String(input)));
+      return new Response(JSON.stringify({
+        kind: "graph_neighbors",
+        nodes: [
+          { uri: "akb://eng/doc/a", name: "Alpha design", title: "Alpha design", doc_type: "spec", tags: ["graph"], path: "a", resource_type: "doc", depth: 0, updated_at: "2026-10-20T13:08:25Z" },
+          { uri: "akb://eng/doc/b", name: "b", doc_type: "note", tags: [], path: "b", resource_type: "doc", depth: 1 },
+        ],
+        edges: [{ source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "related_to", kind: "explicit", edge_type: "strong" }],
+        truncated: true,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  const all = await client.graph.neighbors("akb://eng/doc/a", { hops: 2 });
+  const strong = await client.graph.neighbors("akb://eng/doc/a", { hops: 2, limit: 50, edgeType: "strong" });
+  const weak = await client.graph.neighbors("akb://eng/doc/a", { edgeType: "weak" });
+
+  assert.equal(urls[0].searchParams.has("edge_type"), false);
+  assert.equal(urls[1].search, "?uri=akb%3A%2F%2Feng%2Fdoc%2Fa&hops=2&limit=50&edge_type=strong");
+  assert.equal(urls[2].searchParams.get("edge_type"), "weak");
+  const data = strong.throwOnError().data;
+  assert.equal(data.truncated, true);
+  assert.equal(data.nodes[0].title, "Alpha design");
+  assert.deepEqual(data.nodes[0].tags, ["graph"]);
+  assert.equal(data.nodes[1].title, undefined);
+  // The time passes through as the server wrote it, and a node without one has none.
+  assert.equal(data.nodes[0].updated_at, "2026-10-20T13:08:25Z");
+  assert.equal(data.nodes[1].updated_at, undefined);
+  assert.equal(all.throwOnError().data.nodes[1].path, "b");
+  assert.equal(weak.throwOnError().data.kind, "graph_neighbors");
+});
+
+test("graph neighbors sends direction only when the caller sets it, and composes with edgeType", async () => {
+  const urls = [];
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input) => {
+      urls.push(new URL(String(input)));
+      return new Response(JSON.stringify({ kind: "graph_neighbors", nodes: [], edges: [], truncated: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await client.graph.neighbors("akb://eng/doc/a", { hops: 2 });
+  await client.graph.neighbors("akb://eng/doc/a", { direction: "both" });
+  await client.graph.neighbors("akb://eng/doc/a", { direction: "outward" });
+  await client.graph.neighbors("akb://eng/doc/a", { hops: 3, limit: 40, edgeType: "strong", direction: "outward" });
+
+  assert.equal(urls[0].searchParams.has("direction"), false);
+  assert.equal(urls[1].searchParams.get("direction"), "both");
+  assert.equal(urls[2].search, "?uri=akb%3A%2F%2Feng%2Fdoc%2Fa&direction=outward");
+  assert.equal(urls[3].search, "?uri=akb%3A%2F%2Feng%2Fdoc%2Fa&hops=3&limit=40&edge_type=strong&direction=outward");
+});
+
 test("graph facade omits defaults, preflights vault, preserves 4xx, and keeps raw request", async () => {
   const calls = [];
   const responses = [
@@ -1810,6 +1869,49 @@ test("graph link facade sends edge_type only when the caller sets it", async () 
   assert.equal(omitted.throwOnError().data.edge_type, "strong");
   assert.equal(weak.throwOnError().data.edge_type, "weak");
   assert.equal(strong.throwOnError().data.edge_type, "strong");
+});
+
+test("graph, relations and link responses from a server that predates edge_type, labels and truncated reach the caller as they are", async () => {
+  // None of these fields exists in what an older server sends, and the SDK adds
+  // nothing. The types therefore must not promise them (see the
+  // `older*` values in graph-consumer-types.ts and relations-provenance-consumer-types.ts).
+  const older = {
+    neighbors: {
+      kind: "graph_neighbors",
+      nodes: [{ uri: "akb://eng/doc/a", name: "a", resource_type: "doc", depth: 0 }],
+      edges: [{ source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "related_to", kind: "explicit" }],
+    },
+    relations: {
+      kind: "relations",
+      uri: "akb://eng/doc/a",
+      relations: [{ direction: "outgoing", relation: "related_to", uri: "akb://eng/doc/b", resource_type: "doc", kind: "explicit", name: "b" }],
+    },
+    link: { kind: "relation_link", linked: true, source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "related_to" },
+  };
+  const client = createClient("https://akb.test/api/v1/", {
+    fetch: async (input, init) => {
+      const { pathname } = new URL(String(input));
+      if (!pathname.endsWith("/relations")) return responseJson(older.neighbors);
+      return responseJson(init?.method === "POST" ? older.link : older.relations);
+    },
+  });
+
+  const neighbors = (await client.graph.neighbors("akb://eng/doc/a")).throwOnError().data;
+  const relations = (await client.graph.relations("akb://eng/doc/a")).throwOnError().data;
+  const link = (await client.graph.link({
+    source: "akb://eng/doc/a", target: "akb://eng/doc/b", relation: "related_to",
+  })).throwOnError().data;
+
+  assert.deepEqual(neighbors, older.neighbors);
+  assert.deepEqual(relations, older.relations);
+  assert.deepEqual(link, older.link);
+  assert.equal(neighbors.edges[0].edge_type, undefined);
+  assert.equal(neighbors.truncated, undefined);
+  assert.equal(neighbors.nodes[0].title, undefined);
+  assert.equal(neighbors.nodes[0].updated_at, undefined);
+  assert.equal(relations.relations[0].edge_type, undefined);
+  assert.equal(relations.relations[0].path, undefined);
+  assert.equal(link.edge_type, undefined);
 });
 
 test("storage upload sends contentHash to presign so the same bytes are not stored twice", async () => {

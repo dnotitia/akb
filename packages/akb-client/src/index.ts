@@ -40,6 +40,7 @@ export type {
   AkbDrillDownEnvelope,
   AkbEdgeType,
   AkbGrepEnvelope,
+  AkbGraphDirection,
   AkbGraphEdge,
   AkbGraphEnvelope,
   AkbGraphHealthEnvelope,
@@ -462,6 +463,22 @@ export interface AkbSearchFacade extends AkbNamespaceStub {
 export interface AkbGraphNeighborsOptions {
   hops?: 1 | 2 | 3 | 4 | 5;
   limit?: number;
+  /**
+   * Follow, and return, only edges of this strength — in the directions
+   * `direction` allows, so `limit` is spent on matching neighbours. Omit for
+   * every edge. A server that predates the option ignores it; such a response
+   * has no `truncated`.
+   */
+  edgeType?: import("./core/schema.gen.js").AkbEdgeType;
+  /**
+   * Which edges of a reached node the walk takes. `"both"` (the default) takes
+   * every edge touching it; `"outward"` takes its outgoing edges plus incoming
+   * `derived_from` edges (what was derived from it) and incoming `depends_on`
+   * edges (what depends on it), so the walk stops at shared context instead of
+   * fanning out through hubs. Composes with `edgeType`. A server that predates
+   * the option ignores it and walks both ways.
+   */
+  direction?: import("./core/schema.gen.js").AkbGraphDirection;
 }
 
 export interface AkbGraphOverviewOptions {
@@ -483,7 +500,12 @@ export interface AkbGraphLinkInput {
   target: string;
   relation: import("./core/schema.gen.js").AkbWritableRelationType;
   metadata?: Record<string, AkbJsonValue>;
-  /** Connection strength; the server treats an omitted value as "strong". */
+  /**
+   * Connection strength. Name it to set it, up or down. Leave it out to say
+   * nothing about it: a new link is "strong", and linking an edge that already
+   * exists keeps the strength it has. A server that predates the option ignores
+   * it, and its result has no `edge_type`.
+   */
   edge_type?: import("./core/schema.gen.js").AkbEdgeType;
 }
 
@@ -1094,6 +1116,8 @@ function makeGraphFacade(
       const params = new URLSearchParams({ uri });
       appendOptional(params, "hops", options.hops);
       appendOptional(params, "limit", options.limit);
+      appendOptional(params, "edge_type", options.edgeType);
+      appendOptional(params, "direction", options.direction);
       return request<import("./core/schema.gen.js").AkbGraphNeighborsEnvelope>(`/graph?${params}`);
     },
     overview(options: AkbGraphOverviewOptions = {}) {

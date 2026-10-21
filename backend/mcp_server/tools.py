@@ -37,16 +37,23 @@ from mcp.types import Tool
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
-from app.services.kg_service import DEFAULT_EDGE_TYPE, EDGE_TYPES, LINK_RELATION_TYPES
+from app.services.kg_service import (
+    DEFAULT_GRAPH_DIRECTION,
+    EDGE_TYPES,
+    GRAPH_DIRECTIONS,
+    LINK_RELATION_TYPES,
+)
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
 # `RelationType` model can never drift. `_REL_LIST` is the human-readable
 # spelling reused across descriptions. The edge-strength vocabulary
-# (`akb_link.edge_type`) follows the same rule.
+# (`akb_link.edge_type`) and the graph walk direction (`akb_graph.direction`)
+# follow the same rule.
 _REL_ENUM = list(LINK_RELATION_TYPES)
 _REL_LIST = ", ".join(LINK_RELATION_TYPES)
 _EDGE_TYPE_ENUM = list(EDGE_TYPES)
+_GRAPH_DIRECTION_ENUM = list(GRAPH_DIRECTIONS)
 
 
 # A column's name is the SQL identifier `akb_sql` uses as written, so a header
@@ -627,7 +634,8 @@ TOOLS = [
         description=(
             "Get relations for any resource (document, table, or file). "
             "Shows same-vault cross-type connections: doc→table, doc→file, table→file, etc. "
-            "Each row identifies whether it is an explicit link or implicit document-derived edge."
+            "Each row identifies whether it is an explicit link or implicit document-derived edge, "
+            "and names the resource at the other end by its title."
         ),
         input_schema={
             "type": "object",
@@ -644,7 +652,11 @@ TOOLS = [
         description=(
             "Get a same-vault knowledge graph — nodes (documents, tables, files) and edges (relations). "
             "Provide `uri` to get a subgraph centered on any resource with BFS traversal. "
-            "Provide `vault` (without uri) to get the full vault graph."
+            "Provide `vault` (without uri) to get the full vault graph. "
+            "Each node is named by its title; documents also carry doc_type, tags and path. "
+            "With `uri`, `edge_type` (strong or weak) walks only edges of that strength, and "
+            "`direction=outward` follows each node's outgoing edges plus incoming `derived_from` "
+            "and `depends_on` edges only."
         ),
         input_schema={
             "type": "object",
@@ -663,6 +675,30 @@ TOOLS = [
                     ),
                 },
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200, "description": "Max nodes"},
+                "edge_type": {
+                    "type": "string",
+                    "enum": _EDGE_TYPE_ENUM,
+                    "description": (
+                        "Only with `uri`: follow and return only edges of this strength "
+                        "(strong or weak), in the directions `direction` allows, so `limit` is "
+                        "spent on matching neighbours. Omit for every edge. Refused together "
+                        "with `vault` and no `uri`."
+                    ),
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": _GRAPH_DIRECTION_ENUM,
+                    "default": DEFAULT_GRAPH_DIRECTION,
+                    "description": (
+                        "Only with `uri`: `both` (default) follows every edge of a reached node; "
+                        "`outward` follows its outgoing edges plus what was derived from it "
+                        "(incoming `derived_from` edges) and what depends on it (incoming "
+                        "`depends_on` edges), so the walk stops at shared context (any other "
+                        "incoming relation, such as `related_to`, `references` or `links_to`) "
+                        "instead of fanning out through hubs. Composes with `edge_type`. "
+                        "`outward` is refused together with `vault` and no `uri`."
+                    ),
+                },
             },
         },
     ),
@@ -672,7 +708,8 @@ TOOLS = [
             "Create a relation between any two resources (documents, tables, files). "
             "Source and target are AKB URIs in the same vault. "
             f"Relation types: {_REL_LIST}. "
-            "Optional `edge_type`: strong (default) or weak; body links are always weak. "
+            "Optional `edge_type`: strong or weak; body links are always weak. "
+            "Omit it to keep an existing link's strength (a new link is strong). "
             "Example: link a design doc to its data table, or attach a diagram file to a spec."
         ),
         input_schema={
@@ -685,11 +722,16 @@ TOOLS = [
                     "description": "Relation type",
                     "enum": _REL_ENUM,
                 },
+                # No `default`: a client that fills schema defaults into a call would
+                # turn "name nothing" into "strong" and promote every weak edge it
+                # links again.
                 "edge_type": {
                     "type": "string",
-                    "description": "Connection strength: strong (default) or weak; body links are always weak.",
+                    "description": (
+                        "Connection strength: strong or weak; body links are always weak. "
+                        "Omit it to keep an existing link's strength (a new link is strong)."
+                    ),
                     "enum": _EDGE_TYPE_ENUM,
-                    "default": DEFAULT_EDGE_TYPE,
                 },
             },
             "required": ["source", "target", "relation"],

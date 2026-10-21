@@ -96,6 +96,37 @@ def test_graph_neighbors_edges_carry_edge_type_next_to_kind(client, monkeypatch)
     ]
 
 
+STAMP = "2026-10-20T13:08:25Z"
+
+
+def test_graph_nodes_serve_updated_at_when_known_and_leave_it_out_when_not(client, monkeypatch):
+    """The time a resource last changed rides on the node as a string, and a node
+    the service gave none stays without the key (never `null`) through the models."""
+    known = {"uri": URI, "name": "A", "resource_type": "doc", "updated_at": STAMP}
+    unknown = {"uri": f"akb://{VAULT}/doc/specs/gone.md", "name": "specs/gone.md", "resource_type": "doc"}
+
+    async def _graph(_vault, resource_uri=None, **_kwargs):
+        return {"nodes": [{**known, "depth": 0}, {**unknown, "depth": 1}], "edges": []}
+
+    async def _overview(*_args, **_kwargs):
+        return {**_overview_payload(), "nodes": [{**known, "degree": 1}, {**unknown, "degree": 1}]}
+
+    async def _health(*_args, **_kwargs):
+        return {"hubs": [{**known, "degree": 5}], "orphans": {"count": 0, "sample": []}}
+
+    monkeypatch.setattr(knowledge, "get_graph", _graph)
+    monkeypatch.setattr(knowledge, "get_overview", _overview)
+    monkeypatch.setattr(knowledge, "get_health", _health)
+    neighbors = client.get("/api/v1/graph", params={"uri": URI}).json()
+    overview = client.get("/api/v1/graph/overview", params={"vault": VAULT}).json()
+    health = client.get("/api/v1/graph/health", params={"vault": VAULT}).json()
+
+    for body in (neighbors, overview):
+        assert body["nodes"][0]["updated_at"] == STAMP
+        assert "updated_at" not in body["nodes"][1]
+    assert health["hubs"][0]["updated_at"] == STAMP
+
+
 def test_graph_rejects_collection_uri_before_response_validation(client):
     response = client.get("/api/v1/graph", params={"uri": COLLECTION_URI})
     assert response.status_code == 400

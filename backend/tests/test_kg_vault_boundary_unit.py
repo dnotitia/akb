@@ -167,6 +167,11 @@ async def test_relation_projection_omits_foreign_uri_and_exposes_edge_kind(monke
             "kind": "explicit",
             "edge_type": "strong",
             "name": "Visible target",
+            # The label's other fields (a catalog row with no doc_type / tags yet).
+            "title": "Visible target",
+            "doc_type": "note",
+            "tags": [],
+            "path": "specs/b.md",
         }
     ]
     assert edge_queries

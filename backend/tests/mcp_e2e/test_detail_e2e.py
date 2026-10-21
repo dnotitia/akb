@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 from typing import Any
 
 from mcp import Client
@@ -12,6 +13,10 @@ from mcp import Client
 from .conftest import SecondaryMcpSession
 from .runtime import RuntimeContext
 from .test_product_e2e import _call_json, _create_vault
+
+
+# `updated_at` on a graph node or a relation row: UTC to the second.
+_UTC_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
 
 
 async def _search_until_found(
@@ -633,6 +638,10 @@ async def test_unicode_graph_grep_and_ownership(
     )
     assert _relation_count(relations) >= 1
     assert [(row["kind"], row["edge_type"]) for row in relations["relations"]] == [("explicit", "strong")]
+    # A row names the document at the other end by its title, not by its path,
+    # and says when that document last changed (UTC to the second).
+    assert [(row["name"], row["title"]) for row in relations["relations"]] == [("Data Model", "Data Model")]
+    assert all(re.fullmatch(_UTC_STAMP, row["updated_at"]) for row in relations["relations"])
     graph = await _call_json(
         mcp_client,
         runtime_session,
@@ -642,6 +651,77 @@ async def test_unicode_graph_grep_and_ownership(
     assert len(graph.get("nodes", [])) >= 2
     assert len(graph.get("edges", [])) >= 1
     assert {(edge["kind"], edge["edge_type"]) for edge in graph["edges"]} == {("explicit", "strong")}
+    assert {"API Spec", "Data Model"} <= {node["name"] for node in graph["nodes"]}
+    assert all(re.fullmatch(_UTC_STAMP, node["updated_at"]) for node in graph["nodes"])
+    assert graph["truncated"] is False
+    # An outward walk follows a resource's own edges: `first` depends on `second`, so
+    # it reaches it. `second` has that edge incoming, and an incoming `depends_on` is one
+    # of the two an outward walk follows (the other is `derived_from`): `first` depends on
+    # it, so it is reached as a dependent. Both walks cross the edge.
+    outward_from_first = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": first["uri"], "hops": 1, "direction": "outward"},
+    )
+    assert {node["uri"] for node in outward_from_first["nodes"]} == {first["uri"], second["uri"]}
+    assert [(edge["source"], edge["target"]) for edge in outward_from_first["edges"]] == [(first["uri"], second["uri"])]
+    outward_from_second = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": second["uri"], "hops": 1, "direction": "outward"},
+    )
+    assert {node["uri"] for node in outward_from_second["nodes"]} == {first["uri"], second["uri"]}
+    assert [(edge["source"], edge["target"]) for edge in outward_from_second["edges"]] == [(first["uri"], second["uri"])]
+    assert outward_from_second["truncated"] is False
+    both_from_second = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": second["uri"], "hops": 1, "direction": "both"},
+    )
+    assert {node["uri"] for node in both_from_second["nodes"]} == {first["uri"], second["uri"]}
+    # Any other incoming relation is some other resource's context: `third` only points at
+    # `second` with `related_to`, so an outward walk from `second` stops short of it while
+    # the default walk takes it.
+    third = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_put",
+        {
+            "vault": vault,
+            "collection": "specs",
+            "title": "Related Doc",
+            "content": "# Related Doc\nPoints at the data model",
+        },
+    )
+    await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_link",
+        {"source": third["uri"], "target": second["uri"], "relation": "related_to"},
+    )
+    outward_past_related = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": second["uri"], "hops": 1, "direction": "outward"},
+    )
+    assert {node["uri"] for node in outward_past_related["nodes"]} == {first["uri"], second["uri"]}
+    both_with_related = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": second["uri"], "hops": 1, "direction": "both"},
+    )
+    assert {node["uri"] for node in both_with_related["nodes"]} == {first["uri"], second["uri"], third["uri"]}
+    await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_unlink",
+        {"source": third["uri"], "target": second["uri"], "relation": "related_to"},
+    )
     # Linking the same edge again updates it, edge_type included.
     relinked = await _call_json(
         mcp_client,
@@ -650,6 +730,14 @@ async def test_unicode_graph_grep_and_ownership(
         {"source": first["uri"], "target": second["uri"], "relation": "depends_on", "edge_type": "weak"},
     )
     assert relinked["edge_type"] == "weak"
+    # ... and a re-link that names no strength leaves it where it is.
+    bare_relink = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_link",
+        {"source": first["uri"], "target": second["uri"], "relation": "depends_on"},
+    )
+    assert bare_relink["edge_type"] == "weak"
     weak_relations = await _call_json(
         mcp_client,
         runtime_session,
@@ -657,6 +745,50 @@ async def test_unicode_graph_grep_and_ownership(
         {"uri": first["uri"]},
     )
     assert [(row["kind"], row["edge_type"]) for row in weak_relations["relations"]] == [("explicit", "weak")]
+    # A strength-aware walk follows only edges of that strength: the weak link is
+    # invisible to a strong walk and the only edge of a weak one.
+    strong_walk = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": first["uri"], "hops": 1, "edge_type": "strong"},
+    )
+    assert [node["uri"] for node in strong_walk["nodes"]] == [first["uri"]]
+    assert strong_walk["edges"] == [] and strong_walk["truncated"] is False
+    weak_walk = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": first["uri"], "hops": 1, "edge_type": "weak"},
+    )
+    assert {node["uri"] for node in weak_walk["nodes"]} == {first["uri"], second["uri"]}
+    assert [(edge["kind"], edge["edge_type"]) for edge in weak_walk["edges"]] == [("explicit", "weak")]
+    # The vault overview is not strength-aware, so the pairing is refused.
+    refused_walk = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"vault": vault, "edge_type": "strong"},
+        expect_error=True,
+    )
+    assert refused_walk.get("code") == "invalid_argument"
+    # ... and so is a direction: the overview has none to restrict.
+    refused_outward = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"vault": vault, "direction": "outward"},
+        expect_error=True,
+    )
+    assert refused_outward.get("code") == "invalid_argument"
+    invalid_direction = await _call_json(
+        mcp_client,
+        runtime_session,
+        "akb_graph",
+        {"uri": first["uri"], "direction": "sideways"},
+        expect_error=True,
+    )
+    assert invalid_direction.get("code") == "invalid_argument"
     invalid_edge_type = await _call_json(
         mcp_client,
         runtime_session,

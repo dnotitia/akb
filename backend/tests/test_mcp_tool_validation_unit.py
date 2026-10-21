@@ -105,14 +105,20 @@ def test_relation_tool_descriptions_match_the_vault_boundary():
 
 
 def test_akb_link_advertises_edge_type_from_the_shared_vocabulary():
-    from app.services.kg_service import DEFAULT_EDGE_TYPE, EDGE_TYPES
+    from app.services.kg_service import EDGE_TYPES
 
     link = next(tool for tool in TOOLS if tool.name == "akb_link")
     edge_type = link.input_schema["properties"]["edge_type"]
 
     assert edge_type["enum"] == list(EDGE_TYPES)
-    assert edge_type["default"] == DEFAULT_EDGE_TYPE == "strong"
     assert "edge_type" not in link.input_schema["required"]
+    # No advertised default. An omitted `edge_type` keeps an existing edge's
+    # strength, and a client that fills schema defaults into a call would turn
+    # "name nothing" into "strong" and promote every weak edge it links again.
+    assert "default" not in edge_type
     # One short sentence on the tool, and the same words on the parameter.
-    assert "strong (default) or weak; body links are always weak" in link.description
-    assert "strong (default) or weak; body links are always weak" in edge_type["description"]
+    sentence = "strong or weak; body links are always weak. Omit it to keep an existing link's strength"
+    assert sentence in link.description
+    assert sentence in edge_type["description"]
+    assert "a new link is strong" in link.description
+    assert "a new link is strong" in edge_type["description"]

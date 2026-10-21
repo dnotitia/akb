@@ -367,6 +367,16 @@ jobs:
             # facts about the SQL, so a fake would agree with itself; off this
             # list the file skips in both lanes.
             tests/test_edge_type_postgres.py
+            # A node's title lives in a different place on each document
+            # authority: the `documents` row on bare Git, the head revision's
+            # frontmatter on postgres_native, where no such row exists. That a
+            # native vault is read through its ledger — one joined statement, a
+            # retained catalog row filling only what the body leaves out — and
+            # that the strength predicate selects the same rows as the Python
+            # rule, are both facts about the SQL; a fake would agree with itself.
+            # Off this list the files skip in both lanes.
+            tests/test_graph_node_labels_postgres.py
+            tests/test_graph_strong_walk_postgres.py
             tests/test_search_covering_indexes_e2e.py
             # Needs the vchord service, not the postgres one. It skips rather
             # than failing where the extension is absent, so it has to be on a

@@ -361,6 +361,16 @@ export interface AkbGraphNode {
   resource_type: "doc" | "table" | "file";
   depth?: number | null;
   degree?: number | null;
+  /** A document's real title (absent when it has none); a table's or file's name. */
+  title?: string;
+  /** Documents only. */
+  doc_type?: string;
+  /** Documents only. */
+  tags?: string[];
+  /** Documents only: the vault-relative path. */
+  path?: string;
+  /** When the resource last changed, UTC to the second (`2026-10-20T13:08:25Z`); absent when unknown. */
+  updated_at?: string;
   [key: string]: unknown;
 }
 
@@ -369,7 +379,8 @@ export interface AkbGraphEdge {
   target: string;
   relation: AkbRelationType;
   kind: "implicit" | "explicit";
-  edge_type: AkbEdgeType;
+  /** Connection strength; absent from a server that predates it. */
+  edge_type?: AkbEdgeType;
   [key: string]: unknown;
 }
 
@@ -377,6 +388,8 @@ export interface AkbGraphNeighborsEnvelope {
   kind: "graph_neighbors";
   nodes: AkbGraphNode[];
   edges: AkbGraphEdge[];
+  /** True when the `limit` node cap cut the walk short. */
+  truncated?: boolean;
   [key: string]: unknown;
 }
 
@@ -406,6 +419,9 @@ export interface AkbGraphHealthEnvelope {
 
 export type AkbGraphEnvelope = AkbGraphNeighborsEnvelope | AkbGraphOverviewEnvelope;
 
+/** Which edges of a reached node a neighbourhood walk takes: `both` takes every edge touching it; `outward` takes its outgoing edges plus incoming `derived_from` edges (what was derived from it) and incoming `depends_on` edges (what depends on it). */
+export type AkbGraphDirection = "both" | "outward";
+
 export type AkbWritableRelationType =
   | "depends_on"
   | "related_to"
@@ -424,8 +440,19 @@ export interface AkbRelation {
   relation: AkbRelationType;
   uri: string;
   resource_type: "doc" | "table" | "file";
-  edge_type: AkbEdgeType;
+  /** Connection strength; absent from a server that predates it. */
+  edge_type?: AkbEdgeType;
   name?: string | null;
+  /** A document's real title (absent when it has none); a table's or file's name. */
+  title?: string;
+  /** Documents only. */
+  doc_type?: string;
+  /** Documents only. */
+  tags?: string[];
+  /** Documents only: the vault-relative path. */
+  path?: string;
+  /** When the resource last changed, UTC to the second (`2026-10-20T13:08:25Z`); absent when unknown. */
+  updated_at?: string;
   [key: string]: unknown;
 }
 
@@ -442,7 +469,8 @@ export interface AkbRelationLinkEnvelope {
   source: string;
   target: string;
   relation: AkbWritableRelationType;
-  edge_type: AkbEdgeType;
+  /** The strength now stored on the edge; absent from a server that predates it. */
+  edge_type?: AkbEdgeType;
   [key: string]: unknown;
 }
 
@@ -496,7 +524,7 @@ export type AkbSuccessEnvelope =
   | AkbRelationUnlinkEnvelope
   | AkbProvenanceEnvelope;
 
-export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null; edge_type?: "strong" | "weak" };
+export type LinkRequest = { source: string; target: string; relation: "depends_on" | "related_to" | "implements" | "references" | "attached_to" | "derived_from"; metadata?: { [key: string]: unknown } | null; edge_type?: "strong" | "weak" | null };
 
 export type CreateCollectionRequest = { path: string; summary?: string | null };
 

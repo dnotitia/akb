@@ -570,6 +570,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "resource_type": {"type": "string", "enum": ["doc", "table", "file"]},
                 "depth": _nullable_integer(),
                 "degree": _nullable_integer(),
+                **_resource_label_properties(),
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
         },
@@ -618,6 +619,7 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "kind": {"type": "string", "enum": ["implicit", "explicit"]},
                 "edge_type": _edge_type_property(),
                 "name": _nullable_string(),
+                **_resource_label_properties(),
             },
             "additionalProperties": {"$ref": "#/components/schemas/AkbJsonValue"},
         },
@@ -639,6 +641,13 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
             {
                 "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphNode"}},
                 "edges": {"type": "array", "items": {"$ref": "#/components/schemas/AkbGraphEdge"}},
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when the `limit` node cap cut the walk short: more nodes qualified "
+                        "within `hops` than were returned."
+                    ),
+                },
             },
             "Resource-centered graph neighborhood.",
             required=("kind", "nodes", "edges"),
@@ -1157,6 +1166,49 @@ def _edge_type_property() -> dict[str, Any]:
             "Connection strength, separate from the relation name and from `kind`. "
             "An implicit edge is always weak; an explicit edge is strong unless made weak."
         ),
+    }
+
+
+def _resource_label_properties() -> dict[str, Any]:
+    """Optional fields a graph node and a relation row carry about their resource.
+
+    Set only when the resource resolves in the vault. ``name`` (a separate,
+    always-present property) is the title when the resource has one; these add
+    the parts a client needs to draw it without a second request, and when it
+    last changed (``updated_at``, absent when the store has no time for it).
+    """
+    return {
+        "title": {
+            "type": "string",
+            "description": (
+                "A document's real title, absent when it has none (its `name` is then its path); "
+                "a table's or file's name."
+            ),
+        },
+        "doc_type": {
+            "type": "string",
+            "description": "Document type (`note` when the document states none). Documents only.",
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Document tags. Documents only.",
+        },
+        "path": {
+            "type": "string",
+            "description": "Vault-relative path. Documents only.",
+        },
+        "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": (
+                "When the resource last changed, UTC to the second (`2026-10-20T13:08:25Z`); "
+                "absent when unknown. A document: its head revision's time on a native "
+                "installation, its catalog `updated_at` otherwise. A table: its creation or last "
+                "schema change (writing rows does not move it). A file: its last confirmed "
+                "upload, replacement or size update."
+            ),
+        },
     }
 
 

@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.kg_service import DEFAULT_EDGE_TYPE, EdgeType, LinkRelationType
+from app.services.kg_service import EdgeType, LinkRelationType
 from app.util.text import NFCModel
 
 
@@ -29,10 +29,16 @@ class LinkRequest(NFCModel):
     target: str
     relation: LinkRelationType
     metadata: dict | None = None
-    edge_type: EdgeType = Field(
-        default=DEFAULT_EDGE_TYPE,
+    # No advertised default, and `null` is the same as leaving it out. A request
+    # that names no strength says nothing about it: a new edge is strong, an
+    # existing one keeps its strength. A default of `strong` here would turn every
+    # bare re-link (a client that predates the field, one updating only `metadata`)
+    # into a promotion, and a generator that fills defaults would do the same.
+    edge_type: EdgeType | None = Field(
+        default=None,
         description=(
-            "Connection strength: strong (default) or weak; body links are always weak. "
+            "Connection strength: strong or weak; body links are always weak. "
+            "Omit it to keep an existing link's strength (a new link is strong). "
             "Stored under the reserved `edge_type` key of `metadata`."
         ),
     )
@@ -45,11 +51,25 @@ class KnowledgeResponse(BaseModel):
 
 
 class GraphNode(KnowledgeResponse):
+    """A resource in a graph. ``name`` is its title when it has one.
+
+    ``title`` / ``doc_type`` / ``tags`` / ``path`` are set only when the
+    resource resolves in the vault: a document carries all four (``title``
+    only if it has a real one), a table or file just ``title``.
+    ``updated_at`` (UTC, ``YYYY-MM-DDTHH:MM:SSZ``) says when the resource last
+    changed and is left out when that is unknown.
+    """
+
     uri: str
     name: str
     resource_type: ResourceType
     depth: int | None = None
     degree: int | None = None
+    title: str | None = None
+    doc_type: str | None = None
+    tags: list[str] | None = None
+    path: str | None = None
+    updated_at: str | None = None
 
 
 class GraphEdge(KnowledgeResponse):
@@ -67,7 +87,14 @@ class RelationItem(KnowledgeResponse):
     resource_type: ResourceType
     kind: EdgeKind
     edge_type: EdgeType
+    # The resource at the other end: ``name`` is its title when it has one, and
+    # the rest follow `GraphNode` (set only when the resource resolves).
     name: str | None = None
+    title: str | None = None
+    doc_type: str | None = None
+    tags: list[str] | None = None
+    path: str | None = None
+    updated_at: str | None = None
 
 
 class OrphanSummary(KnowledgeResponse):
@@ -79,6 +106,9 @@ class GraphNeighborsResponse(KnowledgeResponse):
     kind: Literal["graph_neighbors"] = "graph_neighbors"
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+    # True when the `limit` node cap cut the walk short: more nodes qualified
+    # within `hops` than were returned. Parallel to the overview's `truncated`.
+    truncated: bool | None = None
 
 
 class GraphOverviewResponse(KnowledgeResponse):

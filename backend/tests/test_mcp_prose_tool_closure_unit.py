@@ -232,6 +232,24 @@ def test_relation_help_matches_the_vault_boundary_and_graph_schema() -> None:
     for topic in ("relations", "akb_link", "akb_relations", "akb_graph"):
         assert "edge_type" in topics[topic], topic
     assert "weak" in topics["akb_link"] and "strong" in topics["akb_link"]
+    # A link that names no strength leaves an existing edge's strength alone, so
+    # the help must not promise that an omitted `edge_type` means `strong`.
+    link_help = re.sub(r"\s+", " ", topics["akb_link"])
+    assert "an omitted one leaves the stored strength as it is (a new edge is `strong`)" in link_help
+    assert "(default)" not in link_help
+    relations_help = re.sub(r"\s+", " ", topics["relations"])
+    assert "linking it again with none leaves its strength as it is" in relations_help
+
+    # The walk's direction is documented where the walk is: the parameter, what
+    # `outward` follows, that it needs `uri`, and an example.
+    graph_help = re.sub(r"\s+", " ", topics["akb_graph"])
+    assert "| direction |" in topics["akb_graph"]
+    for phrase in (
+        "`outward`", "`both`", "incoming `derived_from` and `depends_on` edges", "what depends on it",
+        "With `vault` and no `uri`, `outward` is refused",
+    ):
+        assert phrase in graph_help, phrase
+    assert 'direction="outward"' in topics["akb_graph"]
 
 
 def test_help_root_table_topics_are_real_help_topics() -> None:

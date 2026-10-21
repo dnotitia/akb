@@ -2272,10 +2272,24 @@ export const grepDocs = (query: string, vaults?: string[] | string, limit = 20, 
 export type EdgeType = "strong" | "weak";
 export interface GraphApiNode {
   uri: string;
+  // The node's title when it has one; a document without a title is named by
+  // its path.
   name?: string;
   resource_type?: string;
   degree?: number | null;
   depth?: number | null;
+  // What the server knows about the resource, set only when it resolves in the
+  // vault and optional so an older server stays valid. `title` is a document's
+  // real title (absent when it has none) or a table's / file's name; `doc_type`,
+  // `tags` and `path` are documents only.
+  title?: string;
+  doc_type?: string;
+  tags?: string[];
+  path?: string;
+  // When the resource last changed: ISO 8601 in UTC to the second
+  // (`2026-10-20T13:08:25Z`). Absent when the server has no time for it (or is
+  // older than this field), so a time filter must decide what absent means.
+  updated_at?: string;
 }
 export interface GraphApiEdge {
   source: string;
@@ -2292,6 +2306,14 @@ export interface GraphApiEdge {
 // `/coll/<path>/doc/<basename>` form transparently.
 import { docUri as _docUri } from "@/lib/uri";
 
+// GET /graph. With `uri` it is the neighbourhood walk; the server then also says
+// whether `limit` cut it short. Without it, the vault overview shape applies
+// (see GraphOverviewResponse). Optional so an older server stays valid.
+export interface GraphNeighborsResponse {
+  nodes: GraphApiNode[];
+  edges: GraphApiEdge[];
+  truncated?: boolean;
+}
 export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) => {
   // Backend 0.3.0 renamed the graph traversal radius from `depth`
   // to `hops` to disambiguate it from `browse?depth` (collection-tree
@@ -2303,7 +2325,7 @@ export const getGraph = (vault: string, docPath?: string, hops = 2, limit = 50) 
   // canonical URI so the same backend endpoint can center the BFS correctly.
   if (docPath) p.set("uri", docPath.startsWith("akb://") ? docPath : _docUri(vault, docPath));
   else p.set("vault", vault);
-  return api<{ nodes: GraphApiNode[]; edges: GraphApiEdge[] }>(`/graph?${p}`);
+  return api<GraphNeighborsResponse>(`/graph?${p}`);
 };
 
 // Whole-vault overview: the top-`topK` highest-degree nodes + induced edges,
@@ -2370,7 +2392,14 @@ export interface RelationRow {
   resource_type?: string;
   kind: "implicit" | "explicit";
   edge_type?: EdgeType;
+  // The other side's title when it has one (else its path), plus the same
+  // optional fields as GraphApiNode.
   name?: string;
+  title?: string;
+  doc_type?: string;
+  tags?: string[];
+  path?: string;
+  updated_at?: string;
 }
 export const getRelations = (vault: string, docPath: string) => {
   // The relations endpoint accepts any typed resource URI. Document callers
