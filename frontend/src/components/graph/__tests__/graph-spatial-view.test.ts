@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PerspectiveCamera, Vector3 } from "three";
-import { cameraForPoints, edgeCurvePoints, focusSpatialCamera, visibleLabels } from "../graph-spatial-view";
+import { TOP_VIEW, cameraForPoints, edgeCurvePoints, focusSpatialCamera, visibleLabels } from "../graph-spatial-view";
 
 describe("spatial graph presentation", () => {
   it.each([12, 400])("brings a selected point into the unobscured viewport from camera depth %i", distance => {
@@ -39,5 +39,37 @@ describe("spatial graph presentation", () => {
     const labels = [{ uri: "normal", x: 100, y: 100, depth: 0, priority: 0 }, { uri: "selected", x: 105, y: 100, depth: 0, priority: 100 }, { uri: "behind-camera", x: 300, y: 200, depth: 2, priority: 0 }];
     expect(visibleLabels(labels, 800, 600).map(l => l.uri)).toEqual(["selected"]);
     expect(labels).toHaveLength(3);
+  });
+});
+
+describe("flat map camera", () => {
+  it("looks straight down on the map's centre", () => {
+    const view = cameraForPoints([{ x: -50, y: 0, z: 0 }, { x: 50, y: 20, z: 0 }], 1.5, TOP_VIEW);
+    expect(view.position.x).toBeCloseTo(view.target.x);
+    expect(view.position.y).toBeCloseTo(view.target.y);
+    expect(view.position.z).toBeGreaterThan(view.target.z);
+    expect(view.target).toEqual({ x: 0, y: 10, z: 0 });
+  });
+});
+
+describe("flat map edge curves", () => {
+  it("bend parallel relationships within the plane so a top-down camera sees them apart", () => {
+    const a = { x: -50, y: 0, z: 0 }, b = { x: 50, y: 0, z: 0 };
+    const first = edgeCurvePoints(a, b, 0, 2, true), second = edgeCurvePoints(a, b, 1, 2, true);
+    expect([...first, ...second].every(point => point.z === 0)).toBe(true);
+    expect(Math.abs(first[8].y - second[8].y)).toBeGreaterThan(5);
+    expect(edgeCurvePoints(a, a, 0, 1, true).every(point => point.z === 0)).toBe(true);
+  });
+});
+
+describe("label boxes", () => {
+  it("collide by their own size and anchor, so a label beside its dot does not hide one below another", () => {
+    const base = { depth: 0, priority: 1, width: 120, lines: 1 };
+    const kept = visibleLabels([
+      { uri: "a", x: 500, y: 300, ...base, ax: -0.5, ay: 0, priority: 2 },
+      { uri: "b", x: 560, y: 300, ...base, ax: 0, ay: -0.5 },
+      { uri: "c", x: 520, y: 305, ...base, ax: -0.5, ay: 0 },
+    ], 1200, 800);
+    expect(kept.map(l => l.uri)).toEqual(["a", "b"]);
   });
 });

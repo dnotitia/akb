@@ -920,8 +920,42 @@ an `sr-only` summary, never the only signal.
   still operable. These are independent pressed-state filter buttons,
   not tabs; hidden kinds retain their counts and remain recoverable. Counts
   describe the loaded map, not an assumed complete Vault inventory. A
-  focused-neighborhood breadcrumb and hop control appear only when
-  relevant. Keep gesture instructions in Help, not another persistent title row.
+  focused-neighborhood breadcrumb and a hop dropdown (1, 2 or 3 hops) appear
+  around a focus; a "Changed within" dropdown (last day, 7 days, 30 days, any
+  time) sits beside it and in the whole-Vault strip, keeping only resources
+  whose `updated_at` falls in the window (the focus, the selection, revealed
+  resources and resources without a reported time always stay), applied
+  before the walk so it never passes through a hidden resource. Around a focus the canvas colours each resource by its hop distance —
+  focus `cat-5`, then `cat-1`, `cat-2`, `cat-3` for 1, 2 and 3 hops, a
+  lightness-ramped run of the categorical scale — and shape alone carries the
+  kind; a compact hop legend beside the control names each colour, and the
+  kind legend's markers turn neutral so they do not claim a colour the map is
+  not using. Around a focus, "Strong links only" is on by default: the map
+  follows explicit relations outward from the focus (and `derived_from` back
+  to what was derived from it), so shared context such as a cluster ends the
+  walk instead of pulling in every other resource that shares it; the focus's
+  own body links, and those of every strongly reached resource short of the
+  chosen depth (one step further out), are weak neighbours that are never
+  followed: with more than
+  five they fold into a "Show N weak links" control (with five or fewer they
+  show, faded), and while folded no weak line is drawn. Around a focus the map
+  is concentric: the focus at the centre and each strongly reached resource on
+  its hop's ring (weak neighbours just outside the deepest ring); only the
+  walk's backbone (the edge that first reached each resource) pulls in the
+  layout and draws at full weight, other strong edges among the kept resources
+  stay faint until a resource is selected. A note says where the strong walk
+  ends. Labels are titles (the file name without path or extension when the
+  server has no title) cut to 15 characters on one line (the inspector and
+  tooltip carry the full title), prefixed by a muted category (document type,
+  else collection) when the map holds more than one;
+  around a focus they sit on the far side of their dot from the focus and are
+  prioritised by distance. Turning it off (`links=all`) shows every loaded
+  connection. A Vault without explicit relations around the focus shows all
+  connections with a one-line notice. The whole-Vault map also defaults to
+  strong links only (body links drawn only when it is turned off) and colours
+  resources by collection: the four largest collections take `cat-1`..`cat-4`,
+  the rest share `cat-6`, named in a compact legend; shape still carries the
+  kind. A fit keeps the map below the floating tools. Keep gesture instructions in Help, not another persistent title row.
   Measure the dock's actual height after wrapping: List's scroll viewport,
   inspector, relationship details, and notices must begin below it. Focusable
   canvas labels must also stay clear. Empty space around floating controls
@@ -929,10 +963,11 @@ an `sr-only` summary, never the only signal.
   Honest loaded-resource/relationship counts live at the canvas foot.
   Relation kinds, hidden resources, and orphan decluttering live
   behind Filters rather than in a permanent left rail; resource types are also
-  available there. Hop depth appears only
-  after a resource becomes the focus. The graph canvas owns the remaining
-  workspace: a true Three.js/WebGL perspective scene, with compact bottom
-  orbit/zoom/fit/pan tools. Use Obsidian-inspired unlit, camera-facing dots and
+  available there. The graph canvas owns the remaining
+  workspace: a Three.js/WebGL scene shown as a flat map by default (every
+  resource on one plane, seen from straight above, no rotation) with a 2D / 3D
+  choice in the bottom tools that the browser remembers; 3D is the
+  perspective volume with compact orbit buttons. Zoom/fit/pan tools serve both. Use Obsidian-inspired unlit, camera-facing dots and
   plain projected text, never glossy spheres, cubes, boxed labels or lighting.
   Dot radius stays bounded in screen pixels, including single-resource fit and
   zoom; loaded connections modestly increase size. Small flat circles identify
@@ -941,18 +976,24 @@ an `sr-only` summary, never the only signal.
   tooltips and the inspector retain explicit kind text. A separate teal ring
   marks selection without erasing the resource's kind color or shape. Neutral
   curved lines preserve parallel relationships;
-  dashed lines mean body links, not a different relation type. Selection accents
+  dashed lines mean weak connections (body links, or a relation made weak via `edge_type`), not a different relation type; strength comes from the server's `edge_type` (explicit relations strong by default) and is never inferred from the relation label. Where a strong connection joins two resources, a weak one between the same two is not drawn and the inspector lists the pair once. Selection accents
   only the resource and its immediate connections. All initial scenes use
-  off-thread three-dimensional force layout, never row/column packing or a
-  tilted 2D plane. Projected labels face the reader and avoid overlap; zoom,
+  off-thread force layout in the chosen dimension (two for the flat map, three
+  for 3D), never row/column packing or a tilted plane; switching dimension
+  lays the map out afresh. Projected labels face the reader and avoid overlap; zoom,
   selection or List reveals dense titles. Selection, theme and filtering do
   not restart layout; incremental expansion fixes existing coordinates.
-  Left-drag orbits, right-drag pans, scroll/pinch zooms. There is no automatic
-  camera motion; buttons and canvas keyboard shortcuts provide alternatives.
-  Pinning is explicit. WebGL2 initialization/context failure offers List instead
+  On the flat map, dragging the background pans and arrow keys pan; in 3D,
+  left-drag orbits and right-drag pans. Scroll/pinch zooms in both. Dragging a
+  resource moves that resource (on its camera-facing plane, z = 0 on the flat
+  map) with its lines attached and never selects it; it keeps that place
+  through later layouts until Rearrange. There is no automatic camera motion;
+  buttons and canvas keyboard shortcuts provide alternatives. Pinning is
+  explicit. WebGL2 initialization/context failure offers List instead
   of silently substituting another renderer. Selecting a node opens a 22rem overlay inspector and never
-  narrows the canvas. The inspector prioritizes title/location, Preview / Open
-  in vault, Explore connections and Load connections; summary and secondary
+  narrows the canvas. The inspector prioritizes the title (a link that opens the resource in the vault)
+  and location, Focus (the primary action: make it the centre of the map),
+  Preview and Load connections; Outgoing and Incoming connections start folded; summary and secondary
   copy/pin/hide tools remain subordinate. Whole-Vault search changes to a focused neighborhood while click
   selection remains highlight-only. A first-class List view is the keyboard and
   assistive-technology source of truth, progressively revealing at most 50 rows

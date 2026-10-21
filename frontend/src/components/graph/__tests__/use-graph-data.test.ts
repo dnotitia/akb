@@ -7,10 +7,14 @@ import {
   docIdFromUri,
   endpointUri,
   degreeMap,
+  changedWithin,
+  hopDistances,
   impactCones,
+  strongNeighborhood,
+  strongerOnly,
 } from "../use-graph-data";
 import { docUri } from "@/lib/uri";
-import { ALL_RELATIONS, DEFAULT_VIEW, type GraphNode, type GraphEdge } from "../graph-types";
+import { ALL_RELATIONS, DEFAULT_VIEW, categoryOf, displayName, edgeId, edgeStrength, shortName, type GraphNode, type GraphEdge } from "../graph-types";
 
 describe("apiToPayload", () => {
   it("preserves server degree, traversal depth, and relation source without guessing missing values", () => {
@@ -422,5 +426,148 @@ describe("impactCones", () => {
     const { out } = impactCones(cyclic, "x");
     expect(out.has("x")).toBe(false); // root excluded
     expect(out).toEqual(new Set(["y"])); // and it returns (no infinite loop)
+  });
+});
+
+describe("hopDistances", () => {
+  const edge = (source: string, target: string): GraphEdge => ({ source, target, relation: "links_to" as GraphEdge["relation"], kind: "implicit" });
+  it("walks relationships in either direction and keeps the shortest distance", () => {
+    const hops = hopDistances([edge("a", "b"), edge("c", "b"), edge("c", "d"), edge("a", "d"), edge("e", "e")], "a");
+    expect(Object.fromEntries(hops)).toEqual({ a: 0, b: 1, d: 1, c: 2 });
+  });
+  it("is empty without a start and leaves unreachable resources out", () => {
+    expect(hopDistances([edge("a", "b")], undefined).size).toBe(0);
+    expect(hopDistances([edge("a", "b"), edge("x", "y")], "a").has("x")).toBe(false);
+  });
+});
+
+describe("strongNeighborhood", () => {
+  const node = (uri: string): GraphNode => ({ uri, name: uri, kind: "document" });
+  const strong = (source: string, target: string, relation: GraphEdge["relation"] = "related_to"): GraphEdge => ({ source, target, relation, kind: "explicit" });
+  const weak = (source: string, target: string): GraphEdge => ({ source, target, relation: "links_to", kind: "implicit" });
+  // An incident with its context, its postmortem, a sibling incident sharing the cluster, and body links.
+  const payload = {
+    nodes: ["inc", "inc2", "cluster", "node", "service", "owner", "pm", "runbook", "secondary", "inc-old"].map(node),
+    edges: [
+      strong("inc", "cluster"), strong("inc", "node"), strong("inc", "service"), strong("inc", "owner"),
+      strong("pm", "inc", "derived_from"), strong("pm", "service"),
+      strong("inc2", "cluster"), strong("inc2", "service"),
+      weak("inc", "runbook"), weak("inc", "secondary"), weak("inc", "inc-old"), weak("runbook", "inc2"),
+    ],
+  };
+
+  it("keeps an incident's own context and its postmortem, not the other incidents of the same cluster", () => {
+    const scene = strongNeighborhood(payload, "inc", 3);
+    expect(scene.strong).toBe(true);
+    expect(new Set(scene.nodes.map(n => n.uri))).toEqual(new Set(["inc", "cluster", "node", "service", "owner", "pm", "runbook", "secondary", "inc-old"]));
+    expect([...scene.weak].sort()).toEqual(["inc-old", "runbook", "secondary"]);
+    expect(scene.edges.some(e => e.source === "runbook" && e.target === "inc2")).toBe(false);
+  });
+
+  it("walks a postmortem to its incidents and their context, within the hop limit", () => {
+    expect(new Set(strongNeighborhood(payload, "pm", 1).nodes.map(n => n.uri))).toEqual(new Set(["pm", "inc", "service"]));
+    // Hop 2 also shows the incident's own weak links (one step past it), faded and never walked.
+    const two = strongNeighborhood(payload, "pm", 2);
+    expect(new Set(two.nodes.map(n => n.uri))).toEqual(new Set(["pm", "inc", "service", "cluster", "node", "owner", "runbook", "secondary", "inc-old"]));
+    expect(Object.fromEntries(two.weakDepth)).toEqual({ runbook: 2, secondary: 2, "inc-old": 2 });
+  });
+
+  it("gives every strongly reached resource its own weak links, within the chosen depth", () => {
+    const one = strongNeighborhood(payload, "inc", 1);
+    expect([...one.weak].sort()).toEqual(["inc-old", "runbook", "secondary"]);
+    // runbook's own body link to inc2 would sit at hop 3, past the depth: never shown.
+    expect(strongNeighborhood(payload, "inc", 2).nodes.some(n => n.uri === "inc2")).toBe(false);
+  });
+
+  it("always keeps what the reader revealed, with its edges to the scene", () => {
+    const scene = strongNeighborhood(payload, "inc", 2, ["inc2"]);
+    expect(scene.nodes.map(n => n.uri)).toContain("inc2");
+    expect(scene.edges.some(e => e.source === "inc2" && e.target === "cluster")).toBe(true);
+  });
+
+  it("leaves a map without explicit relations unchanged", () => {
+    const plain = { nodes: payload.nodes, edges: payload.edges.filter(e => e.kind !== "explicit") };
+    const scene = strongNeighborhood(plain, "inc", 2);
+    expect(scene.strong).toBe(false);
+    expect(scene.nodes).toHaveLength(plain.nodes.length);
+  });
+});
+
+describe("edge strength", () => {
+  it("reads the server's edge_type and falls back to provenance", () => {
+    expect(edgeStrength({ kind: "explicit" })).toBe("strong");
+    expect(edgeStrength({ kind: "implicit" })).toBe("weak");
+    expect(edgeStrength({})).toBe("weak");
+    expect(edgeStrength({ kind: "explicit", edge_type: "weak" })).toBe("weak");
+    expect(edgeStrength({ kind: "implicit", edge_type: "strong" })).toBe("strong");
+  });
+
+  it("keeps one line per pair when a strong connection repeats a body link, in either direction", () => {
+    const edges: GraphEdge[] = [
+      { source: "pm", target: "cluster", relation: "related_to", kind: "explicit" },
+      { source: "pm", target: "cluster", relation: "links_to", kind: "implicit" },
+      { source: "inc", target: "pm", relation: "links_to", kind: "implicit" },
+      { source: "pm", target: "inc", relation: "derived_from", kind: "explicit" },
+      { source: "pm", target: "runbook", relation: "links_to", kind: "implicit" },
+    ];
+    expect(strongerOnly(edges).map(e => `${e.source}>${e.target}:${e.relation}`)).toEqual([
+      "pm>cluster:related_to", "pm>inc:derived_from", "pm>runbook:links_to",
+    ]);
+  });
+
+  it("applies to every visible scene and keeps the server's edge_type", () => {
+    const payload = apiToPayload({
+      nodes: [{ uri: "a", name: "A", resource_type: "document" }, { uri: "b", name: "B", resource_type: "document" }],
+      edges: [
+        { source: "a", target: "b", relation: "related_to", kind: "explicit", edge_type: "strong" },
+        { source: "b", target: "a", relation: "links_to", kind: "implicit", edge_type: "weak" },
+      ],
+    } as never);
+    expect(payload.edges.map(e => e.edge_type)).toEqual(["strong", "weak"]);
+    expect(visibleGraph(payload, DEFAULT_VIEW, new Set(), false).edges).toHaveLength(1);
+  });
+});
+
+describe("labels and the strong walk's shape", () => {
+  it("names a resource by its title, else by its file name without path or extension", () => {
+    expect(displayName({ name: "incidents/inc-1.md", title: "Payment pods crash" })).toBe("Payment pods crash");
+    expect(displayName({ name: "incidents/inc-1.md" })).toBe("inc-1");
+    expect(displayName({ name: "incidents/inc-1.md", title: "  " })).toBe("inc-1");
+    expect(categoryOf({ doc_type: "postmortem", group: "postmortems" })).toBe("postmortem");
+    expect(categoryOf({ group: "hr/people" })).toBe("people");
+    expect(categoryOf({})).toBe("");
+  });
+
+  it("records the backbone and what each hop adds", () => {
+    const s = (source: string, target: string, relation: GraphEdge["relation"] = "related_to"): GraphEdge => ({ source, target, relation, kind: "explicit" });
+    const scene = strongNeighborhood({ nodes: ["f", "a", "b", "pm", "c"].map(uri => ({ uri, name: uri, kind: "document" as const })),
+      edges: [s("f", "a"), s("f", "b"), s("pm", "f", "derived_from"), s("pm", "c"), s("pm", "a")] }, "f", 3);
+    expect(scene.perHop).toEqual([3, 1, 0]);
+    expect(Object.fromEntries(scene.reach)).toEqual({ f: 0, a: 1, b: 1, pm: 1, c: 2 });
+    expect(scene.tree.has(edgeId(s("pm", "c")))).toBe(true);
+    expect(scene.tree.has(edgeId(s("pm", "a")))).toBe(false);
+  });
+});
+
+describe("changedWithin", () => {
+  const now = Date.parse("2026-10-21T00:00:00Z");
+  const at = (uri: string, updated_at?: string): GraphNode => ({ uri, name: uri, kind: "document", ...(updated_at ? { updated_at } : {}) });
+  const payload = {
+    nodes: [at("focus", "2026-01-01T00:00:00Z"), at("fresh", "2026-10-20T12:00:00Z"), at("week", "2026-10-15T00:00:00Z"), at("old", "2026-09-01T00:00:00Z"), at("unknown")],
+    edges: [{ source: "focus", target: "old", relation: "related_to" as const, kind: "explicit" as const }, { source: "focus", target: "fresh", relation: "related_to" as const, kind: "explicit" as const }],
+  };
+  it("keeps what changed within the window, the kept resources and those without a time", () => {
+    expect(changedWithin(payload, "1", ["focus"], now).nodes.map(n => n.uri)).toEqual(["focus", "fresh", "unknown"]);
+    expect(changedWithin(payload, "7", ["focus"], now).nodes.map(n => n.uri)).toEqual(["focus", "fresh", "week", "unknown"]);
+    expect(changedWithin(payload, "30", [], now).nodes.map(n => n.uri)).toEqual(["fresh", "week", "unknown"]);
+    expect(changedWithin(payload, "all", [], now)).toBe(payload);
+  });
+  it("drops edges to what it removes", () => {
+    expect(changedWithin(payload, "7", ["focus"], now).edges.map(e => e.target)).toEqual(["fresh"]);
+  });
+  it("caps map labels at fifteen characters", () => {
+    expect(shortName({ name: "x", title: "dino-shop/recommendationservice OOMKilled" })).toBe("dino-shop/recom…");
+    expect(shortName({ name: "x", title: "조은우 (dino.jo.eunwoo)" })).toBe("조은우 (dino.jo.eu…");
+    expect(shortName({ name: "x", title: "dino-dc1-poc01" })).toBe("dino-dc1-poc01");
   });
 });

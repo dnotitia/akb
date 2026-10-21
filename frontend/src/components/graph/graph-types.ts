@@ -22,6 +22,10 @@ export const ALL_RELATIONS: ReadonlyArray<RelationKind> = [
 export interface GraphNode {
   uri: string;
   name: string;
+  /** The document's own title when the server reports one; labels prefer it over ``name``. */
+  title?: string;
+  /** When the resource last changed (ISO 8601), when the server reports it. */
+  updated_at?: string;
   kind: NodeKind;
   doc_id?: string;
   doc_type?: string;
@@ -42,6 +46,20 @@ export interface GraphEdge {
   relation: RelationKind;
   /** Server-reported provenance. Never infer it from the relation label. */
   kind?: "implicit" | "explicit";
+  /** Server-reported strength: an explicit relation is strong unless made weak; a body link is always weak. */
+  edge_type?: "strong" | "weak";
+}
+
+/** A stable key for one edge (endpoints, relation and provenance); endpoints are canonical URI strings. */
+export function edgeId(e: Pick<GraphEdge, "source" | "target" | "relation" | "kind">): string {
+  return [e.source, e.target, e.relation, e.kind ?? ""].join("\u0000");
+}
+
+/** The strength of a connection: the server's ``edge_type``; from a server that does not report it, an explicit
+ *  relation is strong and anything else weak. Never inferred from the relation label. */
+export function edgeStrength(edge: Pick<GraphEdge, "kind" | "edge_type">): "strong" | "weak" {
+  if (edge.edge_type === "strong" || edge.edge_type === "weak") return edge.edge_type;
+  return edge.kind === "explicit" ? "strong" : "weak";
 }
 
 /** A related-resource reference from the detail panel's RELATIONS list —
@@ -66,13 +84,48 @@ export interface GraphView {
   // field was called `depth`, which collided with the also-
   // renamed `akb_browse.depth` (collection-tree depth).
   hops: 1 | 2 | 3;
+  /** Around a focus: follow explicit relations only ("strong", the default)
+   *  or every loaded connection, body links included ("all"). */
+  links: "strong" | "all";
+  /** Only resources changed within the last N days ("all" = any time). */
+  since: GraphSince;
   types: Set<NodeKind>;
   relations: Set<RelationKind>;
   selected?: string;
 }
 
+/** Colour tokens for the distance from the focused resource: the focus, then
+ *  1, 2 and 3 hops away. A lightness-ramped run of the categorical scale, so
+ *  neighbouring steps differ slightly and the focus stands out in the accent. */
+export const HOP_TOKENS = ["cat-5", "cat-1", "cat-2", "cat-3"] as const;
+
+/** What a resource is called on the map: its title, else its name without the collection path and extension. */
+export function displayName(node: Pick<GraphNode, "name" | "title">): string {
+  const title = node.title?.trim();
+  if (title) return title;
+  const leaf = node.name.split("/").filter(Boolean).at(-1) ?? node.name;
+  return leaf.replace(/\.md$/i, "") || node.name;
+}
+
+/** The short category shown before a label: the document type when known, else the collection it lives in. */
+export function categoryOf(node: Pick<GraphNode, "doc_type" | "group">): string {
+  return node.doc_type?.trim() || node.group?.split("/").at(-1) || "";
+}
+
+export type GraphSince = "all" | "1" | "7" | "30";
+export const GRAPH_SINCE: GraphSince[] = ["1", "7", "30", "all"];
+
+/** Labels on the map are kept short; the inspector and tooltips carry the full title. */
+export const LABEL_MAX_CHARS = 15;
+export function shortName(node: Pick<GraphNode, "name" | "title">): string {
+  const full = displayName(node), chars = [...full];
+  return chars.length > LABEL_MAX_CHARS ? chars.slice(0, LABEL_MAX_CHARS).join("") + "…" : full;
+}
+
 export const DEFAULT_VIEW: GraphView = {
   hops: 1,
+  links: "strong",
+  since: "all",
   types: new Set(ALL_NODE_KINDS),
   relations: new Set(ALL_RELATIONS),
 };

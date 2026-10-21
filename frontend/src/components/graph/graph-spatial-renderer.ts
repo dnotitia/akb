@@ -1,14 +1,14 @@
 import {
   BufferGeometry, CircleGeometry, Color, DynamicDrawUsage,
   Float32BufferAttribute, Group, InstancedMesh, LineBasicMaterial, LineDashedMaterial,
-  LineSegments, Matrix4, Mesh, MeshBasicMaterial, PerspectiveCamera, PlaneGeometry,
-  Raycaster, RingGeometry, Scene, Spherical, Vector2, Vector3, WebGLRenderer,
+  LineSegments, MOUSE, Matrix4, Mesh, MeshBasicMaterial, PerspectiveCamera, Plane, PlaneGeometry,
+  Raycaster, RingGeometry, Scene, Spherical, TOUCH, Vector2, Vector3, WebGLRenderer,
   type Material, type Object3D,
 } from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import type { GraphEdge, GraphNode } from "./graph-types";
-import type { SpatialPoint } from "./graph-spatial-layout";
-import { cameraForPoints, edgeCurvePoints, focusSpatialCamera, visibleLabels, type ProjectedLabel } from "./graph-spatial-view";
+import { HOP_TOKENS, categoryOf, edgeId, edgeStrength, shortName, type GraphEdge, type GraphNode } from "./graph-types";
+import type { GraphDimension, SpatialPoint } from "./graph-spatial-layout";
+import { CORNER_VIEW, TOP_VIEW, cameraForPoints, edgeCurvePoints, focusSpatialCamera, visibleLabels, type ProjectedLabel } from "./graph-spatial-view";
 
 interface Callbacks {
   onSelect(uri: string | undefined): void;
@@ -17,7 +17,10 @@ interface Callbacks {
   onLabels(labels: ProjectedLabel[]): void;
   onCameraChange(): void;
   onContextLost(): void;
+  /** A resource was dragged to a new position (already written to the shared position map). */
+  onMove?(uri: string): void;
 }
+
 
 /** GPU rendering and camera only. Data, permissions and force layout stay outside. */
 export class SpatialGraphRenderer {
@@ -43,9 +46,17 @@ export class SpatialGraphRenderer {
   private frame = 0;
   private disposed = false;
   private down?: { x: number; y: number; button: number };
+  private drag?: { uri: string; pointerId: number; plane: Plane; grab: Vector3; moved: boolean };
+  private dragFrame = 0;
+  private hops?: Map<string, number>;
+  private weak = new Set<string>();
+  private topInset = 0;
+  private showCategory = false;
+  private tree?: Set<string>;
+  private groupTokens?: Map<string, string>;
   private colors: Record<string, string> = {};
 
-  constructor(private host: HTMLDivElement, private callbacks: Callbacks) {
+  constructor(private host: HTMLDivElement, private callbacks: Callbacks, private dimension: GraphDimension = 2) {
     this.renderer = new WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.domElement.setAttribute("aria-hidden", "true");
@@ -57,10 +68,15 @@ export class SpatialGraphRenderer {
     this.controls.maxDistance = 50000;
     this.controls.screenSpacePanning = true;
     this.controls.addEventListener("change", this.changed);
+    this.applyDimension();
     this.scene.add(this.resources);
     this.camera.position.set(100, 60, 260);
-    this.renderer.domElement.addEventListener("pointerdown", this.pointerDown);
+    // Capture phase: a press on a resource must disable the camera controls
+    // before their own pointerdown handler starts an orbit or a pan.
+    this.renderer.domElement.addEventListener("pointerdown", this.pointerDown, { capture: true });
     this.renderer.domElement.addEventListener("pointerup", this.pointerUp);
+    this.renderer.domElement.addEventListener("pointercancel", this.pointerCancel);
+    this.renderer.domElement.addEventListener("lostpointercapture", this.pointerCancel);
     this.renderer.domElement.addEventListener("pointermove", this.pointerMove);
     this.renderer.domElement.addEventListener("pointerleave", this.pointerLeave);
     this.renderer.domElement.addEventListener("contextmenu", this.contextMenu);
@@ -71,9 +87,79 @@ export class SpatialGraphRenderer {
   private changed = () => { if (!this.adjusting) this.callbacks.onCameraChange(); this.draw(); };
   private contextLost = (event: Event) => { event.preventDefault(); this.callbacks.onContextLost(); };
   private contextMenu = (event: Event) => event.preventDefault();
-  private pointerDown = (event: PointerEvent) => { this.down = { x: event.clientX, y: event.clientY, button: event.button }; };
+  /** 2D: a flat map seen from straight above; left-drag pans. 3D: left-drag orbits, right-drag pans. */
+  private applyDimension() {
+    const flat = this.dimension === 2;
+    this.controls.enableRotate = !flat;
+    this.controls.mouseButtons = flat
+      ? { LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }
+      : { LEFT: MOUSE.ROTATE, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN };
+    this.controls.touches = flat ? { ONE: TOUCH.PAN, TWO: TOUCH.DOLLY_PAN } : { ONE: TOUCH.ROTATE, TWO: TOUCH.DOLLY_PAN };
+    this.camera.up.set(0, 1, 0);
+  }
+
+  setDimension(dimension: GraphDimension) {
+    if (dimension === this.dimension) return;
+    this.dimension = dimension; this.applyDimension();
+  }
+
+  private pointerDown = (event: PointerEvent) => {
+    this.down = { x: event.clientX, y: event.clientY, button: event.button };
+    if (event.button !== 0) return;
+    const node = this.hit(event).node, point = node && this.positions.get(node.uri);
+    if (!node || !point) return;
+    // Drag on the plane through the resource that faces the camera (z = 0 on a flat map).
+    const at = new Vector3(point.x, point.y, point.z);
+    const normal = new Vector3(); this.camera.getWorldDirection(normal);
+    const plane = new Plane().setFromNormalAndCoplanarPoint(normal, at);
+    const grab = this.pointOnPlane(event, plane)?.sub(at) ?? new Vector3();
+    this.drag = { uri: node.uri, pointerId: event.pointerId, plane, grab, moved: false };
+    this.controls.enabled = false;
+    this.renderer.domElement.setPointerCapture?.(event.pointerId);
+    this.host.style.cursor = "grabbing";
+  };
+  private pointOnPlane(event: PointerEvent, plane: Plane) {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.ray.setFromCamera(new Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1), this.camera);
+    return this.ray.ray.intersectPlane(plane, new Vector3()) ?? undefined;
+  }
+  private dragTo(event: PointerEvent) {
+    const drag = this.drag, down = this.down;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.moved && down && Math.hypot(event.clientX - down.x, event.clientY - down.y) <= 5) return;
+    const hit = this.pointOnPlane(event, drag.plane); if (!hit) return;
+    hit.sub(drag.grab);
+    if (!drag.moved) {
+      // The move counts from the first frame past the click threshold, so a
+      // layout that finishes mid-gesture cannot overwrite the dragged position.
+      drag.moved = true;
+      this.callbacks.onMove?.(drag.uri);
+    }
+    this.positions.set(drag.uri, { x: hit.x, y: hit.y, z: this.dimension === 2 ? 0 : hit.z });
+    // One rebuild per frame keeps the lines attached while the pointer moves.
+    if (!this.dragFrame) this.dragFrame = requestAnimationFrame(() => { this.dragFrame = 0; if (!this.disposed) this.rebuild(); });
+  }
+  /** Ends the drag of ``event``'s pointer; ``commit`` places the resource at the release point first. Always restores the camera controls. */
+  private endDrag(event: PointerEvent, commit: boolean) {
+    const drag = this.drag; if (!drag || event.pointerId !== drag.pointerId) return;
+    try {
+      if (commit && drag.moved) this.dragTo(event);
+    } finally {
+      this.drag = undefined; this.controls.enabled = true;
+      if (this.renderer.domElement.hasPointerCapture?.(drag.pointerId)) this.renderer.domElement.releasePointerCapture(drag.pointerId);
+      this.host.style.cursor = "pointer";
+    }
+  }
+  private pointerCancel = (event: PointerEvent) => {
+    if (this.drag?.pointerId !== event.pointerId) return;
+    this.endDrag(event, false); this.down = undefined;
+  };
   private pointerUp = (event: PointerEvent) => {
+    // Another pointer (a second finger) neither ends nor clicks during a drag.
+    if (this.drag && event.pointerId !== this.drag.pointerId) return;
+    const dragged = this.drag?.moved; this.endDrag(event, true);
     const down = this.down; this.down = undefined;
+    if (dragged) return;
     if (!down || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) return;
     const hit = this.hit(event);
     if (down.button === 2) { if (hit.node) this.callbacks.onContext(hit.node, event.clientX, event.clientY); }
@@ -84,12 +170,13 @@ export class SpatialGraphRenderer {
     }
   };
   private pointerMove = (event: PointerEvent) => {
+    if (this.drag) { this.dragTo(event); return; }
     if (event.buttons) return;
     const hit = this.hit(event), uri = hit.node?.uri;
     this.host.style.cursor = hit.node || hit.edge ? "pointer" : "grab";
     if (uri !== this.hovered) { this.hovered = uri; this.draw(); }
   };
-  private pointerLeave = () => { this.hovered = undefined; this.host.style.cursor = "grab"; this.draw(); };
+  private pointerLeave = () => { if (this.drag) return; this.hovered = undefined; this.host.style.cursor = "grab"; this.draw(); };
 
   private hit(event: PointerEvent) {
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -114,9 +201,14 @@ export class SpatialGraphRenderer {
     this.selected = selected; this.edge = edge; this.pinned = pinned; this.rebuild();
   }
 
+  /** Distance from the focused resource; while set, a resource's colour is its distance and its shape its kind. */
+  setHops(hops: Map<string, number> | undefined, weak: Set<string> = new Set(), tree?: Set<string>, groupTokens?: Map<string, string>) {
+    this.hops = hops; this.weak = weak; this.tree = tree; this.groupTokens = groupTokens; this.rebuild();
+  }
+
   theme() {
     const css = getComputedStyle(document.documentElement);
-    this.colors = Object.fromEntries(["surface", "cat-1", "cat-3", "cat-4", "graph-edge", "link"].map(key => [key, css.getPropertyValue(`--color-${key}`).trim()]));
+    this.colors = Object.fromEntries(["surface", "cat-1", "cat-2", "cat-3", "cat-4", "cat-5", "cat-6", "graph-edge", "link"].map(key => [key, css.getPropertyValue(`--color-${key}`).trim()]));
     this.scene.background = new Color(this.colors.surface);
     this.rebuild();
   }
@@ -134,6 +226,7 @@ export class SpatialGraphRenderer {
 
   private rebuild() {
     this.clearObjects(); this.neighbors = new Set(); this.degrees = new Map();
+    this.showCategory = new Set(this.nodes.map(categoryOf)).size > 1;
     for (const edge of this.edges) {
       this.degrees.set(edge.source, (this.degrees.get(edge.source) ?? 0) + 1);
       this.degrees.set(edge.target, (this.degrees.get(edge.target) ?? 0) + 1);
@@ -152,7 +245,12 @@ export class SpatialGraphRenderer {
       mesh.renderOrder = 1;
       nodes.forEach((node, i) => {
         const active = node.uri === this.selected, nearby = this.neighbors.has(node.uri);
-        const color = new Color(this.colors[kind === "document" ? "cat-1" : kind === "table" ? "cat-3" : "cat-4"]);
+        const hop = this.hops?.get(node.uri);
+        const group = this.groupTokens && (this.groupTokens.get(node.group ?? "") ?? "cat-6");
+        const color = new Color(this.colors[this.hops
+          ? HOP_TOKENS[Math.min(hop ?? HOP_TOKENS.length - 1, HOP_TOKENS.length - 1)]
+          : group ?? (kind === "document" ? "cat-1" : kind === "table" ? "cat-3" : "cat-4")]);
+        if (this.weak.has(node.uri) && !active) color.lerp(background, 0.55);
         if (this.selected && !active && !nearby) color.lerp(background, 0.65);
         mesh.setColorAt(i, color);
       });
@@ -168,17 +266,20 @@ export class SpatialGraphRenderer {
       const key = JSON.stringify([edge.source, edge.target].sort());
       pairs.set(key, [...(pairs.get(key) ?? []), i]);
     });
+    // Weak connections (body links, or a relation made weak) are dashed; strong ones solid.
     for (const implicit of [false, true]) {
       const vertices: number[] = [], colors: number[] = [], indices: number[] = [];
       this.edges.forEach((edge, edgeIndex) => {
-        if ((edge.kind === "implicit") !== implicit) return;
+        if ((edgeStrength(edge) === "weak") !== implicit) return;
         const a = this.positions.get(edge.source), b = this.positions.get(edge.target);
         if (!a || !b) return;
         const parallel = pairs.get(JSON.stringify([edge.source, edge.target].sort()))!;
-        const points = edgeCurvePoints(a, b, parallel.indexOf(edgeIndex), parallel.length);
+        const points = edgeCurvePoints(a, b, parallel.indexOf(edgeIndex), parallel.length, this.dimension === 2);
         const active = edge.source === this.selected || edge.target === this.selected || this.isInspected(edge);
         const color = new Color(this.colors[active ? "link" : "graph-edge"]);
         if (!active) color.lerp(background, 0.25);
+        // Around a focus the walk's backbone carries the picture; other strong edges among the kept resources stay as faint context.
+        if (!active && this.tree && edgeStrength(edge) === "strong" && !this.tree.has(edgeId(edge))) color.lerp(background, 0.85);
         if (this.selected && !active) color.lerp(background, 0.82);
         for (let i = 0; i < points.length - 1; i++) {
           const from = points[i], to = points[i + 1];
@@ -192,6 +293,17 @@ export class SpatialGraphRenderer {
       const lines = new LineSegments(geometry, material); lines.computeLineDistances(); this.edgeObjects.set(lines, indices); this.resources.add(lines);
     }
     this.draw();
+  }
+
+  /** Label priority without a selection: around a focus by distance (focus, then hop 1, 2, 3; weak last), else by connections. */
+  private labelRank(uri: string) {
+    if (this.neighbors.has(uri)) return 70;
+    if (this.hops) {
+      if (this.weak.has(uri)) return 10;
+      const hop = this.hops.get(uri);
+      return hop === undefined ? 5 : [95, 80, 60, 40][Math.min(hop, 3)];
+    }
+    return (this.pinned.has(uri) ? 20 : 0) + Math.min(19, this.degrees.get(uri) ?? 0);
   }
 
   private isInspected(edge: GraphEdge) { return !!this.edge && edge.source === this.edge.source && edge.target === this.edge.target && edge.relation === this.edge.relation && edge.kind === this.edge.kind; }
@@ -232,12 +344,21 @@ export class SpatialGraphRenderer {
       const width = this.host.clientWidth, height = this.host.clientHeight;
       this.faceDotsToCamera(height);
       this.renderer.render(this.scene, this.camera);
+      const screen = (p: SpatialPoint) => { const v = new Vector3(p.x, p.y, p.z).project(this.camera); return { x: (v.x + 1) / 2 * width, y: (-v.y + 1) / 2 * height, z: v.z }; };
+      // Around a focus each label sits on the far side of its resource, away from the focus, so ring labels do not pile onto the centre.
+      const focusUri = this.hops && [...this.hops].find(([, hop]) => hop === 0)?.[0];
+      const focusPoint = focusUri && this.positions.get(focusUri) ? screen(this.positions.get(focusUri)!) : undefined;
       const labels = this.nodes.flatMap(node => {
         const p = this.positions.get(node.uri); if (!p) return [];
-        const projected = new Vector3(p.x, p.y, p.z).project(this.camera);
-        const labelOffset = this.dotRadius(node) + 3;
-        return [{ uri: node.uri, x: (projected.x + 1) / 2 * width, y: (-projected.y + 1) / 2 * height + labelOffset, depth: projected.z,
-          priority: node.uri === this.selected ? 100 : node.uri === this.hovered ? 90 : this.neighbors.has(node.uri) ? 50 : this.pinned.has(node.uri) ? 20 : 0 }];
+        const at = screen(p), gap = this.dotRadius(node) + 3;
+        const chars = [...shortName(node)].length + (this.showCategory ? categoryOf(node).length + 1 : 0);
+        const size = { width: 16 + chars * 6.8, lines: 1 };
+        const priority = node.uri === this.selected ? 100 : node.uri === this.hovered ? 90 : this.labelRank(node.uri);
+        const dx = focusPoint ? at.x - focusPoint.x : 0, dy = focusPoint ? at.y - focusPoint.y : 0, len = Math.hypot(dx, dy);
+        if (!focusPoint || node.uri === focusUri || len < 1) return [{ uri: node.uri, x: at.x, y: at.y + gap, depth: at.z, ...size, ax: -0.5, ay: 0, priority }];
+        const ux = dx / len, uy = dy / len;
+        return [{ uri: node.uri, x: at.x + ux * gap, y: at.y + uy * gap, depth: at.z, ...size, priority,
+          ax: ux > 0.35 ? 0 : ux < -0.35 ? -1 : -0.5, ay: uy < -0.35 ? -1 : uy > 0.35 ? 0 : -0.5 }];
       });
       // Reserve the helper/empty-relationship notice and camera-control areas.
       const readable = labels.filter(label => label.y > (this.edges.length ? 44 : 110)
@@ -251,11 +372,21 @@ export class SpatialGraphRenderer {
     this.renderer.setSize(width, height); this.camera.aspect = width / height; this.camera.updateProjectionMatrix(); this.draw();
   }
 
+  /** Height of the floating tools over the top of the canvas; a fit keeps the map below them. */
+  setTopInset(px: number) { this.topInset = Math.max(0, px); }
+
   fit() {
-    const view = cameraForPoints(this.nodes.flatMap(n => this.positions.has(n.uri) ? [this.positions.get(n.uri)!] : []), this.camera.aspect);
+    const height = Math.max(1, this.host.clientHeight), free = Math.max(height * 0.5, height - this.topInset);
+    const view = cameraForPoints(this.nodes.flatMap(n => this.positions.has(n.uri) ? [this.positions.get(n.uri)!] : []), this.camera.aspect * height / free,
+      this.dimension === 2 ? TOP_VIEW : CORNER_VIEW);
     this.adjusting = true;
-    this.camera.position.set(view.position.x, view.position.y, view.position.z); this.controls.target.set(view.target.x, view.target.y, view.target.z);
-    this.controls.update(); this.adjusting = false; this.draw();
+    const target = new Vector3(view.target.x, view.target.y, view.target.z);
+    // Fit into the area below the tools: back off by the lost height, then shift the map down by half of it.
+    const position = new Vector3(view.position.x, view.position.y, view.position.z).sub(target).multiplyScalar(height / free).add(target);
+    this.camera.position.copy(position); this.controls.target.copy(target);
+    this.controls.update(); this.adjusting = false;
+    if (height > free) this.pan(0, (height - free) / 2, false);
+    this.draw();
   }
 
   focus(uri: string) {
@@ -273,6 +404,7 @@ export class SpatialGraphRenderer {
     this.adjusting = !user; this.camera.position.add(offset); this.controls.target.add(offset); this.controls.update(); this.adjusting = false; this.draw();
   }
   orbit(x: number, y: number) {
+    if (this.dimension === 2) return;
     const sphere = new Spherical().setFromVector3(this.camera.position.clone().sub(this.controls.target));
     sphere.theta += x; sphere.phi = Math.max(0.1, Math.min(Math.PI - 0.1, sphere.phi + y));
     this.camera.position.copy(new Vector3().setFromSpherical(sphere).add(this.controls.target)); this.controls.update(); this.draw();
@@ -284,10 +416,11 @@ export class SpatialGraphRenderer {
   }
 
   dispose() {
-    this.disposed = true; cancelAnimationFrame(this.frame);
+    this.disposed = true; cancelAnimationFrame(this.frame); cancelAnimationFrame(this.dragFrame);
     this.controls.removeEventListener("change", this.changed); this.controls.dispose(); this.clearObjects();
     const canvas = this.renderer.domElement;
-    canvas.removeEventListener("pointerdown", this.pointerDown); canvas.removeEventListener("pointerup", this.pointerUp);
+    canvas.removeEventListener("pointerdown", this.pointerDown, { capture: true }); canvas.removeEventListener("pointerup", this.pointerUp);
+    canvas.removeEventListener("pointercancel", this.pointerCancel); canvas.removeEventListener("lostpointercapture", this.pointerCancel);
     canvas.removeEventListener("pointermove", this.pointerMove); canvas.removeEventListener("pointerleave", this.pointerLeave);
     canvas.removeEventListener("contextmenu", this.contextMenu); canvas.removeEventListener("webglcontextlost", this.contextLost);
     this.renderer.dispose(); this.renderer.forceContextLoss(); canvas.remove();

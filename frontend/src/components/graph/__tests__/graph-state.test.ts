@@ -113,3 +113,14 @@ describe("graph-state codec", () => {
     expect(back.relations.size).toBe(0);
   });
 });
+
+describe("links mode", () => {
+  it("defaults to strong links and round-trips all", () => {
+    expect(queryToView(new URLSearchParams("")).links).toBe("strong");
+    const view = queryToView(new URLSearchParams("entry=akb%3A%2F%2Fv%2Fdoc%2Fa.md&links=all"));
+    expect(view.links).toBe("all");
+    expect(viewToQuery(view)).toContain("links=all");
+    expect(viewToQuery({ ...view, links: "strong" })).not.toContain("links=");
+  });
+});
+

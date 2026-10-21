@@ -11,6 +11,8 @@ import { groupOf } from "./cluster";
 import {
   ALL_NODE_KINDS,
   RELATION_CLASS,
+  edgeId,
+  edgeStrength,
   type GraphEdge,
   type GraphNode,
   type GraphView,
@@ -59,6 +61,11 @@ function normalizeRelation(raw: string | undefined): RelationKind | null {
   }
 }
 
+/** ``{ [key]: value }`` for a non-blank string from a server that may not send the field, else nothing. */
+function optionalText<K extends string>(key: K, value: unknown): Partial<Record<K, string>> {
+  return typeof value === "string" && value.trim() ? { [key]: value } as Record<K, string> : {};
+}
+
 /** Convert a backend /graph response into the renderer's payload shape.
  *  Shared by the full-graph load and on-demand node expansion so both map
  *  kinds/relations/groups identically. */
@@ -66,6 +73,9 @@ export function apiToPayload(resp: GraphOverviewResponse): GraphPayload {
   const nodes: GraphNode[] = resp.nodes.map((n) => ({
     uri: n.uri,
     name: n.name || n.uri,
+    ...optionalText("title", (n as unknown as { title?: unknown }).title),
+    ...optionalText("doc_type", (n as unknown as { doc_type?: unknown }).doc_type),
+    ...optionalText("updated_at", (n as unknown as { updated_at?: unknown }).updated_at),
     kind: normalizeKind(n.resource_type),
     group: groupOf(n.uri),
     degree: n.degree ?? undefined,
@@ -74,7 +84,11 @@ export function apiToPayload(resp: GraphOverviewResponse): GraphPayload {
   const edges: GraphEdge[] = resp.edges
     .map((e): GraphEdge | null => {
       const rel = normalizeRelation(e.relation);
-      return rel ? { source: endpointUri(e.source), target: endpointUri(e.target), relation: rel, kind: e.kind } : null;
+      const edgeType = (e as { edge_type?: unknown }).edge_type;
+      return rel ? {
+        source: endpointUri(e.source), target: endpointUri(e.target), relation: rel, kind: e.kind,
+        ...(edgeType === "strong" || edgeType === "weak" ? { edge_type: edgeType } : {}),
+      } : null;
     })
     .filter((e): e is GraphEdge => e !== null);
   const meta: GraphMeta = {
@@ -121,6 +135,118 @@ export function endpointUri(end: unknown): string {
 /** uri → degree (incident visible-edge count). Normalizes legacy object
  *  endpoints through endpointUri. Shared by scene labels and page hub ranking
  *  so the visible-degree rule lives once. */
+/** A focused neighbourhood that keeps only strong connections.
+ *
+ *  Strong connections are explicit relations: from the focus they are followed
+ *  outward (a resource's own context, e.g. an incident's cluster, node, service
+ *  and owner) and, for ``derived_from``, also back to what was derived from it
+ *  (an incident's postmortem). Following them outward only is what stops a walk
+ *  at shared context such as a cluster, instead of fanning out to every other
+ *  incident of that cluster. Body links (implicit) are weak: only the focus's
+ *  own weak neighbours stay, listed in ``weak`` and never walked further.
+ *  A map without any explicit relation is returned unchanged with
+ *  ``strong: false``, so a Vault that never declares relations keeps its links. */
+export function strongNeighborhood(
+  p: GraphPayload,
+  focus: string | undefined,
+  hops: number,
+  /** Resources the reader asked to see (loaded connections, a followed relationship, the selection): always kept. */
+  revealed: Iterable<string> = [],
+): GraphPayload & StrongScene {
+  const explicit = p.edges.filter(e => edgeStrength(e) === "strong" && e.source !== e.target);
+  if (!focus || explicit.length === 0) return { ...p, weak: new Set(), weakDepth: new Map(), strong: false, reach: new Map(), tree: new Set(), perHop: [] };
+  const reach = new Map<string, number>([[focus, 0]]);
+  // The edge by which the walk first reached each resource: the backbone the map draws at full weight.
+  const tree = new Set<string>();
+  const queue = [focus];
+  for (let index = 0; index < queue.length; index += 1) {
+    const here = queue[index], next = reach.get(here)! + 1;
+    if (next > hops) continue;
+    for (const e of explicit) {
+      const other = e.source === here ? e.target : e.relation === "derived_from" && e.target === here ? e.source : undefined;
+      if (other === undefined || reach.has(other)) continue;
+      reach.set(other, next); queue.push(other); tree.add(edgeId(e));
+    }
+  }
+  // How many resources each step adds, for an honest hop control (the walk may end before the chosen depth).
+  const perHop = Array.from({ length: hops }, (_, i) => [...reach.values()].filter(d => d === i + 1).length);
+  // Weak neighbours are each strongly reached resource's own: within the chosen depth, a resource's body links show
+  // one step further out (faded), and are never walked.
+  const weakDepth = new Map<string, number>();
+  for (const e of p.edges) {
+    if (edgeStrength(e) === "strong") continue;
+    for (const [from, to] of [[e.source, e.target], [e.target, e.source]] as const) {
+      const depth = reach.get(from);
+      if (depth === undefined || depth >= hops || reach.has(to)) continue;
+      weakDepth.set(to, Math.min(weakDepth.get(to) ?? Infinity, depth + 1));
+    }
+  }
+  const weak = new Set(weakDepth.keys());
+  const extra = new Set([...revealed].filter(uri => !reach.has(uri) && !weak.has(uri)));
+  const keep = new Set([...reach.keys(), ...weak, ...extra]);
+  const edges = p.edges.filter(e => {
+    if (!keep.has(e.source) || !keep.has(e.target)) return false;
+    if (extra.has(e.source) || extra.has(e.target)) return true;
+    if (edgeStrength(e) === "strong") return reach.has(e.source) && reach.has(e.target);
+    const near = (a: string, b: string) => (reach.get(a) ?? Infinity) < hops && weak.has(b);
+    return near(e.source, e.target) || near(e.target, e.source);
+  });
+  return { nodes: p.nodes.filter(n => keep.has(n.uri)), edges, meta: p.meta, weak, weakDepth, strong: true, reach, tree, perHop };
+}
+
+/** Only resources changed within the last ``since`` days; ``keep`` (the focus, what the reader selected or revealed)
+ *  and resources whose time the server does not report always stay. Applied before the walk, so it never passes
+ *  through a resource outside the window. */
+export function changedWithin(p: GraphPayload, since: GraphView["since"], keep: Iterable<string>, now = Date.now()): GraphPayload {
+  if (since === "all") return p;
+  const cutoff = now - Number(since) * 24 * 60 * 60 * 1000, kept = new Set(keep);
+  const nodes = p.nodes.filter(n => {
+    if (kept.has(n.uri) || !n.updated_at) return true;
+    const at = Date.parse(n.updated_at);
+    return Number.isNaN(at) || at >= cutoff;
+  });
+  const ids = new Set(nodes.map(n => n.uri));
+  return { ...p, nodes, edges: p.edges.filter(e => ids.has(e.source) && ids.has(e.target)) };
+}
+
+export interface StrongScene {
+  /** Resources joined to a strongly reached resource by a weak connection only (never walked). */
+  weak: Set<string>;
+  /** Hop at which each weak resource shows: one past the resource whose body link it is. */
+  weakDepth: Map<string, number>;
+  /** False when the map has no strong connection, so everything loaded is shown. */
+  strong: boolean;
+  /** Hop distance of every strongly reached resource (the focus is 0). */
+  reach: Map<string, number>;
+  /** ``edgeId`` of the edge that first reached each resource. */
+  tree: Set<string>;
+  /** Resources added by hop 1, 2, … up to the chosen depth. */
+  perHop: number[];
+}
+
+
+/** Hops from ``start`` over the loaded relationships, either direction. Resources the walk does not reach are absent. */
+export function hopDistances(edges: GraphEdge[], start: string | undefined): Map<string, number> {
+  const distance = new Map<string, number>();
+  if (!start) return distance;
+  const neighbors = new Map<string, string[]>();
+  for (const { source, target } of edges) {
+    if (source === target) continue;
+    neighbors.set(source, [...(neighbors.get(source) ?? []), target]);
+    neighbors.set(target, [...(neighbors.get(target) ?? []), source]);
+  }
+  distance.set(start, 0);
+  const queue = [start];
+  for (let index = 0; index < queue.length; index += 1) {
+    const here = queue[index], next = distance.get(here)! + 1;
+    for (const other of neighbors.get(here) ?? []) {
+      if (distance.has(other)) continue;
+      distance.set(other, next); queue.push(other);
+    }
+  }
+  return distance;
+}
+
 export function degreeMap(edges: GraphEdge[]): Map<string, number> {
   const d = new Map<string, number>();
   for (const e of edges) {
@@ -204,7 +330,15 @@ export function visibleGraph(
       source: endpointUri(e.source),
       target: endpointUri(e.target),
     }));
-  return { nodes, edges, meta: p.meta };
+  return { nodes, edges: strongerOnly(edges), meta: p.meta };
+}
+
+/** One connection per pair of resources: where a strong connection joins two resources, weak ones between the same
+ *  two (in either direction) are dropped, so a relation and the body link that repeats it draw one line. */
+export function strongerOnly(edges: GraphEdge[]): GraphEdge[] {
+  const pair = (e: GraphEdge) => [e.source, e.target].sort().join("\u0000");
+  const strong = new Set(edges.filter(e => edgeStrength(e) === "strong").map(pair));
+  return edges.filter(e => edgeStrength(e) === "strong" || !strong.has(pair(e)));
 }
 
 // Extract the doc / table / file id from an `akb://{vault}/{kind}/{path}` URI.
@@ -275,18 +409,37 @@ export async function fetchNeighbors(
   return apiToPayload(resp);
 }
 
+/** Strong links around a focus: the server walks strong edges only, so its node budget goes to the strong
+ *  neighbourhood, and one hop of every edge adds the focus's own weak neighbours. */
+export async function fetchStrongNeighbors(vault: string, id: string, hops: 1 | 2 | 3, limit = 200): Promise<GraphPayload> {
+  const strong = await getGraph(vault, id, hops, limit, "strong");
+  // Every strongly reached resource short of the chosen depth brings its own weak links: one hop of every edge around
+  // it (the focus first; bounded so a large strong neighbourhood stays a handful of requests).
+  const around = [...new Map(strong.nodes.map(n => [n.uri, n.depth ?? 0])).entries()]
+    .filter(([, depth]) => depth < hops).sort((a, b) => a[1] - b[1]).slice(0, WEAK_SOURCES).map(([uri]) => uri);
+  if (!around.includes(id)) around.unshift(id);
+  const rings = await Promise.all(around.map(uri => getGraph(vault, uri, 1, 150)));
+  const merged = rings.reduce((all, ring) => mergeGraph(all, apiToPayload(ring)), apiToPayload(strong));
+  const truncated = (strong as { truncated?: unknown }).truncated === true;
+  return truncated ? { ...merged, meta: { ...merged.meta, truncated: true } } : merged;
+}
+
+/** How many strongly reached resources contribute their weak links to one neighbourhood. */
+const WEAK_SOURCES = 12;
+
 export function useNeighborhood(
   vault: string,
   entry: string | undefined,
   hops: 1 | 2 | 3,
+  links: "strong" | "all" = "all",
 ) {
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   return useQuery({
-    queryKey: ["graph", user?.user_id, revision, vault, "neighborhood", entry, hops],
+    queryKey: ["graph", user?.user_id, revision, vault, "neighborhood", entry, hops, links],
     enabled: !!entry && !!user?.user_id && !checking,
     // Single server-side BFS call (was N per-node /relations round trips).
     // The enabled guard requires a resource and a verified account.
-    queryFn: () => fetchNeighbors(vault, entry!, hops, 200),
+    queryFn: () => links === "strong" ? fetchStrongNeighbors(vault, entry!, hops) : fetchNeighbors(vault, entry!, hops, 200),
   });
 }

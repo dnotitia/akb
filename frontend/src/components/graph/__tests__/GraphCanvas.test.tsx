@@ -31,9 +31,9 @@ describe("GraphCanvas WebGL fallback", () => {
       reportError(...args);
     });
     render(<GraphFallbackFixture />);
-    expect(screen.getByRole("alert")).toHaveTextContent("3D requires WebGL 2");
+    expect(screen.getByRole("alert")).toHaveTextContent("The graph requires WebGL 2");
     expect(screen.getByRole("alert")).toHaveTextContent("every loaded resource in List");
-    expect(screen.getByRole("img")).toHaveAccessibleName(/3D knowledge graph: 2 resources, 0 relationships/);
+    expect(screen.getByRole("img")).toHaveAccessibleName(/Knowledge graph map: 2 resources, 0 relationships/);
     await userEvent.click(screen.getByRole("button", { name: "Use List" }));
     expect(screen.getByRole("region", { name: "Relationship index" })).toBeVisible();
     expect(screen.getByRole("button", { name: /Alpha/ })).toBeVisible();

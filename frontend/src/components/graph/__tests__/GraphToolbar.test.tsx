@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { searchDocs, type SearchResponse } from "@/lib/api";
 import { GraphToolbar } from "../GraphToolbar";
-import { DEFAULT_VIEW, type NodeKind, type RelationKind } from "../graph-types";
+import { DEFAULT_VIEW, type GraphView, type NodeKind, type RelationKind } from "../graph-types";
 
 vi.mock("@/lib/api", () => ({ searchDocs: vi.fn() }));
 const search = vi.mocked(searchDocs);
@@ -305,13 +305,57 @@ describe("GraphToolbar commands", () => {
     expect(props.onRearrange).toHaveBeenCalledOnce();
   });
 
-  it("only exposes neighborhood controls when focused, without a permanent resource-count row", () => {
-    const { rerender } = setup();
+  it("only exposes neighborhood controls when focused, without a permanent resource-count row", async () => {
+    const user = userEvent.setup();
+    const { rerender, props } = setup();
     expect(screen.queryByText("1 resource")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "1 hop neighborhood" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Neighborhood depth" })).not.toBeInTheDocument();
     rerender({ view: { ...DEFAULT_VIEW, entry: documentNode.uri } });
-    expect(screen.getByRole("button", { name: "1 hop neighborhood" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "3 hop neighborhood" }));
+    const depth = screen.getByRole("button", { name: "Neighborhood depth" });
+    expect(depth).toHaveTextContent("1 hop");
+    await user.click(depth);
+    await user.click(screen.getByRole("menuitemradio", { name: "3 hops" }));
+    const update = vi.mocked(props.onChange).mock.calls.at(-1)![0] as GraphView | ((view: GraphView) => GraphView);
+    expect((typeof update === "function" ? update({ ...DEFAULT_VIEW, entry: documentNode.uri }) : update).hops).toBe(3);
     expect(localStorage.getItem("akb:graph:hops")).toBeNull();
+  });
+
+  it("chooses how recently changed the shown resources are, around a focus and for the whole Vault", async () => {
+    const user = userEvent.setup();
+    const { rerender, props } = setup();
+    const since = screen.getByRole("button", { name: "Changed within" });
+    expect(since).toHaveTextContent("Any time");
+    await user.click(since);
+    expect(screen.getAllByRole("menuitemradio").map(item => item.textContent)).toEqual(["Last day", "Last 7 days", "Last 30 days", "Any time"]);
+    await user.click(screen.getByRole("menuitemradio", { name: "Last 7 days" }));
+    const update = vi.mocked(props.onChange).mock.calls.at(-1)![0] as GraphView | ((view: GraphView) => GraphView);
+    expect((typeof update === "function" ? update(DEFAULT_VIEW) : update).since).toBe("7");
+    rerender({ view: { ...DEFAULT_VIEW, entry: documentNode.uri, since: "30" } });
+    expect(screen.getByRole("button", { name: "Changed within" })).toHaveTextContent("Last 30 days");
+  });
+
+  it("toggles strong links around a focus", () => {
+    const { props } = setup({ view: { ...DEFAULT_VIEW, entry: documentNode.uri } });
+    const toggle = screen.getByRole("button", { name: "Strong links only" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggle);
+    const update = vi.mocked(props.onChange).mock.calls.at(-1)![0] as GraphView | ((view: GraphView) => GraphView);
+    expect((typeof update === "function" ? update({ ...DEFAULT_VIEW, entry: documentNode.uri }) : update).links).toBe("all");
+  });
+
+  it("names the colour of each hop up to the chosen depth around a focus", () => {
+    const { rerender } = setup({ view: { ...DEFAULT_VIEW, entry: documentNode.uri, hops: 2 } });
+    const legend = screen.getByLabelText("Hop colours");
+    expect(legend).toHaveTextContent("Focus12");
+    expect(legend).not.toHaveTextContent("3");
+    rerender({ view: { ...DEFAULT_VIEW, entry: documentNode.uri, hops: 3 } });
+    expect(screen.getByLabelText("Hop colours")).toHaveTextContent("Focus123");
+  });
+
+  it("keeps the whole-Vault legend in kind colours and greys it while hops colour the map", () => {
+    const { container, rerender } = setup({ resourceCounts: { document: 1, table: 0, file: 0 } });
+    expect(container.querySelector("svg.text-cat-1")).not.toBeNull();
+    rerender({ view: { ...DEFAULT_VIEW, entry: documentNode.uri } });
+    expect(container.querySelector("svg.text-cat-1")).toBeNull();
   });
 });

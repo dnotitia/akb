@@ -1,6 +1,6 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
-  ArrowDownLeft, ArrowUpRight, ChevronRight, Copy, Crosshair, ExternalLink,
+  ArrowDownLeft, ArrowUpRight, ChevronRight, Copy, Crosshair,
   Eye, EyeOff, FileText, MoreHorizontal, Network, Paperclip, Pin, PinOff, Table2, X,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
@@ -14,7 +14,7 @@ import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-c
 import { getDocument, getRelations, type RelationRow } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import {
-  ALL_NODE_KINDS, ALL_RELATIONS, RELATION_LABEL, kindToSegment,
+  ALL_NODE_KINDS, ALL_RELATIONS, RELATION_LABEL, edgeStrength, kindToSegment,
   type NodeKind, type RelatedRef, type RelationKind,
 } from "./graph-types";
 
@@ -98,9 +98,10 @@ export function GraphDetailPanel({
     onClose();
   }
 
+  const resourceHref = `/vault/${encodeURIComponent(vault)}/${kindToSegment(kind)}/${encodeURIComponent(docId)}`;
   function openResource() {
     if (onOpen) return onOpen();
-    window.location.assign(`/vault/${encodeURIComponent(vault)}/${kindToSegment(kind)}/${encodeURIComponent(docId)}`);
+    window.location.assign(resourceHref);
   }
 
   async function copyUri() {
@@ -163,14 +164,18 @@ export function GraphDetailPanel({
 
       <div className="min-h-0 overflow-y-auto overscroll-contain rail-scroll">
         <header className="p-4 pb-3">
-          <h2 ref={titleRef} id={titleId} tabIndex={-1} className="break-words font-display text-lg font-semibold leading-snug tracking-tight text-foreground focus:outline-none">{title}</h2>
+          <h2 ref={titleRef} id={titleId} tabIndex={-1} className="break-words font-display text-lg font-semibold leading-snug tracking-tight text-foreground focus:outline-none">
+            {/* The title opens the resource in the vault (a real link, so it also opens in a new tab). */}
+            <a href={resourceHref} title="Open in vault"
+              onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return; event.preventDefault(); openResource(); }}
+              className="text-foreground underline-offset-4 hover:text-link hover:underline focus:outline-none focus-visible:rounded-[var(--radius-xs)] focus-visible:ring-2 focus-visible:ring-ring">{title}</a>
+          </h2>
           {summary && <p className="mt-2 line-clamp-3 break-words text-sm leading-relaxed text-foreground-muted">{summary}</p>}
           <div className="mt-3 flex flex-wrap gap-2">
-            {kind === "document" && onPreview && <Button id="graph-preview-trigger" type="button" size="sm" onClick={onPreview} className={`flex-1 ${actionClass}`}><Eye className="h-3.5 w-3.5 shrink-0" aria-hidden />Preview</Button>}
-            <Button type="button" size="sm" variant={kind === "document" && onPreview ? "outline" : "default"} onClick={openResource} className={`flex-1 ${actionClass}`}><ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />Open in vault</Button>
+            {onFocus && <Button type="button" size="sm" onClick={onFocus} title="Make this resource the centre of the map" className={`flex-1 ${actionClass}`}><Network className="h-3.5 w-3.5 shrink-0" aria-hidden />Focus</Button>}
+            {kind === "document" && onPreview && <Button id="graph-preview-trigger" type="button" size="sm" variant={onFocus ? "outline" : "default"} onClick={onPreview} className={`flex-1 ${actionClass}`}><Eye className="h-3.5 w-3.5 shrink-0" aria-hidden />Preview</Button>}
           </div>
-          {(onFocus || onExpand) && <div className="mt-2 flex flex-col gap-1">
-            {onFocus && <Button type="button" variant="ghost" size="sm" onClick={onFocus} className={`justify-start text-link ${actionClass}`}><Network className="h-3.5 w-3.5 shrink-0" aria-hidden />Explore connections</Button>}
+          {onExpand && <div className="mt-2 flex flex-col gap-1">
             {onExpand && <Button type="button" variant="ghost" size="sm" onClick={onExpand} loading={expanding} className={`justify-start text-link ${actionClass}`}>
               {expanding ? "Loading connections…" : expansionError ? "Retry loading connections" : "Load connections"}
             </Button>}
@@ -194,7 +199,7 @@ export function GraphDetailPanel({
           ) : relationCount === 0 ? (
             <p className="py-2 text-sm text-foreground-muted">No direct connections</p>
           ) : (
-            <div className="space-y-4" key={uri}>
+            <div className="space-y-1" key={uri}>
               {!!relations.outgoing.length && <RelationList rows={relations.outgoing} direction="outgoing" onSelect={onSelectRelated} onFit={onFitToNode} />}
               {!!relations.incoming.length && <RelationList rows={relations.incoming} direction="incoming" onSelect={onSelectRelated} onFit={onFitToNode} />}
             </div>
@@ -207,8 +212,12 @@ export function GraphDetailPanel({
 
 function normalizeRelations(rows: RelationRow[]): { incoming: RelatedRef[]; outgoing: RelatedRef[] } {
   const groups: { incoming: RelatedRef[]; outgoing: RelatedRef[] } = { incoming: [], outgoing: [] };
+  // A body link that repeats a strong relation with the same resource (either direction) is listed once, as the relation.
+  const strength = (row: RelationRow) => edgeStrength({ kind: row.kind, edge_type: (row as { edge_type?: "strong" | "weak" }).edge_type });
+  const strongWith = new Set(rows.filter(row => strength(row) === "strong").map(row => row.uri));
   for (const row of rows) {
     if (!RELATION_SET.has(row.relation)) continue;
+    if (strength(row) === "weak" && strongWith.has(row.uri)) continue;
     const parsedKind = parseUri(row.uri)?.kind;
     const inferredKind = parsedKind === "file" || parsedKind === "table" ? parsedKind : "document";
     groups[row.direction].push({
@@ -228,13 +237,22 @@ function RelationList({ rows, direction, onSelect, onFit }: {
   onFit: (uri: string) => void;
 }) {
   const [visibleCount, setVisibleCount] = useState(RELATION_PAGE_SIZE);
-  const headingId = useId();
+  // Each direction starts folded; its heading opens it.
+  const [open, setOpen] = useState(false);
+  const headingId = useId(), listId = useId();
   const DirectionIcon = direction === "outgoing" ? ArrowUpRight : ArrowDownLeft;
   const label = direction === "outgoing" ? "Outgoing connections" : "Incoming connections";
   return (
     <section aria-label={label}>
-      <h4 id={headingId} className="mb-1 flex items-center gap-1.5 text-xs font-medium text-foreground-muted"><DirectionIcon className="h-3.5 w-3.5" aria-hidden />{direction === "outgoing" ? "Outgoing" : "Incoming"}<span className="ml-auto tabular-nums">{rows.length}</span></h4>
-      <ul aria-labelledby={headingId} className="divide-y divide-border">
+      <h4 id={headingId} className="text-xs font-medium text-foreground-muted">
+        <button type="button" aria-expanded={open} aria-controls={listId} onClick={() => setOpen(value => !value)}
+          className="flex min-h-9 w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1 text-left hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+          <ChevronRight className={`h-3.5 w-3.5 shrink-0 transition-transform ${open ? "rotate-90" : ""}`} aria-hidden />
+          <DirectionIcon className="h-3.5 w-3.5" aria-hidden />{direction === "outgoing" ? "Outgoing" : "Incoming"}<span className="ml-auto tabular-nums">{rows.length}</span>
+        </button>
+      </h4>
+      {open && <>
+      <ul id={listId} aria-labelledby={headingId} className="divide-y divide-border">
         {rows.slice(0, visibleCount).map((row, index) => {
           const Icon = iconForKind(row.kind);
           return <li key={`${row.uri}:${row.relation}:${row.source}:${index}`}>
@@ -254,6 +272,7 @@ function RelationList({ rows, direction, onSelect, onFit }: {
         })}
       </ul>
       {visibleCount < rows.length && <Button type="button" variant="ghost" size="sm" className={`mt-1 w-full text-link ${actionClass}`} onClick={() => setVisibleCount((count) => count + RELATION_PAGE_SIZE)}>Show more ({rows.length - visibleCount} remaining)</Button>}
+      </>}
     </section>
   );
 }

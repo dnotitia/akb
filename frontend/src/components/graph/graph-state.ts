@@ -26,6 +26,8 @@ export function viewToQuery(v: GraphView): string {
   // accepts the legacy `depth` query param so bookmarked URLs from
   // pre-0.3.0 keep working — there's no reason to break them.
   if (v.hops !== DEFAULT_VIEW.hops) p.set("hops", String(v.hops));
+  if (v.links !== DEFAULT_VIEW.links) p.set("links", v.links);
+  if (v.since !== DEFAULT_VIEW.since) p.set("since", v.since);
   if (!setsEqual(v.types, ALL_KIND_SET)) {
     p.set("types", [...v.types].join(","));
   }
@@ -55,6 +57,8 @@ export function queryToView(q: URLSearchParams): GraphView {
     // Read `hops` first; fall back to legacy `depth` from pre-0.3.0
     // bookmarked URLs.
     hops: parseHops(q.get("hops") ?? q.get("depth")),
+    links: q.get("links") === "all" ? "all" : "strong",
+    since: (["1", "7", "30"] as const).find(value => value === q.get("since")) ?? "all",
     types: types !== null
       ? new Set(
           types.split(",").filter((s): s is NodeKind => (ALL_KIND_SET as Set<string>).has(s)),

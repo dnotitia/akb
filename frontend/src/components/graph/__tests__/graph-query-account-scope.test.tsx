@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
@@ -82,6 +82,12 @@ describe("graph query account and access scope", () => {
   });
 });
 
+/** Connections start folded per direction: open them, then find the row. */
+async function findRow(name: string) {
+  for (const toggle of await screen.findAllByRole("button", { expanded: false, name: /^(Outgoing|Incoming)/ })) fireEvent.click(toggle);
+  return screen.findByRole("button", { name });
+}
+
 describe("inspector query account and access scope", () => {
   const props = { vault: "team", docId: "selected.md", uri, name: "Selection", kind: "document" as const, onSelectRelated: vi.fn(), onFitToNode: vi.fn(), onClose: vi.fn() };
 
@@ -90,7 +96,7 @@ describe("inspector query account and access scope", () => {
     const tree = () => <Wrapper><GraphDetailPanel {...props} /></Wrapper>;
     const panel = render(tree());
     expect(await screen.findByText("Initial resource description")).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Initial resource neighbor" })).toBeInTheDocument();
+    expect(await findRow("Initial resource neighbor")).toBeInTheDocument();
     inspectorResponse("New resource");
     if (change === "account") scope.user = { ...account, user_id: "bob" };
     else scope.revision = 1;
@@ -98,7 +104,7 @@ describe("inspector query account and access scope", () => {
     expect(screen.queryByText("Initial resource description")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Initial resource neighbor" })).not.toBeInTheDocument();
     expect(await screen.findByText("New resource description")).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "New resource neighbor" })).toBeInTheDocument();
+    expect(await findRow("New resource neighbor")).toBeInTheDocument();
   });
 
   it("waits for access verification before fetching descriptions or connections", async () => {
@@ -111,7 +117,7 @@ describe("inspector query account and access scope", () => {
     scope.checking = false;
     panel.rerender(tree());
     expect(await screen.findByText("Initial resource description")).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Initial resource neighbor" })).toBeInTheDocument();
+    expect(await findRow("Initial resource neighbor")).toBeInTheDocument();
   });
 
   it("does not fetch resource details without an authenticated account", () => {

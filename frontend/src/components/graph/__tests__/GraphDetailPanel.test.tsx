@@ -28,6 +28,16 @@ function renderPanel(props: Partial<React.ComponentProps<typeof GraphDetailPanel
   return render(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} {...props} /></QueryClientProvider>);
 }
 
+/** Connections start folded per direction: open every direction, then find the row. */
+async function openConnections() {
+  const toggles = await screen.findAllByRole("button", { expanded: false, name: /^(Outgoing|Incoming)/ });
+  for (const toggle of toggles) fireEvent.click(toggle);
+}
+async function findRow(name: string) {
+  await openConnections();
+  return screen.findByRole("button", { name });
+}
+
 function relation(overrides: Record<string, unknown> = {}) {
   return {
     direction: "outgoing", relation: "depends_on", uri: "akb://akb/doc/y",
@@ -43,7 +53,7 @@ beforeEach(() => {
 });
 
 describe("GraphDetailPanel resource actions", () => {
-  it("keeps preview, navigation and exploration usable while optional document details are pending", async () => {
+  it("keeps focus, preview, the title link and loading connections usable while optional document details are pending", async () => {
     getDocument.mockReturnValue(new Promise(() => {}));
     const onOpen = vi.fn();
     const onPreview = vi.fn();
@@ -53,9 +63,10 @@ describe("GraphDetailPanel resource actions", () => {
     renderPanel({ onOpen, onPreview, onFocus, onExpand });
     expect(screen.getByRole("heading", { name: "Selected resource" })).toBeTruthy();
     expect(screen.getByText("Engineering")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open in vault" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Preview" }));
-    await user.click(screen.getByRole("button", { name: "Open in vault" }));
-    await user.click(screen.getByRole("button", { name: "Explore connections" }));
+    await user.click(screen.getByRole("link", { name: "Selected resource" }));
+    await user.click(screen.getByRole("button", { name: "Focus" }));
     await user.click(screen.getByRole("button", { name: "Load connections" }));
     expect(onPreview).toHaveBeenCalledOnce();
     expect(onOpen).toHaveBeenCalledOnce();
@@ -67,8 +78,8 @@ describe("GraphDetailPanel resource actions", () => {
     getDocument.mockRejectedValue(new Error("503 unavailable"));
     getRelations.mockResolvedValue({ uri: baseProps.uri, relations: [relation()] });
     renderPanel({ onOpen: vi.fn(), onPreview: vi.fn() });
-    expect(await screen.findByRole("button", { name: "Related document" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Open in vault" })).not.toHaveAttribute("disabled");
+    expect(await findRow("Related document")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Selected resource" })).toHaveAttribute("href", "/vault/akb/doc/d-1");
     expect(screen.getByRole("button", { name: "Preview" })).not.toHaveAttribute("disabled");
   });
 
@@ -87,7 +98,7 @@ describe("GraphDetailPanel resource actions", () => {
     await screen.findByText("No direct connections");
     expect(getDocument).not.toHaveBeenCalled();
     expect(getRelations).toHaveBeenCalledWith("akb", uri);
-    expect(screen.getByRole("button", { name: "Open in vault" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Selected resource" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
     expect(screen.queryByText(/not provided/i)).toBeNull();
   });
@@ -114,7 +125,7 @@ describe("GraphDetailPanel relations", () => {
     getRelations.mockResolvedValue({ uri: baseProps.uri, relations: [relation({ direction, kind: source })] });
     const user = userEvent.setup();
     renderPanel();
-    await user.click(await screen.findByRole("button", { name: "Related document" }));
+    await user.click(await findRow("Related document"));
     expect(baseProps.onSelectRelated).toHaveBeenCalledWith({
       uri: "akb://akb/doc/y", name: "Related document", kind: "document",
       relation: "depends_on", direction, source,
@@ -144,6 +155,8 @@ describe("GraphDetailPanel relations", () => {
     const user = userEvent.setup();
     renderPanel();
     const outgoing = await screen.findByRole("region", { name: "Outgoing connections" });
+    expect(within(outgoing).queryByText(/depends on/i)).toBeNull();
+    await openConnections();
     const incoming = screen.getByRole("region", { name: "Incoming connections" });
     expect(within(outgoing).getByText(/depends on/i)).toBeTruthy();
     await user.click(within(incoming).getByRole("button", { name: "Reports" }));
@@ -156,6 +169,7 @@ describe("GraphDetailPanel relations", () => {
     const user = userEvent.setup();
     renderPanel();
     const region = await screen.findByRole("region", { name: "Outgoing connections" });
+    await openConnections();
     expect(within(region).getAllByRole("button", { name: /^Neighbor/ })).toHaveLength(25);
     expect(screen.queryByRole("button", { name: "Neighbor 79" })).toBeNull();
     await user.click(within(region).getByRole("button", { name: /show more/i }));
@@ -166,7 +180,7 @@ describe("GraphDetailPanel relations", () => {
     getRelations.mockResolvedValue({ uri: baseProps.uri, relations: [relation({ resource_type: undefined, uri: "akb://akb/coll/Engineering/file/f-2", name: "Architecture image", relation: "attached_to" })] });
     const user = userEvent.setup();
     renderPanel();
-    await user.click(await screen.findByRole("button", { name: "Architecture image" }));
+    await user.click(await findRow("Architecture image"));
     expect(baseProps.onSelectRelated).toHaveBeenCalledWith({ uri: "akb://akb/coll/Engineering/file/f-2", name: "Architecture image", kind: "file", relation: "attached_to", direction: "outgoing", source: "explicit" });
   });
 
@@ -177,7 +191,7 @@ describe("GraphDetailPanel relations", () => {
     const panel = render(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} /></QueryClientProvider>);
     getRelations.mockResolvedValue({ uri: "akb://akb/file/f-new", relations: [relation({ name: "Current connection" })] });
     panel.rerender(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} kind="file" docId="f-new" uri="akb://akb/file/f-new" name="Current file" /></QueryClientProvider>);
-    expect(await screen.findByRole("button", { name: "Current connection" })).toBeTruthy();
+    expect(await findRow("Current connection")).toBeTruthy();
     resolveOld({ uri: baseProps.uri, relations: [relation({ name: "Old connection" })] });
     await waitFor(() => expect(client.getQueryState(["relations", "panel-test", 0, "akb", baseProps.uri])?.status).toBe("success"));
     expect(screen.queryByRole("button", { name: "Old connection" })).toBeNull();

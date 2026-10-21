@@ -50,15 +50,18 @@ function neighborhood(scene: Scene, uri: string) {
 
 async function fixture(page: Page, scene = fixtureScene(), options: {
   dark?: boolean;
+  /** The 3D volume unless a test opts into the default flat map with 2. */
+  dimension?: 2 | 3;
   onGraph?: (route: Route, url: URL) => Promise<boolean>;
 } = {}) {
   const requests: URL[] = [];
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
-  await page.addInitScript(dark => {
+  await page.addInitScript(([dark, dimension]) => {
     localStorage.setItem("akb_token", "graph-browser-fixture");
     localStorage.setItem("akb_theme", dark ? "dark" : "light");
-  }, options.dark ?? false);
+    if (dimension === 3) localStorage.setItem("akb.graph.dimension", "3");
+  }, [options.dark ?? false, options.dimension ?? 3] as const);
   await page.route("**/health/**", route => route.fulfill({ json: {} }));
   await page.route("**/api/**", async route => {
     const url = new URL(route.request().url());
@@ -193,7 +196,7 @@ async function expectNonblankCanvas(page: Page) {
 async function graphReady(page: Page, count: number) {
   const host = page.getByTestId("graph-canvas");
   await expect(host).toBeVisible();
-  await expect(host).toHaveAccessibleName(new RegExp("^3D knowledge graph: " + count + " resources?\\b"));
+  await expect(host).toHaveAccessibleName(new RegExp("^(3D knowledge graph|Knowledge graph map): " + count + " resources?\\b"));
   const canvas = host.locator("canvas").first();
   await expect(canvas).toBeVisible();
   await expect.poll(() => canvas.evaluate(element => {
@@ -223,6 +226,13 @@ async function expectReadableLabels(page: Page) {
   expect(labels.length).toBeGreaterThan(0);
   expect(labels.every(label => label.fontPixels >= 12 && label.height >= 20)).toBe(true);
   await expect(page.getByLabel("Pan map", { exact: true })).toBeVisible();
+}
+
+/** The inspector's connections start folded per direction; open both. */
+async function openConnections(inspector: ReturnType<Page["getByRole"]>) {
+  const toggles = inspector.getByRole("button", { expanded: false, name: /^(Outgoing|Incoming)/ });
+  await expect(toggles.first()).toBeVisible();
+  for (let count = await toggles.count(); count > 0; count = await toggles.count()) await toggles.first().click();
 }
 
 async function selectFromSearch(page: Page, name: string) {
@@ -599,7 +609,8 @@ test("mobile starts in List and offers a usable 3D Graph and inspector", async (
   }
   await list.getByRole("button", { name: /API Gateway/ }).click();
   const inspector = page.getByRole("complementary", { name: "Inspector for API Gateway", exact: true });
-  await expect(inspector.getByRole("button", { name: "Open in vault", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(inspector.getByRole("button", { name: "Focus", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(inspector.getByRole("link", { name: "API Gateway", exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("graph-mobile-inspector.png"), animations: "disabled" });
   await inspector.getByRole("button", { name: "Close inspector", exact: true }).click();
   await page.getByRole("button", { name: "Graph", exact: true }).click();
@@ -659,7 +670,7 @@ test("an expansion arriving after focus changes cannot join the new scene", asyn
   await page.getByRole("button", { name: "Load connections", exact: true }).click();
   await expect.poll(() => Boolean(pending)).toBe(true);
   await selectFromSearch(page, scene.nodes[1].name);
-  await page.getByRole("button", { name: "Explore connections", exact: true }).click();
+  await page.getByRole("button", { name: "Focus", exact: true }).click();
   await graphReady(page, 2);
   await expect(page).toHaveURL(new RegExp("entry=" + encodeURIComponent(scene.nodes[1].uri)));
   const lateUri = "akb://fixture/doc/late-response.md";
@@ -683,10 +694,11 @@ test("List stays selected when exploring connections and changing traversal dept
   await graphReady(page, 30);
   await page.getByRole("button", { name: "List", exact: true }).click();
   await selectFromSearch(page, "Service metrics");
-  await page.getByRole("button", { name: "Explore connections", exact: true }).click();
+  await page.getByRole("button", { name: "Focus", exact: true }).click();
   await expect(page).toHaveURL(/entry=/);
   await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await page.getByRole("button", { name: "2 hop neighborhood", exact: true }).click();
+  await page.getByRole("button", { name: "Neighborhood depth", exact: true }).click();
+  await page.getByRole("menuitemradio", { name: "2 hops", exact: true }).click();
   await expect(page).toHaveURL(/hops=2/);
   await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByRole("region", { name: "Relationship index", exact: true })).toBeVisible();
@@ -704,6 +716,7 @@ test("following a relationship restores its hidden target to the scene", async (
   await expect(page.getByLabel("Visible graph labels", { exact: true }).getByRole("button", { name: "Inspect Service metrics", exact: true })).toHaveCount(0);
   await selectFromSearch(page, "API Gateway");
   const inspector = page.getByRole("complementary", { name: "Inspector for API Gateway", exact: true });
+  await openConnections(inspector);
   await inspector.getByRole("button", { name: "Service metrics", exact: true }).first().click();
   await expect(page.getByRole("complementary", { name: "Inspector for Service metrics", exact: true })).toBeVisible();
   await graphReady(page, 30);
@@ -711,7 +724,7 @@ test("following a relationship restores its hidden target to the scene", async (
 });
 
 for (const direction of ["outgoing", "incoming"] as const) {
-  test(`following ${direction} relations preserves provenance without duplicating loaded connections`, async ({ page }) => {
+  test(`following ${direction} relations shows one connection per pair without duplicating loaded connections`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 });
     const scene = fixtureScene(2, 2);
     scene.edges = scene.edges.filter(edge => edge.relation === "references");
@@ -732,20 +745,21 @@ for (const direction of ["outgoing", "incoming"] as const) {
     const canvas = page.getByTestId("graph-canvas");
     await selectFromSearch(page, start.name);
     const inspector = page.getByRole("complementary", { name: `Inspector for ${start.name}`, exact: true });
-    const labels = direction === "outgoing" ? ["Explicit relation", "Body link"] : ["Body link", "Explicit relation"];
-    await inspector.getByRole("button", { name: target.name, exact: true }).filter({ hasText: labels[0] }).click();
+    // A body link that repeats a strong (explicit) relation with the same resource is listed and drawn once, as the relation.
+    await openConnections(inspector);
+    const rows = inspector.getByRole("button", { name: target.name, exact: true });
+    await expect(rows).toHaveCount(1);
+    await expect(rows).toHaveText(/Explicit relation/);
+    await rows.click();
     await expect(canvas).toHaveAccessibleName(/2 resources, 1 relationships/);
-
-    // An explicit relation and a body link with the same endpoints are distinct.
-    await page.getByRole("complementary", { name: `Inspector for ${target.name}`, exact: true })
-      .getByRole("button", { name: start.name, exact: true }).filter({ hasText: labels[0] }).click();
-    await inspector.getByRole("button", { name: target.name, exact: true }).filter({ hasText: labels[1] }).click();
-    await expect.soft(canvas).toHaveAccessibleName(/2 resources, 2 relationships/);
-    // Loading the server versions (including a repeated load) must not add copies.
+    const targetInspector = page.getByRole("complementary", { name: `Inspector for ${target.name}`, exact: true });
+    await openConnections(targetInspector);
+    await targetInspector.getByRole("button", { name: start.name, exact: true }).filter({ hasText: "Explicit relation" }).click();
+    // Loading the server versions (including a repeated load) must not add copies or the repeated body link.
     for (let attempt = 0; attempt < 2; attempt++) {
       await page.getByRole("button", { name: "Load connections", exact: true }).click();
       await expect(page.getByRole("button", { name: "Load connections", exact: true })).toBeEnabled();
-      await expect(canvas).toHaveAccessibleName(/2 resources, 2 relationships/);
+      await expect(canvas).toHaveAccessibleName(/2 resources, 1 relationships/);
     }
     expect(errors).toEqual([]);
   });
@@ -857,3 +871,167 @@ for (const count of [700, 1500]) {
     await testInfo.attach("fixture-measurement", { body: JSON.stringify(measurement), contentType: "application/json" });
   });
 }
+
+test.describe("flat map (the default view)", () => {
+  async function canvasPoint(page: Page) {
+    return page.getByTestId("graph-canvas").evaluate(element => {
+      const box = element.getBoundingClientRect();
+      const labels = [...element.parentElement!.querySelectorAll("button[data-graph-node]")].map(button => button.getBoundingClientRect());
+      for (const xRatio of [0.3, 0.5, 0.15, 0.65]) {
+        for (const yRatio of [0.4, 0.25, 0.6]) {
+          const x = box.x + box.width * xRatio, y = box.y + box.height * yRatio;
+          const target = document.elementFromPoint(x, y);
+          const clear = labels.every(label => Math.hypot(label.x + label.width / 2 - x, label.y - y) > 60);
+          if (target?.tagName === "CANVAS" && element.contains(target) && clear) return { x, y };
+        }
+      }
+      return null;
+    });
+  }
+
+  test("opens flat, with no rotation controls, and offers 3D as a choice", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    const { errors } = await fixture(page, fixtureScene(), { dimension: 2 });
+    await page.goto("/vault/fixture/graph");
+    await graphReady(page, 30);
+    await expect(page.getByTestId("graph-canvas")).toHaveAccessibleName(/^Knowledge graph map: 30 resources/);
+    await expect(page.getByRole("button", { name: "2D", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: "Rotate left", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "3D", exact: true }).click();
+    await expect(page.getByTestId("graph-canvas")).toHaveAccessibleName(/^3D knowledge graph: 30 resources/);
+    await expect(page.getByRole("button", { name: "Rotate left", exact: true })).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem("akb.graph.dimension"))).toBe("3");
+    expect(errors).toEqual([]);
+  });
+
+  test("dragging the background pans the map without rotating it", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await fixture(page, fixtureScene(), { dimension: 2 });
+    await page.goto("/vault/fixture/graph");
+    await graphReady(page, 30);
+    await frames(page);
+    const before = await labelPositions(page);
+    const point = await canvasPoint(page);
+    expect(point, "The pan must start on empty canvas").not.toBeNull();
+    await page.mouse.move(point!.x, point!.y);
+    await page.mouse.down();
+    await page.mouse.move(point!.x + 120, point!.y + 60, { steps: 12 });
+    await page.mouse.up();
+    await frames(page);
+    const after = await labelPositions(page);
+    const shifts = after.flatMap(label => {
+      const prior = before.find(item => item.uri === label.uri);
+      return prior ? [{ dx: label.x - prior.x, dy: label.y - prior.y }] : [];
+    });
+    expect(shifts.length).toBeGreaterThan(2);
+    // A pan moves every label by the same offset; a rotation would not.
+    for (const shift of shifts) {
+      expect(shift.dx).toBeCloseTo(120, -1);
+      expect(shift.dy).toBeCloseTo(60, -1);
+    }
+  });
+
+  test("dragging a resource moves only that resource and it stays there", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    const { errors } = await fixture(page, fixtureScene(), { dimension: 2 });
+    await page.goto("/vault/fixture/graph");
+    await graphReady(page, 30);
+    await frames(page);
+    const before = await labelPositions(page);
+    const host = (await page.getByTestId("graph-canvas").boundingBox())!;
+    // The dot sits just above its projected label; pick one whose dot is bare canvas (no other label over it).
+    const candidates = before.filter(label => label.x > host.x + 200 && label.x < host.x + host.width - 420 && label.y > host.y + 160 && label.y < host.y + host.height - 200);
+    let target: (typeof before)[number] | undefined, dot = { x: 0, y: 0 };
+    for (const label of candidates) {
+      const point = { x: label.x, y: label.y - label.height / 2 - 8 };
+      if (await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.tagName === "CANVAS", point)) { target = label; dot = point; break; }
+    }
+    expect(target, "A resource away from the floating controls").toBeDefined();
+    if (!target) return;
+    await page.mouse.move(dot.x, dot.y);
+    await page.mouse.down();
+    await page.mouse.move(dot.x - 90, dot.y + 70, { steps: 12 });
+    await page.mouse.up();
+    await frames(page);
+    const after = await labelPositions(page);
+    const moved = after.find(label => label.uri === target.uri)!;
+    expect(moved.x - target.x).toBeCloseTo(-90, -1);
+    expect(moved.y - target.y).toBeCloseTo(70, -1);
+    const others = after.filter(label => label.uri !== target.uri).flatMap(label => {
+      const prior = before.find(item => item.uri === label.uri);
+      return prior ? [Math.hypot(label.x - prior.x, label.y - prior.y)] : [];
+    });
+    expect(Math.max(...others)).toBeLessThan(2);
+    // A drag is not a click: nothing became selected.
+    await expect(page.getByRole("complementary", { name: /^Inspector for / })).toHaveCount(0);
+    // The drag completes without a page error and the map stays usable for another drag.
+    expect(errors).toEqual([]);
+    await page.mouse.move(dot.x - 90, dot.y + 70);
+    await page.mouse.down();
+    await page.mouse.move(dot.x - 30, dot.y + 110, { steps: 8 });
+    await page.mouse.up();
+    await frames(page);
+    const again = (await labelPositions(page)).find(label => label.uri === target.uri)!;
+    expect(again.x - target.x).toBeCloseTo(-30, -1);
+    expect(again.y - target.y).toBeCloseTo(110, -1);
+    expect(errors).toEqual([]);
+    await page.getByRole("button", { name: "Fit graph", exact: true }).click();
+    await frames(page);
+    await expect(page.getByText(/Arranging.*map/)).toBeHidden();
+  });
+
+  test("a focused neighbourhood colours resources by hop distance", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await fixture(page, fixtureScene(), { dimension: 2 });
+    await page.goto("/vault/fixture/graph?entry=" + encodeURIComponent("akb://fixture/coll/architecture/doc/api-gateway.md"));
+    await graphReady(page, 2);
+    await expect(page.getByLabel("Hop colours")).toHaveText(/Focus\s*1/);
+    async function pixelsFor(token: string) {
+      return page.getByTestId("graph-canvas").locator("canvas").evaluate((canvas, name) => {
+        const bitmap = canvas as HTMLCanvasElement;
+        const stage = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const context = stage.getContext("2d")!;
+        context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        context.fillRect(0, 0, 1, 1);
+        const color = context.getImageData(0, 0, 1, 1).data;
+        context.clearRect(0, 0, bitmap.width, bitmap.height);
+        context.drawImage(bitmap, 0, 0);
+        const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+        let matching = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+          if ([0, 1, 2].every(channel => Math.abs(pixels[i + channel] - color[channel]) <= 2)) matching++;
+        }
+        return matching;
+      }, token);
+    }
+    await expect.poll(() => pixelsFor("--color-cat-5"), { message: "The focus is drawn in the focus colour" }).toBeGreaterThan(15);
+    await expect.poll(() => pixelsFor("--color-cat-1"), { message: "Its neighbour is drawn in the 1-hop colour" }).toBeGreaterThan(15);
+  });
+});
+
+test("strong links only keeps a focus's own context and fades its body links", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const scene = fixtureScene(30, 24);
+  const [incident, cluster, service, owner, sibling, runbook] = scene.nodes;
+  const around = {
+    nodes: [incident, cluster, service, owner, sibling, runbook],
+    edges: [
+      { source: incident.uri, target: cluster.uri, relation: "related_to", kind: "explicit" },
+      { source: incident.uri, target: service.uri, relation: "related_to", kind: "explicit" },
+      { source: incident.uri, target: owner.uri, relation: "related_to", kind: "explicit" },
+      { source: sibling.uri, target: cluster.uri, relation: "related_to", kind: "explicit" },
+      { source: incident.uri, target: runbook.uri, relation: "links_to", kind: "implicit" },
+    ],
+  };
+  await fixture(page, scene, { dimension: 2, onGraph: async route => { await route.fulfill({ json: around }); return true; } });
+  await page.goto("/vault/fixture/graph?hops=2&entry=" + encodeURIComponent(incident.uri));
+  await graphReady(page, 5);
+  const toggle = page.getByRole("button", { name: "Strong links only", exact: true });
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("graph-canvas")).toHaveAccessibleName(/: 5 resources, 4 relationships/);
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(page).toHaveURL(/links=all/);
+  await expect(page.getByTestId("graph-canvas")).toHaveAccessibleName(/: 6 resources, 5 relationships/);
+});
+
