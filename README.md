@@ -289,6 +289,10 @@ OKF and AKB are complementary — OKF standardizes *how knowledge is written
 down*; AKB stores, versions, searches, governs, and serves it to agents. See
 [`okf/`](okf/) for the mapping and a sample bundle.
 
+## One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/AKB/)
+
 ## Quick Start
 
 New installations use **PostgreSQL Native** with a persisted installation identity
