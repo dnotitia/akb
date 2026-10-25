@@ -297,6 +297,9 @@ Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
 - [Evaluating retrieval claims for an agent knowledge layer](docs/guides/evaluating-retrieval-claims.md)
 - [Keeping document structure in retrieval: heading-aware chunks and section reads](docs/guides/structure-aware-chunking-and-section-reads.md)
 - [Self-hosting AKB: license terms, seat counting, and checks before you commit](docs/guides/self-hosting-license-and-seats.md)
+- [Applying permissions at query time when agents search shared knowledge](docs/guides/query-time-permissions-for-agent-search.md)
+- [Keeping a record of what coding agents decided](docs/guides/recording-coding-agent-decisions.md)
+- [Keeping search current when documents and embedding models change](docs/guides/keeping-embeddings-current.md)
 
 ## Quick Start
 
