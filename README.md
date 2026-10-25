@@ -289,6 +289,15 @@ OKF and AKB are complementary — OKF standardizes *how knowledge is written
 down*; AKB stores, versions, searches, governs, and serves it to agents. See
 [`okf/`](okf/) for the mapping and a sample bundle.
 
+## Guides
+
+Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
+
+- [Sharing one agent memory across Claude Code, Cursor, and other MCP clients](docs/guides/shared-agent-memory-across-mcp-clients.md)
+- [Evaluating retrieval claims for an agent knowledge layer](docs/guides/evaluating-retrieval-claims.md)
+- [Keeping document structure in retrieval: heading-aware chunks and section reads](docs/guides/structure-aware-chunking-and-section-reads.md)
+- [Self-hosting AKB: license terms, seat counting, and checks before you commit](docs/guides/self-hosting-license-and-seats.md)
+
 ## Quick Start
 
 New installations use **PostgreSQL Native** with a persisted installation identity
