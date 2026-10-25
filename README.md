@@ -289,6 +289,14 @@ OKF and AKB are complementary — OKF standardizes *how knowledge is written
 down*; AKB stores, versions, searches, governs, and serves it to agents. See
 [`okf/`](okf/) for the mapping and a sample bundle.
 
+## Guides
+
+Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
+
+- [Applying permissions at query time when agents search shared knowledge](docs/guides/query-time-permissions-for-agent-search.md)
+- [Keeping a record of what coding agents decided](docs/guides/recording-coding-agent-decisions.md)
+- [Keeping search current when documents and embedding models change](docs/guides/keeping-embeddings-current.md)
+
 ## Quick Start
 
 New installations use **PostgreSQL Native** with a persisted installation identity
