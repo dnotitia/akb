@@ -348,6 +348,9 @@ async def run_paired(args: argparse.Namespace) -> int:
         if selection_path is not None
         else None
     )
+    if selection is not None:
+        baseline_manifest = selection.execution_manifest
+        candidate_manifest = selection.execution_manifest
     destination_paths = {
         args.baseline_output.resolve(strict=False),
         args.candidate_output.resolve(strict=False),

@@ -82,6 +82,7 @@ from .execution import (
     summarize_outcomes,
     summarize_outcomes_by_locale,
     validate_routing_evidence,
+    validate_openrouter_endpoint_price_ceiling,
     validate_model_configuration,
     worst_case_cost,
 )
@@ -111,29 +112,6 @@ def _validate_openrouter_model_identity(spec: ModelSpec, model_record: dict[str,
     canonical_slug = model_record.get("canonical_slug")
     if canonical_slug != _expected_openrouter_canonical_slug(spec):
         raise ValueError(f"provider model canonical identity drifted for {spec.class_name}")
-
-
-def _validate_openrouter_endpoint_price_ceiling(spec: ModelSpec, endpoint: dict[str, Any]) -> None:
-    """Compare registry per-token prompt/completion prices with manifest per-million ceilings."""
-    pricing = endpoint.get("pricing")
-    if not isinstance(pricing, dict):
-        raise ValueError(f"provider endpoint pricing is missing for {spec.class_name}")
-
-    limits = {
-        "prompt": spec.input_cost_per_million_usd,
-        "completion": spec.output_cost_per_million_usd,
-    }
-    for price_name, ceiling_per_million in limits.items():
-        if price_name not in pricing:
-            raise ValueError(f"provider endpoint {price_name} price is missing for {spec.class_name}")
-        try:
-            price_per_token = Decimal(str(pricing[price_name]))
-        except InvalidOperation as exc:
-            raise ValueError(f"provider endpoint {price_name} price is invalid for {spec.class_name}") from exc
-        if not price_per_token.is_finite() or price_per_token <= 0:
-            raise ValueError(f"provider endpoint {price_name} price must be finite and positive for {spec.class_name}")
-        if price_per_token * Decimal(1_000_000) > Decimal(str(ceiling_per_million)):
-            raise ValueError(f"provider endpoint {price_name} price exceeds the manifest ceiling for {spec.class_name}")
 
 
 _DYNAMIC_PROVIDER_REGISTRY_FIELDS = frozenset(
@@ -179,14 +157,21 @@ def _provider_registry_invariant_snapshot(
         registered = models[spec.model_id]
         model_record = registered.get("model_record") if isinstance(registered, dict) else None
         selected_endpoint = registered.get("selected_endpoint") if isinstance(registered, dict) else None
-        if not isinstance(model_record, dict) or not isinstance(selected_endpoint, dict):
+        eligible_endpoints = registered.get("eligible_endpoints") if isinstance(registered, dict) else None
+        if (
+            not isinstance(model_record, dict)
+            or not isinstance(selected_endpoint, dict)
+            or not isinstance(eligible_endpoints, list)
+            or not eligible_endpoints
+        ):
             raise RuntimeContractError(
                 f"provider registry identity is incomplete for {spec.class_name}",
                 stage="provider_registry",
             )
         try:
             _validate_openrouter_model_identity(spec, model_record)
-            _validate_openrouter_endpoint_price_ceiling(spec, selected_endpoint)
+            for endpoint in eligible_endpoints:
+                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
         except ValueError as exc:
             raise RuntimeContractError(str(exc), stage="provider_registry") from exc
         if registered_route_target(spec, registered) is None:
@@ -198,6 +183,7 @@ def _provider_registry_invariant_snapshot(
             "manifest_version": registered.get("manifest_version"),
             "model_record": without_dynamic_metrics(model_record),
             "selected_endpoint": without_dynamic_metrics(selected_endpoint),
+            "eligible_endpoints": without_dynamic_metrics(eligible_endpoints),
         }
     return {"status": "verified", "models": invariant_models}
 
@@ -519,11 +505,9 @@ class PairedArmCoordinator:
                     for repeat_index in range(1, manifest.repeats + 1)
                     for task in tasks
                     if transport in task.fixture.transports
-                    and (
-                        selection is None
-                        or selection.contains(model.class_name, transport, task.id, repeat_index)
-                    )
                     for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)
+                    if selection is None
+                    or selection.contains(arm, model.class_name, transport, task.id, repeat_index)
                 ]
         self._positions = {cell: 0 for cell in self._schedule}
         self._registered: set[ArmName] = set()
@@ -940,6 +924,7 @@ class BenchmarkRunner:
                         continue
                     for repeat_index in range(1, self.manifest.repeats + 1):
                         if self.selection is not None and not self.selection.contains(
+                            cast(ArmName, self.arm),
                             model_spec.class_name,
                             transport,
                             task.id,
@@ -960,6 +945,9 @@ class BenchmarkRunner:
                         )
                         planned[hash_json(key.model_dump(mode="json"))] = key
         return planned
+
+    def _should_run_smoke_gate(self, pending_by_run: Mapping[str, Any]) -> bool:
+        return self.selection is None and (any(pending_by_run.values()) or self._checkpoint_store is not None)
 
     def _checkpoint_store_for(
         self,
@@ -1090,7 +1078,7 @@ class BenchmarkRunner:
         completed_trials = sum(len(outcomes) for outcomes in source_trials.values())
         all_outcomes = [outcome for outcomes in source_trials.values() for outcome in outcomes]
         expected_trials = (
-            len(self.selection.selected_trials)
+            self.selection.expected_trials_by_arm[cast(ArmName, self.arm)]
             if self.selection is not None
             else sum(
                 1
@@ -1867,27 +1855,64 @@ class BenchmarkRunner:
                                 f"provider endpoint registry is invalid for {spec.class_name}",
                                 stage="provider_registry",
                             )
-                        selected = [
-                            endpoint
-                            for endpoint in endpoints
-                            if isinstance(endpoint, dict)
-                            and str(endpoint.get("provider_name", "")).casefold() == spec.routing.order[0].casefold()
-                            and endpoint.get("quantization") == "fp8"
-                        ]
-                        if len(selected) != 1:
+                        canonical_slug = _expected_openrouter_canonical_slug(spec)
+                        eligible: list[dict[str, Any]] = []
+                        price_rejections: list[str] = []
+                        required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
+                        for endpoint in endpoints:
+                            if not isinstance(endpoint, dict):
+                                continue
+                            provider_name = endpoint.get("provider_name")
+                            supported_parameters = endpoint.get("supported_parameters")
+                            if (
+                                not isinstance(provider_name, str)
+                                or not provider_name
+                                or endpoint.get("model_id") != spec.model_id
+                                or endpoint.get("quantization") != "fp8"
+                                or endpoint.get("tag") != f"{provider_name.casefold()}/fp8"
+                                or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
+                                or not isinstance(supported_parameters, list)
+                                or not all(isinstance(parameter, str) for parameter in supported_parameters)
+                                or not required_parameters.issubset(supported_parameters)
+                                or (
+                                    not spec.routing.allow_fallbacks
+                                    and provider_name.casefold() != spec.routing.order[0].casefold()
+                                )
+                            ):
+                                continue
+                            try:
+                                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
+                            except ValueError as exc:
+                                price_rejections.append(str(exc))
+                                continue
+                            eligible.append(endpoint)
+                        if not eligible:
+                            reason = price_rejections[0] if price_rejections else (
+                                "no registered fp8 endpoint satisfies the model, parameter, and routing constraints "
+                                f"for {spec.class_name}"
+                            )
                             raise RuntimeContractError(
-                                f"pinned {spec.routing.order[0]} fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
+                                reason,
                                 stage="provider_registry",
                             )
-                        try:
-                            _validate_openrouter_endpoint_price_ceiling(spec, selected[0])
-                        except ValueError as exc:
-                            raise RuntimeContractError(str(exc), stage="provider_registry") from exc
+                        preferred = [
+                            endpoint
+                            for endpoint in eligible
+                            if str(endpoint.get("provider_name", "")).casefold()
+                            == spec.routing.order[0].casefold()
+                        ]
+                        if len(preferred) > 1:
+                            raise RuntimeContractError(
+                                f"preferred fp8 endpoint is ambiguous for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        selected_endpoint = preferred[0] if preferred else eligible[0]
                         registered_model = {
                             "manifest_version": spec.version,
                             "model_record": row,
                             "endpoint_snapshot": endpoints_response,
-                            "selected_endpoint": selected[0],
+                            "selected_endpoint": selected_endpoint,
+                            "eligible_endpoints": eligible,
                         }
                         if registered_route_target(spec, registered_model) is None:
                             raise RuntimeContractError(
@@ -2390,7 +2415,13 @@ class BenchmarkRunner:
                     stage="provider_registry",
                 )
 
-            if any(pending_by_run.values()) or self._checkpoint_store is not None:
+            if self.selection is not None:
+                self._smoke_gate = {
+                    "status": "not_run",
+                    "required_cells": [],
+                    "cells": [],
+                }
+            elif self._should_run_smoke_gate(pending_by_run):
                 current_stage = "smoke_gate"
                 catalog_input_schemas = {
                     key: input_schemas_from_catalog(snapshot)
@@ -2933,10 +2964,16 @@ def _validate_provider_registry_identity(
         ):
             raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
         selected_endpoint = captured_model.get("selected_endpoint")
-        if not isinstance(selected_endpoint, dict):
-            raise ValueError(f"{arm} provider registry selected endpoint is invalid")
+        eligible_endpoints = captured_model.get("eligible_endpoints")
+        if (
+            not isinstance(selected_endpoint, dict)
+            or not isinstance(eligible_endpoints, list)
+            or not eligible_endpoints
+        ):
+            raise ValueError(f"{arm} provider registry eligible endpoints are invalid")
         try:
-            _validate_openrouter_endpoint_price_ceiling(spec, selected_endpoint)
+            for endpoint in eligible_endpoints:
+                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
         except ValueError as exc:
             raise ValueError(f"{arm} provider registry pricing is invalid: {exc}") from exc
         if registered_route_target(spec, captured_model) is None:
@@ -3337,7 +3374,7 @@ def _selected_diagnostic_summary(
         raw_plan = selection.get("selected_trials") if isinstance(selection, dict) else None
         identities: set[tuple[str, str, str, int]] = set()
         for item in raw_plan if isinstance(raw_plan, list) else []:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or item.get("arm") != arm:
                 continue
             model_class, transport, task_id, repeat_index = (
                 item.get("model_class"),

@@ -97,6 +97,7 @@ def _registered_model(spec) -> dict[str, Any]:
         "model_record": {"id": spec.model_id, "canonical_slug": canonical_slug},
         "endpoint_snapshot": endpoint_snapshot,
         "selected_endpoint": endpoint,
+        "eligible_endpoints": [endpoint],
     }
 
 
@@ -120,6 +121,7 @@ async def _capture_registry_with_httpx(
     *,
     manifest: BenchmarkRunManifest | None = None,
     endpoint_price_overrides: dict[str, dict[str, Any] | None] | None = None,
+    endpoint_provider_overrides: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     manifest = manifest or load_run_manifest(ROOT / "config" / "run.json")
     for spec in manifest.models:
@@ -137,30 +139,35 @@ async def _capture_registry_with_httpx(
             model_id = f"{segments[-3]}/{segments[-2]}"
             model_row = next(row for row in model_rows if row["id"] == model_id)
             spec = next(spec for spec in manifest.models if spec.model_id == model_id)
-            provider_name = _provider_display_name(spec)
-            endpoint = {
-                "model_id": model_id,
-                "name": f"{provider_name} | {model_row['canonical_slug']}",
-                "provider_name": provider_name,
-                "tag": f"{spec.routing.order[0]}/fp8",
-                "quantization": "fp8",
-                "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
-                "pricing": {
-                    "prompt": str(Decimal(str(spec.input_cost_per_million_usd)) / Decimal(1_000_000)),
-                    "completion": str(Decimal(str(spec.output_cost_per_million_usd)) / Decimal(1_000_000)),
-                },
-            }
-            if endpoint_price_overrides and model_id in endpoint_price_overrides:
-                price_override = endpoint_price_overrides[model_id]
-                if price_override is None:
-                    endpoint.pop("pricing")
-                else:
-                    endpoint["pricing"] = price_override
+            provider_names = (
+                endpoint_provider_overrides[model_id]
+                if endpoint_provider_overrides and model_id in endpoint_provider_overrides
+                else [_provider_display_name(spec)]
+            )
+            provider_endpoints = []
+            for provider_name in provider_names:
+                endpoint = {
+                    "model_id": model_id,
+                    "name": f"{provider_name} | {model_row['canonical_slug']}",
+                    "provider_name": provider_name,
+                    "tag": f"{provider_name.casefold()}/fp8",
+                    "quantization": "fp8",
+                    "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
+                    "pricing": {
+                        "prompt": str(Decimal(str(spec.input_cost_per_million_usd)) / Decimal(1_000_000)),
+                        "completion": str(Decimal(str(spec.output_cost_per_million_usd)) / Decimal(1_000_000)),
+                    },
+                }
+                if endpoint_price_overrides and model_id in endpoint_price_overrides:
+                    price_override = endpoint_price_overrides[model_id]
+                    if price_override is None:
+                        endpoint.pop("pricing")
+                    else:
+                        endpoint["pricing"] = price_override
+                provider_endpoints.append(endpoint)
             return httpx.Response(
                 200,
-                json={
-                    "data": {"endpoints": [endpoint]}
-                },
+                json={"data": {"endpoints": provider_endpoints}},
             )
         return httpx.Response(404, json={"error": {"message": "unexpected registry request"}})
 
@@ -243,6 +250,46 @@ async def test_provider_registry_accepts_streamlake_fp8_at_manifest_price_ceilin
         f"{OPENROUTER_BASE_URL}/models/deepseek/deepseek-v4-flash-0731/endpoints",
         f"{OPENROUTER_BASE_URL}/models/qwen/qwen3.8-27b/endpoints",
     }
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_selects_preferred_endpoint_and_accepts_registered_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_raw = _streamlake_manifest().model_dump(mode="json")
+    manifest_raw["models"][0]["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    primary_id = manifest.models[0].model_id
+    registry, _ = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_provider_overrides={primary_id: ["DeepInfra", "StreamLake"]},
+    )
+
+    models = registry["models"]
+    assert isinstance(models, dict)
+    primary = models[primary_id]
+    assert isinstance(primary, dict)
+    assert [endpoint["provider_name"] for endpoint in primary["eligible_endpoints"]] == [
+        "DeepInfra",
+        "StreamLake",
+    ]
+    assert primary["selected_endpoint"]["provider_name"] == "StreamLake"
+    assert validate_routing_evidence(
+        [{"model": primary_id, "routing": _routing_metadata(manifest.models[0], provider="DeepInfra")}],
+        manifest.models[0],
+        primary,
+    ) == (True, True)
+
+    narrowed_registry = deepcopy(primary)
+    narrowed_registry["eligible_endpoints"] = [narrowed_registry["eligible_endpoints"][0]]
+    narrowed_registry["selected_endpoint"] = narrowed_registry["eligible_endpoints"][0]
+    assert validate_routing_evidence(
+        [{"model": primary_id, "routing": _routing_metadata(manifest.models[0], provider="DeepInfra")}],
+        manifest.models[0],
+        narrowed_registry,
+    ) == (False, False)
 
 
 @pytest.mark.parametrize(

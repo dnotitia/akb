@@ -440,7 +440,7 @@ class ExpectedResultBinding(ContractModel):
 
 class ProviderRouting(ContractModel):
     order: list[str] = Field(min_length=1, max_length=1)
-    allow_fallbacks: Literal[False] = False
+    allow_fallbacks: bool = False
     require_parameters: Literal[True] = True
     quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
@@ -451,7 +451,7 @@ class ProviderRouting(ContractModel):
             r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*",
             value[0],
         ) is None:
-            raise ValueError("provider routing order must contain one lowercase OpenRouter provider slug")
+            raise ValueError("provider routing preference must contain one lowercase OpenRouter provider slug")
         return value
 
     def request_body(self, *, input_price: float, output_price: float) -> dict[str, Any]:

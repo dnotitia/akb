@@ -222,13 +222,18 @@ def test_manifest_treats_configured_model_prices_as_finite_ceilings() -> None:
             BenchmarkRunManifest.model_validate(invalid)
 
 
-def test_manifest_rejects_provider_or_output_limit_drift() -> None:
+def test_manifest_allows_automatic_fallback_without_changing_provider_preference() -> None:
     raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
     raw["models"][0]["routing"]["allow_fallbacks"] = True
-    with pytest.raises(ValueError):
-        BenchmarkRunManifest.model_validate(raw)
+    manifest = BenchmarkRunManifest.model_validate(raw)
+    spec = manifest.models[0]
+    assert spec.routing.order == ["deepinfra"]
+    assert spec.routing.allow_fallbacks is True
+    assert spec.routing.request_body(
+        input_price=spec.input_cost_per_million_usd,
+        output_price=spec.output_cost_per_million_usd,
+    )["provider"]["allow_fallbacks"] is True
 
-    raw["models"][0]["routing"]["allow_fallbacks"] = False
     raw["models"][0]["settings"]["max_tokens"] = 2048
     with pytest.raises(ValueError, match="output limits"):
         BenchmarkRunManifest.model_validate(raw)

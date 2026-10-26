@@ -101,6 +101,7 @@ def provider_registry_snapshot(manifest: Any | None = None) -> dict[str, Any]:
             "model_record": model_row,
             "endpoint_snapshot": endpoint_snapshot,
             "selected_endpoint": selected_endpoint,
+            "eligible_endpoints": [selected_endpoint],
         }
         endpoint_snapshots[model.model_id] = endpoint_snapshot
     payload = {

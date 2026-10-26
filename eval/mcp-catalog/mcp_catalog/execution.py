@@ -3704,13 +3704,13 @@ def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
 def registered_route_target(
     model_spec: ModelSpec,
     registered_model: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Return the canonical model and provider pinned by one registry snapshot."""
+) -> tuple[str, frozenset[str]] | None:
+    """Return the canonical model and every registry-eligible upstream."""
 
     provider_slug = model_spec.routing.order[0]
     expected_routing = {
-        "order": [provider_slug],
-        "allow_fallbacks": False,
+        "order": model_spec.routing.order,
+        "allow_fallbacks": model_spec.routing.allow_fallbacks,
         "require_parameters": True,
         "quantizations": ["fp8"],
     }
@@ -3721,42 +3721,100 @@ def registered_route_target(
     data = endpoint_snapshot.get("data") if isinstance(endpoint_snapshot, dict) else None
     endpoints = data.get("endpoints") if isinstance(data, dict) else None
     selected_endpoint = registered_model.get("selected_endpoint")
+    eligible_endpoints = registered_model.get("eligible_endpoints")
     if (
         not isinstance(model_record, dict)
         or model_record.get("id") != model_spec.model_id
         or not isinstance(model_record.get("canonical_slug"), str)
         or not isinstance(endpoints, list)
         or not isinstance(selected_endpoint, dict)
+        or not isinstance(eligible_endpoints, list)
+        or not eligible_endpoints
     ):
         return None
 
-    candidates = [
-        endpoint
-        for endpoint in endpoints
-        if isinstance(endpoint, dict)
-        and isinstance(endpoint.get("provider_name"), str)
-        and endpoint["provider_name"].casefold() == provider_slug.casefold()
-        and endpoint.get("quantization") == "fp8"
-    ]
     canonical_slug = model_record["canonical_slug"]
-    selected_provider = selected_endpoint.get("provider_name")
-    supported_parameters = selected_endpoint.get("supported_parameters")
     required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
-    if (
-        len(candidates) != 1
-        or selected_endpoint != candidates[0]
-        or selected_endpoint.get("model_id") != model_spec.model_id
-        or not isinstance(selected_provider, str)
-        or selected_provider.casefold() != provider_slug.casefold()
-        or selected_endpoint.get("tag") != f"{provider_slug}/fp8"
-        or selected_endpoint.get("quantization") != "fp8"
-        or selected_endpoint.get("name") != f"{selected_provider} | {canonical_slug}"
-        or not isinstance(supported_parameters, list)
-        or not all(isinstance(parameter, str) for parameter in supported_parameters)
-        or not required_parameters.issubset(set(supported_parameters))
-    ):
+    expected_eligible_endpoints: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        provider_name = endpoint.get("provider_name")
+        endpoint_parameters = endpoint.get("supported_parameters")
+        if (
+            not isinstance(provider_name, str)
+            or not provider_name
+            or endpoint.get("model_id") != model_spec.model_id
+            or endpoint.get("quantization") != "fp8"
+            or endpoint.get("tag") != f"{provider_name.casefold()}/fp8"
+            or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
+            or not isinstance(endpoint_parameters, list)
+            or not all(isinstance(parameter, str) for parameter in endpoint_parameters)
+            or not required_parameters.issubset(endpoint_parameters)
+            or (
+                not model_spec.routing.allow_fallbacks
+                and provider_name.casefold() != provider_slug.casefold()
+            )
+        ):
+            continue
+        try:
+            validate_openrouter_endpoint_price_ceiling(model_spec, endpoint)
+        except ValueError:
+            continue
+        expected_eligible_endpoints.append(endpoint)
+    if eligible_endpoints != expected_eligible_endpoints or not expected_eligible_endpoints:
         return None
-    return canonical_slug, selected_provider
+
+    allowed_providers: set[str] = set()
+    preferred_endpoints: list[dict[str, Any]] = []
+    for endpoint in eligible_endpoints:
+        if (
+            not isinstance(endpoint, dict)
+            or endpoint not in endpoints
+            or endpoint.get("model_id") != model_spec.model_id
+            or endpoint.get("quantization") != "fp8"
+        ):
+            return None
+        provider_name = endpoint.get("provider_name")
+        if not isinstance(provider_name, str) or not provider_name:
+            return None
+        provider_key = provider_name.casefold()
+        if not model_spec.routing.allow_fallbacks and provider_key != provider_slug.casefold():
+            return None
+        if provider_key in allowed_providers:
+            return None
+        allowed_providers.add(provider_key)
+        if provider_key == provider_slug.casefold():
+            preferred_endpoints.append(endpoint)
+
+    if len(preferred_endpoints) > 1:
+        return None
+    expected_selected = preferred_endpoints[0] if preferred_endpoints else eligible_endpoints[0]
+    if selected_endpoint != expected_selected:
+        return None
+    return canonical_slug, frozenset(allowed_providers)
+
+
+def validate_openrouter_endpoint_price_ceiling(model_spec: ModelSpec, endpoint: dict[str, Any]) -> None:
+    """Reject a registry endpoint whose prompt or completion price exceeds the manifest ceiling."""
+
+    pricing = endpoint.get("pricing")
+    if not isinstance(pricing, dict):
+        raise ValueError(f"provider endpoint pricing is missing for {model_spec.class_name}")
+    for price_name, ceiling_per_million in (
+        ("prompt", model_spec.input_cost_per_million_usd),
+        ("completion", model_spec.output_cost_per_million_usd),
+    ):
+        if price_name not in pricing:
+            raise ValueError(f"provider endpoint {price_name} price is missing for {model_spec.class_name}")
+        try:
+            price_per_token = Decimal(str(pricing[price_name]))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError(f"provider endpoint {price_name} price is invalid for {model_spec.class_name}") from exc
+        if not price_per_token.is_finite() or price_per_token <= 0:
+            raise ValueError(f"provider endpoint {price_name} price must be finite and positive for {model_spec.class_name}")
+        if price_per_token * Decimal(1_000_000) > Decimal(str(ceiling_per_million)):
+            raise ValueError(f"provider endpoint {price_name} price exceeds the manifest ceiling for {model_spec.class_name}")
 
 
 def validate_routing_evidence(
@@ -3769,7 +3827,7 @@ def validate_routing_evidence(
     route_target = registered_route_target(model_spec, registered_model)
     if route_target is None:
         return False, False
-    canonical_model, provider_name = route_target
+    canonical_model, eligible_providers = route_target
     observed = False
     for item in evidence:
         if item.get("model") != model_spec.model_id:
@@ -3787,7 +3845,8 @@ def validate_routing_evidence(
         if (
             len(selected) != 1
             or selected[0].get("model") != canonical_model
-            or selected[0].get("provider") != provider_name
+            or not isinstance(selected[0].get("provider"), str)
+            or selected[0]["provider"].casefold() not in eligible_providers
         ):
             return observed, False
         observed = True

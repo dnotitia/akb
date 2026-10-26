@@ -1,4 +1,4 @@
-"""The explicitly approved AKB-361 tool-guidance regression sample."""
+"""Source-bound selection for the AKB-361 provider-failure remeasurement."""
 
 from __future__ import annotations
 
@@ -8,51 +8,78 @@ from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import Field, model_validator
 
-from .contracts import BenchmarkRunManifest, ContractModel, TaskManifest, Transport
+from .contracts import ArmName, BenchmarkRunManifest, ContractModel, TaskManifest, Transport, hash_json
 from .evidence import validate_model_input_evidence
 from .execution import TrialOutcome, has_measured_evidence, has_server_instructions_evidence
 from .pairing import planned_arm_order
 
-SelectionIdentity = tuple[str, str, str, int]
-ParentLineage = Literal["previous"]
-ParentName = Literal["previous_baseline", "previous_candidate"]
+SelectionIdentity = tuple[ArmName, str, str, str, int]
+ParentLineage = Literal["resume04"]
+ParentName = Literal[
+    "baseline_artifact",
+    "baseline_checkpoint",
+    "candidate_artifact",
+    "candidate_checkpoint",
+]
 
 TOTAL_BUDGET_USD = Decimal("50")
-PRIOR_SPEND_USD = Decimal("9.2804328442")
+PRIOR_SPEND_USD = Decimal("11.1961127352")
 NEW_EXECUTION_LIMIT_USD = TOTAL_BUDGET_USD - PRIOR_SPEND_USD
 PER_TRIAL_LIMIT_USD = Decimal("0.10")
 REQUEST_TIMEOUT_SECONDS = 300
 PAIRED_ORDER_MODE = "counterbalanced_task_repeat"
 PAIRED_ORDER_SEED = "akb-358-v1"
+ARM_NAMES: tuple[ArmName, ArmName] = ("baseline", "candidate")
 APPROVED_AUTHORIZATION = {
     "uri": "akb://reef-akb/coll/issues/doc/akb-361.md",
-    "revision": "41ff509113638ffe9ec0af1f803b42439be87405",  # pragma: allowlist secret
-    "content_sha256": "b11b8f36d5c8fa36fe3eb6b453a56b612b15487f3d7b26b939d903c7b9f357a7",  # pragma: allowlist secret
+    "revision": "c7ffee0f74e3f85d1ce8502f343c16d51a6bb83d",  # pragma: allowlist secret
+    "content_sha256": "b1bed7a8febaad288255a55ad0caaacc7fe55aa1d114d7319a47740f0dda9b7f",  # pragma: allowlist secret
 }
 APPROVED_PARENT_SHA256: dict[ParentName, str] = {
-    "previous_baseline": "276e0dfdfdad58ce083f65b3ea0c21a22675f31d8a393995dace62b77eaa43a4",  # pragma: allowlist secret
-    "previous_candidate": "3195db132b810dfd37b58a4e1d8169ba92dca965ffa5140ec5c2a4624f6d647c",  # pragma: allowlist secret
+    "baseline_artifact": "aee24ffd43b29636cb1ea50994fef068183b5ce6013a10f30cc29980e87d9a0d",  # pragma: allowlist secret
+    "baseline_checkpoint": "87a78c5929685e7586b567648c40ac1d159d40e1928fff611626fda630b9a798",  # pragma: allowlist secret
+    "candidate_artifact": "b4f22694020812e2cdd99058fd3153958a5cce491fb830f6011baacb6c214987",  # pragma: allowlist secret
+    "candidate_checkpoint": "ded15e8564780025738acd4bbd60a3f3b389f9febfe228c02d7951a48a88d623",  # pragma: allowlist secret
+}
+SOURCE_REVISIONS = {
+    "baseline": "9daf7b44f9387776f845f181d29f1a7c8d21b37a",  # pragma: allowlist secret
+    "candidate": "c353e91ca3a3277c37986c635ed593cdf119ba85",  # pragma: allowlist secret
 }
 
-_ROLE_BY_IDENTITY: dict[SelectionIdentity, Literal["failure", "control"]] = {
-    ("primary", "http", "collection-relation-lifecycle-ko", 2): "failure",
-    ("primary", "http", "table-schema-conflict-en", 2): "failure",
-    ("primary", "stdio", "stdio-image-files-ko", 1): "failure",
-    ("primary", "stdio", "table-publication-en", 1): "failure",
-    ("primary", "stdio", "table-publication-ko", 1): "failure",
-    ("primary", "stdio", "table-schema-conflict-en", 1): "failure",
-    ("primary", "http", "exhaustive-inspection-ko", 1): "control",
-    ("primary", "http", "ambiguous-clarification-ko", 2): "control",
-    ("primary", "http", "exhaustive-inspection-en", 2): "control",
-    ("primary", "http", "ambiguous-clarification-en", 2): "control",
-    ("primary", "stdio", "exhaustive-inspection-ko", 2): "control",
-    ("primary", "stdio", "stdio-local-ko", 2): "control",
-    ("primary", "stdio", "exhaustive-inspection-en", 2): "control",
-    ("primary", "stdio", "read-vaults-en", 2): "control",
+# arm, model class, transport, task, repeat, original failure kind
+APPROVED_FAILURES: tuple[tuple[ArmName, str, Transport, str, int, str], ...] = (
+    ("baseline", "lightweight", "http", "authorization-readonly-ko", 2, "provider"),
+    ("baseline", "lightweight", "http", "create-vault-ko", 1, "request_timeout"),
+    ("baseline", "lightweight", "http", "history-provenance-en", 1, "interrupted"),
+    ("baseline", "lightweight", "http", "invalid-recovery-en", 2, "unknown"),
+    ("baseline", "lightweight", "http", "overlapping-document-en", 2, "unknown"),
+    ("baseline", "lightweight", "http", "overlapping-document-ko", 2, "provider"),
+    ("baseline", "lightweight", "stdio", "history-provenance-en", 1, "provider"),
+    ("baseline", "lightweight", "stdio", "import-export-en", 2, "provider"),
+    ("baseline", "lightweight", "stdio", "import-export-ko", 2, "provider"),
+    ("baseline", "lightweight", "stdio", "table-schema-conflict-en", 1, "provider"),
+    ("baseline", "primary", "http", "collection-relation-lifecycle-en", 1, "unknown"),
+    ("baseline", "primary", "http", "collection-relation-lifecycle-ko", 1, "unknown"),
+    ("baseline", "primary", "http", "knowledge-workflow-ko", 1, "request_timeout"),
+    ("candidate", "lightweight", "http", "overlapping-document-en", 2, "provider"),
+    ("candidate", "lightweight", "http", "overlapping-document-ko", 1, "provider"),
+    ("candidate", "lightweight", "http", "table-publication-ko", 1, "provider"),
+    ("candidate", "lightweight", "stdio", "access-ownership-public-en", 2, "provider"),
+    ("candidate", "lightweight", "stdio", "access-ownership-public-ko", 1, "provider"),
+    ("candidate", "lightweight", "stdio", "create-vault-ko", 1, "request_timeout"),
+    ("candidate", "lightweight", "stdio", "import-export-en", 2, "provider"),
+    ("candidate", "primary", "http", "knowledge-workflow-ko", 1, "unknown"),
+    ("candidate", "primary", "stdio", "history-provenance-en", 1, "interrupted"),
+    ("candidate", "primary", "stdio", "knowledge-workflow-ko", 1, "request_timeout"),
+)
+
+_FAILURE_KIND_BY_IDENTITY: dict[SelectionIdentity, str] = {
+    (arm, model_class, transport, task_id, repeat_index): failure_kind
+    for arm, model_class, transport, task_id, repeat_index, failure_kind in APPROVED_FAILURES
 }
 
 
@@ -62,7 +89,7 @@ class AuthorizationPin(ContractModel):
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class ParentArtifact(ContractModel):
+class ParentFile(ContractModel):
     path: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -76,23 +103,27 @@ class SelectionBudget(ContractModel):
 
 
 class SelectedTrial(ContractModel):
+    arm: ArmName
     model_class: Literal["primary", "lightweight"]
     transport: Transport
     task_id: str = Field(pattern=r"^[a-z][a-z0-9-]{2,63}$")
     repeat_index: int = Field(ge=1)
-    role: Literal["failure", "control"]
+    role: Literal["failure"]
     parent_lineage: ParentLineage
+    parent_record_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parent_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failure_kind: Literal["provider", "request_timeout", "interrupted", "unknown"]
 
     @property
     def identity(self) -> SelectionIdentity:
-        return (self.model_class, self.transport, self.task_id, self.repeat_index)
+        return (self.arm, self.model_class, self.transport, self.task_id, self.repeat_index)
 
 
 class SelectionDocument(ContractModel):
     schema_version: Literal[1]
     authorization: AuthorizationPin
-    parents: dict[ParentName, ParentArtifact]
-    selected_trials: list[SelectedTrial] = Field(min_length=14, max_length=14)
+    parents: dict[ParentName, ParentFile]
+    selected_trials: list[SelectedTrial]
     budget: SelectionBudget
 
     @model_validator(mode="after")
@@ -100,19 +131,23 @@ class SelectionDocument(ContractModel):
         if self.authorization.model_dump(mode="json") != APPROVED_AUTHORIZATION:
             raise ValueError("selection authorization differs from the approved AKB-361 revision")
         if set(self.parents) != set(APPROVED_PARENT_SHA256):
-            raise ValueError("selection must pin the approved previous baseline and candidate artifacts")
+            raise ValueError("selection must pin the four approved resume04 parent files")
         if {name: parent.sha256 for name, parent in self.parents.items()} != APPROVED_PARENT_SHA256:
-            raise ValueError("selection parent artifact hashes differ from the approved AKB-361 artifacts")
+            raise ValueError("selection parent file hashes differ from the approved AKB-361 evidence")
         identities = [trial.identity for trial in self.selected_trials]
         if len(set(identities)) != len(identities):
-            raise ValueError("selection contains duplicate trial identities")
-        if set(identities) != set(_ROLE_BY_IDENTITY):
-            raise ValueError("selection identities differ from the approved AKB-361 sample")
+            raise ValueError("selection contains duplicate arm-specific trial identities")
+        if set(identities) != set(_FAILURE_KIND_BY_IDENTITY):
+            raise ValueError("selection identities differ from the 23 approved parent failures")
         for trial in self.selected_trials:
-            if trial.role != _ROLE_BY_IDENTITY[trial.identity] or trial.parent_lineage != "previous":
-                raise ValueError("selection role or parent lineage differs from the approved sample")
-        if Counter(trial.role for trial in self.selected_trials) != Counter(failure=6, control=8):
-            raise ValueError("selection must contain six failures and eight controls")
+            if (
+                trial.role != "failure"
+                or trial.parent_lineage != "resume04"
+                or trial.failure_kind != _FAILURE_KIND_BY_IDENTITY[trial.identity]
+            ):
+                raise ValueError("selection role, parent lineage, or failure kind differs from the approved sample")
+        if Counter(trial.arm for trial in self.selected_trials) != Counter(baseline=13, candidate=10):
+            raise ValueError("selection must contain 13 baseline and 10 candidate failures")
         budget = self.budget
         if (
             budget.session_max_usd != TOTAL_BUDGET_USD
@@ -133,24 +168,47 @@ class ToolGuidanceSelection:
     budget: SelectionBudget
     parents: dict[str, dict[str, str]]
     selected_trials: tuple[SelectedTrial, ...]
-    parent_results: dict[SelectionIdentity, dict[str, dict[str, Any]]]
+    parent_results: dict[SelectionIdentity, dict[str, Any]]
+    execution_manifest: BenchmarkRunManifest
+
+    @property
+    def expected_trials_by_arm(self) -> dict[ArmName, int]:
+        counts = Counter(trial.arm for trial in self.selected_trials)
+        return {"baseline": counts["baseline"], "candidate": counts["candidate"]}
 
     @property
     def identities(self) -> frozenset[SelectionIdentity]:
         return frozenset(trial.identity for trial in self.selected_trials)
 
-    def contains(self, model_class: str, transport: str, task_id: str, repeat_index: int) -> bool:
-        return (model_class, transport, task_id, repeat_index) in self.identities
+    def contains(
+        self,
+        arm: ArmName,
+        model_class: str,
+        transport: str,
+        task_id: str,
+        repeat_index: int,
+    ) -> bool:
+        return (arm, model_class, transport, task_id, repeat_index) in self.identities
 
     def artifact_metadata(self) -> dict[str, Any]:
+        preferences = {
+            model.class_name: list(model.routing.order)
+            for model in self.execution_manifest.models
+        }
         return {
-            "purpose": "tool_guidance_regression",
+            "purpose": "provider_failure_remeasurement",
             "authorization": self.authorization.model_dump(mode="json"),
             "selection_sha256": self.sha256,
             "parents": {name: dict(parent) for name, parent in sorted(self.parents.items())},
             "selected_trials": [trial.model_dump(mode="json") for trial in self.selected_trials],
-            "selected_identity_count": len(self.selected_trials),
-            "expected_model_trials": 2 * len(self.selected_trials),
+            "expected_trials_by_arm": self.expected_trials_by_arm,
+            "expected_model_trials": len(self.selected_trials),
+            "routing_policy": {
+                "provider_preference_by_model": preferences,
+                "allow_fallbacks": True,
+                "require_parameters": True,
+                "quantizations": ["fp8"],
+            },
             "budget": {
                 "session_max_usd": str(self.budget.session_max_usd),
                 "prior_conservative_spend_usd": str(self.budget.prior_conservative_spend_usd),
@@ -161,7 +219,7 @@ class ToolGuidanceSelection:
         }
 
     def checkpoint_preflight(self) -> dict[str, Any]:
-        """Return the immutable, read-only input validation recorded in checkpoints."""
+        """Return the immutable source and budget validation stored in child checkpoints."""
 
         return {
             "read_only": True,
@@ -171,7 +229,10 @@ class ToolGuidanceSelection:
             "parents": {name: dict(parent) for name, parent in sorted(self.parents.items())},
             "parent_count": len(self.parents),
             "selected_trial_count": len(self.selected_trials),
-            "role_counts": dict(sorted(Counter(trial.role for trial in self.selected_trials).items())),
+            "selected_trials_by_arm": self.expected_trials_by_arm,
+            "failure_kind_counts": dict(
+                sorted(Counter(trial.failure_kind for trial in self.selected_trials).items())
+            ),
             "budget": {
                 "session_max_usd": str(self.budget.session_max_usd),
                 "prior_conservative_spend_usd": str(self.budget.prior_conservative_spend_usd),
@@ -199,56 +260,196 @@ class ToolGuidanceSelection:
             document = SelectionDocument.model_validate_json(raw)
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValueError(f"selection file is invalid: {exc}") from exc
-        _validate_manifest(manifest, document.selected_trials, tasks, document.budget)
-        parents = _validate_parents(document.parents, selection_directory=path.parent)
+
+        parents = _load_parent_files(document.parents, selection_directory=path.parent)
+        source_manifest = _validate_parent_artifacts(parents, tasks)
+        execution_manifest = _build_execution_manifest(
+            source_manifest,
+            manifest,
+            tasks,
+            document.budget,
+        )
+        parent_results = _parent_results(parents, document.selected_trials)
         return cls(
             path=path,
             sha256=selection_sha256,
             authorization=document.authorization,
             budget=document.budget,
-            parents=parents,
+            parents={
+                name: {"path": parent["path"], "sha256": parent["sha256"]}
+                for name, parent in sorted(parents.items())
+            },
             selected_trials=tuple(document.selected_trials),
-            parent_results=_parent_results(parents, document.selected_trials),
+            parent_results=parent_results,
+            execution_manifest=execution_manifest,
         )
 
 
-def _validate_manifest(
-    manifest: BenchmarkRunManifest,
-    selected_trials: list[SelectedTrial],
+def _load_parent_files(
+    parents: dict[ParentName, ParentFile],
+    *,
+    selection_directory: Path,
+) -> dict[str, dict[str, Any]]:
+    loaded: dict[str, dict[str, Any]] = {}
+    for name, binding in parents.items():
+        try:
+            parent_path = Path(binding.path).expanduser()
+            if not parent_path.is_absolute():
+                parent_path = selection_directory / parent_path
+            parent_path = parent_path.resolve(strict=True)
+            raw = parent_path.read_bytes()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"{name} parent file is unavailable") from exc
+        if hashlib.sha256(raw).hexdigest() != binding.sha256:
+            raise ValueError(f"{name} parent file SHA-256 does not match the selection")
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(f"{name} parent file is invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} parent file must contain a JSON object")
+        loaded[name] = {
+            "path": str(parent_path),
+            "sha256": binding.sha256,
+            "document": value,
+        }
+    return loaded
+
+
+def _validate_parent_artifacts(
+    parents: dict[str, dict[str, Any]],
+    tasks: list[TaskManifest],
+) -> BenchmarkRunManifest:
+    task_corpus_hash = hash_json([task.model_dump(mode="json") for task in tasks])
+    manifests: list[BenchmarkRunManifest] = []
+    for arm in ("baseline", "candidate"):
+        artifact = parents[f"{arm}_artifact"]["document"]
+        checkpoint = parents[f"{arm}_checkpoint"]["document"]
+        if artifact.get("arm") != arm or artifact.get("source_revision") != SOURCE_REVISIONS[arm]:
+            raise ValueError(f"resume04 {arm} artifact has the wrong source identity")
+        try:
+            parent_manifest = BenchmarkRunManifest.model_validate(artifact["manifest"])
+        except Exception as exc:
+            raise ValueError(f"resume04 {arm} artifact manifest is invalid: {exc}") from exc
+        manifest_hash = hash_json(parent_manifest.model_dump(mode="json"))
+        if (
+            artifact.get("run_manifest_hash") != manifest_hash
+            or artifact.get("task_corpus_hash") != task_corpus_hash
+            or parent_manifest.arm_source_revisions[arm] != SOURCE_REVISIONS[arm]
+        ):
+            raise ValueError(f"resume04 {arm} artifact manifest or task corpus hash is invalid")
+        if not isinstance(checkpoint.get("header"), dict):
+            raise ValueError(f"resume04 {arm} checkpoint header is missing")
+        header = checkpoint["header"]
+        if (
+            checkpoint.get("schema_version") != 4
+            or checkpoint.get("lifecycle") != "finalized"
+            or header.get("arm") != arm
+            or header.get("source_revision") != SOURCE_REVISIONS[arm]
+            or header.get("run_manifest_hash") != manifest_hash
+            or header.get("task_corpus_hash") != task_corpus_hash
+            or header.get("pre_smoke_seal_hash") != artifact.get("pre_smoke_seal_hash")
+            or header.get("provider_registry_hash") != _provider_registry_hash(artifact)
+        ):
+            raise ValueError(f"resume04 {arm} checkpoint header is not bound to its artifact")
+        records = checkpoint.get("records")
+        if not isinstance(records, dict):
+            raise ValueError(f"resume04 {arm} checkpoint has no trial record map")
+        for key_digest, record in records.items():
+            if not isinstance(record, dict) or not isinstance(record.get("key"), dict):
+                raise ValueError(f"resume04 {arm} checkpoint contains a malformed trial record")
+            key = record["key"]
+            outcome = record.get("outcome")
+            if (
+                not isinstance(outcome, dict)
+                or key_digest != hash_json(key)
+                or record.get("record_hash")
+                != hash_json({"status": record.get("status"), "key": key, "outcome": outcome})
+                or key.get("arm") != arm
+                or key.get("source_revision") != SOURCE_REVISIONS[arm]
+                or key.get("run_manifest_hash") != manifest_hash
+                or key.get("task_corpus_hash") != task_corpus_hash
+            ):
+                raise ValueError(f"resume04 {arm} checkpoint record identity or hash is invalid")
+        manifests.append(parent_manifest)
+    baseline_manifest, candidate_manifest = manifests
+    if baseline_manifest != candidate_manifest:
+        raise ValueError("resume04 parent artifacts do not share an identical preregistered manifest")
+    if baseline_manifest.paired_order != PAIRED_ORDER_MODE or baseline_manifest.paired_order_seed != PAIRED_ORDER_SEED:
+        raise ValueError("resume04 parent manifest does not preserve the approved paired order")
+    if set(baseline_manifest.arm_source_revisions.items()) != set(SOURCE_REVISIONS.items()):
+        raise ValueError("resume04 parent manifest source revisions differ from the approved sources")
+    for model in baseline_manifest.models:
+        if (
+            model.version not in {"20260731", "20260814"}
+            or model.settings.get("temperature") != 0
+            or model.settings.get("max_tokens") != 8192
+            or model.routing.allow_fallbacks
+            or model.routing.require_parameters is not True
+            or model.routing.quantizations != ["fp8"]
+        ):
+            raise ValueError("resume04 parent manifest does not preserve the approved model contract")
+    return baseline_manifest
+
+
+def _provider_registry_hash(artifact: dict[str, Any]) -> str | None:
+    registry = artifact.get("provider_registry")
+    return registry.get("snapshot_hash") if isinstance(registry, dict) else None
+
+
+def _build_execution_manifest(
+    source_manifest: BenchmarkRunManifest,
+    input_manifest: BenchmarkRunManifest,
     tasks: list[TaskManifest],
     selection_budget: SelectionBudget,
-) -> None:
-    budget = manifest.budget
-    if set(manifest.arms) != {"baseline", "candidate"} or set(manifest.transports) != {"http", "stdio"}:
-        raise ValueError("run manifest does not contain the approved paired transports and arms")
-    if manifest.paired_order != PAIRED_ORDER_MODE or manifest.paired_order_seed != PAIRED_ORDER_SEED:
-        raise ValueError("run manifest does not preserve the approved paired arm order and seed")
-    if (
-        Decimal(str(budget.max_total_cost_usd)) != selection_budget.session_max_usd
-        or Decimal(str(budget.max_cost_per_trial_usd)) != selection_budget.per_trial_usd
-        or budget.request_timeout_seconds != selection_budget.request_timeout_seconds
-    ):
-        raise ValueError("run manifest differs from the approved tool-guidance measurement budget")
-    expected_routes: dict[Literal["primary", "lightweight"], str] = {
-        "primary": "streamlake",
-        "lightweight": "akashml",
+) -> BenchmarkRunManifest:
+    source_manifest.validate_tasks(tasks)
+    input_manifest.validate_tasks(tasks)
+    if source_manifest.model_dump(mode="json"):
+        source_data = source_manifest.model_dump(mode="json")
+        input_data = input_manifest.model_dump(mode="json")
+        for field in ("models", "budget", "arm_source_revisions"):
+            source_data.pop(field, None)
+            input_data.pop(field, None)
+        if source_data != input_data:
+            raise ValueError("resume04 parent run plan differs from the supplied benchmark contract")
+    source_models = {model.class_name: model for model in source_manifest.models}
+    input_models = {model.class_name: model for model in input_manifest.models}
+    if set(source_models) != set(input_models):
+        raise ValueError("resume04 parent model classes differ from the supplied benchmark contract")
+    for class_name, source_model in source_models.items():
+        input_model = input_models[class_name]
+        if (
+            source_model.model_id != input_model.model_id
+            or source_model.version != input_model.version
+            or source_model.provider != input_model.provider
+            or source_model.base_url_env != input_model.base_url_env
+            or source_model.provider_key_env != input_model.provider_key_env
+            or source_model.settings != input_model.settings
+        ):
+            raise ValueError(f"resume04 {class_name} model identity differs from the supplied benchmark contract")
+    expected_budget = {
+        "max_total_cost_usd": float(selection_budget.session_max_usd),
+        "max_cost_per_trial_usd": float(selection_budget.per_trial_usd),
+        "request_timeout_seconds": selection_budget.request_timeout_seconds,
     }
-    models = {model.class_name: model for model in manifest.models}
-    if set(models) != set(expected_routes):
-        raise ValueError("run manifest does not contain the approved model cells")
-    for model_class, provider in expected_routes.items():
-        route = models[model_class].routing
-        if route.order != [provider] or route.allow_fallbacks:
-            raise ValueError("run manifest does not use the approved fixed provider routes")
-    task_by_id = {task.id: task for task in tasks}
-    for trial in selected_trials:
-        if trial.model_class not in models or trial.transport not in manifest.transports:
-            raise ValueError("selection contains an unregistered model or transport")
-        task = task_by_id.get(trial.task_id)
-        if task is None or trial.transport not in task.fixture.transports:
-            raise ValueError("selection contains a task outside its registered transport scope")
-        if trial.repeat_index > manifest.repeats:
-            raise ValueError("selection contains a repeat outside the registered run plan")
+    if source_manifest.budget.model_dump(mode="json") != expected_budget:
+        raise ValueError("resume04 manifest budget differs from the approved selection limits")
+    models = [
+        model.model_copy(
+            update={
+                "routing": model.routing.model_copy(update={"allow_fallbacks": True}),
+            }
+        )
+        for model in source_manifest.models
+    ]
+    execution_manifest = source_manifest.model_copy(update={"models": models})
+    if set(execution_manifest.arms) != {"baseline", "candidate"} or set(execution_manifest.transports) != {"http", "stdio"}:
+        raise ValueError("run manifest does not contain the approved paired transports and arms")
+    for model in execution_manifest.models:
+        if not model.routing.allow_fallbacks:
+            raise ValueError("selection routing must allow automatic provider fallbacks")
+    return execution_manifest
 
 
 def _parent_rows(artifact: dict[str, Any]) -> list[dict[str, Any]]:
@@ -260,82 +461,87 @@ def _parent_rows(artifact: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(run, dict):
             raise ValueError("parent artifact contains a malformed run")
         trials = run.get("trials")
-        if not isinstance(trials, list):
-            raise ValueError("parent artifact contains no trial rows")
-        if any(not isinstance(row, dict) for row in trials):
-            raise ValueError("parent artifact contains a malformed trial row")
+        if not isinstance(trials, list) or any(not isinstance(row, dict) for row in trials):
+            raise ValueError("parent artifact contains malformed trial rows")
         rows.extend(trials)
     return rows
 
 
-def _validate_parents(
-    parents: dict[ParentName, ParentArtifact],
-    *,
-    selection_directory: Path,
-) -> dict[str, dict[str, str]]:
-    metadata: dict[str, dict[str, str]] = {}
-    for name in APPROVED_PARENT_SHA256:
-        parent = parents[name]
-        try:
-            parent_path = Path(parent.path).expanduser()
-            if not parent_path.is_absolute():
-                parent_path = selection_directory / parent_path
-            parent_path = parent_path.resolve(strict=True)
-            raw = parent_path.read_bytes()
-        except (OSError, RuntimeError) as exc:
-            raise ValueError(f"{name} parent artifact is unavailable") from exc
-        if hashlib.sha256(raw).hexdigest() != parent.sha256:
-            raise ValueError(f"{name} parent artifact SHA-256 does not match the selection")
-        try:
-            artifact = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError(f"{name} parent artifact is invalid JSON") from exc
-        expected_arm = "baseline" if name.endswith("_baseline") else "candidate"
-        if not isinstance(artifact, dict) or artifact.get("arm") != expected_arm:
-            raise ValueError(f"{name} parent artifact has the wrong arm identity")
-        _parent_rows(artifact)
-        metadata[name] = {"path": str(parent_path), "sha256": parent.sha256}
-    return metadata
-
-
 def _parent_results(
-    parents: dict[str, dict[str, str]],
+    parents: dict[str, dict[str, Any]],
     selected_trials: list[SelectedTrial],
-) -> dict[SelectionIdentity, dict[str, dict[str, Any]]]:
-    artifacts: dict[str, dict[str, Any]] = {}
-    for name, parent in parents.items():
-        raw = Path(parent["path"]).read_bytes()
-        if hashlib.sha256(raw).hexdigest() != parent["sha256"]:
-            raise ValueError(f"{name} parent artifact changed while selection was loading")
-        artifacts[name] = json.loads(raw)
-
-    results: dict[SelectionIdentity, dict[str, dict[str, Any]]] = {}
+) -> dict[SelectionIdentity, dict[str, Any]]:
+    results: dict[SelectionIdentity, dict[str, Any]] = {}
+    selected_by_arm: dict[ArmName, set[SelectionIdentity]] = {
+        arm: {trial.identity for trial in selected_trials if trial.arm == arm}
+        for arm in ARM_NAMES
+    }
+    for arm in ARM_NAMES:
+        artifact = parents[f"{arm}_artifact"]["document"]
+        checkpoint = parents[f"{arm}_checkpoint"]["document"]
+        rows = _parent_rows(artifact)
+        failed_rows = {
+            (
+                arm,
+                row.get("model_class"),
+                row.get("transport"),
+                row.get("task_id"),
+                row.get("repeat_index"),
+            )
+            for row in rows
+            if row.get("failure_kind") not in (None, "none")
+        }
+        if failed_rows != selected_by_arm[arm]:
+            raise ValueError(f"resume04 {arm} selection does not include exactly every recorded execution failure")
     for trial in selected_trials:
-        rows_by_arm: dict[str, dict[str, Any]] = {}
-        for arm in ("baseline", "candidate"):
-            name = f"{trial.parent_lineage}_{arm}"
-            rows = [
-                row
-                for row in _parent_rows(artifacts[name])
-                if all(
-                    row.get(field) == value
-                    for field, value in zip(
-                        ("model_class", "transport", "task_id", "repeat_index"),
-                        trial.identity,
-                        strict=True,
-                    )
-                )
-            ]
-            if len(rows) != 1 or rows[0].get("arm") != arm:
-                raise ValueError(f"{name} does not contain exactly one registered parent trial")
-            rows_by_arm[arm] = rows[0]
-        baseline, candidate = rows_by_arm["baseline"], rows_by_arm["candidate"]
-        if trial.role == "failure":
-            if candidate.get("success") is not False:
-                raise ValueError("selected failure is not a prior candidate failure")
-        elif baseline.get("success") is not True or candidate.get("success") is not True:
-            raise ValueError("selected control was not successful in both pinned parent arms")
-        results[trial.identity] = rows_by_arm
+        artifact = parents[f"{trial.arm}_artifact"]["document"]
+        checkpoint = parents[f"{trial.arm}_checkpoint"]["document"]
+        matching_rows = [
+            row
+            for row in _parent_rows(artifact)
+            if row.get("arm") == trial.arm
+            and row.get("model_class") == trial.model_class
+            and row.get("transport") == trial.transport
+            and row.get("task_id") == trial.task_id
+            and row.get("repeat_index") == trial.repeat_index
+        ]
+        if len(matching_rows) != 1:
+            raise ValueError("selected failure does not map to exactly one parent artifact row")
+        row = matching_rows[0]
+        if row.get("success") is not False or row.get("failure_kind") != trial.failure_kind:
+            raise ValueError("selected parent row is not the approved failed outcome")
+        statuses = [
+            status
+            for run_key, run in artifact["runs"].items()
+            if run_key == f"{trial.model_class}:{trial.transport}" and isinstance(run, dict)
+            for status in run.get("statuses", [])
+            if isinstance(status, dict)
+            and status.get("task_id") == trial.task_id
+            and status.get("repeat_index") == trial.repeat_index
+        ]
+        if len(statuses) != 1 or statuses[0].get("status") != "failed":
+            raise ValueError("selected parent artifact row does not have a failed checkpoint status")
+        record = checkpoint["records"].get(trial.parent_record_key)
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != "failed"
+            or record.get("record_hash") != trial.parent_record_hash
+            or record.get("key", {}).get("arm") != trial.arm
+            or record.get("key", {}).get("model_class") != trial.model_class
+            or record.get("key", {}).get("transport") != trial.transport
+            or record.get("key", {}).get("task_id") != trial.task_id
+            or record.get("key", {}).get("repeat_index") != trial.repeat_index
+            or record.get("outcome") != row
+            or record.get("outcome", {}).get("failure_kind") != trial.failure_kind
+        ):
+            raise ValueError("selected parent checkpoint record or record hash differs from its artifact row")
+        results[trial.identity] = {
+            "arm": trial.arm,
+            "row": row,
+            "record_key": trial.parent_record_key,
+            "record_hash": trial.parent_record_hash,
+            "status": record["status"],
+        }
     return results
 
 
@@ -344,11 +550,7 @@ def _parent_metrics(row: dict[str, Any]) -> dict[str, Any]:
         "success",
         "trial_error",
         "failure_kind",
-        "first_action_accuracy",
-        "first_material_action_accuracy",
-        "argument_validity",
-        "nonexistent_tool_attempts",
-        "wrong_capability_calls",
+        "error",
         "model_requests",
         "input_tokens",
         "output_tokens",
@@ -357,24 +559,38 @@ def _parent_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return {field: row.get(field) for field in fields}
 
 
-def _trial_metrics(outcome: TrialOutcome, expected_instructions: str | None) -> dict[str, Any]:
-    return {
-        "success": outcome.success,
-        "trial_error": outcome.trial_error,
-        "failure_kind": outcome.failure_kind,
-        "first_action_accuracy": outcome.first_action_accuracy,
-        "first_material_action_accuracy": outcome.first_material_action_accuracy,
-        "argument_validity": outcome.argument_validity,
-        "nonexistent_tool_attempts": outcome.nonexistent_tool_attempts,
-        "wrong_capability_calls": outcome.wrong_capability_calls,
-        "model_requests": outcome.model_requests,
-        "input_tokens": outcome.input_tokens,
-        "output_tokens": outcome.output_tokens,
-        "cost_usd": outcome.cost_usd,
-        "server_instructions_sha256": outcome.server_instructions_sha256,
-        "model_input_requests": len(outcome.model_input_evidence),
-        "server_instructions_delivered": has_server_instructions_evidence(outcome, expected_instructions),
-    }
+def _sealed_instructions(
+    artifact: dict[str, Any],
+    outcome: TrialOutcome,
+    task_by_id: dict[str, TaskManifest],
+) -> str | None:
+    task = task_by_id.get(outcome.task_id)
+    catalogs = artifact.get("catalogs")
+    if task is None or not isinstance(catalogs, dict):
+        return None
+    snapshot = catalogs.get(f"{outcome.transport}:{task.fixture.credential_profile}")
+    discovery = snapshot.get("server_discover") if isinstance(snapshot, dict) else None
+    instructions = discovery.get("instructions") if isinstance(discovery, dict) else None
+    return instructions if isinstance(instructions, str) else None
+
+
+def _provider_names(outcome: TrialOutcome) -> list[str]:
+    names: Counter[str] = Counter()
+    for evidence in outcome.provider_evidence:
+        if not isinstance(evidence, dict):
+            continue
+        routing = evidence.get("routing")
+        if not isinstance(routing, dict):
+            continue
+        endpoints = routing.get("endpoints")
+        available = endpoints.get("available") if isinstance(endpoints, dict) else None
+        for endpoint in available if isinstance(available, list) else []:
+            if not isinstance(endpoint, dict) or endpoint.get("selected") is not True:
+                continue
+            provider = endpoint.get("provider")
+            if isinstance(provider, str) and provider:
+                names[provider] += 1
+    return [name for name, _count in sorted(names.items())]
 
 
 def build_selection_summary(
@@ -385,28 +601,23 @@ def build_selection_summary(
     manifest: BenchmarkRunManifest,
     tasks: list[TaskManifest],
 ) -> dict[str, Any]:
-    expected = selection.identities
-    expected_smoke_cells = [
-        f"{model.class_name}:{transport}"
-        for model in manifest.models
-        for transport in manifest.transports
-    ]
-    arm_summaries: dict[str, Any] = {}
-    observed: dict[str, set[SelectionIdentity]] = {}
-    outcome_by_arm: dict[str, dict[SelectionIdentity, TrialOutcome]] = {}
-    complete = comparison.get("verdict") == "inconclusive"
-    smoke_requests = 0
-    event_lists: list[list[dict[str, Any]]] = []
-    paired_complete = True
+    expected_by_arm = {
+        arm: {identity for identity in selection.identities if identity[0] == arm}
+        for arm in ("baseline", "candidate")
+    }
     task_by_id = {task.id: task for task in tasks}
-    model_ids: dict[str, str] = {model.class_name: model.model_id for model in manifest.models}
+    model_ids = {model.class_name: model.model_id for model in manifest.models}
+    arm_summaries: dict[str, Any] = {}
+    outcomes: dict[SelectionIdentity, TrialOutcome] = {}
+    event_lists: list[list[dict[str, Any]]] = []
+    complete = comparison.get("verdict") == "inconclusive"
 
-    for arm in ("baseline", "candidate"):
+    for arm in ARM_NAMES:
         artifact = artifacts.get(arm, {})
+        expected = expected_by_arm[arm]
         complete = complete and artifact.get("selection") == selection.artifact_metadata()
         rows: dict[SelectionIdentity, TrialOutcome] = {}
         counts: Counter[SelectionIdentity] = Counter()
-        all_ids: set[SelectionIdentity] = set()
         malformed = 0
         runs = artifact.get("runs", {})
         for run in runs.values() if isinstance(runs, dict) else []:
@@ -414,127 +625,119 @@ def build_selection_summary(
                 if not isinstance(raw, dict):
                     malformed += 1
                     continue
-                identity_value = (
-                    raw.get("model_class"),
-                    raw.get("transport"),
-                    raw.get("task_id"),
-                    raw.get("repeat_index"),
-                )
+                model_class = raw.get("model_class")
+                transport = raw.get("transport")
+                task_id = raw.get("task_id")
+                repeat_index = raw.get("repeat_index")
                 if not (
-                    isinstance(identity_value[0], str)
-                    and isinstance(identity_value[1], str)
-                    and isinstance(identity_value[2], str)
-                    and isinstance(identity_value[3], int)
+                    isinstance(model_class, str)
+                    and isinstance(transport, str)
+                    and isinstance(task_id, str)
+                    and type(repeat_index) is int
                 ):
                     malformed += 1
                     continue
-                identity = (identity_value[0], identity_value[1], identity_value[2], identity_value[3])
-                all_ids.add(identity)
+                identity: SelectionIdentity = (
+                    cast(ArmName, arm),
+                    model_class,
+                    transport,
+                    task_id,
+                    repeat_index,
+                )
                 counts[identity] += 1
-                input_evidence_invalid = False
                 try:
                     validate_model_input_evidence(raw)
-                except ValueError:
-                    malformed += 1
-                    input_evidence_invalid = True
-                try:
                     outcome = TrialOutcome.model_validate(raw)
                 except ValueError:
-                    if not input_evidence_invalid:
-                        malformed += 1
-                    continue
-                if outcome.arm != arm:
                     malformed += 1
                     continue
-                if outcome.model_id != model_ids.get(outcome.model_class):
+                model_class = cast(Literal["primary", "lightweight"], outcome.model_class)
+                if outcome.arm != arm or outcome.model_id != model_ids.get(model_class):
                     malformed += 1
                     continue
                 rows[identity] = outcome
-        outcome_by_arm[arm] = rows
-        observed[arm] = all_ids & expected
-        missing = sorted(expected - observed[arm])
+                outcomes[identity] = outcome
+
+        observed = set(rows)
+        missing = sorted(expected - observed)
         duplicates = sorted(identity for identity in expected if counts[identity] > 1)
-        extras = sorted(all_ids - expected)
-        measured = sum(
-            has_measured_evidence(outcome, task_by_id[outcome.task_id])
-            for outcome in rows.values()
-            if outcome.task_id in task_by_id
+        extras = sorted(observed - expected)
+        instruction_missing: list[SelectionIdentity] = []
+        unmeasured: list[SelectionIdentity] = []
+        for identity, outcome in rows.items():
+            if outcome.error is None:
+                task = task_by_id.get(outcome.task_id)
+                if task is None or not has_measured_evidence(outcome, task):
+                    unmeasured.append(identity)
+                instructions = _sealed_instructions(artifact, outcome, task_by_id)
+                if not has_server_instructions_evidence(outcome, instructions):
+                    instruction_missing.append(identity)
+
+        smoke = artifact.get("smoke_gate")
+        smoke_valid = (
+            isinstance(smoke, dict)
+            and smoke.get("status") == "not_run"
+            and smoke.get("required_cells") == []
+            and smoke.get("cells") == []
         )
-        proof_missing = [
-            identity
-            for identity, outcome in rows.items()
-            if not _instruction_proof_valid(outcome, artifact, task_by_id)
-        ]
+        checkpoint = artifact.get("checkpoint")
+        checkpoint_valid = (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("record_count") == len(expected)
+            and checkpoint.get("lifecycle") == "finalized"
+            and checkpoint.get("reserved_cost_usd") == 0
+            and checkpoint.get("smoke_status") is None
+            and checkpoint.get("smoke_cell_count") == 0
+        )
         arm_complete = (
             not missing
             and not duplicates
             and not extras
             and malformed == 0
-            and measured == len(expected)
-            and not proof_missing
+            and not unmeasured
+            and not instruction_missing
+            and smoke_valid
+            and checkpoint_valid
         )
         complete = complete and arm_complete
-
-        smoke_gate = artifact.get("smoke_gate", {})
-        smoke = smoke_gate.get("cells", []) if isinstance(smoke_gate, dict) else []
-        smoke_cells = [cell.get("cell") for cell in smoke if isinstance(cell, dict)]
-        smoke_valid = (
-            isinstance(smoke_gate, dict)
-            and smoke_gate.get("status") == "passed"
-            and smoke_gate.get("required_cells") == expected_smoke_cells
-            and smoke_cells == expected_smoke_cells
-        )
-        for cell in smoke if isinstance(smoke, list) else []:
-            raw_outcome = cell.get("outcome") if isinstance(cell, dict) else None
-            if not isinstance(raw_outcome, dict):
-                smoke_valid = False
-                continue
-            try:
-                validate_model_input_evidence(raw_outcome)
-            except ValueError:
-                smoke_valid = False
-            try:
-                smoke_outcome = TrialOutcome.model_validate(raw_outcome)
-            except ValueError:
-                smoke_valid = False
-                continue
-            smoke_requests += smoke_outcome.model_requests
-            smoke_valid = (
-                smoke_valid
-                and cell.get("status") == "completed"
-                and _instruction_proof_valid(smoke_outcome, artifact, task_by_id)
-            )
-        complete = complete and smoke_valid
-
-        execution = artifact.get("paired_execution", {})
-        if isinstance(execution, dict):
-            events = execution.get("events", [])
-            if isinstance(events, list) and all(isinstance(event, dict) for event in events):
-                event_lists.append(events)
-            else:
-                paired_complete = False
-            paired_complete = paired_complete and execution.get("complete") is True
+        execution = artifact.get("paired_execution")
+        if isinstance(execution, dict) and isinstance(execution.get("events"), list):
+            event_lists.append(execution["events"])
+            complete = complete and execution.get("complete") is True
         else:
-            paired_complete = False
+            complete = False
+
+        new_failure_kinds = Counter(
+            outcome.failure_kind
+            for identity, outcome in rows.items()
+            if identity in expected and outcome.failure_kind != "none"
+        )
         arm_summaries[arm] = {
             "artifact_status": artifact.get("status"),
-            "observed_selected_trials": len(rows),
             "expected_selected_trials": len(expected),
-            "missing_identities": [list(item) for item in missing],
-            "duplicate_identities": [list(item) for item in duplicates],
-            "unexpected_identities": [list(item) for item in extras],
+            "observed_selected_trials": len(rows),
+            "successful_tasks": sum(outcome.success for outcome in rows.values()),
+            "task_error_trials": sum(outcome.trial_error for outcome in rows.values()),
+            "execution_failure_trials": sum(outcome.error is not None for outcome in rows.values()),
+            "new_failure_kind_counts": dict(sorted(new_failure_kinds.items())),
+            "missing_identities": [list(item[1:]) for item in missing],
+            "duplicate_identities": [list(item[1:]) for item in duplicates],
+            "unexpected_identities": [list(item[1:]) for item in extras],
             "malformed_trials": malformed,
-            "missing_instruction_proof": [list(item) for item in proof_missing],
-            "unselected_model_requests": sum(
-                outcome.model_requests for identity, outcome in rows.items() if identity not in expected
-            ),
-            "smoke_gate_status": smoke_gate.get("status") if isinstance(smoke_gate, dict) else None,
+            "unmeasured_completed_trials": [list(item[1:]) for item in unmeasured],
+            "missing_instruction_proof": [list(item[1:]) for item in instruction_missing],
+            "new_model_requests": sum(outcome.model_requests for outcome in rows.values()),
+            "new_input_tokens": sum(outcome.input_tokens for outcome in rows.values()),
+            "new_output_tokens": sum(outcome.output_tokens for outcome in rows.values()),
+            "new_cost_usd": str(sum((Decimal(str(outcome.cost_usd)) for outcome in rows.values()), start=Decimal("0"))),
+            "observed_upstreams": sorted({name for outcome in rows.values() for name in _provider_names(outcome)}),
+            "smoke_gate_status": smoke.get("status") if isinstance(smoke, dict) else None,
+            "checkpoint_valid": checkpoint_valid,
         }
 
     expected_events = {
-        (f"{model_class}:{transport}", task_id, repeat, arm)
-        for model_class, transport, task_id, repeat in expected
-        for arm in ("baseline", "candidate")
+        (f"{model_class}:{transport}", task_id, repeat_index, arm)
+        for arm, model_class, transport, task_id, repeat_index in selection.identities
     }
     event_count = 0
     if len(event_lists) == 2 and event_lists[0] == event_lists[1]:
@@ -559,100 +762,82 @@ def build_selection_summary(
             )
         except (KeyError, TypeError, ValueError):
             order_valid = False
-        complete = complete and (
-            paired_complete
-            and len(events) == 2 * len(expected)
+        events_valid = (
+            len(events) == len(selection.selected_trials)
             and [event.get("sequence") for event in events] == list(range(1, len(events) + 1))
             and keys == expected_events
             and order_valid
         )
+        complete = complete and events_valid
     else:
+        events_valid = False
         complete = False
 
-    comparisons: list[dict[str, Any]] = []
+    identity_results: list[dict[str, Any]] = []
     for trial in selection.selected_trials:
-        identity = trial.identity
-        previous = selection.parent_results[identity]
-        new_baseline = outcome_by_arm.get("baseline", {}).get(identity)
-        new_candidate = outcome_by_arm.get("candidate", {}).get(identity)
-        comparisons.append(
+        parent = selection.parent_results[trial.identity]
+        new_outcome = outcomes.get(trial.identity)
+        identity_results.append(
             {
-                "identity": list(identity),
+                "arm": trial.arm,
+                "identity": list(trial.identity[1:]),
                 "role": trial.role,
                 "parent_lineage": trial.parent_lineage,
-                "prior_baseline": _parent_metrics(previous["baseline"]),
-                "prior_candidate": _parent_metrics(previous["candidate"]),
-                "new_baseline": (
-                    _trial_metrics(
-                        new_baseline,
-                        _sealed_instructions(artifacts.get("baseline", {}), new_baseline, task_by_id),
-                    )
-                    if new_baseline is not None
-                    else None
-                ),
-                "new_candidate": (
-                    _trial_metrics(
-                        new_candidate,
-                        _sealed_instructions(artifacts.get("candidate", {}), new_candidate, task_by_id),
-                    )
-                    if new_candidate is not None
+                "parent_record_key": trial.parent_record_key,
+                "parent_record_hash": trial.parent_record_hash,
+                "parent_failure_kind": trial.failure_kind,
+                "parent": _parent_metrics(parent["row"]),
+                "new": (
+                    {
+                        "success": new_outcome.success,
+                        "trial_error": new_outcome.trial_error,
+                        "failure_kind": new_outcome.failure_kind,
+                        "error": new_outcome.error,
+                        "model_requests": new_outcome.model_requests,
+                        "input_tokens": new_outcome.input_tokens,
+                        "output_tokens": new_outcome.output_tokens,
+                        "cost_usd": new_outcome.cost_usd,
+                        "upstreams": _provider_names(new_outcome),
+                    }
+                    if new_outcome is not None
                     else None
                 ),
             }
         )
-    total_trial_cost = sum(
-        (
-            Decimal(str(outcome.cost_usd))
-            for outcomes in outcome_by_arm.values()
-            for identity, outcome in outcomes.items()
-            if identity in expected
-        ),
+    total_cost = sum(
+        (Decimal(str(outcome.cost_usd)) for outcome in outcomes.values()),
         start=Decimal("0"),
     )
+    paired_budget = artifacts.get("baseline", {}).get("paired_budget_used")
+    try:
+        reported_paired_cost = Decimal(str(paired_budget.get("cost_usd"))) if isinstance(paired_budget, dict) else Decimal("NaN")
+        paired_cost_valid = (
+            reported_paired_cost.is_finite()
+            and Decimal("0") <= reported_paired_cost <= selection.budget.new_execution_limit_usd
+        )
+    except (ArithmeticError, ValueError):
+        paired_cost_valid = False
+    if (
+        not isinstance(paired_budget, dict)
+        or artifacts.get("candidate", {}).get("paired_budget_used") != paired_budget
+        or not paired_cost_valid
+        or paired_budget.get("new_execution_limit_usd") != str(selection.budget.new_execution_limit_usd)
+    ):
+        complete = False
     return {
         "schema_version": 1,
         "selection": selection.artifact_metadata(),
         "status": "complete" if complete else "incomplete",
         "canonical_comparison_verdict": comparison.get("verdict", "inconclusive"),
         "adopt_eligible": False,
-        "parent_results_merged": False,
+        "parents_merged": False,
         "arms": arm_summaries,
-        "identity_comparisons": comparisons,
-        "expected_paired_identities": len(expected),
-        "expected_new_model_trials": 2 * len(expected),
-        "observed_paired_execution_events": event_count,
-        "paired_execution_complete": paired_complete,
-        "smoke_cells_per_arm": len(expected_smoke_cells),
-        "observed_new_smoke_model_requests": smoke_requests,
-        "new_selected_trial_cost_usd": str(total_trial_cost),
+        "identity_results": identity_results,
+        "expected_selected_trials_by_arm": selection.expected_trials_by_arm,
+        "expected_new_model_trials": len(selection.selected_trials),
+        "observed_execution_events": event_count,
+        "paired_execution_events_valid": events_valid,
+        "observed_new_smoke_model_requests": 0,
+        "new_selected_trial_cost_usd": str(total_cost),
         "new_execution_cost_limit_usd": str(selection.budget.new_execution_limit_usd),
-        "unselected_model_requests": sum(
-            summary["unselected_model_requests"] for summary in arm_summaries.values()
-        ),
     }
-
-
-def _sealed_instructions(
-    artifact: dict[str, Any],
-    outcome: TrialOutcome,
-    task_by_id: dict[str, TaskManifest],
-) -> str | None:
-    task = task_by_id.get(outcome.task_id)
-    catalogs = artifact.get("catalogs")
-    if task is None or not isinstance(catalogs, dict):
-        return None
-    snapshot = catalogs.get(f"{outcome.transport}:{task.fixture.credential_profile}")
-    discovery = snapshot.get("server_discover") if isinstance(snapshot, dict) else None
-    instructions = discovery.get("instructions") if isinstance(discovery, dict) else None
-    return instructions if isinstance(instructions, str) else None
-
-
-def _instruction_proof_valid(
-    outcome: TrialOutcome,
-    artifact: dict[str, Any],
-    task_by_id: dict[str, TaskManifest],
-) -> bool:
-    return has_server_instructions_evidence(
-        outcome,
-        _sealed_instructions(artifact, outcome, task_by_id),
-    )

@@ -26,12 +26,16 @@ def _seal(artifact: dict) -> None:
 def _attach_selection_metadata(baseline: dict, candidate: dict) -> None:
     selection = {
         "selection_sha256": "a" * 64,
-        "selected_trials": [{
-            "model_class": "primary",
-            "transport": "http",
-            "task_id": "read-vaults-en",
-            "repeat_index": 1,
-        }],
+        "selected_trials": [
+            {
+                "arm": arm,
+                "model_class": "primary",
+                "transport": "http",
+                "task_id": "read-vaults-en",
+                "repeat_index": 1,
+            }
+            for arm in ("baseline", "candidate")
+        ],
     }
     for artifact in (baseline, candidate):
         artifact["selection"] = deepcopy(selection)
