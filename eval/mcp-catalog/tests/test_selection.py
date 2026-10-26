@@ -7,9 +7,13 @@ from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from typing import Any
 
 import pytest
+from openai.types.chat import ChatCompletion
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.models import ModelRequestParameters
 
 import mcp_catalog.cli as cli_module
 import mcp_catalog.execution as execution_module
@@ -25,7 +29,7 @@ from mcp_catalog.checkpoint import (
 )
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import canonical_json
-from mcp_catalog.execution import ModelInputEvidence, TrialOutcome
+from mcp_catalog.execution import ModelInputEvidence, TrialOutcome, build_model
 from mcp_catalog.pairing import planned_arm_order
 from mcp_catalog.runner import BenchmarkRunner, PairedArmCoordinator
 from mcp_catalog.runtime import RuntimeDescriptor
@@ -291,6 +295,66 @@ def test_selection_loads_parent_rows_read_only_and_builds_the_approved_fallback_
     }
     assert {name: Path(parent["path"]).read_bytes() for name, parent in selection.parents.items()} == parent_bytes
     assert selection.checkpoint_preflight()["selected_trial_count"] == 23
+
+
+@pytest.mark.asyncio
+async def test_selection_sends_same_fallback_wire_for_both_arms_and_model_classes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, _tasks, selection = _write_selection(tmp_path, monkeypatch)
+    wire_by_arm: dict[str, dict[str, dict[str, Any]]] = {}
+
+    for arm in ("baseline", "candidate"):
+        wire_by_arm[arm] = {}
+        for spec in selection.execution_manifest.models:
+            monkeypatch.setenv(spec.base_url_env, "https://openrouter.ai/api/v1")
+            monkeypatch.setenv(spec.provider_key_env, "fixture-provider-key")
+            model = build_model(spec)
+            response = ChatCompletion.model_validate(
+                {
+                    "id": f"response-{arm}-{spec.class_name}",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "ok"},
+                        }
+                    ],
+                    "created": 1,
+                    "model": spec.model_id,
+                    "object": "chat.completion",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            )
+            request = AsyncMock(return_value=response)
+            monkeypatch.setattr(model.client.chat.completions, "create", request)
+
+            await model._completions_create(
+                [ModelRequest(parts=[UserPromptPart("fixture selection request")])],
+                False,
+                model.settings,
+                ModelRequestParameters(),
+            )
+
+            kwargs = request.await_args.kwargs
+            provider_wire = kwargs["extra_body"]["provider"]
+            assert kwargs["model"] == spec.model_id
+            assert spec.version in {"20260731", "20260814"}
+            assert provider_wire == {
+                "order": spec.routing.order,
+                "allow_fallbacks": True,
+                "require_parameters": True,
+                "quantizations": ["fp8"],
+                "max_price": {
+                    "prompt": spec.input_cost_per_million_usd,
+                    "completion": spec.output_cost_per_million_usd,
+                },
+            }
+            assert model.settings["max_tokens"] == 8192
+            wire_by_arm[arm][spec.class_name] = provider_wire
+
+    assert wire_by_arm["baseline"] == wire_by_arm["candidate"]
 
 
 @pytest.mark.parametrize(
