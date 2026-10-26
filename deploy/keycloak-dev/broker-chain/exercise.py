@@ -8,6 +8,7 @@ import hashlib
 from html import unescape
 from html.parser import HTMLParser
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -1883,6 +1884,12 @@ async def _prove_local_realm_migration(state: dict[str, object]) -> dict[str, ob
     else:
         raise _fail("fixture_legacy_local_login_remained_enabled")
 
+    browser_route = await _prove_browser_route(
+        entry_alias="local", actual_alias="local", username=LOCAL_MIGRANT_USERNAME,
+        password=LOCAL_MIGRANT_PASSWORD, expected_user_id=str(user_id),
+        broker_subject=broker_subject,
+    )
+
     async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
         await _remove_broker_person(client, broker_subject)
         broker_admin = await _admin_token(client, BROKER)
@@ -1899,6 +1906,7 @@ async def _prove_local_realm_migration(state: dict[str, object]) -> dict[str, ob
         raise _fail("fixture_local_realm_record_not_drained")
 
     return {
+        "browser_route": browser_route,
         "keycloak_account": "realm-local-password-no-federation",
         "pre_transition_local_login": "same-akb-user-id",
         "first_login": "membership_required-and-recorded",
@@ -2320,6 +2328,167 @@ async def _install_brokered_account_guard() -> dict[str, object]:
     }
 
 
+async def _prepare_browser_route_fixture() -> None:
+    """Enable real server-side browser custody in this disposable process."""
+    from app.services.sso_session_epoch import reconcile_sso_session_epoch
+
+    # Importing the complete production ASGI app also constructs its Git
+    # service. Keep that unrelated storage inside the runner's disposable cwd.
+    object.__setattr__(settings, "git_storage_path", str(Path.cwd() / "browser-route-vaults"))
+    object.__setattr__(settings, "sso_browser_session_encryption_key", secrets.token_urlsafe(32))
+    object.__setattr__(
+        settings, "keycloak_management_client_secret",
+        "fixture-only-management-secret",  # pragma: allowlist secret
+    )
+    # The committed realm keeps the older leaf-verifier probe callback. Add the
+    # real deployment callback only inside this run's disposable Keycloak.
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        admin_token = await _admin_token(client, BROKER)
+        browser = await _exact_client(client, admin_token=admin_token, client_id="fixture-browser")
+        browser["redirectUris"] = [*browser["redirectUris"], settings.keycloak_browser_redirect_uri]
+        response = await client.put(
+            f"{BROKER}/admin/realms/akb/clients/{browser['id']}",
+            headers={"Authorization": f"Bearer {admin_token}"}, json=browser,
+        )
+        if response.status_code != 204:
+            raise _fail("fixture_browser_callback_registration_failed")
+    await reconcile_sso_session_epoch()
+
+
+class _ProviderLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "a" and values.get("id") == "social-workforce" and values.get("href"):
+            self.links.append(values["href"])
+
+
+async def _prove_browser_route(
+    *, entry_alias: str, actual_alias: str, username: str, password: str,
+    expected_user_id: str, broker_subject: str, select_upstream: bool = False,
+) -> dict[str, object]:
+    """Navigate production login/callback routes and real Keycloak HTML forms.
+
+    ASGI only replaces the local HTTP listener. State/cookies, provider catalog,
+    code exchange, both signed-token verifiers, admission, session encryption
+    and /auth/me are the production implementations with real PostgreSQL.
+    """
+    # app.main enables INFO logging. httpx INFO records full redirect URLs,
+    # including single-use authorization codes; never emit those in a fixture.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    from app.main import app
+    from app.services.sso_browser_session_crypto import BrowserSessionCipher
+    from app.services.sso_browser_session_service import (
+        sso_browser_session_cookie_name, sso_browser_csrf_cookie_name,
+    )
+
+    intended = "/documents?fixture=workspace-provider-selection"
+    callback_uri = settings.keycloak_browser_redirect_uri
+    native_page_seen = False
+    selected_link = False
+    submitted = False
+    callback_url = None
+    async with (
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BROKER,
+                          follow_redirects=False) as akb,
+        httpx.AsyncClient(verify=False, follow_redirects=False, timeout=20.0) as browser,
+    ):
+        start = await akb.get(f"/api/v1/auth/sso/{entry_alias}/login", params={"redirect": intended})
+        if start.status_code != 303 or not start.headers.get("set-cookie"):
+            raise _evidence("fixture_browser_route_start_failed", {"entry_alias": entry_alias, "status": start.status_code})
+        response = await browser.get(start.headers["location"])
+        for _ in range(30):
+            if response.status_code in {301, 302, 303, 307, 308}:
+                target = urljoin(str(response.url), response.headers.get("location", ""))
+                if target.startswith(callback_uri + "?"):
+                    callback_url = target
+                    break
+                if urlsplit(target).netloc not in {urlsplit(BROKER).netloc, urlsplit(UPSTREAM).netloc}:
+                    raise _fail("fixture_browser_route_unexpected_redirect")
+                response = await browser.get(target)
+                continue
+            if response.status_code != 200:
+                raise _fail("fixture_browser_route_page_failed")
+            host = urlsplit(str(response.url)).netloc
+            if select_upstream and not selected_link:
+                if host != urlsplit(BROKER).netloc:
+                    raise _fail("fixture_workspace_did_not_show_native_realm")
+                _login_form(response)  # Native username/password form must exist.
+                native_page_seen = True
+                parser = _ProviderLinkParser()
+                parser.feed(response.text)
+                if len(parser.links) != 1:
+                    raise _fail("fixture_workspace_upstream_link_not_exact")
+                selected_link = True
+                response = await browser.get(urljoin(str(response.url), parser.links[0]))
+                continue
+            expected_host = urlsplit(BROKER if actual_alias == "local" else UPSTREAM).netloc
+            if submitted or host != expected_host:
+                raise _fail("fixture_browser_route_unexpected_credential_page")
+            native_page_seen = native_page_seen or actual_alias == "local"
+            action, data = _login_form(response)
+            data.update(username=username, password=password, login=data.get("login") or "Sign In")
+            response = await browser.post(action, data=data)
+            submitted = True
+        if callback_url is None or not submitted:
+            raise _fail("fixture_browser_route_callback_missing")
+        callback = await akb.get(callback_url)
+        if (
+            callback.status_code != 303 or callback.headers.get("location") != intended
+            or callback.content or "json" in callback.headers.get("content-type", "")
+            or callback.headers.get("cache-control") != "no-store"
+        ):
+            raise _evidence("fixture_browser_route_callback_not_successful_navigation", {
+                "entry_alias": entry_alias, "actual_alias": actual_alias,
+                "status": callback.status_code,
+                "redirect_path": urlsplit(callback.headers.get("location", "")).path,
+            })
+        cookie_name = sso_browser_session_cookie_name()
+        token = akb.cookies.get(cookie_name)
+        if not token or not akb.cookies.get(sso_browser_csrf_cookie_name()):
+            raise _fail("fixture_browser_route_session_cookies_missing")
+        session_headers = [value for value in callback.headers.get_list("set-cookie")
+                           if value.startswith(cookie_name + "=")]
+        if len(session_headers) != 1 or not all(
+            flag in session_headers[0] for flag in ("HttpOnly", "Secure", "SameSite=lax", "Path=/")
+        ):
+            raise _fail("fixture_browser_route_session_cookie_attributes_invalid")
+        me = await akb.get("/api/v1/auth/me")
+        if me.status_code != 200 or me.json().get("user_id") != expected_user_id:
+            raise _fail("fixture_browser_route_wrong_akb_account")
+        pool = await postgres.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sso_browser_sessions WHERE token_hash=$1",
+                hashlib.sha256(token.encode()).hexdigest(),
+            )
+        if row is None or str(row["user_id"]) != expected_user_id or (
+            row["identity_issuer"], row["identity_subject"]
+        ) != (BROKER_ISSUER, broker_subject):
+            raise _fail("fixture_browser_route_session_identity_wrong")
+        custody = BrowserSessionCipher.from_encoded_key(settings.sso_browser_session_encryption_key).open(
+            row["token_envelope"], context=f"session:{row['id']}:user:{row['user_id']}",
+        )
+        if custody["provider_alias"] != actual_alias:
+            raise _fail("fixture_browser_route_session_provider_wrong")
+        # The exact callback URL must no longer be consumable, even with the
+        # newly issued session cookie. No authorization code or token is logged.
+        replay = await akb.get(callback_url)
+        if replay.status_code != 303 or not replay.headers.get("location", "").startswith("/auth?"):
+            raise _fail("fixture_browser_route_state_replay_accepted")
+    return {
+        "entry_alias": entry_alias, "actual_provider_alias": actual_alias,
+        "native_realm_page": native_page_seen, "selected_upstream_link": selected_link,
+        "same_akb_user": True, "signed_access_and_id_tokens": True,
+        "relative_redirect": True, "opaque_secure_session_cookies": True,
+        "callback_json": False, "single_use_state": True,
+    }
+
+
 async def main() -> None:
     control = KeycloakProviderControl(
         KeycloakAdminConfig(
@@ -2423,6 +2592,16 @@ async def main() -> None:
     catalog = await control.list_providers(force_refresh=True)
     if enabled.state != "enabled" or [item.alias for item in catalog] != ["workforce"]:
         raise _fail("fixture_enable_readback_failed")
+
+    await _prepare_browser_route_fixture()
+    browser_routes = {}
+    for name, entry, select in (("direct_upstream", "workforce", False), ("workspace_upstream", "local", True)):
+        browser_routes[name] = await _prove_browser_route(
+            entry_alias=entry, actual_alias="workforce", username="alice",
+            password="fixture-only-alice-password",  # pragma: allowlist secret
+            expected_user_id=str(state["user_id"]), broker_subject=broker_subject,
+            select_upstream=select,
+        )
 
     broker_tokens = await _authorization_code_tokens(
         issuer=BROKER_ISSUER,
@@ -2550,6 +2729,7 @@ async def main() -> None:
                 "authority_boundary": authority_boundary,
                 "seeding_dead_end": seeding_dead_end,
                 "admission_chain": admission,
+                "browser_routes": browser_routes,
                 "local_realm_migration": local_realm_migration,
                 "brokered_account_guard": brokered_account_guard,
                 "brokered_local_password": brokered_local_password,

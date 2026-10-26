@@ -14,6 +14,8 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 
 const sample = {
   vault: "v",
+  complete: true,
+  archive_scope: "unarchived" as const,
   path: "",
   items: [
     { type: "collection", name: "architecture", path: "architecture", doc_count: 2 },

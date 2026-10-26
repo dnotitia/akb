@@ -308,9 +308,14 @@ async def create_table(vault: str, req: CreateTableRequest, user: AuthenticatedU
 
 
 @router.get("/tables/{vault}", summary="List tables in a vault")
-async def list_tables(vault: str, user: AuthenticatedUser = Depends(get_current_user)):
+async def list_tables(
+    vault: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    include_row_counts: bool = True,
+):
+    """List the catalog. Set include_row_counts=false for schema-only reads."""
     access = await check_vault_access(user.user_id, vault, required_role="reader")
-    tables = await table_service.list_tables(access["vault_id"])
+    tables = await table_service.list_tables(access["vault_id"], include_row_counts=include_row_counts)
     return {"kind": "table", "vault": vault, "items": tables, "total": len(tables)}
 
 

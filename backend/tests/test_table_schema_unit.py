@@ -1,5 +1,9 @@
 """Unit coverage for merged registry/live table schema introspection."""
 
+import pytest
+from jsonschema import Draft202012Validator
+
+from app.openapi_contract import JSON_OBJECT_SCHEMA, JSON_VALUE_SCHEMA, _success_envelope_schemas
 from app.services import table_schema_service
 
 
@@ -68,10 +72,12 @@ def test_build_table_schema_serializes_rich_constraints_and_drift() -> None:
         "drift": {"missing": False, "type_mismatch": False},
     }
     assert score["unique"] is False
+    assert "enum" not in score
     assert score["index"] is True
     assert score["pg_type"] == "text"
     assert score["drift"] == {"missing": False, "type_mismatch": True}
     assert missing["pg_type"] is None
+    assert "enum" not in missing
     assert missing["drift"] == {"missing": True, "type_mismatch": False}
 
     assert schema["drift"] == {
@@ -87,3 +93,36 @@ def test_build_table_schema_serializes_rich_constraints_and_drift() -> None:
             }
         ],
     }
+
+
+@pytest.mark.parametrize("extra", [{}, {"enum": None}, {"enum": ["draft", "open"]}, {"enum": []}])
+@pytest.mark.parametrize("required", [False, True])
+def test_enum_projection_matches_the_published_contract(extra, required) -> None:
+    schema = table_schema_service._build_table_schema(
+        "demo-vault",
+        {"name": "items", "columns": [{"name": "value", "type": "text", "required": required, **extra}]},
+        {"id": "uuid", "value": "text"},
+    )
+    components = {
+        **_success_envelope_schemas(),
+        "AkbJsonValue": JSON_VALUE_SCHEMA,
+        "AkbJsonObject": JSON_OBJECT_SCHEMA,
+    }
+    for name, payload in (
+        ("AkbTableSchemaEnvelope", schema),
+        ("AkbVaultTableSchemaEnvelope", {
+            "kind": "vault_table_schema", "vault": "demo-vault", "tables": [schema], "total": 1,
+        }),
+    ):
+        Draft202012Validator({
+            "$ref": f"#/components/schemas/{name}", "components": {"schemas": components},
+        }).validate(payload)
+
+    column = schema["columns"][0]
+    assert column["required"] is required
+    if extra.get("enum") is None:
+        assert "enum" not in column
+    else:
+        # Preserve supplied arrays, including legacy empty arrays; do not
+        # reinterpret an empty set as an unconstrained column.
+        assert column["enum"] == extra["enum"]

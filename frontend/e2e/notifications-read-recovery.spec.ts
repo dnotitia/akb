@@ -57,7 +57,7 @@ for (const scenario of ["transient", "initial-conflict", "retry-conflict"] as co
       await expect(panel.getByRole("link", { name: "New access change to review" })).toHaveCount(0);
       expect(writes).toEqual(Array.from({ length: attempts }, () => ({ read: true, version: "v1" })));
       // No automatic acknowledgement while refreshing/reviewing v2.
-      await panel.getByRole("button", { name: "Mark read" }).click();
+      await panel.getByRole("button", { name: "Mark read: New access change to review", exact: true }).click();
       await expect.poll(() => writes.at(-1)).toEqual({ read: true, version: "v2" });
       await expect.poll(() => writes.length).toBe(attempts + 1);
     }

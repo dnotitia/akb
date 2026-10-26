@@ -209,11 +209,20 @@ attached. Off by default, so an installation that
 registers no provider keeps the behaviour it has rather than silently gaining a
 login.
 
-The two kinds are not interchangeable and neither accepts the other's shape. A
-brokered sign-in carries the `identity_provider` claim and it must be present
-and equal to the selected alias; a direct realm sign-in cannot carry it, because
-nothing brokered it, and it must be absent. The claim never becomes optional:
-that would let a token minted through one provider be presented for another.
+The realm page also offers enabled upstream providers. The workspace entry
+records `local` and a snapshot of enabled managed aliases in the browser-bound,
+single-use state. The callback accepts the actual provider only if that snapshot
+allowed it and the provider is still enabled; its enabled state is read without
+the provider cache. Both verified tokens must identify the same provider, which
+also governs account admission and authoritative email-domain policy. A provider
+enabled after the page opened is not added to an existing state. If the provider
+catalog is unavailable at entry, the snapshot permits only the native account.
+
+The two token kinds keep their separate contracts. Brokered tokens require a
+matching signed `identity_provider` claim; native tokens must have no such claim.
+Direct upstream buttons stay pinned to their selected provider. States issued
+before this change, without a choice snapshot, also stay exactly pinned; restart
+an older workspace login before choosing an upstream.
 
 Registering this realm as its own upstream provider is a different thing and
 stays refused (`provider_issuer_is_broker`) -- it would be an authorize loop,
@@ -229,6 +238,21 @@ The same form never accepts a password from an account that came through an
 identity provider; see
 [Brokered accounts do not use realm passwords](#brokered-accounts-do-not-use-realm-passwords).
 An account belongs to one kind or the other.
+
+
+### Upgrading the workspace selection flow
+
+Update every callback-serving API process before new workspace states reach
+them. Older code rejects the extra state field. Use the manifests' `Recreate`
+strategy, or prepare a new API fleet and switch service traffic after draining
+the old fleet. A private overlay using `RollingUpdate` must not mix old and new
+callback readers across this transition. Direct upstream states retain their
+previous format, and new code can finish old direct/native states. No schema
+migration or worker update is required for this browser-state change.
+
+For rollback, drain the new issuers first. An unfinished workspace login issued
+by the new code must be restarted on the previous version; never reinterpret its
+snapshot as authorization for an old exact-provider flow.
 
 ## Brokered accounts do not use realm passwords
 

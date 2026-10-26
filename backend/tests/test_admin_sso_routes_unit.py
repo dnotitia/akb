@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 import uuid
 
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from app.api.routes import admin_auth, admin_sso
+from app.api.routes import admin_auth, admin_sso, admin_sso_operations
 from app.config import settings
 from app.exceptions import AuthenticationError, ForbiddenError
 from app.services.admin_auth_service import ProductAdminIdentity
@@ -78,6 +79,10 @@ class Control:
     async def list_providers(self, **_kwargs):
         return tuple(self.providers)
 
+    async def read_realm_identity(self):
+        return {"realm_id": "fixture-realm-id", "realm_name": "akb",
+                "issuer": "https://auth.akb.example.com/realms/akb"}
+
     async def configure(self, spec):
         self.configured_secret = spec.client_secret
         return ProviderMutationReadback(before=None, after=_provider())
@@ -111,6 +116,13 @@ class Control:
 
 
 def _client(monkeypatch, control: Control, *, admin=None) -> TestClient:
+    @asynccontextmanager
+    async def unowned_provider_guard(*_args, **_kwargs):
+        async def complete(_provider):
+            pass
+        yield complete
+
+    monkeypatch.setattr(admin_sso, "provider_mutation_guard", unowned_provider_guard)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     monkeypatch.setattr(
         admin_sso,
@@ -470,6 +482,8 @@ def test_only_provider_catalog_configuration_and_toggle_use_machine_control():
         keyed_methods = {(route.path, method) for method in route.methods}
         if keyed_methods & machine_routes:
             assert admin_sso.get_sso_provider_control_actor in callables
+        elif (route.path, "GET") == ("/admin/sso/providers/{alias}/ownership", "GET") and "GET" in route.methods:
+            assert admin_sso_operations.get_metadata_actor in callables
         else:
             assert admin_sso.get_sso_provider_control_actor not in callables
             assert (

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { browseVault, type ArchiveScope } from "@/lib/api";
+import { ApiError, browseVault, type ArchiveScope, type BrowseOptions } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
 import { parseFileUri } from "@/lib/uri";
 
@@ -32,22 +32,8 @@ interface BrowseItem {
   [k: string]: any;
 }
 
-/**
- * A single unbounded browse (`depth=-1` — entire subtree) gives us every
- * collection + doc + table + file in one response. We fold everything into
- * a nested tree on the client so "overview" under many parents renders as
- * `features/overview`, `prd/overview`, etc. — not 14 lookalike cards.
- *
- * `depth=-1` is the tree-depth contract introduced in backend 0.3.0:
- * 0=root-only, N=N levels, -1=unbounded. Pre-0.3.0 the default was the
- * misnomer "depth=2" (= "include documents"); this code requests the
- * unbounded subtree explicitly so the tree builder sees every node.
- *
- * Compatibility note: older backends expose no cursor or kind filter, so the
- * client still requests the full subtree. VaultExplorer limits DOM work with
- * kind disclosures and progressive pages. True network/memory scaling will
- * require a future browse contract with collection + kind + cursor inputs.
- */
+/** Account/grant-scoped pages. Scroll demand and scoped searches request one
+ * bounded page at a time rather than downloading a whole Vault up front. */
 export function vaultTreeQueryKey(
   userId: string | undefined,
   revision: number,
@@ -57,37 +43,43 @@ export function vaultTreeQueryKey(
   return ["vault-tree", userId, revision, vault, archiveScope] as const;
 }
 
-/**
- * One cached full-subtree browse per account, access revision, Vault and
- * scope. The explorer, breadcrumb and move dialog share it, so returning to a
- * Vault or opening a document inside it reuses the tree instead of
- * downloading the whole Vault again.
- */
-export function vaultTreeQueryOptions(
-  userId: string | undefined,
-  revision: number,
-  vault: string,
+export function useVaultTree(
+  vault: string | undefined,
   archiveScope: ArchiveScope = "unarchived",
+  options: { content_type?: BrowseOptions["content_type"]; collection?: string; depth?: number; name_query?: string; enabled?: boolean } = {},
 ) {
-  return {
-    queryKey: vaultTreeQueryKey(userId, revision, vault, archiveScope),
-    queryFn: () => archiveScope === "unarchived"
-      ? browseVault(vault, undefined, -1)
-      : browseVault(vault, undefined, -1, { archive_scope: archiveScope }),
-    staleTime: 30_000,
-    retry: false,
-  };
-}
-
-export function useVaultTree(vault: string | undefined, archiveScope: ArchiveScope = "unarchived") {
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
-  const query = useQuery({
-    ...vaultTreeQueryOptions(user?.user_id, revision, vault ?? "", archiveScope),
-    enabled: Boolean(vault) && !checking,
+  const query = useInfiniteQuery({
+    queryKey: [...vaultTreeQueryKey(user?.user_id, revision, vault ?? "", archiveScope), options.content_type ?? "all", options.collection ?? "", ...(options.depth === undefined ? [] : [options.depth]), ...(options.name_query ? [options.name_query] : [])],
+    initialPageParam: undefined as string | undefined,
+    queryFn: async (context) => {
+      const { pageParam, client, queryKey } = context;
+      try {
+        const result = await browseVault(vault!, options.collection, options.depth ?? -1, {
+          page_size: 100, archive_scope: archiveScope,
+          ...(options.content_type ? { content_type: options.content_type } : {}),
+          ...(pageParam ? { cursor: pageParam } : {}),
+          ...(options.name_query ? { name_query: options.name_query } : {}),
+          signal: context.signal,
+        });
+        if (options.name_query && result.name_query !== options.name_query) throw new Error("Name search is unavailable. Please try again later.");
+        return result;
+      } catch (error) {
+        if (!context.signal.aborted && error instanceof ApiError && [401, 403].includes(error.status)) {
+          client.getQueryCache().find({ queryKey, exact: true })?.setState({ data: undefined, dataUpdatedAt: 0 });
+        }
+        throw error;
+      }
+    },
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    staleTime: 30_000,
+    retry: false,
+    enabled: Boolean(vault) && !checking && options.enabled !== false,
     // While another scope of the same Vault loads, keep showing the last one;
     // never show a different Vault's tree.
     placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[1] === user?.user_id && previousQuery?.queryKey[2] === revision &&
       previousQuery?.queryKey[3] === vault ? previous : undefined,
   });
   const queryClient = useQueryClient();
@@ -98,38 +90,85 @@ export function useVaultTree(vault: string | undefined, archiveScope: ArchiveSco
   }, [queryClient, userId, revision, vault]);
 
   useEffect(() => {
+    if (options.enabled === false) return;
     const refresh = (event: Event) => {
       if ((event as CustomEvent<{ vault?: string }>).detail?.vault === vault) refetch();
     };
     window.addEventListener("akb:document-status-changed", refresh);
     return () => window.removeEventListener("akb:document-status-changed", refresh);
-  }, [vault, refetch]);
+  }, [vault, refetch, options.enabled]);
 
-  const data = vault ? query.data : undefined;
+  const accessDenied = query.error instanceof ApiError && [401, 403].includes(query.error.status);
+  const data = vault && !checking && !accessDenied ? query.data : undefined;
+  const lastPage = data?.pages.at(-1);
   const showingPreviousScope = query.isPlaceholderData;
   const unsupported = Boolean(
-    data && !showingPreviousScope && archiveScope !== "unarchived" && data.archive_scope !== archiveScope,
+    lastPage && !showingPreviousScope && archiveScope !== "unarchived" && lastPage.archive_scope !== archiveScope,
   );
   const items = useMemo(
-    () => (data ? (unsupported ? [] : data.items as BrowseItem[]) : null),
+    () => {
+      if (!data) return null;
+      if (unsupported) return [];
+      const unique = new Map<string, BrowseItem>();
+      for (const page of data.pages) for (const item of page.items as BrowseItem[]) {
+        unique.set(item.uri || `${item.type}:${item.path}`, item);
+      }
+      return [...unique.values()];
+    },
     [data, unsupported],
   );
   const error = vault && query.error ? (query.error as Error).message || String(query.error) : "";
 
   const tree = useMemo<TreeNode[] | null>(() => {
     if (!items) return null;
-    return buildTree(items);
-  }, [items]);
+    const context = lastPage?.context;
+    return buildTree(context?.type === "collection"
+      ? [{ type: "collection", name: context.name, path: context.path, summary: context.summary }, ...items]
+      : items);
+  }, [items, lastPage?.context]);
 
   return {
     tree,
+    items,
+    path: lastPage?.path,
+    accessDenied,
+    complete: lastPage?.complete === true,
+    paginationUnsupported: Boolean(lastPage && typeof lastPage.complete !== "boolean"),
+    hasMore: query.hasNextPage,
+    pageCount: data?.pages.length ?? 0,
+    // Kind ordering puts the Collection catalog before every resource kind.
+    // A following page without Collections has passed that catalog, even if
+    // status filtering leaves the resource page empty.
+    pastCollectionCatalog: Boolean(lastPage && !lastPage.items.some(item => item.type === "collection")),
+    loadingMore: query.isFetchingNextPage,
+    loadMore: () => { if (!checking && options.enabled !== false && query.hasNextPage && !query.isFetching) void query.fetchNextPage(); },
     loading: items === null && !error && Boolean(vault),
-    refreshing: Boolean(vault) && query.isFetching && items !== null,
+    refreshing: Boolean(vault) && query.isFetching && !query.isFetchingNextPage && items !== null,
     showingPreviousScope,
     unsupported,
     error,
     refetch,
   };
+}
+
+/** A browse context describes a prefix, even when that collection was deleted.
+ * Verify the actual row through its bounded parent catalog before offering it. */
+export function useCollectionProof(vault: string, path: string, enabled = true) {
+  const parent = path.split("/").slice(0, -1).join("/");
+  const query = useVaultTree(vault, "unarchived", {
+    collection: parent || undefined, content_type: "collections", depth: 0,
+    enabled: enabled && Boolean(path),
+  });
+  const row = !query.showingPreviousScope && !query.accessDenied && !query.error
+    ? query.items?.find(item => item.type === "collection" && item.path === path) : undefined;
+  const node: TreeNode | undefined = row ? { kind: "collection", name: row.name, path: row.path, raw: row } : undefined;
+  useEffect(() => {
+    // Verification is a lookup, not a directory the user should have to page.
+    if (enabled && path && !row && query.hasMore && !query.loadingMore && !query.refreshing && !query.error && !query.showingPreviousScope) query.loadMore();
+  }, [enabled, path, row, query.hasMore, query.loadingMore, query.refreshing, query.error, query.showingPreviousScope, query.pageCount, query.loadMore]);
+  return { ...query, verified: Boolean(row),
+    missing: enabled && Boolean(path) && !query.showingPreviousScope && !query.error && query.complete && !query.refreshing && !row,
+    node };
 }
 
 export function buildTree(items: BrowseItem[]): TreeNode[] {

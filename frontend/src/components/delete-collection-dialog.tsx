@@ -31,6 +31,7 @@ interface DeleteCollectionDialogProps {
    * would 409 with `sub_collection_count >= 1`.
    */
   subCollectionCount: number;
+  countsComplete?: boolean;
   onDeleted: () => void;
 }
 
@@ -57,9 +58,10 @@ export function DeleteCollectionDialog({
   tableCount = 0,
   fileCount,
   subCollectionCount,
+  countsComplete = true,
   onDeleted,
 }: DeleteCollectionDialogProps) {
-  const isCascade = docCount + tableCount + fileCount + subCollectionCount > 0;
+  const isCascade = !countsComplete || docCount + tableCount + fileCount + subCollectionCount > 0;
   const [typed, setTyped] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -110,16 +112,17 @@ export function DeleteCollectionDialog({
   // Bulleted item list for the destructive banner. Each line is skipped
   // when its count is zero so the banner only enumerates real impact.
   const items: string[] = [];
-  if (docCount > 0) {
+  if (!countsComplete) items.push("all contents, including resources not loaded in the explorer");
+  if (countsComplete && docCount > 0) {
     items.push(`${docCount} document${docCount === 1 ? "" : "s"}`);
   }
-  if (tableCount > 0) {
+  if (countsComplete && tableCount > 0) {
     items.push(`${tableCount} table${tableCount === 1 ? "" : "s"}`);
   }
-  if (fileCount > 0) {
+  if (countsComplete && fileCount > 0) {
     items.push(`${fileCount} file${fileCount === 1 ? "" : "s"}`);
   }
-  if (subCollectionCount > 0) {
+  if (countsComplete && subCollectionCount > 0) {
     items.push(
       `${subCollectionCount} sub-collection${subCollectionCount === 1 ? "" : "s"}`,
     );

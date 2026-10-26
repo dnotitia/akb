@@ -437,7 +437,7 @@ class SeahorseCloudStore:
             body["fusion"] = {"type": "rrf", "parameters": {"k": RRF_K}}
         # ACL pre-filter (issue #189 Phase 2): exactly one of vault_ids /
         # source_ids; vault_filter_sql asserts that + UUID-validates each id.
-        # source_types (workbench #1069) ANDs a source_type predicate onto the
+        # source_types ANDs a source_type predicate onto the
         # same filter — the column is stored on every point (COL_SOURCE_TYPE).
         acl = _vault_filter_sql(
             vault_ids, source_ids, vault_col=COL_VAULT_ID, source_col=COL_SOURCE_ID,

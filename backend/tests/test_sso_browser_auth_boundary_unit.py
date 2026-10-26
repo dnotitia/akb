@@ -94,8 +94,9 @@ async def test_enabled_provider_login_sets_only_a_bound_transient_cookie(monkeyp
     control = _Control()
 
     class OIDC:
-        async def begin_browser_login(self, redirect_path, *, provider_alias):
+        async def begin_browser_login(self, redirect_path, *, provider_alias, allowed_provider_aliases):
             assert (redirect_path, provider_alias) == ("/vaults?one=1", "workforce")
+            assert allowed_provider_aliases is None
             return BrowserAuthorizationRequest(
                 location="https://id.example/authorize?state=server-owned",
                 browser_binding="browser-binding-value-that-is-long-enough",

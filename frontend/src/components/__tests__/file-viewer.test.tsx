@@ -104,6 +104,21 @@ describe("FilePreviewBody existing format branches", () => {
     expect(await screen.findByRole("button", { name: /object/ })).toBeInTheDocument();
   });
 
+  it("offers recovery when a PDF does not finish loading", () => {
+    vi.useFakeTimers();
+    const refresh = vi.fn();
+    try {
+      render(<FilePreviewBody mime="application/pdf" directUrl="/slow.pdf" rawUrl="/slow.pdf" name="Slow PDF" onRefreshLink={refresh} />);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(screen.getByText(/PDF is taking longer/)).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "Open PDF" })).toHaveAttribute("href", "/slow.pdf");
+      fireEvent.click(screen.getByRole("button", { name: "Refresh link" }));
+      expect(refresh).toHaveBeenCalledOnce();
+      fireEvent.load(screen.getByTitle("Slow PDF"));
+      expect(screen.queryByText(/PDF is taking longer/)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
   it("continues to render images and PDFs inline", () => {
     const image = render(
       <FilePreviewBody mime="image/png" directUrl="/diagram.png" rawUrl="/diagram.png" name="diagram.png" />,

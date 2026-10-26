@@ -350,13 +350,17 @@ def test_contributor_setup_recipe_produces_a_loadable_config(tmp_path):
     from app.config import Settings
 
     guide = (ROOT / "CONTRIBUTING.md").read_text()
-    pin = "sed -i 's/^document_revision_backend: .*/document_revision_backend: bare_git/' config/app.yaml"
+    pin = (
+        "sed 's/^document_revision_backend: .*/document_revision_backend: bare_git/' "
+        "config/app.yaml > config/app.yaml.tmp\n"
+        "mv config/app.yaml.tmp config/app.yaml"
+    )
     assert pin in guide, "CONTRIBUTING no longer pins the selector it tells contributors to pin"
 
     config = tmp_path / "config"
     config.mkdir()
     shutil.copyfile(ROOT / "config/app.yaml.example", config / "app.yaml")
-    subprocess.run(["sed", "-i", pin.split("'")[1], "config/app.yaml"], cwd=tmp_path, check=True)
+    subprocess.run(["sh", "-ec", pin], cwd=tmp_path, check=True)
 
     loaded = Settings.model_validate(yaml.safe_load((config / "app.yaml").read_text()))
     assert loaded.document_revision_backend == "bare_git"

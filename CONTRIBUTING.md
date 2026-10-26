@@ -47,13 +47,23 @@ Bare Git contract (see `backend/tests/conftest.py` and
 # 1. Configure
 cp config/app.yaml.example   config/app.yaml
 cp config/secret.yaml.example config/secret.yaml
-sed -i 's/^document_revision_backend: .*/document_revision_backend: bare_git/' config/app.yaml
+# Pin the revision backend for this Compose development stack.
+sed 's/^document_revision_backend: .*/document_revision_backend: bare_git/' config/app.yaml > config/app.yaml.tmp
+mv config/app.yaml.tmp config/app.yaml
+$EDITOR config/app.yaml
 $EDITOR config/secret.yaml   # at minimum, set embed_api_key
 
-# 2. Run the stack
+# 2. Generate persistent RS256 signing keys once (never on each restart).
+# config/app.yaml.example already points to /etc/akb/local-session/*.
+docker compose build backend
+docker compose run --rm --no-deps -v "$PWD/config:/etc/akb" backend \
+  python -m app.cli generate-local-session-keyset \
+  --output-dir /etc/akb/local-session
+
+# 3. Run the stack
 docker compose up -d
 
-# 3. Tail backend logs
+# 4. Tail backend logs
 docker compose logs -f backend
 ```
 
@@ -74,7 +84,11 @@ for the suite, runtime, and clean-host bootstrap contracts.
 
 The backend reads exactly two YAML files — `app.yaml` (non-secret) and
 `secret.yaml` (gitignored) — from `./config/` or `/etc/akb/`. **No environment
-variables are read by the backend.** When you need a new setting:
+variables configure application settings in `app/config.py`.** Deployment-layer
+exceptions include PostgreSQL pool sizing (`AKB_PG_POOL_MIN_SIZE` /
+`AKB_PG_POOL_MAX_SIZE`), the optional stats listener (`AKB_STATS_PORT`), and
+process composition (`AKB_PROCESS_ROLE`, `AKB_TOKENIZER_PROCESSES`). When you
+need a new application setting:
 
 1. Add the field with a sensible default to `Settings` in
    `backend/app/config.py`.
@@ -216,6 +230,24 @@ bash scripts/check.sh
       diffs (check `git diff` carefully).
 - [ ] New configuration is reflected in `config/*.yaml.example`.
 - [ ] User-facing behaviour changes are noted in the PR description.
+
+## Public Documentation
+
+Keep architecture, API contracts, decision rationale, and useful historical
+records public. Mark historical results and superseded proposals with their
+scope and status so readers can distinguish them from current instructions.
+
+Before publishing documentation:
+
+- Remove operator-specific runtime/usage snapshots, personal filesystem paths,
+  and private ticket or repository references that readers cannot use.
+- Verify commands and tool arguments against the current implementation and
+  check relative links. Separate archived recipes from supported installation
+  instructions; record the revision for reproducible historical results.
+- Prefer small synthetic examples with public source fixtures over examples
+  that depend on private vaults, customer data, or operational credentials.
+- Describe licensing accurately: the backend is BSL **source-available**;
+  `akb-mcp` is MIT-licensed. See [License](README.md#license).
 
 ## Commit Messages
 

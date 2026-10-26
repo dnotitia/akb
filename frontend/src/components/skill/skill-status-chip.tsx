@@ -1,5 +1,8 @@
-import { Link } from "react-router-dom";
+import { useId } from "react";
+import { Link, useLocation } from "react-router-dom";
 import { SkillBadge } from "@/components/ui/skill-badge";
+import { documentPreviewState } from "@/lib/document-preview-navigation";
+import { vaultGuideHref } from "@/lib/vault-guide-navigation";
 
 interface Props {
   vault: string;
@@ -10,13 +13,14 @@ interface Props {
 }
 
 export function SkillStatusChip({ vault, defined, customized }: Props) {
-  // One destination in every state: the settings section is the only place the
-  // guide can be read AND edited, and the canonical doc URL redirects here
-  // anyway — link straight at it instead of through the bounce.
-  const href = `/vault/${vault}/settings#skill`;
+  const location = useLocation();
+  const id = useId();
+  const href = defined ? vaultGuideHref(vault) : `/vault/${encodeURIComponent(vault)}/settings#skill`;
   return (
     <Link
       to={href}
+      id={id}
+      state={defined ? documentPreviewState(location, id) : undefined}
       aria-label={defined ? "Open vault guide" : "Set up vault guide"}
       className="inline-flex rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
     >

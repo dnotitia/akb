@@ -8,12 +8,14 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncpg
 import pytest
 
-from app.exceptions import ConflictError, ValidationError
+from app.exceptions import ConflictError, ForbiddenError, ValidationError
+from app.services import app_identity_service as identity
 from app.services import app_rollout_service as rollout
 from app.services import app_rollout_worker as worker
 from app.services import app_resource_service as resources
@@ -132,10 +134,19 @@ def _manifest(app_key: str = "rollout-test") -> tuple[dict, str]:
     return manifest, checksum
 
 
+def _principal(app_id):
+    return identity.AppPrincipal(
+        app_id=app_id, credential_id=uuid.uuid4(), credential_generation=1,
+        deployment="test", token_id=str(uuid.uuid4()),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+
+
 async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeypatch):
     async with _fresh_database() as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         monkeypatch.setattr(worker, "get_pool", lambda: pool)
+        monkeypatch.setattr(identity, "get_pool", lambda: pool)
         manifest, checksum = _manifest("rollout-test")
         async with pool.acquire() as conn:
             app_id = await conn.fetchval("INSERT INTO app_definitions(app_key) VALUES($1) RETURNING id", "rollout-test")
@@ -158,6 +169,25 @@ async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeyp
         assert first["release_id"] == str(new_id)
         assert replay["replayed"] is True
         assert replay["job_id"] == first["job_id"]
+        principal = _principal(app_id)
+        # Exactly one installation: no unrelated active anchor can hide this
+        # upgrade's authorization gap. General data access stays active-only.
+        observed = await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="solo")
+        assert observed["job_id"] == first["job_id"]
+        retried = await rollout.request_rollout_as_app(
+            principal, release_id=new_id, manifest_checksum_value=checksum,
+            idempotency_key=key, correlation_id="solo-request-replay",
+        )
+        assert retried["job_id"] == first["job_id"] and retried["replayed"] is True
+        with pytest.raises(ForbiddenError):
+            await rollout.request_rollout_as_app(
+                principal, release_id=new_id, manifest_checksum_value=checksum,
+                idempotency_key=str(uuid.uuid4()), correlation_id="solo-new-request",
+            )
+        with pytest.raises(ForbiddenError):
+            await identity.authorize_app_request(
+                principal, vault_id=vault_id, capability="rollout:read", correlation_id="data-stays-closed",
+            )
         await worker.run_once()
         async with pool.acquire() as conn:
             checkpoint = await conn.fetchval(
@@ -174,6 +204,49 @@ async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeyp
             assert await conn.fetchval("SELECT status FROM app_rollout_jobs WHERE id=$1", uuid.UUID(first["job_id"])) == "applied"
             assert await conn.fetchval("SELECT count(*) FROM vt_rollout__orders WHERE flag IS NULL") == 0
             assert await conn.fetchval("SELECT lifecycle FROM vault_app_installations WHERE id=$1", installation_id) == "active"
+        observed = await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="completed")
+        assert observed["status"] == "applied"
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(_principal(uuid.uuid4()), first["job_id"], correlation_id="foreign-app")
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(principal, uuid.uuid4(), correlation_id="unknown-job")
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE vault_app_installations SET grant_generation=2 WHERE id=$1", installation_id)
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="stale-generation")
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE installation_grants SET status='revoked',revoked_at=NOW() WHERE installation_id=$1 AND status='active'", installation_id)
+            await conn.execute("INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) VALUES($1,3,$2,'test')", installation_id, ["rollout:request"])
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="missing-read")
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE installation_grants SET status='revoked',revoked_at=NOW() WHERE installation_id=$1 AND status='active'", installation_id)
+            await conn.execute("INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) VALUES($1,4,$2,'test')", installation_id, ["rollout:read"])
+        # New current authority may inspect its own old job; its generation
+        # need not equal the historical snapshot's baseline generation.
+        assert (await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="current-grant"))["status"] == "applied"
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE installation_grants SET status='revoked',revoked_at=NOW() WHERE installation_id=$1 AND status='active'", installation_id)
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="revoked")
+        with pytest.raises(ForbiddenError):
+            await rollout.request_rollout_as_app(
+                principal, release_id=new_id, manifest_checksum_value=checksum,
+                idempotency_key=key, correlation_id="revoked-request-replay",
+            )
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE vault_app_installations SET lifecycle='uninstalled',desired_release_id=NULL WHERE id=$1", installation_id)
+            unrelated_vault = await conn.fetchval("INSERT INTO vaults(name,git_path) VALUES('unrelated','/tmp/unrelated.git') RETURNING id")
+            unrelated = await conn.fetchval("INSERT INTO vault_app_installations(app_id,vault_id,desired_release_id,current_release_id,lifecycle) VALUES($1,$2,$3,$3,'active') RETURNING id", app_id, unrelated_vault, new_id)
+            await conn.execute("INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) VALUES($1,1,$2,'test')", unrelated, ["rollout:read", "rollout:request"])
+        await identity.authorize_app_capability(principal, capability="rollout:read", correlation_id="unrelated-anchor")
+        with pytest.raises(ForbiddenError):
+            await rollout.get_rollout_as_app(principal, first["job_id"], correlation_id="uninstalled")
+        with pytest.raises(ForbiddenError):
+            await rollout.request_rollout_as_app(
+                principal, release_id=new_id, manifest_checksum_value=checksum,
+                idempotency_key=key, correlation_id="uninstalled-request-replay",
+            )
 
 
 async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monkeypatch):
@@ -205,7 +278,7 @@ async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monk
             await conn.execute(
                 "INSERT INTO installation_grants(installation_id,generation,capabilities,issuer,status) VALUES($1,1,$2,'test','active')",
                 installation_id,
-                ["installation:read"],
+                ["installation:read", "rollout:read"],
             )
             async with conn.transaction():
                 queued = await rollout.enqueue_installation_rollout(
@@ -217,6 +290,7 @@ async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monk
                 )
         assert queued is not None
         assert queued["status"] == "pending"
+        assert (await rollout.get_rollout_as_app(_principal(app_id), queued["job_id"], correlation_id="installing"))["status"] == "pending"
 
         newer_checksum = rollout.manifest_checksum(manifest, version="3.0.0")
         async with pool.acquire() as conn:
@@ -507,6 +581,7 @@ async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypa
     """A recovery retry never rewrites the blocked source ledger."""
     async with _fresh_database() as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
+        monkeypatch.setattr(identity, "get_pool", lambda: pool)
         manifest, checksum = _manifest("resume-test")
         async with pool.acquire() as conn:
             app_id = await conn.fetchval(
@@ -657,27 +732,23 @@ async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypa
                 source_id,
             )
         key = str(uuid.uuid4())
-        first = await rollout.resume_rollout(
-            app_id,
+        principal = _principal(app_id)
+        assert (await rollout.get_rollout_as_app(principal, source_id, correlation_id="blocked"))["status"] == "blocked"
+        first = await rollout.resume_rollout_as_app(
+            principal,
             source_id,
             release_id=new_release,
             manifest_checksum_value=checksum,
             idempotency_key=key,
-            requested_by_kind="admin",
             correlation_id="resume-test",
-            actor="test",
-            actor_id="test",
         )
-        replay = await rollout.resume_rollout(
-            app_id,
+        replay = await rollout.resume_rollout_as_app(
+            principal,
             source_id,
             release_id=new_release,
             manifest_checksum_value=checksum,
             idempotency_key=key,
-            requested_by_kind="admin",
             correlation_id="resume-test",
-            actor="test",
-            actor_id="test",
         )
         assert first["replayed"] is False
         assert replay["replayed"] is True
@@ -706,6 +777,14 @@ async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypa
                 "SELECT count(*) FROM app_rollout_jobs WHERE source_rollout_id=$1",
                 source_id,
             ) == 1
+            await conn.execute("UPDATE installation_grants SET status='revoked',revoked_at=NOW() WHERE installation_id=$1 AND status='active'", installation_id)
+            await conn.execute("INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) VALUES($1,2,$2,'test')", installation_id, ["rollout:read"])
+        # Even a cached idempotent resume requires current request authority.
+        with pytest.raises(ForbiddenError):
+            await rollout.resume_rollout_as_app(
+                principal, source_id, release_id=new_release, manifest_checksum_value=checksum,
+                idempotency_key=key, correlation_id="resume-revoked-request",
+            )
 
 
 async def test_blocked_resume_accepts_mixed_source_target_lifecycles(monkeypatch):

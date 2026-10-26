@@ -1,9 +1,9 @@
 ---
 title: akb_create_table — opt-in idempotent create (`if_not_exists`)
 status: implemented
-stage: proposal
+stage: implemented-pending-sign-off
 created: 2026-07-29
-updated: 2026-07-29
+updated: 2026-10-20
 reviews:
   - feedback/2026-07-29-codex-round1.md
   - feedback/2026-07-29-codex-round2-impl.md
@@ -31,19 +31,11 @@ reviews:
 table exists" has one option: call create, catch the 409, and infer that the
 table already exists.
 
-Production tool-usage data (2026-07-29, first ~110 minutes after enabling
-`tool_usage`) shows this is the dominant use of the tool:
-
-```
-tool               calls   errors   code       followed by
-akb_create_table     461      461    conflict   alter_table 66.6% / browse 33.4%
-akb_alter_table      308        0    —          —
-```
-
-Every `akb_create_table` call in the window returned 409; every one was followed
-in the same session by a successful call. A representative caller is a job that
-runs every 5 minutes, 29 calls, ~50s, whose steps 2–7 are three create/browse
-probe pairs.
+Historical tool-usage observations showed repeated create conflicts followed by
+successful follow-up operations. Recurring callers used create/browse probes to
+check whether tables already existed. Exact deployment counts, schedules and
+session traces are omitted from this public design; these observations motivate
+the contract, but are not a controlled benchmark or proof of task completion.
 
 The caller is using an error response as a return value.
 
@@ -56,7 +48,7 @@ The caller is using an error response as a return value.
    mean the caller's own attempt won, or another actor's did.
 3. **The metric is destroyed.** 100% failure on a healthy tool cannot be alerted
    on, and a real defect in the same tool would be indistinguishable from the
-   routine 461.
+   routine existence probes.
 4. **TOCTOU.** `find_by_name` then create is check-then-act; the pre-check can be
    lost to a concurrent creator.
 
@@ -417,20 +409,9 @@ no-ops and changed nothing; scenario 5 is a conflict, not a no-op.
 **Medium.** The original draft said "low, no user is blocked". Codex round 1
 pushed back and is right: the data proves callers *recovered*, not that tasks
 completed successfully or that nothing was slowed. It is systematic latency and
-cost, and it destroys an operational signal outright — after nine hours of
-production collection the count is **876 conflicts out of 897 calls (97.7%)**,
-so the tool's failure rate cannot be read at all.
-
-Still below the two live defects found in the same dataset and above backlog:
-
-* `akb_search` — 75 calls, **mean 14.0s, max 35.5s**, zero failures. Root cause
-  is now established independently: the vector working set (~23 GB) far exceeds
-  `shared_buffers` (2 GB) on CephFS-backed storage, so cold blocks cost
-  ~0.66–2.15 ms each and `track_io_timing` attributes 99.8% of a cold query to
-  disk I/O wait. A latency problem that never fails is invisible to any error
-  metric.
-* A 5-minute scheduled job whose terminal `akb_sql` step fails every run against
-  a missing table in another vault.
+cost, and it obscures the operational failure signal when routine existence
+probes dominate reported errors. This historical prioritization is not a claim
+about the current health or workload of any deployment.
 
 ## Out of scope
 
@@ -442,8 +423,8 @@ operation.
 
 ## Status
 
-**Implemented on `feat/create-table-if-not-exists`; Codex round 13 verdict is
-"Ready to merge. No blockers remain." Awaiting PM sign-off.** Revised through thirteen Codex rounds (see `feedback/`), which found and
+**Implemented; the historical Codex round 13 verdict is
+"Ready to merge. No blockers remain." The original record did not record PM sign-off.** Revised through thirteen Codex rounds (see `feedback/`), which found and
 closed: an unimplementable transaction flow, an incorrect `matches_request`, a
 REST gate that ignored OAuth scopes, a stale typed SDK, and a double-
 normalization regression that broke every enum create.

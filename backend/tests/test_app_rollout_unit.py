@@ -5,12 +5,35 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
-from app.exceptions import ValidationError
+from app.exceptions import ForbiddenError, ValidationError
 from app.services import app_rollout_service as rollout
 from app.services import app_rollout_worker as worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["request", "resume"])
+@pytest.mark.parametrize("wrong_app", [False, True])
+async def test_app_mode_requires_a_bound_principal_before_database_access(monkeypatch, operation, wrong_app):
+    async def no_database():
+        pytest.fail("unauthenticated app-mode rollout reached the database")
+
+    monkeypatch.setattr(rollout, "get_pool", no_database)
+    args = [uuid.uuid4()]
+    if operation == "resume":
+        args.append(uuid.uuid4())
+    call = rollout.resume_rollout if operation == "resume" else rollout.request_rollout
+    principal = SimpleNamespace(app_id=uuid.uuid4()) if wrong_app else None
+    with pytest.raises(ForbiddenError):
+        await call(
+            *args, release_id=uuid.uuid4(),
+            manifest_checksum_value="a" * 64, idempotency_key=str(uuid.uuid4()),
+            requested_by_kind="app", correlation_id="no-principal", actor="app", actor_id="app",
+            _principal=principal,
+        )
 
 
 def _manifest(*, operation: str = "add_column", phase: str = "expand") -> dict:

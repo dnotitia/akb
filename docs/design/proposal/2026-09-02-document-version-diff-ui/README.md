@@ -8,6 +8,8 @@ updated: 2026-09-02
 
 # Document version diff UI
 
+> Historical design record: the feature is implemented (see status above). This path is retained for existing references; current behavior is documented in [the frontend guide](../../../../frontend/README.md#editing-documents).
+
 ## Decision
 
 Implement AKB-227, but narrow the launch scope to a **read-only unified diff of

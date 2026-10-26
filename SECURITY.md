@@ -32,13 +32,21 @@ Out of scope:
   notify us so we can update pins).
 - Self-hosted deployments where the operator has materially changed the
   configuration in ways that weaken security (e.g. running with the default
-  `jwt_secret`).
+  development credentials or exposing private signing keys).
 
 ## Hardening Checklist for Operators
 
 When deploying AKB beyond local development:
 
-- [ ] Rotate `jwt_secret` to a strong random value (`openssl rand -hex 32`).
+- [ ] Generate and persist installation-owned RS256 local-session keys; keep
+      the private PEM out of source control and restrict access to it. Follow
+      the [local JWT migration and rotation guide](README.md#local-jwt-migration-and-rotation)
+      when replacing keys, retaining prior public JWKs for an overlap window.
+- [ ] Set independent strong values for `system_hmac_secret` and other
+      configured capability/session secrets in `secret.yaml` (for example,
+      `openssl rand -hex 32` for each). `jwt_secret` is legacy migration input
+      for non-session HMAC capabilities; changing it does not rotate RS256
+      human-session signing keys.
 - [ ] Set strong `db_password`; never reuse the docker-compose default.
 - [ ] If using Qdrant with an API key, set `vector_api_key`.
 - [ ] Restrict MCP `/mcp/` and REST `/api/` endpoints to authenticated

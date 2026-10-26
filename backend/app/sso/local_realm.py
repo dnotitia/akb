@@ -10,6 +10,12 @@ somewhere else. So it is not in `app.sso.registry`, which is the registry OF
 Keycloak representations; it is a setting, projected into the same catalog at the
 one place the catalog is read for the browser.
 
+The browser entry also offers enabled brokers on the realm's login page. New
+browser states record those allowed choices; a returned broker token is checked
+against that snapshot and its current enabled state, then projected under its
+actual provider. Native tokens still have no broker claim. This does not make
+the local alias a broker or relax either token kind's verification contract.
+
 It exists because an `sso` installation with no external identity provider had no
 way in at all: `providers` was empty, the retired provider-less route answers 410,
 registering the realm as its own provider is refused (correctly -- it is an

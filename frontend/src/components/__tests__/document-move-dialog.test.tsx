@@ -23,6 +23,11 @@ import { ApiError, browseVault, moveDocument } from "@/lib/api";
 const browseVaultMock = browseVault as unknown as ReturnType<typeof vi.fn>;
 const moveDocumentMock = moveDocument as unknown as ReturnType<typeof vi.fn>;
 
+const duplicateTitle = () => new ApiError("duplicate title", 409, {
+  code: "document_title_conflict",
+  details: { title: "API contract", collection: "archive", existing_path: "archive/api-contract.md", existing_title: "API contract" },
+});
+
 function renderDialog(
   onMoved = vi.fn(),
   onOpenChange = vi.fn(),
@@ -54,6 +59,7 @@ beforeEach(() => {
   browseVaultMock.mockReset();
   moveDocumentMock.mockReset();
   browseVaultMock.mockResolvedValue({
+    complete: true,
     items: [
       { type: "collection", path: "archive" },
       { type: "collection", path: "drafts" },
@@ -114,12 +120,11 @@ describe("DocumentMoveDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("preflights collection collisions and keeps both without exposing the suffix as the title", async () => {
+  it("uses authoritative server validation and keeps both without exposing the suffix as the title", async () => {
     browseVaultMock.mockResolvedValue({
       items: [
         { type: "collection", path: "archive" },
         { type: "collection", path: "drafts" },
-        { type: "document", name: "API contract", path: "archive/api-contract.md" },
       ],
     });
     moveDocumentMock.mockResolvedValue({
@@ -131,11 +136,13 @@ describe("DocumentMoveDialog", () => {
       current_commit: "abc1234",
       action: "moved",
     });
+    moveDocumentMock.mockRejectedValueOnce(duplicateTitle());
     const user = userEvent.setup();
     const { onMoved, onOpenChange } = renderDialog();
 
     await user.click(await screen.findByLabelText("Target collection"));
     await user.click(screen.getByRole("menuitemradio", { name: "archive" }));
+    await user.click(screen.getByRole("button", { name: "Move document" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "already exists here",
     );
@@ -172,7 +179,6 @@ describe("DocumentMoveDialog", () => {
       items: [
         { type: "collection", path: "archive" },
         { type: "collection", path: "drafts" },
-        { type: "document", name: "API Contract", path: "archive/legacy-contract.md" },
       ],
     });
     const user = userEvent.setup();
@@ -185,14 +191,14 @@ describe("DocumentMoveDialog", () => {
     expect(screen.getByRole("button", { name: "Move document" })).toBeEnabled();
   });
 
-  it("opens the conflicting document from the preflight notice", async () => {
+  it("opens the conflicting document from a server conflict while preserving the selected destination", async () => {
     browseVaultMock.mockResolvedValue({
       items: [
         { type: "collection", path: "archive" },
         { type: "collection", path: "drafts" },
-        { type: "document", name: "API contract", path: "archive/api-contract.md" },
       ],
     });
+    moveDocumentMock.mockRejectedValueOnce(duplicateTitle());
     const user = userEvent.setup();
     const onOpenDocument = vi.fn();
     const onOpenChange = vi.fn();
@@ -200,6 +206,9 @@ describe("DocumentMoveDialog", () => {
 
     await user.click(await screen.findByLabelText("Target collection"));
     await user.click(screen.getByRole("menuitemradio", { name: "archive" }));
+    await user.click(screen.getByRole("button", { name: "Move document" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("already exists here");
+    expect(screen.getByLabelText("Target collection")).toHaveTextContent("archive");
     await user.click(screen.getByRole("button", { name: "Open existing" }));
 
     expect(onOpenDocument).toHaveBeenCalledWith("archive/api-contract.md");

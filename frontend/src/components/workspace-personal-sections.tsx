@@ -9,7 +9,7 @@ import { readWorkspaceShortcuts, removeWorkspaceShortcut, workspaceShortcutHref,
 
 const focus = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
 
-export function WorkspacePersonalSections({ userId, vaults }: { userId: string; vaults: { name: string; role?: string }[] }) {
+export function WorkspacePersonalSections({ userId, vaults, sections = ["recent", "drafts", "pinned"] }: { userId: string; vaults: { name: string; role?: string }[]; sections?: ("recent" | "drafts" | "pinned")[] }) {
   const [, refresh] = useReducer(value => value + 1, 0);
   const { pathname, search } = useLocation();
   useEffect(() => {
@@ -33,9 +33,9 @@ export function WorkspacePersonalSections({ userId, vaults }: { userId: string; 
     pinned: shortcuts.map(item => ({ key: `${item.kind}:${item.vault}:${item.path}`, title: item.title, context: `${item.vault} / ${item.path}`, to: workspaceShortcutHref(item), icon: item.kind === "collection" ? <Folder className="h-3.5 w-3.5" /> : <FileText className="h-3.5 w-3.5" />, remove: () => removeWorkspaceShortcut(userId, item) })),
   };
   return <div className="space-y-2 px-2 pb-3">
-    <PersonalSection title="Recently viewed" rows={rows.recent} current={pathname + search} />
-    <PersonalSection title="Drafts" rows={rows.drafts} current={pathname + search} description="Saved in this browser. Edit drafts expire after 24 hours." />
-    <PersonalSection title="Pinned" rows={rows.pinned} current={pathname + search} description="Your document and Collection shortcuts" />
+    {sections.includes("recent") && <PersonalSection title="Recently viewed" rows={rows.recent} current={pathname + search} />}
+    {sections.includes("drafts") && <PersonalSection title="Drafts" rows={rows.drafts} current={pathname + search} description="Saved in this browser. Edit drafts expire after 24 hours." />}
+    {sections.includes("pinned") && <PersonalSection title="Pinned" rows={rows.pinned} current={pathname + search} description="Your document and Collection shortcuts" />}
   </div>;
 }
 
@@ -62,7 +62,7 @@ function PersonalSection({ title, rows, current, description }: { title: string;
           const failed = row.remove?.() === false;
           setError(failed);
           if (!failed) requestAnimationFrame(() => (summary.current ?? document.getElementById("workspace-vaults-link"))?.focus());
-        }} className={cn("mr-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100 hover:bg-surface-active", focus)}><X className="h-3 w-3" aria-hidden /></button>}
+        }} className={cn("mr-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100 pointer-coarse:h-11 pointer-coarse:w-11 pointer-coarse:opacity-100 hover:bg-surface-active", focus)}><X className="h-3 w-3" aria-hidden /></button>}
       </li>)}</ul>
       {rows.length > 3 && <button type="button" onClick={() => setAll(value => !value)} className={cn("flex h-9 w-full items-center rounded-[var(--radius-sm)] pl-6 pr-3 text-xs text-link hover:bg-surface-hover", focus)}>{all ? "Show less" : `Show ${rows.length - 3} more`}</button>}
       {error && <p role="alert" className="px-3 py-2 text-xs text-destructive">Could not remove this shortcut. Browser storage may be unavailable.</p>}

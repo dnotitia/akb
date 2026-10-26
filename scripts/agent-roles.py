@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Render the Codex and Claude Code role configuration from .agents/roles.toml.
 
-    python scripts/agent-roles.py          # write .codex/ and .claude/
+    python scripts/agent-roles.py          # write .codex/ and .claude/agents/
     python scripts/agent-roles.py --check  # exit 1 if either view drifted
 
 One role definition, two rendered views. The rendered files are committed
 because each agent finds its configuration by file name; the check exists
 because a hand edit to a rendered file is a second contract nobody reads.
+
+Neither view names a model or a reasoning effort: each person's own agent
+configuration chooses them and every role inherits the session's choice. A
+pinned model goes stale and overrides that choice for everyone, so the source
+and .claude/settings.json are refused when they carry one.
+
 Stdlib only: tomllib needs Python 3.11+, which scripts/check.sh already
 requires for the analyzers.
 """
@@ -27,13 +33,43 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / ".agents" / "roles.toml"
+CLAUDE_SETTINGS = REPO / ".claude" / "settings.json"
 GENERATED = "Generated from .agents/roles.toml by scripts/agent-roles.py; edit the source."
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
 READ_ONLY_DISALLOWED = "Edit, Write, NotebookEdit"
+
+# The keys the source may carry. Anything else is refused rather than ignored,
+# so a setting nobody renders cannot look like configuration.
+DELEGATION_KEYS = {"max_workers", "depth"}
+ROLE_KEYS = {"description", "read_only", "instructions"}
+
+# A key naming a model or tuning one: model, model.codex, effort, effortLevel,
+# model_reasoning_effort, model_provider, model_verbosity, availableModels, ...
+MODEL_KEY = re.compile(r"model|effort|reasoning|verbosity", re.IGNORECASE)
+MODEL_FIX = (
+    "this repository does not pin a coding-agent model or reasoning effort; "
+    "Claude Code and Codex inherit each person's own choice. Remove {keys} from {file}"
+)
 
 
 def fail(message: str) -> None:
     sys.exit(f"agent-roles: {message}")
+
+
+def model_keys(table: dict, prefix: str = "") -> list[str]:
+    """Dotted paths of every key in ``table`` that names or tunes a model."""
+    found: list[str] = []
+    for key, value in table.items():
+        path = f"{prefix}{key}"
+        if MODEL_KEY.search(key):
+            found.append(path)
+        elif isinstance(value, dict):
+            found += model_keys(value, f"{path}.")
+    return found
+
+
+def refuse_model_keys(keys: list[str], file: str, then: str) -> None:
+    if keys:
+        fail(MODEL_FIX.format(keys=", ".join(f"`{k}`" for k in keys), file=file) + f", then run: {then}")
 
 
 def toml_string(value: str) -> str:
@@ -56,43 +92,52 @@ def yaml_scalar(value: str) -> str:
 def load() -> dict:
     with SOURCE.open("rb") as handle:
         spec = tomllib.load(handle)
-    owner = spec.get("owner") or fail("[owner] is required")
+    refuse_model_keys(model_keys(spec), ".agents/roles.toml", "python scripts/agent-roles.py")
+    unknown = sorted(set(spec) - {"delegation", "roles"})
+    if unknown:
+        fail(f"unknown top-level table(s) in .agents/roles.toml: {', '.join(unknown)}")
     delegation = spec.get("delegation") or fail("[delegation] is required")
     roles = spec.get("roles") or fail("at least one [roles.<id>] is required")
-    for section, table in (("owner", owner), *((f"roles.{k}", v) for k, v in roles.items())):
-        if table.get("effort") not in EFFORTS:
-            fail(f"[{section}] effort must be one of {', '.join(EFFORTS)}")
-        model = table.get("model") or {}
-        for agent in ("codex", "claude"):
-            if not isinstance(model.get(agent), str) or not model[agent]:
-                fail(f"[{section}] model.{agent} is required")
+    if set(delegation) - DELEGATION_KEYS:
+        fail(f"[delegation] unknown key(s): {', '.join(sorted(set(delegation) - DELEGATION_KEYS))}")
+    for key in sorted(DELEGATION_KEYS):
+        if not isinstance(delegation.get(key), int) or delegation[key] < 1:
+            fail(f"[delegation] {key} must be a positive integer")
     for role_id, role in roles.items():
         if not re.fullmatch(r"[a-z][a-z0-9_]*", role_id):
             fail(f"role id {role_id!r}: lowercase letters, digits and underscores only")
+        if set(role) - ROLE_KEYS:
+            fail(f"[roles.{role_id}] unknown key(s): {', '.join(sorted(set(role) - ROLE_KEYS))}")
         if not isinstance(role.get("description"), str) or not role["description"].strip():
             fail(f"[roles.{role_id}] description is required")
         if not isinstance(role.get("instructions"), str) or not role["instructions"].strip():
             fail(f"[roles.{role_id}] instructions is required")
         if not isinstance(role.get("read_only"), bool):
             fail(f"[roles.{role_id}] read_only must be true or false")
-    for key in ("max_workers", "depth"):
-        if not isinstance(delegation.get(key), int) or delegation[key] < 1:
-            fail(f"[delegation] {key} must be a positive integer")
     return spec
 
 
+def check_claude_settings() -> None:
+    # settings.json is hand-maintained (permissions); it must not pin a model
+    # either, or the rendered agents would inherit that pin instead.
+    if not CLAUDE_SETTINGS.exists():
+        return
+    settings = json.loads(CLAUDE_SETTINGS.read_text())
+    if not isinstance(settings, dict):
+        fail(".claude/settings.json must be a JSON object")
+    keys = [k for k in settings if MODEL_KEY.search(k)]
+    env = settings.get("env")
+    if isinstance(env, dict):
+        keys += [f"env.{k}" for k in env if MODEL_KEY.search(k)]
+    refuse_model_keys(keys, ".claude/settings.json", "python scripts/agent-roles.py --check")
+
+
 def render_codex_config(spec: dict) -> str:
-    owner, delegation, roles = spec["owner"], spec["delegation"], spec["roles"]
+    delegation, roles = spec["delegation"], spec["roles"]
     lines = [
         f"# {GENERATED}",
-        "# Coding-agent defaults. Product inference models are configured separately.",
-        f"model = {toml_string(owner['model']['codex'])}",
-        f"model_reasoning_effort = {toml_string(owner['effort'])}",
-    ]
-    verbosity = (owner.get("verbosity") or {}).get("codex")
-    if verbosity:
-        lines.append(f"model_verbosity = {toml_string(verbosity)}")
-    lines += [
+        "# No model or reasoning effort is set: each person's own Codex configuration",
+        "# chooses them. Product inference models are configured separately.",
         "",
         "[agents]",
         f"max_concurrent_threads_per_session = {delegation['max_workers']}",
@@ -109,11 +154,7 @@ def render_codex_config(spec: dict) -> str:
 
 
 def render_codex_role(role: dict) -> str:
-    lines = [
-        f"# {GENERATED}",
-        f"model = {toml_string(role['model']['codex'])}",
-        f"model_reasoning_effort = {toml_string(role['effort'])}",
-    ]
+    lines = [f"# {GENERATED}"]
     if role["read_only"]:
         lines.append('sandbox_mode = "read-only"')
     lines.append(f"developer_instructions = {toml_multiline(role['instructions'])}")
@@ -130,8 +171,6 @@ def render_claude_role(role_id: str, role: dict) -> str:
         f"# {GENERATED}",
         f"name: {claude_name(role_id)}",
         f"description: {yaml_scalar(role['description'])}",
-        f"model: {role['model']['claude']}",
-        f"effort: {role['effort']}",
     ]
     if role["read_only"]:
         lines += ["permissionMode: plan", f"disallowedTools: {READ_ONLY_DISALLOWED}"]
@@ -139,25 +178,8 @@ def render_claude_role(role_id: str, role: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_claude_settings(spec: dict, existing: str | None) -> str:
-    # Only the two keys this file owns are rendered; permissions and anything
-    # else in settings.json stay hand-maintained.
-    settings = json.loads(existing) if existing else {}
-    if not isinstance(settings, dict):
-        fail(".claude/settings.json must be a JSON object")
-    owner = spec["owner"]
-    merged = {"model": owner["model"]["claude"], "effortLevel": owner["effort"]}
-    merged.update({k: v for k, v in settings.items() if k not in merged})
-    return json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
-
-
 def render_all(spec: dict) -> dict[Path, str]:
-    settings_path = REPO / ".claude" / "settings.json"
-    existing = settings_path.read_text() if settings_path.exists() else None
-    out: dict[Path, str] = {
-        REPO / ".codex" / "config.toml": render_codex_config(spec),
-        settings_path: render_claude_settings(spec, existing),
-    }
+    out: dict[Path, str] = {REPO / ".codex" / "config.toml": render_codex_config(spec)}
     for role_id, role in spec["roles"].items():
         out[REPO / ".codex" / "agents" / f"{role_id}.toml"] = render_codex_role(role)
         out[REPO / ".claude" / "agents" / f"{claude_name(role_id)}.md"] = render_claude_role(role_id, role)
@@ -177,7 +199,9 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="report drift instead of writing")
     args = parser.parse_args()
 
-    rendered = render_all(load())
+    spec = load()
+    check_claude_settings()
+    rendered = render_all(spec)
     stray = strays(rendered)
     if args.check:
         drift: list[str] = []
@@ -198,7 +222,7 @@ def main() -> int:
                 print(f"  {item}", file=sys.stderr)
             print("  run: python scripts/agent-roles.py", file=sys.stderr)
             return 1
-        print(f"agent-roles: {len(rendered)} rendered files match .agents/roles.toml")
+        print(f"agent-roles: {len(rendered)} rendered files match .agents/roles.toml; no model or effort pinned")
         return 0
 
     for path, content in rendered.items():

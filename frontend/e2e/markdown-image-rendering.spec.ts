@@ -34,6 +34,7 @@ test.describe("common Markdown image rendering mock contract", () => {
   });
 
   test("shows available, request-failure, and decode-failure states", async ({ page, request }) => {
+    await page.setViewportSize({ width: 2560, height: 1440 });
     const imageFixture = await fixture(request);
     await page.goto(imageFixture.identity!.start_url!);
 
@@ -48,6 +49,17 @@ test.describe("common Markdown image rendering mock contract", () => {
     await expect(frames.nth(1)).toHaveAccessibleName("Image unavailable: Request failure");
     await expect(frames.nth(2)).toHaveAttribute("data-markdown-image-state", "decode");
     await expect(frames.nth(2)).toHaveAccessibleName("Image unavailable: Decode failure");
+
+    // Missing/undecodable attachments share the same reading boundary as
+    // available images, instead of growing out to the full canvas width.
+    const heading = page.getByRole("heading", { level: 2, name: "Image rendering fixture", exact: true });
+    const textBox = (await heading.boundingBox())!;
+    expect(textBox.width).toBe(1024);
+    for (const frame of await frames.all()) {
+      const box = (await frame.boundingBox())!;
+      expect(box.x).toBeCloseTo(textBox.x, 0);
+      expect(box.width).toBeCloseTo(textBox.width, 0);
+    }
   });
 
   test("keeps image-only continuation and canonical Markdown through edit/save/reopen", async ({

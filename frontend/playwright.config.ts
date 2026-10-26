@@ -18,10 +18,8 @@ const imageRenderingScenario = process.env.AKB_FE_E2E_SCENARIO === "markdown-ima
 // Mock mode owns its Vite webServer and browser MSW worker. Real mode consumes
 // the already-ready frontend origin from the repository runtime descriptor.
 //
-// We deliberately keep the suite small (`smoke.spec.ts`) — slow E2E
-// loops kill iteration speed. Rich coverage lives in vitest+RTL +
-// MSW. Playwright's job is "the build still actually works in a
-// browser end-to-end" — not exhaustive UX coverage.
+// The full browser regression covers the real runtime and isolated HTTP
+// fixtures. Keep one worker and serialization for the shared backend.
 export default defineConfig({
   testDir: "./e2e",
   ...(recoveryScenario
@@ -32,10 +30,10 @@ export default defineConfig({
   fullyParallel: false,                  // single backend, serialize
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
-  // Finish inside the repository runtime job's 45-minute budget, leaving room
+  // Finish inside the repository runtime job's 60-minute budget, leaving room
   // for API/setup work, cleanup, and failure-artifact upload. Per-test limits
   // remain unchanged; an exhausted suite budget still fails the check.
-  globalTimeout: process.env.CI ? 30 * 60 * 1000 : undefined,
+  globalTimeout: process.env.CI ? 40 * 60 * 1000 : undefined,
   workers: 1,
   reporter: process.env.CI ? "github" : "list",
   use: {

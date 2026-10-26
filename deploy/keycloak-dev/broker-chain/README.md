@@ -15,6 +15,26 @@ the AKB API audience and still must be rejected. Finally, the provider is
 disabled, the AKB identity binding is rolled back, the operator removes the
 Keycloak prelink/user, and a secret-free JSON receipt is printed.
 
+The browser-route regression also starts at AKB's real
+`/api/v1/auth/sso/{alias}/login` route. It compares direct `workforce` entry with
+`local` ("This workspace") entry: the latter must show the native realm's
+username/password form and the real upstream link, which the fixture follows
+before submitting upstream credentials. Both return through the production
+callback, verify real signed access and ID tokens, and reach the same prelinked
+AKB account through `/auth/me`. The local migration phase supplies the third
+control: a realm-native credential still completes the same callback as `local`.
+
+The fixture mounts the production FastAPI app in an ASGI HTTP transport for
+AKB requests; Keycloak requests use actual HTTPS against the two containers.
+It does not replace provider catalogs, state, cookie handling, token exchange,
+verifiers, admission, or session storage. Per-run setup registers the exact AKB
+callback on the disposable browser client, generates a process-only custody
+key, and reconciles the real runtime authority. Each route checks the intended
+relative redirect, absence of a JSON callback body, secure opaque session
+cookies, the issuer/subject and actual provider in encrypted session custody,
+and rejection of a replayed callback. Only boolean results and provider aliases
+enter the receipt; codes, cookies, credentials, and tokens do not.
+
 Two further phases are about the people nobody linked by hand, which is
 everyone a workspace admits after it owns its identity provider.
 

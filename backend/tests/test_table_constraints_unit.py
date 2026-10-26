@@ -871,6 +871,12 @@ class _FakeConn:
     def transaction(self):
         return _FakeTxn()
 
+    async def fetchval(self, sql, user_id):
+        # The error-translation case executes as an active human admin.
+        assert "FROM users WHERE id=$1 FOR SHARE" in sql
+        assert user_id == uuid.UUID("00000000-0000-0000-0000-000000000001")
+        return True
+
     async def execute(self, sql, *args):
         # SET LOCAL ... statements succeed; the user INSERT raises.
         if self._raise_on_sql and not sql.upper().startswith("SET LOCAL"):

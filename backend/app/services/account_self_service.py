@@ -204,6 +204,8 @@ async def delete_account(
                 await conn.execute("UPDATE vault_access_contributions SET granted_by=NULL WHERE granted_by=$1", uid)
                 await conn.execute("UPDATE publications SET created_by=NULL WHERE created_by=$1", uid)
                 await emit_event(conn, "auth.account_deleted", actor_id=str(uid), payload={"user_id": str(uid)})
+                from app.repositories.user_avatars_repo import enqueue_account_cleanup
+                await enqueue_account_cleanup(conn, uid)
                 await conn.execute("DELETE FROM users WHERE id=$1", uid)
     except (asyncpg.DeadlockDetectedError, asyncpg.LockNotAvailableError, asyncpg.ForeignKeyViolationError):
         raise ConflictError("Account resources changed. Review the account again.", code="account_state_changed") from None

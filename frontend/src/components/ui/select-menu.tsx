@@ -22,6 +22,9 @@ interface SelectMenuProps {
   id?: string;
   className?: string;
   contentClassName?: string;
+  collisionPadding?: number;
+  /** Keep explanatory option text readable on narrow menus. */
+  wrapHints?: boolean;
   /** Navigation identity controls should not resemble form fields. */
   variant?: "field" | "navigation";
   leadingIcon?: ReactNode;
@@ -55,6 +58,8 @@ export function SelectMenu({
   id,
   className,
   contentClassName,
+  collisionPadding,
+  wrapHints = false,
   variant = "field",
   leadingIcon,
   disabled,
@@ -111,6 +116,7 @@ export function SelectMenu({
         <DropdownMenu.Content
           align="start"
           sideOffset={6}
+          collisionPadding={collisionPadding}
           onCloseAutoFocus={showFilter ? () => setFilter("") : undefined}
           className={cn("z-[var(--z-popover)] max-h-[min(60vh,18rem)] min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md", contentClassName)}
         >
@@ -150,7 +156,7 @@ export function SelectMenu({
                   </TooltipText>
                   {o.hint && (
                     <TooltipText
-                      className="block truncate text-xs text-foreground-muted"
+                      className={cn("block text-xs text-foreground-muted", wrapHints ? "whitespace-normal" : "truncate")}
                       tip={o.hint}
                     >
                       {o.hint}

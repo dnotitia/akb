@@ -95,7 +95,7 @@ NATIVE_SEARCH_MAX_BODY_BYTES = 128 * 1024 * 1024
 # is `settings.search_max_source_uris` (configurable, documented there); this
 # constant stays so older imports keep resolving, but nothing reads it anymore.
 NATIVE_SEARCH_MAX_SOURCE_URIS = 200
-# Frontmatter slice for candidate filtering (workbench #1069, part 2): the
+# Frontmatter slice for candidate filtering, read instead of the body: the
 # filter decision needs only the leading frontmatter envelope (`type`/`tags`/
 # `status`), never the body. Reading the first 8KiB bounds per-resource memory
 # regardless of body size; a resource whose envelope does not close inside the
@@ -558,8 +558,8 @@ def vault_path_eligible(
     and NO doc-level narrowing filter (those still need per-resource source_ids).
     When False, the existing source_ids path runs unchanged.
 
-    The vector-store vault filter now ALSO constrains source_type (workbench
-    #1069: the caller passes `source_types` alongside `vault_ids`), so the
+    The vector-store vault filter now ALSO constrains source_type (the
+    caller passes `source_types` alongside `vault_ids`), so the
     native arm is eligible too — stale legacy Document points are excluded
     driver-side before the top-K is cut and can no longer suppress valid
     native hits. `_hydrate_hits` keeps its arm-mismatch skip as defense in
@@ -852,7 +852,7 @@ class SearchService:
                 raise ValidationError(
                     "native search scope exceeds the bounded candidate corpus"
                 )
-            # Slice + paginate (workbench #1069, part 2): filter 판정 needs only
+            # Slice + paginate: the filter decision needs only
             # the leading frontmatter envelope, so fetch an 8KiB prefix per row
             # instead of the full body, keyset-paged by resource_id so peak
             # memory is page-sized rather than scope-sized. `byte_size` still
@@ -1234,7 +1234,7 @@ class SearchService:
         # Hybrid (dense + BM25 sparse) via the configured driver. Explicitly
         # degraded partial hits continue through normal dedup and hydration.
         #
-        # source_types (workbench #1069): constrain the driver-side pre-filter
+        # source_types: constrain the driver-side pre-filter
         # to the active Document arm (+ table/file, which have no second arm)
         # so stale points from the non-active arm can never consume the top-K.
         # `_hydrate_hits` keeps its arm-mismatch skip as defense in depth.
@@ -1298,9 +1298,9 @@ class SearchService:
         # in the driver-returned order. Keeps document results fully
         # backward-compatible (doc_id == source_id) while adding table/file.
         phase_started = time.perf_counter()
-        # `dropped` counts hits lost between retrieval and hydration by cause
-        # (workbench #1069 G3), so `total_matches > 0, returned == 0` can never
-        # again read as a silent zero-match. A FAULT cause marks the response
+        # `dropped` counts hits lost between retrieval and hydration by cause,
+        # so a `total_matches > 0, returned == 0` response can never again
+        # read as a silent zero-match. A FAULT cause marks the response
         # degraded; a cause in `NON_DEGRADING_DROP_CAUSES` does not, because a
         # filter honouring the request is not a failure (akb#604).
         #
@@ -1508,7 +1508,7 @@ class SearchService:
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
         document_source = _configured_document_source_type()
         unknown_types: set[str] = set()
-        # Hydration-drop accounting (workbench #1069 G3): every hit that enters
+        # Hydration-drop accounting: every hit that enters
         # this method but leaves as no result is counted by cause, so a
         # `total_matches > 0, returned == 0` response can say WHERE the hits
         # went instead of reading as a silent zero-match. Keys are stable
@@ -1518,7 +1518,7 @@ class SearchService:
             if h.source_type in {LEGACY_DOCUMENT_SOURCE, NATIVE_DOCUMENT_SOURCE} and h.source_type != document_source:
                 # A selected backend has exactly one Document authority. Old
                 # vector points from the other arm are never hydrated. With the
-                # driver-side `source_types` predicate (workbench #1069) these
+                # driver-side `source_types` predicate, these
                 # should no longer arrive; the skip stays as defense in depth
                 # and the counter proves it (stays zero when the predicate
                 # works, goes non-zero if a driver ignores it).
@@ -1870,9 +1870,9 @@ class SearchService:
             if not m:
                 # The hit survived retrieval but its source row is gone or stale
                 # (deleted between retrieval and hydration, or a derived chunk
-                # whose head moved). Count it — this is the workbench #1069
-                # `total_matches=30, returned=0` shape, and it must never again
-                # read as a silent zero-match.
+                # whose head moved). Count it: uncounted misses are how a response
+                # ends up as `total_matches=30, returned=0` with no explanation,
+                # and that shape must never again read as a silent zero-match.
                 dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
                 continue
             # Archive scope (akb#530). `m["status"]` is the AUTHORITY for this

@@ -26,7 +26,7 @@ for (const width of [390, 1440]) for (const dark of [false, true]) {
     const directory = page.getByRole("region", { name: "Your vaults" });
     const list = directory.getByRole("list", { name: "Available vaults" });
     await expect(list.getByRole("link")).toHaveCount(30);
-    await directory.getByRole("button", { name: "Show more vaults (35 remaining)" }).click();
+    await list.getByRole("link").last().scrollIntoViewIfNeeded();
     await expect(list.getByRole("link")).toHaveCount(60);
     await directory.getByRole("textbox", { name: "Find a vault" }).fill("workspace-64");
     await expect(list.getByRole("link")).toHaveCount(1);

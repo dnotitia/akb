@@ -205,6 +205,9 @@ def _authenticated_user(row, scope: str) -> AuthenticatedUser:
         is_admin=row["is_admin"],
         auth_method="browser_session",
         oauth_scopes=scope.split(" "),
+        browser_session_id=row["id"],
+        browser_session_epoch=row["session_epoch"],
+        browser_session_runtime_generation=current_sso_session_authority().runtime_generation,
     )
 
 
@@ -268,6 +271,7 @@ async def create_sso_browser_session(
     token_response: Mapping[str, object],
     *,
     login_sequence: int | None = None,
+    callback_challenge_id: uuid.UUID | None = None,
 ) -> IssuedSsoBrowserSession:
     """Persist one exact-bound session after both token profiles verified."""
     if principal.profile_id != KEYCLOAK_ACCESS_V1 or user.auth_method != "oauth":
@@ -332,6 +336,12 @@ async def create_sso_browser_session(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if callback_challenge_id is not None:
+                from app.sso.callback_evidence import lock_callback_authority
+                try:
+                    await lock_callback_authority(conn, callback_challenge_id)
+                except AKBError:
+                    raise AuthenticationError("SSO login evidence is unavailable") from None
             await lock_active_sso_session_epoch(conn, authority)
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -444,6 +454,13 @@ async def create_sso_browser_session(
                 idle_expiry,
                 absolute_expiry,
             )
+            if callback_challenge_id is not None:
+                from app.sso.callback_evidence import record_callback
+                try:
+                    await record_callback(conn, callback_challenge_id, user_id=user_id,
+                                          issuer=issuer, subject=subject, provider_alias=provider_alias)
+                except AKBError:
+                    raise AuthenticationError("SSO login evidence is unavailable") from None
             await emit_event(
                 conn,
                 "auth.sso_browser_session_created",

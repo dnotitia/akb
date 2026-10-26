@@ -7,6 +7,9 @@ reasoning_effort: medium
 
 # AKB Git Release Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Record a **single release/tag event** as a `git-release` document in the target AKB vault. Mechanical assembly only — the release notes (from a GitHub Release fetched via `gh release view`, or the annotated tag message as fallback) are quoted as compiled-truth, and the commit/PR membership is derived from documents already in the vault. No LLM synthesis. This skill does not accept hand-supplied payloads — the canonical sources of release-notes text are GitHub itself (via `gh`) and `git` itself (annotated tag message).
 
 Scope boundaries:
@@ -116,18 +119,7 @@ Call the resulting ordered list `sha_list` (chronologically ascending). If `sha_
 
 ### Step 5 — Dedup check
 
-```text
-mcp__akb__akb_search(
-  query="release {tag} {repo_name}",
-  vault="{vault_name}",
-  collection="git-releases",
-  type="reference",
-  tags=["git", "kind:release", "project:{repo_name}"],
-  limit=5
-)
-```
-
-Among the hits, find the one whose frontmatter has `repo == repo_name AND tag == tag`. If found, capture `existing_doc_id` for the update path; otherwise, proceed to create.
+Enumerate `akb_browse(vault={vault_name}, collection="git-releases", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. Match `repo == repo_name AND tag == tag`. Capture `existing_doc_id` and `existing_uri` on a unique match; create only after complete enumeration. Report multiple matches without writing.
 
 ### Step 6 — Fetch commit documents
 
@@ -146,17 +138,17 @@ mcp__akb__akb_search(
 )
 ```
 
-For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_search` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_search` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_get` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
+For each search, treat a matching short-SHA title prefix as a candidate only. Read candidates with `akb_get(uri={hit.uri})` and verify the full `sha` and `repo` metadata before selecting a unique match. A ranked search miss is not proof of absence: if no candidate matches, enumerate `git-commits` with the paginated browse procedure used for dedup, then verify the same fields. Preserve the returned canonical `uri` in each commit record. Report ambiguity without writing.
 
 For each `commit_records[i]`, populate the downstream-needed fields from the AKB primitives that durably persist them:
 
-- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_search`).
+- `uri`, `doc_id`, `path`, `title`, `summary` — from the verified hit (whitelist fields exposed by `akb_search`).
 - `short_sha` — first 7 chars of the full SHA (already known from the search query); also recoverable from the title prefix.
 - `author` — parse from the row's `tags` array as `tag[len("author:"):]` for the first `author:*` tag emitted by `/ingest-commit` Step 6. Single-author commits emit one such tag; merge commits emit either the merging committer or whichever name `.mailmap` resolved. `null` if no `author:*` tag is present (defensive — the commit ingest always emits one).
 - `conv_type` — parse from the row's `tags` array as `tag[len("type:"):]` for the first `type:*` tag. `null` when the commit subject did not match the conventional-commit pattern.
 - `scope` — parse `tag[len("scope:"):]` for the first `scope:*` tag. Drives PR-level `pr_scope` aggregation downstream without re-deriving from a `paths` list.
 
-Skip the secondary `akb_get` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_search`. A 30-commit PR is one batched `akb_search` round trip, not 30+30.
+Reuse the hydrated result after identity verification; do not fetch the same document again for its summary or tags.
 
 The full file list, per-commit stats, and diff scope are not aggregated across commits — the per-commit body's `### Paths` and `## Stats` sections are the audit surface, reachable via the PR's `depends_on` graph edge.
 
@@ -173,19 +165,19 @@ Collect the results into `commit_records`, aligned with `sha_list`.
 
 ### Step 7 — Derive the PR axis
 
-There is no commit-side backlink to read — PR-to-commit linkage lives on each PR document's outgoing `depends_on` graph edge (set by `ingest-pr` Step 7). Discover candidate PRs by searching the vault, then intersect each PR's `depends_on` with the release's commit set: `range_commit_uris = { "akb://{vault_name}/doc/{record.path}" for record in commit_records }`.
+There is no commit-side backlink to read — PR-to-commit linkage lives on each PR document's outgoing `depends_on` graph edge (set by `ingest-pr` Step 7). Discover candidate PRs by browsing the complete collection, then intersect each PR's `depends_on` with the release's commit set: `range_commit_uris = { record.uri for record in commit_records }`.
 
-Search for PRs: `akb_search(vault="{vault_name}", query="pr {repo_name}", collection="git-prs", type="reference", tags=["git", "kind:pr", "project:{repo_name}"], limit=500)`. Hits return summaries (`path`, `title`, `summary`, `tags`, fusion score) but no frontmatter or graph edges — hydrate separately:
+Enumerate `akb_browse(vault={vault_name}, collection="git-prs", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. This enumeration, rather than ranked semantic search, supplies the complete PR candidate set for the following blocks.
 
-1. **Hydration block** (one parallel tool-use block) — `akb_get(vault="{vault_name}", doc_id={hit.path})` for every hit. Capture `path`, frontmatter `repo` / `pr_number` / `merged_at`, and `title`. Filter to rows whose `repo == repo_name`.
-2. **Outgoing-edge block** (second parallel tool-use block) — `akb_relations(vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{pr.path}", direction="outgoing", type="depends_on")` for each surviving PR. Sequential per-PR fetches are forbidden.
+1. **Hydration block** (one parallel tool-use block) — reuse each browsed document already fetched above (or `akb_get(uri={item.uri})` if not yet hydrated). Capture `uri`, `path`, frontmatter `repo` / `pr_number` / `merged_at`, and `title`. Filter to rows whose `repo == repo_name`.
+2. **Outgoing-edge block** (second parallel tool-use block) — `akb_relations(uri={pr.uri}, direction="outgoing", type="depends_on")` for each surviving PR. Sequential per-PR fetches are forbidden.
 
-For each PR, set `pr.commit_uris` to the outgoing edges and compute `pr.commit_uris ∩ range_commit_uris`. Drop PRs with empty intersection (out of range) and PRs with empty `depends_on` (their commits surface as orphans in the body). Order survivors by `merged_at` ascending into `pr_records` with `doc_id` / `path` / `pr_number` / `title` / `merged_at` / `covered_commit_uris`.
+For each PR, set `pr.commit_uris` to the outgoing edges and compute `pr.commit_uris ∩ range_commit_uris`. Drop PRs with empty intersection (out of range) and PRs with empty `depends_on` (their commits surface as orphans in the body). Order survivors by `merged_at` ascending into `pr_records` with `uri` / `doc_id` / `path` / `pr_number` / `title` / `merged_at` / `covered_commit_uris`.
 
 Compose:
 
 ```
-pr_doc_refs         = [ "akb://{vault_name}/doc/{pr.path}" for pr in pr_records ]   # full URIs, chronological
+pr_doc_refs         = [ pr.uri for pr in pr_records ]   # full URIs, chronological
 covered_commit_uris = ⋃ { pr.covered_commit_uris for pr in pr_records }
 orphan_commit_uris  = range_commit_uris − covered_commit_uris
 ```
@@ -293,7 +285,7 @@ Lists **every** commit in `sha_list` (chronological), regardless of PR membershi
 
 **Create.** `akb_put(vault="{vault_name}", collection="git-releases", title="Release {tag}", type="reference", tags={tags}, content={assembled_body}, summary="{tag} ({len(commit_records)} commits, {len(pr_records)} PRs)", depends_on={release_depends_on})`.
 
-**Update.** `akb_update(vault="{vault_name}", doc_id={existing_doc_id}, title="Release {tag}", tags={tags}, content={assembled_body}, summary="{tag} ({len(commit_records)} commits, {len(pr_records)} PRs)", depends_on={release_depends_on})`.
+**Update.** `akb_update(uri={existing_uri}, title="Release {tag}", tags={tags}, content={assembled_body}, summary="{tag} ({len(commit_records)} commits, {len(pr_records)} PRs)", depends_on={release_depends_on})`.
 
 `depends_on` is passed as a top-level argument so AKB stores it as graph edges. The release-to-PR-and-orphan-commit relationship lives entirely on this edge — no member-side `release` backlink is written. PR-covered commits are reachable transitively via the PR's own `depends_on`. Re-ingest of the same tag rewrites the edge set idempotently. Capture the resulting `release_doc_id` and `release_doc_path`.
 

@@ -56,6 +56,21 @@ describe("VaultCreateDialog", () => {
 
   afterEach(cleanup);
 
+  it("explains pending optional templates and recovers a failed lookup", async () => {
+    const user = userEvent.setup();
+    let reject!: (error: Error) => void;
+    vi.mocked(listVaultTemplates).mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
+    render(<DialogHarness />);
+    await user.click(screen.getByRole("button", { name: "New vault" }));
+    expect(screen.getByText("Loading optional templates; you can still create an empty vault")).toBeInTheDocument();
+    await act(async () => reject(new Error("Templates offline")));
+    expect(screen.queryByText(/Loading optional templates/)).toBeNull();
+    expect(screen.getByText(/Templates unavailable/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Retry templates" }));
+    await waitFor(() => expect(screen.queryByText(/Templates unavailable/)).toBeNull());
+    expect(listVaultTemplates).toHaveBeenCalledTimes(2);
+  });
+
   it("opens with focus in the name field and returns focus when cancelled", async () => {
     const user = userEvent.setup();
     render(<DialogHarness />);

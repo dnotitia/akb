@@ -14,7 +14,7 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { ProfileSection, type User } from "./profile-section";
+import { ProfileSection, type ProfileUserPatch, type User } from "./profile-section";
 import { TokensSection, type PAT } from "./tokens-section";
 import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
@@ -32,6 +32,10 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   const { checking, revision } = useAccessVerification();
   const shellUser = useCurrentUser();
   const readGeneration = useRef(0);
+  const patsGeneration = useRef(0);
+  const usersGeneration = useRef(0);
+  const [patsLoading, setPatsLoading] = useState(false);
+  const [usersLoading, setUsersLoading] = useState(false);
   const [loadedRevision, setLoadedRevision] = useState<number | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [accountError, setAccountError] = useState(false);
@@ -86,15 +90,21 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   }, [dirty, busy]);
   const loadPATs = useCallback(async () => {
     const generation = readGeneration.current;
-    setPatsError(false);
-    try { const data = await listPATs(); if (mounted.current && generation === readGeneration.current) setPats(data.tokens || []); }
-    catch { if (mounted.current && generation === readGeneration.current) setPatsError(true); }
+    const request = ++patsGeneration.current;
+    const current = () => mounted.current && generation === readGeneration.current && request === patsGeneration.current;
+    setPatsLoading(true); setPatsError(false);
+    try { const data = await listPATs(); if (current()) setPats(data.tokens || []); return current(); }
+    catch (error) { if (current()) { setPatsError(true); if ([401, 403].includes((error as { status?: number })?.status ?? 0)) setPats(null); } return false; }
+    finally { if (current()) setPatsLoading(false); }
   }, []);
   const loadUsers = useCallback(async () => {
     const generation = readGeneration.current;
-    setUsersError(false);
-    try { const data = await adminListUsers(); if (mounted.current && generation === readGeneration.current) setUsers(data.users || []); }
-    catch { if (mounted.current && generation === readGeneration.current) setUsersError(true); }
+    const request = ++usersGeneration.current;
+    const current = () => mounted.current && generation === readGeneration.current && request === usersGeneration.current;
+    setUsersLoading(true); setUsersError(false);
+    try { const data = await adminListUsers(); if (current()) setUsers(data.users || []); return current(); }
+    catch (error) { if (current()) { setUsersError(true); if ([401, 403].includes((error as { status?: number })?.status ?? 0)) setUsers(null); } return false; }
+    finally { if (current()) setUsersLoading(false); }
   }, []);
   const userId = user?.user_id;
   useEffect(() => { if (verified && userId && activeTab === "tokens") void loadPATs(); }, [verified, revision, userId, activeTab, loadPATs]);
@@ -130,7 +140,7 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   useDocumentHistoryGuard(dirty || busy, proceed => request({ type: "history", proceed }));
   const localPasswordEnabled = authConfig?.available === true &&
     (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") && authConfig.local_auth.enabled;
-  function updateUser(patch: { display_name?: string | null; email?: string }) {
+  function updateUser(patch: ProfileUserPatch) {
     setUser(current => current ? { ...current, ...patch } : current);
     // Refresh the shared identity without remounting the underlying workspace.
     window.dispatchEvent(new Event("akb:revalidate-access"));
@@ -140,10 +150,15 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
     <Icon className="h-4 w-4 shrink-0" aria-hidden /><span>{label}</span>
   </TabsTrigger>;
 
-  return <Dialog open onOpenChange={open => { if (!open) request({ type: "close" }); }}>
+  // Own actual close gestures explicitly. A native photo picker can move
+  // focus outside Radix before its selected-file/dirty state is observable.
+  return <Dialog open>
     <DialogContent hideClose data-testid="account-settings-dialog"
       className="left-0 top-0 flex h-dvh max-h-dvh w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none p-0 sm:left-1/2 sm:top-1/2 sm:h-[min(47.5rem,calc(100dvh-3rem))] sm:max-h-[calc(100dvh-3rem)] sm:w-[calc(100%-3rem)] sm:max-w-[65rem] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-[var(--radius-xl)]"
       onOpenAutoFocus={event => { event.preventDefault(); heading.current?.focus(); }}
+      onEscapeKeyDown={event => { event.preventDefault(); request({ type: "close" }); }}
+      onPointerDownOutside={event => { event.preventDefault(); request({ type: "close" }); }}
+      onInteractOutside={event => event.preventDefault()}
       onCloseAutoFocus={event => { event.preventDefault(); onRestoreFocus?.(); }}>
       <header className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-5">
         <div className="flex items-center gap-2.5"><Settings className="h-4 w-4 text-foreground-muted" aria-hidden /><DialogTitle ref={heading} tabIndex={-1} className="text-base outline-none">Settings</DialogTitle></div>
@@ -169,17 +184,17 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
               the cleanup of a temporarily hidden Activity. */}
           {user && activeTab === "profile" && <TabsContent value="profile" className="pt-0">{verified && authConfig?.available === false && <Alert variant="warning" className="mb-4">Account editing is temporarily unavailable because authentication settings could not be verified. <Button variant="outline" size="sm" onClick={() => void loadAccount()}>Retry</Button></Alert>}<ProfileSection key={user.user_id} visible={verified} user={user} localPasswordEnabled={localPasswordEnabled} localProfileEditingEnabled={localPasswordEnabled} onDirtyChange={setDirty} onBusyChange={setBusy} onUserUpdate={updateUser} onPasswordChanged={() => completeSessionNavigation(() => navigate("/auth?reason=password-changed", { replace: true }))} /></TabsContent>}
           {user && activeTab === "security" && <TabsContent value="security" className="pt-0"><SecuritySection key={user.user_id} visible={verified} user={user} ownsOperation={ownsOperation} onBusyChange={setBusy} onDirtyChange={setDirty} /></TabsContent>}
-          {user?.is_admin && activeTab === "admin" && <TabsContent value="admin" className="pt-0"><AdminSection key={user.user_id} visible={verified} ownsOperation={ownsOperation} user={user} onDirtyChange={setDirty} onBusyChange={setBusy} users={users} usersError={usersError} localPasswordEnabled={localPasswordEnabled} onReloadUsers={loadUsers} /></TabsContent>}
+          {user?.is_admin && activeTab === "admin" && <TabsContent value="admin" className="pt-0"><AdminSection key={user.user_id} visible={verified} ownsOperation={ownsOperation} user={user} onDirtyChange={setDirty} onBusyChange={setBusy} users={users} usersError={usersError} usersLoading={usersLoading} localPasswordEnabled={localPasswordEnabled} onReloadUsers={loadUsers} /></TabsContent>}
           <Activity mode={verified ? "visible" : "hidden"}><div>{user && <>
             <TabsContent value="preferences" className="pt-0"><PreferencesSection /></TabsContent>
             <TabsContent value="notifications" className="pt-0"><NotificationsSection onBusyChange={reportBusy} /></TabsContent>
-            <TabsContent value="tokens" className="pt-0"><TokensSection key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
+            <TabsContent value="tokens" className="pt-0"><TokensSection key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} patsLoading={patsLoading} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
           </>}</div></Activity>
         </div>
       </Tabs>
       <ConfirmDialog open={verified && pending !== null} onOpenChange={open => { if (!open) setPending(null); }} returnFocusRef={confirmFocus}
         title={activeTab === "tokens" ? "Leave agent connections?" : "Discard unsaved changes?"}
-        description={activeTab === "tokens" ? "Unfinished token setup will be cleared. If you created a token, copy and store its secret first; it cannot be retrieved again. Leaving does not revoke it." : "Your profile or password changes have not been saved. Keep editing, or discard them to continue."}
+        description={activeTab === "tokens" ? "Unfinished token setup will be cleared. If you created a token, copy and store its secret first; it cannot be retrieved again. Leaving does not revoke it." : "Your profile, photo or password changes have not been saved. Keep editing, or discard them to continue."}
         confirmLabel={activeTab === "tokens" ? "Leave section" : "Discard changes"} cancelLabel={activeTab === "tokens" ? "Stay here" : "Keep editing"} variant="destructive"
         onConfirm={() => { if (pending) { setDirty(false); execute(pending); } }} />
     </DialogContent>

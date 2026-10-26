@@ -20,6 +20,7 @@ from app.exceptions import (
     RecoveryAdminProtectedError,
     ServiceIdentityAdoptionError,
     ValidationError,
+    AKBError,
 )
 from app.repositories.events_repo import emit_event
 from app.services.account_markers import (
@@ -167,6 +168,19 @@ async def ensure_human_external_identity(
                     issuer,
                     subject,
                 )
+                try:
+                    actor_uuid = uuid.UUID(actor_id)
+                except (TypeError, ValueError):
+                    actor_uuid = None
+                machine_actor = actor_uuid is not None and await conn.fetchval(
+                    "SELECT account_kind='service' FROM users WHERE id=$1", actor_uuid,
+                )
+                if bound is None and machine_actor and existing_user_uuid is not None:
+                    # Activation, ACL and offboarding of an admitted UUID do
+                    # not require another login binding. Adding a new binding
+                    # to that UUID is an exact, human-granted operation.
+                    raise AKBError("An exact identity operation is required.", 403,
+                                   code="bounded_identity_operation_required")
                 if bound is not None:
                     if is_retired_recovery_admin_password(bound["password_hash"]):
                         raise RecoveryAdminProtectedError()
@@ -244,7 +258,7 @@ async def ensure_human_external_identity(
                         )
                         if len(rows) > 1:
                             raise ExternalIdentityConflictError()
-                        if rows and not adopt_unbound_email:
+                        if rows and (machine_actor or not adopt_unbound_email):
                             raise ExternalIdentityAdoptionNotRequestedError(
                                 str(rows[0]["id"])
                             )

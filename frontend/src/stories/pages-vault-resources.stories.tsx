@@ -93,8 +93,8 @@ export const NewDocumentPrefilledCollection: Story = {
   },
 };
 
-export const SkillRedirectToSettings: Story = {
-  name: "Skill redirect / guide editor in settings",
+export const SkillRedirectToReader: Story = {
+  name: "Skill redirect / guide reader",
   parameters: {
     router: { initialEntries: ["/vault/akb/skill"] },
     msw: {
@@ -108,7 +108,8 @@ export const SkillRedirectToSettings: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { level: 1, name: vaultSkillDoc.title })).toBeInTheDocument();
+    await expect(canvas.getByRole("link", { name: "Edit guide" })).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

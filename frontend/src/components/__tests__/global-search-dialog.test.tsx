@@ -670,4 +670,19 @@ describe("GlobalSearchDialog", () => {
       await screen.findByRole("option", { name: /PostgreSQL tuning/i }),
     ).toBeInTheDocument();
   });
+  it("retains labelled previous results while a source refinement fails and retries", async () => {
+    const actor = userEvent.setup(); renderDialog();
+    await actor.click(screen.getByRole("button", { name: "Search knowledge" }));
+    await actor.type(screen.getByRole("combobox"), "postgres");
+    await screen.findByText("PostgreSQL tuning");
+    searchDocsMock.mockRejectedValueOnce(new Error("Offline"));
+    await actor.click(screen.getByRole("button", { name: /^Tables/ }));
+    expect(screen.getByText("PostgreSQL tuning")).toBeVisible();
+    expect(screen.getByRole("option")).toBeDisabled();
+    await screen.findByText("Search could not be updated; previous results shown");
+    expect(screen.getByText(/Previous results for all content kinds/)).toBeVisible();
+    await actor.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("option")).toBeEnabled());
+  });
+
 });

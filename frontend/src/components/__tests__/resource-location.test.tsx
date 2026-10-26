@@ -73,6 +73,7 @@ describe("Resource location", () => {
     expect(kindIcon?.closest("button, a")).toBeNull();
     expect(within(trail).getByText(`(${kind})`)).toHaveClass("sr-only");
     expect(within(trail).queryByRole("img")).not.toBeInTheDocument();
+    expect(within(trail).queryByRole("button", { name: /Pages in/ })).not.toBeInTheDocument();
   });
 
   it("uses one directory query for shared desktop/mobile ancestry and links to real collection destinations", async () => {
@@ -80,7 +81,7 @@ describe("Resource location", () => {
     const trails = screen.getAllByRole("navigation", { name: "Resource location" });
     await waitFor(() => expect(within(trails[0]).getByRole("link", { name: "Team guides" })).toBeInTheDocument());
     expect(browseVault).toHaveBeenCalledTimes(1);
-    expect(browseVault).toHaveBeenCalledWith("팀 Vault", undefined, -1);
+    expect(browseVault).toHaveBeenCalledWith("팀 Vault", "engineering/platform/guides", 0, { content_type: "collections", page_size: 1 });
     for (const trail of trails) {
       expect(trail.querySelector("ol")).toBeInTheDocument();
       expect(within(trail).getByRole("link", { name: "팀 Vault" })).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
@@ -164,6 +165,9 @@ describe("Resource location", () => {
     expect(screen.getByTestId("published")).toHaveTextContent("Human document name");
     expect(screen.getByRole("navigation", { name: "Resource location" })).toHaveTextContent("Human document name");
     expect(screen.queryByText("Preview title")).not.toBeInTheDocument();
+    const trail = screen.getByRole("navigation", { name: "Resource location" });
+    expect(within(trail).getByRole("link", { name: "팀 Vault" })).toHaveAttribute("href", "/vault/%ED%8C%80%20Vault");
+    expect(within(trail).queryByRole("button", { name: /Pages in/ })).not.toBeInTheDocument();
   });
 
   it("clears resource metadata when navigating to an unresolved or denied resource", async () => {

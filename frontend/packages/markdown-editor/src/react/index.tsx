@@ -11,6 +11,9 @@ import {
 import type { ComponentPropsWithoutRef, DragEventHandler, ReactNode } from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
+import { createPortal } from 'react-dom'
+import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import type { Editor } from '@tiptap/core'
 import {
   Bold,
@@ -660,11 +663,14 @@ function releaseMarkdownResolution(resolution: MarkdownTargetResolution | undefi
   }
 }
 
+/** Presentation widgets are React-owned, not authored Markdown DOM. */
+function markdownContentElements<T extends HTMLElement>(root: HTMLElement, selector: string): T[] {
+  return Array.from(root.querySelectorAll<T>(selector)).filter(element => !element.closest('[data-markdown-leading-adornment]'))
+}
+
 function markdownKeyboardControls(root: HTMLElement): HTMLElement[] {
   return Array.from(
-    root.querySelectorAll<HTMLElement>(
-      'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]',
-    ),
+    markdownContentElements<HTMLElement>(root, 'a[href]:not([aria-disabled="true"]), a[data-markdown-reference-runtime-url][role="link"]:not([aria-disabled="true"]), input[type="checkbox"]:not(:disabled), pre[data-markdown-code][tabindex="0"]'),
   )
 }
 
@@ -738,7 +744,7 @@ export function MarkdownSurface({
     const managed = new Map<HTMLElement, { tagName: string; id: string | null }>()
     const apply = () => {
       const offset = Math.trunc(headings.levelOffset ?? 0)
-      root.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6').forEach((heading, index) => {
+      markdownContentElements<HTMLElement>(root, 'h1, h2, h3, h4, h5, h6').forEach((heading, index) => {
         const original = managed.get(heading) ?? {
           tagName: heading.tagName.toLowerCase(),
           id: heading.getAttribute('id'),
@@ -815,7 +821,7 @@ export function MarkdownSurface({
       }
     >()
     const apply = () => {
-      for (const table of root.querySelectorAll<HTMLTableElement>('table')) {
+      for (const table of markdownContentElements<HTMLTableElement>(root, 'table')) {
         const addedClasses = addedTableClasses.get(table) ?? tableClasses.filter(
           className => !table.classList.contains(className),
         )
@@ -883,29 +889,29 @@ export function MarkdownSurface({
     if (!root || !editor) return
 
     const applyLocaleNames = () => {
-      root.querySelectorAll<HTMLElement>('pre[data-markdown-code]').forEach(code => {
+      markdownContentElements<HTMLElement>(root, 'pre[data-markdown-code]').forEach(code => {
         const language = code.dataset.markdownCodeLanguage || undefined
         setAttributeIfChanged(code, 'aria-label', messages.codeRegion(language))
       })
-      root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(task => {
+      markdownContentElements<HTMLElement>(root, 'li[data-checked]').forEach(task => {
         const checkbox = task.querySelector<HTMLInputElement>('input[type="checkbox"]')
         if (!checkbox) return
         const text = markdownTaskText(task)
         const label = messages.taskCheckbox(text)
         setAttributeIfChanged(checkbox, 'aria-label', label)
       })
-      root.querySelectorAll<HTMLTableElement>('table').forEach(table => {
+      markdownContentElements<HTMLTableElement>(root, 'table').forEach(table => {
         setAttributeIfChanged(
           table,
           'aria-label',
           editable ? messages.table.editableTable : messages.table.readOnlyTable,
         )
       })
-      root.querySelectorAll<HTMLElement>('div[data-markdown-table-wrapper="true"]').forEach(wrapper => {
+      markdownContentElements<HTMLElement>(root, 'div[data-markdown-table-wrapper="true"]').forEach(wrapper => {
         setAttributeIfChanged(wrapper, 'role', 'region')
         setAttributeIfChanged(wrapper, 'aria-label', messages.table.scrollable)
       })
-      root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]').forEach(frame => {
+      markdownContentElements<HTMLElement>(root, '[data-markdown-image-frame]').forEach(frame => {
         const state = frame.dataset.markdownImageState
         if (state === 'available') return
         const image = frame.querySelector<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]')
@@ -918,7 +924,7 @@ export function MarkdownSurface({
         const message = frame.querySelector<HTMLElement>('[data-markdown-image-message]')
         if (message && message.textContent !== label) message.textContent = label
       })
-      root.querySelectorAll<HTMLElement>('[data-markdown-resolution="unavailable"]').forEach(element => {
+      markdownContentElements<HTMLElement>(root, '[data-markdown-resolution="unavailable"]').forEach(element => {
         const target = element.dataset.markdownTarget
         const resolution = target ? resolutions.get(target) : undefined
         if (resolution?.status === 'unavailable' && resolution.label) return
@@ -929,7 +935,7 @@ export function MarkdownSurface({
           setAttributeIfChanged(element, 'aria-label', messages.reference.unavailable)
         }
       })
-      root.querySelectorAll<HTMLElement>('[data-markdown-reference="true"]').forEach(element => {
+      markdownContentElements<HTMLElement>(root, '[data-markdown-reference="true"]').forEach(element => {
         const status = element.dataset.markdownReferenceResolution
         if (status === 'pending') {
           setAttributeIfChanged(element, 'title', messages.reference.resolving)
@@ -962,7 +968,7 @@ export function MarkdownSurface({
     const root = editor?.view.dom
     if (!root) return
 
-    root.querySelectorAll<HTMLImageElement>('img[data-markdown-image], img[data-markdown-target]').forEach(
+    markdownContentElements<HTMLImageElement>(root, 'img[data-markdown-image], img[data-markdown-target]').forEach(
       element => {
         if (image?.referrerPolicy) element.setAttribute('referrerpolicy', image.referrerPolicy)
         else element.removeAttribute('referrerpolicy')
@@ -1109,7 +1115,7 @@ export function MarkdownSurface({
       const managedTargets = new Set(
         extractMarkdownTargets(serializeEditorMarkdown(editor)).map(({ target }) => target),
       )
-      const frames = [...root.querySelectorAll<HTMLElement>('[data-markdown-image-frame]')]
+      const frames = [...markdownContentElements<HTMLElement>(root, '[data-markdown-image-frame]')]
       const framedImages = new Set<HTMLImageElement>()
       for (const frame of frames) {
         const element = frame.querySelector<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]')
@@ -1121,7 +1127,7 @@ export function MarkdownSurface({
         applyImage(frame, element, target, undefined, managedTargets.has(target))
       }
 
-      root.querySelectorAll<HTMLImageElement>('img[data-markdown-target], img[data-markdown-image]').forEach(element => {
+      markdownContentElements<HTMLImageElement>(root, 'img[data-markdown-target], img[data-markdown-image]').forEach(element => {
         if (framedImages.has(element)) return
         const target = element.dataset.markdownTarget
         if (!target) return
@@ -1129,7 +1135,7 @@ export function MarkdownSurface({
         applyImage(element, element, target, undefined, managedTargets.has(target))
       })
 
-      root.querySelectorAll<HTMLElement>('a[href]').forEach(element => {
+      markdownContentElements<HTMLElement>(root, 'a[href]').forEach(element => {
         if (element.dataset.markdownReference === 'true') return
         const target =
           element.dataset.markdownTarget ??
@@ -1200,14 +1206,13 @@ export function MarkdownSurface({
 
     const applyTaskSemantics = () => {
       if (editable) {
-        root
-          .querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])')
+        markdownContentElements<HTMLAnchorElement>(root, 'a[href]:not([aria-disabled="true"])')
           .forEach(link => {
             if (!link.hasAttribute('tabindex')) link.tabIndex = 0
           })
       }
 
-      root.querySelectorAll<HTMLElement>('li[data-checked]').forEach(taskItem => {
+      markdownContentElements<HTMLElement>(root, 'li[data-checked]').forEach(taskItem => {
         const checkbox = taskItem.querySelector<HTMLInputElement>('input[type="checkbox"]')
         if (!checkbox) return
 
@@ -1426,8 +1431,7 @@ export function MarkdownSurface({
     }
 
     const applyReferences = () => {
-      root
-        .querySelectorAll<HTMLElement>('[data-markdown-reference="true"]')
+      markdownContentElements<HTMLElement>(root, '[data-markdown-reference="true"]')
         .forEach(applyReference)
     }
 
@@ -1976,6 +1980,8 @@ export function MarkdownEditor({
 }
 
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
+  /** Read-only presentation after a leading heading, or before a headingless body. Never serialized. */
+  afterLeadingHeading?: ReactNode
   markdown: string
   profile?: MarkdownProfile
   adapters?: MarkdownAdapters
@@ -1985,6 +1991,7 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
 
 export function MarkdownViewer({
   markdown,
+  afterLeadingHeading,
   profile = 'preserve',
   adapters,
   reference,
@@ -2000,6 +2007,33 @@ export function MarkdownViewer({
     slash: false,
   })
   const rawEditor = getMarkdownEditor(editor)
+  const [adornmentHost] = useState(() => {
+    if (typeof document === 'undefined') return null
+    const element = document.createElement('div')
+    element.dataset.markdownLeadingAdornment = 'true'
+    element.setAttribute('contenteditable', 'false')
+    return element
+  })
+  const hasAdornment = afterLeadingHeading != null && afterLeadingHeading !== false
+  useLayoutEffect(() => {
+    if (!rawEditor || !adornmentHost || !hasAdornment) return
+    const key = new PluginKey('markdownViewerLeadingAdornment')
+    rawEditor.registerPlugin(new Plugin({
+      key,
+      props: {
+        decorations(state) {
+          const first = state.doc.firstChild
+          const position = first?.type.name === 'heading' ? first.nodeSize : 0
+          return DecorationSet.create(state.doc, [Decoration.widget(position, adornmentHost, {
+            key: 'leading-adornment', side: -1, ignoreSelection: true,
+            stopEvent: () => true,
+          })])
+        },
+      },
+    }))
+    return () => { rawEditor.unregisterPlugin(key) }
+  }, [rawEditor, adornmentHost, hasAdornment])
+
   const resolutions = useMarkdownTargetResolutions(
     markdown,
     adapters?.targetResolver,
@@ -2028,15 +2062,18 @@ export function MarkdownViewer({
   }, [rawEditor])
 
   return (
-    <MarkdownSurface
-      {...props}
-      editor={editor}
-      editable={false}
-      resolutions={resolutions}
-      resolvingTargets={Boolean(adapters?.targetResolver)}
-      referenceResolutions={referenceResolutions}
-      resolvingReferences={Boolean(referenceAdapter?.resolve)}
-    />
+    <>
+      <MarkdownSurface
+        {...props}
+        editor={editor}
+        editable={false}
+        resolutions={resolutions}
+        resolvingTargets={Boolean(adapters?.targetResolver)}
+        referenceResolutions={referenceResolutions}
+        resolvingReferences={Boolean(referenceAdapter?.resolve)}
+      />
+      {hasAdornment && adornmentHost && createPortal(afterLeadingHeading, adornmentHost)}
+    </>
   )
 }
 

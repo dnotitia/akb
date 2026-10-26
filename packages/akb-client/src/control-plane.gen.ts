@@ -87,6 +87,7 @@ export interface LegacyAdoptionCreateRequest {
 export interface LegacyAdoptionTargetProjection {
   target_id: ControlPlaneUuid;
   vault_id: ControlPlaneUuid;
+  vault_deleted?: boolean;
   table_allowlist: string[];
   included_tables?: string[];
   excluded_tables?: string[];

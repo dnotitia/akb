@@ -60,15 +60,27 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 const openFilters = async (user: ReturnType<typeof userEvent.setup>) =>
-  user.click(screen.getByRole("button", { name: "More filters" }));
+  user.click(screen.getByRole("button", { name: "Filters" }));
+const closeFilters = async (user: ReturnType<typeof userEvent.setup>) =>
+  user.click(screen.getByRole("button", { name: "Done" }));
+
+async function selectMethod(user: ReturnType<typeof userEvent.setup>, method: "By meaning" | "Exact text") {
+  await user.click(screen.getByRole("button", { name: "Search method" }));
+  await user.click(screen.getByRole("menuitemradio", { name: new RegExp(`^${method}`) }));
+}
+
+async function selectType(user: ReturnType<typeof userEvent.setup>, type: string) {
+  await user.click(screen.getByRole("button", { name: "Result type" }));
+  await user.click(screen.getByRole("menuitemradio", { name: type }));
+}
 
 describe("server search filters", () => {
-  it("removes a visible filter without opening the tray or losing query and Vault scope", async () => {
+  it("removes a visible filter without opening the dialog or losing query and Vault scope", async () => {
     search.mockResolvedValue(response([hit("Guide")]));
     renderAt("/search?q=x&v=eng&collection=guides&doc_type=report");
     const user = userEvent.setup();
     await screen.findByText("Guide");
-    expect(screen.queryByRole("complementary", { name: "Search filters" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Search filters" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Remove filter Collection: guides" }));
     await waitFor(() => expect(search.mock.calls.at(-1)?.[3]?.collection).toBeUndefined());
     expect(search.mock.calls.at(-1)?.slice(0, 3)).toEqual(["x", ["eng"], 25]);
@@ -76,6 +88,18 @@ describe("server search filters", () => {
     await user.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(screen.getByTestId("url")).not.toHaveTextContent("doc_type"));
     expect(screen.getByTestId("url")).toHaveTextContent("v=eng");
+  });
+
+  it("keeps keyboard focus on active filters and returns to Filters after the last removal", async () => {
+    renderAt("/search?q=x&collection=guides&tag=ops");
+    const user = userEvent.setup();
+    const tagChip = screen.getByRole("button", { name: "Remove filter Tag: ops" });
+    await user.click(screen.getByRole("button", { name: "Remove filter Collection: guides" }));
+    expect(tagChip).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("button", { name: "Remove filter Tag: ops" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Filters" })).toHaveFocus();
+    expect(screen.getByTestId("url")).toHaveTextContent("q=x");
   });
 
   it("requests archived documents on the server, displays status, and preserves scope across modes and Back", async () => {
@@ -89,16 +113,18 @@ describe("server search filters", () => {
     await openFilters(user);
     await user.click(screen.getByLabelText("Document state"));
     await user.click(screen.getByRole("menuitemradio", { name: "Archived documents" }));
+    await closeFilters(user);
     await screen.findByText("Old guide");
     expect(screen.getByText("Archived")).toBeInTheDocument();
     expect(search).toHaveBeenLastCalledWith("x", [], 25, expect.objectContaining({ archive_scope: "archived", source_type: "document" }));
     expect(screen.getByTestId("url")).toHaveTextContent("archive_scope=archived");
-    await user.click(screen.getByRole("button", { name: "Literal", pressed: false }));
+    await selectMethod(user, "Exact text");
     await screen.findByText("Old literal guide");
     expect(screen.getByText("Archived")).toBeInTheDocument();
     expect(grep).toHaveBeenLastCalledWith("x", [], 20, expect.objectContaining({ archive_scope: "archived" }));
     await user.click(screen.getByRole("button", { name: "Back" }));
     await screen.findByText("Old guide");
+    await openFilters(user);
     expect(screen.getByLabelText("Document state")).toHaveTextContent("Archived documents");
   });
 
@@ -120,13 +146,38 @@ describe("server search filters", () => {
     expect(screen.queryByText("Current guide")).not.toBeInTheDocument();
   });
 
-  it("keeps filters available before results and after a zero-match response", async () => {
-    renderAt();
+  it.each(["/search", "/search?q=x"])(
+    "keeps every filter available with or without query results (%s)",
+    async (url) => {
+      renderAt(url);
+      const user = userEvent.setup();
+      if (url.includes("?q=")) await screen.findByRole("heading", { name: /No results/ });
+      expect(screen.getByRole("button", { name: "Result type" })).toBeEnabled();
+      await openFilters(user);
+      expect(screen.getByRole("button", { name: "Toggle report" })).toBeEnabled();
+      expect(screen.getByLabelText("Tags (match any)")).toBeEnabled();
+      expect(screen.getByLabelText("Collection path (including children)")).toBeEnabled();
+      expect(screen.getByLabelText("Document state")).toBeEnabled();
+      await closeFilters(user);
+      expect(screen.getByRole("button", { name: "Result type" })).toBeEnabled();
+    },
+  );
+
+  it("uses one filter dialog with complete refinements and predictable keyboard focus", async () => {
+    renderAt("/search");
     const user = userEvent.setup();
-    await openFilters(user);
-    expect(screen.getByRole("button", { name: "Toggle report" })).toBeEnabled();
+    const trigger = screen.getByRole("button", { name: "Filters" });
+    await user.click(trigger);
+    expect(screen.getByRole("dialog", { name: "Search filters" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Search filters" })).toHaveFocus();
+    expect(screen.getByLabelText("Collection path (including children)")).toBeEnabled();
     expect(screen.getByLabelText("Tags (match any)")).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Tables" })).toBeEnabled();
+    expect(screen.getByLabelText("Document state")).toBeEnabled();
+    expect(screen.getAllByRole("button", { name: /^Toggle / })).toHaveLength(9);
+    expect(search).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
   });
 
   it("finds a matching document outside the initial 25 results by re-searching on the server", async () => {
@@ -143,6 +194,7 @@ describe("server search filters", () => {
     await screen.findByText("Initial 0");
     await openFilters(user);
     await user.click(screen.getByRole("button", { name: "Toggle report" }));
+    await closeFilters(user);
     await screen.findByText("Previously outside top 25");
     expect(screen.queryByText("Initial 0")).not.toBeInTheDocument();
     expect(search).toHaveBeenLastCalledWith(
@@ -157,6 +209,7 @@ describe("server search filters", () => {
     expect(screen.getByTestId("url")).toHaveTextContent("doc_type=report");
     await user.click(screen.getByRole("button", { name: "Back" }));
     await screen.findByText("Initial 0");
+    await openFilters(user);
     expect(
       screen.getByRole("button", { name: "Toggle report" }),
     ).toHaveAttribute("aria-pressed", "false");
@@ -165,8 +218,7 @@ describe("server search filters", () => {
   it("sends resource type, collection, tags and archive filters rather than slicing results", async () => {
     renderAt();
     const user = userEvent.setup();
-    await openFilters(user);
-    await user.click(screen.getByRole("button", { name: "Tables" }));
+    await selectType(user, "Tables");
     await waitFor(() =>
       expect(search).toHaveBeenLastCalledWith(
         "x",
@@ -175,6 +227,7 @@ describe("server search filters", () => {
         expect.objectContaining({ source_type: "table" }),
       ),
     );
+    await openFilters(user);
     await user.type(
       screen.getByLabelText("Collection path (including children)"),
       "guides/api",
@@ -221,9 +274,7 @@ describe("server search filters", () => {
     );
     const user = userEvent.setup();
     await waitFor(() => expect(search).toHaveBeenCalled());
-    await user.click(
-      screen.getByRole("button", { name: "Literal", pressed: false }),
-    );
+    await selectMethod(user, "Exact text");
     await waitFor(() =>
       expect(grep).toHaveBeenLastCalledWith(
         "API",

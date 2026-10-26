@@ -132,11 +132,17 @@
   --font-sans: "Pretendard Variable", "Pretendard", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
   --font-display: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
+  --text-ui: .8125rem;
+  --text-ui--line-height: 1.25rem;
 
   /* Reader spacing is distinct from its optional prose measure. Dialog edges
      follow the viewport; body gutters follow the actual reading container. */
   --spacing-document-preview-edge: clamp(1rem, 2vw, 3rem);
   --spacing-document-reading-gutter: clamp(1rem, 2cqi, 2rem);
+  --spacing-document-command-row: 3rem;
+  --spacing-document-command-touch-row: 4rem;
+  --spacing-document-command-inset: 1.25rem;
+  --spacing-vault-box-depth: 1rem;
 
   /* ── Radius — soft, rounded family look (12px controls, 14px cards,
      16px modals/hero — mirrors seahorse/akb-platform) ─────────────── */
@@ -179,6 +185,9 @@
   --duration-fast: 120ms;
   --duration-base: 220ms;
   --duration-slow: 420ms;
+  --duration-title-reveal-wait: 600ms;
+  --duration-title-reveal-min: 1800ms;
+  --motion-title-reveal-speed: 28;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in: cubic-bezier(0.4, 0, 1, 1);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
@@ -491,6 +500,33 @@ h1, h2, h3, h4, h5, h6 {
   background: var(--color-primary);
 }
 
+/* Search refinement keeps the query and result copy readable while controls
+   use the workspace's denser rhythm on desktop. Touch and narrow layouts
+   retain the 44px targets declared by the search components. */
+@media (min-width: 640px) and (pointer: fine) {
+  .search-query-entry {
+    min-height: 2.75rem;
+    padding-block: 0;
+  }
+  .search-query-control,
+  .search-compact-control,
+  .search-filter-tags input {
+    min-height: 2.25rem;
+    height: 2.25rem;
+  }
+  .search-compact-icon {
+    width: 2.25rem;
+  }
+  .search-scope-option,
+  .search-compact-menu [role="menuitemradio"] {
+    min-height: 2.25rem;
+  }
+  .search-filter-panel > button {
+    width: 2.25rem;
+    height: 2.25rem;
+  }
+}
+
 /* Home knowledge ledger: cards and change rows share one restrained teal
    interaction rail. It appears only on hover/focus and uses transform-only
    motion, so the dense dashboard keeps stable geometry. */
@@ -632,6 +668,99 @@ body::before {
 .feat-eyebrow-neutral   { color: var(--color-foreground-muted); }
 
 /* ── Motion ──────────────────────────────────────────────────────── */
+/* Inspect an overflowing title once; icons, metadata and row boxes stay put. */
+/* Three shallow faces extend the Vault's Box glyph into a usable container.
+   Only decorative faces skew; text and the full native-link target stay flat. */
+.vault-box::before,
+.vault-box::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  border: 1px solid var(--color-border-strong);
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+.vault-box::before {
+  left: var(--spacing-vault-box-depth);
+  right: 0;
+  top: 0;
+  height: var(--spacing-vault-box-depth);
+  transform: skewX(-45deg);
+  transform-origin: left top;
+  border-bottom: 0;
+  border-radius: var(--radius-xs) var(--radius-xs) 0 0;
+  background: var(--color-workspace-section);
+}
+.vault-box::after {
+  right: 0;
+  top: var(--spacing-vault-box-depth);
+  bottom: 0;
+  width: var(--spacing-vault-box-depth);
+  transform: skewY(-45deg);
+  transform-origin: left top;
+  border-left: 0;
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
+  background: var(--color-surface-2);
+}
+.vault-box-link,
+.vault-box-loading {
+  position: relative;
+  isolation: isolate;
+  padding-top: calc(var(--spacing-vault-box-depth) + .75rem);
+  padding-right: calc(var(--spacing-vault-box-depth) + .75rem);
+}
+.vault-box-link::before,
+.vault-box-loading > .vault-box-front {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  z-index: -1;
+  top: var(--spacing-vault-box-depth);
+  right: var(--spacing-vault-box-depth);
+  bottom: 0;
+  left: 0;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xs);
+  background: var(--color-surface);
+  transition: border-color var(--duration-fast) var(--ease-out), background var(--duration-fast) var(--ease-out);
+}
+.vault-box:has(.vault-box-link):is(:hover, :focus-within)::before,
+.vault-box:has(.vault-box-link):is(:hover, :focus-within)::after,
+.vault-box:is(:hover, :focus-within) .vault-box-link::before {
+  border-color: var(--color-link);
+}
+.vault-box:hover .vault-box-link::before {
+  background: var(--color-surface-hover);
+}
+
+/* Collection index sheets use a quiet folded corner, distinct from Vault boxes. */
+.collection-sheet::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  top: -1px;
+  right: -1px;
+  width: .875rem;
+  height: .875rem;
+  border-bottom-left-radius: var(--radius-xs);
+  background: linear-gradient(45deg, var(--color-surface-2) 46%, var(--color-border-strong) 49%, var(--color-background) 52%);
+}
+
+.overflow-reveal-title { display: block; min-width: 0; overflow: hidden; }
+.overflow-reveal-title-text { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.overflow-reveal-title:is([data-reveal="waiting"], [data-reveal="running"]) .overflow-reveal-title-text {
+  animation: akb-title-reveal max(var(--duration-title-reveal-min), calc(var(--title-reveal-travel) / var(--motion-title-reveal-speed) * 1s)) linear var(--duration-title-reveal-wait) 1 forwards;
+}
+.overflow-reveal-title:is([data-reveal="running"], [data-reveal="settled"]) .overflow-reveal-title-text {
+  width: max-content;
+  overflow: visible;
+  text-overflow: clip;
+}
+.overflow-reveal-title[data-reveal="settled"] .overflow-reveal-title-text { transform: translateX(var(--title-reveal-distance)); }
+@keyframes akb-title-reveal { from { transform: translateX(0); } to { transform: translateX(var(--title-reveal-distance)); } }
+@media (prefers-reduced-motion: reduce), (hover: none), (pointer: coarse) {
+  .overflow-reveal-title .overflow-reveal-title-text { animation: none; transform: none; width: auto; overflow: hidden; text-overflow: ellipsis; }
+}
+
 @keyframes akb-in {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: none; }
@@ -847,66 +976,106 @@ body::before {
    Keep prose, code blocks and ordinary tables aligned on one scannable measure.
    Long code and wide tables scroll inside their own bounds; only media may use
    the wider workspace independently of the reading measure. */
+/* Compact administration workspaces keep one scale for forms and ledgers.
+   Pointer controls may be smaller; touch controls retain their full targets. */
+.workspace-density-compact :is(button, .workspace-control) { min-height: 2.75rem; }
+.workspace-density-compact .workspace-icon-control { min-width: 2.75rem; }
+.workspace-density-compact input:not([type="radio"]):not([type="checkbox"]) { min-height: 2.75rem; font-size: 1rem; }
+@media (min-width: 40rem) and (pointer: fine) {
+  .workspace-density-compact :is(button, .workspace-control) { height: 2rem; min-height: 2rem; }
+  .workspace-density-compact .workspace-icon-control { width: 2rem; min-width: 2rem; padding-inline: 0; }
+  .workspace-density-compact input:not([type="radio"]):not([type="checkbox"]) { height: 2rem; min-height: 2rem; padding-block: .25rem; font-size: var(--text-ui); line-height: var(--text-ui--line-height); }
+}
+
 /* Reader commands use the available workspace width, not the viewport. Keep
    modes/actions on one metric even when the navigation rails are expanded. */
-.document-command-inner { --reader-control-size: 2.75rem; }
-.document-unified-toolbar .document-command-inner { padding-block: .5rem; }
-.document-unified-toolbar [data-slot="resource-command-meta"] { flex-wrap: nowrap; }
-.document-unified-toolbar [data-slot="resource-command-actions"] { flex-shrink: 0; }
-.document-command-inner [data-reader-control] {
-  height: var(--reader-control-size);
-  min-height: var(--reader-control-size);
-  border-radius: var(--radius-sm);
-  font-size: .875rem;
-  line-height: 1.25rem;
-  font-weight: 500;
-  gap: .375rem;
+.document-command-inner { --reader-control-size: 2.75rem; --reader-icon-size: 1rem; }
+[data-reader-control][hidden] { display: none; }
+.document-command-inner [data-reader-control] { height: var(--reader-control-size); min-height: var(--reader-control-size); border-radius: var(--radius-sm); font-size: .875rem; line-height: 1.25rem; font-weight: 500; gap: .375rem; }
+.document-command-inner [data-reader-icon], .document-command-inner [data-reader-navigation] { width: var(--reader-control-size); min-width: var(--reader-control-size); padding-inline: 0; }
+.document-unified-toolbar .document-command-inner { display: grid; min-height: calc(var(--spacing-document-command-row) - 1px); grid-template-columns: minmax(0, 1fr) auto; gap: .5rem; padding: .375rem var(--spacing-document-command-inset); }
+/* Include the common bottom hairline in the row metric, so adjacent panes
+   meet exactly instead of adding a border below an independent min-height. */
+[data-navigation-mode]:has(.document-unified-toolbar) [data-slot="collection-management-row"] { height: var(--spacing-document-command-row); }
+.document-unified-toolbar [data-slot="resource-command-meta"] { display: contents; }
+.document-unified-toolbar [data-slot="resource-command-actions"] { flex-wrap: nowrap; gap: .25rem; grid-column: 2; }
+.document-reader-controls { display: flex; align-items: center; gap: .375rem; }
+.document-reader-status { display: flex; min-width: 0; align-items: center; column-gap: .75rem; row-gap: .25rem; }
+.document-reader-status time { font-size: .75rem; line-height: 1rem; }
+.document-command-inner [data-reader-icon] > svg { width: var(--reader-icon-size); height: var(--reader-icon-size); }
+.document-edit-toolbar .document-command-inner { grid-template-columns: minmax(0,1fr) auto; }
+.document-edit-toolbar [data-slot="resource-command-actions"] { grid-column: 2; }
+.document-read-modes { position: relative; display: inline-flex; isolation: isolate; align-items: center; gap: .125rem; padding: .125rem; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); }
+.document-read-modes::before { content: ""; position: absolute; z-index: -1; left: .125rem; top: .125rem; width: var(--reader-control-size, 2.75rem); height: var(--reader-control-size, 2.75rem); border: 1px solid var(--color-link); border-radius: var(--radius-sm); background: transparent; transition: transform var(--duration-base) var(--ease-out); }
+.document-read-modes[data-mode="raw"]::before { transform: translateX(calc(var(--reader-control-size, 2.75rem) + .125rem)); }
+.document-read-modes [role="radio"] { position: relative; width: var(--reader-control-size, 2.75rem); height: var(--reader-control-size, 2.75rem); padding: 0; background: transparent; color: var(--color-foreground-muted); }
+.document-read-modes [role="radio"][aria-checked="true"] { color: var(--color-link); }
+.document-read-modes [role="radio"]:hover { color: var(--color-link); background: transparent; }
+.document-read-modes [role="radio"]:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--color-ring); }
+.document-reader-menu-item { display: flex; cursor: pointer; user-select: none; align-items: flex-start; gap: .5rem; border-radius: var(--radius-sm); padding: .5rem .625rem; font-size: .875rem; outline: none; }
+.document-reader-menu-item[data-highlighted] { background: var(--color-surface-hover); }
+.document-reader-menu-item > svg { flex-shrink: 0; margin-top: .125rem; color: var(--color-foreground-muted); }
+.document-reader-menu-item[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+.document-copy-labelled { min-height: 2.75rem; }
+.document-details-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; background: var(--color-surface); color: var(--color-foreground); }
+.document-details-docked { width: 19rem; flex-shrink: 0; border-left: 1px solid var(--color-border); }
+.document-details-overlay { position: fixed; inset-block: 0; right: 0; z-index: var(--z-modal); width: calc(100% - 2rem); max-width: 24rem; border-left: 1px solid var(--color-border); box-shadow: var(--shadow-lg); }
+.document-panel-heading { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: .75rem; min-height: 3.5rem; padding: .375rem .75rem .375rem 1.25rem; border-bottom: 1px solid var(--color-border); }
+.document-panel-heading h2 { font-size: .875rem; font-weight: 600; }
+.document-panel-heading > button { width: 2.75rem; height: 2.75rem; }
+.document-panel-scroll { min-height: 0; flex: 1; overflow-y: auto; padding: 1.25rem; }
+.document-panel-outline { padding-bottom: 1.25rem; }
+.document-panel-outline > h3 { margin-bottom: .75rem; font-size: .75rem; font-weight: 500; color: var(--color-foreground-muted); }
+.document-panel-sections > details { border-top: 1px solid var(--color-border); }
+.document-panel-sections summary { display: flex; cursor: pointer; align-items: center; justify-content: space-between; gap: .75rem; min-height: 3rem; list-style: none; font-size: .8125rem; font-weight: 500; }
+.document-panel-sections summary::-webkit-details-marker { display: none; }
+.document-panel-sections summary:focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; border-radius: var(--radius-sm); }
+.document-panel-sections summary svg { color: var(--color-foreground-muted); transition: transform var(--duration-fast) var(--ease-out); }
+.document-panel-sections details[open] > summary svg { transform: rotate(180deg); }
+.document-panel-section-body { padding-bottom: 1.25rem; }
+@media (pointer: fine) {
+  /* Inline Vault navigation reserves at least 41rem for its working pane.
+     Use that same boundary for compact pointer tools and aligned row heights. */
+  @container resource-commands (min-width: 41rem) { .document-command-inner { --reader-control-size: 1.75rem; --reader-icon-size: .875rem; } .document-command-inner [data-reader-navigation] { width: auto; padding-inline: .625rem; } }
 }
-.document-command-inner [data-reader-icon],
-.document-command-inner [data-reader-navigation] {
-  width: var(--reader-control-size);
-  min-width: var(--reader-control-size);
-  padding-inline: 0;
+@media (pointer: coarse) {
+  .document-unified-toolbar .document-command-inner { min-height: calc(var(--spacing-document-command-touch-row) - 1px); }
+  [data-navigation-mode]:has(.document-unified-toolbar) [data-slot="collection-management-row"] { height: var(--spacing-document-command-touch-row); }
 }
-/* A successful publish changes the label, not the reader's height. Measure
-   both labels with the current font; preview-header controls remain unchanged. */
-.document-publication-reserve { display: none; }
-.document-command-inner .document-publication-label { display: inline-grid; }
-.document-command-inner .document-publication-label > span { grid-area: 1 / 1; }
-.document-command-inner .document-publication-reserve { display: block; visibility: hidden; }
-.document-command-group {
-  display: inline-flex;
-  flex-shrink: 0;
-  align-items: center;
-  gap: .25rem;
+@container resource-commands (max-width: 39.999rem) {
+  .document-unified-toolbar:not(.document-edit-toolbar) .document-command-inner { grid-template-columns: minmax(0, 1fr) auto; gap: .25rem .5rem; }
+  .document-unified-toolbar:not(.document-edit-toolbar) [data-slot="resource-command-actions"] { grid-column: 1 / -1; grid-row: 1; }
+  .document-reader-status { grid-column: 1 / -1; grid-row: 2; min-height: 1.5rem; }
+  .document-reader-status:empty { display: none; }
 }
-.document-command-divider {
-  position: relative;
-  padding-left: .5rem;
+/* Copy remains available in the actions menu. Reserve the narrowest reader
+   row for its modes, editing, details and the menu without shrinking targets. */
+@container resource-commands (max-width: 20rem) {
+  .document-unified-toolbar:not(.document-edit-toolbar) .document-copy-button { display: none; }
+  .document-unified-toolbar:not(.document-edit-toolbar) [data-slot="resource-command-actions"] { flex-wrap: wrap; justify-content: flex-start; }
 }
-.document-command-divider::before {
-  content: "";
-  position: absolute;
-  inset-block: .5rem;
-  left: 0;
-  width: 1px;
-  background: var(--color-border);
-}
-@container resource-commands (min-width: 32rem) {
-  .document-command-inner [data-reader-navigation] { width: auto; padding-inline: .625rem; }
-}
-@container resource-commands (min-width: 48rem) {
-  .document-command-inner { --reader-control-size: 2rem; }
-  .document-unified-toolbar .document-command-inner { flex-wrap: nowrap; }
-}
-@container resource-commands (max-width: 47.999rem) {
-  .document-unified-toolbar [data-slot="resource-command-meta"] { flex-basis: 100%; min-height: 1.25rem; }
-  .document-unified-toolbar [data-slot="resource-command-actions"] { width: 100%; justify-content: flex-start; row-gap: .5rem; }
-}
-@container resource-commands (max-width: 32rem) {
-  .document-command-inner [data-slot="resource-command-actions"] { gap: .25rem; }
-  .document-read-modes [role="tab"] { padding-inline: .5rem; }
-  .document-command-inner [data-publication-trigger] > svg { display: none; }
+@media (prefers-reduced-motion: reduce) { .document-read-modes::before, .document-panel-sections summary svg { transition: none; } }
+
+/* Presentation-only metadata uses the same measure as the intact Markdown. */
+.document-reading-flow .ProseMirror > [data-markdown-leading-adornment] { width: 100%; max-width: var(--document-reading-measure); margin: 0 auto 1.25rem; }
+.document-reading-flow .ProseMirror > :is(h1,h2,h3,h4,h5,h6) + [data-markdown-leading-adornment] { margin-top: 0; }
+.document-summary-line { --summary-edge-clearance: 28px; display: flex; align-items: center; gap: .5rem; min-width: 0; min-height: 2.75rem; font-family: var(--font-sans); }
+.document-summary-viewport { flex: 1; min-width: 0; overflow: hidden; border-radius: var(--radius-sm); }
+.document-summary-line .document-summary-text { display: block; width: max-content; min-width: 100%; max-width: none; margin: 0; color: var(--color-foreground-muted); font-size: .8125rem; line-height: 1.6; font-weight: 400; letter-spacing: -.01em; white-space: nowrap; }
+.document-summary-line[data-overflow="true"] .document-summary-viewport { mask-image: linear-gradient(to right, black calc(100% - var(--summary-edge-clearance)), transparent); }
+.document-summary-line[data-overflow="true"] .document-summary-text { animation: document-summary-flow var(--summary-duration) linear 2s infinite alternate; }
+.document-summary-line:is(:hover,:focus-within) .document-summary-text,
+.document-summary-line[data-paused="true"] .document-summary-text { animation-play-state: paused; }
+.document-summary-motion { flex-shrink: 0; width: 2.75rem; height: 2.75rem; padding: 0; color: var(--color-foreground-muted); }
+.document-summary-motion:is(:hover,:focus-visible) { color: var(--color-link); }
+.document-summary-viewport:focus-visible { overflow-x: auto; mask-image: none !important; outline: 2px solid var(--color-ring); outline-offset: 2px; }
+.document-summary-viewport:focus-visible .document-summary-text { animation: none !important; }
+@keyframes document-summary-flow { 0%,12% { transform: translateX(0); } 88%,100% { transform: translateX(var(--summary-distance)); } }
+@container (min-width: 48rem) { .document-summary-line { min-height: 1.75rem; } .document-summary-motion { width: 1.75rem; height: 1.75rem; } }
+@media (prefers-reduced-motion: reduce) {
+  .document-summary-line .document-summary-text { animation: none !important; width: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .document-summary-viewport { mask-image: none !important; }
+  .document-summary-motion { display: none; }
 }
 
 .document-preview-surface {
@@ -927,26 +1096,35 @@ body::before {
 
 .document-reading-inset {
   padding-inline: var(--spacing-document-reading-gutter);
-  padding-block: 1.25rem;
+  padding-block: 1rem;
 }
 
 .document-reading-flow,
 .document-reading-source {
-  --document-reading-measure: 64rem;
+  --document-reading-measure: 52rem;
 }
 
 .document-reading-flow {
   font-size: 1rem;
   line-height: 1.65;
 }
-.document-reading-flow.document-reading-wide,
-.document-reading-source.document-reading-wide { --document-reading-measure: none; }
 
 .document-reading-source {
   width: 100%;
   max-width: var(--document-reading-measure);
   margin-inline: auto;
 }
+.document-reading-flow .ProseMirror > :is(h1,h2,h3,h4,h5,h6) {
+  font-family: var(--font-sans);
+  font-weight: 550;
+  line-height: 1.4;
+  letter-spacing: -.015em;
+  margin-block: 1.5rem .5rem;
+}
+.document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.375rem; }
+@media (max-width: 40rem) { .document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.25rem; } }
+.document-reading-flow .ProseMirror > h3 { font-size: 1.125rem; }
+.document-reading-flow .ProseMirror > :is(h4,h5,h6) { font-size: 1rem; }
 .document-reading-flow .ProseMirror { min-width: 0; }
 /* Nested blocks stay within their parent; top-level blocks share the measure. */
 .document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
@@ -958,7 +1136,8 @@ body::before {
   margin-inline: auto;
 }
 .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
-.document-reading-flow .ProseMirror > p:has(img) { max-width: none; }
+/* Image frames live inside paragraphs: keep that paragraph on the same
+   reading measure as prose, including loading and unavailable placeholders. */
 .document-reading-flow .ProseMirror img { max-width: 100%; height: auto; }
 .document-reading-flow .ProseMirror table {
   display: table;

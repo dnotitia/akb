@@ -1829,6 +1829,9 @@ class DocumentService:
         include_hashes: bool = False,
         include_archived: bool = False,
         archive_scope: ArchiveScope | None = None,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        name_query: str | None = None,
     ) -> BrowseResponse:
         """Unified vault browse.
 
@@ -1853,6 +1856,16 @@ class DocumentService:
         are the ones gated by depth.
         """
         from app.services.search_filters import resolve_archive_scope, status_matches
+
+        if page_size is not None or cursor is not None or name_query is not None or content_type in ("collections", "resources"):
+            from app.services.browse_pages import browse_page
+
+            return await browse_page(
+                self, await get_pool(), vault, native=False, collection=collection, depth=depth,
+                content_type=content_type, include_hashes=include_hashes,
+                include_archived=include_archived, archive_scope=archive_scope,
+                page_size=page_size if page_size is not None else 100, cursor=cursor, name_query=name_query,
+            )
 
         scope = resolve_archive_scope(archive_scope, include_archived)
         include_archived = scope != "unarchived"

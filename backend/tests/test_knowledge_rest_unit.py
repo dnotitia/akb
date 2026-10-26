@@ -104,25 +104,9 @@ def test_overview_and_health_keep_existing_nested_shape(client, monkeypatch):
 
 
 def test_provenance_keeps_flat_payload_and_explicit_null(client, monkeypatch):
-    class _Conn:
-        async def fetchrow(self, *_args):
-            return {"vault_id": uuid.uuid4(), "doc_pk": uuid.uuid4()}
-
-    class _Acquire:
-        async def __aenter__(self):
-            return _Conn()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _Pool:
-        def acquire(self):
-            return _Acquire()
-
-    async def _pool():
-        return _Pool()
-
-    async def _provenance(*_args, **_kwargs):
+    async def _provenance(ref, *, vault_id):
+        assert ref == "specs/a.md"
+        assert isinstance(vault_id, uuid.UUID)
         return {
             "doc_id": "doc-id",
             "title": "A",
@@ -136,10 +120,31 @@ def test_provenance_keeps_flat_payload_and_explicit_null(client, monkeypatch):
             "relations": [],
         }
 
-    monkeypatch.setattr(knowledge, "get_pool", _pool)
     monkeypatch.setattr(knowledge, "get_provenance", _provenance)
     body = client.get("/api/v1/provenance", params={"uri": URI}).json()
     assert body["kind"] == "provenance"
     assert "provenance" not in body
     assert body["created_by"] is None
     assert body["current_commit"] is None
+
+
+def test_provenance_authorizes_before_catalog_resolution(client, monkeypatch):
+    from fastapi import HTTPException
+
+    async def denied(*_args, **_kwargs):
+        raise HTTPException(403, "No reader access")
+
+    async def unexpected(*_args, **_kwargs):
+        pytest.fail("unauthorized caller must not reach the document catalog")
+
+    monkeypatch.setattr(knowledge, "check_vault_access", denied)
+    monkeypatch.setattr(knowledge, "get_provenance", unexpected)
+    assert client.get("/api/v1/provenance", params={"uri": URI}).status_code == 403
+
+
+def test_provenance_maps_missing_catalog_entry_to_404(client, monkeypatch):
+    async def missing(*_args, **_kwargs):
+        return {"error": "Document not found", "code": "not_found"}
+
+    monkeypatch.setattr(knowledge, "get_provenance", missing)
+    assert client.get("/api/v1/provenance", params={"uri": URI}).status_code == 404

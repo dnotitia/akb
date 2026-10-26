@@ -1,5 +1,11 @@
 import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { extendTailwindMerge } from "tailwind-merge";
+
+// Register the UI text scale so it overrides a primitive's font size while
+// preserving independent foreground colors and responsive variants.
+const twMerge = extendTailwindMerge({
+  extend: { classGroups: { "font-size": [{ text: ["ui"] }] } },
+});
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));

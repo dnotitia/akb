@@ -142,13 +142,47 @@ describe("Home cardless workspace summary", () => {
     await act(async () => resolve(sample));
     expect(screen.queryByText("8,001")).not.toBeInTheDocument();
   });
-  it("never retains previous private totals after refresh fails", async () => {
+  it("retains verified totals after a transient refresh failure and retries without blanking", async () => {
     const { tree, client } = setup();
     render(tree());
     await screen.findByText("8,001");
     vi.mocked(getWorkspaceSummary).mockRejectedValue(new Error("Offline"));
     await act(async () => { await client.invalidateQueries({ queryKey: ["workspace-summary"] }); });
+    expect(await screen.findByText("Totals could not be updated; previous totals shown.")).toBeInTheDocument();
+    expect(screen.getByText("8,001")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Workspace summary" })).toHaveAttribute("aria-busy", "false");
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({ ...sample, document_count: 8_002 });
+    act(() => screen.getByRole("button", { name: "Retry totals" }).click());
+    expect(await screen.findByText("8,002")).toBeInTheDocument();
+  });
+  it("clears cached totals after explicit access denial", async () => {
+    const { tree, client } = setup(); render(tree());
+    await screen.findByText("8,001");
+    vi.mocked(getWorkspaceSummary).mockRejectedValue(new WorkspaceSummaryAccessDenied());
+    await act(async () => { await client.invalidateQueries({ queryKey: ["workspace-summary"] }); });
     expect(await screen.findByText("Totals unavailable")).toBeInTheDocument();
     expect(screen.queryByText("8,001")).not.toBeInTheDocument();
+    expect(screen.queryByText("20")).not.toBeInTheDocument();
   });
+  it("keeps denied totals hidden through a later outage and remount until fresh authorized success", async () => {
+    const { tree, client } = setup(); const view = render(tree());
+    await screen.findByText("8,001");
+    vi.mocked(getWorkspaceSummary).mockRejectedValue(new WorkspaceSummaryAccessDenied());
+    await act(async () => { await client.invalidateQueries({ queryKey: ["workspace-summary"] }); });
+    expect(await screen.findByText("Totals unavailable")).toBeVisible();
+    vi.mocked(getWorkspaceSummary).mockRejectedValue(new Error("Offline"));
+    act(() => screen.getByRole("button", { name: "Retry totals" }).click());
+    await waitFor(() => expect(client.getQueryState(["workspace-summary", "user-a", "0"])?.error?.message).toBe("Offline"));
+    expect(screen.queryByText("8,001")).not.toBeInTheDocument();
+    expect(screen.queryByText("20")).not.toBeInTheDocument();
+    view.unmount(); render(tree());
+    await screen.findByText("Totals unavailable");
+    expect(screen.queryByText("8,001")).not.toBeInTheDocument();
+    expect(screen.queryByText("20")).not.toBeInTheDocument();
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({ ...sample, document_count: 7 });
+    act(() => screen.getByRole("button", { name: "Retry totals" }).click());
+    expect(await screen.findByText("7")).toBeVisible();
+    expect(screen.getByText("20")).toBeVisible();
+  });
+
 });

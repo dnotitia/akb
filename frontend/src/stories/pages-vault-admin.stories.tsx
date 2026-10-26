@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, within } from "storybook/test";
 import { delay, http, HttpResponse } from "msw";
 import {
   API,
@@ -243,14 +243,12 @@ export const VaultSettingsOwner: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await userEvent.click(await canvas.findByRole("tab", { name: "Advanced" }));
+    await expect(await canvas.findByRole("heading", { name: "Settings", level: 2 })).toBeInTheDocument();
+    await expect(await canvas.findByLabelText("Description")).toHaveValue(ownerInfo.description);
     await expect(await canvas.findByRole("heading", { name: "Danger zone" })).toBeVisible();
-    // Active vault + write role → the guide is editable here.
-    await userEvent.click(canvas.getByRole("tab", { name: "Vault guide" }));
-    await expect(
-      await canvas.findByRole("button", { name: /reset to template/i }),
-    ).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: "Open guide" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("button", { name: "Edit guide" })).toBeInTheDocument();
+    await expect(canvas.queryByRole("tablist")).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -270,7 +268,7 @@ export const VaultSettingsReadOnly: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText(/only the vault owner can change them/i)).toBeInTheDocument();
+    await expect(await canvas.findByText(/only the vault owner can change settings/i)).toBeInTheDocument();
     await expect(canvas.queryByText("Danger zone")).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -292,19 +290,11 @@ export const VaultSettingsArchived: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("tab", { name: "Advanced" }));
     await expect(await canvas.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
-    await expect(await canvas.findByText("The vault is read-only. Members and agents can still retrieve its knowledge.")).toBeVisible();
+    await expect(await canvas.findByText("Read-only. Restore writing at any time.")).toBeVisible();
     await expect(canvas.queryByRole("complementary", { name: "Vault details" })).not.toBeInTheDocument();
-    // Owner, but the vault is server-side read-only: the guide section renders
-    // its read surfaces (await one so the negatives below aren't just "not
-    // loaded yet") without the Edit tab or Reset button.
-    await userEvent.click(canvas.getByRole("tab", { name: "Vault guide" }));
-    await expect(await canvas.findByRole("tab", { name: /agent view/i })).toBeInTheDocument();
-    await expect(canvas.queryByRole("tab", { name: /^edit$/i })).not.toBeInTheDocument();
-    await expect(
-      canvas.queryByRole("button", { name: /reset to template/i }),
-    ).not.toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: "Open guide" })).toBeInTheDocument();
+    await expect(canvas.queryByRole("button", { name: "Edit guide" })).not.toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };

@@ -1070,3 +1070,13 @@ def test_event_tail_openapi_contract_is_authenticated_typed_sse():
         "payload",
     ]
     assert schemas["TailCheckpointV1"]["required"] == ["version", "cursor"]
+
+
+def test_browse_pagination_receipt_is_published_for_sdk_consumers():
+    schema = app.openapi()
+    envelope = schema["components"]["schemas"]["AkbDocumentEnvelope"]
+    for field, kind in (("scanned", "integer"), ("complete", "boolean"), ("next_cursor", "string")):
+        assert envelope["properties"][field] == {"anyOf": [{"type": kind}, {"type": "null"}]}
+        assert field not in envelope["required"]  # legacy responses remain valid
+    browse = schema["paths"]["/api/v1/browse/{vault}"]["get"]
+    assert {"page_size", "cursor", "content_type", "name_query"} <= {p["name"] for p in browse["parameters"]}

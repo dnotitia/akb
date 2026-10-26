@@ -6,6 +6,7 @@ import {
   listVaultTemplates,
   type VaultTemplateSummary,
 } from "@/lib/api";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -38,19 +39,24 @@ export function VaultCreateForm({
   const [accessibleConflict, setAccessibleConflict] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [templates, setTemplates] = useState<VaultTemplateSummary[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templatesError, setTemplatesError] = useState("");
+  const [templatesAttempt, setTemplatesAttempt] = useState(0);
   const [selectedTemplate, setSelectedTemplate] = useState("");
   const nameRef = useRef<HTMLInputElement>(null);
   const conflictCheckGeneration = useRef(0);
   const nameValid = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name.trim());
 
   useEffect(() => {
+    let active = true;
     listVaultTemplates()
-      .then(setTemplates)
+      .then((items) => { if (active) setTemplates(items); })
       .catch((cause) => {
-        console.warn("Failed to load vault templates; falling back to none-only.", cause);
-        setTemplates([]);
-      });
-  }, []);
+        if (active) setTemplatesError(cause instanceof Error ? cause.message : "Templates could not be loaded.");
+      })
+      .finally(() => { if (active) setTemplatesLoading(false); });
+    return () => { active = false; };
+  }, [templatesAttempt]);
 
   useEffect(
     () => () => {
@@ -191,6 +197,13 @@ export function VaultCreateForm({
             })),
           ]}
         />
+        {templatesLoading && <InlineLoadingState label="Loading optional templates; you can still create an empty vault" />}
+        {templatesError && <Alert variant="warning">
+          <p>Templates unavailable. You can still create an empty vault.</p>
+          <p className="mt-1 text-xs">{templatesError}</p>
+          <Button type="button" variant="outline" size="sm" className="mt-2" loading={templatesLoading}
+            onClick={() => { setTemplatesError(""); setTemplatesLoading(true); setTemplatesAttempt(value => value + 1); }}>Retry templates</Button>
+        </Alert>}
         {selectedSummary && (
           <div className="coord">
             {selectedSummary.description}

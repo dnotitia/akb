@@ -10,6 +10,7 @@ import {
 } from "@/lib/markdown-adapters";
 import { parseHeadings, stripFrontmatter } from "@/lib/markdown";
 import { cn } from "@/lib/utils";
+import { DocumentSummary } from "@/components/document-summary";
 
 export type AssetContext =
   | {
@@ -32,13 +33,21 @@ const AKB_MARKDOWN_VIEWER_TABLE_LAYOUT = {
 export interface MarkdownRenderProps {
   markdown: string;
   className?: string;
+  /** Read-only document metadata; never part of Markdown or its anchor sequence. */
+  summary?: string | null;
   assetContext?: AssetContext;
+  /** Embedded readers need unique anchors and headings below their section. */
+  headingIdPrefix?: string;
+  headingLevelOffset?: number;
 }
 
 export function MarkdownRender({
   markdown,
   className,
+  summary,
   assetContext,
+  headingIdPrefix = "",
+  headingLevelOffset = 1,
 }: MarkdownRenderProps) {
   const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
   const authenticated =
@@ -69,16 +78,17 @@ export function MarkdownRender({
   const resolver = publicationResolver ?? adapters?.targetResolver;
   const headingOptions = useMemo(
     () => ({
-      levelOffset: 1,
-      ids: parseHeadings(body).map((heading) => heading.slug),
+      levelOffset: headingLevelOffset,
+      ids: parseHeadings(body).map((heading) => `${headingIdPrefix}${heading.slug}`),
     }),
-    [body],
+    [body, headingIdPrefix, headingLevelOffset],
   );
 
   return (
     <MarkdownLocaleProvider locale="en">
       <MarkdownViewer
         markdown={body}
+        afterLeadingHeading={summary?.trim() ? <DocumentSummary key={summary} summary={summary} /> : undefined}
         className={cn(
           "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
           className,

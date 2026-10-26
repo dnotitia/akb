@@ -53,6 +53,31 @@ _SERVICE_ACCOUNT_CLAIMS = frozenset({"client_id", "clientId", "clientHost", "cli
 _HUMAN_PROFILE_CLAIMS = frozenset({"email", "email_verified", "name"})
 _JWKS_REFRESH_COOLDOWN_SECONDS = 30.0
 _BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
+MAX_BROWSER_PROVIDER_CHOICES = 128
+
+
+def browser_login_provider_aliases(selected_alias: str, value: object) -> tuple[str, ...]:
+    """Validate a server-owned browser selection snapshot, never a token grant.
+
+    A direct provider remains pinned. The workspace entry may offer its native
+    realm and enabled brokers, but must retain the native choice. Legacy states
+    without this field are handled separately and remain exactly pinned.
+    """
+    if (
+        not isinstance(value, list)
+        or not 1 <= len(value) <= MAX_BROWSER_PROVIDER_CHOICES
+        or any(not isinstance(alias, str) for alias in value)
+    ):
+        raise AuthenticationError("Invalid browser provider selection")
+    try:
+        aliases = tuple(validate_alias(alias) for alias in value)
+    except ProviderDefinitionError:
+        raise AuthenticationError("Invalid browser provider selection") from None
+    if list(aliases) != value or len(set(aliases)) != len(aliases) or selected_alias not in aliases:
+        raise AuthenticationError("Invalid browser provider selection")
+    if not local_realm.is_local_alias(selected_alias) and aliases != (selected_alias,):
+        raise AuthenticationError("Invalid browser provider selection")
+    return aliases
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +241,8 @@ class KeycloakOIDC:
         redirect_path: str,
         *,
         provider_alias: str,
+        allowed_provider_aliases: list[str] | None = None,
+        login_challenge_id: str | None = None,
     ) -> BrowserAuthorizationRequest:
         """Build the ordinary AKB browser's nonce+PKCE authorization request.
 
@@ -230,7 +257,7 @@ class KeycloakOIDC:
         browser_binding = secrets.token_urlsafe(32)
         from app.services.sso_browser_session_service import next_browser_login_sequence
         login_sequence = await next_browser_login_sequence()
-        payload: dict[str, str] = {
+        payload: dict[str, object] = {
             "redirect_path": redirect_path,
             "provider_alias": provider_alias,
             "client_id": selected_client_id,
@@ -239,6 +266,12 @@ class KeycloakOIDC:
             "browser_binding_hash": hashlib.sha256(browser_binding.encode("ascii")).hexdigest(),
             "login_sequence": str(login_sequence),
         }
+        if login_challenge_id is not None:
+            payload["login_challenge_id"] = login_challenge_id
+        if allowed_provider_aliases is not None:
+            payload["allowed_provider_aliases"] = list(
+                browser_login_provider_aliases(provider_alias, allowed_provider_aliases)
+            )
         params: dict[str, str] = {
             "client_id": selected_client_id,
             "redirect_uri": settings.keycloak_browser_redirect_uri,
