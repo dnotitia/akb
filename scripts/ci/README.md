@@ -311,7 +311,11 @@ npm --prefix packages/akb-mcp-client run --silent inspect -- \
 ```
 
 CI, Docker builders, and the Ubuntu bootstrap use Node.js `22.23.4`, matching
-`frontend/package.json`. The supported package runtime floors follow the
+`frontend/package.json`. The published `akb-mcp` CLI also checks the runtime
+before loading the proxy or connecting, and exits with an upgrade message on
+unsupported Node versions. npm may still install it with an engine warning
+under its default configuration; installation success does not bypass this
+runtime check. The supported package runtime floors follow the
 [October 2026 Node.js security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases).
 
 The smoke uses security-patched Node.js (`^22.23.4 || ^24.22.1 || ^26.12.1`) and the exact-pinned

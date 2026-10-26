@@ -1,3 +1,4 @@
+import { nodeVersionMeetsFloor } from "../lib/node-runtime.mjs";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -8,7 +9,6 @@ import {
   INSPECTOR_VERSION,
   PACKAGE_ROOT,
   inspectInstallation,
-  nodeVersionMeetsFloor,
   parseArguments,
   runSmoke,
 } from "../scripts/mcp-inspector-smoke.mjs";

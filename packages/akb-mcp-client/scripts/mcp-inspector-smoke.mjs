@@ -8,6 +8,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 
+import { requireSupportedNode } from "../lib/node-runtime.mjs";
+
 export const INSPECTOR_VERSION = "2.4.0";
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const SERVER_NAME = "akb";
@@ -35,12 +37,6 @@ function string(value, label) {
   return value;
 }
 
-export function nodeVersionMeetsFloor(value) {
-  if (!/^v?\d+\.\d+\.\d+$/.test(String(value))) return false;
-  const [major, minor, patch] = String(value).replace(/^v/, "").split(".").map(Number);
-  const floor = { 22: [23, 4], 24: [22, 1], 26: [12, 1] }[major];
-  return Boolean(floor && (minor > floor[0] || (minor === floor[0] && patch >= floor[1])));
-}
 
 function originUrl(value, label) {
   let url;
@@ -81,7 +77,7 @@ export function parseArguments(argv) {
 }
 
 export async function inspectInstallation({ packageRoot = PACKAGE_ROOT, nodeVersion = process.versions.node } = {}) {
-  if (!nodeVersionMeetsFloor(nodeVersion)) error(`Security-patched Node.js ^22.23.4 || ^24.22.1 || ^26.12.1 is required`);
+  requireSupportedNode(nodeVersion);
   const inspectorRoot = resolve(packageRoot, "node_modules/@modelcontextprotocol/inspector");
   let manifest;
   try {
