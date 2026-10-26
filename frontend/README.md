@@ -27,19 +27,15 @@ Two write surfaces live in the SPA — both reuse the same lazy-loaded
   asks for title, collection (lowercase path, `engineering/specs`-style),
   optional type/domain/tags/summary, and a body in markdown. New
   collections are created on the fly by the backend.
-- **Edit body** — `EDIT` tab on the document page (writers and above,
-  hidden in historical view). The editor reclaims the full outlet width
-  while open (right rail hides). Saves go through
-  `PATCH /documents/:vault/:id` with only the `content` field; metadata
-  is preserved by the backend's frontmatter merge logic. Use the
-  `Edit details` button in the right rail for title/type/tags/etc.
+- **Edit document** — the document editing workspace combines title, details
+  (including type/tags) and Markdown body. Saves send only changed fields to
+  `PATCH /documents/:vault/:id`, together with `expected_commit` for optimistic
+  concurrency. A missing or stale revision must be resolved before saving.
 
-Both flows guard against accidental data loss:
-
-- `beforeunload` warning while the editor is dirty.
-- Confirmation when switching tabs from `EDIT` with unsaved changes.
-- `EDIT*` star marker + a `UNSAVED CHANGES` line while dirty.
-- Cancel resets the editor to the last server state.
+The editor warns about unsaved changes when leaving and supports recoverable
+local drafts. Draft recovery keeps incompatible or expired text available for
+copying; an expired image attachment is not guaranteed to remain recoverable.
+Cancel/discard is confirmed before losing unsaved work.
 
 Link URLs in user-authored markdown pass through `sanitizeLinkUrl()`
 on both the editor and the rendered view — `javascript:`, `data:`,
@@ -57,15 +53,14 @@ recoverable drafts do not promise a longer attachment lifetime than the configur
 ```
 src/
   pages/                       route components
-    document.tsx               read + edit body (Rendered / Raw / Agent / Edit)
+    document.tsx               document reading, unified editing and revision diff
     document-new.tsx           create page with form + shared Markdown body
     vault.tsx                  vault home; `+ NEW DOC` entry point
     ...
   components/
     markdown-editor.tsx        shared Tiptap editor wrapper (lazy chunk)
     markdown-editor-fallback.tsx  Suspense placeholder (main bundle)
-    document-view.tsx          Rendered/Raw/Agent + WAI-ARIA tab strip
-    frontmatter-edit-dialog.tsx  metadata + optional body edit
+    document-view.tsx          document rendering and reading controls
     ui/tag-input.tsx           shared tag chip input
     ui/...
   lib/

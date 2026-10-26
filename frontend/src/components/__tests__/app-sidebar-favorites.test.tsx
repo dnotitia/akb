@@ -1,7 +1,7 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AppSidebar } from "@/components/app-sidebar";
 import { listVaults } from "@/lib/api";
@@ -14,9 +14,10 @@ vi.mock("@/lib/api", () => ({ listVaults: vi.fn() }));
 const key = "akb-vault-favorites:v2:sidebar-test";
 const vaults = Array.from({ length: 7 }, (_, index) => ({ id: `id-${index}`, name: `vault-${index}`, role: "writer" }));
 
+function Location() { return <output aria-label="Sidebar route">{useLocation().pathname}</output>; }
 function mount(compact = false, path = "/vault/vault-0/settings") {
   return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-    <MemoryRouter initialEntries={[path]}><AppSidebar compact={compact} /></MemoryRouter>
+    <MemoryRouter initialEntries={[path]}><AppSidebar compact={compact} /><Location /></MemoryRouter>
   </QueryClientProvider>);
 }
 beforeEach(() => {
@@ -94,6 +95,43 @@ describe("Workspace favorite navigation", () => {
     mount(true);
     expect(screen.queryByRole("navigation", { name: "Favorite vaults" })).not.toBeInTheDocument();
     expect(within(screen.getByRole("navigation", { name: "Workspace navigation" })).getAllByRole("link").map(link => link.textContent || link.getAttribute("aria-label"))).toEqual(["Home", "Search", "Vaults"]);
+  });
+
+  it.each([false, true])("navigates to the directory through a native Vaults link (compact=%s)", async compact => {
+    mount(compact);
+    const navigation = screen.getByRole("navigation", { name: "Workspace navigation" });
+    const link = within(navigation).getByRole("link", { name: "Vaults" });
+    expect(link).toHaveAttribute("href", "/vault");
+    expect(link).not.toHaveAttribute("aria-haspopup");
+    expect(link).not.toHaveAttribute("aria-expanded");
+    expect(link).not.toHaveAttribute("data-vault-switcher-trigger");
+    expect(within(navigation).queryByRole("button", { name: "Vaults" })).not.toBeInTheDocument();
+    if (compact) {
+      expect(link).toHaveTextContent("");
+      expect(within(navigation).getByRole("link", { name: "Home" })).toHaveTextContent("");
+      expect(within(navigation).getByRole("link", { name: "Search" })).toHaveTextContent("");
+    } else expect(link).toHaveTextContent("Vaults");
+    const user = userEvent.setup();
+    await user.click(link);
+    expect(screen.getByLabelText("Sidebar route")).toHaveTextContent(/^\/vault$/);
+    expect(screen.queryByRole("dialog", { name: "Vaults" })).not.toBeInTheDocument();
+  });
+
+  it.each([{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { button: 1 }])("preserves native modified Vault directory links: %j", modifiers => {
+    mount(true);
+    const link = within(screen.getByRole("navigation", { name: "Workspace navigation" })).getByRole("link", { name: "Vaults" });
+    fireEvent.click(link, modifiers);
+    expect(link).toHaveAttribute("href", "/vault");
+    expect(screen.getByLabelText("Sidebar route")).toHaveTextContent("/vault/vault-0/settings");
+    expect(screen.queryByRole("dialog", { name: "Vaults" })).not.toBeInTheDocument();
+  });
+
+  it("returns Escape to the same favorite options trigger", async () => {
+    mount(); const user = userEvent.setup();
+    const trigger = await screen.findByRole("button", { name: "Options for vault-1" });
+    await user.click(trigger);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it("removes a favorite through the menu and restores focus", async () => {

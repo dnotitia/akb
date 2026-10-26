@@ -1,5 +1,6 @@
+import { ApiError } from "@/lib/api";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render as renderBase, screen, waitFor, cleanup, fireEvent, within } from "@testing-library/react";
+import { act, render as renderBase, screen, waitFor, cleanup, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { GraphDetailPanel } from "../GraphDetailPanel";
@@ -12,7 +13,8 @@ function render(ui: React.ReactNode) {
 const getDocument = vi.fn();
 const getRelations = vi.fn();
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
   getDocument: (...args: unknown[]) => getDocument(...args),
   getRelations: (...args: unknown[]) => getRelations(...args),
 }));
@@ -178,8 +180,10 @@ describe("GraphDetailPanel relations", () => {
     getRelations.mockResolvedValue({ uri: "akb://akb/file/f-new", relations: [relation({ name: "Current connection" })] });
     panel.rerender(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} kind="file" docId="f-new" uri="akb://akb/file/f-new" name="Current file" /></QueryClientProvider>);
     expect(await screen.findByRole("button", { name: "Current connection" })).toBeTruthy();
-    resolveOld({ uri: baseProps.uri, relations: [relation({ name: "Old connection" })] });
-    await waitFor(() => expect(client.getQueryState(["relations", "panel-test", 0, "akb", baseProps.uri])?.status).toBe("success"));
+    await act(async () => resolveOld({ uri: baseProps.uri, relations: [relation({ name: "Old connection" })] }));
+    // Reading the query signal cancels the detached observer; a late response
+    // must not populate its cache or overwrite the currently selected node.
+    expect(client.getQueryData(["relations", "panel-test", 0, "akb", baseProps.uri])).toBeUndefined();
     expect(screen.queryByRole("button", { name: "Old connection" })).toBeNull();
     expect(screen.getByRole("heading", { name: "Current file" })).toBeTruthy();
   });
@@ -240,4 +244,32 @@ describe("GraphDetailPanel secondary controls and focus", () => {
     expect(screen.getByText(baseProps.uri)).toBeTruthy();
     expect(screen.queryByText("URI copied")).toBeNull();
   });
+});
+
+it("retains connections after a failed background refresh", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  getRelations.mockResolvedValueOnce({ relations: [relation()] }).mockRejectedValue(new Error("Offline"));
+  render(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} /></QueryClientProvider>);
+  await screen.findByRole("button", { name: "Related document" });
+  await client.refetchQueries({ queryKey: ["relations"] });
+  expect(await screen.findByText("Couldn't load connections.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Related document" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Retry connections" })).toBeEnabled();
+});
+
+it("keeps denied connections hidden through a transient retry and restores only a fresh success", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  getRelations.mockResolvedValue({ relations: [relation()] });
+  render(<QueryClientProvider client={client}><GraphDetailPanel {...baseProps} /></QueryClientProvider>);
+  await screen.findByRole("button", { name: "Related document" });
+  getRelations.mockRejectedValue(new ApiError("Denied", 403, {}));
+  await client.refetchQueries({ queryKey: ["relations"] });
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Related document" })).not.toBeInTheDocument());
+  getRelations.mockRejectedValue(new ApiError("Offline", 503, {}));
+  await client.refetchQueries({ queryKey: ["relations"] });
+  await screen.findByText("Offline");
+  expect(screen.queryByRole("button", { name: "Related document" })).not.toBeInTheDocument();
+  getRelations.mockResolvedValue({ relations: [relation({ name: "Fresh connection" })] });
+  await client.refetchQueries({ queryKey: ["relations"] });
+  expect(await screen.findByRole("button", { name: "Fresh connection" })).toBeInTheDocument();
 });

@@ -376,3 +376,41 @@ async def test_migration_requires_the_exact_active_external_human(
         )
 
     assert captured.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("issuer", "subject"),
+    [
+        ("https://another-workspace.example.com/realms/akb", "old-subject"),
+        (_OLD_ISSUER, "another-subject"),
+        (_OLD_ISSUER + "/", "old-subject"),
+    ],
+)
+async def test_migration_does_not_infer_the_old_binding_from_account_or_email(
+    migration_store, issuer, subject,
+):
+    pool, events, service = migration_store
+    user_id, token_id, vault_id = await _seed_continuity_state(pool)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE external_identities SET issuer=$2, subject=$3 WHERE user_id=$1",
+            user_id, issuer, subject,
+        )
+
+    with pytest.raises(service.IdentityMigrationError) as captured:
+        await service.apply_identity_migration(
+            existing_user_id=str(user_id),
+            old_issuer=_OLD_ISSUER,
+            old_subject="old-subject",
+            new_issuer=_NEW_ISSUER,
+            new_subject="new-subject",
+            actor_id="product-admin",
+        )
+
+    assert captured.value.code == "identity_migration_old_binding_missing"
+    assert events == []
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT COUNT(*) FROM external_identities WHERE user_id=$1", user_id) == 1
+        assert await conn.fetchval("SELECT user_id FROM tokens WHERE id=$1", token_id) == user_id
+        assert await conn.fetchval("SELECT owner_id FROM vaults WHERE id=$1", vault_id) == user_id
+        assert await conn.fetchval("SELECT role FROM vault_access WHERE user_id=$1 AND vault_id=$2", user_id, vault_id) == "writer"

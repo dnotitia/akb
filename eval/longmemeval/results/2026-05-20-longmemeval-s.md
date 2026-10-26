@@ -70,7 +70,15 @@ latency is ~1.0s with rerank on vs ~0.5s off — the second hop.)
 Takeaway: **when the first-stage retriever is already near-ceiling, a
 cross-encoder reranker has little upside and real downside.**
 
-## Reproduce
+## Historical reproduction recipe
+
+This records the May 2026 experiment at backend `b54184a`. The commands below
+are archival, not an installation procedure for the current checkout: the old
+HS256 configuration cannot start the current backend. The recipe does not pin
+all dependencies or external model revisions, so it does not promise exact
+reproduction today. For current runtime preparation and smoke checks, follow
+[the benchmark guide](../README.md#setup-and-smoke-test).
+
 
 ```bash
 cd eval/longmemeval

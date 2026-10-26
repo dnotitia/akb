@@ -42,6 +42,17 @@ describe("Workspace personal sections", () => {
     expect(screen.queryByRole("link", { name: "Pinned document" })).not.toBeInTheDocument();
   });
 
+  it("supports a current-Vault pin section without mixing other personal lists", async () => {
+    recordRecentDocumentView("me", { vault: "team", path: "recent.md", title: "Recent only" });
+    toggleWorkspaceShortcut("me", { kind: "document", vault: "team", path: "pin.md", title: "Team pin" });
+    toggleWorkspaceShortcut("me", { kind: "document", vault: "other", path: "pin.md", title: "Other Vault pin" });
+    render(<MemoryRouter><WorkspacePersonalSections userId="me" vaults={vaults} sections={["pinned"]} /></MemoryRouter>);
+    expect(screen.queryByText("Recently viewed", { selector: "summary" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("Pinned", { selector: "summary" }));
+    expect(screen.getByRole("link", { name: "Team pin" })).toBeVisible();
+    expect(screen.queryByRole("link", { name: "Other Vault pin" })).not.toBeInTheDocument();
+  });
+
   it("links a recoverable new draft to the composer and updates live", async () => {
     mount();
     act(() => { saveDocumentDraft({ userId: "me", vault: "team", collection: "guides", title: "Unpublished work", body: "Draft body", type: "note", domain: "", summary: "", tags: [], assetIds: [] }); });

@@ -7,6 +7,9 @@ tools: Read, Glob, WebFetch, Bash(curl *), Bash(rm *), mcp__akb__akb_search, mcp
 
 # AKB Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Ingest **one document** (local path or URL) into the target AKB vault as a five-section summary page, optionally preserving the original bytes in AKB's raw file layer. This skill is the `akb-wiki` plugin's ingest write path.
 
 **Workflow classification.** LLM-wiki **Ingest** workflow. **Intent-debt** layer — it externalizes documents of record (papers, articles, manuals, transcripts, web clips) into the vault so the rationale and constraints in those sources stay retrievable by humans and agents.
@@ -108,11 +111,11 @@ Compute `new_hash = sha256(extracted_text)` once up front — used as both the p
 
 Build a `lookup_key`: canonical URL (strip tracking params like `utm_*`, `ref`, `fbclid`) for URL sources, `new_hash` for path sources. Query `akb_search(vault="{vault_name}", query={lookup_key}, collection="corpus-summaries", type="reference", limit=5)`.
 
-For each hit, `akb_get(vault="{vault_name}", doc_id={hit.doc_id})` and inspect the `## Source` block. Match on either a `Location:` line containing the canonical URL **or** a `Content-SHA256:` line matching `new_hash` (only present when a plaintext path was previously ingested). On match, set `dedup_hit = doc_id`, parse `existing_hash` from the existing doc's `Content-SHA256:` (may be absent if the prior ingest had no raw upload), set `dedup_kind = "deterministic"`, and skip Stage 2.
+For each hit, `akb_get(uri={hit.uri})` and inspect the `## Source` block. Match on either a `Location:` line containing the canonical URL **or** a `Content-SHA256:` line matching `new_hash` (only present when a plaintext path was previously ingested). On match, set `dedup_hit = hit.uri` and `dedup_uri = hit.uri`, parse `existing_hash` from the existing doc's `Content-SHA256:` (may be absent if the prior ingest had no raw upload), set `dedup_kind = "deterministic"`, and skip Stage 2.
 
 #### Stage 2 — Semantic fallback
 
-Runs only when Stage 1 produced no hit. Produce a provisional title (URL `<title>` tag, PDF metadata, markdown `# heading`, or filename stem — whichever is available). Query `akb_search(vault="{vault_name}", query={provisional_title}, collection="corpus-summaries", type="reference", limit=5)`. Any hit with `score > 0.85` counts as fuzzy: set `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`. The hit is a **candidate**, not a confirmed identity match.
+Runs only when Stage 1 produced no hit. Produce a provisional title (URL `<title>` tag, PDF metadata, markdown `# heading`, or filename stem — whichever is available). Query `akb_search(vault="{vault_name}", query={provisional_title}, collection="corpus-summaries", type="reference", limit=5)`. Read plausible hits by their returned URI and compare the source identity and content. A semantically similar document without confirmed source identity counts as fuzzy: set `dedup_hit = top_hit.uri`, `dedup_uri = top_hit.uri`, `dedup_kind = "fuzzy"`. The hit is a **candidate**, not a confirmed identity match.
 
 #### Decision
 
@@ -127,7 +130,7 @@ Edge cases (forced create on a fuzzy false-positive, forced replace despite hash
 
 ### Step 5 — Upload raw (when applicable)
 
-Skip when `raw_upload == false`. Otherwise: `akb_put_file(vault="{vault_name}", file_path={local_file_path}, collection="corpus-raw", description={provisional_title})`. Capture `file_id` from the response; compose `Raw URI = akb://{vault_name}/file/{file_id}`. If `local_file_path` was a temp file (URL download), delete it after the upload succeeds: `Bash(rm -f {local_file_path})`.
+Skip when `raw_upload == false`. Otherwise: `akb_put_file(vault="{vault_name}", file_path={local_file_path}, collection="corpus-raw", description={provisional_title})`. Capture `file_id` and the returned canonical `file_uri` from the response. If `local_file_path` was a temp file (URL download), delete it after the upload succeeds: `Bash(rm -f {local_file_path})`.
 
 ### Step 6 — Compose and write summary
 
@@ -157,7 +160,7 @@ Compose the summary document body using the fixed five-section structure. The **
 ## Source
 
 - Location: {source URL or absolute path}
-- Raw: akb://{vault_name}/file/{file_id}     ← omit this line entirely when `raw_upload == false`
+- Raw: {file_uri}     ← omit this line entirely when `raw_upload == false`
 - Format: {format (pdf, html, md, …)}
 - Content-SHA256: {hash of extracted_text, for future dedup}
 - Ingested: {today}
@@ -197,16 +200,16 @@ Branch by Step 4 decision.
 
 **Replace** (deterministic hit with hash differing / absent):
 
-1. `akb_get(vault="{vault_name}", doc_id={dedup_hit}) → existing_content`.
+1. `akb_get(uri={dedup_uri}) → existing_content`.
 2. Apply timeline merge **Mode B** with `new_entry = "- **{today}** | Re-ingested from {source}. [Source: ingest-doc, {today}]"` and `existing_content` as-is.
 3. Build the final `content`: everything from the newly composed body **above** the `---` + `## Timeline` line, then the merged timeline from Mode B. This replaces the compiled-truth zone (TL;DR / Key Points / Content / Source) while preserving all historical timeline entries.
-4. `akb_update(vault="{vault_name}", doc_id={dedup_hit}, content={merged_content}, message="Re-ingested from {source}")`.
+4. `akb_update(uri={dedup_uri}, content={merged_content}, message="Re-ingested from {source}")`.
 
 #### Link raw to doc
 
-When `raw_upload == true` and a doc was created or replaced, materialize the lineage edge: `akb_link(vault="{vault_name}", source="akb://{vault_name}/doc/{doc_path}", target="akb://{vault_name}/file/{file_id}", relation="derived_from")`.
+When `raw_upload == true` and a doc was created or replaced, materialize the lineage edge: `akb_link(vault="{vault_name}", source={doc_uri}, target={file_uri}, relation="derived_from")`.
 
-On the `replace` path, first check `akb_relations(vault="{vault_name}", resource_uri="akb://{vault_name}/doc/{doc_path}", type="derived_from", direction="outgoing")` — the raw `file_id` may have changed or the prior ingest may have used `--no-raw`. Skip `akb_link` idempotently when the edge to the new `file_id` already exists. If a `derived_from` edge points to a *different* `file/{id}`, the prior raw is orphaned — do not delete it (other docs may reference it); leave it and emit a warning in the output.
+On the `replace` path, first check `akb_relations(uri={doc_uri}, type="derived_from", direction="outgoing")` — the raw `file_id` may have changed or the prior ingest may have used `--no-raw`. Skip `akb_link` idempotently when the edge to the new `file_id` already exists. If a `derived_from` edge points to a *different* `file/{id}`, the prior raw is orphaned — do not delete it (other docs may reference it); leave it and emit a warning in the output.
 
 ### Step 7 — Report
 

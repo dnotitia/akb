@@ -35,11 +35,9 @@ function DocumentRouteProbe() {
   return <output data-testid="document-route" hidden>{location.pathname}{location.search}</output>;
 }
 
-// The canonical guide doc (overview/vault-skill.md) no longer renders in the
-// document viewer — it redirects to the vault-settings guide editor — so the
-// viewer stories read a regular document instead.
+// Regular-document fixtures exercise the shared reader independently of guide editing.
 export const DocumentRawTab: Story = {
-  name: "Document read / raw markdown tab",
+  name: "Document read / raw markdown switch",
   parameters: {
     router: { initialEntries: ["/vault/akb/doc/notes%2Frelease.md"] },
     msw: {
@@ -55,10 +53,10 @@ export const DocumentRawTab: Story = {
     // Enter the browser iframe before the action: foreground access proof can
     // replace a loaded surface while an initial pointer gesture is in flight.
     await userEvent.click(await canvas.findByRole("heading", { level: 1, name: "Release note" }));
-    await expect(await canvas.findByRole("tab", { name: "Raw" })).toBeInTheDocument();
-    await userEvent.click(canvas.getByRole("tab", { name: "Raw" }));
+    await expect(await canvas.findByRole("radio", { name: "Raw markdown" })).toBeInTheDocument();
+    await userEvent.click(canvas.getByRole("radio", { name: "Raw markdown" }));
     await expect((await canvas.findByTestId("doc-raw")).textContent).toBe(regularDoc.content);
-    await expect(canvas.getByRole("tab", { name: "Raw" })).toHaveAttribute("aria-selected", "true");
+    await expect(canvas.getByRole("radio", { name: "Raw markdown" })).toHaveAttribute("aria-checked", "true");
     await expect(canvas.getByTestId("document-route").textContent).toBe("/vault/akb/doc/notes%2Frelease.md?view=raw");
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
   },
@@ -82,6 +80,24 @@ export const DocumentRegularNote: Story = {
     await expect(await canvas.findByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
     await expect(canvas.queryByRole("tab", { name: "Agent" })).not.toBeInTheDocument();
   },
+};
+
+export const DocumentLongSummary: Story = {
+  name: "Document read / long summary preview",
+  parameters: {
+    router: { initialEntries: ["/vault/akb/doc/notes%2Frelease.md"] },
+    msw: {
+      handlers: [
+        ...documentPageHandlers,
+        http.get(`${API}/documents/akb/notes%2Frelease.md`, () => HttpResponse.json({
+          ...regularDoc,
+          content: "# Release note\n\nThis release brings a calmer document reading experience, with the tools you need kept within reach.\n\n## Reading documents\n\nSwitch between the formatted preview and Markdown source without leaving your place. The summary appears below the title, with motion only when its text overflows.\n\n## Working together\n\nEdit the document when you need to make changes. Properties, revision history and related documents share a single details panel.\n\n> Sharing stays explicit: review public-link options before publishing a document.\n\n## Verification\n\n- Preview and source stay aligned.\n- Revision history keeps its existing comparisons.\n- Keyboard navigation and small screens remain supported.\n",
+          summary: "This release improves workspace sign-in, document permissions and file upload recovery. Profile photos can be added, replaced and removed. The rollout preserves existing accounts and documents, and verifies reading, editing, revision history and search. This note records the deployment sequence, verification results and remaining follow-up checks.",
+        })),
+      ],
+    },
+  },
+  render: () => <AkbRouteTree />,
 };
 
 export const DocumentLoadError: Story = {

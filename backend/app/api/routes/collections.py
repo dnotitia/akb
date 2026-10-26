@@ -67,13 +67,18 @@ async def browse_vault(
         1,
         ge=-1,
         description=(
-            "Tree depth from browse root. 0 = root only; N = descend N levels; "
-            "-1 = unbounded entire subtree."
+            "Paged browse: 0 = direct children; N = N additional levels; "
+            "-1 = all depths, still limited by page_size. Historical unpaged "
+            "Collection navigation rows are depth-independent."
         ),
     ),
     include_hashes: bool = Query(False, description="Include content hash/version metadata for documents and files."),
     include_archived: bool = Query(False, description="Include archived documents (hidden from browse by default)."),
     archive_scope: ArchiveScope | None = Query(None, description="Document archive scope; overrides include_archived."),
+    content_type: Literal["all", "collections", "resources", "documents", "tables", "files"] = Query("all"),
+    name_query: str | None = Query(None, max_length=200, description="Literal case-insensitive name/path search across the selected scope. Follow empty pages with next_cursor until complete."),
+    page_size: int | None = Query(None, ge=1, le=200, description="Opt into identity-bounded pages; follow next_cursor until complete=true."),
+    cursor: str | None = Query(None, max_length=32768, description="Continuation for the same Vault, collection, depth, kind and archive scope."),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
@@ -81,6 +86,9 @@ async def browse_vault(
         vault, collection=collection, depth=depth, include_hashes=include_hashes,
         include_archived=include_archived,
         archive_scope=archive_scope,
+        content_type=content_type,
+        page_size=page_size, cursor=cursor,
+        **({"name_query": name_query} if name_query is not None else {}),
     )
 
 

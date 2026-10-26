@@ -13,6 +13,7 @@ Two auto-extraction sources for documents:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -22,7 +23,7 @@ from typing import Literal, NamedTuple, get_args
 
 from markdown_it import MarkdownIt
 
-from app.exceptions import ValidationError
+from app.exceptions import NotFoundError, ValidationError
 from app.db.postgres import get_pool
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.asset_service import ASSET_URL_PREFIX
@@ -911,6 +912,82 @@ async def get_graph(
     }
 
 
+async def _graph_document_rows(
+    conn, vault_id, *, paths: list[str] | None = None,
+    excluded_paths: list[str] | None = None, limit: int | None = None,
+    include_archived: bool = False,
+) -> list[dict]:
+    """Graph metadata from the selected authority, not a frozen mirror.
+
+    Native metadata lives in verified Head payloads. Read bounded pages on
+    the caller's connection and snapshot, retaining only metadata afterwards.
+    This also keeps the exact health count coherent under concurrent edits.
+    """
+    from app.services.document_counters import native_documents_are_authoritative
+
+    if paths == [] or limit == 0:
+        return []
+    if not native_documents_are_authoritative():
+        clauses = ["vault_id = $1"]
+        params: list = [vault_id]
+        if not include_archived:
+            clauses.append("status != 'archived'")
+        if paths is not None:
+            params.append(paths)
+            clauses.append(f"path = ANY(${len(params)}::text[])")
+        if excluded_paths:
+            params.append(excluded_paths)
+            clauses.append(f"path != ALL(${len(params)}::text[])")
+        sql = "SELECT path, title FROM documents WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC"
+        if limit is not None:
+            params.append(limit)
+            sql += f" LIMIT ${len(params)}"
+        return [dict(row) for row in await conn.fetch(sql, *params)]
+
+    from app.services.document_service import _parse_markdown
+    from app.services.native_document_service import NativeDocumentService, _fill_from_legacy
+    from app.services.native_revision_service import NativeRevisionService
+
+    native = NativeRevisionService(await get_pool())
+    result: list[dict] = []
+    cursor = None
+    # Never hold the whole Vault's body bytes, nor a second pool connection.
+    async with conn.transaction(isolation="repeatable_read", readonly=True):
+        while True:
+            page = await native.list_live_head_snapshots(
+                namespace_id=vault_id, surface="document", paths=paths,
+                excluded_paths=excluded_paths, before=cursor, limit=256, conn=conn,
+            )
+            if not page:
+                break
+            parsed = await asyncio.to_thread(lambda: [_parse_markdown(s.text)[0] for s in page])
+            incomplete = [s.resource_id for s, fm in zip(page, parsed, strict=True)
+                          if not NativeDocumentService._has_complete_native_frontmatter(fm)]
+            legacy = {}
+            if incomplete:
+                rows = await conn.fetch(
+                    "SELECT id, title, doc_type, status, summary, domain, created_by, "
+                    "created_at, updated_at, tags FROM documents "
+                    "WHERE vault_id = $1 AND id = ANY($2::uuid[])", vault_id, incomplete,
+                )
+                legacy = {row["id"]: dict(row) for row in rows}
+            for snapshot, fm in zip(page, parsed, strict=True):
+                if snapshot.resource_id in legacy:
+                    _fill_from_legacy(fm, legacy[snapshot.resource_id])
+                if not include_archived and fm.get("status") == "archived":
+                    continue
+                result.append({"path": snapshot.path,
+                               "title": fm.get("title") or snapshot.path.rsplit("/", 1)[-1]})
+                if limit is not None and len(result) >= limit:
+                    return result
+            # Advance even if every item was archived. Updated-at is stable
+            # for this scan because every page shares the snapshot above.
+            cursor = (page[-1].resource_updated_at, page[-1].resource_id)
+            if len(page) < 256:
+                break
+    return result
+
+
 async def _fetch_orphan_nodes(
     conn, vault: str, vault_id, *,
     doc_paths: set[str], table_names: set[str], file_ids: set[str], limit: int,
@@ -936,11 +1013,8 @@ async def _fetch_orphan_nodes(
     orphan docs never starves orphan tables/files (the motivating case).
     """
     per = max(0, limit)
-    doc_rows = await conn.fetch(
-        "SELECT path, title FROM documents "
-        "WHERE vault_id = $1 AND status != 'archived' AND path != ALL($2::text[]) "
-        "ORDER BY created_at DESC LIMIT $3",
-        vault_id, list(doc_paths), per,
+    doc_rows = await _graph_document_rows(
+        conn, vault_id, excluded_paths=list(doc_paths), limit=per,
     )
     tbl_rows = await conn.fetch(
         "SELECT t.name, t.description, c.path AS coll "
@@ -1247,10 +1321,7 @@ async def get_health(
         connected = {r["uri"] for r in connected_rows}
 
         # Orphans: non-archived docs whose URI is in no edge.
-        doc_rows = await conn.fetch(
-            "SELECT path, title FROM documents WHERE vault_id = $1 AND status != 'archived'",
-            vault_id,
-        )
+        doc_rows = await _graph_document_rows(conn, vault_id)
         orphan_count = 0
         orphan_sample: list[dict] = []
         for r in doc_rows:
@@ -1295,36 +1366,57 @@ async def get_provenance(doc_id: str, *, vault_id: uuid.UUID) -> dict:
     the scope a doc_id alone would let anyone read another vault's
     document title/path/author/commit metadata.
     """
+    from app.repositories.document_repo import DocumentRepository
+    from app.repositories.native_revision_repo import NativeRevisionRepository
+    from app.services.document_counters import native_documents_are_authoritative
+    from app.services.native_document_service import NativeDocumentService
+
     pool = await get_pool()
+    native = native_documents_are_authoritative()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT d.id, d.title, d.path, d.created_by, d.created_at, d.updated_at,
-                   d.current_commit, d.metadata, v.name as vault_name
-            FROM documents d
-            JOIN vaults v ON d.vault_id = v.id
-            WHERE d.id::text = $1 AND d.vault_id = $2
-            """,
-            doc_id, vault_id,
-        )
-        if not row:
+        vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+        if not vault:
             return err("Document not found", code=NOT_FOUND)
+        if native:
+            resource = await NativeRevisionRepository(pool).resolve_live_reference(
+                namespace_id=vault_id, surface="document", reference=doc_id, conn=conn,
+            )
+            row = None
+        else:
+            resource = None
+            row = await DocumentRepository(pool).find_by_ref_with_conn(conn, vault_id, doc_id)
 
-        uri = doc_uri(row["vault_name"], row["path"])
-        relations = await get_resource_relations(row["vault_name"], uri, vault_id=vault_id)
-
-        return {
-            "doc_id": str(row["id"]),
-            "title": row["title"],
-            "path": row["path"],
-            "vault": row["vault_name"],
-            "uri": uri,
+    # Resolve once to a stable identity. A delete/recreate at the path between
+    # these reads must not disclose the replacement document's provenance.
+    if native:
+        if resource is None:
+            return err("Document not found", code=NOT_FOUND)
+        try:
+            document = await NativeDocumentService(pool=pool).get_by_resource_id(vault, resource["resource_id"])
+        except NotFoundError:
+            return err("Document not found", code=NOT_FOUND)
+        result = {
+            "doc_id": str(resource["resource_id"]), "title": document.title,
+            "path": document.path, "vault": vault, "uri": document.uri,
+            "created_by": document.created_by,
+            "created_at": document.created_at.isoformat() if document.created_at else None,
+            "updated_at": document.updated_at.isoformat() if document.updated_at else None,
+            "current_commit": document.current_commit,
+        }
+    else:
+        if row is None:
+            return err("Document not found", code=NOT_FOUND)
+        result = {
+            "doc_id": str(row["id"]), "title": row["title"], "path": row["path"],
+            "vault": vault, "uri": doc_uri(vault, row["path"]),
             "created_by": row["created_by"],
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
             "current_commit": row["current_commit"],
-            "relations": relations,
         }
+    # The lookup connection is released before relation/name hydration.
+    result["relations"] = await get_resource_relations(vault, result["uri"], vault_id=vault_id)
+    return result
 
 
 # ── Batch name resolution ────────────────────────────────────
@@ -1372,10 +1464,8 @@ async def _batch_resolve_names(
     names: dict[str, str] = {}
 
     if doc_paths:
-        rows = await conn.fetch(
-            "SELECT path, title FROM documents "
-            "WHERE path = ANY($1::text[]) AND vault_id = $2",
-            doc_paths, vault_id,
+        rows = await _graph_document_rows(
+            conn, vault_id, paths=doc_paths, include_archived=True,
         )
         for r in rows:
             doc_uri_opt = doc_uris.get(r["path"])

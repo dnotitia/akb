@@ -34,13 +34,18 @@ async def _store(monkeypatch, *, statement_timeout=None):
     try:
         await admin.execute(f'CREATE DATABASE "{name}"')
         test_dsn = urlunsplit(urlsplit(dsn)._replace(path=f"/{name}"))
+        # Schema setup is outside the retrieval session's deliberately tiny
+        # timeout. Slow DDL must not fail before the cancellation oracle runs.
+        setup = await asyncpg.connect(test_dsn)
+        try:
+            await setup.execute("CREATE TABLE bm25_vocab_epoch (id integer PRIMARY KEY, epoch bigint NOT NULL)")
+            await setup.execute("INSERT INTO bm25_vocab_epoch VALUES (1, 0)")
+        finally:
+            await setup.close()
         pool = await asyncpg.create_pool(
             test_dsn, min_size=2, max_size=2, command_timeout=30,
             server_settings={"statement_timeout": statement_timeout} if statement_timeout else None,
         )
-        async with pool.acquire() as conn:
-            await conn.execute("CREATE TABLE bm25_vocab_epoch (id integer PRIMARY KEY, epoch bigint NOT NULL)")
-            await conn.execute("INSERT INTO bm25_vocab_epoch VALUES (1, 0)")
         store = PgvectorStore(dsn=None, schema="vector_index", dense_dim=2, sparse_shape="vchord",
                               retrieval_timeout_secs=0.4)
 

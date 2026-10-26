@@ -567,7 +567,14 @@ async def _attempt_password_resolve(
     if throttled:
         # Count this attempt BEFORE the (slow, awaited) bcrypt verify so a
         # concurrent burst can't all slip past a stale counter.
-        lock = pub_rl.reserve(slug, ip)
+        try:
+            lock = await pub_rl.reserve(slug, ip)
+        except pub_rl.BudgetUnavailable:
+            raise HTTPException(
+                status_code=503,
+                detail="Password verification is temporarily unavailable. Please retry shortly.",
+                headers={"Retry-After": "1"},
+            ) from None
         if lock > 0:
             # Locked. An anonymous flood (rotating IPs) can trip the per-slug
             # backstop; let the authenticated owner through so they're never shut
@@ -601,7 +608,7 @@ async def _attempt_password_resolve(
         )
         raise
     if throttled and not owner_bypass:
-        pub_rl.release(slug, ip)  # verified correct — undo the speculative count
+        await pub_rl.release(slug, ip)  # verified correct — undo the speculative count
     return pub
 
 

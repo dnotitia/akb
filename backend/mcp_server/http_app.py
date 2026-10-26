@@ -1,10 +1,10 @@
 """Authenticated MCP Streamable HTTP application.
 
 The MCP SDK owns the protocol transport and its two protocol eras.  This
-module owns only the AKB authentication boundary and the small adapter that
-lets the SDK bind stateful legacy sessions to the authenticated AKB principal.
-Modern 2026-07-28 requests are handled as stateless exchanges by the SDK;
-legacy initialize/session requests retain the SDK's stateful transport.
+module owns the AKB authentication boundary and compatibility adapter.
+Both modern 2026-07-28 requests and legacy initialize requests use stateless
+transport: legacy negotiation remains supported without issuing a session ID
+or retaining replica-local session state.
 """
 
 from __future__ import annotations

@@ -86,6 +86,11 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       return route.fulfill({ json: { tokens: [], templates: [], items: [], changes: [] } });
     });
     await page.goto("/");
+    const globalVaults = width >= 1024
+      ? page.getByTestId("app-sidebar").getByRole("link", { name: "Vaults", exact: true })
+      : page.getByRole("navigation", { name: "Primary mobile navigation", exact: true }).getByRole("link", { name: "Vaults", exact: true });
+    await expect(globalVaults).toHaveAttribute("href", "/vault");
+
     if (width >= 1024) {
       await expect(page.getByRole("navigation", { name: "Current page", exact: true })).toHaveText("Home");
     }
@@ -97,6 +102,13 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await expect(directory.getByText("Documents", { exact: true }).first()).toBeVisible();
     await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", String(width >= 1024));
     await expect(page.getByRole("button", { name: "Connect an agent", exact: true })).toBeVisible();
+    // Check explicit minimization before sidebar focus and screenshot scrolling
+    // can legitimately minimize the invitation through overlap protection.
+    const connectionLauncher = page.getByRole("button", { name: "Connect an agent", exact: true });
+    if (width >= 1024) {
+      await page.getByRole("button", { name: "Minimize connection guide" }).click();
+      await expect(connectionLauncher).toBeFocused();
+    }
     await expect(page.getByRole("tablist", { name: "Recent updates scope" })).toHaveCount(0);
     await expect(page.getByRole("heading", { name: "Watched documents", exact: true })).toBeVisible();
     const homePaper = await page.locator("#main").evaluate(element => getComputedStyle(element.closest(".min-h-screen")!).backgroundColor);
@@ -150,11 +162,6 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     } else expect(fourth.y).toBeGreaterThan(first.y);
     expect((await viewed.boundingBox())!.y).toBeLessThan((await directory.boundingBox())!.y);
     await page.screenshot({ path: testInfo.outputPath("home-workspace.png"), fullPage: true });
-    const connectionLauncher = page.getByRole("button", { name: "Connect an agent", exact: true });
-    if (width >= 1024) {
-      await page.getByRole("button", { name: "Minimize connection guide" }).click();
-      await expect(connectionLauncher).toBeFocused();
-    }
     await connectionLauncher.click();
     const connection = page.getByRole("dialog", { name: "Connect an agent" });
     await expect(connection.getByRole("group", { name: "AI tool", exact: true })).toBeVisible();
@@ -213,76 +220,71 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
       await expect(pageLocation).toHaveText("platform/Search");
       await expect(pageLocation.getByRole("link", { name: "platform" })).toHaveAttribute("href", "/vault/platform");
       await expect(page.getByRole("navigation", { name: "Breadcrumb", exact: true })).toHaveCount(0);
-      const vaultList = page.getByRole("navigation", { name: "Vaults", exact: true });
-      await expect(page.locator('[data-slot="workspace-sidebar-heading"]')).toHaveCSS("height", "40px");
-      expect((await page.locator("#workspace-navigation").boundingBox())!.y).toBe(96);
+      const nav = page.locator("#vault-workspace-navigation");
+      await expect(nav).toBeVisible();
       await page.getByRole("button", { name: "Expand sidebar", exact: true }).click();
       await expect(page.getByTestId("app-sidebar")).toHaveAttribute("data-compact", "false");
-      if (width < 1920) {
-        // Expanded workspace navigation leaves too little reading space for
-        // two inline rails, so vault navigation becomes a dismissible drawer.
-        const navigationTrigger = page.getByRole("button", { name: "Open vault navigation", exact: true });
-        await expect(navigationTrigger).toBeVisible();
-        await navigationTrigger.click();
-        await expect(vaultList).toBeVisible();
-        await page.keyboard.press("Escape");
-        await expect(vaultList).toBeHidden();
-        await expect(navigationTrigger).toBeFocused();
-        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-        return;
-      }
-      await expect.poll(async () => (await vaultList.boundingBox())!.x).toBe(208);
+      await expect.poll(async () => (await nav.boundingBox())!.x).toBe(208);
       await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
-      await expect.poll(async () => (await vaultList.boundingBox())!.x).toBe(56);
-      await expect(vaultList).toBeVisible();
-      expect((await vaultList.boundingBox())!.y).toBe(0);
-      const switcher = vaultList.getByRole("button", { name: "Switch vault", exact: true });
+      await expect.poll(async () => (await nav.boundingBox())!.x).toBe(56);
+      expect((await nav.boundingBox())!.y).toBe(0);
+      const switcher = nav.getByRole("button", { name: "Switch vault: platform", exact: true });
       await expect(switcher).toHaveCSS("border-top-width", "0px");
-      await expect(switcher.locator("svg")).toHaveCount(2);
       await switcher.click();
-      await expect(page.getByRole("menuitemradio", { name: "research Favorite", exact: true })).toBeVisible();
+      const picker = page.getByRole("dialog", { name: "Vaults", exact: true });
+      await expect(picker.getByRole("region", { name: "Favorite vaults" }).getByRole("link", { name: "research", exact: true })).toBeVisible();
+      await expect(picker.getByRole("button", { name: "Create vault", exact: true })).toBeVisible();
+      await expect(picker).not.toHaveAttribute("aria-modal", "true");
+      await expect(page.locator('[data-slot="dialog-overlay"]')).toHaveCount(0);
       await page.keyboard.press("Escape");
-      const identity = (await page.locator('[data-slot="vault-identity-header"]').boundingBox())!;
-      expect((await vaultList.getByRole("button", { name: "New vault", exact: true }).boundingBox())!.y).toBeGreaterThanOrEqual(identity.y + identity.height);
-      await page.getByRole("button", { name: "Collapse collections", exact: true }).click();
-      await page.getByRole("button", { name: "Expand collections", exact: true }).click();
-      const nav = page.locator("#vault-workspace-navigation");
-      const bounds = (await nav.boundingBox())!;
-      expect(bounds.y).toBe(0);
+      await expect(switcher).toBeFocused();
+      await page.getByRole("button", { name: "Close vault navigation", exact: true }).click();
+      const open = page.getByRole("button", { name: "Open vault navigation", exact: true });
+      await expect(open).toBeFocused();
+      await expect(nav).toBeHidden();
+      await open.click();
+      await expect(nav).toBeVisible();
       await expect.poll(async () => {
         const current = (await nav.boundingBox())!;
         return Math.abs((await page.locator("header.app-header").boundingBox())!.x - (current.x + current.width + 1));
       }).toBeLessThanOrEqual(1);
-      await expect(page.getByRole("separator", { name: "Resize tree panel" })).toHaveCSS("width", "1px");
-      const handle = (await page.getByRole("separator", { name: "Resize tree panel" }).boundingBox())!;
-      await page.mouse.move(handle.x - 2, handle.y + 140);
+      const resizer = page.getByRole("separator", { name: "Resize vault navigation" });
+      await expect(resizer).toHaveCSS("width", "1px");
+      const handle = (await resizer.boundingBox())!;
+      await page.mouse.move(handle.x, handle.y + 140);
       await page.mouse.down();
-      await page.mouse.move(handle.x + 30, handle.y + 140);
+      await page.mouse.move(handle.x + 32, handle.y + 140);
       await page.mouse.up();
-      await expect.poll(async () => (await page.getByRole("separator", { name: "Resize tree panel" }).boundingBox())!.x).toBeGreaterThan(handle.x + 20);
+      await expect.poll(async () => (await resizer.boundingBox())!.x).toBeGreaterThan(handle.x + 20);
       await page.screenshot({ path: testInfo.outputPath("vault-full-height-navigation.png"), fullPage: true });
       await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "Navigate in platform", exact: true })).toHaveText("Navigate");
-      const managementBottoms: number[] = [];
-      for (const selector of ['[data-slot="vault-management-row"]', '[data-slot="collection-management-row"]']) {
-        const row = (await page.locator(selector).boundingBox())!;
-        managementBottoms.push(row.y + row.height);
-      }
-      expect(managementBottoms[0]).toBe(managementBottoms[1]);
-      await page.getByRole("button", { name: "Minimize vault list to a rail", exact: true }).click();
-      expect((await vaultList.boundingBox())!.width).toBe(56);
-      expect((await vaultList.boundingBox())!.y).toBe(0);
-      await page.getByRole("button", { name: "Expand vault list", exact: true }).click();
-      await vaultList.getByRole("link").filter({ hasText: "research" }).first().click();
+      await pageLocation.getByRole("link", { name: "platform", exact: true }).click();
+      const pages = page.getByRole("navigation", { name: "Vault pages", exact: true });
+      await expect(pages.getByRole("link")).toHaveCount(4);
+      await expect(pages.getByRole("link", { name: "Settings", exact: true })).toHaveAttribute("href", "/vault/platform/settings");
+      await expect(page.getByRole("button", { name: "Add content", exact: true })).toHaveCount(1);
+      await switcher.click();
+      await picker.getByRole("link", { name: "research", exact: true }).click();
       await expect(page).toHaveURL(/\/vault\/research$/);
-      await expect(vaultList).toBeVisible();
+      await expect(nav).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-      await page.goto("/vault");
-      await expect(vaultList).toBeVisible();
-      const unselected = (await page.locator("#vault-workspace-navigation").boundingBox())!;
-      expect(unselected.y).toBe(0);
-      expect((await page.locator("header.app-header").boundingBox())!.x).toBe(unselected.x + unselected.width);
+      await globalVaults.click();
+      await expect(page).toHaveURL(/\/vault$/);
+      await expect(page.getByRole("dialog", { name: "Vaults", exact: true })).toHaveCount(0);
+      await expect(nav).toBeVisible();
+      await expect(nav.getByRole("navigation", { name: "Vaults", exact: true })).toBeVisible();
+      await expect.poll(async () => {
+        const current = (await nav.boundingBox())!;
+        return Math.abs((await page.locator("header.app-header").boundingBox())!.x - (current.x + current.width + 1));
+      }).toBeLessThanOrEqual(1);
       await page.screenshot({ path: testInfo.outputPath("vault-unselected-lines.png"), fullPage: true });
+    } else {
+      await page.keyboard.press("Escape");
+      await globalVaults.click();
+      await expect(page).toHaveURL(/\/vault$/);
+      // This branch retains the empty-directory fixture from the first-run flow.
+      await expect(page.getByRole("heading", { name: "Create your first vault.", exact: true })).toBeVisible();
+      await expect(page.getByRole("dialog", { name: "Vaults", exact: true })).toHaveCount(0);
     }
   });
 }

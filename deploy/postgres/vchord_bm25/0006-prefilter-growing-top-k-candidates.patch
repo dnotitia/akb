@@ -1,0 +1,49 @@
+Apply the same snapshot/qual check to growing candidates as to sealed ones.
+
+The finite scan used to admit high-scoring growing rows before checking the
+executor's snapshot or WHERE clause. Invisible and out-of-scope rows could
+fill top-k and raise its pruning threshold, discarding valid sealed matches.
+The backend's exact completion repaired the answer, but common terms then
+scanned and sorted their entire posting lists. Keep the exact path as a
+correctness fallback; do not create the avoidable short page in the first
+place. Respect enable_prefilter=off, as the sealed scan already does.
+
+License: this patch modifies vchord_bm25 and is offered under the same terms
+as vchord_bm25 itself: AGPL-3.0-only or Elastic-2.0, at the recipient's option.
+
+--- a/src/index/scan.rs
++++ b/src/index/scan.rs
+@@ -174,4 +174,6 @@
+     let term_stat_reader = TermStatReader::new(index, meta);
++    let payload_reader = PayloadReader::new(index, meta.payload_blkno);
++    let prefilter = ENABLE_PREFILTER.get();
+     if let Some(growing) = meta.growing_segment.as_ref() {
+         let reader = GrowingSegmentReader::new(index, growing);
+         let mut doc_id = meta.sealed_doc_id;
+@@ -180,7 +182,17 @@
+             if !delete_bitmap_reader.is_delete(doc_id) {
+                 let score =
+                     bm25_score_batch(meta.doc_cnt, avgdl, &term_stat_reader, vector, query_vector);
+-                computer.push(score, doc_id);
++                if score > computer.threshold() {
++                    let eligible = !prefilter || {
++                        let value = payload_reader.read(doc_id);
++                        let mut tid = pgrx::pg_sys::ItemPointerData::default();
++                        pgrx::itemptr::u64_to_item_pointer(value, &mut tid);
++                        unsafe { check(scan_state, &mut tid) }
++                    };
++                    if eligible {
++                        computer.push(score, doc_id);
++                    }
++                }
+             }
+             doc_id += 1;
+         }
+@@ -209,6 +221,4 @@
+-    let payload_reader = PayloadReader::new(index, meta.payload_blkno);
+-
+-    if ENABLE_PREFILTER.get() {
++    if prefilter {
+         let f = |doc_id| {
+             let value = payload_reader.read(doc_id);
+             let mut tid = pgrx::pg_sys::ItemPointerData::default();

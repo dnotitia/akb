@@ -236,6 +236,7 @@ class BrowseContext(BaseModel):
     path: str
     summary: str | None = None
     description: str | None = None
+    ancestry: list[dict[str, str]] | None = None
 
 
 class BrowseResponse(BaseModel):
@@ -248,6 +249,12 @@ class BrowseResponse(BaseModel):
     context: BrowseContext | None = None
     items: list[BrowseItem]
     hint: str | None = None
+    # Present only for opt-in identity-bounded pages. None means this server
+    # has not supplied a completeness receipt; it never means complete.
+    scanned: int | None = None
+    complete: bool | None = None
+    next_cursor: str | None = None
+    name_query: str | None = None
 
 
 class SearchResult(BaseModel):

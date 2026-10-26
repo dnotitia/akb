@@ -13,7 +13,7 @@
 // cost) and lets us assert call args directly. The MSW-level contract
 // test already lives in lib/__tests__/api-search-contract.test.ts.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, cleanup, waitFor, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 
@@ -74,6 +74,32 @@ function renderAuthenticatedAt(url: string) {
   );
 }
 
+it("explains protective grep scope rejection without retrying the unchanged scope", async () => {
+  const user = userEvent.setup();
+  mockedGrep.mockRejectedValueOnce(Object.assign(new Error("Candidate resources exceed 10000. Narrow the collection scope."), {
+    status: 422, detail: { code: "grep_scope_too_large" },
+  }));
+  renderAt("/search?q=needle&mode=literal&v=eng");
+  expect(await screen.findByText("Narrow the search scope")).toBeVisible();
+  expect(screen.getByText("Search scope too large", { exact: true })).toBeVisible();
+  expect(screen.queryByText("Search unavailable", { exact: true })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Choose a Collection in Filters" }));
+  expect(screen.getByRole("dialog", { name: "Search filters" })).toBeVisible();
+  expect(screen.getByLabelText("Collection path (including children)")).toHaveFocus();
+  expect(mockedGrep).toHaveBeenCalledTimes(1);
+});
+
+async function selectMethod(user: ReturnType<typeof userEvent.setup>, method: "By meaning" | "Exact text") {
+  await user.click(screen.getByRole("button", { name: "Search method" }));
+  await user.click(screen.getByRole("menuitemradio", { name: new RegExp(`^${method}`) }));
+}
+
+async function selectType(user: ReturnType<typeof userEvent.setup>, type: string) {
+  await user.click(screen.getByRole("button", { name: "Result type" }));
+  await user.click(screen.getByRole("menuitemradio", { name: type }));
+}
+
 function SearchLocationProbe() {
   const location = useLocation();
   return (
@@ -88,7 +114,7 @@ function SearchLocationProbe() {
 }
 
 describe("SearchPage · semantic (dense) mode", () => {
-  it("separates the query, refinement rail and readable results workspace", async () => {
+  it("keeps search controls above the results and opens filters only when requested", async () => {
     const user = userEvent.setup();
     renderAt("/search");
 
@@ -102,14 +128,17 @@ describe("SearchPage · semantic (dense) mode", () => {
       "max-w-none",
       "overflow-hidden",
     );
-    expect(commandHeader).toHaveClass("flex");
+    expect(commandHeader).toHaveAttribute("role", "search");
+    expect(within(commandHeader).getByTestId("search-query-entry")).toHaveClass("border", "bg-surface");
     expect(workspace.contains(commandHeader)).toBe(true);
     expect(workspace.contains(suggestions)).toBe(true);
-    expect(screen.getByRole("group", { name: "Search mode" })).toBeTruthy();
+    const queryEntry = within(commandHeader).getByTestId("search-query-entry");
+    expect(queryEntry).toContainElement(screen.getByRole("button", { name: "Search method" }));
+    expect(queryEntry).toContainElement(screen.getByRole("button", { name: "Search scope: All vaults" }));
+    expect(within(queryEntry).getAllByRole("button", { name: "Search method" })).toHaveLength(1);
+    expect(within(commandHeader).getByRole("searchbox", { name: "Search query" })).toBeInTheDocument();
+    expect(within(commandHeader).getByRole("button", { name: "Search" })).toHaveAttribute("type", "submit");
     expect(screen.getByRole("region", { name: "Search results" })).toBeTruthy();
-    expect(screen.getByTestId("search-tool-row")).toHaveClass(
-      "min-h-10",
-    );
     expect(commandHeader).toContainElement(
       screen.getByRole("button", { name: "Search scope: All vaults" }),
     );
@@ -120,25 +149,53 @@ describe("SearchPage · semantic (dense) mode", () => {
       "flex-1",
       "overflow-y-auto",
     );
-    expect(screen.getByRole("complementary", { name: "Search refinements" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Tables", pressed: false })).toBeTruthy();
-    await user.click(
-      screen.getByRole("button", { name: "More filters" }),
-    );
     expect(
-      screen.getByRole("complementary", { name: "Search filters" }),
-    ).toBeTruthy();
+      screen.queryByRole("complementary", { name: "Search refinements" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Result type" })).toHaveTextContent("All content");
+
+    const filters = screen.getByRole("button", { name: "Filters" });
+    expect(filters).toHaveAttribute("aria-haspopup", "dialog");
+    expect(screen.queryByRole("dialog", { name: "Search filters" })).not.toBeInTheDocument();
+    await user.click(filters);
+    expect(screen.getByRole("dialog", { name: "Search filters" })).toHaveAccessibleDescription(
+      "Changes apply as you select them. Use Apply for a collection path.",
+    );
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(filters).toHaveFocus();
   });
 
-  it("offers All as the content-kind reset without changing the query", async () => {
+  it("offers All content in the result-type menu without changing the query", async () => {
     mockedSearch.mockResolvedValue({ query: "postgres", total: 0, returned: 0, total_matches: 0, results: [] });
     const user = userEvent.setup();
     renderAt("/search?q=postgres&source=table&v=engineering");
-    await screen.findByRole("button", { name: "Tables", pressed: true });
-    await user.click(screen.getByRole("button", { name: "All" }));
+    expect(await screen.findByRole("button", { name: "Result type" })).toHaveTextContent("Tables");
+    await selectType(user, "All content");
     expect(screen.getByRole("searchbox", { name: "Search query" })).toHaveValue("postgres");
-    expect(screen.getByRole("button", { name: "All", pressed: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Result type" })).toHaveTextContent("All content");
     await waitFor(() => expect(mockedSearch).toHaveBeenLastCalledWith("postgres", ["engineering"], 25, expect.objectContaining({ source_type: undefined })));
+  });
+
+  it("submits the current draft from the search surface while preserving its Vault context", async () => {
+    mockedSearch.mockResolvedValue({ query: "new query", total: 0, returned: 0, total_matches: 0, results: [] });
+    const user = userEvent.setup();
+    renderAt("/search?q=old&v=engineering");
+    await waitFor(() => expect(mockedSearch).toHaveBeenCalled());
+    const form = screen.getByTestId("search-command-header");
+    const queryEntry = within(form).getByTestId("search-query-entry");
+    const query = within(queryEntry).getByRole("searchbox", { name: "Search query" });
+    const submit = within(queryEntry).getByRole("button", { name: "Search" });
+    expect(submit).toHaveAttribute("type", "submit");
+    await user.clear(query);
+    await user.type(query, "new query");
+    expect(within(queryEntry).getByRole("button", { name: "Clear search query" })).toBeInTheDocument();
+    expect(within(queryEntry).getByRole("button", { name: "Search scope: engineering" })).toBeInTheDocument();
+    expect(within(queryEntry).getByRole("button", { name: "Search method" })).toHaveTextContent("By meaning");
+    await user.click(submit);
+    await waitFor(() => expect(mockedSearch).toHaveBeenLastCalledWith(
+      "new query", ["engineering"], 25, expect.any(Object),
+    ));
   });
 
   it("calls searchDocs on initial render with ?q and renders a hit", async () => {
@@ -345,8 +402,8 @@ describe("SearchPage · literal mode + counter header (PR #39 regression)", () =
   });
 });
 
-describe("SearchPage · mode toggle re-issues the correct call", () => {
-  it("switches from semantic to literal on button click", async () => {
+describe("SearchPage · search method re-issues the correct call", () => {
+  it("switches from meaning to exact text through the method menu", async () => {
     mockedSearch.mockResolvedValue({
       query: "k8s",
       total: 0,
@@ -364,14 +421,14 @@ describe("SearchPage · mode toggle re-issues the correct call", () => {
     renderAt("/search?q=k8s");
     await waitFor(() => expect(mockedSearch).toHaveBeenCalledTimes(1));
     const u = userEvent.setup();
-    // The mode toggle ("Literal", with aria-pressed) and the short-query
-    // hint link below ("LITERAL") both reference literal mode. The toggle
-    // is the only one with aria-pressed set.
-    const toggle = screen
-      .getAllByRole("button", { name: "Literal" })
-      .find((b) => b.hasAttribute("aria-pressed"));
-    if (!toggle) throw new Error("Literal toggle button not found");
-    await u.click(toggle);
+    await u.click(screen.getByRole("button", { name: "Search method" }));
+    expect(screen.getByRole("menuitemradio", { name: /^By meaning/ })).toHaveTextContent("Semantic");
+    expect(screen.getByRole("menuitemradio", { name: /^Exact text/ })).toHaveTextContent("Literal");
+    await u.keyboard("{Escape}");
+    await selectMethod(u, "Exact text");
+    expect(screen.getByRole("button", { name: "Search method" })).toHaveTextContent("Exact text");
+    expect(screen.queryByRole("button", { name: "Result type" })).not.toBeInTheDocument();
+    expect(screen.getByText("Exact matches")).toBeInTheDocument();
     await waitFor(() => expect(mockedGrep).toHaveBeenCalledWith("k8s", [], 20, expect.objectContaining({ regex: false, case_sensitive: false })));
   });
 });
@@ -400,4 +457,17 @@ describe("text File literal search", () => {
     expect(screen.queryByText(/No results for/)).not.toBeInTheDocument();
     expect(screen.queryByText(/0 resources/)).not.toBeInTheDocument();
   });
+});
+
+it("retains same-query results after a background failure and recovers", async () => {
+  mockedSearch.mockResolvedValue({ query: "postgres", total: 1, returned: 1, total_matches: 1, results: [{ uri: "akb://alpha/doc/guide.md", vault: "alpha", path: "guide.md", title: "Kept result", score: 1 }] });
+  renderAt("/search?q=postgres");
+  await screen.findByText("Kept result");
+  mockedSearch.mockRejectedValueOnce(new Error("Offline"));
+  act(() => window.dispatchEvent(new Event("akb:document-status-changed")));
+  await screen.findByText("Search could not be updated; previous results shown");
+  expect(screen.getByText("Kept result")).toBeVisible();
+  const actor = userEvent.setup(); await actor.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(screen.queryByText("Search could not be updated; previous results shown")).not.toBeInTheDocument());
+  expect(screen.getByText("Kept result")).toBeVisible();
 });

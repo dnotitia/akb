@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation, useParams } from "react-router-dom";
 import { ArrowLeft, FileQuestion } from "lucide-react";
 import { MarkdownRender } from "@/components/markdown-render";
 import {
@@ -24,19 +24,26 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 export default function PublicationPage() {
   const { slug } = useParams<{ slug: string }>();
+  const { search } = useLocation();
+  return <PublicationContent key={`${slug}:${search}`} slug={slug} search={search} />;
+}
+
+function PublicationContent({ slug, search }: { slug?: string; search: string }) {
+  const requestGeneration = useRef(0);
   const [data, setData] = useState<PublicationResponse | null>(null);
   const [error, setError] = useState<PublicationError | null>(null);
   const [needsPassword, setNeedsPassword] = useState(false);
   const [caps, setCaps] = useState<PublicationCapabilities>({ can_edit: false });
 
-  async function load() {
+  const load = useCallback(async () => {
     if (!slug) return;
+    const generation = ++requestGeneration.current;
     // Reset stale state from previous param before re-fetch resolves.
     setData(null);
     setNeedsPassword(false);
     setError(null);
     try {
-      const urlParams = new URLSearchParams(window.location.search);
+      const urlParams = new URLSearchParams(search);
       const params: Record<string, string> = {};
       urlParams.forEach((v, k) => {
         // Drop our control params (incl. the view-grant) so they aren't sent as
@@ -44,9 +51,11 @@ export default function PublicationPage() {
         if (k !== "token" && k !== "password" && k !== "format" && k !== "grant") params[k] = v;
       });
       const result = await getPublication(slug, params);
+      if (generation !== requestGeneration.current) return;
       setData(result);
       setNeedsPassword(false);
     } catch (e) {
+      if (generation !== requestGeneration.current) return;
       const err = e as PublicationError;
       if (err.password_required) {
         setNeedsPassword(true);
@@ -54,12 +63,12 @@ export default function PublicationPage() {
         setError(err);
       }
     }
-  }
+  }, [slug, search]);
 
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug]);
+    void load();
+    return () => { requestGeneration.current += 1; };
+  }, [load]);
 
   // Owner affordance (F6): if the current session can edit this publication's
   // source, surface a quiet toolbar with a route back into the app. Anonymous-
@@ -92,7 +101,7 @@ export default function PublicationPage() {
   }
 
   if (error) {
-    return <ErrorPage error={error} />;
+    return <ErrorPage error={error} onRetry={() => void load()} />;
   }
 
   if (!data) {
@@ -297,7 +306,7 @@ function MetaField({
   );
 }
 
-function ErrorPage({ error }: { error: PublicationError }) {
+function ErrorPage({ error, onRetry }: { error: PublicationError; onRetry: () => void }) {
   let code = "Error";
   let title = "Something went wrong";
   let message = error.message;
@@ -334,6 +343,9 @@ function ErrorPage({ error }: { error: PublicationError }) {
           <p className="mt-3 text-sm text-foreground-muted leading-relaxed max-w-sm mx-auto">
             {message}
           </p>
+          {!error.expired && !error.view_limit_reached && !error.not_found && (
+            <Button variant="outline" className="mt-6 mr-2" onClick={onRetry}>Try again</Button>
+          )}
           <Button asChild variant="default" className="mt-6">
             <a href="/">
               <ArrowLeft className="h-4 w-4" aria-hidden />

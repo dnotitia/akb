@@ -23,6 +23,9 @@ class _Conn:
     def transaction(self) -> _Txn:
         return _Txn()
 
+    async def fetchval(self, _sql: str, *_args: Any) -> bool:
+        return True  # These forwarding cases use a live human administrator.
+
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
         if sql.startswith("INSERT"):

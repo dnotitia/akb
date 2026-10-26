@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, Protocol, runtime_checkable
+from typing import Any, Final, Protocol, runtime_checkable
 
 import asyncpg
 
@@ -1724,6 +1724,12 @@ class NativeRevisionService:
         surface: str,
         path_like: str | None = None,
         max_slashes: int | None = None,
+        resource_ids: list[uuid.UUID] | None = None,
+        paths: list[str] | None = None,
+        excluded_paths: list[str] | None = None,
+        before: tuple[datetime, uuid.UUID] | None = None,
+        limit: int | None = None,
+        conn: asyncpg.Connection | None = None,
     ) -> list[NativeRevisionSnapshot]:
         """Read and verify every live Head under a namespace in one query.
 
@@ -1733,11 +1739,17 @@ class NativeRevisionService:
         as browse would otherwise pay several sequential round-trips per
         Resource.
         """
+        bounded: dict[str, Any] = {}
+        for key, value in (("resource_ids", resource_ids), ("paths", paths), ("excluded_paths", excluded_paths),
+                           ("before", before), ("limit", limit), ("conn", conn)):
+            if value is not None:
+                bounded[key] = value
         rows = await self.repository.list_live_heads_with_payloads(
             namespace_id=namespace_id,
             surface=surface,
             path_like=path_like,
             max_slashes=max_slashes,
+            **bounded,
         )
         for row in rows:
             if row["revision_id"] is None:

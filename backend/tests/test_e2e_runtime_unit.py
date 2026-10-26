@@ -1302,7 +1302,14 @@ async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, ca
     prepare_private_runtime_root(config.runtime_root)
     runtime = E2ERuntime(config)
 
+    phase_called = []
+
+    async def fake_publication_phase():
+        phase_called.append(True)
+
+    runtime._run_publication_budget_check = fake_publication_phase
     assert await runtime._run_gate() == 0
+    assert phase_called == [True]
 
     captured = capfd.readouterr()
     gate_log = (config.logs_dir / "gate.log").read_text(encoding="utf-8")
@@ -2940,3 +2947,104 @@ async def test_supervisor_distinguishes_intentional_stop_from_unexpected_child_e
         await asyncio.gather(stop_backend, supervisor, return_exceptions=True)
         for process in processes.values():
             await original_terminate(process, grace_seconds=0.2)
+
+
+@pytest.mark.asyncio
+async def test_publication_phase_failure_prevents_later_gate_suites(tmp_path, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path, mode="gate"))
+    monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
+
+    async def fail():
+        raise AssertionError("replica assertion")
+
+    async def must_not_run(*args, **kwargs):
+        pytest.fail("later suites ran after the required replica phase failed")
+
+    monkeypatch.setattr(runtime, "_run_publication_budget_check", fail)
+    monkeypatch.setattr(runtime, "_run_logged_command", must_not_run)
+    with pytest.raises(e2e_runtime.ProductAssertionFailure, match="replica budget"):
+        await runtime._run_gate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "assertion", "startup", "drain", "reset_during_replacement"])
+async def test_publication_replica_phase_owns_processes_and_fences_reset(tmp_path, monkeypatch, outcome):
+    import publication_budget_probe
+
+    runtime = _ready_runtime(tmp_path)
+    runtime._pat_value = "synthetic-fixture-pat"
+    primary = runtime._children["backend"]
+    calls, launches, completed = [], [], []
+
+    class Replica:
+        returncode = None
+
+        def __init__(self, pid):
+            self.pid = pid
+
+    async def spawn(name, argv, log_name, **kwargs):
+        assert runtime._reset_lock.locked()
+        assert name == "publication-replica"
+        assert kwargs["environment"] == {"AKB_PROCESS_ROLE": "api"}
+        assert kwargs["cwd"] == runtime.config.config_dir.parent
+        launch = {"id": argv[argv.index("--launch-id") + 1],
+                  "report": Path(argv[argv.index("--drain-report") + 1]),
+                  "port": argv[argv.index("--port") + 1]}
+        launches.append(launch)
+        runtime._children[name] = ManagedProcess(Replica(primary.process.pid + len(launches)))
+        calls.append("start")
+
+    async def ready(*args):
+        calls.append("ready")
+        if outcome == "startup":
+            raise ProvisioningFailure("replica startup failed")
+
+    async def drain(name, launch_id, report_path):
+        assert runtime._reset_lock.locked()
+        assert name == "publication-replica"
+        assert launch_id == launches[-1]["id"]
+        assert report_path == launches[-1]["report"]
+        calls.append("drain")
+        if outcome == "drain":
+            raise ProvisioningFailure("replica drain failed")
+        runtime._children.pop(name)
+        if outcome == "reset_during_replacement":
+            runtime.config = dataclasses.replace(runtime.config, storage_generation=1)
+        return {}
+
+    async def probe(origins, pat, *, replace_replica, hold_budget_lock):
+        assert len(origins) == len(set(origins)) == 2
+        assert pat == runtime._pat_value
+        assert runtime._reset_lock.locked()
+        if outcome == "assertion":
+            raise AssertionError("wrong budget")
+        evidence = await replace_replica()
+        assert evidence["before"]["pid"] != evidence["after"]["pid"]
+        assert evidence["before"]["launch_id"] != evidence["after"]["launch_id"]
+        assert evidence["storage_generation"] == 0
+        assert launches[0]["port"] == launches[1]["port"]
+        return {"replacement": evidence}
+
+    def emit(event):
+        assert "publication-replica" not in runtime._children, "success emitted before drain"
+        completed.append(event)
+
+    monkeypatch.setattr(runtime, "_spawn_host_process", spawn)
+    monkeypatch.setattr(runtime, "_wait_http", ready)
+    monkeypatch.setattr(runtime, "_drain_backend_process", drain)
+    monkeypatch.setattr(publication_budget_probe, "run_checks", probe)
+    monkeypatch.setattr(e2e_runtime, "emit_gate_event", emit)
+    if outcome == "success":
+        await runtime._run_publication_budget_check()
+        assert runtime._prepared and runtime._lifecycle_state == "ready"
+        assert calls == ["start", "ready", "drain", "start", "ready", "drain"]
+        assert completed[0]["event"] == "publication_budget_complete"
+        assert completed[0]["checks"] == 5
+    else:
+        with pytest.raises((AssertionError, ProvisioningFailure)):
+            await runtime._run_publication_budget_check()
+        assert not runtime._prepared and runtime._lifecycle_state == "failed"
+        assert completed == []
+    assert not runtime._reset_lock.locked()
+    assert runtime._children["backend"] is primary
+    assert ("publication-replica" in runtime._children) is (outcome == "drain")

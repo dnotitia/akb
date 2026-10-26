@@ -53,6 +53,14 @@ async def _fresh_database():
         ).read_text()
         async with pool.acquire() as conn:
             await conn.execute(init_sql)
+        # Admin SQL bypass is reserved for a live human administrator, not
+        # an arbitrary caller-supplied name or an absent UUID.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash, is_admin) "
+                "VALUES ($1, 'rows-changed-admin', 'rows-changed-admin@example.com', '!fixture!', true)",
+                uuid.UUID(int=221),
+            )
         from app.db import postgres as postgres_module
 
         previous_pool = postgres_module._pool
@@ -127,21 +135,21 @@ async def _assert_mutation_contract(
         )
 
     await executor.execute(
-        user_id="user-id",
+        user_id=str(uuid.UUID(int=221)),
         actor_id=actor,
         sql=f"INSERT INTO {pg_name} (value) VALUES ('one')",
         is_admin=True,
         vault_names=["rows-changed"],
     )
     await executor.execute(
-        user_id="user-id",
+        user_id=str(uuid.UUID(int=221)),
         actor_id=actor,
         sql=f"INSERT INTO {pg_name} (value) VALUES ('bulk-a'), ('bulk-b')",
         is_admin=True,
         vault_names=["rows-changed"],
     )
     await executor.execute(
-        user_id="user-id",
+        user_id=str(uuid.UUID(int=221)),
         actor_id=actor,
         sql=f"UPDATE {pg_name} SET value = 'updated' WHERE value LIKE 'bulk-%'",
         is_admin=True,
@@ -160,7 +168,7 @@ async def _assert_mutation_contract(
         )
 
     await executor.execute(
-        user_id="user-id",
+        user_id=str(uuid.UUID(int=221)),
         actor_id=actor,
         sql=f"UPDATE {pg_name} SET value = 'missing' WHERE value = 'does-not-exist'",
         is_admin=True,
@@ -178,7 +186,7 @@ async def _assert_mutation_contract(
         await tx.rollback()
 
     await executor.execute(
-        user_id="user-id",
+        user_id=str(uuid.UUID(int=221)),
         actor_id=actor,
         sql=f"DELETE FROM {pg_name} WHERE value = 'updated'",
         is_admin=True,
@@ -243,7 +251,7 @@ async def test_publisher_fanout_preserves_rows_changed_envelope(monkeypatch):
             )
 
         await UserSqlExecutor(pool).execute(
-            user_id="user-id",
+            user_id=str(uuid.UUID(int=221)),
             actor_id="alice",
             sql=f"INSERT INTO {pg_name} (value) VALUES ('one')",
             is_admin=True,
@@ -319,7 +327,7 @@ async def test_publisher_suppresses_gardener_bookkeeping_without_xadd(monkeypatc
             for table_name in ("sweep_log", "gardener_event_log", "gardener_kv", "nodes"):
                 pg_name = table_data_repo.pg_table_name(vault_name, table_name)
                 await executor.execute(
-                    user_id="user-id",
+                    user_id=str(uuid.UUID(int=221)),
                     actor_id="alice",
                     sql=f"INSERT INTO {pg_name} (value) VALUES ('one')",
                     is_admin=True,
@@ -399,7 +407,7 @@ async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch):
             )
 
         await UserSqlExecutor(pool).execute(
-            user_id="user-id",
+            user_id=str(uuid.UUID(int=221)),
             actor_id="alice",
             sql=f"INSERT INTO {pg_name} (value) VALUES ('one')",
             is_admin=True,

@@ -7,7 +7,10 @@ import { getDocument, getGraph, getGraphOverview, getRelations, type CurrentUser
 import { GraphDetailPanel } from "../GraphDetailPanel";
 import { useFullGraph, useNeighborhood } from "../use-graph-data";
 
-vi.mock("@/lib/api", () => ({ getDocument: vi.fn(), getGraph: vi.fn(), getGraphOverview: vi.fn(), getRelations: vi.fn() }));
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
+  getDocument: vi.fn(), getGraph: vi.fn(), getGraphOverview: vi.fn(), getRelations: vi.fn(),
+}));
 const overview = vi.mocked(getGraphOverview);
 const neighborhood = vi.mocked(getGraph);
 const resource = vi.mocked(getDocument);

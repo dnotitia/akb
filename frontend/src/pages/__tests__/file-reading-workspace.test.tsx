@@ -89,6 +89,30 @@ describe("file reading workspace", () => {
     expect(vaultInfo).toHaveBeenCalledTimes(2);
   });
 
+  it("retains the mounted preview during refresh and failure until an explicit reader reload", async () => {
+    const user = userEvent.setup();
+    render(<FileHarness />);
+    const frame = await screen.findByTitle(firstFile.name);
+    fireEvent.load(frame);
+    const pending = deferred<Response>();
+    fileFetch.mockImplementation(() => pending.promise);
+    await user.click(screen.getByRole("button", { name: "Refresh link" }));
+    expect(screen.getByTitle(firstFile.name)).toBe(frame);
+    expect(screen.getByRole("region", { name: "File preview" })).toHaveAttribute("aria-busy", "true");
+    await act(async () => pending.resolve(await response({}, 503)));
+    expect(await screen.findByText(/Couldn't refresh the file link/)).toBeInTheDocument();
+    expect(screen.getByTitle(firstFile.name)).toBe(frame);
+    expect(screen.getByRole("region", { name: "File preview" })).toHaveAttribute("aria-busy", "false");
+    fileFetch.mockImplementation(() => response({ download_url: "https://files.example/renewed" }));
+    await user.click(screen.getByRole("button", { name: "Refresh link" }));
+    await waitFor(() => expect(screen.queryByText(/Couldn't refresh the file link/)).toBeNull());
+    expect(screen.getByTitle(firstFile.name)).toBe(frame);
+    expect(screen.getByRole("link", { name: "Download file" })).toHaveAttribute("href", "https://files.example/renewed");
+    await user.click(screen.getByRole("button", { name: "Reload preview" }));
+    expect(screen.getByTitle(firstFile.name)).not.toBe(frame);
+    expect(screen.getByTitle(firstFile.name)).toHaveAttribute("src", "https://files.example/renewed");
+  });
+
   it("publishes resolved location and keeps metadata in the labelled Info disclosure", async () => {
     const user = userEvent.setup();
     const { container } = render(<FileHarness />);
@@ -98,7 +122,7 @@ describe("file reading workspace", () => {
     expect(screen.getByRole("heading", { level: 1 })).toHaveClass("sr-only");
     expect(container.querySelectorAll('[data-slot="resource-command-row"]')).toHaveLength(1);
     expect(screen.getByTestId("location")).toHaveTextContent(JSON.stringify({
-      vault: "ops", title: firstFile.name, kind: "File", collectionPath: "guides",
+      vault: "ops", title: firstFile.name, kind: "File", collectionPath: "guides", resourceRef: "f-first",
     }));
     expect(screen.queryByText("Mina")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Actions for/ })).not.toBeInTheDocument();

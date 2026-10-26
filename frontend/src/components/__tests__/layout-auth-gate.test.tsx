@@ -25,6 +25,7 @@ vi.mock("@/lib/api", async importOriginal => ({
   getAuthConfig: vi.fn(),
   getMe: vi.fn(),
   searchDocs: vi.fn(),
+  listVaults: vi.fn(async () => ({ vaults: [] })),
   logoutOrdinarySession: vi.fn(),
   clearPrivateAssetCache: vi.fn(),
   clearSharedVaultReads: vi.fn(),
@@ -53,6 +54,8 @@ function renderAt(path: string, queryClient = new QueryClient()) {
           <Route element={<Layout />}>
             <Route path="/" element={<div data-testid="home"><AccessProbe /></div>} />
             <Route path="/search" element={<div data-testid="search-page" />} />
+            <Route path="/vault" element={<div data-testid="vault-directory" />} />
+            <Route path="/vault/:name" element={<div data-testid="vault-overview" />} />
             <Route path="/settings" element={<div data-testid="account-settings" />} />
             <Route
               path="/vault/:name/settings"
@@ -161,6 +164,26 @@ describe("Layout — auth gate", () => {
     expect(headerRow).not.toHaveClass("xl:px-12", "2xl:px-16");
   });
 
+  it("uses the named Vault title action only for parent navigation", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/vault/team/settings");
+    await screen.findByTestId("vault-settings");
+    const header = screen.getByRole("banner");
+    const parent = within(header).getByRole("link", { name: "Back to vault team" });
+    expect(parent).toHaveAttribute("href", "/vault/team");
+    expect(within(header).queryByRole("button", { name: /^(Open|Close) vault navigation$/ })).not.toBeInTheDocument();
+    const overview = within(header).getByRole("link", { name: "Back to team" });
+    expect(overview).toHaveAttribute("href", "/vault/team");
+    expect(overview.querySelector(".lucide-box")).not.toBeNull();
+    expect(overview.querySelector(".lucide-arrow-left")).toBeNull();
+    fireEvent.click(parent);
+    const directory = await within(header).findByRole("link", { name: "Back to all vaults" });
+    expect(directory).toHaveAttribute("href", "/vault");
+    fireEvent.click(directory);
+    await screen.findByTestId("vault-directory");
+    expect(within(header).queryByRole("link", { name: "Back to all vaults" })).not.toBeInTheDocument();
+  });
+
   it("keeps accessible indexing status immediately before global search", async () => {
     vi.mocked(api.getToken).mockReturnValue("fake-jwt");
 
@@ -229,15 +252,51 @@ describe("Layout — auth gate", () => {
     expect(
       within(navigation).getByRole("link", { name: "Home" }),
     ).toHaveAttribute("aria-current", "page");
-    expect(
-      within(navigation).getByRole("link", { name: "Vaults" }),
-    ).toHaveAttribute("href", "/vault");
+    const vaults = within(navigation).getByRole("link", { name: "Vaults" });
+    expect(vaults).toHaveAttribute("href", "/vault");
+    expect(vaults).not.toHaveAttribute("aria-haspopup");
+    expect(vaults).not.toHaveAttribute("data-vault-switcher-trigger");
+    expect(within(navigation).queryByRole("button", { name: "Vaults" })).not.toBeInTheDocument();
     expect(
       within(navigation).getByRole("link", { name: "Search" }),
     ).toHaveAttribute("href", "/search");
     expect(
       screen.getByRole("button", { name: "Collapse sidebar" }),
     ).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(vaults);
+    expect(await screen.findByTestId("vault-directory")).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Vaults" })).not.toBeInTheDocument();
+  });
+
+  it("keeps native directory navigation in the mobile header", async () => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+    await screen.findByTestId("home");
+    const navigation = screen.getByRole("navigation", { name: "Primary mobile navigation" });
+    const vaults = within(navigation).getByRole("link", { name: "Vaults" });
+    expect(vaults).toHaveAttribute("href", "/vault");
+    expect(vaults).toHaveTextContent("");
+    expect(vaults).not.toHaveAttribute("aria-haspopup");
+    expect(vaults).not.toHaveAttribute("data-vault-switcher-trigger");
+    expect(within(navigation).queryByRole("button", { name: "Vaults" })).not.toBeInTheDocument();
+    fireEvent.click(vaults);
+    expect(await screen.findByTestId("vault-directory")).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Vaults" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { surface: "Workspace navigation", modifiers: { ctrlKey: true } },
+    { surface: "Primary mobile navigation", modifiers: { metaKey: true } },
+  ])("$surface preserves native modified Vault directory navigation", async ({ surface, modifiers }) => {
+    vi.mocked(api.getToken).mockReturnValue("fake-jwt");
+    renderAt("/");
+    await screen.findByTestId("home");
+    const vaults = within(screen.getByRole("navigation", { name: surface })).getByRole("link", { name: "Vaults" });
+    fireEvent.click(vaults, modifiers);
+    expect(vaults).toHaveAttribute("href", "/vault");
+    expect(screen.getByTestId("home")).toBeVisible();
+    expect(screen.queryByTestId("vault-directory")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Vaults" })).not.toBeInTheDocument();
   });
 
   it("collapses the workspace sidebar and remembers the preference", async () => {

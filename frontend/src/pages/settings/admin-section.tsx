@@ -16,6 +16,8 @@ import { AdminResetPasswordDialog } from "@/components/admin-reset-password-dial
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { Panel } from "@/components/ui/panel";
+import { Alert } from "@/components/ui/alert";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 import type { User } from "./profile-section";
 
 type AdminSort = "recent" | "oldest" | "username" | "vaults";
@@ -24,8 +26,9 @@ interface Props {
   user: User;
   users: AdminUser[] | null;
   usersError: boolean;
+  usersLoading?: boolean;
   localPasswordEnabled: boolean;
-  onReloadUsers: () => void;
+  onReloadUsers: () => void | Promise<boolean>;
   onDirtyChange?: (dirty: boolean) => void;
   onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
@@ -36,6 +39,7 @@ export function AdminSection({
   user,
   users,
   usersError,
+  usersLoading = false,
   localPasswordEnabled,
   onReloadUsers,
   onDirtyChange,
@@ -43,6 +47,8 @@ export function AdminSection({
   ownsOperation,
   visible = true,
 }: Props) {
+  const [deletedIds, setDeletedIds] = useState<string[]>([]);
+  const [notice, setNotice] = useState("");
   const [adminQuery, setAdminQuery] = useState("");
   const [adminSort, setAdminSort] = useState<AdminSort>("recent");
   const debouncedQuery = useDebounce(adminQuery, 200);
@@ -57,9 +63,9 @@ export function AdminSection({
   const filteredUsers = useMemo(() => {
     if (!users) return [];
     const q = debouncedQuery.trim().toLowerCase();
-    let result = users;
+    let result = users.filter(u => !deletedIds.includes(u.id));
     if (q) {
-      result = users.filter(
+      result = result.filter(
         (u) =>
           u.username.toLowerCase().includes(q) ||
           u.email?.toLowerCase().includes(q) ||
@@ -82,7 +88,7 @@ export function AdminSection({
         break;
     }
     return sorted;
-  }, [users, debouncedQuery, adminSort]);
+  }, [users, debouncedQuery, adminSort, deletedIds]);
 
   async function confirmDeleteUser() {
     if (!pendingDeleteUser) return;
@@ -90,7 +96,11 @@ export function AdminSection({
     setDeletingId(u.id);
     try {
       await adminDeleteUser(u.id);
-      onReloadUsers();
+      if (ownsOperation?.() === false) return;
+      setDeletedIds(ids => [...ids, u.id]);
+      setNotice("User deleted.");
+      const refreshed = await onReloadUsers();
+      if (ownsOperation?.() !== false && refreshed === false) setNotice("User deleted. The user list could not be updated; retry the list below.");
     } finally {
       setDeletingId(null);
     }
@@ -98,7 +108,7 @@ export function AdminSection({
 
   return (
     <>
-      <Activity mode={visible ? "visible" : "hidden"}><section aria-labelledby="settings-users-heading">
+      <Activity mode={visible ? "visible" : "hidden"}><section aria-labelledby="settings-users-heading" aria-busy={usersLoading}>
         <header className="mb-4 flex items-start justify-between gap-4 border-b border-border pb-4">
           <div className="flex items-start gap-3">
             <div>
@@ -109,9 +119,12 @@ export function AdminSection({
             </div>
           </div>
           <Badge variant="default" className="shrink-0 tabular-nums">
-            {users ? `${filteredUsers.length} of ${users.length}` : "··"}
+            {users ? `${filteredUsers.length} of ${users.filter(u => !deletedIds.includes(u.id)).length}` : "··"}
           </Badge>
         </header>
+        {notice && <Alert variant="info" className="mb-3">{notice}</Alert>}
+        {usersLoading && users && <InlineLoadingState label="Updating users" className="py-3" />}
+        {usersError && users && <Alert variant="warning" className="mb-3">Could not update users. Previous users are shown.<Button variant="outline" size="sm" loading={usersLoading} onClick={() => void onReloadUsers()}>Retry</Button></Alert>}
         <Panel variant="workspace">
         <div className="flex flex-col gap-3 border-b border-border p-3 sm:flex-row sm:items-center">
           <div className="relative min-w-0 flex-1">
@@ -140,12 +153,12 @@ export function AdminSection({
           />
         </div>
         <div>
-          {usersError ? (
+          {usersError && !users ? (
             <EmptyState
               title="Couldn't load users"
               description="Something went wrong fetching the user list."
               action={
-                <Button variant="outline" size="sm" onClick={onReloadUsers}>
+                <Button variant="outline" size="sm" loading={usersLoading} onClick={() => void onReloadUsers()}>
                   Retry
                 </Button>
               }

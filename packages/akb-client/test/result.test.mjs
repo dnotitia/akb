@@ -347,6 +347,10 @@ test("docs facade scopes document operations and maps typed payloads", async () 
     depth: 0,
     includeHashes: true,
     includeArchived: true,
+    archiveScope: "all",
+    contentType: "documents",
+    pageSize: 100,
+    cursor: "opaque+/position=",
   });
   const putResult = await client.docs.put({
     collection: "guides",
@@ -383,6 +387,10 @@ test("docs facade scopes document operations and maps typed payloads", async () 
   assert.equal(browseUrl.searchParams.get("depth"), "0");
   assert.equal(browseUrl.searchParams.get("include_hashes"), "true");
   assert.equal(browseUrl.searchParams.get("include_archived"), "true");
+  assert.equal(browseUrl.searchParams.get("archive_scope"), "all");
+  assert.equal(browseUrl.searchParams.get("content_type"), "documents");
+  assert.equal(browseUrl.searchParams.get("page_size"), "100");
+  assert.equal(browseUrl.searchParams.get("cursor"), "opaque+/position=");
   assert.equal(browseResult.throwOnError().data.kind, "document");
 
   assert.equal(seen[2].method, "POST");

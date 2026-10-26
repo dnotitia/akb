@@ -29,6 +29,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { InviteMemberDialog } from "@/components/invite-member-dialog";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 import { Panel } from "@/components/ui/panel";
 import { RoleSelect } from "@/components/role-select";
 import {
@@ -108,6 +109,9 @@ function VaultMembersWorkspace({
   const [info, setInfo] = useState<VaultInfo | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
   const [error, setError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [permissionError, setPermissionError] = useState("");
+  const [notice, setNotice] = useState("");
   const [filter, setFilter] = useState("");
   const [inviteOpen, setInviteOpen] = useState(false);
   const inviteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -150,20 +154,25 @@ function VaultMembersWorkspace({
   const refresh = useCallback(async () => {
     if (!name || checking || !active.current) return;
     const generation = ++loadGeneration.current;
+    setRefreshing(true);
+    setError("");
+    setPermissionError("");
     try {
-      const [nextInfo, nextMembers] = await Promise.all([
-        getVaultInfo(name).catch(() => null),
-        getVaultMembers(name),
-      ]);
+      const [permission, roster] = await Promise.allSettled([getVaultInfo(name), getVaultMembers(name)]);
       if (!active.current || generation !== loadGeneration.current) return;
-      setInfo(nextInfo);
-      setMembers(nextMembers.members || []);
-      setError("");
-    } catch (caught: unknown) {
-      if (!active.current || generation !== loadGeneration.current) return;
-      setInfo(null);
-      setError(errorMessage(caught, "Failed to load members"));
-      setMembers([]);
+      if (permission.status === "fulfilled") setInfo(permission.value);
+      else {
+        setInfo(null);
+        setPermissionError(errorMessage(permission.reason, "Could not verify Vault permissions"));
+      }
+      const denied = [permission, roster].some(result => result.status === "rejected" && [401, 403].includes(result.reason?.status));
+      if (denied) {
+        setInfo(null); setMembers(null);
+        setError("Access could not be verified. Retry to check your membership.");
+      } else if (roster.status === "fulfilled") setMembers(roster.value.members || []);
+      else setError(errorMessage(roster.reason, "Failed to load members"));
+    } finally {
+      if (active.current && generation === loadGeneration.current) setRefreshing(false);
     }
   }, [name, checking]);
 
@@ -196,11 +205,11 @@ function VaultMembersWorkspace({
   const membershipDisabledReason = info?.is_archived
     ? `Vault '${name}' is archived (read-only)`
     : managedWriteDisabledReason;
-  const canManage = hasManageRole && !membershipDisabledReason;
+  const canManage = hasManageRole && !membershipDisabledReason && !refreshing && !permissionError;
   // Ownership transfer is allowed on archived Vaults, but still passes the
   // backend's owner-level managed-write policy guard.
   const hasTransferRole = info?.role === "owner";
-  const canTransfer = hasTransferRole && !managedWriteDisabledReason;
+  const canTransfer = hasTransferRole && !managedWriteDisabledReason && !refreshing && !permissionError;
 
   const filtered = useMemo(() => {
     const list = members || [];
@@ -222,6 +231,9 @@ function VaultMembersWorkspace({
       id: pendingRevoke.id,
       username: pendingRevoke.username,
     });
+    if (!active.current) return;
+    setMembers(current => current?.filter(member => member.id !== pendingRevoke.id) ?? null);
+    setNotice(`Access revoked for ${pendingRevoke.username}.`);
     await refresh();
   }
 
@@ -234,6 +246,9 @@ function VaultMembersWorkspace({
       id: pendingTransfer.id,
       username: pendingTransfer.username,
     });
+    if (!active.current) return;
+    setInfo(null);
+    setNotice(`Ownership transferred to ${pendingTransfer.username}.`);
     await refresh();
   }
 
@@ -283,7 +298,7 @@ function VaultMembersWorkspace({
 
   return (
     <>
-      <div className="@container/members w-full max-w-none">
+      <div className="workspace-density-compact @container/members mx-auto w-full max-w-7xl">
         <h1 id="members-heading" className="sr-only">
           Members
         </h1>
@@ -292,7 +307,7 @@ function VaultMembersWorkspace({
           icon={UsersRound}
           title="Members"
           tone="people"
-          testId="member-roster-header"
+          testId="member-roster-header" compact
           right={
             <>
               {members && !error && (
@@ -320,6 +335,7 @@ function VaultMembersWorkspace({
           }
         />
 
+        {notice && <Alert variant="success" className="mb-3">{notice}</Alert>}
         {undoTarget && (
           <div
             role="status"
@@ -329,7 +345,7 @@ function VaultMembersWorkspace({
               className="h-4 w-4 shrink-0 text-success"
               aria-hidden
             />
-            <span className="text-sm text-foreground">
+            <span className="text-ui text-foreground">
               Changed {undoTarget.username} from {undoTarget.prev} to{" "}
               {undoTarget.next}.
             </span>
@@ -339,7 +355,7 @@ function VaultMembersWorkspace({
             <Button
               variant="ghost"
               size="icon"
-              className="ml-auto"
+              className="workspace-icon-control ml-auto"
               onClick={() => setUndoTarget(null)}
               aria-label="Dismiss role change message"
             >
@@ -357,6 +373,7 @@ function VaultMembersWorkspace({
           variant="workspace"
           role="region"
           aria-labelledby="members-heading"
+          aria-busy={refreshing}
           inset={false}
           data-testid="members-workspace-frame"
           className="overflow-hidden"
@@ -364,7 +381,7 @@ function VaultMembersWorkspace({
           {(total > FILTER_THRESHOLD || filter) && (
             <div
               data-testid="member-roster-controls"
-              className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2.5 @lg/members:px-4"
+              className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-3 @lg/members:px-5 @lg/members:py-2.5"
             >
               <div className="relative w-full @md/members:w-72">
                 <Search
@@ -388,7 +405,10 @@ function VaultMembersWorkspace({
             </div>
           )}
 
-          {error ? (
+          {refreshing && members !== null && <InlineLoadingState label="Updating members" className="px-4 py-3" />}
+          {permissionError && <Alert variant="warning" className="m-4" title="Could not verify Vault permissions">{permissionError}<Button variant="outline" size="sm" loading={refreshing} onClick={() => void refresh()}>Retry permissions</Button></Alert>}
+          {error && members !== null && <Alert variant="destructive" className="m-4" title="Could not update members">{error} Previous members are shown.<Button variant="outline" size="sm" loading={refreshing} onClick={() => void refresh()}>Try again</Button></Alert>}
+          {error && members === null ? (
             <div className="p-4">
               <Alert variant="destructive" title="Failed to load members">
                 {error}
@@ -396,6 +416,7 @@ function VaultMembersWorkspace({
                   <Button
                     variant="outline"
                     size="sm"
+                    loading={refreshing}
                     onClick={() => void refresh()}
                   >
                     Try again
@@ -442,7 +463,7 @@ function VaultMembersWorkspace({
                   <tr>
                     <th
                       scope="col"
-                      className="px-3 py-2.5 font-medium @lg/members:px-4"
+                      className="px-4 py-2.5 font-medium @lg/members:px-5"
                     >
                       Member
                     </th>
@@ -480,14 +501,14 @@ function VaultMembersWorkspace({
                         key={member.id}
                         className="transition-token hover:bg-surface-hover"
                       >
-                        <td className="min-w-0 px-3 py-3 align-middle @lg/members:px-4">
-                          <div className="flex min-w-0 items-center gap-3">
+                        <td className="min-w-0 px-4 py-3 align-middle @lg/members:px-5 @lg/members:py-2.5">
+                          <div className="flex min-w-0 items-center gap-2.5">
                             <span className="hidden @md/members:block">
                               <MemberAvatar member={member} />
                             </span>
                             <div className="min-w-0">
                               <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-                                <span className="min-w-0 break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
+                                <span className="min-w-0 break-words text-ui font-medium text-foreground [overflow-wrap:anywhere]">
                                   {member.display_name?.trim() ||
                                     member.username}
                                 </span>
@@ -495,7 +516,7 @@ function VaultMembersWorkspace({
                                   <Badge variant="info-outline">You</Badge>
                                 )}
                               </div>
-                              <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs leading-relaxed text-foreground-muted">
+                              <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs leading-4 text-foreground-muted">
                                 <span className="break-all">@{member.username}</span>
                                 {member.email && (
                                   <>
@@ -510,7 +531,7 @@ function VaultMembersWorkspace({
                             </div>
                           </div>
                         </td>
-                        <td className="hidden px-4 py-3 align-middle text-xs text-foreground-muted @3xl/members:table-cell">
+                        <td className="hidden px-4 py-3 align-middle text-xs text-foreground-muted @lg/members:py-2.5 @3xl/members:table-cell">
                           {member.since ? (
                             <time
                               dateTime={member.since}
@@ -522,7 +543,7 @@ function VaultMembersWorkspace({
                             "—"
                           )}
                         </td>
-                        <td className="px-2 py-3 text-right align-middle">
+                        <td className="px-2 py-3 text-right align-middle @lg/members:py-2.5">
                           {canChangeRole ? (
                             <RoleSelect
                               vault={name}
@@ -549,7 +570,7 @@ function VaultMembersWorkspace({
                             </span>
                           )}
                         </td>
-                        <td className="py-3 pr-2 text-right align-middle">
+                        <td className="py-3 pr-3 text-right align-middle @lg/members:py-2.5">
                           {canManageMember && (
                             <MemberActionsMenu
                               member={member}
@@ -648,7 +669,7 @@ function MemberAvatar({ member }: { member: Member }) {
   return (
     <span
       aria-hidden
-      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-surface-2 text-xs font-semibold text-foreground"
+      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-surface-2 text-xs font-medium text-foreground"
     >
       {initialsFor(label)}
     </span>
@@ -676,6 +697,7 @@ function MemberActionsMenu({
           variant="ghost"
           size="icon"
           aria-label={`More actions for ${member.username}`}
+          className="workspace-icon-control"
         >
           <MoreHorizontal className="h-4 w-4" aria-hidden />
         </Button>
@@ -723,10 +745,10 @@ function MemberListSkeleton() {
       {[0, 1, 2, 3].map((index) => (
         <div
           key={index}
-          className="flex items-center gap-3 px-4 py-3 lg:px-5"
+          className="flex items-center gap-2.5 px-4 py-3 @lg/members:px-5 @lg/members:py-2.5"
           aria-hidden
         >
-          <span className="h-8 w-8 animate-pulse rounded-full bg-surface-2" />
+          <span className="h-7 w-7 animate-pulse rounded-full bg-surface-2" />
           <div className="flex-1 space-y-2">
             <span className="block h-3 w-32 animate-pulse rounded bg-surface-2" />
             <span className="block h-3 w-48 animate-pulse rounded bg-surface-2" />
@@ -747,7 +769,7 @@ function RolePermissions({ currentRole }: { currentRole?: Role }) {
           size="icon"
           aria-label="Role permissions"
           title="Role permissions"
-          className="h-11 w-11 text-foreground-muted @lg/members:h-9 @lg/members:w-9"
+          className="workspace-icon-control h-11 w-11 text-foreground-muted @lg/members:h-9 @lg/members:w-9"
         >
           <CircleHelp className="h-4 w-4" aria-hidden />
         </Button>

@@ -7,6 +7,9 @@ tools: Read, mcp__akb__akb_search, mcp__akb__akb_get, mcp__akb__akb_put, mcp__ak
 
 # AKB Atlassian Page Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Ingest **one Confluence page** into the target AKB vault as a five-section LLM-wiki summary document — the `akb-wiki` plugin's Confluence write path, specializing `akb-wiki`'s generic `/akb-ingest` pattern.
 
 **Workflow classification.** LLM-wiki **Ingest** workflow. **Intent-debt** layer — Confluence pages externalize design decisions, RFCs, runbooks, post-mortems. Ingest pulls that rationale into the vault before the page evolves out from under the team.
@@ -146,11 +149,11 @@ Two deterministic signals + optional semantic, with version monotonicity short-c
 
 #### Stage 1 — Deterministic match by `(space_key, page_id)`
 
-`akb_search(vault={vault_name}, collection=atlassian-pages, type=reference, tags=["page-id:{page_id}"], limit=5)`. Single-tag filter narrows to the exact page-id cell — AKB's `tags` filter has OR semantics, so multi-tag would broaden instead of narrow; one tag reduces to exact-membership. Confluence page ids are tenant-unique, so `page-id:{page_id}` + collection scope is sufficient. On hit, capture `dedup_hit = doc_id` and `dedup_existing_version = int(version_tag.split(":", 1)[1])` from the `version:{N}` tag; set `dedup_kind = "deterministic"`. Skip Stage 2.
+Enumerate `akb_browse(vault={vault_name}, collection="atlassian-pages", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. Match the exact `page-id:{page_id}` tag. On a match, capture `dedup_hit = item.uri`, `dedup_uri = item.uri`, and `dedup_existing_version` from the `version:{N}` tag; set `dedup_kind = "deterministic"` and skip Stage 2. Multiple matches are ambiguous: report them without writing.
 
 #### Stage 2 — Semantic fallback
 
-Only runs when Stage 1 produced no hit. `akb_search(query={title}, vault={vault_name}, collection=atlassian-pages, type=reference, limit=5)`. Any hit with `score > 0.85` is a fuzzy match — capture `dedup_hit = top_hit.doc_id`, `dedup_kind = "fuzzy"`.
+Only runs when Stage 1 produced no hit. `akb_search(query={title}, vault={vault_name}, collection=atlassian-pages, type=reference, limit=5)`. Read plausible hits by their returned URI and compare the source identity and content; a semantically similar document without confirmed source identity is a fuzzy candidate — capture `dedup_hit = top_hit.uri`, `dedup_uri = top_hit.uri`, `dedup_kind = "fuzzy"`.
 
 #### Decision
 
@@ -250,10 +253,10 @@ Branch by Step 4 resolution.
 
 **Replace** (deterministic newer, or fuzzy resolved to replace):
 
-1. `akb_get(vault={vault_name}, doc_id={dedup_hit}) → existing_content`.
+1. `akb_get(uri={dedup_uri}) → existing_content`.
 2. Apply **timeline merge — Mode B (entry-only append)** with `new_entry = "- **{today}** | Re-ingested page version {page.version} (was version {dedup_existing_version}). [Source: ingest-confluence, {today}]"`.
 3. Build final `content`: everything from the new body **above** `---` + `## Timeline` (compiled-truth refresh) + Mode B's merged timeline section.
-4. `akb_update(vault={vault_name}, doc_id={dedup_hit}, tags={tags}, content={merged_content}, summary={one_sentence_summary}, message="Re-ingested page version {page.version}")` — bumped `version:{page.version}` tag enables next-run dedup.
+4. `akb_update(uri={dedup_uri}, tags={tags}, content={merged_content}, summary={one_sentence_summary}, message="Re-ingested page version {page.version}")` — bumped `version:{page.version}` tag enables next-run dedup.
 
 Mode B is the right choice here: the new entry is a single bullet, the rest of the body is rewritten in place, and timeline is the only history-preserving zone.
 

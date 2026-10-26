@@ -101,6 +101,14 @@ class AuthenticatedUser:
     # "not a tokens-table credential" (JWT/OAuth), so PAT scope enforcement
     # is skipped. A concrete empty set is deny-all.
     token_scopes: frozenset[str] | None = None
+    # Verified request-carrier receipts, not API profile fields. Slow account
+    # asset transfers recheck these under the authoritative user/session locks
+    # before publishing; no unverified token parsing occurs downstream.
+    local_session_generation: int | None = None
+    local_session_expires_at: float | None = None
+    browser_session_id: uuid.UUID | None = None
+    browser_session_epoch: uuid.UUID | None = None
+    browser_session_runtime_generation: int | None = None
 
 
 # ── Password hashing ────────────────────────────────────────
@@ -1711,6 +1719,8 @@ async def _project_local_session_principal(
                 display_name=row["display_name"],
                 is_admin=row["is_admin"],
                 auth_method="jwt",
+                local_session_generation=row["session_generation"],
+                local_session_expires_at=float(principal.claims["exp"]),
             )
 
 

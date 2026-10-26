@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/* \
 WORKDIR /app
 
 COPY . .
+RUN printf '%s\n' "$AKB_SOURCE_REVISION" > /app/.akb-source-revision
 RUN pip install --no-cache-dir .
 RUN /usr/local/bin/python -I -B -c "import app.cli; import mcp_server"
 

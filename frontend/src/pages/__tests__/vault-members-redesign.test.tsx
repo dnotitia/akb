@@ -537,3 +537,39 @@ describe("Vault Members redesign", () => {
     );
   });
 });
+
+
+describe("Members loading recovery", () => {
+  it("keeps the roster when permissions fail and exposes a busy retry", async () => {
+    getVaultInfoMock.mockRejectedValueOnce(new Error("Permission service unavailable"));
+    renderPage();
+    await screen.findByText("Could not verify Vault permissions");
+    expect(screen.getByRole("table", { name: "Vault members" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Invite member" })).toBeNull();
+    let resolve!: (value: unknown) => void;
+    getVaultInfoMock.mockReturnValueOnce(new Promise(r => { resolve = r; }));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Retry permissions" }));
+    expect(screen.getByTestId("members-workspace-frame")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("table", { name: "Vault members" })).toBeVisible();
+    await act(async () => resolve({ role: "owner" }));
+    expect(screen.getByRole("button", { name: "Invite member" })).toBeEnabled();
+    expect(screen.getByTestId("members-workspace-frame")).toHaveAttribute("aria-busy", "false");
+  });
+
+  it("keeps surviving members and reports revoke success when the following read fails", async () => {
+    vi.mocked(revokeAccess).mockResolvedValue({} as never);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole("button", { name: "More actions for mina" }));
+    await user.click(screen.getByRole("menuitem", { name: "Revoke access" }));
+    getVaultMembersMock.mockRejectedValueOnce(new Error("Roster unavailable"));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Revoke access" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.getByText("Access revoked for mina.")).toBeVisible();
+    expect(screen.getByText("Dana Lee")).toBeVisible();
+    expect(screen.queryByText("Mina Park")).toBeNull();
+    expect(screen.getByText("Could not update members")).toBeVisible();
+    expect(screen.getByTestId("members-workspace-frame")).toHaveAttribute("aria-busy", "false");
+  });
+});

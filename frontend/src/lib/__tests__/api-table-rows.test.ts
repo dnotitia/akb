@@ -6,6 +6,7 @@ import {
   getVaultTableRow,
   insertVaultTableRow,
   listVaultTableRows,
+  listVaultTables,
   setToken,
   TableRowConflictError,
   updateVaultTableRow,
@@ -25,6 +26,25 @@ afterAll(() => {
 });
 
 describe("Vault table row API contracts", () => {
+  it("can read a page without requesting an exact count", async () => {
+    server.use(http.get("*/api/v1/tables/ops/incidents/rows", ({ request }) => {
+      expect(request.headers.has("prefer")).toBe(false);
+      expect(new URL(request.url).searchParams.get("limit")).toBe("51");
+      return HttpResponse.json({ kind: "table_query", columns: [], items: [], total: 0 });
+    }));
+    await listVaultTableRows("ops", "incidents", { limit: 51, countExact: false });
+  });
+
+  it("requests a schema-only catalog explicitly, preserving the counted default", async () => {
+    const flags: Array<string | null> = [];
+    server.use(http.get("*/api/v1/tables/ops", ({ request }) => {
+      flags.push(new URL(request.url).searchParams.get("include_row_counts"));
+      return HttpResponse.json({ items: [] });
+    }));
+    await listVaultTables("ops");
+    await listVaultTables("ops", { includeRowCounts: false });
+    expect(flags).toEqual([null, "false"]);
+  });
   it("loads a bounded row page with an exact total", async () => {
     server.use(
       http.get(`*/api/v1/tables/ops/incidents/rows`, ({ request }) => {
@@ -83,6 +103,7 @@ describe("Vault table row API contracts", () => {
         const url = new URL(request.url);
         expect(url.searchParams.get("id")).toBe(`eq.${rowId}`);
         expect(url.searchParams.get("limit")).toBe("1");
+        expect(request.headers.has("prefer")).toBe(false);
         return HttpResponse.json({
           kind: "table_query",
           columns: ["id", "title"],

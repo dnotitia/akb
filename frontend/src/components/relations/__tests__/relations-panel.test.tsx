@@ -77,3 +77,15 @@ describe("RelationsPanel authority and source ownership", () => {
     expect(screen.queryByText("Hidden")).not.toBeInTheDocument();
   });
 });
+
+it("does not show an empty result before discovery succeeds", () => {
+  render(<MemoryRouter><RelationsPanel vault="alpha" sourceUri="akb://alpha/doc/a.md" relations={[]} relationsError={false} initialLoading hasSnapshot={false} canWrite={false} graphHref="/graph" onReload={vi.fn()} /></MemoryRouter>);
+  expect(screen.getByRole("status", { name: "Loading relations" })).toBeInTheDocument();
+  expect(screen.queryByText("No relations yet.")).not.toBeInTheDocument();
+  expect(screen.queryByText("0 relations")).not.toBeInTheDocument();
+});
+it("retains loaded rows with a retry after a background failure", () => {
+  render(<MemoryRouter><RelationsPanel vault="alpha" sourceUri="akb://alpha/doc/a.md" relations={[explicit]} relationsError canWrite={false} graphHref="/graph" onReload={vi.fn()} /></MemoryRouter>);
+  expect(screen.getByText("Visible relation", { exact: false })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Retry relations" })).toBeEnabled();
+});

@@ -130,6 +130,15 @@ updates are applied by the package and never become serialized Markdown:
 />
 ```
 
+`MarkdownViewer.afterLeadingHeading` accepts a React node for read-only
+metadata or controls after the first block when it is a heading, or before a
+headingless body. It uses a ProseMirror widget and a React portal: the source,
+document model, reference definitions and authored heading IDs stay intact.
+The slot is excluded from Markdown DOM normalization and keyboard-control
+rewriting. Updating/removing it never writes into the document. Product CSS
+can style its `[data-markdown-leading-adornment]` host. It is intentionally a
+viewer option, not an editable document node.
+
 The WYSIWYG editor enables one common slash menu by default. It owns these ten
 commands: Heading 1–3, Quote, Bullet list, Numbered list, Task list, Table,
 Code block, and Divider. The menu filters its localized labels, descriptions,

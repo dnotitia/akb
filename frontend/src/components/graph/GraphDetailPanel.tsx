@@ -1,17 +1,18 @@
+import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowDownLeft, ArrowUpRight, ChevronRight, Copy, Crosshair, ExternalLink,
   Eye, EyeOff, FileText, MoreHorizontal, Network, Paperclip, Pin, PinOff, Table2, X,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { LoadingState } from "@/components/ui/loading-state";
+import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TonalIcon } from "@/components/ui/tonal-icon";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { getDocument, getRelations, type RelationRow } from "@/lib/api";
+import { ApiError, getDocument, getRelations, type RelationRow } from "@/lib/api";
 import { parseUri } from "@/lib/uri";
 import {
   ALL_NODE_KINDS, ALL_RELATIONS, RELATION_LABEL, kindToSegment,
@@ -54,6 +55,7 @@ export function GraphDetailPanel({
   onTogglePin, pinned, onFocus, onOpen, onPreview, onExpand, expanding = false,
   expansionError, onHide,
 }: Props) {
+  const queryClient = useQueryClient();
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const canQuery = !!user?.user_id && !checking;
@@ -84,10 +86,12 @@ export function GraphDetailPanel({
   });
   const relationsQuery = useQuery({
     queryKey: ["relations", user?.user_id, revision, vault, uri],
-    queryFn: () => getRelations(vault, uri),
+    queryFn: ({ queryKey, signal }) => readWithAccessBoundary(queryClient, queryKey, () => getRelations(vault, uri), signal),
     enabled: canQuery,
     retry: false,
   });
+  const relationsDenied = relationsQuery.error instanceof ApiError && [401, 403, 404].includes(relationsQuery.error.status);
+  const hasRelations = Boolean(relationsQuery.data) && !relationsDenied;
   const relations = useMemo(() => normalizeRelations(relationsQuery.data?.relations ?? []), [relationsQuery.data]);
   const title = (kind === "document" && resourceQuery.data?.title) || name;
   const summary = kind === "document" ? resourceQuery.data?.summary : undefined;
@@ -178,20 +182,20 @@ export function GraphDetailPanel({
           {expansionError && <Alert variant="destructive" className="mt-2 text-xs">{expansionError}</Alert>}
         </header>
 
-        <section aria-label="Connections" className="border-t border-border px-4 py-3">
+        <section aria-label="Connections" aria-busy={relationsQuery.isFetching} className="border-t border-border px-4 py-3">
           <div className="mb-3 flex items-center justify-between gap-2">
             <h3 className="text-sm font-semibold text-foreground">Connections</h3>
-            {relationsQuery.isSuccess && <span className="text-xs tabular-nums text-foreground-muted">{relationCount}</span>}
+            {hasRelations && <span className="text-xs tabular-nums text-foreground-muted">{relationCount}</span>}
           </div>
+          {relationsQuery.isFetching && hasRelations && <InlineLoadingState label="Updating connections" />}
+          {relationsQuery.isError && <Alert variant="destructive"><div>
+            <p className="font-medium">Couldn't load connections.</p>
+            <p className="mt-1 break-words text-xs">{relationsQuery.error instanceof Error ? relationsQuery.error.message : "Please try again."}</p>
+            <Button type="button" size="sm" variant="outline" className="mt-2" loading={relationsQuery.isFetching} onClick={() => void relationsQuery.refetch()}>Retry connections</Button>
+          </div></Alert>}
           {relationsQuery.isLoading ? (
             <LoadingState label="Loading connections" className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="mt-2 h-10 w-full" /></LoadingState>
-          ) : relationsQuery.isError ? (
-            <Alert variant="destructive"><div>
-              <p className="font-medium">Couldn't load connections.</p>
-              <p className="mt-1 break-words text-xs">{relationsQuery.error instanceof Error ? relationsQuery.error.message : "Please try again."}</p>
-              <Button type="button" size="sm" variant="outline" className="mt-2" onClick={() => relationsQuery.refetch()}>Retry connections</Button>
-            </div></Alert>
-          ) : relationCount === 0 ? (
+          ) : relationsQuery.isError && !hasRelations ? null : relationCount === 0 ? (
             <p className="py-2 text-sm text-foreground-muted">No direct connections</p>
           ) : (
             <div className="space-y-4" key={uri}>

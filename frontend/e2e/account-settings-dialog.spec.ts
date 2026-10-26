@@ -56,6 +56,39 @@ test("unsaved profile changes protect Escape, dismissal and section changes", as
   await expect(page).toHaveURL(/\/$/);
 });
 
+for (const scenario of [
+  { width: 375, height: 812, dark: false },
+  { width: 1440, height: 900, dark: true },
+  { width: 812, height: 375, dark: true },
+]) test(`password draft protects immediate Escape at ${scenario.width}x${scenario.height}`, async ({ page }, testInfo) => {
+  await setup(page, { dark: scenario.dark });
+  await page.setViewportSize(scenario);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/settings");
+  const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
+  const current = dialog.getByLabel("Current password", { exact: true });
+  await expect(current).toBeEnabled();
+  await current.fill("Unsaved synthetic password");
+  await page.keyboard.press("Escape");
+  const confirm = page.getByRole("dialog", { name: "Discard unsaved changes?" });
+  await expect(confirm).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("settings-password-discard.png"), animations: "disabled" });
+  await confirm.getByRole("button", { name: "Keep editing" }).click();
+  await expect(current).toHaveValue("Unsaved synthetic password");
+  await expect(current).toBeFocused();
+  expect(await page.evaluate(() => {
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  })).toBe(true);
+  // Reverting the only edit restores a normal, confirmation-free close.
+  await current.fill("");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(confirm).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
 for (const width of [375, 1440]) for (const dark of [false, true]) test(`settings deep link and theme controls fit ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
   await setup(page, { dark });
   await page.setViewportSize({ width, height: 800 });

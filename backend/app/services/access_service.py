@@ -2166,12 +2166,17 @@ async def delete_user_account(user_id: str) -> dict:
     async with pool.acquire() as conn:
         # Detach residual references rather than deleting the artifacts
         async with role_authority_transaction(conn):
+            # Serialize with avatar publication before reading its cleanup
+            # snapshot. The remote candidate PUT never holds this user lock.
+            await conn.fetchrow("SELECT id FROM users WHERE id=$1 FOR UPDATE", uid)
             await conn.execute("UPDATE vault_access SET granted_by = NULL WHERE granted_by = $1", uid)
             await conn.execute(
                 "UPDATE vault_access_contributions SET granted_by = NULL WHERE granted_by = $1",
                 uid,
             )
             await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
+            from app.repositories.user_avatars_repo import enqueue_account_cleanup
+            await enqueue_account_cleanup(conn, uid)
             # CASCADE handles tokens + vault_access.user_id + the bases behind it
             await conn.execute("DELETE FROM users WHERE id = $1", uid)
 

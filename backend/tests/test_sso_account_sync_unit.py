@@ -50,3 +50,28 @@ async def test_failed_second_user_discards_partial_page():
         transport=httpx.MockTransport(respond))
     with pytest.raises(ProviderControlError):
         await control.read_managed_account_states(("first", "second"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["valid", "wrong_name", "missing_id", "disabled", "forbidden"])
+async def test_realm_identity_requires_live_exact_realm_read(mode):
+    calls = []
+    def respond(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "fixture-token"})
+        assert request.url.path == "/admin/realms/akb"
+        if mode == "forbidden":
+            return httpx.Response(403)
+        return httpx.Response(200, json={"id": None if mode == "missing_id" else "realm-uuid",
+            "realm": "other" if mode == "wrong_name" else "akb", "enabled": mode != "disabled"})
+    control = KeycloakProviderControl(KeycloakAdminConfig("https://internal.example.test",
+        "https://sso.example.test", "akb", "manager", "fixture-secret", True),  # pragma: allowlist secret
+        transport=httpx.MockTransport(respond))
+    if mode == "valid":
+        assert await control.read_realm_identity() == {"realm_id": "realm-uuid", "realm_name": "akb",
+            "issuer": "https://sso.example.test/realms/akb"}
+    else:
+        with pytest.raises(ProviderControlError):
+            await control.read_realm_identity()
+    assert calls == [("POST", "/realms/akb/protocol/openid-connect/token"), ("GET", "/admin/realms/akb")]

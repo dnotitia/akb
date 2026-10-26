@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Owns read-only HTTP fixtures; never writes user data.");
 
 for (const width of [375, 2560]) for (const dark of [false, true]) {
-  test(`Search page selected Vaults wrap and survive reload at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+  test(`Search page Vault summary preserves selections across reload at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 1000 });
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.addInitScript(({ dark }) => {
@@ -37,10 +37,10 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     const query = page.getByRole("searchbox", { name: "Search query", exact: true });
     await expect(query).toHaveValue("guide");
     const command = page.getByTestId("search-command-header");
-    const removeAlpha = command.getByRole("button", { name: "Remove alpha from search scope" });
-    const removeBeta = command.getByRole("button", { name: "Remove beta from search scope" });
-    await expect(removeAlpha).toBeInViewport();
-    await expect(removeBeta).toBeInViewport();
+    const summary = command.getByRole("button", { name: "Search scope: 2 vaults", exact: true });
+    await expect(summary).toHaveText("2 vaults");
+    await expect(summary).toBeInViewport();
+    await expect(command.getByRole("group", { name: "Vault search scope" }).getByRole("button")).toHaveCount(1);
     await expect(query).toBeInViewport();
     const queryBox = (await query.boundingBox())!;
     const submitBox = (await command.getByRole("button", { name: "Search", exact: true }).boundingBox())!;
@@ -49,14 +49,19 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await page.screenshot({ path: testInfo.outputPath("search-multi-vault.png") });
 
     await page.reload();
-    await expect(page.getByRole("button", { name: "Search scope: alpha, beta", exact: true })).toBeVisible();
-    await removeAlpha.click();
+    await summary.click();
+    await expect(page.getByRole("menuitemcheckbox", { name: /^alpha(?:\s*Current vault)?$/ })).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByRole("menuitemcheckbox", { name: "beta", exact: true })).toHaveAttribute("aria-checked", "true");
+    await page.getByRole("menuitemcheckbox", { name: /^alpha(?:\s*Current vault)?$/ }).click();
+    await page.keyboard.press("Escape");
     await expect(page.getByRole("button", { name: "Search scope: beta", exact: true })).toBeVisible();
     await page.goBack();
-    await expect(page.getByRole("button", { name: "Search scope: alpha, beta", exact: true })).toBeVisible();
+    await expect(summary).toBeVisible();
     await page.goForward();
     await expect(page.getByRole("button", { name: "Search scope: beta", exact: true })).toBeVisible();
-    await removeBeta.click();
+    await page.getByRole("button", { name: "Search scope: beta", exact: true }).click();
+    await page.getByRole("menuitemcheckbox", { name: "beta", exact: true }).click();
+    await page.keyboard.press("Escape");
     await expect.poll(() => searches.at(-1)?.searchParams.getAll("vault")).toEqual([]);
     expect(new URL(page.url()).searchParams.has("v")).toBe(true);
     expect(new URL(page.url()).searchParams.get("v")).toBe("");
@@ -68,7 +73,7 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await page.getByRole("button", { name: "Add beta to search scope", exact: true }).click();
     await expect(query).toHaveValue("");
     await expect(query).toBeFocused();
-    await expect(page.getByRole("button", { name: "Remove beta from search scope" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Search scope: beta", exact: true })).toBeVisible();
     expect(new URL(page.url()).searchParams.get("source")).toBe("file");
     await query.fill("new guide");
     await command.getByRole("button", { name: "Search", exact: true }).click();
@@ -98,7 +103,7 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await expect(query).toHaveValue("modal guide");
     expect(new URL(page.url()).searchParams.get("v")).toBe("alpha,beta");
     expect(new URL(page.url()).searchParams.get("source")).toBe("file");
-    await expect(page.getByRole("button", { name: "Search scope: alpha, beta", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Search scope: 2 vaults", exact: true })).toBeVisible();
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe("/vault/alpha/search");
     await expect(query).toHaveValue("new guide");

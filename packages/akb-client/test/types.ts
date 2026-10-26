@@ -242,6 +242,13 @@ const documentPutInput: AkbDocumentPutInput = {
 };
 const browsedDocs = await docs.browse({ collection: "guides", depth: 0, includeHashes: true });
 browsedDocs.throwOnError().data.kind satisfies "document";
+const browsePage = browsedDocs.throwOnError().data;
+browsePage.complete satisfies boolean | null | undefined;
+browsePage.scanned satisfies number | null | undefined;
+if (browsePage.next_cursor) await docs.browse({ pageSize: 100, cursor: browsePage.next_cursor });
+await docs.browse({ contentType: "collections", pageSize: 100, cursor: "opaque", archiveScope: "all" });
+// @ts-expect-error paging resource kinds use the API's plural names.
+docs.browse({ contentType: "document" });
 const fetchedDoc = await docs.get("guides/readme.md", { version: "abc1234" });
 fetchedDoc.throwOnError().data.content satisfies string | null | undefined;
 const putDoc = await docs.put(documentPutInput);

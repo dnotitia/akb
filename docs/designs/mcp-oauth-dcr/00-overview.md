@@ -51,7 +51,7 @@ By contrast, the Resource Server role is small and well-bounded:
 3. Enforce the existing PG-native RBAC.
 
 Steps 1 and 2 are implemented in
-[`backend/app/services/keycloak_oidc.py`](../../backend/app/services/keycloak_oidc.py)
+[`backend/app/services/keycloak_oidc.py`](../../../backend/app/services/keycloak_oidc.py)
 and the common verified-principal projector. REST and MCP select distinct
 profiles before parsing any untrusted JOSE metadata.
 

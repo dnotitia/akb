@@ -9,7 +9,7 @@ import uuid
 import asyncpg
 import pytest
 
-from app.exceptions import ConflictError, ForbiddenError, ValidationError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.services import app_legacy_adoption_service as adoption
 from app.services import app_resource_service as resources
 from app.services.auth_service import AuthenticatedUser
@@ -222,3 +222,41 @@ async def test_target_authorization_denies_before_app_lookup(monkeypatch) -> Non
             correlation_id="unit-test",
         )
     assert called is True
+
+
+@pytest.mark.asyncio
+async def test_same_name_recreation_during_authorization_never_grants_old_history(monkeypatch):
+    original, replacement = uuid.uuid4(), uuid.uuid4()
+
+    class _Pool:
+        def acquire(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def fetch(self, query, *_args):
+            if "FROM app_legacy_adoption_targets" in query:
+                return [{"vault_id": original}]
+            return [{"id": original, "name": "reused-name"}]
+
+    async def pool():
+        return _Pool()
+
+    async def replacement_access(*_args, **_kwargs):
+        return {"vault_id": replacement, "role": "admin"}
+
+    monkeypatch.setattr(adoption, "get_pool", pool)
+    monkeypatch.setattr(adoption, "check_vault_access", replacement_access)
+    with pytest.raises(NotFoundError):
+        await adoption._authorize_existing_plan(
+            _user(), uuid.uuid4(), uuid.uuid4(), action="read", correlation_id="name-race",
+        )
+    with pytest.raises(ForbiddenError):
+        await adoption._authorize_target_vaults(
+            _user(), [_target(original)], app_id=uuid.uuid4(),
+            action="create", correlation_id="name-race",
+        )

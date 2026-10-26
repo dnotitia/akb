@@ -36,5 +36,4 @@ collections:
     guide: |
       채용 프로세스, JD 템플릿, 면접 가이드를 저장합니다.
       권장 문서 타입: reference
-      템플릿: doc-templates/job-description.md
     suggested_types: [reference, plan]

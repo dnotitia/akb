@@ -1,0 +1,13 @@
+id: q001
+category: api-contract
+query: "In the fictional Orchard demo, what constraints apply to every mutating Catalog API request?"
+ground_truth:
+  must_mention:
+    - "Idempotency-Key"
+    - "allowlist"
+    - "credential references"
+  forbidden:
+    - "any endpoint is permitted"
+    - "raw secrets are sent in the request payload"
+  source_docs:
+    - "akb://bench-synthetic/coll/fixtures/doc/catalog-api.md"

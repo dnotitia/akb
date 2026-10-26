@@ -23,7 +23,7 @@ from .paths import evalset_dir, runs_dir
 
 # `evalset/` is the private Korean-law set the harness shipped against;
 # `EVALSET_DIR` points the same code at another one — e.g. the tracked
-# `evalset-project-akb/` seed questions. Resolved in `paths` so the runner,
+# `evalset-synthetic/` seed questions. Resolved in `paths` so the runner,
 # the judge prep and this aggregator cannot disagree about which questions
 # a run is about.
 EVALSET = evalset_dir()

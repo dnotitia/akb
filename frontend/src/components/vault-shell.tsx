@@ -1,12 +1,16 @@
 import { Outlet, useLocation, useNavigate, useParams, useOutletContext } from "react-router-dom";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
-import { RailCollapseButton } from "@/components/navigation-rail-controls";
 import { AppPageLocation } from "@/components/app-page-location";
 import { VaultExplorer } from "@/components/vault-explorer";
 import { VaultCreateDialog } from "@/components/vault-create-dialog";
 import { DocumentCreateDialog } from "@/components/document-create-dialog";
-import { VaultRail } from "@/components/vault-rail";
+import { VaultNavigationHeader } from "@/components/vault-navigation-header";
+import { VaultDirectorySidebar } from "@/components/vault-directory-sidebar";
+import { VaultParentBackLink, VaultNavigationToggle } from "@/components/vault-navigation-controls";
+import { WorkspacePersonalSections } from "@/components/workspace-personal-sections";
+import { useCurrentUser } from "@/contexts/current-user-context";
+import { useVaults } from "@/hooks/use-vaults";
+import { useWorkspaceShortcuts } from "@/lib/workspace-shortcuts";
 import { TitleBar } from "@/components/title-bar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
@@ -20,17 +24,13 @@ import { cn } from "@/lib/utils";
 import { focusedVaultPageForPath } from "@/lib/vault-workspace";
 
 const TREE_VISIBLE_KEY = "akb.treeVisible";
-const VAULT_COLLAPSED_KEY = "akb.vaultRailCollapsed";
 
-export interface VaultNavigationControl {
-  open: boolean;
-  onToggle: () => void;
-}
+export type { VaultNavigationControl } from "@/components/vault-navigation-controls";
 
 /**
- * Content exploration retains Collections; Vault-level tasks omit it. All named
- * Vault routes share the same header menu. Explicit rail choices
- * survive the presentation change, including browser history and direct entry.
+ * One context panel owns Vault selection and content exploration. The global
+ * app rail remains separate; the same panel shows Vaults or their collections.
+ * Panel width and visibility survive route changes and responsive overlays.
  */
 export function VaultShell() {
   const { name } = useParams<{ name: string }>();
@@ -38,7 +38,6 @@ export function VaultShell() {
   const navigate = useNavigate();
   const layout = useOutletContext<{
     setVaultNavigationWidth?: (width: number) => void;
-    setVaultNavigationControl?: (control: VaultNavigationControl | null) => void;
     minimumVaultWorkspaceWidth?: number;
   } | null>();
   const focusedPage = focusedVaultPageForPath(location.pathname);
@@ -70,46 +69,45 @@ export function VaultShell() {
       : true,
   );
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [directoryVisible, setDirectoryVisible] = useState(true);
+  const previousVault = useRef(name);
   const workspaceRef = useRef<HTMLDivElement>(null);
+  const navigationStubRef = useRef<HTMLDivElement>(null);
+  const [collapsedNavigationWidth, setCollapsedNavigationWidth] = useState(37);
+  const navigationHadFocus = useRef(false);
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [minimumContentWidth, setMinimumContentWidth] = useState(656);
-  const [mobileRailCollapsed, setMobileRailCollapsed] = useState(false);
   const [visible, setVisible] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
     return window.localStorage.getItem(TREE_VISIBLE_KEY) !== "0";
   });
+  useLayoutEffect(() => {
+    if (previousVault.current === name) return;
+    // Entering a Vault replaces a visible directory in-place. A fresh deep
+    // link still honors its saved preference; returning restores the directory.
+    if (!previousVault.current && name) setVisible(directoryVisible);
+    if (previousVault.current && !name) setDirectoryVisible(true);
+    previousVault.current = name;
+  }, [name, directoryVisible]);
   const [routeTreeOverride, setRouteTreeOverride] = useState<{
     key: string;
     visible: boolean;
   } | null>(null);
-  const tree = useColumnResize({
-    storageKey: "akb.treeWidth.v2",
-    min: 220,
-    max: 480,
-    default: 258,
+  const panel = useColumnResize({
+    storageKey: "akb.focusedNavigationWidth.v1",
+    min: 224,
+    max: 360,
+    default: 256,
   });
-  // Vault switcher rail (expanded mode) — drag-resizable like the tree, its own
-  // persisted width. Collapsed mode stays a fixed w-14 icon rail.
-  const rail = useColumnResize({
-    storageKey: "akb.vaultRailWidth.v2",
-    min: 192,
-    max: 320,
-    default: 218,
-  });
-
-  // The vault column can simplify to a thin icon rail (persisted) when the user
-  // wants the space back; the tree column collapses independently via ⌘\.
-  const [vaultCollapsed, setVaultCollapsed] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem(VAULT_COLLAPSED_KEY) === "1";
-  });
-  const toggleVaultCollapsed = useCallback(() => {
-    setVaultCollapsed((c) => {
-      const next = !c;
-      window.localStorage.setItem(VAULT_COLLAPSED_KEY, next ? "1" : "0");
-      return next;
-    });
+  const navigationTrigger = useCallback(() => {
+    const opener = document.getElementById("vault-navigation-trigger");
+    if (opener && !opener.hidden) return opener;
+    const closer = document.getElementById("vault-navigation-collapse");
+    return closer && !closer.closest("[hidden]") ? closer : null;
   }, []);
+  const focusNavigationTrigger = useCallback(() => {
+    navigationTrigger()?.focus();
+  }, [navigationTrigger]);
 
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1024px)");
@@ -120,31 +118,42 @@ export function VaultShell() {
   }, []);
 
   useEffect(() => {
-    setMobileNavOpen(false);
-  }, [location.pathname]);
+    const showDirectory = location.pathname === "/vault" && location.state?.vaultSidebarNavigation === true;
+    setMobileNavOpen(showDirectory);
+    if (!showDirectory) return;
+    setDirectoryVisible(true);
+    const frame = requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>('[data-slot="vault-directory-sidebar"] input[type="search"]')?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [location.pathname, location.search, location.state?.vaultSidebarNavigation]);
 
   const setTreeVisible = useCallback((next: boolean) => {
     setVisible(next);
-    window.localStorage.setItem(TREE_VISIBLE_KEY, next ? "1" : "0");
+    try { window.localStorage.setItem(TREE_VISIBLE_KEY, next ? "1" : "0"); } catch { /* Keep the session choice when storage is unavailable. */ }
   }, []);
 
   // A Collection deep link may reveal its tree without changing the user's
   // saved rail preference. Ordinary section changes retain the same rail.
   const collectionTarget = location.pathname === `/vault/${encodeURIComponent(name ?? "")}`
     ? new URLSearchParams(location.search).get("collection") : null;
-  const routeTreeKey = collectionTarget ? `collection:${location.key}` : "";
-  const effectiveTreeVisible = collectionTarget
+  // A card in the main Collection workspace already presents its destination;
+  // a raw deep link or picker shortcut may still reveal the explorer for it.
+  const revealCollectionTarget = collectionTarget && location.state?.collectionView !== "main";
+  const routeTreeKey = revealCollectionTarget ? `collection:${location.key}` : "";
+  const effectiveTreeVisible = !name ? directoryVisible : revealCollectionTarget
     ? routeTreeOverride?.key === routeTreeKey ? routeTreeOverride.visible : true
     : visible;
   const setEffectiveTreeVisible = useCallback(
     (next: boolean) => {
-      if (collectionTarget) {
+      if (!name) { setDirectoryVisible(next); return; }
+      if (revealCollectionTarget) {
         setRouteTreeOverride({ key: routeTreeKey, visible: next });
         return;
       }
       setTreeVisible(next);
     },
-    [routeTreeKey, setTreeVisible, collectionTarget],
+    [routeTreeKey, setTreeVisible, revealCollectionTarget, name],
   );
 
   // Callback-ref pattern: children publish their refetch fns on mount; the
@@ -161,16 +170,16 @@ export function VaultShell() {
   }, []);
   const openCreateVault = useCallback(() => {
     if (document.activeElement instanceof HTMLElement) {
-      createVaultTriggerRef.current = document.activeElement;
+      createVaultTriggerRef.current = mobileNavOpen ? document.getElementById("vault-navigation-trigger") : document.activeElement;
     }
     setMobileNavOpen(false);
     setCreateVaultOpen(true);
-  }, []);
+  }, [mobileNavOpen]);
   const handleVaultCreated = useCallback(
     (vaultName: string) => {
       setCreateVaultOpen(false);
       refetchVaults();
-      navigate(`/vault/${vaultName}`);
+      navigate(`/vault/${encodeURIComponent(vaultName)}`);
     },
     [navigate, refetchVaults],
   );
@@ -178,7 +187,7 @@ export function VaultShell() {
     (options?: DocumentCreateDialogOptions) => {
       if (!name) return;
       if (document.activeElement instanceof HTMLElement) {
-        createDocumentTriggerRef.current = document.activeElement;
+        createDocumentTriggerRef.current = mobileNavOpen ? document.getElementById("vault-navigation-trigger") : document.activeElement;
       }
       setMobileNavOpen(false);
       setCreateDocument((current) => ({
@@ -187,7 +196,7 @@ export function VaultShell() {
         session: current.session + 1,
       }));
     },
-    [name],
+    [name, mobileNavOpen],
   );
   const handleDocumentCreated = useCallback(
     (path?: string) => {
@@ -195,17 +204,15 @@ export function VaultShell() {
       if (!name) return;
       navigate(
         path
-          ? `/vault/${name}/doc/${encodeURIComponent(path)}`
-          : `/vault/${name}`,
+          ? `/vault/${encodeURIComponent(name)}/doc/${encodeURIComponent(path)}`
+          : `/vault/${encodeURIComponent(name)}`,
       );
     },
     [name, navigate],
   );
 
-  const workspaceNavigationWidth =
-    (vaultCollapsed ? 56 : rail.width) +
-    (!vaultCollapsed && !!name ? 1 : 0) +
-    (name && !isFocusedWorkspace ? (effectiveTreeVisible ? tree.width : 40) : 0) + 1;
+  const workspaceNavigationWidth = panel.width + 1;
+  const settledNavigationWidth = panel.settledWidth + 1;
   // Measure the workspace after the personal rail, not a viewport breakpoint.
   // A narrow reading surface temporarily uses the existing navigation drawer;
   // neither the saved widths nor the user's expanded/collapsed preference changes.
@@ -223,81 +230,139 @@ export function VaultShell() {
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
-  const navigationOverlay = desktopNav && workspaceWidth > 0 && workspaceWidth - workspaceNavigationWidth < (layout?.minimumVaultWorkspaceWidth ?? minimumContentWidth);
-  const inlineNavigation = desktopNav && !navigationOverlay;
+  const navigationOverlay = desktopNav && workspaceWidth > 0 && workspaceWidth - settledNavigationWidth < (layout?.minimumVaultWorkspaceWidth ?? minimumContentWidth);
+  const inlineNavigation = desktopNav && !navigationOverlay && effectiveTreeVisible;
+  const navigationOpen = inlineNavigation || mobileNavOpen;
   useEffect(() => {
-    if (!collectionTarget) setRouteTreeOverride(null);
-    if (collectionTarget && !inlineNavigation) setMobileNavOpen(true);
-  }, [collectionTarget, inlineNavigation]);
-  const toggleNavigation = useCallback(() => setMobileNavOpen(open => !open), []);
-  const publishControl = layout?.setVaultNavigationControl;
+    if (!revealCollectionTarget) setRouteTreeOverride(null);
+    if (revealCollectionTarget && (!desktopNav || navigationOverlay)) setMobileNavOpen(true);
+  }, [revealCollectionTarget, routeTreeKey, desktopNav, navigationOverlay]);
+  const toggleNavigation = useCallback(() => {
+    if (desktopNav && !navigationOverlay) {
+      setMobileNavOpen(false);
+      setEffectiveTreeVisible(!effectiveTreeVisible);
+    } else {
+      setMobileNavOpen(open => !open);
+    }
+    requestAnimationFrame(() => {
+      const target = navigationTrigger();
+      if (target !== document.activeElement) target?.focus();
+    });
+  }, [desktopNav, navigationOverlay, effectiveTreeVisible, setEffectiveTreeVisible, navigationTrigger]);
   useLayoutEffect(() => {
-    publishControl?.(navigationOverlay ? { open: mobileNavOpen, onToggle: toggleNavigation } : null);
-  }, [navigationOverlay, mobileNavOpen, toggleNavigation, publishControl]);
-  useLayoutEffect(() => () => publishControl?.(null), [publishControl]);
+    if (navigationOpen || !navigationHadFocus.current) return;
+    const active = document.activeElement;
+    const pane = document.getElementById("vault-workspace-navigation");
+    // Responsive reflow can hide the focused control before this effect runs.
+    // Keep a visible keyboard starting point without stealing dialog focus.
+    if (active === document.body || pane?.contains(active)
+      || active?.hasAttribute("data-vault-navigation-resizer")) {
+      navigationHadFocus.current = false;
+      focusNavigationTrigger();
+    }
+  }, [navigationOpen, desktopNav, focusNavigationTrigger]);
+  const closeAfterNavigation = useCallback(() => {
+    // Header links mark the destination for the persistent main-focus observer.
+    setMobileNavOpen(false);
+  }, []);
+  useLayoutEffect(() => {
+    const stub = navigationStubRef.current;
+    if (!stub) return;
+    const measure = () => setCollapsedNavigationWidth(stub.offsetWidth || (desktopNav ? 37 : 45));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(stub);
+    return () => observer.disconnect();
+  }, [inlineNavigation, desktopNav]);
 
   useEffect(() => {
     if (inlineNavigation || !mobileNavOpen) return;
     const panel = document.getElementById("vault-workspace-navigation");
-    const frame = window.requestAnimationFrame(() => panel?.querySelector<HTMLElement>('button:not([disabled]), a[href]')?.focus());
+    const frame = window.requestAnimationFrame(() => {
+      if (!panel?.contains(document.activeElement) && !document.activeElement?.hasAttribute("data-vault-navigation-resizer")) {
+        const initialControl = panel?.querySelector<HTMLElement>("#vault-navigation-collapse")
+          ?? panel?.querySelector<HTMLElement>('button:not([disabled]), a[href]');
+        initialControl?.focus();
+      }
+    });
+    const tooltipEscapes = new WeakSet<KeyboardEvent>();
+    const rememberTooltipEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !(event.target instanceof HTMLElement)
+        || !panel?.contains(event.target)) return;
+      const describesTooltip = event.target.getAttribute("aria-describedby")?.split(/\s+/)
+        .some(id => document.getElementById(id)?.getAttribute("role") === "tooltip");
+      if (!describesTooltip && !panel.querySelector('[role="tooltip"]')) return;
+      // Radix dismisses layers at document capture. Remember interactive layers
+      // before they disappear so one Escape never closes both them and the rail.
+      const nestedLayerOpen = Array.from(document.querySelectorAll(
+        '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], dialog[open]',
+      )).some(layer => !layer.closest('[hidden], [inert], [aria-hidden="true"], [data-state="closed"]'));
+      if (!nestedLayerOpen) tooltipEscapes.add(event);
+    };
     const close = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // A tooltip is only a label: its consumed Escape also dismisses the rail.
+      // Pickers, menus, dialogs and other cancelled events keep their priority.
+      if (event.key !== "Escape" || event.defaultPrevented && !tooltipEscapes.has(event)) return;
       setMobileNavOpen(false);
-      document.getElementById("vault-navigation-trigger")?.focus();
     };
     // This is a navigation disclosure, not a modal. Let Tab leave naturally,
     // dismissing the covering panel before the next destination takes focus.
     // Portalled switcher/collection menus remain part of the disclosure.
-    const leave = (event: FocusEvent) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement) || panel?.contains(target)
-        || target.id === "vault-navigation-trigger"
-        || target.closest('[data-radix-popper-content-wrapper], [role="dialog"]')) return;
-      setMobileNavOpen(false);
+    const belongsToNavigation = (target: EventTarget | null) => {
+      return target instanceof HTMLElement && (panel?.contains(target)
+        || target.id.startsWith("vault-navigation-trigger")
+        || target.hasAttribute("data-vault-navigation-resizer")
+        || target.closest('[data-radix-popper-content-wrapper], [role="dialog"]'));
     };
+    let leaveFrame: number | undefined;
+    const leave = (event: FocusEvent) => {
+      if (belongsToNavigation(event.target)) return;
+      if (leaveFrame !== undefined) window.cancelAnimationFrame(leaveFrame);
+      // A cancelled confirmation can briefly return focus to the editor before
+      // its portalled Vault picker restores it. Let that picker settle first;
+      // an intentional departure closes it before this frame and dismisses both.
+      leaveFrame = window.requestAnimationFrame(() => {
+        if (belongsToNavigation(document.activeElement)
+          || panel?.querySelector('[data-vault-switcher-trigger][aria-expanded="true"]')) return;
+        setMobileNavOpen(false);
+      });
+    };
+    window.addEventListener("keydown", rememberTooltipEscape, true);
     window.addEventListener("keydown", close);
     document.addEventListener("focusin", leave);
     return () => {
       window.cancelAnimationFrame(frame);
+      if (leaveFrame !== undefined) window.cancelAnimationFrame(leaveFrame);
+      window.removeEventListener("keydown", rememberTooltipEscape, true);
       window.removeEventListener("keydown", close);
       document.removeEventListener("focusin", leave);
     };
-  }, [inlineNavigation, mobileNavOpen]);
+  }, [inlineNavigation, mobileNavOpen, location.key]);
 
-  // Focused tasks have no Collections to toggle. Their explicit shortcut
-  // toggles the Vault list instead, without changing the saved tree choice.
+  // The same shortcut toggles the same panel on every named Vault route.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
-        e.preventDefault();
-        if (!inlineNavigation) {
-          setMobileNavOpen((open) => !open);
-          return;
-        }
-        if (isFocusedWorkspace) toggleVaultCollapsed();
-        else setEffectiveTreeVisible(!effectiveTreeVisible);
+    const onKey = (event: KeyboardEvent) => {
+      if (!event.defaultPrevented && !event.altKey && (event.metaKey || event.ctrlKey) && event.key === "\\") {
+        event.preventDefault();
+        toggleNavigation();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inlineNavigation, effectiveTreeVisible, setEffectiveTreeVisible, isFocusedWorkspace, toggleVaultCollapsed]);
+  }, [name, toggleNavigation]);
 
-  // No empty context column before a Vault is selected.
-  const showTree = !!name && !isFocusedWorkspace && effectiveTreeVisible;
   const publishWidth = layout?.setVaultNavigationWidth;
   useLayoutEffect(() => {
-    publishWidth?.(inlineNavigation ? workspaceNavigationWidth : 0);
-  }, [inlineNavigation, workspaceNavigationWidth, publishWidth]);
+    publishWidth?.(inlineNavigation ? workspaceNavigationWidth : collapsedNavigationWidth);
+  }, [inlineNavigation, workspaceNavigationWidth, collapsedNavigationWidth, publishWidth]);
   useLayoutEffect(() => () => publishWidth?.(0), [publishWidth]);
-  const effectiveVaultCollapsed = inlineNavigation
-    ? vaultCollapsed
-    : mobileRailCollapsed;
-  const toggleEffectiveVaultCollapsed = inlineNavigation
-    ? toggleVaultCollapsed
-    : () => setMobileRailCollapsed((collapsed) => !collapsed);
-  const mobileTreeWidth = effectiveVaultCollapsed
-    ? "calc(100vw - 3.5rem)"
-    : "calc(100vw - 10rem)";
+  const cancelResize = panel.cancel;
+  useLayoutEffect(() => {
+    if (inlineNavigation && !panel.isResizing) setMobileNavOpen(false);
+  }, [inlineNavigation, panel.width, panel.isResizing]);
+  useEffect(() => {
+    if (!desktopNav || !navigationOpen) cancelResize();
+  }, [desktopNav, navigationOpen, cancelResize]);
 
   return (
     <VaultCreateDialogProvider openCreateVault={openCreateVault}>
@@ -307,108 +372,83 @@ export function VaultShell() {
           refetchVaults={refetchVaults}
         >
         <div className="flex flex-col h-full min-h-0">
-        <div ref={workspaceRef} className="relative flex flex-1 min-h-0 min-w-0" data-navigation-mode={inlineNavigation ? "inline" : "overlay"} data-workspace-mode={isFocusedWorkspace ? "focused" : "content"}>
+        <div ref={workspaceRef} onFocusCapture={event => {
+          const target = event.target as HTMLElement;
+          navigationHadFocus.current = Boolean(target.closest("#vault-workspace-navigation") || target.hasAttribute("data-vault-navigation-resizer"));
+        }} className="relative flex flex-1 min-h-0 min-w-0" data-navigation-mode={inlineNavigation ? "inline" : "overlay"} data-workspace-mode={isFocusedWorkspace ? "focused" : "content"}>
           {!inlineNavigation && mobileNavOpen && <button type="button" tabIndex={-1} aria-label="Dismiss vault navigation"
-            onClick={() => { setMobileNavOpen(false); document.getElementById("vault-navigation-trigger")?.focus(); }}
+            onClick={() => { setMobileNavOpen(false); focusNavigationTrigger(); }}
             className="absolute inset-0 z-40 cursor-default bg-foreground/20" />}
-          {/* Selection and content exploration retain their own full-height rails. */}
+          {!inlineNavigation && <div ref={navigationStubRef} data-slot="vault-navigation-collapsed" aria-hidden={navigationOpen || undefined}
+            className={cn("relative flex w-9 shrink-0 flex-col border-r border-border bg-navigation max-sm:w-11 pointer-coarse:w-11", desktopNav && "-mt-14 h-[calc(100%+3.5rem)]")}>
+            <div className="flex h-14 shrink-0 items-center justify-center border-b border-border">
+              <VaultNavigationToggle id="vault-navigation-trigger" open={false} onToggle={toggleNavigation} hidden={navigationOpen} />
+            </div>
+          </div>}
+          <>
           <div
             id="vault-workspace-navigation"
+            aria-label={name ? `${name} navigation` : "Vault directory navigation"}
+            hidden={!navigationOpen}
             className={cn(
-              "absolute bottom-0 left-0 z-[var(--z-overlay)] hidden max-w-full shrink-0 min-h-0 bg-surface shadow-lg",
-              desktopNav ? "top-0" : "top-14",
-              inlineNavigation && "lg:static lg:z-auto lg:-mt-14 lg:h-[calc(100%+3.5rem)] lg:flex lg:shadow-none",
-              mobileNavOpen && "flex",
-              !showTree && "border-r border-border",
+              "absolute bottom-0 left-0 z-[var(--z-overlay)] max-w-full shrink-0 min-h-0 flex-col border-r border-border bg-navigation shadow-lg",
+              desktopNav ? "-top-14" : "top-0",
+              inlineNavigation && "lg:static lg:z-auto lg:-mt-14 lg:h-[calc(100%+3.5rem)] lg:shadow-none",
+              navigationOpen ? "flex" : "hidden",
             )}
+            style={{ width: desktopNav ? panel.width : "min(20rem, calc(100vw - 1.5rem))" }}
           >
-            <VaultRail
-              current={name || ""}
-              onRefetchReady={onVaultsRefetchReady}
-              onCreateVault={openCreateVault}
-              collapsed={effectiveVaultCollapsed}
-              onToggleCollapsed={toggleEffectiveVaultCollapsed}
-              width={inlineNavigation ? rail.width : 160}
-            />
-            {/* Resize the expanded Vault list beside Collections.
-                The collapsed list remains a fixed-width icon strip. */}
-            {inlineNavigation && !vaultCollapsed && !!name && (
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="Resize vault list"
-                title="Drag to resize · double-click to reset"
-                {...rail.handlers}
-                className="group relative z-10 w-px shrink-0 cursor-col-resize touch-none before:absolute before:inset-y-0 before:-left-1 before:w-2"
-              >
-                <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
-              </div>
-            )}
-            {/* Collections is exclusively a content explorer, not a Vault menu. */}
-            {showTree && (
-              <div
-                data-slot="vault-collections-sidebar"
-                className="flex h-full min-h-0 shrink-0 flex-col overflow-hidden bg-surface"
-                style={{ width: inlineNavigation ? tree.width : desktopNav ? 320 : mobileTreeWidth }}
-              >
-                <VaultExplorer vault={name}
-                  onCollapse={() => setEffectiveTreeVisible(false)}
-                  onRefetchReady={onTreeRefetchReady} />
-              </div>
-            )}
-            {!isFocusedWorkspace && !effectiveTreeVisible && !!name && (
-              <nav
-                aria-label="Collections (collapsed)"
-                className="h-full w-10 shrink-0 border-r border-border"
-              >
-                <div className="flex h-10 items-center justify-center border-b border-border lg:h-14">
-                  <RailCollapseButton collapsed label="Expand collections" onClick={() => setEffectiveTreeVisible(true)} />
-                </div>
-              </nav>
-            )}
+            {name ? <><VaultNavigationHeader current={name} onCreateVault={openCreateVault}
+              onRefetchReady={onVaultsRefetchReady} onNavigate={closeAfterNavigation} navigationControl={{ open: navigationOpen, onToggle: toggleNavigation }} />
+            <div id="vault-collections-sidebar" data-slot="vault-collections-sidebar" className="flex min-h-0 flex-1 flex-col">
+              <VaultExplorer key={name} vault={name} presentation="focused" onRefetchReady={onTreeRefetchReady} />
+            </div>
+            <VaultScopedShortcuts vault={name} /></> : <VaultDirectorySidebar onCreateVault={openCreateVault} onNavigate={closeAfterNavigation} onRefetchReady={onVaultsRefetchReady} navigationControl={{ open: navigationOpen, onToggle: toggleNavigation }} />}
           </div>
-          {/* resize handle — resizes the tree column; only when the tree shows.
-              Delta-based, so the fixed rail offset doesn't affect it. */}
-          {inlineNavigation && showTree && (
+          {desktopNav && navigationOpen && (
             <div
               role="separator"
+              data-vault-navigation-resizer=""
               aria-orientation="vertical"
-              aria-label="Resize tree panel"
-              title="Drag to resize · double-click to reset"
-              {...tree.handlers}
-              className="group relative z-10 w-px shrink-0 cursor-col-resize touch-none before:absolute before:inset-y-0 before:-left-1 before:w-2 lg:-mt-14 lg:h-[calc(100%+3.5rem)]"
+              aria-label="Resize vault navigation"
+              aria-controls="vault-workspace-navigation"
+              aria-valuemin={224}
+              aria-valuemax={360}
+              aria-valuenow={panel.width}
+              aria-valuetext={`${panel.width}px`}
+              tabIndex={0}
+              title="Drag or use arrow keys to resize · double-click to reset"
+              {...panel.handlers}
+              onPointerUp={event => {
+                if (workspaceWidth - panel.width - 1 < (layout?.minimumVaultWorkspaceWidth ?? minimumContentWidth)) setMobileNavOpen(true);
+                panel.handlers.onPointerUp(event);
+              }}
+              onPointerCancel={event => {
+                if (workspaceWidth - panel.width - 1 < (layout?.minimumVaultWorkspaceWidth ?? minimumContentWidth)) setMobileNavOpen(true);
+                panel.handlers.onPointerCancel(event);
+              }}
+              onKeyDown={event => {
+                if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) setMobileNavOpen(true);
+                panel.handlers.onKeyDown(event);
+              }}
+              style={!inlineNavigation ? { position: "absolute", left: panel.width, top: 0, bottom: 0 } : undefined}
+              className={cn(
+                "group relative z-[var(--z-overlay)] w-px shrink-0 cursor-col-resize touch-none outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background before:absolute before:inset-y-0 before:-left-1.5 before:w-3",
+                inlineNavigation && "lg:-mt-14 lg:h-[calc(100%+3.5rem)]",
+              )}
             >
-              <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-active:bg-primary" />
+              <div className="mx-auto h-full w-px bg-border transition-colors group-hover:bg-primary group-focus-visible:bg-primary group-active:bg-primary" />
             </div>
           )}
+          </>
 
           {/* Desktop location lives in the app header. Narrow screens keep the
               breadcrumb and navigation-drawer trigger in their own location row. */}
           <div className="@container/vault-content flex min-h-0 min-w-0 flex-1 flex-col">
             {!desktopNav && <TitleBar
               crumbs={[]}
-              breadcrumb={<AppPageLocation mobile />}
-              left={
-                <button
-                  type="button"
-                  id="vault-navigation-trigger"
-                  onClick={() => setMobileNavOpen((open) => !open)}
-                  aria-label={
-                    mobileNavOpen
-                      ? "Close vault navigation"
-                      : "Open vault navigation"
-                  }
-                  aria-expanded={mobileNavOpen}
-                  aria-controls="vault-workspace-navigation"
-                  className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-md)] text-foreground-muted hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  {mobileNavOpen ? (
-                    <PanelLeftClose className="h-4 w-4" aria-hidden />
-                  ) : (
-                    <PanelLeftOpen className="h-4 w-4" aria-hidden />
-                  )}
-                </button>
-              }
+              breadcrumb={<AppPageLocation mobile parentBack={Boolean(name)} />}
+              left={name ? <VaultParentBackLink /> : undefined}
               className="h-14 shrink-0 overflow-visible bg-surface pr-2 backdrop-blur-none"
               showBack={false}
             />}
@@ -416,7 +456,7 @@ export function VaultShell() {
             {isGraph || isResourceViewer || isSearch ? (
               <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
                 <ErrorBoundary resetKeys={[location.pathname]}>
-                  <Outlet />
+                  <Outlet context={{ vaultNavigationOpen: navigationOpen }} />
                 </ErrorBoundary>
               </div>
             ) : (
@@ -424,25 +464,21 @@ export function VaultShell() {
                 data-slot="vault-route-viewport"
                 className={cn(
                   "min-h-0 min-w-0 flex-1 bg-background",
-                  isSettings
-                    ? "overflow-y-auto xl:overflow-hidden"
-                    : "overflow-y-auto",
+                  "overflow-y-auto",
                 )}
               >
                 <div
                   className={cn(
                     "w-full",
-                    isSettings
-                      ? "min-h-full xl:h-full xl:min-h-0"
-                      : isOverview
-                        ? "min-h-full px-2 py-3 lg:p-0"
-                        : isActivity || isPublications || isMembers
-                          ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
-                          : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
+                    isOverview || isPublications || isMembers || isSettings
+                        ? "min-h-full px-4 py-5 sm:px-6 xl:px-8"
+                        : !name ? "p-0"
+                          : isActivity ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
+                            : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
                   )}
                 >
                   <ErrorBoundary resetKeys={[location.pathname]}>
-                    <Outlet />
+                    <Outlet context={{ vaultNavigationOpen: navigationOpen }} />
                   </ErrorBoundary>
                 </div>
               </div>
@@ -468,11 +504,22 @@ export function VaultShell() {
             }
             onCreated={handleDocumentCreated}
             returnFocusRef={createDocumentTriggerRef}
-            desktopLeftOffset={(inlineNavigation ? workspaceNavigationWidth : 0) + 16}
+            desktopLeftOffset={(inlineNavigation ? workspaceNavigationWidth : collapsedNavigationWidth) + 16}
           />
         )}
         </VaultRefreshProvider>
       </DocumentCreateDialogProvider>
     </VaultCreateDialogProvider>
   );
+}
+
+/** Pins remain scoped to the current accessible Vault; no second directory. */
+function VaultScopedShortcuts({ vault }: { vault: string }) {
+  const user = useCurrentUser();
+  const { vaults } = useVaults();
+  const shortcuts = useWorkspaceShortcuts(user?.user_id);
+  if (!user || !vaults.some(item => item.name === vault) || !shortcuts.some(item => item.vault === vault)) return null;
+  return <div className="max-h-48 shrink-0 overflow-y-auto border-t border-border pt-2 rail-scroll">
+    <WorkspacePersonalSections userId={user.user_id} vaults={vaults.filter(item => item.name === vault)} sections={["pinned"]} />
+  </div>;
 }

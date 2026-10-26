@@ -358,6 +358,11 @@ export interface AkbDocumentBrowseOptions extends AkbDocumentVaultOptions {
   depth?: number;
   includeHashes?: boolean;
   includeArchived?: boolean;
+  archiveScope?: "unarchived" | "archived" | "all";
+  contentType?: "all" | "collections" | "documents" | "tables" | "files";
+  /** Opt into bounded identity pages; follow the returned next_cursor. */
+  pageSize?: number;
+  cursor?: string;
 }
 
 export interface AkbDocumentPutInput extends AkbDocumentVaultOptions {
@@ -1294,6 +1299,10 @@ function makeDocsFacade(
       appendOptional(params, "depth", options.depth);
       appendOptional(params, "include_hashes", options.includeHashes);
       appendOptional(params, "include_archived", options.includeArchived);
+      appendOptional(params, "archive_scope", options.archiveScope);
+      appendOptional(params, "content_type", options.contentType);
+      appendOptional(params, "page_size", options.pageSize);
+      appendOptional(params, "cursor", options.cursor);
       const query = params.size > 0 ? `?${params}` : "";
       return request<import("./core/schema.gen.js").AkbDocumentEnvelope>(
         `/browse/${encodePathSegment(vault)}${query}`,

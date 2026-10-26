@@ -309,6 +309,7 @@ jobs:
             tests/test_m1_file_measurement_pg.py
             tests/test_native_revision_m1_payload_placement_migration.py
             tests/concurrency/test_invariants_unit.py
+            tests/test_publication_budget_postgres.py
             tests/test_publication_resolution_vault_binding_unit.py
             tests/test_native_publication_pg.py
             tests/test_native_publication_binding_pg.py
@@ -332,11 +333,22 @@ jobs:
             tests/test_recovery_admin_provisioning_postgres.py
             tests/test_local_session_generation_postgres.py
             tests/test_account_self_lifecycle_postgres.py
+            # Photo revision races, session revocation and cleanup are real
+            # transaction guarantees; otherwise this file skips in both lanes.
+            tests/test_user_avatar_postgres.py
             tests/test_sso_account_lifecycle_postgres.py
             tests/test_sso_account_sync_postgres.py
             tests/test_pat_issuance_postgres.py
+            # Native service bootstrap needs real transactions and role DDL;
+            # missing DSN remains a hard failure, never a unit-lane skip.
+            tests/test_platform_service_bootstrap_postgres_e2e.py
             tests/test_admin_auth_postgres.py
             tests/test_sso_identity_migration_postgres.py
+            tests/test_sso_migration_actor_postgres.py
+            tests/test_sso_identity_operations_postgres.py
+            tests/test_sso_management_targets_postgres.py
+            tests/test_sso_callback_evidence_postgres.py
+            tests/test_sso_operation_attempts_postgres.py
             tests/test_pending_admission_postgres.py
             tests/test_edge_vault_boundary_postgres.py
             tests/test_workspace_external_identity.py
@@ -353,6 +365,8 @@ jobs:
             tests/test_native_document_events_postgres.py
             tests/test_notification_unwatch_postgres.py
             tests/test_recent_watching_postgres.py
+            tests/test_native_recent_index_postgres.py
+            tests/test_table_catalog_counts_postgres.py
             tests/test_search_update_status_pg.py
             tests/test_event_tail_postgres.py
             tests/test_search_file_cutover_receipt_postgres.py
@@ -360,6 +374,10 @@ jobs:
             tests/test_tool_usage_e2e.py
             tests/test_table_if_not_exists_e2e.py
             tests/test_kg_document_ref_postgres.py
+            # Native graph catalogs, snapshot pagination and stable endpoint
+            # identity need real PostgreSQL; otherwise they skip in unit CI.
+            tests/test_graph_native_catalog_pg.py
+            tests/test_native_graph_resource_identity_pg.py
             tests/test_search_covering_indexes_e2e.py
             # Needs the vchord service, not the postgres one. It skips rather
             # than failing where the extension is absent, so it has to be on a
@@ -368,6 +386,7 @@ jobs:
             tests/test_bm25_vector_backfill_postgres.py
             tests/test_bm25_transition_boundary_postgres.py
             tests/test_vchord_candidate_budget_postgres.py
+            tests/test_vchord_growing_prefilter_postgres.py
             tests/test_vchord_index_build_postgres.py
             tests/test_vchord_vacuum_postgres.py
             tests/test_vchord_encoding_contract_postgres.py
@@ -378,6 +397,7 @@ jobs:
             # Real cancellation/reset, exact scoped scores, and bounded Native
             # source lookups must run on a fresh DB, not skip in both lanes.
             tests/test_pgvector_hybrid_deadline_postgres.py
+            tests/test_transient_recovery_postgres.py
             tests/test_pgvector_scope_routing_postgres.py
             tests/test_native_search_source_scope_postgres.py
             tests/test_bm25_revert_range_postgres.py
@@ -392,6 +412,9 @@ jobs:
             # publisher drain — a fake proves nothing, and off this list
             # the file skips in the unit job too and the fix ships ungated.
             tests/test_dynamic_table_rows_changed_postgres.py
+            # Identity pages and byte guards must exercise real snapshot and
+            # pool behavior, not silently skip in the DB-free unit lane.
+            tests/test_browse_pages_postgres.py
           )
           # A truncated list is the failure this step has already had
           # once, and it reads as a pass. Both halves of that are worth

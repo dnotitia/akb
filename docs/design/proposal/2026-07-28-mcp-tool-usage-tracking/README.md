@@ -1,19 +1,21 @@
 ---
-status: proposal
-stage: proposal
+status: partially-implemented
+stage: wave-a-implemented-wave-b-deferred
 created: 2026-07-28
-updated: 2026-07-28
+updated: 2026-10-20
 head: b3abdf0
-method: production measurement (PG + Redis, read-only) + PM decision on purpose/retention + independent Codex adversarial review (verdict REDESIGN; wave A applied, wave B deferred)
+method: historical read-only investigation (PG + Redis) + PM decision on purpose/retention + independent Codex adversarial review (verdict REDESIGN; wave A applied, wave B deferred)
 ---
 
 # MCP 툴 사용량 추적 — 디스패치 초크포인트 → PG 싱크
+
+> 역사적 설계 기록: wave A 구현과 wave B 보류를 구분한다. 아래 문제 진술과 코드 위치는 작성 당시 기준이며 현재 운영 상태를 설명하지 않는다.
 
 ## 0. 한 장 요약
 
 > AKB는 **어떤 MCP 툴이 실제로 쓰이는지 답할 수 없다.** 관측 지점은 이미 있지만
 > (`record_tool`, 디스패치 초크포인트), 그 싱크가 조회 불가능한 해시체인 파일이고
-> 프로덕션에서 꺼져 있다. 나머지 두 스트림(`events`, `audit`)은 목적이 달라
+> 감사 설정에 따라 선택적으로 활성화된다. 나머지 두 스트림(`events`, `audit`)은 목적이 달라
 > 대체할 수 없다. **같은 초크포인트에 PG 싱크를 하나 추가한다.**
 
 `akb_todo`가 1년 넘게 유령으로 남아 있었던 것도, 지금 어떤 툴이 죽었는지 물었을 때
@@ -38,7 +40,7 @@ method: production measurement (PG + Redis, read-only) + PM decision on purpose/
 | 저장소 | PG 테이블 | 해시체인 JSONL → S3 |
 | 목적 | Redis 팬아웃 = **배달** | 변조 탐지 = **증거** |
 | 수명 | **배달되면 삭제** (7일치) | 보존 (WORM) |
-| 프로덕션 상태 | 켜짐 | **꺼짐** (`enabled=False` 기본값) |
+| 활성화 | 이벤트 전달 구성에 따름 | 감사 설정으로 선택적으로 활성화 |
 
 **`events`가 부적합한 이유 (실측):**
 
@@ -374,7 +376,7 @@ REST 표면도 잡히지 않는다 — 지표 정의상 의도된 것이며, 위
 
 ## 7. 열린 질문
 
-1. 롤업에 `vault` 차원을 넣을 것인가? (행 수 × 볼트 수 = 40배) — 현재는 제외
+1. 롤업에 `vault` 차원을 넣을 것인가? (볼트 수에 따라 행 수 증가) — 당시 범위에서는 제외
 2. `duration_ms`를 롤업에 p95로 넣을 것인가? — 현재는 `total_duration_ms`만 (평균 도출 가능)
-3. 프로덕션 활성화 시점 — 기본 off이므로 `internal/backend-config-patch.yaml`에
-   명시적으로 켜야 한다. 켜지 않으면 이 작업은 코드만 있고 데이터는 0이 된다.
+3. 배포별 활성화 정책 — `tool_usage.enabled`를 배포 설정에서 명시적으로 구성한다.
+   이 문서는 특정 배포의 활성화 상태를 기록하지 않는다.
