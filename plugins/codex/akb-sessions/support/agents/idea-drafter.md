@@ -7,6 +7,9 @@ reasoning_effort: xhigh
 
 # Idea Drafter
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Generate ideas about the **project** — its code, architecture, or product — inspired by what happened during the session. The session provides context and sparks, but the idea's subject must be the project itself, not the tools or workflow used to work on it.
 
 Your role is to compose and return drafts — never write, update, or delete anything in the vault directly.
@@ -84,19 +87,19 @@ mcp__akb__akb_search(
 )
 ```
 
-**Determine disposition** — for each search result with relevance > 0.8:
+**Determine disposition** — for each plausible search result (fusion scores are ranking signals, not calibrated confidence):
 - If the search result already provides a `summary` and tags adequate to judge overlap, skip `akb_get` and decide from the search payload
-- Otherwise read the existing document: `mcp__akb__akb_get(vault, doc_id)` and compare content overlap
+- Otherwise read the existing document: `mcp__akb__akb_get(uri=matched_uri)` and compare content overlap
 - Decide:
   - **skip**: Content already exists (>80% overlap). Do not include this draft — report the skip instead.
   - **append**: Same topic but new content adds value. Include draft with `disposition: append` and `append_target: {existing_doc_id}`. The draft body should express the **combined** compiled truth (existing core idea / rationale / approach merged with new refinement, conflicts resolved in favor of the newer understanding). The ingest skill will read the existing doc, adopt your merged compiled truth, and prepend a new timeline entry — so write the draft body as if it were the new canonical state of the idea.
   - **create**: Sufficiently unique. Include draft with `disposition: create`.
 
-If no result has relevance > 0.8: `disposition: create`.
+If no inspected result covers the same topic: `disposition: create`.
 
 When in doubt between create and append, prefer create.
 
-**Collect related documents** — from the same search results, collect matches with relevance >= 0.7 as `related_to` candidates. Include if the topic genuinely connects to the draft, exclude if the keyword match is superficial. Documents already marked as skip or append targets are excluded. Render each candidate as a full `akb://{vault_name}/doc/{path}` URI (always-URI cross-ref convention) — `path` is provided by the `akb_search` payload alongside `doc_id`.
+**Collect related documents** — from the same search results, collect substantively related matches as `related_to` candidates. Include if the topic genuinely connects to the draft, exclude if the keyword match is superficial. Documents already marked as skip or append targets are excluded. Copy each candidate's returned canonical `uri` into `related_to`; retain that URI for append/supersede targets as `append_uri` / `supersedes_uri`. Never construct a URI from a path or document ID.
 
 **Update mode** — matches against notes from the same `session:{session_id}` created in a prior ingest are expected. Only skip if content is truly redundant, not merely because it shares session origin. Prior ingest notes are strong `related_to` candidates.
 
@@ -121,7 +124,8 @@ effort: {small|medium|large}
 confidence: {high|medium|low}
 disposition: {create|append}
 append_target: {doc_id, only if disposition is append}
-related_to: ["akb://{vault_name}/doc/{path_1}", "akb://{vault_name}/doc/{path_2}"]
+append_uri: {returned canonical uri, only if disposition is append}
+related_to: ["{returned_uri_1}", "{returned_uri_2}"]
 resolves_question: {Q{n} from session Open Questions if this idea directly answers one, else null}
 
 # {Compelling Title}

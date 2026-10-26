@@ -1,9 +1,11 @@
-import { createRef, useState } from "react";
+import { createRef, useRef, useState } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { MemoryRouter } from "react-router-dom";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DocumentPublicationControl } from "@/components/document-publication-control";
+import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { createPublication, getDocument, listPublications, type Publication } from "@/lib/api";
 
 vi.mock("@/lib/api", () => ({ createPublication: vi.fn(), getDocument: vi.fn(), listPublications: vi.fn() }));
@@ -35,6 +37,24 @@ function ArticleAction() {
   return <button type="button" onClick={() => setCount(value => value + 1)}>Article action {count}</button>;
 }
 
+function OverflowPublicationHarness(props: Partial<React.ComponentProps<typeof DocumentPublicationControl>>) {
+  const menuAnchorRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const pending = useRef(false);
+  return <MemoryRouter>
+    <ResourceActionsMenu resourceName="Guide" triggerRef={menuAnchorRef} onCloseAutoFocus={event => {
+      if (!pending.current) return;
+      event.preventDefault();
+      pending.current = false;
+      requestAnimationFrame(() => triggerRef.current?.click());
+    }}>
+      <DropdownMenu.Item onSelect={() => { pending.current = true; }}>{props.publicSlug ? "Public link" : "Publish"}</DropdownMenu.Item>
+    </ResourceActionsMenu>
+    <DocumentPublicationControl vault="demo" docId="docs/guide.md" onPublished={() => {}} onUnpublish={async () => {}}
+      {...props} triggerRef={triggerRef} menuAnchorRef={menuAnchorRef} />
+  </MemoryRouter>;
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -53,6 +73,41 @@ function renderControl(props: Partial<React.ComponentProps<typeof DocumentPublic
 }
 
 describe("DocumentPublicationControl", () => {
+  it("opens a persistent hidden publication trigger from overflow and restores focus on close", async () => {
+    const user = userEvent.setup();
+    render(<OverflowPublicationHarness />);
+    const actions = screen.getByRole("button", { name: "Actions for Guide" });
+    const anchorBounds = vi.spyOn(actions, "getBoundingClientRect").mockReturnValue(new DOMRect(300, 50, 32, 32));
+    expect(document.querySelector("[data-publication-trigger]")).toHaveAttribute("hidden");
+    await user.click(actions);
+    await user.click(screen.getByRole("menuitem", { name: "Publish" }));
+    expect(await screen.findByRole("dialog", { name: "Publish document" })).toBeVisible();
+    expect(anchorBounds).toHaveBeenCalled();
+    expect(createPublication).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(actions).toHaveFocus();
+  });
+
+  it("allows inspecting an existing public link from overflow while guarding unavailable writes", async () => {
+    const user = userEvent.setup();
+    const onUnpublish = vi.fn();
+    render(<OverflowPublicationHarness publicSlug="guide-public" disabledReason="This Vault is read-only." onUnpublish={onUnpublish} />);
+    const actions = screen.getByRole("button", { name: "Actions for Guide" });
+    await user.click(actions);
+    await user.click(screen.getByRole("menuitem", { name: "Public link" }));
+    expect(await screen.findByRole("dialog", { name: "Public link" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Public URL" })).toHaveValue(`${window.location.origin}/p/guide-public`);
+    const unpublish = screen.getByRole("button", { name: "Unpublish" });
+    expect(unpublish).toHaveAttribute("aria-disabled", "true");
+    expect(unpublish).toHaveAccessibleDescription("This Vault is read-only.");
+    await user.click(unpublish);
+    expect(onUnpublish).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Unpublish this document?" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close public link" }));
+    await waitFor(() => expect(actions).toHaveFocus());
+  });
+
   it("opens publication options from the visible toolbar action without mutating", async () => {
     const user = userEvent.setup();
     const triggerRef = createRef<HTMLButtonElement>();

@@ -845,6 +845,22 @@ class KeycloakProviderControl:
             broker_username=username,
         )
 
+    async def read_realm_identity(self) -> dict[str, str]:
+        """Read this configured realm's durable identity; never infer it from a URL."""
+        self._require_direct()
+        async with self._client() as client:
+            token = await self._token(client)
+            response = await self._request(client, "GET",
+                f"/admin/realms/{_path(self.config.realm)}", token=token,
+                expected=frozenset({200}), code="realm_identity_unavailable")
+            realm = _object(self._json(response, code="realm_identity_invalid"), code="realm_identity_invalid")
+            realm_id = realm.get("id")
+            if (realm.get("realm") != self.config.realm or realm.get("enabled") is not True
+                or not isinstance(realm_id, str) or not realm_id or len(realm_id) > 255
+                or any(ord(character) < 0x20 or ord(character) == 0x7f for character in realm_id)):
+                raise _fail("realm_identity_invalid")
+            return {"realm_id": realm_id, "realm_name": self.config.realm, "issuer": self.config.broker_issuer}
+
     async def read_managed_account_states(self, subjects: tuple[str, ...]) -> dict[str, str]:
         """Read one bounded page; missing users are authoritative only in a live realm.
 

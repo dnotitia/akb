@@ -103,7 +103,7 @@ export function DocumentCreateForm({
   const restoredDraftExpired = Boolean(
     restoredDraft?.expiresAt && Date.parse(restoredDraft.expiresAt) <= Date.now(),
   );
-  const { tree } = useVaultTree(vault);
+  const { tree, hasMore, loadingMore, loadMore, complete: directoryComplete } = useVaultTree(vault);
   const { refetchTree, refetchVaults } = useVaultRefresh();
   const collectionOptions = useMemo(
     () =>
@@ -466,11 +466,17 @@ export function DocumentCreateForm({
                   aria-describedby="doc-collection-status" autoComplete="off"
                 />
                 <datalist id="document-collection-options">{collectionOptions.map(path => <option key={path} value={path} />)}</datalist>
+                {hasMore && <div className="space-y-1 text-xs text-foreground-muted">
+                  <p>Suggestions include loaded resources only. You can enter any valid Collection path.</p>
+                  <Button type="button" variant="outline" size="sm" loading={loadingMore} onClick={loadMore}>Load more suggestions</Button>
+                </div>}
                 <p id="doc-collection-status" className={cn("flex items-start gap-1.5 text-xs leading-relaxed text-foreground-muted", (isReservedCollectionPath || !isCollectionSyntaxValid) && "text-destructive")} aria-live="polite">
                   {isReservedCollectionPath || !isCollectionSyntaxValid ? <AlertCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
                     : isExistingCollection ? <Check className="mt-0.5 size-3.5 shrink-0" aria-hidden />
                       : collectionTrimmed ? <FolderPlus className="mt-0.5 size-3.5 shrink-0" aria-hidden /> : <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />}
-                  <span>{locationState}</span>
+                  <span>{!directoryComplete && collectionTrimmed && !isExistingCollection && isCollectionSyntaxValid && !isReservedCollectionPath
+                    ? "Not in the loaded suggestions. The server will resolve or create this Collection when saved."
+                    : locationState}</span>
                 </p>
               </div>
               <div className="space-y-4 border-t border-border pt-4">

@@ -11,6 +11,7 @@ from pydantic import ConfigDict, Field, StrictInt, field_validator
 
 from app.api.deps import get_credential_change_user, get_current_user
 from app.config import settings
+from app.sso.runtime_identity import IdentityCapabilitiesResponse
 from app.exceptions import (
     AuthenticationError,
     BrowserSessionNotReadyError,
@@ -19,6 +20,7 @@ from app.exceptions import (
     ConflictError,
 )
 from app.models.pat_issuance import NAME_MAX_LENGTH, PATIssuanceRequest
+from app.models.user_avatar import CurrentUserProfile
 from app.services.token_issuer_policy import require_issuer_carrier, validate_locked_issuer
 from app.services.access_service import VALID_WRITE_ACTIONS, check_vault_access
 from app.services.auth_service import (
@@ -34,7 +36,10 @@ from app.services.auth_service import (
     project_verified_principal_with_reason,
 )
 from app.services.auth_policy import require_local_auth_enabled, sso_browser_session_ready
-from app.services.keycloak_oidc import get_keycloak_oidc
+from app.services.keycloak_oidc import (
+    browser_login_provider_aliases,
+    get_keycloak_oidc,
+)
 from app.services.sso_browser_session_service import (
     IssuedSsoBrowserSession,
     SSO_BROWSER_CSRF_HEADER,
@@ -358,7 +363,7 @@ def _clear_sso_session_cookies(response: Response) -> None:
     )
 
 
-async def _require_enabled_provider(alias: str) -> str:
+async def _require_enabled_provider(alias: str, *, force_refresh: bool = False) -> str:
     try:
         alias = validate_alias(alias)
     except ProviderDefinitionError:
@@ -383,7 +388,8 @@ async def _require_enabled_provider(alias: str) -> str:
             "SSO provider catalog is unavailable",
         )
     try:
-        catalog = await control.list_providers(allow_stale=False)
+        refresh = {"force_refresh": True} if force_refresh else {}
+        catalog = await control.list_providers(allow_stale=False, **refresh)
     except ProviderControlError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -395,6 +401,29 @@ async def _require_enabled_provider(alias: str) -> str:
             "SSO provider is not enabled",
         )
     return alias
+
+
+async def _browser_provider_choices(alias: str) -> list[str]:
+    """Snapshot choices actually offered by a workspace browser login.
+
+    The native form is also a broker chooser. Its grant comes from this fresh
+    catalog, not from the browser or a returned token. A catalog outage leaves
+    the independent native-account path usable with a native-only snapshot.
+    """
+    if not local_realm.is_local_alias(alias):
+        return [alias]
+    try:
+        control = get_keycloak_provider_control()
+        if control.control_mode != "direct":
+            return [alias]
+        catalog = await control.list_providers(allow_stale=False)
+    except ProviderControlError:
+        return [alias]
+    choices = [alias, *(provider.alias for provider in catalog if provider.state == "enabled")]
+    try:
+        return list(browser_login_provider_aliases(alias, choices))
+    except AuthenticationError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "SSO provider catalog is invalid") from None
 
 
 def _require_signed_provider(
@@ -427,13 +456,22 @@ def _require_signed_provider(
     status_code=status.HTTP_303_SEE_OTHER,
     response_class=RedirectResponse,
 )
-async def sso_provider_login(alias: str, redirect: str = "/"):
+async def sso_provider_login(alias: str, redirect: str = "/", login_challenge: str | None = None):
     _require_sso_browser_session()
     redirect_path = _safe_redirect_path(redirect)
     provider_alias = await _require_enabled_provider(alias)
+    challenge_options = {}
+    if login_challenge is not None:
+        from app.sso.callback_evidence import browser_challenge
+        challenge_options["login_challenge_id"] = await browser_challenge(login_challenge, provider_alias)
     issued = await get_keycloak_oidc().begin_browser_login(
         redirect_path,
         provider_alias=provider_alias,
+        allowed_provider_aliases=(
+            await _browser_provider_choices(provider_alias)
+            if local_realm.is_local_alias(provider_alias) else None
+        ),
+        **challenge_options,
     )
     response = RedirectResponse(issued.location, status_code=status.HTTP_303_SEE_OTHER)
     _set_sso_oidc_binding_cookie(response, issued.browser_binding)
@@ -505,7 +543,7 @@ async def keycloak_callback(
         state,
         request.cookies.get(_sso_oidc_binding_cookie_name(), ""),
     )
-    if not isinstance(transient, dict) or set(transient) - {"login_sequence"} != {
+    if not isinstance(transient, dict) or set(transient) - {"login_sequence", "allowed_provider_aliases", "login_challenge_id"} != {
         "redirect_path",
         "provider_alias",
         "client_id",
@@ -528,14 +566,24 @@ async def keycloak_callback(
         return _sso_sign_in_failed()
     try:
         validate_alias(provider_alias)
-    except ProviderDefinitionError:
+        allowed_aliases = (
+            browser_login_provider_aliases(provider_alias, transient["allowed_provider_aliases"])
+            if "allowed_provider_aliases" in transient else (provider_alias,)
+        )
+    except (ProviderDefinitionError, AuthenticationError):
         return _sso_sign_in_failed()
-    redirect_path = _safe_redirect_path(transient.get("redirect_path"))
+    try:
+        redirect_path = _safe_redirect_path(transient.get("redirect_path"))
+    except AuthenticationError:
+        return _sso_sign_in_failed()
     verifier = transient.get("code_verifier")
     nonce = transient.get("nonce")
     if not isinstance(verifier, str) or not isinstance(nonce, str):
         return _sso_sign_in_failed()
-    tokens = await oidc.exchange_browser_code(code, verifier)
+    try:
+        tokens = await oidc.exchange_browser_code(code, verifier)
+    except AuthenticationError:
+        return _sso_sign_in_failed()
     access_token = tokens.get("access_token")
     id_token = tokens.get("id_token")
     if tokens.get("token_type") != "Bearer" or not isinstance(access_token, str) or not isinstance(id_token, str):
@@ -547,31 +595,54 @@ async def keycloak_callback(
     )
     if principal is None:
         return _sso_sign_in_failed()
-    _require_signed_provider(principal.claims, provider_alias)
-    id_claims = await oidc.verify_browser_id_token(
-        id_token,
-        expected_nonce=nonce,
-        access_token=access_token,
-        expected_provider_alias=provider_alias,
-    )
-    _require_signed_provider(id_claims, provider_alias)
-    # The alias below is the provider this flow selected (transient) and both
-    # tokens vouched for (biconditional claim check above) — never a value
-    # taken from one token alone. It is the only key the
-    # authority-domain decision reads.
-    outcome = await project_verified_principal_with_reason(principal, provider_alias=provider_alias)
+    try:
+        claim_alias = principal.claims.get("identity_provider")
+        if claim_alias is not None and not isinstance(claim_alias, str):
+            return _sso_sign_in_failed()
+        actual_alias = local_realm.ALIAS if claim_alias is None else validate_alias(claim_alias)
+        if actual_alias not in allowed_aliases:
+            return _sso_sign_in_failed()
+        _require_signed_provider(principal.claims, actual_alias)
+        if "allowed_provider_aliases" in transient:
+            # A broker disabled since the chooser opened must not be admitted
+            # from an otherwise valid old snapshot. Native login stays usable
+            # without consulting the external catalog.
+            await _require_enabled_provider(actual_alias, force_refresh=True)
+        id_claims = await oidc.verify_browser_id_token(
+            id_token,
+            expected_nonce=nonce,
+            access_token=access_token,
+            expected_provider_alias=actual_alias,
+        )
+        _require_signed_provider(id_claims, actual_alias)
+    except (AuthenticationError, ProviderDefinitionError, HTTPException):
+        return _sso_sign_in_failed()
+    challenge_id = None
+    if "login_challenge_id" in transient:
+        from app.sso.callback_evidence import verify_callback
+        from app.exceptions import AKBError
+        try:
+            challenge_id = uuid.UUID(transient["login_challenge_id"])
+            await verify_callback(challenge_id, issuer=principal.issuer, subject=principal.subject, provider_alias=actual_alias)
+        except (AKBError, ValueError, TypeError, AttributeError):
+            return _sso_sign_in_failed()
+    # State grants the choice; both signed tokens prove which one was used.
+    # Admission and authoritative-domain policy must use that actual provider.
+    outcome = await project_verified_principal_with_reason(principal, provider_alias=actual_alias)
     user = outcome.user
     if user is None:
         # The one place the reason is repeated, and only for the refusal the
         # allowlist above admits.
         return _sso_sign_in_failed(outcome.refusal_code)
     try:
+        evidence_options = {"callback_challenge_id": challenge_id} if challenge_id is not None else {}
         issued = await create_sso_browser_session(
             user,
             principal,
             id_claims,
             tokens,
             login_sequence=login_sequence,
+            **evidence_options,
         )
     except AuthenticationError:
         return _sso_sign_in_failed()
@@ -660,8 +731,9 @@ async def keycloak_backchannel_logout(logout_token: str = Form(...)):
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/auth/me", summary="Get current user info")
+@router.get("/auth/me", summary="Get current user info", response_model=CurrentUserProfile)
 async def me(user: AuthenticatedUser = Depends(get_current_user)):
+    from app.services.user_avatar_service import profile_metadata
     return {
         "user_id": user.user_id,
         "username": user.username,
@@ -671,6 +743,7 @@ async def me(user: AuthenticatedUser = Depends(get_current_user)):
         "auth_method": user.auth_method,
         "account_kind": user.account_kind,
         "key_class": user.key_class,
+        **await profile_metadata(user),
     }
 
 
@@ -849,3 +922,10 @@ async def revoke_my_sessions(user: AuthenticatedUser = Depends(get_current_user)
     require_local_auth_enabled()
     revoked_at = await revoke_all_sessions(user.user_id)
     return {"revoked_before": revoked_at.isoformat()}
+
+
+@router.get("/auth/identity-capabilities", response_model=IdentityCapabilitiesResponse)
+async def identity_capabilities():
+    from app.sso.runtime_identity import BASE_CAPABILITIES, source_tuple
+
+    return {"schema_version": 1, **source_tuple(), "capabilities": BASE_CAPABILITIES}

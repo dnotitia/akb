@@ -89,7 +89,8 @@ describe("Public links page redesign", () => {
     expect(document.title).toBe("platform-docs · Public links · AKB");
     expect(screen.getByTestId("publication-workspace")).toHaveClass(
       "w-full",
-      "max-w-none",
+      "mx-auto",
+      "max-w-7xl",
     );
     expect(screen.getByTestId("publication-ledger-header")).toHaveClass(
       "border-border",
@@ -496,4 +497,17 @@ describe("Public links page redesign", () => {
     expect(screen.getByRole("menuitem", { name: "Unpublish" })).toHaveAttribute("aria-disabled", "true");
     expect(deletePublication).not.toHaveBeenCalled();
   });
+});
+
+
+it("shows the public-link ledger while optional titles are still loading", async () => {
+  let resolveTitle!: (value: unknown) => void;
+  vi.mocked(getDocument).mockReturnValueOnce(new Promise(resolve => { resolveTitle = resolve; }) as never);
+  listPublicationsMock.mockResolvedValue({ publications: [{ ...PUBLICATION, title: null }, { ...PUBLICATION, slug: "ready", title: "Ready document" }] });
+  renderPage();
+  expect(await screen.findByRole("link", { name: "Ready document" })).toBeVisible();
+  expect(screen.getByRole("list", { name: "Public links" }).children).toHaveLength(2);
+  expect(screen.queryByRole("status", { name: "Loading public links" })).toBeNull();
+  await act(async () => resolveTitle({ title: "Resolved title" }));
+  expect(screen.getByRole("link", { name: "Resolved title" })).toBeVisible();
 });

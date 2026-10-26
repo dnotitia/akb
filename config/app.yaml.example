@@ -286,9 +286,11 @@ app_credential_overlap_seconds: 300
 #                                         # kind appears as provider_type
 #                                         # `local-realm` under the reserved alias
 #                                         # `local`, carries no broker hint, and
-#                                         # requires the identity_provider claim to be
-#                                         # ABSENT where a brokered provider requires
-#                                         # it present and matching. Registering this
+#                                         # snapshots enabled upstream choices for
+#                                         # the realm login page. Native tokens have
+#                                         # no identity_provider claim; choosing an
+#                                         # allowed broker requires matching signed
+#                                         # claims in both tokens. Registering this
 #                                         # realm as its own upstream provider stays
 #                                         # refused; that would be an authorize loop.
 # sso_local_realm_display_name: "This workspace"  # label shown for that choice

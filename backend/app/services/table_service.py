@@ -26,7 +26,7 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError
 from app.models.vault_scope import current_token_uuid, current_vault_scope
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories import vault_write_policy_repo as write_policy_repo
@@ -47,6 +47,7 @@ from app.services.user_sql_executor import (
     PermissionDeniedError,
     UniqueViolationError,
     get_user_sql_executor,
+    human_admin_sql_bypass,
 )
 from app.util.errors import (
     err,
@@ -1173,7 +1174,12 @@ from app.util.text import normalize_collection_path as _normalize_collection_pat
 _TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
-async def list_tables(vault_id: uuid.UUID) -> list[dict]:
+async def list_tables(vault_id: uuid.UUID, *, include_row_counts: bool = True) -> list[dict]:
+    """Return the catalog, optionally avoiding a full scan of every table.
+
+    Counts stay exact and enabled by default. Schema-only consumers opt out;
+    an omitted row_count means unmeasured, never zero or a planner estimate.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
@@ -1185,7 +1191,6 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
         results: list[dict] = []
         for r in rows:
             pg_name = table_data_repo.pg_table_name(vault["name"], r["name"])
-            count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
                 "kind": "table",
                 "uri": table_uri(vault["name"], r["name"], collection=r["collection"]),
@@ -1200,7 +1205,8 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "columns": table_registry_repo.parse_columns(r["columns"]),
                 "unique_keys": table_registry_repo.parse_json_list(r.get("unique_keys")),
                 "indexes": table_registry_repo.parse_json_list(r.get("indexes")),
-                "row_count": count,
+                **({"row_count": await table_data_repo.count_rows(conn, pg_name)}
+                   if include_row_counts else {}),
                 "created_at": r["created_at"].isoformat(),
             })
     return results
@@ -1933,9 +1939,10 @@ async def execute_sql(
       - Single vault: 'pipeline' → 'vt_sales__pipeline'
       - Cross-vault: 'sales__pipeline' → 'vt_sales__pipeline'
 
-    System admins (``users.is_admin = TRUE``) bypass the per-user PG
+    Human system admins (``users.is_admin = TRUE``) bypass the per-user PG
     role and run as the backend service role — matching the existing
-    system-admin trust model. For everyone else, PG is the authority.
+    human system-admin trust model. For service accounts and other users, PG
+    is the authority.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2024,7 +2031,8 @@ async def execute_sql(
                     vrow["id"], token_id, conn=conn,
                 ):
                     continue
-                if is_admin and current_vault_scope.get() is None:
+                if (current_vault_scope.get() is None
+                        and await human_admin_sql_bypass(conn, user_id, is_admin)):
                     # A3: bypass, but LOUDLY — same event as the guard.
                     await emit_event(
                         conn, "vault.write_policy_admin_bypass",
@@ -2074,6 +2082,10 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
+    except TransientDependencyError:
+        # A dependency outage is not invalid SQL. In particular, do not
+        # acquire another connection to enrich a failed/time-limited query.
+        raise
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)
         # Try to enrich column/table-not-exist errors with fuzzy-match

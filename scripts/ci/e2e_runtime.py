@@ -2102,6 +2102,7 @@ class E2ERuntime:
         log_name: str,
         *,
         environment: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> None:
         if name in self._children:
             raise ProvisioningFailure(f"process already running: {name}")
@@ -2110,7 +2111,7 @@ class E2ERuntime:
             os.chmod(log_path, 0o600)
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=str(self.config.config_dir.parent if name == "backend" else self.config.runtime_root),
+                cwd=str(cwd or (self.config.config_dir.parent if name == "backend" else self.config.runtime_root)),
                 env=self._child_environment(environment),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=handle,
@@ -2318,19 +2319,24 @@ class E2ERuntime:
         )
 
     async def _drain_backend(self) -> None:
+        self._backend_drain_evidence = await self._drain_backend_process(
+            "backend", self._backend_launch_id, self._backend_drain_report,
+        )
+
+    async def _drain_backend_process(self, name: str, launch_id: str, report_path: Path | None) -> dict[str, object]:
         """Close serving admission and require acknowledged graceful completion.
 
         Signal only the leader. Its in-flight Git children must finish naturally,
         rather than receiving the supervisor's cleanup termination signal.
         Forced termination never authorizes reuse of the database.
         """
-        managed = self._children.get("backend")
+        managed = self._children.get(name)
         if managed is None or managed.process.returncode is not None:
             raise ProvisioningFailure("backend is unavailable for graceful drain")
         process = managed.process
         groups = managed.owned_groups
         groups.add(process.pid)
-        self._stopping_children.add("backend")
+        self._stopping_children.add(name)
         try:
             await asyncio.to_thread(_live_process_groups, process.pid, groups)
             process.send_signal(signal.SIGTERM)
@@ -2342,21 +2348,21 @@ class E2ERuntime:
                     await asyncio.sleep(0.05)
                 await process.wait()
             try:
-                if self._backend_drain_report is None:
+                if report_path is None:
                     raise ValueError
-                report = json.loads(self._backend_drain_report.read_text())
+                report = json.loads(report_path.read_text())
                 if (not isinstance(report, dict)
-                        or report.get("launch_id") != self._backend_launch_id
+                        or report.get("launch_id") != launch_id
                         or report.get("pid") != process.pid
                         or report.get("shutdown_complete") is not True
                         or process.returncode != 0):
                     raise ValueError
             except (OSError, ValueError, TypeError):
                 raise ProvisioningFailure("backend graceful drain was not acknowledged") from None
-            self._backend_drain_evidence = report
-            self._children.pop("backend", None)
+            self._children.pop(name, None)
+            return report
         finally:
-            self._stopping_children.discard("backend")
+            self._stopping_children.discard(name)
 
     async def _capture_schema_baseline(self) -> None:
         import asyncpg
@@ -4665,7 +4671,99 @@ class E2ERuntime:
                 await stop_task
         return 0
 
+    @contextlib.asynccontextmanager
+    async def _hold_publication_budget_lock(self, slug: str):
+        import asyncpg
+
+        conn = await asyncpg.connect(
+            host="127.0.0.1", port=self.config.postgres_port,
+            user="akb", password="akb", database="akb",  # pragma: allowlist secret
+            timeout=5,
+        )
+        try:
+            async with conn.transaction():
+                found = await conn.fetchval(
+                    "SELECT budget.publication_id FROM publication_password_budgets AS budget "
+                    "JOIN publications AS publication ON publication.id=budget.publication_id "
+                    "WHERE publication.slug=$1 FOR UPDATE OF budget", slug,
+                )
+                if found is None:
+                    raise ProductAssertionFailure("test publication budget was not allocated")
+                yield
+        finally:
+            await conn.close(timeout=5)
+
+    async def _run_publication_budget_check(self) -> None:
+        from publication_budget_probe import run_checks
+
+        # Share fixture storage but never reset it while a second API is live.
+        async with self._reset_lock:
+            if not self._pat_value or "backend" not in self._children:
+                raise ProvisioningFailure("publication probe requires a ready owned backend/PAT")
+            name = "publication-replica"
+            launch_id = ""
+            report_path = None
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            origin = f"http://127.0.0.1:{port}"
+            primary_pid = self._children["backend"].process.pid
+            generation = self.config.storage_generation
+
+            async def start() -> dict[str, object]:
+                nonlocal launch_id, report_path
+                launch_id = uuid.uuid4().hex
+                report_path = self.config.config_dir / f"drain-{launch_id}.json"
+                await self._spawn_host_process(
+                    name, [sys.executable, str(self.config.runtime_scripts_dir / "e2e_backend.py"),
+                           "--app-dir", str(self.config.backend_dir), "--host", "127.0.0.1",
+                           "--port", str(port), "--drain-report", str(report_path),
+                           "--launch-id", launch_id],
+                    "publication-replica.log", environment={"AKB_PROCESS_ROLE": "api"},
+                    cwd=self.config.config_dir.parent,
+                )
+                await self._wait_http(name, origin + "/readyz", self._ready_response)
+                pid = self._children[name].process.pid
+                if pid == primary_pid:
+                    raise ProvisioningFailure("publication probe requires independent API processes")
+                return {"pid": pid, "launch_id": launch_id}
+
+            async def replace() -> dict[str, object]:
+                before = {"pid": self._children[name].process.pid, "launch_id": launch_id}
+                await self._drain_backend_process(name, launch_id, report_path)
+                after = await start()
+                if before == after or before["launch_id"] == after["launch_id"]:
+                    raise ProvisioningFailure("publication replica was not replaced")
+                if self.config.storage_generation != generation:
+                    raise ProvisioningFailure("publication replacement reset storage")
+                return {"before": before, "after": after, "storage_generation": generation}
+
+            try:
+                async with asyncio.timeout(self.config.timeout_seconds):
+                    replica = await start()
+                    evidence = await run_checks(
+                        [self.config.app_origin, origin], self._pat_value,
+                        replace_replica=replace, hold_budget_lock=self._hold_publication_budget_lock,
+                    )
+                    evidence["processes"] = {"primary_pid": primary_pid, "replica": replica}
+            except BaseException:
+                self._prepared = False
+                self._lifecycle_state = "failed"
+                raise
+            finally:
+                if name in self._children:
+                    try:
+                        await self._drain_backend_process(name, launch_id, report_path)
+                    except BaseException:
+                        self._prepared = False
+                        self._lifecycle_state = "failed"
+                        raise
+            emit_gate_event({"event": "publication_budget_complete", "process": "supervisor",
+                             "returncode": 0, "checks": 5, "evidence": evidence})
+
     async def _run_gate(self) -> int:
+        import httpx
+
         suite_path = self.config.runtime_scripts_dir / "e2e_suite_runner.py"
         mcp_pytest_path = self.config.checkout / "backend" / "tests" / "mcp_e2e"
         log_path = self.config.logs_dir / "gate.log"
@@ -4681,6 +4779,11 @@ class E2ERuntime:
                 "source_revision": self._source_revision(),
             },
         )
+
+        try:
+            await self._run_publication_budget_check()
+        except (AssertionError, TimeoutError, httpx.HTTPError) as exc:
+            raise ProductAssertionFailure("publication replica budget check failed") from exc
 
         emit_gate_event(
             {
@@ -4891,6 +4994,8 @@ class E2ERuntime:
             )):
                 self._suite_process = None
         await attempt("fixture", self._stop_fixture_control())
+        if "publication-replica" in self._children:
+            await attempt("publication-replica", self._stop_named_process("publication-replica"))
         for name in ("stdio", "frontend", "backend", "embed"):
             await attempt(name, self._stop_named_process(name))
         await attempt("dependencies", self._compose("down", "--volumes", "--remove-orphans"))

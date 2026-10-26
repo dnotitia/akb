@@ -7,7 +7,8 @@ import { documentSubscription, notificationSubscriptions, NotificationsUnavailab
 import { parseDocUri } from "@/lib/uri";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
-import { InlineLoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingState, InlineLoadingState } from "@/components/ui/loading-state";
 
 export function NotificationsSection({ onBusyChange }: { onBusyChange?: (busy: boolean) => void }) {
   const user = useCurrentUser();
@@ -29,8 +30,9 @@ export function NotificationsSection({ onBusyChange }: { onBusyChange?: (busy: b
         <h2 id="watched-documents-heading" className="text-base font-semibold text-foreground">Watched documents</h2>
         <p className="mt-1 text-sm text-foreground-muted">Get notified when others update these documents. Choose Watch in a document to add it here.</p>
       </div>
-      {query.isPending && <InlineLoadingState label="Loading watched documents" className="py-5" />}
-      {query.error && <Alert variant="info" className="mt-4">{query.error instanceof NotificationsUnavailable ? query.error.message : "Could not load watched documents."}<Button variant="ghost" size="sm" onClick={() => void query.refetch()}>Retry</Button></Alert>}
+      {query.isPending && <LoadingState label="Loading watched documents" className="space-y-3 py-5">{[0, 1, 2].map(row => <Skeleton key={row} className="h-14 w-full" />)}</LoadingState>}
+      {query.isFetching && query.data && <InlineLoadingState label="Updating watched documents" className="py-3" />}
+      {query.error && <Alert variant="info" className="mt-4">{query.error instanceof NotificationsUnavailable ? query.error.message : "Could not load watched documents."}<Button variant="ghost" size="sm" loading={query.isFetching} onClick={() => void query.refetch()}>Retry</Button></Alert>}
       {error && <Alert variant="destructive" className="mt-4">{error}<Button variant="ghost" size="sm" onClick={() => setError(null)}>Dismiss</Button></Alert>}
       {query.data?.items.length === 0 && <p className="py-6 text-sm text-foreground-muted">You aren’t watching any documents yet.</p>}
       <ul className="divide-y divide-border" aria-busy={query.isFetching || busy !== null}>

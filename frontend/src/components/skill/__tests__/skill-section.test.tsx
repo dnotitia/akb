@@ -71,13 +71,13 @@ describe("SkillSection", () => {
     }
   });
 
-  it("keeps dirty content and its revision pin across Preview and Agent view", async () => {
+  it("keeps dirty content and its revision pin across Agent view", async () => {
     const user = userEvent.setup();
     updateDocument.mockResolvedValue({ current_commit: "saved-revision" });
     const rendered = render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
     await user.click(screen.getByRole("button", { name: "Edit guide" }));
     await user.type(screen.getByLabelText("Vault guide body"), " local draft");
-    await user.click(screen.getByRole("button", { name: "Preview guide" }));
+    await openGuideOption(user, "Agent view");
     rendered.rerender(wrap(<SkillSection vault="my-v" doc={{ ...DOC, content: "New remote guide", current_commit: "new-remote-revision" }} canManage />));
     await openGuideOption(user, "Agent view");
     await user.click(screen.getByRole("button", { name: "Edit guide" }));
@@ -144,7 +144,7 @@ describe("SkillSection", () => {
     </ResourceNavigationProvider></MemoryRouter></QueryClientProvider>);
     await user.click(screen.getByRole("button", { name: "Edit guide" }));
     await user.type(screen.getByLabelText("Vault guide body"), " draft");
-    await user.click(screen.getByRole("button", { name: "Preview guide" }));
+    await openGuideOption(user, "Agent view");
     await user.click(screen.getByRole("link", { name: "Leave guide" }));
     await user.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(screen.queryByRole("heading", { name: "Other workspace" })).toBeNull();
@@ -162,7 +162,7 @@ describe("SkillSection", () => {
     await user.type(screen.getByLabelText("Vault guide body"), " draft");
     await user.click(screen.getByRole("button", { name: "Save guide" }));
     expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "Preview guide" }));
+    await openGuideOption(user, "Agent view");
     await user.click(screen.getByRole("button", { name: "Edit guide" }));
     expect(screen.getByLabelText("Vault guide body")).toHaveValue(`${DOC.content} draft`);
     finishSave({ current_commit: "saved-revision" });
@@ -180,21 +180,23 @@ describe("SkillSection", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
   it("renders the editor surface for a normal vault with a guide", async () => {
+    // This case checks the ready guide, not lazy loading. Resolve the real
+    // preview so cold module transforms do not consume findByText's budget.
+    await import("../guide-preview");
     const u = userEvent.setup();
     render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
 
-    // Anchor for the #skill redirect target.
+    // Anchor for the canonical guide-management section.
     expect(document.getElementById("skill")).toBeTruthy();
     const sectionHeader = screen.getByRole("heading", { name: "Vault guide" });
-    expect(sectionHeader).toHaveClass("text-base", "font-semibold");
+    expect(sectionHeader).toHaveClass("text-ui", "font-semibold");
     expect(sectionHeader.nextElementSibling).toHaveAttribute("data-slot", "settings-group");
-    expect(sectionHeader.nextElementSibling).toHaveClass("border-border-strong");
+    expect(sectionHeader.nextElementSibling).not.toHaveClass("border-border-strong");
     expect(sectionHeader).not.toHaveClass("bg-surface-2/55");
-    expect(screen.getByText(/Stored body/)).toBeTruthy();
+    expect(await screen.findByText(/Stored body/)).toBeTruthy();
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
 
-    // History points at the canonical doc pinned to its commit — the one URL
-    // the viewer does NOT bounce back to settings.
+    // History points at the canonical reader pinned to its commit.
     await u.click(screen.getByRole("button", { name: "Guide options" }));
     const history = screen.getByRole("menuitem", { name: /history/i });
     expect(history.getAttribute("href")).toBe(
@@ -283,8 +285,8 @@ describe("SkillSection", () => {
       screen.queryByRole("menuitem", { name: /reset to template/i }),
     ).toBeNull();
     // Expanded preview, Agent view and History are reads — a reader keeps them.
-    expect(screen.getByText(/Stored body/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Preview guide" })).toBeTruthy();
+    expect(await screen.findByText(/Stored body/)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open guide" })).toHaveAttribute("href", "/vault/my-v/doc/overview%2Fvault-skill.md");
     await user.click(screen.getByRole("button", { name: "Guide options" }));
     expect(screen.getByRole("menuitem", { name: /agent view/i })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /history/i })).toBeTruthy();

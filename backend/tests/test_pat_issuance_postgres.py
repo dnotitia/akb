@@ -50,9 +50,10 @@ def wire(monkeypatch, pool):
 
 @asynccontextmanager
 async def client_for(actor):
-    from app.main import akb_error_handler, validation_error_handler, _no_store_public_surfaces
+    from app.main import akb_error_handler, validation_error_handler
+    from app.http_middleware import NoStorePublicSurfacesMiddleware
     app = FastAPI()
-    app.middleware("http")(_no_store_public_surfaces)
+    app.add_middleware(NoStorePublicSurfacesMiddleware)
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(access.router, prefix="/api/v1")
     app.add_exception_handler(AKBError, akb_error_handler)

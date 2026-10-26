@@ -8,19 +8,19 @@ function wrap(ui: React.ReactNode) {
 }
 
 describe("SkillStatusChip", () => {
-  it("customized → the settings guide editor", () => {
+  it("customized → the shared guide reader", () => {
     render(wrap(<SkillStatusChip vault="my-v" defined customized />));
     expect(screen.getByText(/Guide/).textContent).toContain("customized");
     expect(screen.getByRole("link").getAttribute("href")).toBe(
-      "/vault/my-v/settings#skill",
+      "/vault/my-v/doc/overview%2Fvault-skill.md",
     );
   });
 
-  it("still on the template → same destination, different state", () => {
+  it("template → the same guide reader", () => {
     render(wrap(<SkillStatusChip vault="my-v" defined customized={false} />));
     expect(screen.getByText(/Guide/).textContent).toContain("template");
     expect(screen.getByRole("link").getAttribute("href")).toBe(
-      "/vault/my-v/settings#skill",
+      "/vault/my-v/doc/overview%2Fvault-skill.md",
     );
   });
 

@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     # Includes runtime preparation, API suites, and the full browser regression.
     # Playwright has a shorter global budget so failures can upload diagnostics.
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4

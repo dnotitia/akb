@@ -1,4 +1,5 @@
 import { GitCompareArrows, GitCommitHorizontal } from "lucide-react";
+import type { Ref } from "react";
 
 import type { DocumentHistoryEntry } from "@/lib/api";
 import { sameCommitRef } from "@/lib/commit";
@@ -15,6 +16,8 @@ interface HistoryListProps {
   onCompare?: (hash: string, trigger: HTMLButtonElement) => void;
   selectedHash?: string;
   diffHash?: string;
+  compareFocusHash?: string;
+  compareFocusRef?: Ref<HTMLButtonElement>;
 }
 
 export function HistoryList({
@@ -23,6 +26,8 @@ export function HistoryList({
   onCompare,
   selectedHash,
   diffHash,
+  compareFocusHash,
+  compareFocusRef,
 }: HistoryListProps) {
   if (entries.length === 0) {
     return <p className="text-sm text-foreground-muted">No versions yet.</p>;
@@ -71,6 +76,7 @@ export function HistoryList({
             <div className="flex shrink-0 items-center gap-1">
               {onCompare && (
                 <button
+                  ref={entry.hash === compareFocusHash ? compareFocusRef : undefined}
                   type="button"
                   data-document-diff-trigger={entry.hash}
                   onClick={(event) => onCompare(entry.hash, event.currentTarget)}

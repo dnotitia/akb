@@ -24,6 +24,8 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
+import asyncpg
+
 from app.exceptions import InvalidColumnTypeError, ValidationError
 from app.util.text import fuzzy_hint
 
@@ -595,6 +597,7 @@ async def create_dynamic_table(
     # (see table_service._RESERVED + row-write IMMUTABLE sets).
     col_defs.append("row_commit TEXT NOT NULL DEFAULT gen_random_uuid()::TEXT")
     await conn.execute(f'CREATE TABLE {pg_name} ({", ".join(col_defs)})')
+    await install_default_page_index(conn, pg_name)
     # Auto-bump `updated_at` on every UPDATE. PG has no MySQL-style
     # `ON UPDATE CURRENT_TIMESTAMP`, and user SQL reaches the table verbatim
     # through `execute_sql` (no app-layer `SET updated_at = NOW()` hook), so a
@@ -616,6 +619,16 @@ async def create_dynamic_table(
         pg_name,
         vault_id=vault_id,
         resource_uri=resource_uri,
+    )
+
+
+async def install_default_page_index(conn, pg_name: str) -> None:
+    """Support the viewer's stable newest-first page without sorting all rows."""
+    if not _DYNAMIC_PG_NAME_RE.fullmatch(pg_name):
+        raise ValueError(f"Invalid dynamic table name: {pg_name!r}")
+    index = generate_constraint_name(pg_name, ["created_at", "id"], kind="page_idx")
+    await conn.execute(
+        f"CREATE INDEX IF NOT EXISTS {index} ON public.{pg_name} (created_at DESC, id DESC)"
     )
 
 
@@ -681,7 +694,7 @@ async def count_rows(conn, pg_name: str) -> int:
     registry row whose data table was already dropped)."""
     try:
         return int(await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}") or 0)
-    except Exception:  # noqa: BLE001 — table-missing is the usual case here
+    except asyncpg.UndefinedTableError:
         return 0
 
 

@@ -11,7 +11,7 @@ or rollback, so the same pooled connection can serve different users
 in subsequent transactions without cross-contamination. Compatible
 with PgBouncer transaction-pool.
 
-System admins (`users.is_admin = TRUE`) bypass `SET LOCAL ROLE`. Their
+Human system admins (`users.is_admin = TRUE`) bypass `SET LOCAL ROLE`. Their
 SQL runs under the connection's default role (the backend service
 role) so they retain unrestricted access — matching existing trust
 model.
@@ -35,6 +35,19 @@ from app.models.vault_scope import (
 from app.services.role_sync import token_role_name, user_role_name
 
 logger = logging.getLogger("akb.user_sql")
+
+
+async def human_admin_sql_bypass(conn, user_id: uuid.UUID | str, is_admin: bool) -> bool:
+    """Machine administration never delegates the backend database role.
+
+    Read and lock the live account in the SQL transaction. A service PAT's
+    administrative API status does not permit rewriting identity authority via
+    SQL. Scoped token roles continue to take precedence for humans too.
+    """
+    if not is_admin:
+        return False
+    return bool(await conn.fetchval("""SELECT account_kind='human' AND is_admin AND account_status='active'
+        FROM users WHERE id=$1 FOR SHARE""", uuid.UUID(str(user_id))))
 
 
 # ── Result shaping ────────────────────────────────────────────
@@ -146,8 +159,8 @@ class UserSqlExecutor:
       1. Open transaction.
       2. SET LOCAL ROLE:
            - scoped PAT     → akb_token_<tid>  (owner-ACL ∩ scope; even if admin)
-           - else non-admin → akb_user_<uid>
-           - else (unscoped admin) → no switch (connection default = full)
+           - else non-human-admin → akb_user_<uid>
+           - else unscoped human admin → connection default (full)
       3. SET LOCAL search_path = public.
       4. Execute SQL.
       5. Commit (or rollback on exception).
@@ -199,13 +212,13 @@ class UserSqlExecutor:
                         # akb_user_<uid>, which would defeat the scope.
                         role = token_role_name(token_id)
                         await conn.execute(f'SET LOCAL ROLE "{role}"')
-                    elif not is_admin:
+                    elif not await human_admin_sql_bypass(conn, user_id, is_admin):
                         role = user_role_name(user_id)
                         # asyncpg passes the role name as an identifier here;
                         # we built it ourselves from a UUID so the only chars
                         # are [a-z0-9_]. No injection risk.
                         await conn.execute(f'SET LOCAL ROLE "{role}"')
-                    # else: unscoped admin → connection default (full access).
+                    # else: live unscoped human admin → connection default.
                     # Reset search_path defensively — a previous tx on this
                     # pooled connection might have left a different default
                     # (it shouldn't, but be explicit).
@@ -269,6 +282,13 @@ class UserSqlExecutor:
             # exist"); we surface verbatim and let the caller's friendly-
             # hint logic offer fuzzy suggestions for tables in the
             # caller's allowed set.
+            raise
+        except Exception as exc:
+            from app.db.transient import transient_error
+
+            mapped = transient_error(exc)
+            if mapped is not None:
+                raise mapped from exc
             raise
 
 

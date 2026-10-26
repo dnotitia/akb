@@ -2,46 +2,41 @@
 
 ## Coding agent workflow
 
-Both coding agents run the same roles. They are defined once in
-`.agents/roles.toml`; `.codex/` and `.claude/` are rendered from it by
-`scripts/agent-roles.py`, and `scripts/check.sh` fails when a rendered file is
-hand-edited or stale. Model names live only in that source. `CLAUDE.md`
-imports this file, so this is the one contract.
+This file is the instruction file for every coding agent and for people working
+in this repository. Claude Code and Codex both read `AGENTS.md` directly; there
+is no separate per-agent instruction file.
 
-| role | effort | scope |
-| --- | --- | --- |
-| owner (the session default) | `medium`, raised per task | architecture, consequential review, uncertain cross-repository decisions |
-| `explorer` | `max` only | optional bounded read-only lookup: paths and evidence, not decisions |
-| `reviewer` | `high` | read-only review of a named diff with reproducible findings |
-| `efficiency_worker` | `medium` | opt-in implementation, only with evidence of better total efficiency |
-
-- Start on the owner model at the configured `medium` effort. Increase to
-  `high`, `xhigh`, or `max` when the problem or observed result warrants it.
-  These settings concern the coding agent, not product models.
-- The explorer tier is allowed only at `max`, for a bounded auxiliary task.
-  Choose the worker tier only when comparable work has demonstrated adequate
-  quality and better total efficiency than the owner; include latency,
-  retries, and usage in that judgment. Otherwise keep the task on the owner.
-- Carry out the requested outcome using reasonable assumptions. Existing user
-  authorization continues to apply; local skills do not create new approval
-  steps. If an actual instruction blocks progress, cite its file and wording.
-- Delegate independent work when it saves time while the owner makes useful
-  progress: one level deep, at most three workers at a time, each with clear
-  paths, scope, and a check; integrate once. A review or implementation task
-  does not require a fixed agent pipeline.
-- Read only the applicable product and directory guidance. Run checks that
-  exercise the changed behavior and required repository gates; documentation
-  or agent-configuration edits need parsing, links, and relevant policy checks.
-  Repeat a passing check only for a changed input or a specific unresolved risk.
-- Report the result, evidence, and remaining limitation in concise prose.
-  Preserve unrelated local work and keep credentials out of tracked files.
+- **Model and effort are each person's choice.** Nothing in this repository
+  sets a coding-agent model or reasoning effort; Claude Code and Codex use
+  whatever you configured. Product inference models (`embed_model`,
+  `llm_model` in `config/app.yaml`) are a separate, product-level setting.
+- **Helper roles** are optional and defined once in `.agents/roles.toml`:
+  `explorer` and `reviewer` are read-only, `worker` makes bounded edits.
+  `.codex/` and `.claude/agents/` are rendered from that file by
+  `python scripts/agent-roles.py`; edit the source, never a rendered file.
+  `scripts/check.sh` fails on a hand-edited or stale rendered file and on any
+  model or effort key in the source or in `.claude/settings.json`.
+- **Verify before saying something passes.** `bash scripts/check.sh` is the
+  static gate CI runs; its tool setup is in the Static Analysis Gate section
+  of `CONTRIBUTING.md`, and it names any missing prerequisite. Also run the
+  checks that exercise what you changed: the frontend gate below for UI work,
+  the suites in `scripts/ci/README.md` for backend behavior. Report what ran
+  and its result, and say so when a check was not run.
+- **Do not break the contracts below** (proxy-only filesystem tools, the doc
+  ID lookup, the indexing write path's crash-safe ordering, release tag
+  prefixes). A change to one updates its section here in the same pull request.
+  Preserve unrelated local work.
+- **This repository is public.** Code, comments, docs, commit messages and
+  pull-request text must not contain internal hostnames, private planning
+  references, credentials, or references to internal issue trackers. Explain
+  the reason in self-contained prose instead of pointing at private material.
 
 ## Architecture
 
-- **Backend**: Python 3.14, FastAPI + Uvicorn, PostgreSQL 16 + pgvector, GitPython (bare repo)
+- **Backend**: Python 3.14, FastAPI + Uvicorn, PostgreSQL 16 + pgvector; PostgreSQL Native revisions by default, GitPython for explicit Bare Git installations
 - **MCP**: Anthropic MCP SDK (Streamable HTTP) — backend serves as HTTP MCP server
 - **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, zero dependencies, stdio ↔ HTTP bridge
-- **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Plate (`platejs` markdown editor; lazy-loaded in Edit / New-document flows)
+- **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Tiptap (`@akb/markdown-editor`; lazy-loaded in Edit / New-document flows)
 
 ## Frontend Design System
 
@@ -120,17 +115,16 @@ The endpoint-driven suites, isolated repository-owned runtime, and optional
 Ubuntu host bootstrap are documented in
 [`scripts/ci/README.md`](scripts/ci/README.md).
 
-- `backend/tests/test_mcp_e2e.sh` — main E2E (75 tests), covers core CRUD, search, tables, access control
-- `backend/tests/test_edit_e2e.sh` — akb_edit E2E (33 tests)
-- `backend/tests/test_stdio_files_e2e.sh` — file upload/download E2E (18 tests)
-- `backend/tests/test_put_file_param_e2e.sh` — file param E2E (15 tests)
-- `backend/tests/test_security_edge_e2e.sh` — security & edge cases (62 tests)
-- `backend/tests/test_pg_rbac_e2e.sh` — PG-native vault isolation: cross-vault probes via SQL surface variations (44 tests, includes system-catalog access, schema-qualified, quoted, UNION/CTE/EXISTS/subquery, filesystem functions, DDL-shaped attempts, reader-scope writes)
-- `backend/tests/test_graph_replace_e2e.sh` — graph, replace, unicode, cross-vault (29 tests)
-- `backend/tests/test_defensive_e2e.sh` — defensive / lifecycle (33 tests)
-- `backend/tests/test_probes_e2e.sh` — /livez /readyz /health + concurrent-burst regression
-- All tests target whatever `AKB_URL` points at (default `http://localhost:8000`).
-- Tests create ephemeral users/vaults and clean up after themselves.
+- The canonical gate and setup commands live in [scripts/ci/README.md](scripts/ci/README.md).
+- `backend/tests/mcp_e2e/` covers authenticated MCP product behavior through
+  the Python SDK; `test_detail_e2e.py` includes exact-text editing, OCC,
+  Unicode, graph and replacement regressions.
+- Shell suites retain transport, REST, PostgreSQL ACL and local-file
+  boundaries. `test_mcp_e2e.sh` is a transport boundary suite, not the full
+  product gate. Do not substitute it for the SDK suite.
+- Use the repository-owned isolated runtime for the complete gate. Tests
+  create ephemeral data; follow its cleanup contract rather than targeting
+  an unrelated installation.
 
 ## Key Conventions
 
@@ -190,8 +184,9 @@ only.
 - **Backend**: bump `backend/pyproject.toml`, add CHANGELOG entry,
   PR + merge → `git tag -a backend-vX.Y.Z <merge-commit> -m "..."` →
   push → `gh release create backend-vX.Y.Z [--latest] --notes "..."`
-  → `bash deploy/k8s/internal/deploy-internal.sh` (image built from
-  the bumped pyproject version).
+  → build the release image from the bumped version. Deployment is an
+  operator-specific step; use [Native installation](docs/operations/native-installation.md)
+  for supported public deployment instructions.
 - **Proxy**: bump `packages/akb-mcp-client/package.json`, add
   CHANGELOG entry, PR + merge → for an authorized release, run
   `cd packages/akb-mcp-client && npm publish --access public`
@@ -207,14 +202,15 @@ only.
 - **Vector store is a driver-pluggable derived index.** `pgvector`
   (default; can share the main PG instance under a separate
   `vector_index` schema), `qdrant` (separate StatefulSet), or
-  `seahorse` (managed Seahorse Cloud table over BFF + per-table host
-  API; no infra to run). Each driver holds the dense embedding and the
+  `seahorse-cloud` (managed Seahorse Cloud), or the self-hosted
+  `seahorse-db` / `seahorse-db-grpc` drivers. Each driver holds the dense embedding and the
   corpus-side BM25 sparse vector. Selection in `config/app.yaml`
   (`vector_store_driver`).
-- **Write path (POST /documents)** only touches PG + git. No vector-store
-  round-trips on the request thread — chunks go in with
+- **Write path (POST /documents)** persists authoritative revisions in PG
+  for `postgres_native`; explicit `bare_git` installations also use Git.
+  No vector-store round-trips occur on the request thread — chunks go in with
   `vector_indexed_at = NULL`.
-- **Indexing worker** (`embed_worker`, started in `lifespan`) drains
+- **Indexing worker** (`embed_worker`, started in the worker or combined process role) drains
   rows where `vector_indexed_at IS NULL` and runs the full pipeline
   atomically per chunk: embed → BM25 sparse encode →
   `vector_store.upsert_one()` → `vector_indexed_at = NOW()`.
@@ -226,7 +222,16 @@ only.
   vector-store upsert, then `UPDATE chunks SET vector_indexed_at = NOW()`.
   A crash leaves NULL flags; the worker catches up.
 
-## Git Storage
+## Revision storage
+
+New installations use `postgres_native`: authoritative revisions live in
+PostgreSQL and no Git worktree is required. Existing databases require the
+explicit [cutover procedure](docs/operations/native-revision-existing-database-cutover.md);
+changing the selector alone does not migrate data.
+
+### Explicit Bare Git installations
+
+The following Git layout and locking apply only to the Bare Git backend:
 
 - Bare repo per vault at `/data/vaults/{vault_name}.git`
 - **Persistent linked worktree** per vault at

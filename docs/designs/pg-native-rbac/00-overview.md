@@ -1,7 +1,10 @@
 # Vault isolation via PostgreSQL ACL — Design
 
-**Status**: draft, awaiting review
-**Branch**: `feat/pg-native-rbac`
+**Status**: implemented; historical design record (status clarified 2026-10-20)
+
+The implementation is maintained in [`role_sync.py`](../../../backend/app/services/role_sync.py)
+and [`user_sql_executor.py`](../../../backend/app/services/user_sql_executor.py).
+This clarification records implementation evidence, not a new approval.
 **Started**: 2026-05-21
 
 ## Statement

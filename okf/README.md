@@ -14,15 +14,18 @@ MCP and REST. This directory makes AKB a first-class OKF citizen — AKB can
 **export** any vault as a conformant OKF bundle, and ships a standalone
 **conformance validator** anyone can run against any bundle.
 
-## Why AKB is already ~an OKF bundle
+## Storage and export boundaries
 
-An AKB vault is stored as a per-vault git repo of `.md` files with YAML
-frontmatter, and a document's identity is its path — exactly OKF's model
-(`tables/users.md` → concept ID `tables/users`). AKB independently arrived at
-OKF's core design before the spec existed; the remaining gaps are naming and a
-couple of reserved files, which the exporter closes.
+New installations store revisions in PostgreSQL Native. Explicit Bare Git
+installations retain per-vault Markdown worktrees. Server-side MCP/REST export
+reads through `DocumentService` and does not require a Git worktree. The offline
+`okf-export --from-git` CLI below is specifically for Bare Git worktrees.
 
-| OKF v0.1 | AKB native | Exporter does |
+An OKF concept ID follows the exported document path (`tables/users.md` becomes
+`tables/users`). AKB's storage backend and internal revision identity remain
+separate from that portable bundle path.
+
+| OKF v0.1 | AKB metadata | Exporter does |
 | --- | --- | --- |
 | `type` (**required**) | `type` (defaults `note`) | passthrough |
 | `title` | `title` | passthrough |
@@ -32,7 +35,7 @@ couple of reserved files, which the exporter closes.
 | `timestamp` (ISO 8601) | `created_at` / `updated_at` | emit `timestamp` = `updated_at` |
 | *(additional keys allowed)* | `status`, `domain`, … | preserved as extra keys |
 | `index.md` (progressive disclosure) | — (lives in PG) | **generated** |
-| `log.md` (changelog) | — (lives in `git log`) | **generated** |
+| `log.md` (changelog) | export metadata | **generated** |
 | root `okf_version` | — | **generated** (`0.1`) |
 
 ### Documents, tables, and files
@@ -63,9 +66,17 @@ proves it mechanically — see below. The recommended-field name differences
 
 The implementation lives in [`backend/app/services/okf.py`](../backend/app/services/okf.py)
 (pure, unit-tested in `backend/tests/test_okf_unit.py`) and is exposed via the
-backend CLI.
+backend CLI. For a running installation, call
+`akb_export({"vault": "<vault>", "format": "okf"})` to receive a path-to-content
+map, or use authenticated `GET /api/v1/vaults/{vault}/export?format=okf`
+for a ZIP. Both require reader access. Tables/files export metadata and resource
+pointers, not their rows/bytes; archived documents are excluded. This is a
+knowledge catalog export, not a full backup.
+
+The offline commands require the backend Python environment:
 
 ```bash
+cd backend
 # Validate any directory tree against OKF v0.1
 python -m app.cli okf-validate path/to/bundle/
 

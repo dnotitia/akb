@@ -7,6 +7,9 @@ reasoning_effort: medium
 
 # AKB Atlassian Issue Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Record **one Jira issue** as an `atlassian-issue` document in the target AKB vault. Mechanical assembly — title / description / resolution / comments quoted as author-authored compiled-truth; linked-issue refs preserved as raw external keys. No LLM synthesis on the body. Issue metadata is fetched live via the Atlassian MCP server.
 
 **Workflow classification.** LLM-wiki **Ingest** workflow. **Intent-debt** layer — Jira issues externalize the scope, decisions, and discussions shaping work-in-flight. Capturing them faithfully preserves rationale before the issue closes and Jira's UI buries the discussion.
@@ -26,7 +29,7 @@ Scope boundaries:
 /ingest-jira <issue-key> --vault {vault_name} [--project {name}]
 ```
 
-- `<issue-key>` (required, positional) — Jira issue key, e.g. `SDDEV-360`.
+- `<issue-key>` (required, positional) — Jira issue key, e.g. `PROJ-123`.
 - `--vault` (required) — target AKB vault.
 - `--project` (optional) — pin to a project namespace for downstream cross-source rollup. Adds `project: "{name}"` frontmatter and a `project:{name | lower}` tag, *in addition to* the Jira-structural `project:{project_key | lower}` derived from the issue key. The two coexist intentionally: `project_key` is the source-system id, `--project` is the rollup namespace.
 
@@ -66,7 +69,7 @@ Compose `canonical_url = "{issue.tenant_base_url}/browse/{issue.issue_key}"` (fa
 
 ### Step 3 — Dedup check
 
-Always upsert; the check tells Step 5 whether to create or replace. `akb_search(vault={vault_name}, collection=atlassian-issues, type=reference, tags=["issue-key:{issue_key}"], limit=5)`. Single-tag filter narrows to exact-membership (AKB's `tags` filter has OR semantics, so multi-tag would broaden); Jira issue keys are tenant-unique, so `issue-key:{issue_key}` + collection is sufficient. On hit, capture `existing_doc_id`.
+Enumerate `akb_browse(vault={vault_name}, collection="atlassian-issues", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. Match the exact `issue-key:{issue_key}` tag. Capture `existing_doc_id` and `existing_uri` for the update path; create only when enumeration completed without a match. Report multiple matches without writing.
 
 No version field maps cleanly to a monotonic counter (`updated_at` can replay); compiled-truth is rewritten every invocation, and the timeline records each re-ingest — same pattern as `ingest-pr`.
 
@@ -255,10 +258,10 @@ Branch by Step 3 result.
 
 **Update** (`existing_doc_id` from Step 3):
 
-1. `akb_get(vault={vault_name}, doc_id={existing_doc_id}) → existing_content`.
+1. `akb_get(uri={existing_uri}) → existing_content`.
 2. Compose `draft_body` = full new body (compiled-truth + Source + `---` + `## Timeline` + the single new entry).
 3. Apply **timeline merge — Mode A (full-body merge)** against `existing_content`.
-4. `akb_update(vault={vault_name}, doc_id={existing_doc_id}, title="{issue_key}: {issue.title}", tags={tags}, content={merged_body}, summary={issue.title}, message="Re-ingested at status {status}, {N} comments")`.
+4. `akb_update(uri={existing_uri}, title="{issue_key}: {issue.title}", tags={tags}, content={merged_body}, summary={issue.title}, message="Re-ingested at status {status}, {N} comments")`.
 
 Mode A is correct: the compiled-truth zone (Description, Resolution, Comments, Linked, Source) is rewritten from the new fetch — not appended to. Timeline preserves history; the rest mirrors current Jira state.
 

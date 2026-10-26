@@ -37,7 +37,7 @@ class M1ReferencePayloadStore:
 
     selected_placement = "m1-reference-payload-v1"
     verification_profile = "sha256-size-utf8-v1"
-    # Write-path byte cap (workbench #1069, part 3): the same 10MiB the
+    # Write-path byte cap on the payload text: the same 10MiB the
     # pg-bodystore placement enforces (`M1_PG_TEXT_MAX_BYTES`). Without a cap
     # here, an unbounded body can enter the corpus and every read path —
     # candidate filtering, hydration, grep — must assume the unbounded case.

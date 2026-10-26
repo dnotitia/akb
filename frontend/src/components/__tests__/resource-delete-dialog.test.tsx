@@ -6,6 +6,12 @@ import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 afterEach(() => cleanup());
 
 describe("ResourceDeleteDialog", () => {
+  it("does not invent a zero row count for bounded directory results", () => {
+    render(<ResourceDeleteDialog open onOpenChange={() => {}} kind="table" name="audit_log" onConfirm={() => {}} />);
+    expect(screen.getByText(/all its rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/all 0 rows/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete table" })).toBeDisabled();
+  });
   it("uses a standard confirmation for documents", async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn().mockResolvedValue(undefined);

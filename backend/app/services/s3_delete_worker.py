@@ -208,7 +208,8 @@ async def _process_deletes_once() -> int:
                         # object key. A recreated vault can legitimately own
                         # the same key; deleting it would corrupt that File.
                         referenced = await lock_conn.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)",
+                            """SELECT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)
+                                      OR EXISTS (SELECT 1 FROM user_avatars WHERE object_key = $1)""",
                             row["s3_key"],
                         )
                         if not referenced:
@@ -234,7 +235,7 @@ async def _process_deletes_once() -> int:
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
                                 "s3 cleanup lock release failed for %s: %s",
-                                row["s3_key"],
+                                "private account image" if row["s3_key"].startswith(".akb-account-assets/") else row["s3_key"],
                                 exc,
                             )
         except Exception as exc:  # noqa: BLE001

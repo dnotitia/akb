@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
   ArrowRight,
   ChevronRight,
@@ -12,8 +11,7 @@ import {
   type DocumentMoveResult,
 } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
-import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { vaultTreeQueryOptions } from "@/hooks/use-vault-tree";
+import { useVaultTree } from "@/hooks/use-vault-tree";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -31,7 +29,6 @@ import { Label } from "@/components/ui/label";
 import { SelectMenu, type SelectOption } from "@/components/ui/select-menu";
 import {
   documentTitleConflictFromError,
-  findDocumentTitleConflict,
   type DocumentTitleConflict,
 } from "@/lib/document-title-conflict";
 
@@ -43,12 +40,6 @@ interface DocumentMoveDialogProps {
   title: string;
   onMoved: (result: DocumentMoveResult) => void;
   onOpenDocument?: (path: string) => void;
-}
-
-interface BrowseDocument {
-  type: "document";
-  name: string;
-  path: string;
 }
 
 function splitDocumentPath(path: string) {
@@ -110,12 +101,11 @@ export function DocumentMoveDialog({
   const errorRef = useRef<HTMLDivElement | null>(null);
   const conflictRef = useRef<HTMLDivElement | null>(null);
 
-  const user = useCurrentUser();
-  const { checking, revision } = useAccessVerification();
-  const collectionsQuery = useQuery({
-    ...vaultTreeQueryOptions(user?.user_id, revision, vault),
-    enabled: open && Boolean(vault) && !checking,
-  });
+  const directory = useVaultTree(vault, "unarchived", { content_type: "collections", enabled: open });
+  const collectionsQuery = {
+    data: { items: directory.items ?? [] }, isPending: directory.loading,
+    isError: Boolean(directory.error), refetch: directory.refetch,
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -129,7 +119,7 @@ export function DocumentMoveDialog({
 
   const collectionOptions = useMemo<SelectOption[]>(() => {
     const paths = new Set<string>();
-    for (const item of collectionsQuery.data?.items || []) {
+    for (const item of directory.items || []) {
       if (item?.type !== "collection" || typeof item.path !== "string") continue;
       if (isReservedCollection(item.path)) continue;
       paths.add(item.path);
@@ -147,18 +137,7 @@ export function DocumentMoveDialog({
           hint: value === current.collection ? "Current collection" : undefined,
         })),
     ];
-  }, [collectionsQuery.data?.items, current.collection]);
-
-  const documents = useMemo<BrowseDocument[]>(
-    () =>
-      (collectionsQuery.data?.items || []).filter(
-        (item): item is BrowseDocument =>
-          item?.type === "document" &&
-          typeof item.name === "string" &&
-          typeof item.path === "string",
-      ),
-    [collectionsQuery.data?.items],
-  );
+  }, [directory.items, current.collection]);
 
   const destinationPath = collection
     ? `${collection}/${current.slug}.md`
@@ -166,18 +145,10 @@ export function DocumentMoveDialog({
   const destinationChanged = collection !== current.collection;
   const isDirty = destinationChanged || message.trim().length > 0;
 
-  const pathCollision = useMemo(
-    () =>
-      documents.find(
-        (item) => item.path !== path && item.path === destinationPath,
-      ) ?? null,
-    [destinationPath, documents, path],
-  );
-  const localConflict = useMemo(
-    () => findDocumentTitleConflict(documents, title, collection, path),
-    [collection, documents, path, title],
-  );
-  const titleConflict = serverConflict ?? localConflict;
+  // A Collection directory is not a complete document inventory. The move
+  // request performs authoritative title/path validation and returns the
+  // structured conflict needed for Open existing / Keep both recovery.
+  const titleConflict = serverConflict;
 
   function requestClose() {
     if (moving) return;
@@ -322,18 +293,9 @@ export function DocumentMoveDialog({
                   searchPlaceholder="Filter collections…"
                 />
                 <p className="text-xs leading-relaxed text-foreground-muted">
-                  Choose Vault root to move the document outside every collection.
+                  Choose Vault root to move the document outside every collection. The server checks title and path conflicts when you move; a rejected move keeps this draft.
                 </p>
               </div>
-
-              {pathCollision && !titleConflict && (
-                <Alert variant="info" title="The system path is already in use">
-                  <p>
-                    “{pathCollision.name}” resolves to the same technical slug. AKB will
-                    assign a collision-safe path automatically; the visible title stays unchanged.
-                  </p>
-                </Alert>
-              )}
 
               {titleConflict && (
                 <div ref={conflictRef} tabIndex={-1} className="focus:outline-none">
@@ -373,16 +335,12 @@ export function DocumentMoveDialog({
                   </div>
                   <div>
                     <dt className="text-foreground-muted">
-                      {pathCollision ? "Requested path" : "Expected path"}
+                      Expected path
                     </dt>
                     <dd className="mt-1 overflow-x-auto">
                       <code className="font-mono text-foreground">{destinationPath}</code>
                     </dd>
-                    {pathCollision && (
-                      <p className="mt-1 text-foreground-muted">
-                        The server will return the final collision-safe path after the move.
-                      </p>
-                    )}
+                    <p className="mt-1 text-foreground-muted">The server returns the final collision-safe path after the move.</p>
                   </div>
                 </dl>
               </details>
@@ -407,6 +365,10 @@ export function DocumentMoveDialog({
                 </div>
               </div>
 
+              {directory.hasMore && <div className="space-y-2 text-xs text-foreground-muted">
+                <p>More Collections are available. This list is not the complete Vault.</p>
+                <Button type="button" variant="outline" size="sm" loading={directory.loadingMore} onClick={directory.loadMore}>Load more Collections</Button>
+              </div>}
               {collectionsQuery.isError && (
                 <Alert variant="destructive" title="Collections could not be loaded">
                   <span>

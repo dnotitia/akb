@@ -1,28 +1,22 @@
-import { Activity, useEffect, useRef, useState } from "react";
-import { ShieldCheck, UserRound } from "lucide-react";
-import { authSessionSnapshot, beginAccountLifecycle, isCurrentAuthSession, clearCompletedAccountSession, changePassword, getMe, updateProfile } from "@/lib/api";
+import { Activity, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ShieldCheck } from "lucide-react";
+import { authSessionSnapshot, beginAccountLifecycle, isCurrentAuthSession, clearCompletedAccountSession, changePassword, getMe, updateProfile, type CurrentUser } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Alert } from "@/components/ui/alert";
-import { RoleBadge } from "@/components/status-badge";
 import { useFlashStatus } from "@/hooks/use-flash-status";
+import { ProfilePhotoEditor, useProfilePhotoEditor } from "./profile-photo-editor";
 
-export interface User {
-  user_id: string;
-  username: string;
-  email: string;
-  display_name: string | null;
-  is_admin: boolean;
-  auth_method?: string;
-  key_class?: string | null;
-}
+export type User = Pick<CurrentUser, "user_id" | "username" | "email" | "display_name" | "is_admin">
+  & Partial<Pick<CurrentUser, "auth_method" | "key_class" | "account_kind" | "avatar" | "profile_capabilities">>;
+export type ProfileUserPatch = Partial<Pick<CurrentUser, "display_name" | "email" | "avatar" | "profile_capabilities">>;
 
 interface Props {
   user: User;
   localPasswordEnabled: boolean;
   localProfileEditingEnabled: boolean;
-  onUserUpdate: (patch: { display_name?: string | null; email?: string }) => void;
+  onUserUpdate: (patch: ProfileUserPatch) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onBusyChange?: (busy: boolean) => void;
   onPasswordChanged?: () => void;
@@ -63,11 +57,12 @@ export function ProfileSection({
   const [pwBusy, setPwBusy] = useState(false);
   const [pwTouched, setPwTouched] = useState({ new: false, confirm: false });
   const passwordFlash = useFlashStatus(3000);
+  const photo = useProfilePhotoEditor({ user, visible, blocked: profileBusy || pwBusy, onUserUpdate });
 
   const pwTooShort = pwTouched.new && pwNew.length > 0 && pwNew.length < 8;
   const pwMismatch = pwTouched.confirm && pwConfirm.length > 0 && pwNew !== pwConfirm;
   const pwSubmitDisabled =
-    pwBusy || pwNew.length < 8 || pwNew !== pwConfirm || pwCurrent.length === 0;
+    pwBusy || photo.busy || pwNew.length < 8 || pwNew !== pwConfirm || pwCurrent.length === 0;
 
   const baseline = useRef({ id: user.user_id, name: (user.display_name ?? "").trim(), email: (user.email ?? "").trim() });
   // Same-account identity refreshes must not replace an active profile draft.
@@ -83,13 +78,13 @@ export function ProfileSection({
     (user.display_name ?? "").trim() !== profileDisplayName.trim()
     || (user.email ?? "").trim() !== profileEmail.trim();
   const dirty = (localProfileEditingEnabled && profileDirty)
-    || (localPasswordEnabled && Boolean(pwCurrent || pwNew || pwConfirm));
+    || (localPasswordEnabled && Boolean(pwCurrent || pwNew || pwConfirm)) || photo.dirty;
 
-  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
-  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-  const busy = profileBusy || pwBusy;
-  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
-  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
+  useLayoutEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useLayoutEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  const busy = profileBusy || pwBusy || photo.busy;
+  useLayoutEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  useLayoutEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   // Protect both profile and password work during refresh / external navigation.
   useEffect(() => {
@@ -104,7 +99,7 @@ export function ProfileSection({
 
   async function handleSaveProfile(e: React.FormEvent) {
     e.preventDefault();
-    if (!visible || !localProfileEditingEnabled) return;
+    if (!visible || !localProfileEditingEnabled || profileBusy || photo.busy) return;
     setProfileError("");
     setProfileNotice("");
     const patch: { display_name?: string; email?: string } = {};
@@ -138,7 +133,7 @@ export function ProfileSection({
 
   async function handleChangePassword(e: React.FormEvent) {
     e.preventDefault();
-    if (!visible || !localPasswordEnabled) return;
+    if (!visible || !localPasswordEnabled || pwBusy || photo.busy) return;
     setPwError("");
     setCurrentPasswordError(false);
     if (pwNew !== pwConfirm) {
@@ -193,17 +188,7 @@ export function ProfileSection({
           <p className="mt-1 text-sm text-foreground-muted">Your display name and AKB account identity.</p>
         </header>
 
-        <div className="flex items-center gap-3 py-5" data-testid="profile-identity">
-          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-surface-selected text-base font-semibold text-surface-selected-foreground" aria-hidden>
-            {(user.display_name?.trim() || user.username).slice(0, 2) || <UserRound className="h-5 w-5" />}
-          </span>
-          <div className="min-w-0">
-            <p className="break-words text-sm font-semibold text-foreground">{user.display_name?.trim() || user.username}</p>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
-              <RoleBadge role={user.is_admin ? "admin" : "user"} />
-            </div>
-          </div>
-        </div>
+        <div data-testid="profile-identity"><ProfilePhotoEditor editor={photo} /></div>
         <form onSubmit={handleSaveProfile} aria-busy={profileBusy || undefined}>
           <div className="space-y-4">
             <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
@@ -251,7 +236,7 @@ export function ProfileSection({
 
           {localProfileEditingEnabled ? (
             <div className="mt-4 flex flex-wrap items-center gap-3 @min-[28rem]/profile:pl-40">
-              <Button type="submit" loading={profileBusy} disabled={!profileDirty}>
+              <Button type="submit" loading={profileBusy} disabled={!profileDirty || profileBusy || photo.busy}>
                 Save profile
               </Button>
               {profileFlash.message && (

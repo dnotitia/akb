@@ -1,6 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { groupNotifications, notificationDay } from "@/lib/notification-presentation";
+import { Archive, ArchiveRestore, ArrowRightLeft, Bell, FilePenLine, KeyRound, Trash2, UserRoundCheck, UserRoundKey, UserRoundMinus } from "lucide-react";
+import { groupNotifications, notificationDay, notificationPresentation } from "@/lib/notification-presentation";
 import type { NotificationItem } from "@/lib/api-notifications";
+
+describe("notification icon vocabulary", () => {
+  it.each([
+    ["document.update", FilePenLine],
+    ["document.move", ArrowRightLeft],
+    ["access.granted", UserRoundCheck],
+    ["document.archive", Archive],
+    ["document.delete", Trash2],
+    ["document.restore", ArchiveRestore],
+    ["access.changed", KeyRound],
+    ["access.revoked", UserRoundMinus],
+    ["access.membership_removed", UserRoundMinus],
+    ["access.ownership", UserRoundKey],
+    ["future.event", Bell],
+  ] as const)("uses the approved outline glyph for %s", (kind, icon) => {
+    expect(notificationPresentation(kind).icon).toBe(icon);
+  });
+});
 
 describe("notification calendar groups", () => {
   const now = new Date(2026, 8, 8, 12);

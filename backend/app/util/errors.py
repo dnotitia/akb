@@ -36,6 +36,7 @@ from app.exceptions import (
     ConflictError,
     DOCUMENT_TITLE_CONFLICT,
     ForbiddenError,
+    GrepScopeTooLargeError,
     InvalidColumnTypeError,
     NotFoundError,
     RESERVED_SYSTEM_PATH_CODE,
@@ -56,6 +57,10 @@ from app.exceptions import (
 NOT_FOUND = "not_found"
 GONE = "gone"
 
+# Temporary dependency failures. These do NOT imply a safe write replay.
+SERVICE_UNAVAILABLE = "service_unavailable"
+OPERATION_TIMEOUT = "operation_timeout"
+
 # Authorization / permission
 PERMISSION_DENIED = "permission_denied"
 VAULT_ARCHIVED = "vault_archived"
@@ -75,6 +80,7 @@ INSUFFICIENT_SCOPE = "insufficient_scope"
 
 # Caller-side input
 INVALID_ARGUMENT = "invalid_argument"  # generic argument shape problem
+GREP_SCOPE_TOO_LARGE = "grep_scope_too_large"
 INVALID_COLUMN_TYPE = "invalid_column_type"
 INVALID_URI = "invalid_uri"  # akb:// URI parse failure
 INVALID_PATH = "invalid_path"  # collection / file path failure
@@ -172,6 +178,13 @@ def exception_envelope(e: Exception) -> dict:
     internal error. Lives here (no import-time side effects) so it stays unit-
     testable without importing the MCP server. See dnotitia/akb#221.
     """
+    from app.db.transient import transient_error
+
+    transient = transient_error(e)
+    if transient is not None:
+        if transient.code == OPERATION_TIMEOUT:
+            return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint)
+        return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint)
     if isinstance(e, ReservedSystemPathError):
         return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
@@ -215,6 +228,8 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=GIT_HISTORY_OUTPUT_CAPPED)
     if getattr(e, "code", None) == GIT_HISTORY_ENTRY_CAPPED:
         return err(str(e), code=GIT_HISTORY_ENTRY_CAPPED)
+    if isinstance(e, GrepScopeTooLargeError):
+        return err(str(e), code=GREP_SCOPE_TOO_LARGE, hint=e.hint, **(e.details or {}))
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
     return err(str(e), code=INTERNAL)

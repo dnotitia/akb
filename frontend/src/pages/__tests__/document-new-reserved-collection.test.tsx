@@ -28,7 +28,7 @@ vi.mock("@/lib/api", () => ({
 }));
 
 vi.mock("@/hooks/use-vault-tree", () => ({
-  useVaultTree: () => ({ tree: vaultTreeState.tree }),
+  useVaultTree: () => ({ tree: vaultTreeState.tree, complete: true }),
 }));
 
 vi.mock("@/contexts/vault-refresh-context", () => ({

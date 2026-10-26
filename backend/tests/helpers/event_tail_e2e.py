@@ -21,12 +21,17 @@ def read_frames(path: str) -> list[dict]:
     with open(path, "rb") as source:
         raw = source.read(MAX_CAPTURE_BYTES + 1)
     assert len(raw) <= MAX_CAPTURE_BYTES, "event capture exceeds the test budget"
-    text = raw.decode("utf-8").replace("\r\n", "\n")
+    # SSE has CR/LF line endings. Unicode separators inside JSON strings are
+    # payload data and must not become protocol boundaries via splitlines().
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()  # the delimiter alone does not constitute a blank line
     frames: list[dict] = []
     fields: dict[str, str] = {}
     data: list[str] = []
     seen: set[str] = set()
-    for line in text.splitlines():
+    for line in lines:
         if line.startswith(":"):
             continue
         if not line:

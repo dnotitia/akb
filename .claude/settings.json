@@ -1,6 +1,4 @@
 {
-  "model": "fable",
-  "effortLevel": "medium",
   "permissions": {
     "allow": [
       "Bash(git status *)",

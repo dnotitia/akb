@@ -44,6 +44,7 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [pending, setPending] = useState(true);
   const loadedVaultRef = useRef<string | null>(null);
   const hasEntriesRef = useRef(false);
   const [retryKey, setRetryKey] = useState(0);
@@ -54,6 +55,7 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
     const canPreserve = loadedVaultRef.current === name && hasEntriesRef.current;
     if (!canPreserve) setEntries(null);
     setRefreshing(canPreserve);
+    setPending(true);
     setError("");
 
     getVaultActivity(name, {
@@ -73,10 +75,12 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
       .catch((caught: unknown) => {
         if (!active) return;
         setError(errorMessage(caught, "Failed to load activity"));
-        if (!canPreserve) setEntries(null);
+        if (!canPreserve || (typeof caught === "object" && caught !== null && "status" in caught && (caught.status === 401 || caught.status === 403))) {
+          setEntries(null); hasEntriesRef.current = false;
+        }
       })
       .finally(() => {
-        if (active) setRefreshing(false);
+        if (active) { setRefreshing(false); setPending(false); }
       });
 
     return () => {
@@ -102,7 +106,7 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
         Activity
       </h1>
 
-      <Panel variant="workspace" className="w-full" aria-busy={entries === null || refreshing || undefined}>
+      <Panel variant="workspace" className="w-full" aria-busy={checking || pending}>
         <section aria-labelledby="activity-heading">
           <div
             data-testid="activity-ledger-header"
@@ -161,6 +165,7 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
             <div className="border-b border-border bg-surface px-4 py-3 sm:px-5">
               <Alert variant="destructive" title="Activity could not be refreshed">
                 {error}
+                <Button variant="outline" size="sm" className="mt-2" loading={pending} onClick={() => setRetryKey(current => current + 1)}>Retry</Button>
               </Alert>
             </div>
           )}
@@ -174,7 +179,7 @@ function VaultActivityWorkspace({ checking }: { checking: boolean }) {
             <ActivitySkeleton />
           ) : entries.length === 0 ? (
             <ActivityEmptyState
-              filtered={Boolean(debouncedAuthor)}
+              filtered={Boolean(appliedAuthor)}
               onClear={() => setAuthor("")}
             />
           ) : (

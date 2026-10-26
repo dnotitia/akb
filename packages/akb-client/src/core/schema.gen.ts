@@ -148,6 +148,9 @@ export interface AkbDocumentEnvelope {
   public_slug?: string | null;
   metadata_is_current?: boolean;
   items?: AkbJsonObjectArray;
+  scanned?: number | null;
+  complete?: boolean | null;
+  next_cursor?: string | null;
   hint?: string | null;
   deleted?: boolean;
   [key: string]: unknown;

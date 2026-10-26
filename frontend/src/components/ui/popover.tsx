@@ -3,6 +3,7 @@ import { forwardRef, type ComponentPropsWithoutRef, type ElementRef } from "reac
 import { cn } from "@/lib/utils";
 
 const Popover = PopoverPrimitive.Root;
+const PopoverAnchor = PopoverPrimitive.Anchor;
 const PopoverTrigger = PopoverPrimitive.Trigger;
 const PopoverClose = PopoverPrimitive.Close;
 
@@ -29,4 +30,4 @@ const PopoverContent = forwardRef<
 ));
 PopoverContent.displayName = PopoverPrimitive.Content.displayName;
 
-export { Popover, PopoverTrigger, PopoverClose, PopoverContent };
+export { Popover, PopoverAnchor, PopoverTrigger, PopoverClose, PopoverContent };

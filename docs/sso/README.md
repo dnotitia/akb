@@ -170,3 +170,6 @@ Email and username never select the target account.
 
 - [Keycloak Server Administration Guide: identity brokering](https://www.keycloak.org/docs/latest/server_admin/#_identity_broker)
 - [Keycloak Admin REST API: identity-provider instances](https://www.keycloak.org/docs-api/latest/rest-api/index.html#_identity_providers)
+
+Provider ownership and short-lived controller grants are documented in
+[operation authority](operation-authority.md).

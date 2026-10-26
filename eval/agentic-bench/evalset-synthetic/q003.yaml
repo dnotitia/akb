@@ -1,0 +1,14 @@
+id: q003
+category: module-contract
+query: "In the fictional Orchard demo, what MUST the Archive module do and what must it NEVER do?"
+ground_truth:
+  must_mention:
+    - "MUST"
+    - "NEVER"
+    - "checksum"
+    - "local files"
+  forbidden:
+    - "uploads local files without a caller request"
+    - "stores records without a checksum"
+  source_docs:
+    - "akb://bench-synthetic/coll/fixtures/doc/archive-module.md"

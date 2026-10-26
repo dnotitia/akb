@@ -15,6 +15,23 @@ class _User:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_counts", [None, True, False])
+async def test_table_catalog_count_option_keeps_reader_gate(monkeypatch, include_counts):
+    from unittest.mock import AsyncMock
+    from app.api.routes import tables
+
+    access = AsyncMock(return_value={"vault_id": "vault-id"})
+    service = AsyncMock(return_value=[{"name": "records"}])
+    monkeypatch.setattr(tables, "check_vault_access", access)
+    monkeypatch.setattr(tables.table_service, "list_tables", service)
+    options = {} if include_counts is None else {"include_row_counts": include_counts}
+    result = await tables.list_tables("demo", _User(), **options)
+    access.assert_awaited_once_with(_User.user_id, "demo", required_role="reader")
+    service.assert_awaited_once_with("vault-id", include_row_counts=include_counts is not False)
+    assert result["total"] == 1  # Number of tables, not number of rows.
+
+
+@pytest.mark.asyncio
 async def test_create_table_route_forwards_plain_schema_with_legacy_defaults(monkeypatch) -> None:
     from app.api.routes import tables
 

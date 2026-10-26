@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Alert } from "@/components/ui/alert";
 import { createCollection } from "@/lib/api";
 import { isReservedCollection } from "@/lib/skill";
@@ -16,6 +16,7 @@ import {
 
 interface CreateCollectionDialogProps {
   open: boolean;
+  visible?: boolean;
   onOpenChange: (open: boolean) => void;
   vault: string;
   onCreated: (path: string) => void;
@@ -26,6 +27,7 @@ interface CreateCollectionDialogProps {
    * the input on open. Resets back to this seed on dialog close.
    */
   initialPath?: string;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 /** Compute the initial value for the path input given an optional parent.
@@ -58,10 +60,12 @@ function normalize(raw: string): { path: string } | { error: string } {
 
 export function CreateCollectionDialog({
   open,
+  visible = true,
   onOpenChange,
   vault,
   onCreated,
   initialPath,
+  returnFocusRef,
 }: CreateCollectionDialogProps) {
   const [path, setPath] = useState(() => seedFor(initialPath));
   const [summary, setSummary] = useState("");
@@ -143,8 +147,13 @@ export function CreateCollectionDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !working && onOpenChange(o)}>
-      <DialogContent className="max-w-xl">
+    <Dialog open={open && visible} onOpenChange={(o) => !working && onOpenChange(o)}>
+      <DialogContent className="max-w-xl" onCloseAutoFocus={event => {
+        if (!visible) { event.preventDefault(); return; }
+        if (!returnFocusRef?.current?.isConnected) return;
+        event.preventDefault();
+        returnFocusRef.current.focus({ preventScroll: true });
+      }}>
         <DialogHeader>
           <DialogTitle>New collection</DialogTitle>
           <DialogDescription>

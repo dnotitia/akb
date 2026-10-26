@@ -179,3 +179,22 @@ def test_invalid_fixture_selection_fails_before_authentication(overrides):
     assert "private-fixture-marker" not in result.stdout + result.stderr
     assert "curl:" not in result.stderr
     assert "event_tail_failure" in result.stdout
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_unicode_separators_in_event_values_are_not_sse_line_endings(tmp_path, separator):
+    from app.services.event_tail_service import format_sse
+
+    event = copy.deepcopy(EVENT)
+    event["actor"] = f"writer{separator}name"
+    capture, receipt = captures(tmp_path, format_sse("change", event["cursor"], event))
+    helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+def test_record_needs_a_blank_line_after_its_data(tmp_path, ending):
+    capture, receipt = captures(tmp_path, sse(EVENT).replace("\n", ending))
+    helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)
+    Path(capture).write_bytes(sse(EVENT).replace("\n", ending).removesuffix(ending).encode())
+    with pytest.raises(AssertionError, match="incomplete"):
+        helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)

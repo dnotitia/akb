@@ -65,6 +65,32 @@ fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Hosted CI,
 the isolated runtime, and `scripts/run_canonical_e2e.sh` all execute this same
 runner, so there is no second suite array to keep synchronized.
 
+### Publication replica budget phase
+
+Before the MCP/shell suites, every isolated `gate` runs
+`publication_budget_probe.py` against two distinct runtime-owned API processes
+sharing PostgreSQL. The supervisor starts an API-only replica, checks readiness,
+and holds the fixture reset lock until that replica has acknowledged graceful
+shutdown. Missing setup or failed startup, assertions, replacement or drain fail
+the gate; there are no optional credentials or single-origin fallbacks.
+
+Five required groups check publication-wide attempts distributed 16/15 between
+processes, concurrent admission, correct-password refunds at both boundaries,
+actual replica process replacement with unchanged storage and retained backoff
+escalation, and a deliberately held budget row lock. Contention must return 503
+for both anonymous and manager password attempts while valid-token access and
+another publication continue to work; releasing the lock restores access.
+Completion evidence records routing counts, statuses, PID/launch identities and
+storage generation, never passwords or tokens. Replacement reuses the same
+port and database without a fixture reset. The replica is drained before any
+MCP fixture reset or shell suite starts; failure leaves the fixture unavailable
+and retains process ownership for cleanup.
+
+The live-PG CI lane additionally requires `test_publication_budget_postgres.py`
+for atomic counters, decay, bounded state, deletion/expiry and contention.
+Migration 116 must be installed before serving the new API. A rolling upgrade
+has installation-wide protection only after every old API replica is replaced.
+
 ### MCP pytest behavior suite
 
 The authenticated MCP behavior suite runs through the official Python SDK.
@@ -83,6 +109,49 @@ scenarios that need role boundaries add a second user through the same
 authenticated endpoint and client lifecycle.
 The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
 pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
+
+`test_table_schema_e2e.py` checks the real table and Vault schema HTTP responses
+against the same runtime's served OpenAPI contract after create, alter, and
+migration, including replay of the same migration key. These six cases run in
+the mandatory pytest gate with the shared descriptor/reset/PAT lifecycle;
+missing runtime setup fails preparation rather than skipping coverage. To run
+only these cases against a repository-owned `serve` runtime, use the pytest
+command below with `backend/tests/mcp_e2e/test_table_schema_e2e.py` as the test
+path and keep `--confcutdir=backend/tests/mcp_e2e` and `--runtime-descriptor`.
+
+`test_graph_catalog_e2e.py` checks provenance, orphan membership and titles,
+link/unlink/move/delete identity, MCP results and actual Reader/Outsider access
+through the same mandatory runtime fixture lifecycle. It creates its secondary
+users in the disposable fixture and does not skip ACL checks for missing PATs.
+The selected runtime backend is exercised through HTTP; Native catalog paging,
+concurrent edits and stable endpoint identity are additionally required in the
+live-PG lane via `test_graph_native_catalog_pg.py` and
+`test_native_graph_resource_identity_pg.py`.
+
+`test_adoption_vault_delete_e2e.py` requires planned, applied and blocked
+adoption deletion through HTTP, with a non-admin owner, Reader and system
+operator. It checks denied deletion, retained UUIDs, same-name recreation and
+rejected replay through the same reset/PAT fixtures. The live-PG adoption suite
+also checks upgrade retention and both deletion/adoption lock orders. Apply
+commits each target separately: a deleted later target returns 409 after earlier
+live targets may have committed; read the retained plan to inspect partial progress.
+
+`test_rollout_authority_e2e.py` requires one- and two-installation recovery
+through the real worker, with a non-admin owner and registry operator. A NULL
+canary makes a real NOT NULL migration fail; authorized row repair and resume
+must preserve the source job, checksum, grant and data. The cases also cover
+original-request replay while blocked, denial of new requests without active
+authority, credential rotation/revocation and denial of historical reads/replays
+after uninstall even when an unrelated installation becomes active. They use
+the mandatory descriptor/reset/PAT lifecycle without optional credentials.
+
+`test_read_capacity_e2e.py` requires six real HTTP checks for counted and
+schema-only catalogs, page/sentinel ordering, exact and filtered count-only
+requests, row CAS, index/schema compatibility, and Reader/Outsider ACLs.
+Each case uses the descriptor/reset lifecycle and mints a real non-admin owner;
+ACL actors are also created through the isolated API, with no optional PATs or
+endpoint variables. Live-PG tests separately verify that schema-only catalogs
+never call row counting and both fresh/existing Tables receive the page index.
 
 The detailed security suite also covers declarative table constraints and
 indexes, stable permission envelopes, private-document and graph boundaries,

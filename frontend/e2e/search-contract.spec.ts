@@ -5,6 +5,7 @@ import { test, expect } from "@playwright/test";
 for (const viewport of [
   { width: 1440, height: 1000 },
   { width: 390, height: 844 },
+  { width: 320, height: 740 },
   { width: 667, height: 375 },
 ]) {
   for (const dark of [false, true]) {
@@ -103,9 +104,13 @@ for (const viewport of [
       await expect(page.getByText("Initial result")).toBeVisible();
       const query = page.getByRole("searchbox", { name: "Search query" });
       await expect(query).toHaveCount(1);
-      await expect(page.getByRole("button", { name: "All", exact: true })).toHaveCSS("text-align", "left");
-      const inactiveModeBorder = await page.getByRole("button", { name: "Literal", exact: true }).evaluate((button) => getComputedStyle(button).borderBottomColor);
-      await expect(page.getByRole("button", { name: "Semantic", exact: true })).not.toHaveCSS("border-bottom-color", inactiveModeBorder);
+      await expect(page.getByRole("button", { name: "Result type", exact: true })).toHaveText("All content");
+      await expect(page.getByRole("button", { name: "Search method", exact: true })).toHaveText("By meaning");
+      const entry = page.getByTestId("search-query-entry");
+      await expect(entry.getByRole("searchbox", { name: "Search query" })).toBeVisible();
+      await expect(entry.getByRole("button", { name: "Search", exact: true })).toBeVisible();
+      await expect(entry.getByRole("button", { name: "Search method", exact: true })).toHaveCount(1);
+      await expect(page.getByRole("group", { name: "Filter by content kind" })).toHaveCount(0);
       await expect(page.getByTestId("search-workspace").getByRole("searchbox", { name: "Search query" })).toBeVisible();
       await expect(page.locator(".app-header").getByRole("searchbox", { name: "Search query" })).toHaveCount(0);
       await expect(page.locator(".app-header")).toHaveAttribute("data-surface", "paper");
@@ -114,6 +119,35 @@ for (const viewport of [
       const headerBox = await page.locator(".app-header").boundingBox();
       const queryBox = await query.boundingBox();
       expect(queryBox!.y).toBeGreaterThanOrEqual(headerBox!.y + headerBox!.height);
+      const titleBox = (await page.getByRole("heading", { name: "Search", exact: true }).boundingBox())!;
+      const entryBox = (await entry.boundingBox())!;
+      if (viewport.width >= 1024) {
+        expect(titleBox.width).toBeLessThanOrEqual(1);
+        expect(entryBox.y - headerBox!.y - headerBox!.height).toBeLessThanOrEqual(25);
+      } else {
+        expect(titleBox.height).toBeGreaterThanOrEqual(20);
+        expect(titleBox.y + titleBox.height).toBeLessThanOrEqual(entryBox.y);
+      }
+      await query.click();
+      await expect(query).toBeFocused();
+      const focusRingClearance = await entry.evaluate(element => {
+        const field = element.getBoundingClientRect();
+        const clearance: number[] = [];
+        for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+          const style = getComputedStyle(parent);
+          const bounds = parent.getBoundingClientRect();
+          if (/hidden|clip|auto|scroll/.test(style.overflowX)) {
+            clearance.push(field.left - bounds.left, bounds.right - field.right);
+          }
+          if (/hidden|clip|auto|scroll/.test(style.overflowY)) {
+            clearance.push(field.top - bounds.top, bounds.bottom - field.bottom);
+          }
+        }
+        return clearance;
+      });
+      // The shared field has a 2px focus ring beyond a 2px offset.
+      for (const clearance of focusRingClearance) expect(clearance).toBeGreaterThanOrEqual(4);
+      await page.screenshot({ path: testInfo.outputPath("search-query-focused.png"), animations: "disabled" });
       await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
       const quickSearch = page.getByTestId("global-search-dialog");
       await expect(quickSearch).toBeVisible();
@@ -123,19 +157,32 @@ for (const viewport of [
       await expect(quickSearch).toHaveCount(0);
       await expect(query).toHaveValue("deployment");
       await expect(page.getByRole("button", { name: "Search knowledge", exact: true })).toBeFocused();
-      const rail = await page.getByRole("complementary", { name: "Search refinements" }).boundingBox();
+      await expect(page.getByRole("complementary", { name: "Search refinements" })).toHaveCount(0);
       const results = await page.getByRole("region", { name: "Search results" }).boundingBox();
-      if (!rail || !results) throw new Error("Search workspace is not visible");
-      if (viewport.width > 1000) expect(rail.x + rail.width).toBeLessThanOrEqual(results.x + 1);
-      else expect(rail.y + rail.height).toBeLessThanOrEqual(results.y + 1);
+      const controls = await page.getByTestId("search-tool-row").boundingBox();
+      if (!controls || !results) throw new Error("Search workspace is not visible");
+      expect(controls.y + controls.height).toBeLessThanOrEqual(results.y + 1);
+      const submit = (await entry.getByRole("button", { name: "Search", exact: true }).boundingBox())!;
+      const queryEntry = (await entry.boundingBox())!;
+      expect(submit.x).toBeGreaterThan(queryEntry.x);
+      expect(submit.x + submit.width).toBeLessThan(queryEntry.x + queryEntry.width);
+      expect(submit.y).toBeGreaterThanOrEqual(queryEntry.y);
+      const commandFrame = (await page.getByTestId("search-command-header").boundingBox())!;
+      const resultFrame = (await page.getByTestId("search-results-panel").boundingBox())!;
+      expect(Math.abs(resultFrame.x - commandFrame.x)).toBeLessThanOrEqual(1);
+      expect(Math.abs(resultFrame.x + resultFrame.width - commandFrame.x - commandFrame.width)).toBeLessThanOrEqual(1);
+      await expect(page.getByRole("button", { name: "Filters", exact: true })).toBeInViewport();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.screenshot({ path: testInfo.outputPath("search-results.png"), animations: "disabled" });
       await page
-        .getByRole("button", { name: "More filters" })
+        .getByRole("button", { name: "Filters", exact: true })
         .click();
       await page.getByRole("button", { name: "Toggle report" }).click();
+      await page.getByRole("button", { name: "Done", exact: true }).click();
       await expect(
         page.getByText("Report outside initial top 25"),
       ).toBeVisible();
+      await expect(page.getByRole("button", { name: "Filters", exact: true })).toBeFocused();
       await expect(page).toHaveURL(/doc_type=report/);
       await page.reload();
       await page.evaluate(
@@ -145,11 +192,13 @@ for (const viewport of [
       await expect(
         page.getByText("Report outside initial top 25"),
       ).toBeVisible();
+      await page.getByRole("button", { name: "Search method", exact: true }).click();
+      const methodMenu = (await page.getByRole("menu").boundingBox())!;
+      expect(methodMenu.x).toBeGreaterThanOrEqual(8);
+      expect(methodMenu.x + methodMenu.width).toBeLessThanOrEqual(viewport.width - 8);
+      await page.getByRole("menuitemradio", { name: /^Exact text/ }).click();
       await page
-        .getByRole("button", { name: "Literal", pressed: false })
-        .click();
-      await page
-        .getByRole("button", { name: "More filters" })
+        .getByRole("button", { name: "Filters", exact: true })
         .click();
       // Document metadata filters exclude Files; clear the semantic report filter.
       await page.getByRole("button", { name: "Toggle report" }).click();
@@ -174,13 +223,14 @@ for (const viewport of [
       expect(requests.at(-1)?.searchParams.get("regex")).toBe("true");
       expect(requests.at(-1)?.searchParams.get("case_sensitive")).toBe("true");
       expect(requests.at(-1)?.searchParams.getAll("doc_types")).toEqual([]);
+      await page.getByRole("button", { name: "Done", exact: true }).click();
       await expect(page.getByRole("link", { name: /Deployment text File/ })).toHaveAttribute("href", "/vault/fixture/file/f-text");
       await expect(page.getByText("1 resource · 1 match")).toBeVisible();
       await expect(page.getByText("Body line 2")).toBeVisible();
       await page.reload();
       await page.evaluate((isDark) => document.documentElement.classList.toggle("dark", isDark), dark);
       await expect(page.getByText("Deployment text File")).toBeVisible();
-      await page.getByRole("button", { name: "More filters" }).click();
+      await page.getByRole("button", { name: "Filters", exact: true }).click();
       await expect(page.getByLabel("Include text Files")).toBeChecked();
       await page.goBack();
       await expect(
@@ -196,12 +246,19 @@ for (const viewport of [
         fullPage: true,
         animations: "disabled",
       });
+      await page.getByRole("button", { name: "Done", exact: true }).click();
       await page.getByRole("button", { name: "Clear filters", exact: true }).click();
-      await page.getByRole("button", { name: "More filters" }).click();
       await expect(page.getByRole("heading", { name: /No results/ })).toBeVisible();
       await page.screenshot({ path: testInfo.outputPath("search-no-results.png"), animations: "disabled" });
       await page.getByRole("button", { name: "Clear search query" }).click();
-      await expect(page.getByRole("heading", { name: "Find your next starting point" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Suggested searches" })).toBeVisible();
+      const readyPane = page.getByTestId("search-results-pane");
+      const readyPaneBox = (await readyPane.boundingBox())!;
+      const readyContentBox = (await page.getByTestId("search-start-state").boundingBox())!;
+      const readyGeometry = await readyPane.evaluate(element => ({ width: element.clientWidth, scrollTop: element.scrollTop }));
+      expect(Math.abs(readyContentBox.x - readyPaneBox.x)).toBeLessThanOrEqual(1);
+      expect(Math.abs(readyContentBox.y + readyGeometry.scrollTop - readyPaneBox.y)).toBeLessThanOrEqual(1);
+      expect(readyContentBox.width).toBe(readyGeometry.width);
       await page.screenshot({ path: testInfo.outputPath("search-start.png"), animations: "disabled" });
     });
   }

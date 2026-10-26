@@ -1,19 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, type NavigateOptions } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { History, MoreHorizontal, RotateCcw, Save } from "lucide-react";
+import { BookOpen, History, MoreHorizontal, RotateCcw, Save } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { AgentPreview } from "./agent-preview";
-import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Textarea } from "@/components/ui/textarea";
-import { SettingRow, SettingsSection } from "@/components/ui/settings-section";
+import { TonalIcon } from "@/components/ui/tonal-icon";
+import { SettingsSection } from "@/components/ui/settings-section";
 import { authSessionSnapshot, getSkillTemplate, isCurrentAuthSession, updateDocument } from "@/lib/api";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
+import { documentPreviewState } from "@/lib/document-preview-navigation";
+import { retainsGuideSettings, vaultGuideHref } from "@/lib/vault-guide-navigation";
 import { timeAgo } from "@/lib/utils";
 import { useResourceNavigation, useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
@@ -25,12 +27,7 @@ interface SkillDoc {
   current_commit?: string | null;
 }
 
-function guideExcerpt(content = "") {
-  return content.slice(0, 2000)
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
-    .replace(/[#>*_`]/g, "")
-    .replace(/\s+/g, " ").trim().slice(0, 240);
-}
+const GuidePreview = lazy(() => import("./guide-preview"));
 
 interface Props {
   vault: string;
@@ -53,9 +50,8 @@ interface Props {
 }
 
 /**
- * The one editing surface for the vault guide. The document viewer bounces the
- * canonical path here, so preview / agent view / edit / reset / history all
- * live in this section.
+ * The only guide editing surface. Reading uses the shared route-backed reader;
+ * body editing, agent context, reset and history management live here.
  *
  * The body editor is deliberately body-only rather than the document page's
  * FrontmatterEditDialog: that dialog PATCHes `type` along with the body, and
@@ -88,11 +84,16 @@ export function SkillSection({
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
+  const consumedEditRequest = useRef<string | null>(null);
+  const previewId = useId();
+  const previewHref = vaultGuideHref(vault);
+  const previewState = documentPreviewState(location, previewId);
   const { requestNavigation } = useResourceNavigation();
   const [tab, setTab] = useState("preview");
   const [expanded, setExpanded] = useState(false);
   const sectionRef = useRef<HTMLElement>(null);
   const editButtonRef = useRef<HTMLButtonElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -111,11 +112,15 @@ export function SkillSection({
   const guardNavigation = useCallback((href: string, options?: NavigateOptions) => {
     // Settings anchors retain this mounted editor and its draft.
     if (new URL(href, window.location.origin).pathname === location.pathname) return true;
+    if (retainsGuideSettings(vault, location, href, options?.state)) return true;
     setPendingExit({ kind: "navigation", href, options });
     return false;
-  }, [location.pathname]);
+  }, [location, vault]);
   const continueNavigation = useResourceNavigationGuard(!navigationManaged && (dirty || saving) ? guardNavigation : null);
-  useDocumentHistoryGuard(!navigationManaged && (dirty || saving), (proceed) => setPendingExit({ kind: "history", proceed }));
+  useDocumentHistoryGuard(!navigationManaged && (dirty || saving),
+    (proceed) => setPendingExit({ kind: "history", proceed }),
+    destination => destination.pathname !== location.pathname &&
+      !retainsGuideSettings(vault, location, destination.href, window.history.state?.usr));
   useEffect(() => {
     if (!dirty && !saving) return;
     const guard = (event: BeforeUnloadEvent) => {
@@ -147,6 +152,35 @@ export function SkillSection({
     setTab(next);
     setExpanded(true);
   }
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("edit") !== "guide" || location.hash !== "#skill" ||
+        !canManage || checking || loading || busy || !doc) return;
+    const request = JSON.stringify([ownerScope, location.key, location.pathname, location.search, location.hash]);
+    if (consumedEditRequest.current === request) return;
+    // History replacement can precede the router's location-context commit.
+    // Claim this entry before updating the draft so Cancel cannot replay it.
+    consumedEditRequest.current = request;
+    // Consume the explicit edit request once. Returning from a reading preview
+    // resumes an existing draft and its OCC pin instead of reseeding it.
+    if (baseBody === null) {
+      setDraft(doc.content || "");
+      setBaseBody(doc.content || "");
+      setBaseCommit(doc.current_commit || null);
+      setSaveError("");
+      setSaveConflict(false);
+      setSaved(false);
+    }
+    setTab("edit");
+    setExpanded(true);
+    params.delete("edit");
+    navigate({ pathname: location.pathname, search: params.toString(), hash: "#skill" }, { replace: true });
+    const scope = ownerScope;
+    requestAnimationFrame(() => {
+      if (mounted.current && latestScope.current === scope) editorRef.current?.focus({ preventScroll: true });
+    });
+  }, [location, canManage, checking, loading, busy, doc, baseBody, navigate, ownerScope]);
 
   function discardDraft() {
     setDraft("");
@@ -247,10 +281,7 @@ export function SkillSection({
 
   return (
     <SettingsSection ref={sectionRef} id="skill" title="Vault guide">
-      <SettingRow label={<>
-          Instructions
-          {doc?.updated_at && <p className="mt-1 text-xs font-normal text-foreground-muted">Updated {timeAgo(doc.updated_at)}</p>}
-        </>}>
+      <div className="p-4 sm:p-5">
           {error && !isMirror && (
             <Alert variant="destructive" title="Couldn't load the vault guide">
               <p>{error}</p>
@@ -265,29 +296,34 @@ export function SkillSection({
             <Alert variant="warning">The vault guide is missing. It is restored automatically by the system backfill; contact an administrator if this persists.</Alert>
           ) : (
             <>
-              {!expanded && (
-                <div className="mb-3 rounded-[var(--radius-sm)] border border-border bg-background px-3 py-2.5">
-                  <p className="line-clamp-2 text-sm leading-relaxed text-foreground-muted">
-                    {guideExcerpt(doc.content) || "No instructions yet."}
-                  </p>
+              <div className="flex min-w-0 flex-col gap-3 @[48rem]/settings-section:flex-row @[48rem]/settings-section:items-start">
+                <div className="flex min-w-0 flex-1 items-start gap-3">
+                  <TonalIcon tone="guide" size="sm"><BookOpen aria-hidden /></TonalIcon>
+                  <div className="min-w-0 space-y-1">
+                    {expanded && <p className="text-sm font-medium text-foreground">
+                      {tab === "edit" ? "Editing guide" : "Agent view"}
+                    </p>}
+                    <div className="flex min-h-8 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted">
+                      {doc.updated_at && <time dateTime={doc.updated_at}>Updated {timeAgo(doc.updated_at)}</time>}
+                      {dirty && <span role="status">Unsaved guide changes</span>}
+                      {saved && !dirty && <span role="status" className="text-success">Guide saved</span>}
+                    </div>
+                  </div>
                 </div>
-              )}
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="ghost" size="sm" aria-expanded={expanded && tab === "preview"} aria-controls="guide-reading-view"
-                  className="min-h-10 text-link sm:min-h-8"
-                  onClick={() => {
-                    if (expanded && tab === "preview") { setExpanded(false); return; }
-                    selectTab("preview");
-                  }}
-                >{expanded && tab === "preview" ? "Close guide preview" : "Preview guide"}</Button>
+              <div className="flex flex-wrap items-center gap-2 pl-11 @[48rem]/settings-section:shrink-0 @[48rem]/settings-section:pl-0">
+                <Button asChild variant="ghost" size="sm" className="min-h-11 text-link sm:min-h-8">
+                  <Link className="workspace-control" id={previewId} to={previewHref} state={previewState} onClick={event => {
+                    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    if (!requestNavigation(previewHref, { state: previewState })) event.preventDefault();
+                  }}>Open guide</Link>
+                </Button>
                 {canManage && (
-                  <Button ref={editButtonRef} variant="outline" size="sm" className="min-h-10 sm:min-h-8"
+                  <Button ref={editButtonRef} variant="outline" size="sm" className="min-h-11 sm:min-h-8"
                     disabled={busy || (expanded && tab === "edit")} onClick={() => selectTab("edit")}>Edit guide</Button>
                 )}
                 <DropdownMenu.Root modal={false}>
                   <DropdownMenu.Trigger asChild>
-                    <Button variant="outline" size="icon" aria-label="Guide options" className="h-10 w-10 sm:h-8 sm:w-8" disabled={busy || saving}>
+                    <Button variant="ghost" size="icon" aria-label="Guide options" className="workspace-icon-control h-11 w-11 sm:h-8 sm:w-8" disabled={busy || saving}>
                       <MoreHorizontal className="h-4 w-4" aria-hidden />
                     </Button>
                   </DropdownMenu.Trigger>
@@ -315,15 +351,21 @@ export function SkillSection({
                     </DropdownMenu.Content>
                   </DropdownMenu.Portal>
                 </DropdownMenu.Root>
-                {dirty && <span role="status" className="text-xs text-foreground-muted">Unsaved guide changes</span>}
-                {saved && !dirty && <span role="status" className="text-xs text-success">Guide saved</span>}
+              </div>
               </div>
 
-              {expanded && tab === "preview" && (
-                <div id="guide-reading-view" role="region" aria-label="Guide preview" className="mt-3 rounded-[var(--radius-sm)] border border-border bg-surface py-3">
-                  <MarkdownRender markdown={doc.content || ""} assetContext={{ mode: "authenticated", vault, document: VAULT_SKILL_PATH, commit: doc.current_commit || undefined }} />
-                </div>
-              )}
+              {!expanded && (doc.content?.trim() ? (
+                <Suspense fallback={<LoadingState label="Loading guide preview"><Skeleton className="mt-4 h-32 w-full" /></LoadingState>}>
+                  <GuidePreview vault={vault} content={doc.content} onNavigate={(event, url) => {
+                    if (url.origin !== window.location.origin || url.pathname.startsWith("/api/")) return;
+                    event.preventDefault();
+                    const href = `${url.pathname}${url.search}${url.hash}`;
+                    const options = url.pathname === previewHref ? { state: previewState } : undefined;
+                    if (requestNavigation(href, options)) navigate(href, options);
+                  }} />
+                </Suspense>
+              ) : <p className="mt-4 text-sm text-foreground-muted">No instructions yet.</p>)}
+
               {expanded && tab === "agent" && (
                 <div role="region" aria-label="Agent view" className="mt-3 space-y-3 rounded-[var(--radius-sm)] border border-border bg-background p-3">
                   <div className="flex items-center justify-between gap-3">
@@ -335,7 +377,7 @@ export function SkillSection({
               )}
               {expanded && tab === "edit" && canManage && (
                 <div className="mt-3">
-                  <Textarea aria-label="Vault guide body" value={draft} onChange={event => setDraft(event.target.value)}
+                  <Textarea ref={editorRef} autoFocus aria-label="Vault guide body" value={draft} onChange={event => setDraft(event.target.value)}
                     disabled={saving || busy} rows={16} placeholder="Instructions for agents using this vault."
                     className="resize-y font-mono text-sm leading-relaxed" spellCheck={false} />
                   {(saveError || changedElsewhere) && <Alert
@@ -356,7 +398,7 @@ export function SkillSection({
               )}
             </>
           )}
-      </SettingRow>
+      </div>
 
       <ConfirmDialog
         open={!checking && pendingExit !== null}

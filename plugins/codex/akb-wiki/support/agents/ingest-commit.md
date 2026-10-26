@@ -46,7 +46,7 @@ Then validate the SHA: `git -C {repo_path} rev-parse --verify {sha}^{commit}`. F
 
 ### Step 2 — Dedup check
 
-`akb_search(query={full_sha}, vault={vault_name}, collection=git-commits, type=reference, tags=["git", "kind:commit", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter `sha` equals `full_sha`. If found, return without writing:
+Enumerate `akb_browse(vault={vault_name}, collection="git-commits", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. Match metadata `sha == full_sha` and `repo == repo_name`. If a unique match exists, return without writing (multiple matches require reporting ambiguity):
 
 ```markdown
 ## ingest-commit: exists

@@ -71,7 +71,7 @@ def validate_uuid_for_sql(s: str) -> str:
 
 def validate_source_type_for_sql(s: str) -> str:
     """Reject anything that isn't a known `source_type` discriminator before
-    interpolating into a SQL WHERE clause (workbench #1069). Values are
+    interpolating into a SQL WHERE clause. Values are
     driver-owned (`SOURCE_TYPES`), never user input — this is purely defense
     in depth against any caller mistake."""
     from app.services.index_service import SOURCE_TYPES
@@ -95,7 +95,7 @@ def vault_filter_sql(
     caller sends one or the other, never both. Both id kinds are UUIDs, validated
     before interpolation (defense in depth; the IN list is otherwise trusted).
 
-    `source_types` (workbench #1069) ANDs an additional `source_type IN (...)`
+    `source_types` ANDs an additional `source_type IN (...)`
     predicate — orthogonal to the ACL filter, so it combines with either branch
     (or stands alone when both id lists are absent)."""
     assert not (vault_ids and source_ids), \

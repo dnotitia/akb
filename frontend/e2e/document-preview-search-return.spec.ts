@@ -110,3 +110,41 @@ for (const dismissal of ["close control", "browser Back"] as const) {
     await expect(search.getByRole("combobox", { name: "Search in fixture, handbook" })).toHaveValue("reading");
   });
 }
+
+for (const dismissal of ["close control", "browser Back"] as const) {
+  test(`full Search preserves filters, draft, result scroll and focus after ${dismissal}`, async ({ page }) => {
+    await fixture(page);
+    await page.route("**/api/v1/search?**", route => route.fulfill({ json: {
+      query: "reading", archive_scope: "unarchived", total: 25, returned: 25,
+      results: Array.from({ length: 25 }, (_, index) => ({
+        title: `${title} ${index + 1}`, uri: `akb://fixture/coll/guides/doc/reading-${index}.md`,
+        vault: "fixture", path: `guides/reading-${index}.md`, collection: "guides",
+        source_type: "document", doc_type: "report", tags: ["team"],
+        summary: "Keep the document in its search context.", score: 1 / (index + 1),
+      })),
+    } }));
+    await page.goto("/search?q=reading&source=document&doc_type=report&tag=team&collection=guides");
+    const query = page.getByRole("searchbox", { name: "Search query", exact: true });
+    const pane = page.getByTestId("search-results-pane");
+    const result = page.locator("#search-dense-result-18");
+    await expect(result).toBeVisible();
+    await query.fill("unsubmitted draft");
+    await result.scrollIntoViewIfNeeded();
+    const before = await pane.evaluate(element => element.scrollTop);
+    expect(before).toBeGreaterThan(0);
+    const searchURL = page.url();
+    await result.click();
+    const preview = page.getByTestId("document-preview-dialog");
+    await expect(preview).toBeVisible();
+    if (dismissal === "close control") await preview.getByRole("button", { name: "Close dialog", exact: true }).click();
+    else await page.goBack();
+    await expect(preview).toHaveCount(0);
+    await expect(page).toHaveURL(searchURL);
+    await expect(query).toHaveValue("unsubmitted draft");
+    await expect(result).toBeFocused();
+    await expect.poll(() => pane.evaluate(element => element.scrollTop)).toBe(before);
+    // The active chips can be above the scrolled viewport; their saved state survives.
+    await expect(page.getByRole("button", { name: "Remove filter Type: report", exact: true })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Remove filter Tag: team", exact: true })).toHaveCount(1);
+  });
+}

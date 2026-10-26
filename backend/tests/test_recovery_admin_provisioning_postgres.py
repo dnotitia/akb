@@ -1162,7 +1162,7 @@ async def test_retired_tombstone_rejects_external_identity_adoption(
     actor_user_id, actor_token_id = await _create_retirement_actor(pool)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    await _create_sso_recovery_successor(service)
+    successor = await _create_sso_recovery_successor(service)
     await service.retire_local_recovery_admin(
         expected_username="local-recovery-admin",
         expected_email="local-recovery-admin@example.com",
@@ -1180,7 +1180,9 @@ async def test_retired_tombstone_rejects_external_identity_adoption(
             subject=f"subject-{target_by_id}",
             email="local-recovery-admin@example.com",
             display_name="Retired recovery admin",
-            actor_id=str(actor_user_id),
+            # Use the actual human successor: a service actor correctly fails
+            # the earlier exact-operation guard and would not test tombstones.
+            actor_id=successor["user_id"],
             existing_user_id=provisioned["user_id"] if target_by_id else None,
         )
 
@@ -1539,8 +1541,10 @@ async def test_recovery_handover_migration_allows_one_recovery_per_provider(serv
             """
         )
 
+    # Replaying the legacy handover preserves the newer target-scoped guard.
     assert [row["indexname"] for row in indexes] == [
-        "users_one_recovery_admin_per_provider"
+        "users_one_recovery_admin_per_provider",
+        "users_one_recovery_admin_per_target",
     ]
 
 

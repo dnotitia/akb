@@ -10,6 +10,7 @@ import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.access_service import check_vault_access
 from app.services.app_identity_service import record_app_audit
 from app.services.app_inventory_service import expected_schema_fingerprint
@@ -160,7 +161,9 @@ async def _authorize_target_vaults(
         raise ForbiddenError("Legacy adoption request denied")
     try:
         for vault_id in target_ids:
-            await check_vault_access(user.user_id, by_id[vault_id], required_role="admin")
+            access = await check_vault_access(user.user_id, by_id[vault_id], required_role="admin")
+            if access["vault_id"] != vault_id:
+                raise ForbiddenError("Legacy adoption request denied")
     except (ForbiddenError, NotFoundError):
         record_app_audit(
             action,
@@ -208,7 +211,9 @@ async def _authorize_existing_plan(
         if len(names) != len(target_rows):
             raise NotFoundError("Legacy adoption", "not found")
         for row in target_rows:
-            await check_vault_access(user.user_id, names[row["vault_id"]], required_role="admin")
+            access = await check_vault_access(user.user_id, names[row["vault_id"]], required_role="admin")
+            if access["vault_id"] != row["vault_id"]:
+                raise NotFoundError("Legacy adoption", "not found")
     except (ForbiddenError, NotFoundError):
         record_app_audit(
             action,
@@ -235,7 +240,7 @@ async def _fetch_preflight(
 ) -> dict[str, Any]:
     vault_id = uuid.UUID(target["vault_id"])
     table_allowlist = list(target["table_allowlist"])
-    if await conn.fetchval("SELECT 1 FROM vaults WHERE id = $1", vault_id) is None:
+    if not await lock_vault_for_child_write(conn, vault_id):
         raise NotFoundError("Vault", "not found")
     tables = await fetch_allowlisted_tables(
         conn,
@@ -314,6 +319,7 @@ def _target_projection(row: Any, *, replayed: bool | None = None) -> dict[str, A
     result: dict[str, Any] = {
         "target_id": str(row["id"]),
         "vault_id": str(row["vault_id"]),
+        "vault_deleted": row["vault_deleted"],
         "table_allowlist": _json_list(row["table_allowlist"]),
         "included_tables": _json_list(row["included_tables"]),
         "excluded_tables": _json_list(row["excluded_tables"]),
@@ -346,10 +352,11 @@ async def _load_projection(conn: Any, app_id: uuid.UUID, adoption_id: uuid.UUID)
         raise NotFoundError("Legacy adoption", "not found")
     targets = await conn.fetch(
         """
-        SELECT *
-          FROM app_legacy_adoption_targets
-         WHERE adoption_id = $1
-         ORDER BY target_order
+        SELECT target.*, vault.id IS NULL AS vault_deleted
+          FROM app_legacy_adoption_targets AS target
+          LEFT JOIN vaults AS vault ON vault.id = target.vault_id
+         WHERE target.adoption_id = $1
+         ORDER BY target.target_order
         """,
         adoption_id,
     )
@@ -474,6 +481,8 @@ async def create_legacy_adoption(
                 if existing is not None:
                     if existing["input_digest"] != digest:
                         raise ConflictError("Idempotency-Key was already used with different adoption input")
+                    for target in normalized_targets:
+                        await _lock_existing_target_vault(conn, uuid.UUID(target["vault_id"]))
                     await _record_ledger_audit(
                         conn,
                         app_id=app_uuid,
@@ -638,6 +647,11 @@ async def get_legacy_adoption(
     return result
 
 
+async def _lock_existing_target_vault(conn: Any, vault_id: uuid.UUID) -> None:
+    if not await lock_vault_for_child_write(conn, vault_id):
+        raise ConflictError("Target Vault was deleted; create a new adoption plan for a live Vault")
+
+
 async def _apply_target(
     app_id: uuid.UUID,
     adoption_id: uuid.UUID,
@@ -662,6 +676,7 @@ async def _apply_target(
                 )
                 if plan is None or target_row is None:
                     raise NotFoundError("Legacy adoption", "not found")
+                await _lock_existing_target_vault(conn, target_row["vault_id"])
                 if target_row["state"] in {"applied", "replayed"}:
                     await conn.execute(
                         "UPDATE app_legacy_adoption_targets SET state='replayed' WHERE id=$1",
@@ -912,6 +927,7 @@ async def _apply_target(
                     adoption_id,
                 )
                 if row is not None and target is not None:
+                    await _lock_existing_target_vault(conn, target["vault_id"])
                     await conn.execute(
                         """
                         UPDATE app_legacy_adoption_targets

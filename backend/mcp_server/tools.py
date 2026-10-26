@@ -337,6 +337,11 @@ TOOLS = [
             "their intended purpose. Other resource summaries stay opt-in so large "
             "vaults fit in the agent's context window. Returns "
             "{vault, path, context, items, total, returned, truncated?, hint?}."
+            " For large Vaults use page_size (1–200) and next_cursor: identities are "
+            "selected before body reads; complete marks traversal exhaustion, not an "
+            "exact inventory total. A filtered page may be empty and still have a cursor. "
+            "Use collection with depth=0 to drill down. Legacy limit/offset slices a "
+            "fully materialized listing and is not a bounded database read."
         ),
         input_schema={
             "type": "object",
@@ -373,13 +378,15 @@ TOOLS = [
                 },
                 "content_type": {
                     "type": "string",
-                    "enum": ["all", "documents", "tables", "files"],
+                    "enum": ["all", "collections", "documents", "tables", "files"],
                     "default": "all",
                     "description": "Filter by content type",
                 },
                 "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Opt into identity-bounded pages. Do not combine with limit/offset. In this mode depth applies to collections too."},
+                "cursor": {"type": "string", "maxLength": 32768, "description": "Previous next_cursor; keep Vault, collection, depth and content_type unchanged. Follow until complete=true, including after an empty filtered page."},
                 "include_summary": {
                     "type": "boolean",
                     "description": (
@@ -495,6 +502,9 @@ TOOLS = [
             "and `total_*` (full corpus matches) plus a `truncated` flag. When response "
             "safety bounds truncate snippets, the `truncation` object names the applied "
             "resource, match, and byte limits; use count_only for exact counts without snippets."
+            " Result limit does not reduce candidates scanned. A protective grep_scope_too_large "
+            "error requires narrowing vault/collection, not retrying or lowering limit; "
+            "path is not a supported scope parameter."
         ),
         input_schema={
             "type": "object",

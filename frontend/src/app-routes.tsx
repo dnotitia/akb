@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ComponentType } from "react";
 import {
   Navigate,
+  matchPath,
   Route,
   Routes,
   useLocation,
@@ -38,13 +39,13 @@ import {
 } from "@/app-route-contract";
 import { documentPreviewBackground, documentPreviewReturnFocusId, documentPreviewReturnFocusFallbackId, notifyDocumentPreviewClosed } from "@/lib/document-preview-navigation";
 import { isModalOpen } from "@/lib/modal-visibility";
+import { vaultGuideHref } from "@/lib/vault-guide-navigation";
 
-// Old /vault/:name/skill URLs redirect to the guide editor in vault settings —
-// the vault guide is system-managed and has no plain-viewer surface.
+// Legacy guide links retain the same read-first destination as document links.
 function SkillRedirect() {
   const { name } = useParams<{ name: string }>();
   if (!name) return <Navigate to="/" replace />;
-  return <Navigate to={`/vault/${name}/settings#skill`} replace />;
+  return <Navigate to={vaultGuideHref(name)} replace />;
 }
 
 const routeComponents = {
@@ -110,7 +111,7 @@ export function AppRoutes() {
     <>
       <Routes location={backgroundLocation ?? location}>
         {renderRoutes(["admin", "auth", "public"])}
-        <Route element={<Layout routeOverlay={backgroundLocation && (
+        <Route element={<Layout protectBackgroundDrafts={!!backgroundLocation && !!matchPath("/vault/:name/settings", backgroundLocation.pathname)} routeOverlay={backgroundLocation && (
           <Routes location={location}>
             <Route path="/vault/:name/doc/:id" element={<DocumentPreviewDialog />} />
           </Routes>
