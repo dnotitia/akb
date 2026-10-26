@@ -35,6 +35,7 @@ from .runner import (
     attach_paired_execution_evidence,
     compare_artifacts,
     load_paired_resume_source,
+    load_selection_resume_source,
     load_inputs,
 )
 from .runtime import RuntimeContractError, RuntimeDescriptor
@@ -351,6 +352,20 @@ async def run_paired(args: argparse.Namespace) -> int:
     if selection is not None:
         baseline_manifest = selection.execution_manifest
         candidate_manifest = selection.execution_manifest
+        if args.resume:
+            source_resume = load_selection_resume_source(
+                artifact_paths={
+                    "baseline": args.baseline_output,
+                    "candidate": args.candidate_output,
+                },
+                checkpoint_paths={
+                    "baseline": args.baseline_checkpoint,
+                    "candidate": args.candidate_checkpoint,
+                },
+                manifest=baseline_manifest,
+                tasks=baseline_tasks,
+                selection=selection,
+            )
     destination_paths = {
         args.baseline_output.resolve(strict=False),
         args.candidate_output.resolve(strict=False),
@@ -402,7 +417,13 @@ async def run_paired(args: argparse.Namespace) -> int:
 
     started = time.perf_counter()
     if continuation is None:
-        initial_events = source_resume["events"] if source_resume is not None else None
+        initial_events = (
+            None
+            if selection is not None
+            else source_resume["events"]
+            if source_resume is not None
+            else None
+        )
     elif args.resume:
         initial_events = continuation.history_events_for_resume(
             {"baseline": args.baseline_checkpoint, "candidate": args.candidate_checkpoint}

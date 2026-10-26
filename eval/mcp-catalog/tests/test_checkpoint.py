@@ -11,6 +11,7 @@ from mcp_catalog.checkpoint import (
     CheckpointError,
     CheckpointHeader,
     CheckpointKey,
+    CheckpointPairedEvent,
     CheckpointStore,
     checkpoint_record_hash,
     provider_registry_snapshot_hash,
@@ -22,6 +23,7 @@ from paired_artifact_factory import (
     provider_name_for_model,
     synthetic_model_input_evidence,
 )
+from mcp_catalog.pairing import planned_arm_order
 
 ROOT = Path(__file__).parents[1]
 _TEST_PROVIDER_REGISTRY = {"status": "unavailable", "reason": "synthetic checkpoint fixture"}
@@ -503,6 +505,64 @@ def test_measured_behavioral_failure_is_completed_and_reusable(tmp_path: Path) -
     assert resumed.status_for(key) == "completed"
     assert resumed.completed_outcome_for(key) is not None
     assert resumed.document.spent.cost_usd == pytest.approx(0.00001)
+
+
+def test_selection_route_revalidation_keeps_the_original_row_and_does_not_charge_it_twice(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "route-revalidation.checkpoint.json"
+    store, key = _store(path, reuse_terminal_trials=True)
+    manifest, tasks, *_ = _inputs()
+    task = next(task for task in tasks if task.id == key.task_id)
+    order_position = planned_arm_order(task.id, key.repeat_index, manifest.paired_order_seed).index(key.arm)
+    store.record_paired_event(
+        CheckpointPairedEvent(
+            sequence=1,
+            cell=f"{key.model_class}:{key.transport}",
+            task_id=key.task_id,
+            repeat_index=key.repeat_index,
+            arm=key.arm,
+            order_position=order_position,
+        )
+    )
+    source = _outcome(key).model_copy(
+        update={
+            "paired_order_position": order_position,
+            "paired_execution_sequence": 1,
+            "error": "OpenRouter response did not match the registered model/provider route",
+            "failure_kind": "unknown",
+            "routing_valid": False,
+            "success": False,
+        }
+    )
+    store.record_trial(key, source, status="failed")
+    spent_before = store.document.spent.model_dump(mode="json")
+    corrected = source.model_copy(
+        update={"error": None, "failure_kind": "none", "routing_valid": True, "success": True}
+    )
+    lineage = {
+        "eligibility_derivation": "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1",
+        "source_endpoint_snapshot_sha256": "a" * 64,
+        "recorded_eligible_endpoints_sha256": "b" * 64,
+        "verified_eligible_endpoints_sha256": "c" * 64,
+        "reconciled_legacy_projection": True,
+    }
+
+    store.revalidate_selection_route_failure(key, corrected, route_lineage=lineage)
+
+    record = next(iter(store.document.records.values()))
+    assert record.status == "completed"
+    assert record.outcome == corrected
+    assert store.document.spent.model_dump(mode="json") == spent_before
+    assert len(store.document.selection_route_revalidations) == 1
+    audit = store.document.selection_route_revalidations[0]
+    assert audit.source_record.status == "failed"
+    assert audit.source_record.outcome == source
+    assert audit.replacement_record_hash == record.record_hash
+
+    resumed, _ = _store(path, resume=True, reuse_terminal_trials=True)
+    assert resumed.completed_outcome_for(key) == corrected
+    assert resumed.document.selection_route_revalidations[0].source_record.outcome == source
 
 
 def test_provider_failure_without_usage_is_not_reusable(tmp_path: Path) -> None:

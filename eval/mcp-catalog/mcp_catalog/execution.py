@@ -3704,8 +3704,8 @@ def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
 def registered_route_target(
     model_spec: ModelSpec,
     registered_model: dict[str, Any],
-) -> tuple[str, frozenset[str]] | None:
-    """Return the canonical model and every registry-eligible upstream."""
+) -> RegisteredRouteTarget | None:
+    """Verify routing against sealed endpoint rows, including the old projection."""
 
     provider_slug = model_spec.routing.order[0]
     expected_routing = {
@@ -3734,40 +3734,33 @@ def registered_route_target(
         return None
 
     canonical_slug = model_record["canonical_slug"]
-    required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
-    expected_eligible_endpoints: list[dict[str, Any]] = []
-    for endpoint in endpoints:
-        if not isinstance(endpoint, dict):
-            continue
-        provider_name = endpoint.get("provider_name")
-        endpoint_parameters = endpoint.get("supported_parameters")
-        if (
-            not isinstance(provider_name, str)
-            or not provider_name
-            or endpoint.get("model_id") != model_spec.model_id
-            or endpoint.get("quantization") != "fp8"
-            or endpoint.get("tag") != f"{provider_name.casefold()}/fp8"
-            or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
-            or not isinstance(endpoint_parameters, list)
-            or not all(isinstance(parameter, str) for parameter in endpoint_parameters)
-            or not required_parameters.issubset(endpoint_parameters)
-            or (
-                not model_spec.routing.allow_fallbacks
-                and provider_name.casefold() != provider_slug.casefold()
-            )
-        ):
-            continue
-        try:
-            validate_openrouter_endpoint_price_ceiling(model_spec, endpoint)
-        except ValueError:
-            continue
-        expected_eligible_endpoints.append(endpoint)
-    if eligible_endpoints != expected_eligible_endpoints or not expected_eligible_endpoints:
+    expected_eligible_endpoints, _ = eligible_openrouter_endpoints(
+        model_spec,
+        canonical_slug,
+        endpoints,
+    )
+    legacy_eligible_endpoints, _ = eligible_openrouter_endpoints(
+        model_spec,
+        canonical_slug,
+        endpoints,
+        legacy_provider_name_tags=True,
+    )
+    if not expected_eligible_endpoints:
+        return None
+    if eligible_endpoints == expected_eligible_endpoints:
+        selected_from = expected_eligible_endpoints
+        derivation = "sealed_openrouter_endpoint_fields_v2"
+        reconciled_legacy_projection = False
+    elif eligible_endpoints == legacy_eligible_endpoints:
+        selected_from = legacy_eligible_endpoints
+        derivation = "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+        reconciled_legacy_projection = True
+    else:
         return None
 
     allowed_providers: set[str] = set()
     preferred_endpoints: list[dict[str, Any]] = []
-    for endpoint in eligible_endpoints:
+    for endpoint in expected_eligible_endpoints:
         if (
             not isinstance(endpoint, dict)
             or endpoint not in endpoints
@@ -3784,15 +3777,95 @@ def registered_route_target(
         if provider_key in allowed_providers:
             return None
         allowed_providers.add(provider_key)
-        if provider_key == provider_slug.casefold():
+    for endpoint in selected_from:
+        if str(endpoint.get("provider_name", "")).casefold() == provider_slug.casefold():
             preferred_endpoints.append(endpoint)
 
     if len(preferred_endpoints) > 1:
         return None
-    expected_selected = preferred_endpoints[0] if preferred_endpoints else eligible_endpoints[0]
+    expected_selected = preferred_endpoints[0] if preferred_endpoints else selected_from[0]
     if selected_endpoint != expected_selected:
         return None
-    return canonical_slug, frozenset(allowed_providers)
+    return RegisteredRouteTarget(
+        canonical_model=canonical_slug,
+        eligible_providers=frozenset(allowed_providers),
+        eligibility_derivation=derivation,
+        source_endpoint_snapshot_sha256=hashlib.sha256(canonical_json(endpoint_snapshot).encode("utf-8")).hexdigest(),
+        recorded_eligible_endpoints_sha256=hashlib.sha256(canonical_json(eligible_endpoints).encode("utf-8")).hexdigest(),
+        verified_eligible_endpoints_sha256=hashlib.sha256(
+            canonical_json(expected_eligible_endpoints).encode("utf-8")
+        ).hexdigest(),
+        reconciled_legacy_projection=reconciled_legacy_projection,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredRouteTarget:
+    canonical_model: str
+    eligible_providers: frozenset[str]
+    eligibility_derivation: str
+    source_endpoint_snapshot_sha256: str
+    recorded_eligible_endpoints_sha256: str
+    verified_eligible_endpoints_sha256: str
+    reconciled_legacy_projection: bool
+
+    def lineage(self) -> dict[str, str | bool]:
+        return {
+            "eligibility_derivation": self.eligibility_derivation,
+            "source_endpoint_snapshot_sha256": self.source_endpoint_snapshot_sha256,
+            "recorded_eligible_endpoints_sha256": self.recorded_eligible_endpoints_sha256,
+            "verified_eligible_endpoints_sha256": self.verified_eligible_endpoints_sha256,
+            "reconciled_legacy_projection": self.reconciled_legacy_projection,
+        }
+
+
+def eligible_openrouter_endpoints(
+    model_spec: ModelSpec,
+    canonical_slug: str,
+    endpoints: list[Any],
+    *,
+    legacy_provider_name_tags: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Filter raw endpoint rows using their explicit model, quantization, parameters and prices."""
+
+    required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
+    eligible: list[dict[str, Any]] = []
+    price_rejections: list[str] = []
+    provider_slug = model_spec.routing.order[0].casefold()
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        provider_name = endpoint.get("provider_name")
+        tag = endpoint.get("tag")
+        endpoint_parameters = endpoint.get("supported_parameters")
+        if (
+            not isinstance(provider_name, str)
+            or not provider_name
+            or not isinstance(tag, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*/fp8", tag) is None
+            or endpoint.get("model_id") != model_spec.model_id
+            or endpoint.get("quantization") != "fp8"
+            or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
+            or not isinstance(endpoint_parameters, list)
+            or not all(isinstance(parameter, str) for parameter in endpoint_parameters)
+            or not required_parameters.issubset(endpoint_parameters)
+            or (
+                legacy_provider_name_tags
+                and tag != f"{provider_name.casefold()}/fp8"
+            )
+            or (
+                not model_spec.routing.allow_fallbacks
+                and provider_name.casefold() != provider_slug
+            )
+        ):
+            continue
+        try:
+            validate_openrouter_endpoint_price_ceiling(model_spec, endpoint)
+        except ValueError as exc:
+            price_rejections.append(str(exc))
+            continue
+        eligible.append(endpoint)
+    return eligible, price_rejections
 
 
 def validate_openrouter_endpoint_price_ceiling(model_spec: ModelSpec, endpoint: dict[str, Any]) -> None:
@@ -3827,7 +3900,8 @@ def validate_routing_evidence(
     route_target = registered_route_target(model_spec, registered_model)
     if route_target is None:
         return False, False
-    canonical_model, eligible_providers = route_target
+    canonical_model = route_target.canonical_model
+    eligible_providers = route_target.eligible_providers
     observed = False
     for item in evidence:
         if item.get("model") != model_spec.model_id:

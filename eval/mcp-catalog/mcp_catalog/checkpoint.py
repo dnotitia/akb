@@ -113,6 +113,12 @@ class TrialCheckpoint(ContractModel):
     record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class SelectionRouteRevalidation(ContractModel):
+    source_record: TrialCheckpoint
+    replacement_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    route_lineage: dict[str, Any]
+
+
 class CheckpointPairedEvent(ContractModel):
     sequence: int = Field(ge=1)
     cell: str = Field(pattern=r"^(primary|lightweight):(http|stdio)$")
@@ -153,6 +159,7 @@ class CheckpointDocument(ContractModel):
     smoke_status: Literal["in_progress", "passed", "failed"] | None = None
     smoke_gate: dict[str, SmokeCellCheckpoint] = Field(default_factory=dict)
     selection_preflight: dict[str, Any] | None = None
+    selection_route_revalidations: list[SelectionRouteRevalidation] = Field(default_factory=list)
     provider_registry_snapshot: dict[str, Any] | None = None
     provider_registry_revalidation: list[dict[str, Any]] = Field(default_factory=list)
     continuation: dict[str, Any] | None = None
@@ -464,6 +471,83 @@ class CheckpointStore:
         ):
             raise CheckpointError("checkpoint contains an invalid completed trial")
         return record.outcome
+
+    def revalidate_selection_route_failure(
+        self,
+        key: CheckpointKey,
+        outcome: TrialOutcome,
+        *,
+        route_lineage: dict[str, Any],
+    ) -> None:
+        """Replace only a route-only failed row after sealed endpoint evidence verifies it."""
+
+        self._ensure_writable()
+        if self.selection_preflight is None:
+            raise CheckpointError("route revalidation is only supported for selected trials")
+        self._ensure_provider_registry_sealed()
+        self._validate_key(key)
+        digest = checkpoint_key_digest(key)
+        source_record = self.document.records.get(digest)
+        if (
+            source_record is None
+            or source_record.status != "failed"
+            or source_record.outcome.error != "OpenRouter response did not match the registered model/provider route"
+            or source_record.outcome.failure_kind != "unknown"
+            or not source_record.outcome.routing_observed
+            or source_record.outcome.routing_valid
+        ):
+            raise CheckpointError("selection route revalidation source is not the exact route-only failure")
+        if not self._outcome_matches_key(outcome, key):
+            raise CheckpointError("selection route revalidation changed the trial identity")
+        if (
+            outcome.error is not None
+            or outcome.failure_kind != "none"
+            or not outcome.routing_observed
+            or not outcome.routing_valid
+            or outcome.paired_execution_sequence != source_record.outcome.paired_execution_sequence
+            or outcome.paired_order_position != source_record.outcome.paired_order_position
+            or not valid_completed_outcome(outcome, self._task_for_key(key))
+        ):
+            raise CheckpointError("selection route revalidation replacement is not a measured completed outcome")
+        if any(item.source_record.key == key for item in self.document.selection_route_revalidations):
+            raise CheckpointError("selection route failure was already revalidated")
+        route_hashes = (
+            "source_endpoint_snapshot_sha256",
+            "recorded_eligible_endpoints_sha256",
+            "verified_eligible_endpoints_sha256",
+        )
+        if (
+            route_lineage.get("eligibility_derivation")
+            != "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+            or route_lineage.get("reconciled_legacy_projection") is not True
+            or any(
+                not isinstance(route_lineage.get(field), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", route_lineage[field])
+                for field in route_hashes
+            )
+        ):
+            raise CheckpointError("selection route revalidation lacks sealed legacy-projection lineage")
+
+        replacement = TrialCheckpoint(
+            status="completed",
+            key=key,
+            outcome=self._safe_outcome(outcome),
+            record_hash=checkpoint_record_hash("completed", key, self._safe_outcome(outcome)),
+        )
+        self.document.selection_route_revalidations.append(
+            SelectionRouteRevalidation(
+                source_record=source_record,
+                replacement_record_hash=replacement.record_hash,
+                route_lineage=route_lineage,
+            )
+        )
+        sequence = replacement.outcome.paired_execution_sequence
+        if type(sequence) is not int:
+            raise CheckpointError("selection route revalidation lost its paired execution sequence")
+        self._finish_paired_event(key, sequence, "completed", replacement.record_hash)
+        self.document.records[digest] = replacement
+        self._recompute_spent()
+        self._write_atomic()
 
     def smoke_outcome_for(self, cell_key: str) -> TrialOutcome | None:
         record = self.document.smoke_gate.get(cell_key)
@@ -839,6 +923,52 @@ class CheckpointStore:
                 and not valid_completed_outcome(trial_record.outcome, self._task_for_key(trial_record.key))
             ):
                 raise CheckpointError("resume checkpoint contains an invalid completed trial")
+        revalidated_keys: set[str] = set()
+        for item in document.selection_route_revalidations:
+            source = item.source_record
+            digest = checkpoint_key_digest(source.key)
+            current = document.records.get(digest)
+            if (
+                digest in revalidated_keys
+                or source.record_hash != checkpoint_record_hash(source.status, source.key, source.outcome)
+                or source.status != "failed"
+                or source.outcome.error
+                != "OpenRouter response did not match the registered model/provider route"
+                or source.outcome.failure_kind != "unknown"
+                or not source.outcome.routing_observed
+                or source.outcome.routing_valid
+                or current is None
+                or current.status != "completed"
+                or current.record_hash != item.replacement_record_hash
+                or current.outcome.error is not None
+                or current.outcome.failure_kind != "none"
+                or not current.outcome.routing_valid
+                or current.outcome.paired_execution_sequence != source.outcome.paired_execution_sequence
+                or current.outcome.paired_order_position != source.outcome.paired_order_position
+            ):
+                raise CheckpointError("selection route revalidation does not match its original and replacement rows")
+            old_values = source.outcome.model_dump(mode="json")
+            new_values = current.outcome.model_dump(mode="json")
+            allowed_changes = {"error", "failure_kind", "routing_valid", "success"}
+            if any(old_values[name] != new_values[name] for name in old_values if name not in allowed_changes):
+                raise CheckpointError("selection route revalidation changed non-routing trial evidence")
+            lineage = item.route_lineage
+            if (
+                lineage.get("eligibility_derivation")
+                != "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+                or lineage.get("reconciled_legacy_projection") is not True
+                or any(
+                    not isinstance(lineage.get(field), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", lineage[field])
+                    for field in (
+                        "source_endpoint_snapshot_sha256",
+                        "recorded_eligible_endpoints_sha256",
+                        "verified_eligible_endpoints_sha256",
+                    )
+                )
+            ):
+                raise CheckpointError("selection route revalidation lineage is invalid")
+            revalidated_keys.add(digest)
         if (document.attempt_history or document.paired_execution_events) and self.selection_preflight is None:
             raise CheckpointError("non-selection checkpoint contains selection attempt history")
         attempt_sequences: dict[int, TrialCheckpoint] = {}

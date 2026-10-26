@@ -32,6 +32,7 @@ from .checkpoint import (
     CheckpointStore,
     SmokeModelClass,
     SmokeTransport,
+    TrialCheckpoint,
     checkpoint_key_digest,
     checkpoint_record_hash,
     provider_registry_snapshot_hash,
@@ -72,6 +73,7 @@ from .execution import (
     build_model,
     canonicalize_arguments,
     decode_raw_args,
+    eligible_openrouter_endpoints,
     evaluate_dataset,
     execute_smoke,
     has_measured_evidence,
@@ -113,6 +115,64 @@ def _validate_openrouter_model_identity(spec: ModelSpec, model_record: dict[str,
     canonical_slug = model_record.get("canonical_slug")
     if canonical_slug != _expected_openrouter_canonical_slug(spec):
         raise ValueError(f"provider model canonical identity drifted for {spec.class_name}")
+
+
+def _revalidate_selection_route_failure(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[TrialOutcome, dict[str, str | bool]] | None:
+    """Correct the one route-only result whose sealed v1 projection omitted Near AI."""
+
+    if (
+        outcome.arm != "candidate"
+        or outcome.model_class != "lightweight"
+        or outcome.model_id != "qwen/qwen3.8-27b"
+        or outcome.transport != "http"
+        or outcome.task_id != "table-publication-ko"
+        or outcome.repeat_index != 1
+        or model_spec.model_id != outcome.model_id
+        or task.id != outcome.task_id
+        or outcome.error != "OpenRouter response did not match the registered model/provider route"
+        or outcome.failure_kind != "unknown"
+        or not outcome.routing_observed
+        or outcome.routing_valid
+        or outcome.trial_error
+        or not outcome.user_outcome_completed
+    ):
+        return None
+    route = registered_route_target(model_spec, registered_model)
+    if route is None or not route.reconciled_legacy_projection:
+        return None
+    observed, valid = validate_routing_evidence(
+        outcome.provider_evidence,
+        model_spec,
+        registered_model,
+    )
+    if not observed or not valid:
+        return None
+    success = (
+        outcome.user_outcome_completed
+        and outcome.first_material_action_accuracy
+        and outcome.argument_validity
+        and outcome.safety
+        and (outcome.stopping_accuracy or not task.stopping.enforce_for_task_success)
+    )
+    corrected = outcome.model_copy(
+        update={
+            "error": None,
+            "failure_kind": "none",
+            "routing_valid": True,
+            "success": success,
+        }
+    )
+    if (
+        not has_measured_evidence(corrected, task)
+        or not has_server_instructions_evidence(corrected)
+    ):
+        return None
+    return corrected, route.lineage()
 
 
 _DYNAMIC_PROVIDER_REGISTRY_FIELDS = frozenset(
@@ -1254,6 +1314,14 @@ class BenchmarkRunner:
             checkpoint_evidence["smoke_cell_count"] = len(checkpoint_doc.smoke_gate)
             checkpoint_evidence["provider_registry_hash"] = checkpoint_doc.header.provider_registry_hash
             checkpoint_evidence["selection_preflight"] = checkpoint_doc.selection_preflight
+            if checkpoint_doc.attempt_history:
+                checkpoint_evidence["attempt_history"] = [
+                    item.model_dump(mode="json") for item in checkpoint_doc.attempt_history
+                ]
+            if checkpoint_doc.selection_route_revalidations:
+                checkpoint_evidence["selection_route_revalidations"] = [
+                    item.model_dump(mode="json") for item in checkpoint_doc.selection_route_revalidations
+                ]
             checkpoint_evidence["provider_registry_revalidation"] = [
                 {
                     "snapshot_hash": item["snapshot_hash"],
@@ -1364,6 +1432,25 @@ class BenchmarkRunner:
         }
         if self.selection is not None:
             artifact["selection"] = self.selection.artifact_metadata()
+            route_models: dict[str, Any] = {}
+            registered_models = self.provider_registry.get("models")
+            for model_spec in self.manifest.models:
+                registered_model = (
+                    registered_models.get(model_spec.model_id)
+                    if isinstance(registered_models, dict)
+                    else None
+                )
+                target = (
+                    registered_route_target(model_spec, registered_model)
+                    if isinstance(registered_model, dict)
+                    else None
+                )
+                if target is not None:
+                    route_models[model_spec.model_id] = target.lineage()
+            artifact["routing_verification"] = {
+                "status": "verified" if len(route_models) == len(self.manifest.models) else "incomplete",
+                "models": route_models,
+            }
         if failure is not None:
             cleanup = cleanup_errors or []
             stage = failure_stage or _exception_stage(failure, "run")
@@ -1959,36 +2046,11 @@ class BenchmarkRunner:
                                 stage="provider_registry",
                             )
                         canonical_slug = _expected_openrouter_canonical_slug(spec)
-                        eligible: list[dict[str, Any]] = []
-                        price_rejections: list[str] = []
-                        required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
-                        for endpoint in endpoints:
-                            if not isinstance(endpoint, dict):
-                                continue
-                            provider_name = endpoint.get("provider_name")
-                            supported_parameters = endpoint.get("supported_parameters")
-                            if (
-                                not isinstance(provider_name, str)
-                                or not provider_name
-                                or endpoint.get("model_id") != spec.model_id
-                                or endpoint.get("quantization") != "fp8"
-                                or endpoint.get("tag") != f"{provider_name.casefold()}/fp8"
-                                or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
-                                or not isinstance(supported_parameters, list)
-                                or not all(isinstance(parameter, str) for parameter in supported_parameters)
-                                or not required_parameters.issubset(supported_parameters)
-                                or (
-                                    not spec.routing.allow_fallbacks
-                                    and provider_name.casefold() != spec.routing.order[0].casefold()
-                                )
-                            ):
-                                continue
-                            try:
-                                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
-                            except ValueError as exc:
-                                price_rejections.append(str(exc))
-                                continue
-                            eligible.append(endpoint)
+                        eligible, price_rejections = eligible_openrouter_endpoints(
+                            spec,
+                            canonical_slug,
+                            endpoints,
+                        )
                         if not eligible:
                             reason = price_rejections[0] if price_rejections else (
                                 "no registered fp8 endpoint satisfies the model, parameter, and routing constraints "
@@ -2428,6 +2490,37 @@ class BenchmarkRunner:
             initial_timing = self._timing_snapshot()
             assert initial_timing is not None
             await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
+            frozen_registry = self._checkpoint_store.document.provider_registry_snapshot
+            frozen_models = frozen_registry.get("models") if isinstance(frozen_registry, dict) else None
+            if self.selection is not None and isinstance(frozen_models, dict):
+                tasks_by_id = {task.id: task for task in self.tasks}
+                models_by_id = {model.model_id: model for model in self.manifest.models}
+                for planned_key in planned_keys.values():
+                    digest = checkpoint_key_digest(planned_key)
+                    source_record = self._checkpoint_store.document.records.get(digest)
+                    if source_record is None or source_record.status != "failed":
+                        continue
+                    task = tasks_by_id[planned_key.task_id]
+                    model_spec = models_by_id[planned_key.model_id]
+                    registered_model = frozen_models.get(planned_key.model_id)
+                    if not isinstance(registered_model, dict):
+                        continue
+                    revalidation = _revalidate_selection_route_failure(
+                        source_record.outcome,
+                        task,
+                        model_spec,
+                        registered_model,
+                    )
+                    if revalidation is None:
+                        continue
+                    corrected, route_lineage = revalidation
+                    async with self._checkpoint_lock:
+                        await asyncio.to_thread(
+                            self._checkpoint_store.revalidate_selection_route_failure,
+                            planned_key,
+                            corrected,
+                            route_lineage=route_lineage,
+                        )
             for planned_key in planned_keys.values():
                 outcome = self._checkpoint_store.reusable_outcome_for(planned_key)
                 if outcome is not None:
@@ -4208,6 +4301,10 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         if isinstance(checkpoint, dict)
         else None
     )
+    if isinstance(checkpoint_receipt, dict) and isinstance(checkpoint, dict):
+        for field in ("attempt_history", "selection_route_revalidations"):
+            if field in checkpoint:
+                checkpoint_receipt[field] = checkpoint[field]
     hash_input = {
         "schema_version": artifact["schema_version"],
         "status": artifact.get("status", "complete"),
@@ -4250,6 +4347,8 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         hash_input["continuation_runtime_provenance"] = artifact["continuation_runtime_provenance"]
     if "selection" in artifact:
         hash_input["selection"] = artifact["selection"]
+    if "routing_verification" in artifact:
+        hash_input["routing_verification"] = artifact["routing_verification"]
     if "resume_source" in artifact:
         hash_input["resume_source"] = artifact["resume_source"]
     return hash_input
@@ -4767,6 +4866,595 @@ def load_paired_resume_source(
     }
 
 
+def _selection_history_for_checkpoint(document: CheckpointDocument) -> list[dict[str, Any]]:
+    if document.selection_preflight is None:
+        raise ValueError("selection resume checkpoint is missing its selection preflight")
+    events = {item.sequence: item for item in document.paired_execution_events}
+    records = [*document.attempt_history, *document.records.values()]
+    for record in records:
+        outcome = record.outcome
+        sequence = outcome.paired_execution_sequence
+        order_position = outcome.paired_order_position
+        if type(sequence) is not int or type(order_position) is not int:
+            raise ValueError("selection resume checkpoint row is missing paired sequence evidence")
+        identity = (
+            f"{record.key.model_class}:{record.key.transport}",
+            record.key.task_id,
+            record.key.repeat_index,
+            record.key.arm,
+        )
+        previous = events.get(sequence)
+        if previous is None:
+            events[sequence] = CheckpointPairedEvent(
+                sequence=sequence,
+                cell=identity[0],
+                task_id=identity[1],
+                repeat_index=identity[2],
+                arm=identity[3],
+                order_position=order_position,
+                status=record.status,
+                record_hash=record.record_hash,
+            )
+            continue
+        if (
+            (previous.cell, previous.task_id, previous.repeat_index, previous.arm) != identity
+            or previous.order_position != order_position
+            or previous.record_hash not in (None, record.record_hash)
+        ):
+            raise ValueError("selection resume checkpoint event does not match its outcome")
+        events[sequence] = previous.model_copy(
+            update={"status": record.status, "record_hash": record.record_hash}
+        )
+
+    by_identity: dict[tuple[str, str, int, ArmName], list[CheckpointPairedEvent]] = defaultdict(list)
+    for event in events.values():
+        by_identity[(event.cell, event.task_id, event.repeat_index, event.arm)].append(event)
+    for chain in by_identity.values():
+        chain.sort(key=lambda item: item.sequence)
+        previous_sequence: int | None = None
+        for attempt, event in enumerate(chain, start=1):
+            if event.attempt is None:
+                event = event.model_copy(
+                    update={
+                        "attempt": attempt,
+                        **({"retry_of_sequence": previous_sequence} if previous_sequence is not None else {}),
+                    }
+                )
+                events[event.sequence] = event
+            elif event.attempt != attempt or event.retry_of_sequence != previous_sequence:
+                raise ValueError("selection resume checkpoint retry chain is invalid")
+            previous_sequence = event.sequence
+    return [events[sequence].model_dump(mode="json", exclude_none=True) for sequence in sorted(events)]
+
+
+def load_selection_resume_source(
+    *,
+    artifact_paths: Mapping[ArmName, Path],
+    checkpoint_paths: Mapping[ArmName, Path],
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    selection: ToolGuidanceSelection,
+) -> dict[str, Any]:
+    """Validate an interrupted selected run before its checkpoint can be resumed."""
+
+    manifest_data = manifest.model_dump(mode="json")
+    manifest_digest = hash_json(manifest_data)
+    task_data = [task.model_dump(mode="json") for task in tasks]
+    corpus_digest = hash_json(task_data)
+    task_by_id = {task.id: task for task in tasks}
+    model_by_class = {model.class_name: model for model in manifest.models}
+    expected_keys: dict[ArmName, dict[tuple[str, str, int, ArmName], CheckpointKey]] = {
+        "baseline": {},
+        "candidate": {},
+    }
+    trial_order: dict[ArmName, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        for model in manifest.models:
+            for transport in manifest.transports:
+                for task in tasks:
+                    if transport not in task.fixture.transports:
+                        continue
+                    for repeat_index in range(1, manifest.repeats + 1):
+                        if not selection.contains(arm, model.class_name, transport, task.id, repeat_index):
+                            continue
+                        key = CheckpointKey(
+                            source_revision=manifest.arm_source_revisions[arm],
+                            run_manifest_hash=manifest_digest,
+                            task_corpus_hash=corpus_digest,
+                            arm=arm,
+                            model_class=model.class_name,
+                            model_id=model.model_id,
+                            transport=transport,
+                            task_id=task.id,
+                            repeat_index=repeat_index,
+                            locale=task.locale,
+                        )
+                        identity = (f"{model.class_name}:{transport}", task.id, repeat_index, arm)
+                        expected_keys[arm][identity] = key
+                        trial_order[arm].append(key.model_dump(mode="json"))
+
+    expected_order_plan = [
+        {
+            "task_id": task.id,
+            "repeat_index": repeat_index,
+            "arm_order": list(planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)),
+        }
+        for repeat_index in range(1, manifest.repeats + 1)
+        for task in tasks
+    ]
+    source_artifacts: dict[ArmName, dict[str, Any]] = {}
+    source_checkpoints: dict[ArmName, CheckpointDocument] = {}
+    source_hashes: dict[ArmName, dict[str, Any]] = {}
+    selection_events: dict[int, dict[str, Any]] = {}
+    shared_execution: dict[str, Any] | None = None
+    shared_budget: dict[str, Any] | None = None
+    outcome_costs: list[Decimal] = []
+
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        try:
+            artifact_bytes = artifact_paths[arm].read_bytes()
+            checkpoint_bytes = checkpoint_paths[arm].read_bytes()
+            artifact = json.loads(artifact_bytes)
+            checkpoint_raw = json.loads(checkpoint_bytes)
+        except OSError as exc:
+            raise ValueError(f"cannot read {arm} selection resume source: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{arm} selection resume source is invalid JSON") from exc
+        if not isinstance(artifact, dict) or not isinstance(checkpoint_raw, dict):
+            raise ValueError(f"{arm} selection resume source must be JSON objects")
+        try:
+            checkpoint = CheckpointDocument.model_validate(checkpoint_raw)
+        except Exception as exc:
+            raise ValueError(f"{arm} selection resume checkpoint contract validation failed: {exc}") from exc
+
+        if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
+            raise ValueError(f"{arm} selection resume artifact identity is invalid")
+        if artifact.get("selection") != selection.artifact_metadata():
+            raise ValueError(f"{arm} selection resume artifact does not match the approved selection")
+        if artifact.get("manifest") != manifest_data or artifact.get("run_manifest_hash") != manifest_digest:
+            raise ValueError(f"{arm} selection resume artifact does not match the execution manifest")
+        if artifact.get("task_contracts") != task_data or artifact.get("task_corpus_hash") != corpus_digest:
+            raise ValueError(f"{arm} selection resume artifact does not match the task corpus")
+        if artifact.get("task_ids") != [task.id for task in tasks]:
+            raise ValueError(f"{arm} selection resume artifact task order changed")
+        if artifact.get("source_revision") != manifest.arm_source_revisions[arm]:
+            raise ValueError(f"{arm} selection resume artifact source revision changed")
+        if artifact.get("paired_order_plan") != expected_order_plan:
+            raise ValueError(f"{arm} selection resume artifact paired order changed")
+        hash_input = artifact.get("artifact_hash_input")
+        if not isinstance(hash_input, dict) or hash_input.get("trial_order") != trial_order[arm]:
+            raise ValueError(f"{arm} selection resume artifact trial order changed")
+        try:
+            recalculated_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order[arm])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{arm} selection resume artifact hash input is invalid") from exc
+        if recalculated_hash_input != hash_input or artifact.get("artifact_hash") != hash_json(hash_input):
+            raise ValueError(f"{arm} selection resume artifact hash does not match its contents")
+
+        header = checkpoint.header
+        provider_registry = artifact.get("provider_registry")
+        if (
+            checkpoint.lifecycle != "finalized"
+            or checkpoint.reserved_cost_usd != 0
+            or checkpoint.smoke_status is not None
+            or checkpoint.smoke_gate
+            or checkpoint.continuation is not None
+            or checkpoint.selection_preflight != selection.checkpoint_preflight()
+            or header.arm != arm
+            or header.source_revision != manifest.arm_source_revisions[arm]
+            or header.run_manifest_hash != manifest_digest
+            or header.task_corpus_hash != corpus_digest
+            or header.pre_smoke_seal_hash != artifact.get("pre_smoke_seal_hash")
+            or not isinstance(provider_registry, dict)
+            or checkpoint.provider_registry_snapshot != provider_registry
+            or header.provider_registry_hash != provider_registry.get("snapshot_hash")
+            or checkpoint.spent_hash != spent_hash(checkpoint.spent)
+            or checkpoint.timing_hash != timing_hash(checkpoint.timing)
+        ):
+            raise ValueError(f"{arm} selection resume checkpoint seal or lifecycle is invalid")
+        try:
+            registry_hash = provider_registry_snapshot_hash(checkpoint.provider_registry_snapshot or {})
+        except Exception as exc:
+            raise ValueError(f"{arm} selection resume provider registry seal is invalid") from exc
+        if registry_hash != header.provider_registry_hash:
+            raise ValueError(f"{arm} selection resume provider registry hash changed")
+
+        receipt = artifact.get("checkpoint")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"{arm} selection resume artifact is missing its checkpoint receipt")
+        receipt_fields = {
+            "lifecycle": checkpoint.lifecycle,
+            "record_count": len(checkpoint.records),
+            "reserved_cost_usd": checkpoint.reserved_cost_usd,
+            "smoke_status": checkpoint.smoke_status,
+            "smoke_cell_count": len(checkpoint.smoke_gate),
+            "provider_registry_hash": header.provider_registry_hash,
+            "spent": checkpoint.spent.model_dump(mode="json"),
+            "spent_hash": checkpoint.spent_hash,
+            "timing": checkpoint.timing.model_dump(mode="json"),
+            "timing_hash": checkpoint.timing_hash,
+            "selection_preflight": checkpoint.selection_preflight,
+        }
+        if any(receipt.get(name) != value for name, value in receipt_fields.items()):
+            raise ValueError(f"{arm} selection resume checkpoint receipt changed")
+        if "attempt_history" in receipt and receipt["attempt_history"] != [
+            item.model_dump(mode="json") for item in checkpoint.attempt_history
+        ]:
+            raise ValueError(f"{arm} selection resume attempt history receipt changed")
+        if "selection_route_revalidations" in receipt and receipt["selection_route_revalidations"] != [
+            item.model_dump(mode="json") for item in checkpoint.selection_route_revalidations
+        ]:
+            raise ValueError(f"{arm} selection resume route revalidation receipt changed")
+        if (
+            type(receipt.get("new_trials")) is not int
+            or type(receipt.get("reused_trials")) is not int
+            or type(receipt.get("rerun_trials")) is not int
+            or receipt["new_trials"] + receipt["reused_trials"] != len(checkpoint.records)
+            or receipt["rerun_trials"] > receipt["new_trials"]
+        ):
+            raise ValueError(f"{arm} selection resume trial counters are invalid")
+
+        raw_trials: dict[tuple[str, str, int, ArmName], dict[str, Any]] = {}
+        raw_statuses: dict[tuple[str, str, int, ArmName], str] = {}
+        runs = artifact.get("runs")
+        if not isinstance(runs, dict):
+            raise ValueError(f"{arm} selection resume artifact runs are invalid")
+        for cell, report in runs.items():
+            if cell not in {identity[0] for identity in expected_keys[arm]} or not isinstance(report, dict):
+                raise ValueError(f"{arm} selection resume artifact contains an unselected run cell")
+            raw_rows = report.get("trials")
+            raw_cell_statuses = report.get("statuses")
+            if not isinstance(raw_rows, list) or not isinstance(raw_cell_statuses, list):
+                raise ValueError(f"{arm} selection resume rows are malformed")
+            for raw_outcome in raw_rows:
+                if not isinstance(raw_outcome, dict):
+                    raise ValueError(f"{arm} selection resume outcome row is malformed")
+                try:
+                    validate_model_input_evidence(raw_outcome)
+                    outcome = TrialOutcome.model_validate(raw_outcome)
+                except Exception as exc:
+                    raise ValueError(f"{arm} selection resume outcome contract is invalid") from exc
+                identity = (cell, outcome.task_id, outcome.repeat_index, arm)
+                expected_key = expected_keys[arm].get(identity)
+                if (
+                    expected_key is None
+                    or outcome.arm != arm
+                    or outcome.model_class != expected_key.model_class
+                    or outcome.model_id != expected_key.model_id
+                    or outcome.transport != expected_key.transport
+                    or outcome.locale != expected_key.locale
+                    or identity in raw_trials
+                    or type(outcome.paired_execution_sequence) is not int
+                ):
+                    raise ValueError(f"{arm} selection resume outcome identity is invalid")
+                raw_trials[identity] = raw_outcome
+                outcome_costs.append(
+                    max(Decimal(str(outcome.cost_usd)), Decimal(str(outcome.provider_cost_usd or 0.0)))
+                )
+            for raw_status in raw_cell_statuses:
+                if not isinstance(raw_status, dict):
+                    raise ValueError(f"{arm} selection resume status row is malformed")
+                status_task_id = raw_status.get("task_id")
+                status_repeat_index = raw_status.get("repeat_index")
+                status = raw_status.get("status")
+                if (
+                    not isinstance(status_task_id, str)
+                    or type(status_repeat_index) is not int
+                    or status not in {"completed", "failed"}
+                ):
+                    raise ValueError(f"{arm} selection resume status identity is invalid")
+                identity = (cell, status_task_id, status_repeat_index, arm)
+                if identity not in expected_keys[arm] or identity in raw_statuses:
+                    raise ValueError(f"{arm} selection resume status identity is invalid")
+                raw_statuses[identity] = status
+
+        checkpoint_identities = {
+            (f"{record.key.model_class}:{record.key.transport}", record.key.task_id, record.key.repeat_index, arm)
+            for record in checkpoint.records.values()
+        }
+        if set(raw_trials) != set(raw_statuses) or set(raw_trials) != checkpoint_identities:
+            raise ValueError(f"{arm} selection resume artifact rows do not match checkpoint identities")
+        for digest, record in checkpoint.records.items():
+            identity = (
+                f"{record.key.model_class}:{record.key.transport}",
+                record.key.task_id,
+                record.key.repeat_index,
+                arm,
+            )
+            expected_key = expected_keys[arm].get(identity)
+            if (
+                digest != checkpoint_key_digest(record.key)
+                or expected_key != record.key
+                or record.status not in {"completed", "failed"}
+                or record.record_hash != checkpoint_record_hash(record.status, record.key, record.outcome)
+                or record.status != raw_statuses[identity]
+                or record.outcome.model_dump(mode="json") != raw_trials[identity]
+                or (
+                    record.status == "completed"
+                    and not valid_completed_outcome(record.outcome, task_by_id[record.key.task_id])
+                )
+            ):
+                raise ValueError(f"{arm} selection resume checkpoint row changed")
+
+        outcomes = [record.outcome for record in [*checkpoint.attempt_history, *checkpoint.records.values()]]
+        setup_requests = checkpoint.spent.provider_setup_requests
+        if (
+            checkpoint.spent.model_requests != setup_requests + sum(item.model_requests for item in outcomes)
+            or checkpoint.spent.input_tokens != sum(item.input_tokens for item in outcomes)
+            or checkpoint.spent.output_tokens != sum(item.output_tokens for item in outcomes)
+            or not math.isclose(
+                checkpoint.spent.cost_usd,
+                sum((Decimal(str(item.cost_usd)) for item in outcomes), Decimal("0")),
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                checkpoint.spent.model_work_seconds,
+                sum(item.latency_seconds for item in outcomes),
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(f"{arm} selection resume checkpoint spend does not match its outcomes")
+        arm_budget = artifact.get("budget_used")
+        if (
+            not isinstance(arm_budget, dict)
+            or arm_budget.get("model_requests")
+            != checkpoint.spent.model_requests - checkpoint.spent.provider_setup_requests
+            or arm_budget.get("provider_setup_requests") != checkpoint.spent.provider_setup_requests
+            or arm_budget.get("input_tokens") != checkpoint.spent.input_tokens
+            or arm_budget.get("output_tokens") != checkpoint.spent.output_tokens
+            or not math.isclose(
+                float(arm_budget.get("cost_usd", math.nan)),
+                checkpoint.spent.cost_usd,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                float(arm_budget.get("wall_seconds", math.nan)),
+                checkpoint.spent.wall_seconds,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                float(arm_budget.get("model_work_seconds", math.nan)),
+                checkpoint.spent.model_work_seconds,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or arm_budget.get("reserved_cost_usd") != checkpoint.reserved_cost_usd
+        ):
+            raise ValueError(f"{arm} selection resume arm budget does not match its checkpoint")
+
+        history = _selection_history_for_checkpoint(checkpoint)
+        for event in history:
+            identity = (event["cell"], event["task_id"], event["repeat_index"], event["arm"])
+            model_class, transport = event["cell"].split(":", 1)
+            if (
+                event["arm"] != arm
+                or identity not in expected_keys[arm]
+                or event["order_position"]
+                != planned_arm_order(event["task_id"], event["repeat_index"], manifest.paired_order_seed).index(arm)
+            ):
+                raise ValueError(f"{arm} selection resume event identity or paired order changed")
+            if model_class not in model_by_class or transport not in manifest.transports:
+                raise ValueError(f"{arm} selection resume event cell is invalid")
+            if event["sequence"] in selection_events:
+                raise ValueError("selection resume paired sequence is duplicated across arms")
+            selection_events[event["sequence"]] = event
+
+        paired = artifact.get("paired_execution")
+        budget = artifact.get("paired_budget_used")
+        if not isinstance(paired, dict) or not isinstance(budget, dict):
+            raise ValueError(f"{arm} selection resume artifact is missing paired execution accounting")
+        if shared_execution is None:
+            shared_execution = paired
+            shared_budget = budget
+        elif paired != shared_execution or budget != shared_budget:
+            raise ValueError("selection resume arm artifacts disagree on shared execution or budget")
+        source_artifacts[arm] = artifact
+        source_checkpoints[arm] = checkpoint
+        source_hashes[arm] = {
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "artifact_hash": artifact.get("artifact_hash"),
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "checkpoint_spent_hash": checkpoint.spent_hash,
+            "source_revision": artifact.get("source_revision"),
+            "selection_sha256": selection.sha256,
+        }
+
+    assert shared_execution is not None and shared_budget is not None
+    if shared_execution.get("mode") != manifest.paired_order or shared_execution.get("seed") != manifest.paired_order_seed:
+        raise ValueError("selection resume execution order differs from preregistration")
+    artifact_events = shared_execution.get("events")
+    if not isinstance(artifact_events, list):
+        raise ValueError("selection resume paired event history is invalid")
+    artifact_sequences: list[int] = []
+    for event in artifact_events:
+        if not isinstance(event, dict):
+            raise ValueError("selection resume paired event sequence is invalid")
+        sequence = event.get("sequence")
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("selection resume paired event sequence is invalid")
+        artifact_sequences.append(sequence)
+    if artifact_sequences != sorted(set(artifact_sequences)):
+        raise ValueError("selection resume paired event sequence is invalid")
+    maximum_sequence = max(artifact_sequences, default=0)
+    missing_sequences = sorted(set(range(1, maximum_sequence + 1)) - set(artifact_sequences))
+    expected_gaps = [{"sequence": sequence, "status": "unknown_start"} for sequence in missing_sequences]
+    if shared_execution.get("unknown_start_gaps") != expected_gaps:
+        raise ValueError("selection resume unknown-start gaps changed")
+    if set(artifact_sequences) != set(selection_events):
+        raise ValueError("selection resume artifact and checkpoint event sequences differ")
+    for raw_event in artifact_events:
+        assert isinstance(raw_event, dict)
+        sequence = raw_event["sequence"]
+        checkpoint_event = selection_events[sequence]
+        for field_name in ("sequence", "cell", "task_id", "repeat_index", "arm", "order_position"):
+            if raw_event.get(field_name) != checkpoint_event.get(field_name):
+                raise ValueError("selection resume paired event differs from checkpoint lineage")
+        for field_name in ("attempt", "retry_of_sequence"):
+            if field_name in raw_event and raw_event[field_name] != checkpoint_event.get(field_name):
+                raise ValueError("selection resume retry lineage changed")
+        if raw_event.get("status") != checkpoint_event.get("status") and not (
+            raw_event.get("status") == "started"
+            and checkpoint_event.get("status") in {"completed", "failed", "incomplete"}
+            and any(
+                record.outcome.paired_execution_sequence == sequence
+                for checkpoint in source_checkpoints.values()
+                for record in [*checkpoint.attempt_history, *checkpoint.records.values()]
+            )
+        ):
+            raise ValueError("selection resume event status differs from checkpoint evidence")
+        if raw_event.get("record_hash") not in (None, checkpoint_event.get("record_hash")):
+            raise ValueError("selection resume paired event record hash changed")
+    canonical_events = [selection_events[sequence] for sequence in sorted(selection_events)]
+    canonical_unfinished = [
+        event
+        for event in canonical_events
+        if event["status"] in {"started", "incomplete"}
+        and not any(
+            record.outcome.paired_execution_sequence == event["sequence"]
+            for checkpoint in source_checkpoints.values()
+            for record in [*checkpoint.attempt_history, *checkpoint.records.values()]
+        )
+    ]
+    artifact_unfinished = [event for event in artifact_events if event.get("status") == "started"]
+    if shared_execution.get("unfinished_starts") != artifact_unfinished:
+        raise ValueError("selection resume artifact unfinished-start receipt changed")
+    total_expected = len(selection.identities)
+    terminal_count = sum(len(checkpoint.records) for checkpoint in source_checkpoints.values())
+    if shared_execution.get("complete") is not (terminal_count == total_expected):
+        raise ValueError("selection resume completion flag differs from checkpoint rows")
+
+    paired_requests = shared_budget.get("model_requests")
+    paired_setup = shared_budget.get("provider_setup_requests")
+    paired_inputs = shared_budget.get("input_tokens")
+    paired_outputs = shared_budget.get("output_tokens")
+    paired_cost_value = shared_budget.get("cost_usd")
+    paired_work = shared_budget.get("model_work_seconds")
+    paired_wall = shared_budget.get("wall_seconds")
+    if (
+        type(paired_requests) is not int
+        or type(paired_setup) is not int
+        or type(paired_inputs) is not int
+        or type(paired_outputs) is not int
+        or not isinstance(paired_cost_value, (str, int, float))
+        or isinstance(paired_cost_value, bool)
+        or not isinstance(paired_work, (int, float))
+        or isinstance(paired_work, bool)
+        or not isinstance(paired_wall, (int, float))
+        or isinstance(paired_wall, bool)
+        or shared_budget.get("total_tokens") != paired_inputs + paired_outputs
+        or shared_budget.get("max_total_cost_usd") != manifest.budget.max_total_cost_usd
+        or shared_budget.get("new_execution_limit_usd") != str(selection.budget.new_execution_limit_usd)
+        or shared_budget.get("final_reserved_cost_usd") not in ("0", "0.0", 0)
+    ):
+        raise ValueError("selection resume shared budget does not match its approved limits")
+    try:
+        paired_cost = Decimal(str(paired_cost_value))
+        paired_work_value = float(paired_work)
+        paired_wall_value = float(paired_wall)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("selection resume shared budget totals are invalid") from exc
+    if (
+        not paired_cost.is_finite()
+        or paired_cost < 0
+        or not math.isfinite(paired_work_value)
+        or paired_work_value < 0
+        or not math.isfinite(paired_wall_value)
+        or paired_wall_value < 0
+    ):
+        raise ValueError("selection resume shared budget totals are invalid")
+    checkpoint_model_requests = sum(
+        checkpoint.spent.model_requests - checkpoint.spent.provider_setup_requests
+        for checkpoint in source_checkpoints.values()
+    )
+    checkpoint_setup = sum(checkpoint.spent.provider_setup_requests for checkpoint in source_checkpoints.values())
+    checkpoint_inputs = sum(checkpoint.spent.input_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_outputs = sum(checkpoint.spent.output_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_cost = sum(
+        (Decimal(str(checkpoint.spent.cost_usd)) for checkpoint in source_checkpoints.values()),
+        Decimal("0"),
+    )
+    checkpoint_work = sum(checkpoint.spent.model_work_seconds for checkpoint in source_checkpoints.values())
+    residual_model_requests = paired_requests - checkpoint_model_requests
+    residual_provider_setup_requests = paired_setup - checkpoint_setup
+    residual_input_tokens = paired_inputs - checkpoint_inputs
+    residual_output_tokens = paired_outputs - checkpoint_outputs
+    residual_cost = paired_cost - checkpoint_cost
+    residual_conservative_cost = paired_cost - sum(outcome_costs, Decimal("0"))
+    residual_model_work = paired_work_value - checkpoint_work
+    residual_wall = paired_wall_value - max(
+        checkpoint.spent.wall_seconds for checkpoint in source_checkpoints.values()
+    )
+    residual = {
+        "model_requests": residual_model_requests,
+        "provider_setup_requests": residual_provider_setup_requests,
+        "input_tokens": residual_input_tokens,
+        "output_tokens": residual_output_tokens,
+        "cost_usd": str(residual_cost),
+        "conservative_cost_usd": str(residual_conservative_cost),
+        "model_work_seconds": residual_model_work,
+        "wall_seconds_above_max_checkpoint": residual_wall,
+    }
+    if (
+        min(
+            residual_model_requests,
+            residual_provider_setup_requests,
+            residual_input_tokens,
+            residual_output_tokens,
+        )
+        < 0
+        or residual_cost < 0
+        or residual_conservative_cost < 0
+        or residual_model_work < -1e-9
+        or residual_wall < -1e-9
+    ):
+        raise ValueError("selection resume shared budget is below its checkpoint accounting")
+
+    writer_hashes = {
+        filename: hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
+        for filename in ("runner.py", "cli.py", "execution.py", "selection.py")
+    }
+    metadata = {
+        "schema_version": 1,
+        "selection_sha256": selection.sha256,
+        "parents": source_hashes,
+        "source_execution": {
+            "event_count": len(canonical_events),
+            "terminal_outcome_count": terminal_count,
+            "attempt_history_count": sum(len(checkpoint.attempt_history) for checkpoint in source_checkpoints.values()),
+            "unfinished_starts": canonical_unfinished,
+            "artifact_unfinished_starts": artifact_unfinished,
+            "unknown_start_gaps": expected_gaps,
+        },
+        "source_accounting": {
+            "joint_budget_used": shared_budget,
+            "checkpoint_model_requests": checkpoint_model_requests,
+            "checkpoint_provider_setup_requests": checkpoint_setup,
+            "checkpoint_input_tokens": checkpoint_inputs,
+            "checkpoint_output_tokens": checkpoint_outputs,
+            "checkpoint_cost_usd": str(checkpoint_cost),
+            "checkpoint_model_work_seconds": checkpoint_work,
+            "model_request_equation": (
+                f"{paired_requests} = {checkpoint_model_requests} + {residual['model_requests']}"
+            ),
+            "residual": residual,
+        },
+        "writer": {
+            "semantic_evaluator_version": TrialEvaluator().get_evaluator_version(),
+            "report_evaluator_version": MetricsReportEvaluator().get_evaluator_version(),
+            "source_sha256": writer_hashes,
+        },
+    }
+    return {
+        "events": canonical_events,
+        "budget_used": dict(shared_budget),
+        "metadata": metadata,
+    }
+
+
 def _paired_artifact_receipts_reconcile(
     artifacts: dict[str, dict[str, Any]],
     paired_budget_used: dict[str, Any],
@@ -5069,6 +5757,293 @@ def _paired_artifact_receipts_reconcile(
     )
 
 
+def _selection_artifact_receipts_reconcile(
+    artifacts: dict[str, dict[str, Any]],
+    paired_budget_used: dict[str, Any],
+) -> bool:
+    if set(artifacts) != {"baseline", "candidate"}:
+        return False
+    selection = artifacts["baseline"].get("selection")
+    resume_source = artifacts["baseline"].get("resume_source")
+    if (
+        not isinstance(selection, dict)
+        or artifacts["candidate"].get("selection") != selection
+        or artifacts["candidate"].get("resume_source") != resume_source
+    ):
+        return False
+    arm_counts = selection.get("expected_trials_by_arm")
+    selected_trials = selection.get("selected_trials")
+    if not isinstance(arm_counts, dict) or not isinstance(selected_trials, list):
+        return False
+    expected_identities: dict[str, set[tuple[str, str, str, int]]] = {
+        "baseline": set(),
+        "candidate": set(),
+    }
+    for selected in selected_trials:
+        if not isinstance(selected, dict):
+            return False
+        arm = selected.get("arm")
+        identity = (
+            selected.get("model_class"),
+            selected.get("transport"),
+            selected.get("task_id"),
+            selected.get("repeat_index"),
+        )
+        if (
+            arm not in expected_identities
+            or not isinstance(identity[0], str)
+            or not isinstance(identity[1], str)
+            or not isinstance(identity[2], str)
+            or type(identity[3]) is not int
+            or identity in expected_identities[arm]
+        ):
+            return False
+        expected_identities[arm].add(cast(tuple[str, str, str, int], identity))
+
+    residual: dict[str, Any] = {
+        "model_requests": 0,
+        "provider_setup_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": "0",
+        "model_work_seconds": 0.0,
+    }
+    if resume_source is not None:
+        accounting = resume_source.get("source_accounting") if isinstance(resume_source, dict) else None
+        source_residual = accounting.get("residual") if isinstance(accounting, dict) else None
+        if not isinstance(source_residual, dict):
+            return False
+        residual = source_residual
+
+    totals = {
+        "model_requests": 0,
+        "provider_setup_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    total_cost = Decimal("0")
+    total_work = 0.0
+    max_checkpoint_wall = 0.0
+    for arm in ("baseline", "candidate"):
+        artifact = artifacts[arm]
+        checkpoint = artifact.get("checkpoint")
+        spent = checkpoint.get("spent") if isinstance(checkpoint, dict) else None
+        runs = artifact.get("runs")
+        smoke = artifact.get("smoke_gate")
+        if (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("enabled") is not True
+            or checkpoint.get("lifecycle") != "finalized"
+            or checkpoint.get("record_count") != arm_counts.get(arm)
+            or checkpoint.get("reserved_cost_usd") != 0
+            or checkpoint.get("smoke_status") is not None
+            or checkpoint.get("smoke_cell_count") != 0
+            or not isinstance(spent, dict)
+            or not isinstance(runs, dict)
+            or smoke != {"status": "not_run", "required_cells": [], "cells": []}
+        ):
+            return False
+        if checkpoint.get("spent_hash") != hash_json(spent):
+            return False
+        checkpoint_receipt = artifact.get("artifact_hash_input", {}).get("checkpoint_receipt")
+        expected_receipt = {
+            key: checkpoint.get(key)
+            for key in (
+                "enabled",
+                "lifecycle",
+                "record_count",
+                "valid_completed_trials",
+                "reserved_cost_usd",
+                "smoke_status",
+                "smoke_cell_count",
+            )
+        }
+        if isinstance(checkpoint, dict) and "selection_route_revalidations" in checkpoint:
+            expected_receipt["selection_route_revalidations"] = checkpoint["selection_route_revalidations"]
+        if isinstance(checkpoint, dict) and "attempt_history" in checkpoint:
+            expected_receipt["attempt_history"] = checkpoint["attempt_history"]
+        if checkpoint_receipt != expected_receipt:
+            return False
+        if (
+            type(checkpoint.get("new_trials")) is not int
+            or type(checkpoint.get("reused_trials")) is not int
+            or type(checkpoint.get("rerun_trials")) is not int
+            or checkpoint["new_trials"] + checkpoint["reused_trials"] != checkpoint["record_count"]
+            or checkpoint["rerun_trials"] > checkpoint["new_trials"]
+        ):
+            return False
+
+        completed = 0
+        observed = 0
+        observed_identities: set[tuple[str, str, str, int]] = set()
+        status_identities: dict[tuple[str, str, str, int], str] = {}
+        arm_requests = 0
+        arm_inputs = 0
+        arm_outputs = 0
+        arm_cost = Decimal("0")
+        arm_work = 0.0
+        for cell, run in runs.items():
+            if (
+                not isinstance(run, dict)
+                or not isinstance(run.get("trials"), list)
+                or not isinstance(run.get("statuses"), list)
+            ):
+                return False
+            for row in run["statuses"]:
+                if not isinstance(row, dict):
+                    return False
+                if not isinstance(cell, str) or ":" not in cell:
+                    return False
+                model_class, transport = cell.split(":", 1)
+                task_id = row.get("task_id")
+                repeat_index = row.get("repeat_index")
+                status = row.get("status")
+                if (
+                    not isinstance(task_id, str)
+                    or type(repeat_index) is not int
+                    or not isinstance(status, str)
+                    or status not in {"completed", "failed"}
+                ):
+                    return False
+                status_identity: tuple[str, str, str, int] = (model_class, transport, task_id, repeat_index)
+                if status_identity in status_identities:
+                    return False
+                status_identities[status_identity] = status
+            for raw in run["trials"]:
+                if not isinstance(raw, dict):
+                    return False
+                try:
+                    outcome = TrialOutcome.model_validate(raw)
+                except ValueError:
+                    return False
+                if outcome.arm != arm:
+                    return False
+                identity = (outcome.model_class, outcome.transport, outcome.task_id, outcome.repeat_index)
+                if identity in observed_identities:
+                    return False
+                observed_identities.add(identity)
+                observed += 1
+                if status_identities.get(identity) is None:
+                    return False
+                completed += status_identities[identity] == "completed"
+                arm_requests += outcome.model_requests
+                arm_inputs += outcome.input_tokens
+                arm_outputs += outcome.output_tokens
+                arm_cost += Decimal(str(outcome.cost_usd))
+                arm_work += outcome.latency_seconds
+        attempt_history_raw = checkpoint.get("attempt_history", [])
+        if not isinstance(attempt_history_raw, list):
+            return False
+        attempt_history: list[TrialCheckpoint] = []
+        for raw_record in attempt_history_raw:
+            try:
+                record = TrialCheckpoint.model_validate(raw_record)
+            except Exception:
+                return False
+            if (
+                record.status not in {"failed", "incomplete"}
+                or record.outcome.failure_kind != "interrupted"
+                or record.record_hash != checkpoint_record_hash(record.status, record.key, record.outcome)
+                or record.key.arm != arm
+            ):
+                return False
+            attempt_history.append(record)
+            arm_requests += record.outcome.model_requests
+            arm_inputs += record.outcome.input_tokens
+            arm_outputs += record.outcome.output_tokens
+            arm_cost += Decimal(str(record.outcome.cost_usd))
+            arm_work += record.outcome.latency_seconds
+        if (
+            observed != checkpoint.get("record_count")
+            or set(status_identities) != observed_identities
+            or observed_identities != expected_identities[arm]
+        ):
+            return False
+        for name, type_check in (
+            ("model_requests", int),
+            ("provider_setup_requests", int),
+            ("input_tokens", int),
+            ("output_tokens", int),
+        ):
+            value = spent.get(name)
+            if type(value) is not type_check or value < 0:
+                return False
+        setup_requests = spent["provider_setup_requests"]
+        if (
+            spent["model_requests"] != arm_requests + setup_requests
+            or spent["input_tokens"] != arm_inputs
+            or spent["output_tokens"] != arm_outputs
+            or not math.isclose(float(spent.get("cost_usd", math.nan)), float(arm_cost), rel_tol=0, abs_tol=1e-9)
+            or not math.isclose(
+                float(spent.get("model_work_seconds", math.nan)),
+                arm_work,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or checkpoint.get("valid_completed_trials") != completed
+        ):
+            return False
+        arm_budget = artifact.get("budget_used")
+        if not isinstance(arm_budget, dict) or any(
+            arm_budget.get(name) != value
+            for name, value in (
+                ("model_requests", arm_requests),
+                ("provider_setup_requests", setup_requests),
+                ("input_tokens", arm_inputs),
+                ("output_tokens", arm_outputs),
+                ("total_tokens", arm_inputs + arm_outputs),
+            )
+        ):
+            return False
+        for name in ("cost_usd", "wall_seconds", "model_work_seconds"):
+            try:
+                spent_value = float(spent[name])
+                arm_value = float(arm_budget[name])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not math.isfinite(spent_value) or not math.isfinite(arm_value):
+                return False
+            if not math.isclose(spent_value, arm_value, rel_tol=0, abs_tol=1e-9):
+                return False
+
+        totals["model_requests"] += arm_requests
+        totals["provider_setup_requests"] += setup_requests
+        totals["input_tokens"] += arm_inputs
+        totals["output_tokens"] += arm_outputs
+        total_cost += Decimal(str(spent["cost_usd"]))
+        total_work += float(spent["model_work_seconds"])
+        max_checkpoint_wall = max(max_checkpoint_wall, float(spent["wall_seconds"]))
+
+    try:
+        residual_cost = Decimal(str(residual["cost_usd"]))
+        residual_work = float(residual["model_work_seconds"])
+        paired_cost = Decimal(str(paired_budget_used["cost_usd"]))
+        paired_work = float(paired_budget_used["model_work_seconds"])
+        paired_wall = float(paired_budget_used["wall_seconds"])
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
+    for field_name in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens"):
+        value = residual.get(field_name)
+        if type(value) is not int or value < 0:
+            return False
+        if paired_budget_used.get(field_name) != totals[field_name] + value:
+            return False
+    return (
+        paired_budget_used.get("total_tokens")
+        == paired_budget_used.get("input_tokens", 0) + paired_budget_used.get("output_tokens", 0)
+        and Decimal(str(paired_budget_used.get("max_total_cost_usd")))
+        == Decimal(str(selection.get("budget", {}).get("session_max_usd")))
+        and paired_budget_used.get("new_execution_limit_usd") == selection.get("budget", {}).get("new_execution_limit_usd")
+        and paired_budget_used.get("final_reserved_cost_usd") in ("0", "0.0", 0)
+        and paired_cost.is_finite()
+        and math.isclose(float(paired_cost), float(total_cost + residual_cost), rel_tol=0, abs_tol=1e-9)
+        and math.isfinite(paired_work)
+        and math.isclose(paired_work, total_work + residual_work, rel_tol=0, abs_tol=1e-9)
+        and math.isfinite(paired_wall)
+        and paired_wall >= max_checkpoint_wall
+    )
+
+
 def _reconcile_paired_artifact_reservations(
     artifacts: dict[str, dict[str, Any]],
     *,
@@ -5097,7 +6072,13 @@ def _reconcile_paired_artifact_reservations(
     if not final_reserved.is_finite() or final_reserved != 0:
         mark_incomplete("benchmark incomplete: paired ledger ended with a reserved cost")
         return
-    if not _paired_artifact_receipts_reconcile(artifacts, paired_budget_used):
+    selection_mode = isinstance(artifacts.get("baseline", {}).get("selection"), dict)
+    receipts_reconcile = (
+        _selection_artifact_receipts_reconcile(artifacts, paired_budget_used)
+        if selection_mode
+        else _paired_artifact_receipts_reconcile(artifacts, paired_budget_used)
+    )
+    if not receipts_reconcile:
         mark_incomplete("benchmark incomplete: paired ledger receipts do not reconcile with arm checkpoints")
         return
 

@@ -751,6 +751,17 @@ def build_selection_summary(
         )
         arm_summaries[arm] = {
             "artifact_status": artifact.get("status"),
+            "routing_verification": artifact.get("routing_verification"),
+            "selection_route_revalidations": (
+                checkpoint.get("selection_route_revalidations", [])
+                if isinstance(checkpoint, dict)
+                else []
+            ),
+            "checkpoint_attempt_history_count": (
+                len(checkpoint.get("attempt_history", []))
+                if isinstance(checkpoint, dict) and isinstance(checkpoint.get("attempt_history", []), list)
+                else 0
+            ),
             "expected_selected_trials": len(expected),
             "observed_selected_trials": len(rows),
             "successful_tasks": sum(outcome.success for outcome in rows.values()),

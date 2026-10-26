@@ -37,6 +37,7 @@ from mcp_catalog.execution import (
     classify_failure,
     has_measured_evidence,
     outcome_from_run,
+    registered_route_target,
     validate_routing_evidence,
     worst_case_cost,
     run_agent_with_timeout,
@@ -44,7 +45,7 @@ from mcp_catalog.execution import (
 from mcp_catalog.checkpoint import valid_completed_outcome
 from mcp_catalog.runner import BenchmarkRunner
 from mcp_catalog.runtime import RuntimeDescriptor, StateObservation
-from paired_artifact_factory import provider_name_for_model
+from paired_artifact_factory import _make_outcome, provider_name_for_model
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -70,6 +71,48 @@ def _streamlake_manifest() -> BenchmarkRunManifest:
     raw["models"][0]["input_cost_per_million_usd"] = 0.088
     raw["models"][0]["output_cost_per_million_usd"] = 0.264
     return BenchmarkRunManifest.model_validate(raw)
+
+
+def _fallback_qwen_fixture() -> tuple[BenchmarkRunManifest, Any, list[dict[str, Any]]]:
+    manifest_raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    qwen_model_id = "qwen/qwen3.8-27b"
+    qwen = next(model for model in manifest_raw["models"] if model["model_id"] == qwen_model_id)
+    qwen["routing"]["order"] = ["chutes"]
+    qwen["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    qwen_spec = next(model for model in manifest.models if model.model_id == qwen_model_id)
+    canonical_slug = "qwen/qwen3.8-27b-20260814"
+    supported = ["tools", "tool_choice", "temperature", "max_tokens"]
+    endpoints = [
+        {
+            "model_id": qwen_model_id,
+            "name": f"Chutes | {canonical_slug}",
+            "provider_name": "Chutes",
+            "tag": "chutes/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.000000039", "completion": "0.00000125"},
+        },
+        {
+            "model_id": qwen_model_id,
+            "name": f"Near AI | {canonical_slug}",
+            "provider_name": "Near AI",
+            "tag": "near-ai/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.00000004", "completion": "0.00000135"},
+        },
+        {
+            "model_id": qwen_model_id,
+            "name": f"Mancer 2 | {canonical_slug}",
+            "provider_name": "Mancer 2",
+            "tag": "mancer/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.00000018", "completion": "0.0000025"},
+        },
+    ]
+    return manifest, qwen_spec, endpoints
 
 
 def _provider_display_name(spec) -> str:
@@ -122,6 +165,7 @@ async def _capture_registry_with_httpx(
     manifest: BenchmarkRunManifest | None = None,
     endpoint_price_overrides: dict[str, dict[str, Any] | None] | None = None,
     endpoint_provider_overrides: dict[str, list[str]] | None = None,
+    endpoint_records_overrides: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     manifest = manifest or load_run_manifest(ROOT / "config" / "run.json")
     for spec in manifest.models:
@@ -139,6 +183,11 @@ async def _capture_registry_with_httpx(
             model_id = f"{segments[-3]}/{segments[-2]}"
             model_row = next(row for row in model_rows if row["id"] == model_id)
             spec = next(spec for spec in manifest.models if spec.model_id == model_id)
+            if endpoint_records_overrides and model_id in endpoint_records_overrides:
+                return httpx.Response(
+                    200,
+                    json={"data": {"endpoints": endpoint_records_overrides[model_id]}},
+                )
             provider_names = (
                 endpoint_provider_overrides[model_id]
                 if endpoint_provider_overrides and model_id in endpoint_provider_overrides
@@ -290,6 +339,140 @@ async def test_provider_registry_selects_preferred_endpoint_and_accepts_register
         manifest.models[0],
         narrowed_registry,
     ) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_uses_endpoint_tags_without_guessing_display_name_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qwen_model_id = "qwen/qwen3.8-27b"
+    manifest, qwen_spec, endpoint_records = _fallback_qwen_fixture()
+
+    registry, _ = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_records_overrides={qwen_model_id: endpoint_records},
+    )
+
+    assert registry["status"] == "verified"
+    models = registry["models"]
+    assert isinstance(models, dict)
+    registered = models[qwen_model_id]
+    assert isinstance(registered, dict)
+    assert [(item["provider_name"], item["tag"]) for item in registered["eligible_endpoints"]] == [
+        ("Chutes", "chutes/fp8"),
+        ("Near AI", "near-ai/fp8"),
+    ]
+    assert registered["selected_endpoint"]["provider_name"] == "Chutes"
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Near AI")}],
+        qwen_spec,
+        registered,
+    ) == (True, True)
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Mancer 2")}],
+        qwen_spec,
+        registered,
+    ) == (False, False)
+
+
+def test_routing_revalidation_rederives_legacy_eligible_subset_from_sealed_endpoints() -> None:
+    manifest, qwen_spec, endpoint_records = _fallback_qwen_fixture()
+    qwen_model_id = qwen_spec.model_id
+    canonical_slug = "qwen/qwen3.8-27b-20260814"
+    old_projection = [endpoint_records[0]]
+    registered_model = {
+        "model_record": {"id": qwen_model_id, "canonical_slug": canonical_slug},
+        "endpoint_snapshot": {"data": {"endpoints": endpoint_records}},
+        "eligible_endpoints": old_projection,
+        "selected_endpoint": endpoint_records[0],
+    }
+
+    target = registered_route_target(qwen_spec, registered_model)
+    assert target is not None
+    assert target.reconciled_legacy_projection is True
+    assert target.lineage()["eligibility_derivation"] == (
+        "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+    )
+    assert len(target.source_endpoint_snapshot_sha256) == 64
+    assert len(target.recorded_eligible_endpoints_sha256) == 64
+    assert len(target.verified_eligible_endpoints_sha256) == 64
+
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Near AI")}],
+        qwen_spec,
+        registered_model,
+    ) == (True, True)
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Mancer 2")}],
+        qwen_spec,
+        registered_model,
+    ) == (False, False)
+
+
+def test_selection_route_failure_is_revalidated_offline_from_the_sealed_endpoint_snapshot() -> None:
+    _fallback_manifest, _fallback_spec, endpoint_records = _fallback_qwen_fixture()
+    manifest_raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    qwen_row = next(model for model in manifest_raw["models"] if model["model_id"] == "qwen/qwen3.8-27b")
+    qwen_row["routing"]["order"] = ["deepinfra"]
+    qwen_row["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    qwen_spec = next(model for model in manifest.models if model.model_id == "qwen/qwen3.8-27b")
+    task = next(
+        task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "table-publication-ko"
+    )
+    old_projection = [endpoint for endpoint in endpoint_records if endpoint["provider_name"] == "Chutes"]
+    registered_model = {
+        "model_record": {"id": qwen_spec.model_id, "canonical_slug": "qwen/qwen3.8-27b-20260814"},
+        "endpoint_snapshot": {"data": {"endpoints": endpoint_records}},
+        "eligible_endpoints": old_projection,
+        "selected_endpoint": old_projection[0],
+    }
+    outcome = _make_outcome(
+        task,
+        manifest,
+        arm="candidate",
+        model=qwen_spec,
+        transport="http",
+        repeat_index=1,
+        paired_order_position=0,
+        paired_execution_sequence=8,
+    )
+    outcome.provider_evidence = [
+        {**evidence, "routing": _routing_metadata(qwen_spec, provider="Near AI")}
+        for evidence in outcome.provider_evidence
+    ]
+    failed = outcome.model_copy(
+        update={
+            "error": "OpenRouter response did not match the registered model/provider route",
+            "failure_kind": "unknown",
+            "routing_observed": True,
+            "routing_valid": False,
+            "success": False,
+        }
+    )
+
+    revalidated = runner_module._revalidate_selection_route_failure(
+        failed,
+        task,
+        qwen_spec,
+        registered_model,
+    )
+
+    assert revalidated is not None
+    corrected, lineage = revalidated
+    assert corrected.error is None
+    assert corrected.failure_kind == "none"
+    assert corrected.routing_valid is True
+    assert corrected.success is True
+    assert has_measured_evidence(corrected, task)
+    assert lineage["reconciled_legacy_projection"] is True
+    assert lineage["eligibility_derivation"] == (
+        "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+    )
+    assert failed.error == "OpenRouter response did not match the registered model/provider route"
+    assert failed.routing_valid is False
 
 
 @pytest.mark.parametrize(
