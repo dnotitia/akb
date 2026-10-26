@@ -610,6 +610,7 @@ def build_selection_summary(
     arm_summaries: dict[str, Any] = {}
     outcomes: dict[SelectionIdentity, TrialOutcome] = {}
     event_lists: list[list[dict[str, Any]]] = []
+    expected_new_model_trials = 0
     complete = comparison.get("verdict") == "inconclusive"
 
     for arm in ARM_NAMES:
@@ -681,6 +682,31 @@ def build_selection_summary(
             and smoke.get("cells") == []
         )
         checkpoint = artifact.get("checkpoint")
+        checkpoint_new_trials = checkpoint.get("new_trials") if isinstance(checkpoint, dict) else None
+        checkpoint_reused_trials = checkpoint.get("reused_trials") if isinstance(checkpoint, dict) else None
+        checkpoint_rerun_trials = checkpoint.get("rerun_trials") if isinstance(checkpoint, dict) else None
+        checkpoint_spent = checkpoint.get("spent") if isinstance(checkpoint, dict) else None
+        checkpoint_spent_cost = Decimal("NaN")
+        checkpoint_spent_valid = False
+        if isinstance(checkpoint_spent, dict):
+            try:
+                checkpoint_spent_cost = Decimal(str(checkpoint_spent.get("cost_usd")))
+                checkpoint_spent_valid = (
+                    all(
+                        type(checkpoint_spent.get(field)) is int and checkpoint_spent[field] >= 0
+                        for field in (
+                            "model_requests",
+                            "provider_setup_requests",
+                            "input_tokens",
+                            "output_tokens",
+                        )
+                    )
+                    and checkpoint_spent["provider_setup_requests"] <= checkpoint_spent["model_requests"]
+                    and checkpoint_spent_cost.is_finite()
+                    and checkpoint_spent_cost >= 0
+                )
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                checkpoint_spent_valid = False
         checkpoint_valid = (
             isinstance(checkpoint, dict)
             and checkpoint.get("record_count") == len(expected)
@@ -688,7 +714,18 @@ def build_selection_summary(
             and checkpoint.get("reserved_cost_usd") == 0
             and checkpoint.get("smoke_status") is None
             and checkpoint.get("smoke_cell_count") == 0
+            and type(checkpoint_new_trials) is int
+            and type(checkpoint_reused_trials) is int
+            and type(checkpoint_rerun_trials) is int
+            and checkpoint_new_trials >= 0
+            and checkpoint_reused_trials >= 0
+            and checkpoint_rerun_trials >= 0
+            and checkpoint_new_trials + checkpoint_reused_trials == len(expected)
+            and checkpoint_rerun_trials <= checkpoint_new_trials
+            and checkpoint_spent_valid
         )
+        if checkpoint_valid:
+            expected_new_model_trials += cast(int, checkpoint_new_trials)
         arm_complete = (
             not missing
             and not duplicates
@@ -726,13 +763,32 @@ def build_selection_summary(
             "malformed_trials": malformed,
             "unmeasured_completed_trials": [list(item[1:]) for item in unmeasured],
             "missing_instruction_proof": [list(item[1:]) for item in instruction_missing],
-            "new_model_requests": sum(outcome.model_requests for outcome in rows.values()),
-            "new_input_tokens": sum(outcome.input_tokens for outcome in rows.values()),
-            "new_output_tokens": sum(outcome.output_tokens for outcome in rows.values()),
-            "new_cost_usd": str(sum((Decimal(str(outcome.cost_usd)) for outcome in rows.values()), start=Decimal("0"))),
+            "new_model_requests": (
+                checkpoint_spent["model_requests"] - checkpoint_spent["provider_setup_requests"]
+                if checkpoint_spent_valid and isinstance(checkpoint_spent, dict)
+                else sum(outcome.model_requests for outcome in rows.values())
+            ),
+            "new_input_tokens": (
+                checkpoint_spent["input_tokens"]
+                if checkpoint_spent_valid and isinstance(checkpoint_spent, dict)
+                else sum(outcome.input_tokens for outcome in rows.values())
+            ),
+            "new_output_tokens": (
+                checkpoint_spent["output_tokens"]
+                if checkpoint_spent_valid and isinstance(checkpoint_spent, dict)
+                else sum(outcome.output_tokens for outcome in rows.values())
+            ),
+            "new_cost_usd": (
+                str(checkpoint_spent_cost)
+                if checkpoint_spent_valid
+                else str(sum((Decimal(str(outcome.cost_usd)) for outcome in rows.values()), start=Decimal("0")))
+            ),
             "observed_upstreams": sorted({name for outcome in rows.values() for name in _provider_names(outcome)}),
             "smoke_gate_status": smoke.get("status") if isinstance(smoke, dict) else None,
             "checkpoint_valid": checkpoint_valid,
+            "checkpoint_new_trials": checkpoint_new_trials,
+            "checkpoint_reused_trials": checkpoint_reused_trials,
+            "checkpoint_rerun_trials": checkpoint_rerun_trials,
         }
 
     expected_events = {
@@ -740,33 +796,112 @@ def build_selection_summary(
         for arm, model_class, transport, task_id, repeat_index in selection.identities
     }
     event_count = 0
+    observed_unique_trials = 0
+    unknown_start_gaps: list[dict[str, Any]] = []
     if len(event_lists) == 2 and event_lists[0] == event_lists[1]:
         events = event_lists[0]
         event_count = len(events)
-        keys = {
-            (event.get("cell"), event.get("task_id"), event.get("repeat_index"), event.get("arm"))
-            for event in events
-            if type(event.get("sequence")) is int
-        }
+        keys: set[tuple[str, str, int, str]] = set()
+        event_chains: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
+        sequences: list[int] = []
+        event_shape_valid = True
         try:
-            order_valid = all(
-                type(event["repeat_index"]) is int
-                and type(event["order_position"]) is int
-                and event["order_position"]
-                == planned_arm_order(
-                    event["task_id"],
-                    event["repeat_index"],
+            for event in events:
+                sequence = event.get("sequence")
+                event_identity = (
+                    event.get("cell"),
+                    event.get("task_id"),
+                    event.get("repeat_index"),
+                    event.get("arm"),
+                )
+                if (
+                    type(sequence) is not int
+                    or not isinstance(event_identity[0], str)
+                    or not isinstance(event_identity[1], str)
+                    or type(event_identity[2]) is not int
+                    or event_identity[3] not in ARM_NAMES
+                    or type(event.get("order_position")) is not int
+                    or event.get("status") not in {"started", "completed", "failed", "incomplete"}
+                ):
+                    event_shape_valid = False
+                    continue
+                typed_event_identity = cast(tuple[str, str, int, str], event_identity)
+                keys.add(typed_event_identity)
+                sequences.append(sequence)
+                event_chains.setdefault(typed_event_identity, []).append(event)
+                expected_order = planned_arm_order(
+                    event_identity[1],
+                    event_identity[2],
                     manifest.paired_order_seed,
-                ).index(event["arm"])
-                for event in events
-            )
+                ).index(event_identity[3])
+                if event["order_position"] != expected_order:
+                    event_shape_valid = False
         except (KeyError, TypeError, ValueError):
-            order_valid = False
+            event_shape_valid = False
+
+        observed_unique_trials = len(keys)
+        declared_gaps = artifacts.get("baseline", {}).get("paired_execution", {}).get("unknown_start_gaps")
+        if not isinstance(declared_gaps, list):
+            declared_gaps = []
+            event_shape_valid = False
+        unknown_start_gaps = declared_gaps
+        unique_sequences = set(sequences)
+        missing_sequences = sorted(set(range(1, max(unique_sequences, default=0) + 1)) - unique_sequences)
+        expected_gaps = [{"sequence": sequence, "status": "unknown_start"} for sequence in missing_sequences]
+        if declared_gaps != expected_gaps or sequences != sorted(sequences):
+            event_shape_valid = False
+
+        attempts_valid = True
+        latest_sequence_by_identity: dict[tuple[str, str, int, str], int] = {}
+        for chain_identity, chain in event_chains.items():
+            previous_sequence: int | None = None
+            for attempt, event in enumerate(chain, start=1):
+                if event.get("attempt", 1) != attempt:
+                    attempts_valid = False
+                if attempt == 1:
+                    if event.get("retry_of_sequence") is not None:
+                        attempts_valid = False
+                elif event.get("retry_of_sequence") != previous_sequence:
+                    attempts_valid = False
+                sequence = event.get("sequence")
+                if type(sequence) is int:
+                    previous_sequence = sequence
+            if chain:
+                sequence = chain[-1].get("sequence")
+                if type(sequence) is int:
+                    latest_sequence_by_identity[chain_identity] = sequence
+
+        latest_outcomes_valid = True
+        for expected_identity in expected_events:
+            cell, task_id, repeat_index, arm = expected_identity
+            model_class, transport = cell.split(":", 1)
+            trial_identity: SelectionIdentity = (
+                arm,
+                model_class,
+                transport,
+                task_id,
+                repeat_index,
+            )
+            latest_outcome = outcomes.get(trial_identity)
+            if latest_outcome is None or latest_outcome.paired_execution_sequence != latest_sequence_by_identity.get(
+                expected_identity
+            ):
+                latest_outcomes_valid = False
+
+        unfinished = artifacts.get("baseline", {}).get("paired_execution", {}).get("unfinished_starts")
+        expected_unfinished = [event for event in events if event.get("status") == "started"]
+        paired_evidence_equal = artifacts.get("baseline", {}).get("paired_execution") == artifacts.get(
+            "candidate", {}
+        ).get("paired_execution")
         events_valid = (
-            len(events) == len(selection.selected_trials)
-            and [event.get("sequence") for event in events] == list(range(1, len(events) + 1))
+            event_shape_valid
+            and attempts_valid
+            and latest_outcomes_valid
+            and paired_evidence_equal
             and keys == expected_events
-            and order_valid
+            and sequences == sorted(set(sequences))
+            and declared_gaps == expected_gaps
+            and unfinished == expected_unfinished
         )
         complete = complete and events_valid
     else:
@@ -834,10 +969,12 @@ def build_selection_summary(
         "arms": arm_summaries,
         "identity_results": identity_results,
         "expected_selected_trials_by_arm": selection.expected_trials_by_arm,
-        "expected_new_model_trials": len(selection.selected_trials),
+        "expected_new_model_trials": expected_new_model_trials,
         "observed_execution_events": event_count,
+        "observed_unique_selected_trials": observed_unique_trials,
+        "unknown_start_gaps": unknown_start_gaps,
         "paired_execution_events_valid": events_valid,
         "observed_new_smoke_model_requests": 0,
-        "new_selected_trial_cost_usd": str(total_cost),
+        "new_selected_trial_cost_usd": str(reported_paired_cost) if paired_cost_valid else str(total_cost),
         "new_execution_cost_limit_usd": str(selection.budget.new_execution_limit_usd),
     }

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -254,3 +255,69 @@ async def test_paired_first_exception_writes_artifact_for_cancelled_preflight_pe
     assert candidate["paired_budget_used"]["model_requests"] == 0
     assert candidate["paired_budget_used"]["cost_usd"] == 0
     assert comparison["verdict"] == "inconclusive"
+
+
+@pytest.mark.asyncio
+async def test_paired_sigint_finalizes_open_checkpoints_and_writes_available_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    loop = asyncio.get_running_loop()
+    handlers: dict[int, Any] = {}
+    finalized: list[str] = []
+
+    def add_signal_handler(signum: int, callback: Any) -> None:
+        handlers[signum] = callback
+        if signum == signal.SIGINT:
+            loop.call_soon(callback)
+
+    def remove_signal_handler(signum: int) -> bool:
+        handlers.pop(signum, None)
+        return True
+
+    monkeypatch.setattr(loop, "add_signal_handler", add_signal_handler)
+    monkeypatch.setattr(loop, "remove_signal_handler", remove_signal_handler)
+
+    class Runner:
+        def __init__(self, *_args: object, **kwargs: Any) -> None:
+            self.arm = kwargs["arm"]
+            self.secrets: tuple[str, ...] = ()
+
+        async def run(self) -> dict[str, object]:
+            await asyncio.Event().wait()
+            return {}
+
+        async def finalize_cancelled_checkpoint(self) -> None:
+            finalized.append(self.arm)
+
+    monkeypatch.setattr(cli_module, "load_inputs", lambda *_args: (manifest, tasks, descriptor))
+    monkeypatch.setattr(cli_module, "BenchmarkRunner", Runner)
+    args = argparse.Namespace(
+        manifest=Path("manifest.json"),
+        corpus=Path("tasks.json"),
+        coverage=Path("coverage.json"),
+        baseline_descriptor=Path("baseline-descriptor.json"),
+        candidate_descriptor=Path("candidate-descriptor.json"),
+        baseline_output=tmp_path / "baseline.json",
+        candidate_output=tmp_path / "candidate.json",
+        comparison_output=tmp_path / "comparison.json",
+        baseline_checkpoint=tmp_path / "baseline.checkpoint.json",
+        candidate_checkpoint=tmp_path / "candidate.checkpoint.json",
+        selection=None,
+        selection_summary_output=None,
+        amendment=None,
+        resume=False,
+    )
+
+    result = await cli_module.run_paired(args)
+
+    assert result == 1
+    assert sorted(finalized) == ["baseline", "candidate"]
+    assert handlers == {}
+    for output in (args.baseline_output, args.candidate_output, args.comparison_output):
+        assert output.is_file()
+    assert json.loads(args.baseline_output.read_text(encoding="utf-8"))["status"] == "incomplete"
+    assert json.loads(args.candidate_output.read_text(encoding="utf-8"))["status"] == "incomplete"

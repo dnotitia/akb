@@ -26,6 +26,7 @@ from .catalog import capture_catalog, input_schemas_from_catalog
 from .amendment import AmendmentPlan, validate_artifact_lineage
 from .checkpoint import (
     CheckpointHeader,
+    CheckpointPairedEvent,
     CheckpointDocument,
     CheckpointKey,
     CheckpointStore,
@@ -480,6 +481,8 @@ class PairedExecutionTurn:
     arm: ArmName
     order_position: int
     execution_sequence: int
+    attempt: int
+    retry_of_sequence: int | None
 
 
 class PairedArmCoordinator:
@@ -519,6 +522,8 @@ class PairedArmCoordinator:
             "baseline": {},
             "candidate": {},
         }
+        self._selection_history_events: dict[ArmName, list[dict[str, Any]]] = {}
+        self._unknown_start_gaps: list[dict[str, int | str]] = []
         self._events = [dict(event) for event in (initial_events or [])]
         sequences = [event.get("sequence") for event in self._events]
         if sequences != list(range(1, len(self._events) + 1)):
@@ -546,10 +551,18 @@ class PairedArmCoordinator:
         self,
         arm: ArmName,
         reused: Mapping[tuple[str, str, int], TrialOutcome],
+        *,
+        history_events: list[dict[str, Any]] | None = None,
     ) -> None:
         async with self._condition:
             if arm in self._registered:
                 raise RuntimeContractError(f"paired arm {arm} registered twice")
+            if self.selection is not None:
+                if history_events is None:
+                    raise RuntimeContractError("selection resume is missing checkpoint attempt history")
+                self._selection_history_events[arm] = [dict(event) for event in history_events]
+            elif history_events is not None:
+                raise RuntimeContractError("checkpoint attempt history is only valid for selected runs")
             self._reused_outcomes[arm] = dict(reused)
             for identity, outcome in reused.items():
                 cell, task_id, repeat_index = identity
@@ -560,7 +573,7 @@ class PairedArmCoordinator:
                     )
                 self._reused[arm].add(identity)
                 sequence = outcome.paired_execution_sequence
-                if sequence is not None:
+                if sequence is not None and self.selection is None:
                     event = next(
                         (item for item in self._events if item.get("sequence") == sequence),
                         None,
@@ -577,14 +590,19 @@ class PairedArmCoordinator:
                         self._terminal_event_sequences.add(sequence)
             self._registered.add(arm)
             if self._registered == {"baseline", "candidate"}:
-                self._validate_reused_prefixes()
                 if self.selection is not None:
                     self._restore_selection_events()
+                else:
+                    self._validate_reused_prefixes()
                 for cell in self._schedule:
                     self._advance_reused(cell)
             self._condition.notify_all()
 
-    def mark_terminal_outcome(self, outcome: TrialOutcome) -> None:
+    def mark_terminal_outcome(
+        self,
+        outcome: TrialOutcome,
+        status: Literal["completed", "failed", "incomplete"] = "completed",
+    ) -> None:
         """Bind a persisted outcome to the exact paired event that produced it."""
 
         sequence = outcome.paired_execution_sequence
@@ -604,6 +622,8 @@ class PairedArmCoordinator:
             event.get("arm"),
         ) != identity:
             raise RuntimeContractError("trial checkpoint does not match its paired execution event")
+        if self.selection is not None:
+            event["status"] = status
         self._terminal_event_sequences.add(sequence)
 
     def _validate_reused_prefixes(self) -> None:
@@ -619,53 +639,100 @@ class PairedArmCoordinator:
                     )
 
     def _restore_selection_events(self) -> None:
-        restored: list[dict[str, Any]] = []
-        for arm, reused in self._reused_outcomes.items():
-            for (cell, task_id, repeat_index), outcome in reused.items():
-                sequence = outcome.paired_execution_sequence
-                order_position = outcome.paired_order_position
-                if sequence is None or order_position is None:
-                    raise RuntimeContractError("selection resume checkpoint is missing paired execution lineage")
-                restored.append(
-                    {
-                        "sequence": sequence,
-                        "cell": cell,
-                        "task_id": task_id,
-                        "repeat_index": repeat_index,
-                        "arm": arm,
-                        "order_position": order_position,
-                    }
+        by_sequence: dict[int, dict[str, Any]] = {}
+        by_identity: dict[tuple[str, str, int, ArmName], list[dict[str, Any]]] = defaultdict(list)
+        for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+            for raw_event in self._selection_history_events[arm]:
+                event = dict(raw_event)
+                identity = (
+                    event.get("cell"),
+                    event.get("task_id"),
+                    event.get("repeat_index"),
+                    event.get("arm"),
                 )
-        restored.sort(key=lambda event: event["sequence"])
+                sequence = event.get("sequence")
+                if (
+                    not isinstance(identity[0], str)
+                    or not isinstance(identity[1], str)
+                    or type(identity[2]) is not int
+                    or identity[3] != arm
+                    or type(sequence) is not int
+                    or type(event.get("order_position")) is not int
+                    or event.get("status") not in {"started", "completed", "failed", "incomplete"}
+                    or identity[0] not in self._schedule
+                ):
+                    raise RuntimeContractError("selection checkpoint attempt history has an invalid identity")
+                typed_identity = cast(tuple[str, str, int, ArmName], identity)
+                if sequence in by_sequence:
+                    raise RuntimeContractError("selection checkpoint duplicates a paired attempt sequence")
+                model_class, transport = identity[0].split(":", 1)
+                if self.selection is None or not self.selection.contains(
+                    arm,
+                    model_class,
+                    transport,
+                    identity[1],
+                    identity[2],
+                ):
+                    raise RuntimeContractError("selection checkpoint attempt is outside the authorized identities")
+                expected_order = planned_arm_order(
+                    identity[1], identity[2], self.manifest.paired_order_seed
+                ).index(arm)
+                if event["order_position"] != expected_order:
+                    raise RuntimeContractError("selection checkpoint changed the paired arm order")
+                by_sequence[sequence] = event
+                by_identity[typed_identity].append(event)
+
+        for chain in by_identity.values():
+            chain.sort(key=lambda event: event["sequence"])
+            previous_sequence: int | None = None
+            for attempt, event in enumerate(chain, start=1):
+                if event.get("attempt", attempt) != attempt:
+                    raise RuntimeContractError("selection checkpoint retry attempt index is invalid")
+                if attempt == 1:
+                    if event.get("retry_of_sequence") is not None:
+                        raise RuntimeContractError("first selection attempt cannot reference a retry")
+                elif event.get("retry_of_sequence") != previous_sequence:
+                    raise RuntimeContractError("selection checkpoint retry does not link to its previous attempt")
+                previous_sequence = event["sequence"]
+
+        restored = [by_sequence[sequence] for sequence in sorted(by_sequence)]
         sequences = [event["sequence"] for event in restored]
-        if sequences != list(range(1, len(restored) + 1)):
-            raise RuntimeContractError("selection resume checkpoint has a gap or duplicate in paired execution lineage")
-        seen: set[tuple[str, str, int, ArmName]] = set()
-        per_cell: dict[str, list[tuple[str, int, ArmName]]] = defaultdict(list)
+        maximum_sequence = max(sequences, default=0)
+        self._unknown_start_gaps = [
+            {"sequence": sequence, "status": "unknown_start"}
+            for sequence in range(1, maximum_sequence + 1)
+            if sequence not in by_sequence
+        ]
+        self._events = restored
+        self._sequence = maximum_sequence
+        self._events_by_identity.clear()
+        self._terminal_event_sequences = set()
+        self._historical_identities = set(by_identity)
         for event in restored:
-            key = (
+            identity = (
                 event["cell"],
                 event["task_id"],
                 event["repeat_index"],
                 cast(ArmName, event["arm"]),
             )
-            if key in seen:
-                raise RuntimeContractError("selection resume checkpoint duplicates a paired execution event")
-            seen.add(key)
-            per_cell[event["cell"]].append(
-                (event["task_id"], event["repeat_index"], cast(ArmName, event["arm"]))
-            )
-            expected_order = planned_arm_order(
-                event["task_id"], event["repeat_index"], self.manifest.paired_order_seed
-            ).index(cast(ArmName, event["arm"]))
-            if event["order_position"] != expected_order:
-                raise RuntimeContractError("selection resume checkpoint changed the paired arm order")
-        for cell, restored_schedule in per_cell.items():
-            if restored_schedule != self._schedule[cell][: len(restored_schedule)]:
-                raise RuntimeContractError("selection resume checkpoint does not preserve the paired schedule prefix")
-        self._events = restored
-        self._sequence = len(restored)
-        self._historical_identities = seen
+            self._events_by_identity[identity].append(event)
+            if event["status"] != "started":
+                self._terminal_event_sequences.add(event["sequence"])
+
+        for arm, reused in self._reused_outcomes.items():
+            for (cell, task_id, repeat_index), outcome in reused.items():
+                sequence = outcome.paired_execution_sequence
+                if type(sequence) is not int or sequence not in by_sequence:
+                    raise RuntimeContractError("reused selection outcome is missing its paired attempt history")
+                event = by_sequence[sequence]
+                if (
+                    event["cell"],
+                    event["task_id"],
+                    event["repeat_index"],
+                    event["arm"],
+                ) != (cell, task_id, repeat_index, arm) or event["status"] == "started":
+                    raise RuntimeContractError("reused selection outcome does not match a terminal paired attempt")
+                self._terminal_event_sequences.add(sequence)
 
     async def wait_until_registered(self) -> None:
         async with self._condition:
@@ -745,9 +812,14 @@ class PairedArmCoordinator:
                 arm=arm,
                 order_position=expected_position,
                 execution_sequence=self._sequence,
+                attempt=len(self._events_by_identity.get((cell, task_id, repeat_index, arm), [])) + 1,
+                retry_of_sequence=(
+                    self._events_by_identity[(cell, task_id, repeat_index, arm)][-1]["sequence"]
+                    if self._events_by_identity.get((cell, task_id, repeat_index, arm))
+                    else None
+                ),
             )
             identity = (cell, task_id, repeat_index, arm)
-            prior_events = self._events_by_identity.get(identity, [])
             event = {
                 "sequence": turn.execution_sequence,
                 "cell": cell,
@@ -756,9 +828,11 @@ class PairedArmCoordinator:
                 "arm": arm,
                 "order_position": expected_position,
             }
-            if prior_events:
-                event["attempt"] = len(prior_events) + 1
-                event["retry_of_sequence"] = prior_events[-1]["sequence"]
+            if self.selection is not None:
+                event["status"] = "started"
+            if turn.attempt > 1:
+                event["attempt"] = turn.attempt
+                event["retry_of_sequence"] = turn.retry_of_sequence
             self._events.append(event)
             self._events_by_identity[identity].append(event)
         completed = False
@@ -777,7 +851,7 @@ class PairedArmCoordinator:
             position == len(self._schedule[cell])
             for cell, position in self._positions.items()
         )
-        return {
+        evidence = {
             "mode": "counterbalanced_task_repeat",
             "seed": self.manifest.paired_order_seed,
             "complete": complete,
@@ -804,6 +878,9 @@ class PairedArmCoordinator:
                 if (cell, task_id, repeat_index, arm) not in self._historical_identities
             ],
         }
+        if self.selection is not None:
+            evidence["unknown_start_gaps"] = list(self._unknown_start_gaps)
+        return evidence
 
 
 @asynccontextmanager
@@ -1355,10 +1432,36 @@ class BenchmarkRunner:
             if not existed:
                 self._checkpoint_new_trials += 1
         if self.paired_coordinator is not None:
-            self.paired_coordinator.mark_terminal_outcome(outcome)
+            self.paired_coordinator.mark_terminal_outcome(outcome, status)
         self._record_trial(run_key, outcome)
         if cancelled_during_write:
             raise asyncio.CancelledError
+
+    async def finalize_cancelled_checkpoint(self) -> None:
+        """Close an opened checkpoint when cancellation precedes run finalization."""
+
+        store = self._checkpoint_store
+        if store is None or store.document.lifecycle == "finalized":
+            return
+        async with self._checkpoint_lock:
+            lifecycle = store.document.lifecycle
+            if lifecycle == "open":
+                await asyncio.to_thread(store.set_reserved_cost, 0.0)
+                await asyncio.to_thread(
+                    store.set_run_counters,
+                    reused_trials=self._checkpoint_reused_trials,
+                    rerun_trials=self._checkpoint_rerun_trials,
+                )
+            timing = self._timing_snapshot()
+            if timing is None:
+                timing = store.document.timing.active_attempt.model_dump(mode="json") if (
+                    store.document.timing.active_attempt is not None
+                ) else {
+                    "attempt_index": self._timing_attempt_index,
+                    "wall_seconds": store.document.spent.wall_seconds,
+                    "breakdown": {"other": store.document.spent.wall_seconds},
+                }
+            await asyncio.to_thread(store.finalize_timing, timing)
 
     def _refresh_store_secrets(self) -> None:
         if self._checkpoint_store is not None:
@@ -2142,6 +2245,41 @@ class BenchmarkRunner:
                         order_position=paired_turn.order_position,
                         execution_sequence=paired_turn.execution_sequence,
                     )
+                    if self.selection is not None and self._checkpoint_store is not None:
+                        checkpoint_key = planned_by_identity.get(
+                            (
+                                model_spec.class_name,
+                                transport,
+                                paired_turn.task_id,
+                                paired_turn.repeat_index,
+                            )
+                        )
+                        if checkpoint_key is None:
+                            raise RuntimeContractError(
+                                "selection paired start is not an exact planned checkpoint input"
+                            )
+                        start_event = CheckpointPairedEvent(
+                            sequence=paired_turn.execution_sequence,
+                            cell=paired_turn.cell,
+                            task_id=paired_turn.task_id,
+                            repeat_index=paired_turn.repeat_index,
+                            arm=paired_turn.arm,
+                            order_position=paired_turn.order_position,
+                            attempt=paired_turn.attempt,
+                            retry_of_sequence=paired_turn.retry_of_sequence,
+                        )
+                        async with self._checkpoint_lock:
+                            write_task = asyncio.create_task(
+                                asyncio.to_thread(
+                                    self._checkpoint_store.record_paired_event,
+                                    start_event,
+                                )
+                            )
+                            try:
+                                await asyncio.shield(write_task)
+                            except asyncio.CancelledError:
+                                await write_task
+                                raise
                 local_failures: list[Exception] = []
                 try:
                     if self._timing is None:
@@ -2304,7 +2442,16 @@ class BenchmarkRunner:
                 if self._checkpoint_store is not None
                 and (outcome := self._checkpoint_store.reusable_outcome_for(key)) is not None
             }
-            await self.paired_coordinator.register_arm(cast(ArmName, self.arm), reused)
+            history_events = (
+                self._checkpoint_store.selection_execution_history()
+                if self.selection is not None and self._checkpoint_store is not None
+                else None
+            )
+            await self.paired_coordinator.register_arm(
+                cast(ArmName, self.arm),
+                reused,
+                history_events=history_events,
+            )
             await self.paired_coordinator.wait_until_registered()
         planned_by_run = self._planned_trials_by_run(planned_keys)
         pending_by_run = {

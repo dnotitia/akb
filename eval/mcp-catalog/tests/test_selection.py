@@ -15,7 +15,14 @@ import mcp_catalog.cli as cli_module
 import mcp_catalog.execution as execution_module
 import mcp_catalog.runner as runner_module
 import mcp_catalog.selection as selection_module
-from mcp_catalog.checkpoint import CheckpointKey, checkpoint_key_digest, checkpoint_record_hash
+from mcp_catalog.checkpoint import (
+    CheckpointHeader,
+    CheckpointKey,
+    CheckpointPairedEvent,
+    CheckpointStore,
+    checkpoint_key_digest,
+    checkpoint_record_hash,
+)
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import canonical_json
 from mcp_catalog.execution import ModelInputEvidence, TrialOutcome
@@ -382,6 +389,131 @@ def test_selection_schedules_only_the_authorized_arm_and_never_runs_paid_smoke(
 
 
 @pytest.mark.asyncio
+async def test_selection_resume_preserves_unknown_gap_and_retries_interrupted_trials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, tasks, selection = _write_selection(tmp_path, monkeypatch)
+    manifest = selection.execution_manifest
+    task_by_id = {task.id: task for task in tasks}
+    model_by_class = {model.class_name: model for model in manifest.models}
+    per_arm = {
+        arm: [trial for trial in selection.selected_trials if trial.arm == arm]
+        for arm in ("baseline", "candidate")
+    }
+    completed = [per_arm["baseline"][0], per_arm["baseline"][1], per_arm["candidate"][0]]
+    interrupted = [per_arm["baseline"][2], per_arm["candidate"][1]]
+    source_rows = [
+        (completed[0], 1, "completed"),
+        (completed[1], 2, "completed"),
+        (completed[2], 3, "completed"),
+        (interrupted[0], 5, "failed"),
+        (interrupted[1], 6, "failed"),
+    ]
+    history: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    reused: dict[str, dict[tuple[str, str, int], TrialOutcome]] = {
+        "baseline": {},
+        "candidate": {},
+    }
+    interrupted_identities = {
+        (trial.arm, trial.model_class, trial.transport, trial.task_id, trial.repeat_index)
+        for trial in interrupted
+    }
+    for trial, sequence, status in source_rows:
+        task = task_by_id[trial.task_id]
+        cell = f"{trial.model_class}:{trial.transport}"
+        order_position = planned_arm_order(
+            trial.task_id,
+            trial.repeat_index,
+            manifest.paired_order_seed,
+        ).index(trial.arm)
+        history[trial.arm].append(
+            {
+                "sequence": sequence,
+                "cell": cell,
+                "task_id": trial.task_id,
+                "repeat_index": trial.repeat_index,
+                "arm": trial.arm,
+                "order_position": order_position,
+                "attempt": 1,
+                "status": status,
+            }
+        )
+        if (trial.arm, trial.model_class, trial.transport, trial.task_id, trial.repeat_index) in interrupted_identities:
+            continue
+        outcome = TrialOutcome(
+            task_id=trial.task_id,
+            category=task.category,
+            locale=task.locale,
+            arm=trial.arm,
+            model_class=trial.model_class,
+            model_id=model_by_class[trial.model_class].model_id,
+            transport=trial.transport,
+            repeat_index=trial.repeat_index,
+            paired_order_position=order_position,
+            paired_execution_sequence=sequence,
+        )
+        reused[trial.arm][(cell, trial.task_id, trial.repeat_index)] = outcome
+
+    coordinator = PairedArmCoordinator(manifest, tasks, selection=selection)
+    await coordinator.register_arm("baseline", reused["baseline"], history_events=history["baseline"])
+    await coordinator.register_arm("candidate", reused["candidate"], history_events=history["candidate"])
+    assert coordinator._unknown_start_gaps == [{"sequence": 4, "status": "unknown_start"}]
+
+    retry_links: dict[tuple[str, str, str, str, int], int] = {}
+    new_trials = 0
+    for cell, schedule in coordinator._schedule.items():
+        model_class, transport = cell.split(":", 1)
+        for task_id, repeat_index, arm in schedule:
+            identity = (arm, model_class, transport, task_id, repeat_index)
+            if (cell, task_id, repeat_index) in reused[arm]:
+                continue
+            task = task_by_id[task_id]
+            async with coordinator.turn(
+                cell=cell,
+                task_id=task_id,
+                repeat_index=repeat_index,
+                arm=arm,
+            ) as turn:
+                if identity in interrupted_identities:
+                    retry_links[identity] = turn.retry_of_sequence or 0
+                    assert turn.attempt == 2
+                else:
+                    assert turn.attempt == 1
+                outcome = TrialOutcome(
+                    task_id=task_id,
+                    category=task.category,
+                    locale=task.locale,
+                    arm=arm,
+                    model_class=model_class,
+                    model_id=model_by_class[model_class].model_id,
+                    transport=transport,
+                    repeat_index=repeat_index,
+                    paired_order_position=turn.order_position,
+                    paired_execution_sequence=turn.execution_sequence,
+                )
+                coordinator.mark_terminal_outcome(outcome, "failed")
+                new_trials += 1
+
+    evidence = coordinator.evidence()
+    events = evidence["events"]
+    retry_events = [event for event in events if event.get("attempt") == 2]
+    assert new_trials == 20
+    assert len(events) == 25
+    assert len({(event["cell"], event["task_id"], event["repeat_index"], event["arm"]) for event in events}) == 23
+    assert [event["sequence"] for event in events] == [1, 2, 3, *range(5, 27)]
+    assert evidence["unknown_start_gaps"] == [{"sequence": 4, "status": "unknown_start"}]
+    assert len(retry_events) == 2
+    assert {event["retry_of_sequence"] for event in retry_events} == {5, 6}
+    assert retry_links == {
+        (trial.arm, trial.model_class, trial.transport, trial.task_id, trial.repeat_index): sequence
+        for trial, sequence in ((interrupted[0], 5), (interrupted[1], 6))
+    }
+    assert evidence["unfinished_starts"] == []
+    assert evidence["complete"] is True
+
+
+@pytest.mark.asyncio
 async def test_selection_run_passes_captured_catalog_evidence_through_real_runner_without_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -648,6 +780,401 @@ async def test_selection_run_passes_captured_catalog_evidence_through_real_runne
     assert {parent: Path(binding["path"]).read_bytes() for parent, binding in selection.parents.items()} == parent_bytes
 
 
+@pytest.mark.asyncio
+async def test_selection_resume_restores_each_arm_budget_once_and_reuses_terminal_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, tasks, selection = _write_selection(tmp_path / "parents", monkeypatch)
+    manifest = selection.execution_manifest
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    task_by_id = {task.id: task for task in tasks}
+    registry = {"status": "unavailable", "reason": "synthetic checkpoint fixture"}
+    smoke_cells = {
+        f"{model.class_name}:{transport}": (model.class_name, model.model_id, transport)
+        for model in manifest.models
+        for transport in manifest.transports
+    }
+    checkpoint_spend: dict[str, Any] = {}
+    checkpoint_seals: dict[str, str] = {}
+    sequence_by_identity = {
+        trial.identity: sequence
+        for sequence, trial in enumerate(selection.selected_trials, start=1)
+    }
+
+    for arm in ("baseline", "candidate"):
+        source_revision = manifest.arm_source_revisions[arm]
+        # Use the production planner so the resume checkpoint has the exact
+        # approved identities, arm, repeat, manifest, and corpus seals.
+        planner = BenchmarkRunner(manifest, tasks, descriptor, arm=arm, selection=selection)
+        planned_keys = planner._planned_keys(source_revision)
+        assert len(planned_keys) == selection.expected_trials_by_arm[arm]
+        path = tmp_path / f"{arm}.checkpoint.json"
+        store = CheckpointStore(
+            path,
+            header=CheckpointHeader(
+                source_revision=source_revision,
+                run_manifest_hash=hash_json(manifest.model_dump(mode="json")),
+                task_corpus_hash=hash_json([task.model_dump(mode="json") for task in tasks]),
+                arm=arm,
+            ),
+            expected_keys=planned_keys,
+            expected_tasks=task_by_id,
+            expected_smoke_cells=smoke_cells,
+            selection_preflight=selection.checkpoint_preflight(),
+            reuse_terminal_trials=True,
+        )
+        seal = hashlib.sha256(f"synthetic-{arm}-pre-smoke-seal".encode()).hexdigest()
+        checkpoint_seals[arm] = seal
+        store.bind_pre_smoke_seal(seal, registry)
+        for key in planned_keys.values():
+            task = task_by_id[key.task_id]
+            order_position = planned_arm_order(
+                key.task_id,
+                key.repeat_index,
+                manifest.paired_order_seed,
+            ).index(arm)
+            sequence = sequence_by_identity[
+                (
+                    arm,
+                    key.model_class,
+                    key.transport,
+                    key.task_id,
+                    key.repeat_index,
+                )
+            ]
+            store.record_paired_event(
+                CheckpointPairedEvent(
+                    sequence=sequence,
+                    cell=f"{key.model_class}:{key.transport}",
+                    task_id=key.task_id,
+                    repeat_index=key.repeat_index,
+                    arm=arm,
+                    order_position=order_position,
+                    attempt=1,
+                )
+            )
+            store.record_trial(
+                key,
+                TrialOutcome(
+                    task_id=key.task_id,
+                    category=task.category,
+                    locale=task.locale,
+                    arm=arm,
+                    model_class=key.model_class,
+                    model_id=key.model_id,
+                    transport=key.transport,
+                    repeat_index=key.repeat_index,
+                    input_tokens=20,
+                    output_tokens=10,
+                    total_tokens=30,
+                    model_requests=2,
+                    cost_usd=0.01,
+                    paired_order_position=order_position,
+                    paired_execution_sequence=sequence,
+                    error="synthetic terminal provider failure",
+                    failure_kind="provider",
+                ),
+                status="failed",
+            )
+        store.record_provider_setup_requests(1 if arm == "baseline" else 2)
+        checkpoint_spend[arm] = store.document.spent
+
+    class StopAfterRegistration(Exception):
+        pass
+
+    class ResumeProbeCoordinator:
+        def __init__(self) -> None:
+            self.registrations: dict[str, dict[tuple[str, str, int], TrialOutcome]] = {}
+            self.history: dict[str, list[dict[str, Any]]] = {}
+
+        async def register_arm(
+            self,
+            arm: str,
+            reused: dict[tuple[str, str, int], TrialOutcome],
+            *,
+            history_events: list[dict[str, Any]] | None = None,
+        ) -> None:
+            self.registrations[arm] = reused
+            assert history_events is not None
+            self.history[arm] = history_events
+            raise StopAfterRegistration
+
+        async def wait_until_registered(self) -> None:
+            raise AssertionError("resume probe stops after observing reused terminal rows")
+
+    coordinator = ResumeProbeCoordinator()
+    ledger = execution_module.BudgetLedger(
+        manifest,
+        total_cost_limit_usd=selection.budget.new_execution_limit_usd,
+    )
+
+    async def fake_preflight(runner: BenchmarkRunner) -> dict[str, Any]:
+        return {
+            "runtime": {
+                "source_revision": manifest.arm_source_revisions[runner.arm],
+                "artifact_versions": {
+                    "backend_artifact_version": "1.0.0",
+                    "proxy_artifact_version": "1.0.0",
+                },
+                "discovery": {"status": "ready"},
+            },
+            "resolver": SimpleNamespace(secret_values=lambda: ()),
+        }
+
+    monkeypatch.setattr(BenchmarkRunner, "preflight", fake_preflight)
+
+    for arm in ("baseline", "candidate"):
+        runner = BenchmarkRunner(
+            manifest,
+            tasks,
+            descriptor,
+            arm=arm,
+            resume_path=tmp_path / f"{arm}.checkpoint.json",
+            paired_coordinator=coordinator,  # type: ignore[arg-type]
+            shared_ledger=ledger,
+            selection=selection,
+        )
+        with pytest.raises(StopAfterRegistration):
+            await runner.run()
+
+        reused = coordinator.registrations[arm]
+        expected = {
+            (f"{trial.model_class}:{trial.transport}", trial.task_id, trial.repeat_index)
+            for trial in selection.selected_trials
+            if trial.arm == arm
+        }
+        assert set(reused) == expected
+        assert all(outcome.arm == arm for outcome in reused.values())
+        assert len(coordinator.history[arm]) == len(expected)
+        assert runner._checkpoint_store is not None
+        assert runner._checkpoint_store.document.header.arm == arm
+        assert runner._checkpoint_store.document.header.pre_smoke_seal_hash == checkpoint_seals[arm]
+        restored_arms = ("baseline",) if arm == "baseline" else ("baseline", "candidate")
+        expected_requests = sum(checkpoint_spend[name].model_requests for name in restored_arms)
+        expected_setup_requests = sum(
+            checkpoint_spend[name].provider_setup_requests for name in restored_arms
+        )
+        expected_cost = sum(
+            (Decimal(str(checkpoint_spend[name].cost_usd)) for name in restored_arms),
+            Decimal("0"),
+        )
+        assert ledger.requests == expected_requests
+        assert ledger.provider_setup_requests == expected_setup_requests
+        assert ledger.cost_usd == expected_cost
+
+    assert len(coordinator.registrations["baseline"]) == 13
+    assert len(coordinator.registrations["candidate"]) == 10
+    assert ledger.requests == 49
+    assert ledger.input_tokens == 460
+    assert ledger.output_tokens == 230
+    assert ledger.provider_setup_requests == 3
+    assert ledger.cost_usd == Decimal("0.23")
+
+
+def test_selection_checkpoint_retains_interrupted_attempt_and_charges_retry_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, tasks, selection = _write_selection(tmp_path / "parents", monkeypatch)
+    manifest = selection.execution_manifest
+    arm = "baseline"
+    task_by_id = {task.id: task for task in tasks}
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    planned_keys = BenchmarkRunner(
+        manifest,
+        tasks,
+        descriptor,
+        arm=arm,
+        selection=selection,
+    )._planned_keys(manifest.arm_source_revisions[arm])
+    key = next(iter(planned_keys.values()))
+    task = task_by_id[key.task_id]
+    smoke_cells = {
+        f"{model.class_name}:{transport}": (model.class_name, model.model_id, transport)
+        for model in manifest.models
+        for transport in manifest.transports
+    }
+    path = tmp_path / "retry.checkpoint.json"
+    header = CheckpointHeader(
+        source_revision=manifest.arm_source_revisions[arm],
+        run_manifest_hash=hash_json(manifest.model_dump(mode="json")),
+        task_corpus_hash=hash_json([task.model_dump(mode="json") for task in tasks]),
+        arm=arm,
+    )
+    store = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=planned_keys,
+        expected_tasks=task_by_id,
+        expected_smoke_cells=smoke_cells,
+        selection_preflight=selection.checkpoint_preflight(),
+        reuse_terminal_trials=True,
+    )
+    store.bind_pre_smoke_seal("a" * 64, {"status": "unavailable", "reason": "synthetic fixture"})
+    order_position = planned_arm_order(key.task_id, key.repeat_index, manifest.paired_order_seed).index(arm)
+    store.record_paired_event(
+        CheckpointPairedEvent(
+            sequence=1,
+            cell=f"{key.model_class}:{key.transport}",
+            task_id=key.task_id,
+            repeat_index=key.repeat_index,
+            arm=arm,
+            order_position=order_position,
+        )
+    )
+    interrupted = TrialOutcome(
+        task_id=key.task_id,
+        category=task.category,
+        locale=task.locale,
+        arm=arm,
+        model_class=key.model_class,
+        model_id=key.model_id,
+        transport=key.transport,
+        repeat_index=key.repeat_index,
+        paired_order_position=order_position,
+        paired_execution_sequence=1,
+        model_requests=2,
+        input_tokens=20,
+        output_tokens=10,
+        total_tokens=30,
+        cost_usd=0.01,
+        error="synthetic interruption",
+        failure_kind="interrupted",
+    )
+    store.record_trial(key, interrupted, status="failed")
+    assert store.reusable_outcome_for(key) is None
+
+    store.record_paired_event(
+        CheckpointPairedEvent(
+            sequence=2,
+            cell=f"{key.model_class}:{key.transport}",
+            task_id=key.task_id,
+            repeat_index=key.repeat_index,
+            arm=arm,
+            order_position=order_position,
+            attempt=2,
+            retry_of_sequence=1,
+        )
+    )
+    retry = interrupted.model_copy(
+        update={
+            "paired_execution_sequence": 2,
+            "model_requests": 3,
+            "input_tokens": 30,
+            "output_tokens": 15,
+            "total_tokens": 45,
+            "cost_usd": 0.02,
+            "error": "synthetic terminal provider error",
+            "failure_kind": "provider",
+        }
+    )
+    store.record_trial(key, retry, status="failed")
+
+    resumed = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=planned_keys,
+        expected_tasks=task_by_id,
+        expected_smoke_cells=smoke_cells,
+        selection_preflight=selection.checkpoint_preflight(),
+        resume=True,
+        reuse_terminal_trials=True,
+    )
+    history = resumed.selection_execution_history()
+    assert [(event["sequence"], event["attempt"]) for event in history] == [(1, 1), (2, 2)]
+    assert history[1]["retry_of_sequence"] == 1
+    assert len(resumed.document.attempt_history) == 1
+    assert resumed.document.attempt_history[0].outcome == interrupted
+    assert resumed.document.spent.model_requests == 5
+    assert resumed.document.spent.input_tokens == 50
+    assert resumed.document.spent.output_tokens == 25
+    assert resumed.document.spent.cost_usd == pytest.approx(0.03)
+    assert resumed.reusable_outcome_for(key) == retry
+
+
+def test_selection_resume_closes_a_start_without_a_checkpointed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, tasks, selection = _write_selection(tmp_path / "parents", monkeypatch)
+    manifest = selection.execution_manifest
+    arm = "baseline"
+    descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
+    planned_keys = BenchmarkRunner(
+        manifest,
+        tasks,
+        descriptor,
+        arm=arm,
+        selection=selection,
+    )._planned_keys(manifest.arm_source_revisions[arm])
+    key = next(iter(planned_keys.values()))
+    smoke_cells = {
+        f"{model.class_name}:{transport}": (model.class_name, model.model_id, transport)
+        for model in manifest.models
+        for transport in manifest.transports
+    }
+    header = CheckpointHeader(
+        source_revision=manifest.arm_source_revisions[arm],
+        run_manifest_hash=hash_json(manifest.model_dump(mode="json")),
+        task_corpus_hash=hash_json([task.model_dump(mode="json") for task in tasks]),
+        arm=arm,
+    )
+    path = tmp_path / "abandoned-start.checkpoint.json"
+    store = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=planned_keys,
+        expected_tasks={task.id: task for task in tasks},
+        expected_smoke_cells=smoke_cells,
+        selection_preflight=selection.checkpoint_preflight(),
+    )
+    store.bind_pre_smoke_seal("a" * 64, {"status": "unavailable", "reason": "synthetic fixture"})
+    store.record_paired_event(
+        CheckpointPairedEvent(
+            sequence=1,
+            cell=f"{key.model_class}:{key.transport}",
+            task_id=key.task_id,
+            repeat_index=key.repeat_index,
+            arm=arm,
+            order_position=planned_arm_order(key.task_id, key.repeat_index, manifest.paired_order_seed).index(arm),
+        )
+    )
+    store.set_run_counters(reused_trials=0, rerun_trials=0)
+    store.begin_closing()
+    store.finalize_timing({"attempt_index": 1, "wall_seconds": 0, "breakdown": {"other": 0}})
+
+    resumed = CheckpointStore(
+        path,
+        header=header,
+        expected_keys=planned_keys,
+        expected_tasks={task.id: task for task in tasks},
+        expected_smoke_cells=smoke_cells,
+        selection_preflight=selection.checkpoint_preflight(),
+        resume=True,
+        reuse_terminal_trials=True,
+    )
+
+    assert resumed.document.paired_execution_events[0].status == "incomplete"
+    assert resumed.document.paired_execution_events[0].record_hash is None
+    assert resumed.selection_execution_history() == [
+        {
+            "sequence": 1,
+            "cell": f"{key.model_class}:{key.transport}",
+            "task_id": key.task_id,
+            "repeat_index": key.repeat_index,
+            "arm": arm,
+            "order_position": planned_arm_order(
+                key.task_id,
+                key.repeat_index,
+                manifest.paired_order_seed,
+            ).index(arm),
+            "attempt": 1,
+            "status": "incomplete",
+        }
+    ]
+
+
 def test_selection_summary_reads_the_selected_openrouter_upstream() -> None:
     outcome = TrialOutcome(
         task_id="read-vaults-en",
@@ -696,6 +1223,12 @@ def _complete_diagnostic_artifacts(
             model_id=model_ids[trial.model_class],
             transport=trial.transport,
             repeat_index=trial.repeat_index,
+            paired_order_position=planned_arm_order(
+                trial.task_id,
+                trial.repeat_index,
+                selection.execution_manifest.paired_order_seed,
+            ).index(trial.arm),
+            paired_execution_sequence=sequence,
             error="synthetic terminal provider error",
             failure_kind=trial.failure_kind,
         ).model_dump(mode="json")
@@ -713,6 +1246,7 @@ def _complete_diagnostic_artifacts(
                     trial.repeat_index,
                     selection.execution_manifest.paired_order_seed,
                 ).index(trial.arm),
+                "status": "failed",
             }
         )
     paired_budget = {
@@ -732,8 +1266,23 @@ def _complete_diagnostic_artifacts(
                 "reserved_cost_usd": 0,
                 "smoke_status": None,
                 "smoke_cell_count": 0,
+                "new_trials": selection.expected_trials_by_arm[arm],
+                "reused_trials": 0,
+                "rerun_trials": 0,
+                "spent": {
+                    "model_requests": 0,
+                    "provider_setup_requests": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": 0,
+                },
             },
-            "paired_execution": {"complete": True, "events": events},
+            "paired_execution": {
+                "complete": True,
+                "events": events,
+                "unfinished_starts": [],
+                "unknown_start_gaps": [],
+            },
             "paired_budget_used": paired_budget,
         }
         for arm in ("baseline", "candidate")
@@ -763,6 +1312,116 @@ def test_selection_summary_counts_23_terminal_failures_without_smoke_or_adoption
     assert summary["observed_new_smoke_model_requests"] == 0
     assert summary["arms"]["baseline"]["execution_failure_trials"] == 13
     assert summary["arms"]["candidate"]["execution_failure_trials"] == 10
+
+
+def test_selection_summary_counts_retry_attempts_and_preserves_unknown_sequence_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, tasks, selection = _write_selection(tmp_path, monkeypatch)
+    artifacts = _complete_diagnostic_artifacts(selection, tasks)
+    baseline_trials = [trial for trial in selection.selected_trials if trial.arm == "baseline"]
+    candidate_trials = [trial for trial in selection.selected_trials if trial.arm == "candidate"]
+    reused = [baseline_trials[0], baseline_trials[1], candidate_trials[0]]
+    interrupted = [baseline_trials[2], candidate_trials[1]]
+
+    source_events: list[dict[str, Any]] = []
+    latest_sequence: dict[tuple[str, str, str, str, int], int] = {}
+    for trial, sequence in zip(reused, (1, 2, 3), strict=True):
+        latest_sequence[trial.identity] = sequence
+        source_events.append(_selection_event(selection, trial, sequence, status="failed"))
+    for trial, sequence in zip(interrupted, (5, 6), strict=True):
+        latest_sequence[trial.identity] = sequence
+        source_events.append(_selection_event(selection, trial, sequence, status="failed"))
+
+    retry_events = [
+        _selection_event(selection, trial, sequence, status="failed", attempt=2, retry_of=prior)
+        for trial, sequence, prior in zip(interrupted, (7, 8), (5, 6), strict=True)
+    ]
+    for trial, event in zip(interrupted, retry_events, strict=True):
+        latest_sequence[trial.identity] = event["sequence"]
+
+    pending = [
+        trial
+        for trial in selection.selected_trials
+        if trial.identity not in latest_sequence
+    ]
+    new_events = [
+        _selection_event(selection, trial, sequence, status="failed")
+        for sequence, trial in enumerate(pending, start=9)
+    ]
+    for trial, event in zip(pending, new_events, strict=True):
+        latest_sequence[trial.identity] = event["sequence"]
+
+    events = sorted([*source_events, *retry_events, *new_events], key=lambda event: event["sequence"])
+    for arm, artifact in artifacts.items():
+        for run in artifact["runs"].values():
+            for outcome in run["trials"]:
+                identity = (
+                    arm,
+                    outcome["model_class"],
+                    outcome["transport"],
+                    outcome["task_id"],
+                    outcome["repeat_index"],
+                )
+                outcome["paired_execution_sequence"] = latest_sequence[identity]
+        reused_count = 2 if arm == "baseline" else 1
+        artifact["checkpoint"].update(
+            {
+                "new_trials": selection.expected_trials_by_arm[arm] - reused_count,
+                "reused_trials": reused_count,
+                "rerun_trials": 1,
+            }
+        )
+        artifact["paired_execution"] = {
+            "complete": True,
+            "events": events,
+            "unfinished_starts": [],
+            "unknown_start_gaps": [{"sequence": 4, "status": "unknown_start"}],
+        }
+
+    summary = selection_module.build_selection_summary(
+        selection,
+        artifacts,
+        {"verdict": "inconclusive"},
+        manifest=selection.execution_manifest,
+        tasks=tasks,
+    )
+
+    assert summary["status"] == "complete"
+    assert summary["expected_new_model_trials"] == 20
+    assert summary["observed_execution_events"] == 25
+    assert summary["observed_unique_selected_trials"] == 23
+    assert summary["paired_execution_events_valid"] is True
+    assert summary["unknown_start_gaps"] == [{"sequence": 4, "status": "unknown_start"}]
+
+
+def _selection_event(
+    selection: selection_module.ToolGuidanceSelection,
+    trial: selection_module.SelectedTrial,
+    sequence: int,
+    *,
+    status: str,
+    attempt: int = 1,
+    retry_of: int | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "sequence": sequence,
+        "cell": f"{trial.model_class}:{trial.transport}",
+        "task_id": trial.task_id,
+        "repeat_index": trial.repeat_index,
+        "arm": trial.arm,
+        "order_position": planned_arm_order(
+            trial.task_id,
+            trial.repeat_index,
+            selection.execution_manifest.paired_order_seed,
+        ).index(trial.arm),
+        "status": status,
+    }
+    if attempt > 1:
+        event["attempt"] = attempt
+        event["retry_of_sequence"] = retry_of
+    return event
 
 
 @pytest.mark.asyncio

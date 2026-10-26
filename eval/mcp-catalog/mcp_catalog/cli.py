@@ -463,26 +463,50 @@ async def run_paired(args: argparse.Namespace) -> int:
         selection=selection,
         paired_budget_restored=source_resume is not None,
     )
+    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     run_tasks = {
         "baseline": asyncio.create_task(baseline_runner.run(), name="catalog-benchmark-baseline"),
         "candidate": asyncio.create_task(candidate_runner.run(), name="catalog-benchmark-candidate"),
     }
-    done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
-    primary_failure: BaseException | None = None
-    for task in done:
-        try:
-            exception = task.exception()
-        except asyncio.CancelledError as exc:
-            exception = exc
-        if exception is not None:
-            primary_failure = exception
-            break
-    if primary_failure is not None:
-        for task in pending:
-            task.cancel()
-    results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
+    signal_received = asyncio.Event()
+
+    def handle_signal() -> None:
+        signal_received.set()
+        for task in run_tasks.values():
+            if not task.done():
+                task.cancel()
+
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signum, handle_signal)
+    try:
+        done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
+        primary_failure: BaseException | None = None
+        for task in done:
+            try:
+                exception = task.exception()
+            except asyncio.CancelledError as exc:
+                exception = exc
+            if exception is not None:
+                primary_failure = exception
+                break
+        if primary_failure is not None:
+            for task in pending:
+                task.cancel()
+        results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
+    finally:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signum)
     terminal_reserved_cost = ledger.reserved_cost_usd
     await ledger.release_all_reservations()
+
+    for arm, result in zip(run_tasks, results, strict=True):
+        if isinstance(result, asyncio.CancelledError):
+            finalize_checkpoint = getattr(runners[arm], "finalize_cancelled_checkpoint", None)
+            if callable(finalize_checkpoint):
+                await finalize_checkpoint()
 
     artifacts: dict[str, dict[str, Any]] = {}
     failures: list[BaseException] = []
@@ -500,6 +524,7 @@ async def run_paired(args: argparse.Namespace) -> int:
                 result,
                 baseline_manifest,
                 checkpoints[arm],
+                runner=runners[arm],
             )
             if continuation is not None:
                 artifacts[arm]["continuation_lineage"] = continuation.lineage
@@ -533,7 +558,6 @@ async def run_paired(args: argparse.Namespace) -> int:
         paired_budget_used=paired_budget,
         paired_run_terminal=all(task.done() for task in run_tasks.values()),
     )
-    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
     for arm, artifact in artifacts.items():
         if continuation is not None:
@@ -592,9 +616,11 @@ def _paired_arm_failure_artifact(
     error: BaseException,
     manifest: Any,
     checkpoint_path: Path,
+    *,
+    runner: BenchmarkRunner | None = None,
 ) -> dict[str, Any]:
     cancelled = isinstance(error, asyncio.CancelledError)
-    return {
+    artifact: dict[str, Any] = {
         "schema_version": 2,
         "status": "incomplete",
         "arm": arm,
@@ -611,6 +637,26 @@ def _paired_arm_failure_artifact(
         },
         "incomplete_reasons": ["paired arm did not produce a benchmark artifact"],
     }
+    store = getattr(runner, "_checkpoint_store", None) if runner is not None else None
+    if store is not None:
+        document = store.document
+        artifact["checkpoint"] = {
+            "enabled": True,
+            "path": str(checkpoint_path),
+            "new_trials": len(document.records) - document.reused_trial_count,
+            "reused_trials": document.reused_trial_count,
+            "rerun_trials": document.rerun_trial_count,
+            "record_count": len(document.records),
+            "lifecycle": document.lifecycle,
+            "reserved_cost_usd": document.reserved_cost_usd,
+            "smoke_status": document.smoke_status,
+            "smoke_cell_count": len(document.smoke_gate),
+            "selection_preflight": document.selection_preflight,
+            "spent": document.spent.model_dump(mode="json"),
+            "spent_hash": document.spent_hash,
+            "timing_hash": document.timing_hash,
+        }
+    return artifact
 
 
 def compare(args: argparse.Namespace) -> int:

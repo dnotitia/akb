@@ -113,6 +113,19 @@ class TrialCheckpoint(ContractModel):
     record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class CheckpointPairedEvent(ContractModel):
+    sequence: int = Field(ge=1)
+    cell: str = Field(pattern=r"^(primary|lightweight):(http|stdio)$")
+    task_id: str = Field(min_length=1, max_length=100)
+    repeat_index: int = Field(ge=1)
+    arm: ArmName
+    order_position: int = Field(ge=0, le=1)
+    attempt: int | None = Field(default=None, ge=1)
+    retry_of_sequence: int | None = Field(default=None, ge=1)
+    status: Literal["started", "completed", "failed", "incomplete"] = "started"
+    record_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
 class SmokeCellCheckpoint(ContractModel):
     schema_version: Literal[4] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
@@ -135,6 +148,8 @@ class CheckpointDocument(ContractModel):
     timing: CheckpointTiming = Field(default_factory=CheckpointTiming)
     timing_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     records: dict[str, TrialCheckpoint] = Field(default_factory=dict)
+    attempt_history: list[TrialCheckpoint] = Field(default_factory=list)
+    paired_execution_events: list[CheckpointPairedEvent] = Field(default_factory=list)
     smoke_status: Literal["in_progress", "passed", "failed"] | None = None
     smoke_gate: dict[str, SmokeCellCheckpoint] = Field(default_factory=dict)
     selection_preflight: dict[str, Any] | None = None
@@ -299,6 +314,8 @@ class CheckpointStore:
         if resume and self.document.lifecycle == "finalized":
             self.document.lifecycle = "open"
             self._write_atomic()
+        if resume and self.selection_preflight is not None:
+            self._close_abandoned_selection_starts()
 
     def set_secrets(self, secrets: tuple[str, ...]) -> None:
         self.secrets = secrets
@@ -418,7 +435,7 @@ class CheckpointStore:
         if self.continuation is None:
             if self.reuse_terminal_trials:
                 record = self.document.records.get(checkpoint_key_digest(key))
-                if record is None:
+                if record is None or record.outcome.failure_kind == "interrupted":
                     return None
                 if (
                     record.status == "completed"
@@ -487,6 +504,26 @@ class CheckpointStore:
             raise CheckpointError("a completed checkpoint trial must contain usage and routing evidence")
         digest = checkpoint_key_digest(key)
         existed = digest in self.document.records
+        previous = self.document.records.get(digest)
+        if previous is not None and self.selection_preflight is not None:
+            previous_sequence = previous.outcome.paired_execution_sequence
+            next_sequence = safe_outcome.paired_execution_sequence
+            if previous_sequence != next_sequence:
+                if (
+                    previous.status not in {"failed", "incomplete"}
+                    or previous.outcome.failure_kind != "interrupted"
+                    or type(previous_sequence) is not int
+                    or type(next_sequence) is not int
+                ):
+                    raise CheckpointError("selection resume may retry only a checkpointed interrupted attempt")
+                self.document.attempt_history.append(previous)
+        if self.selection_preflight is not None and type(safe_outcome.paired_execution_sequence) is int:
+            self._finish_paired_event(
+                key,
+                safe_outcome.paired_execution_sequence,
+                resolved_status,
+                checkpoint_record_hash(resolved_status, key, safe_outcome),
+            )
         self.document.records[digest] = TrialCheckpoint(
             status=resolved_status,
             key=key,
@@ -507,6 +544,133 @@ class CheckpointStore:
             self._update_timing(timing)
         self._write_atomic()
         return existed
+
+    def record_paired_event(self, event: CheckpointPairedEvent) -> None:
+        """Persist a selection trial start before it can make a provider request."""
+
+        self._ensure_writable()
+        if self.selection_preflight is None:
+            raise CheckpointError("paired start events are only recorded for a selected run")
+        if event.arm != self.header.arm or event.status != "started" or event.record_hash is not None:
+            raise CheckpointError("selection paired start event has an invalid arm or terminal state")
+        identity = (event.cell, event.task_id, event.repeat_index, event.arm)
+        matches = [
+            key
+            for key in self.expected_keys.values()
+            if (f"{key.model_class}:{key.transport}", key.task_id, key.repeat_index, key.arm) == identity
+        ]
+        if len(matches) != 1:
+            raise CheckpointError("selection paired start event is not an exact planned identity")
+        existing = next(
+            (item for item in self.document.paired_execution_events if item.sequence == event.sequence),
+            None,
+        )
+        if existing is not None:
+            if existing != event:
+                raise CheckpointError("selection paired start sequence was reused with different evidence")
+            return
+        self.document.paired_execution_events.append(event)
+        self.document.paired_execution_events.sort(key=lambda item: item.sequence)
+        self._write_atomic()
+
+    def selection_execution_history(self) -> list[dict[str, Any]]:
+        """Return sealed attempt history from this arm's selected checkpoint."""
+
+        if self.selection_preflight is None:
+            raise CheckpointError("selection execution history requires a selected checkpoint")
+        events = {item.sequence: item for item in self.document.paired_execution_events}
+        for record in [*self.document.attempt_history, *self.document.records.values()]:
+            outcome = record.outcome
+            sequence = outcome.paired_execution_sequence
+            order_position = outcome.paired_order_position
+            if type(sequence) is not int or type(order_position) is not int:
+                raise CheckpointError("selection checkpoint trial is missing paired execution lineage")
+            identity = (
+                f"{record.key.model_class}:{record.key.transport}",
+                record.key.task_id,
+                record.key.repeat_index,
+                record.key.arm,
+            )
+            previous = events.get(sequence)
+            if previous is None:
+                events[sequence] = CheckpointPairedEvent(
+                    sequence=sequence,
+                    cell=identity[0],
+                    task_id=identity[1],
+                    repeat_index=identity[2],
+                    arm=identity[3],
+                    order_position=order_position,
+                    status=record.status,
+                    record_hash=record.record_hash,
+                )
+                continue
+            if (
+                (previous.cell, previous.task_id, previous.repeat_index, previous.arm) != identity
+                or previous.order_position != order_position
+                or previous.record_hash not in (None, record.record_hash)
+            ):
+                raise CheckpointError("selection paired start does not match its checkpoint outcome")
+            events[sequence] = previous.model_copy(
+                update={"status": record.status, "record_hash": record.record_hash}
+            )
+
+        by_identity: dict[tuple[str, str, int, ArmName], list[CheckpointPairedEvent]] = {}
+        for event in events.values():
+            identity = (event.cell, event.task_id, event.repeat_index, event.arm)
+            by_identity.setdefault(identity, []).append(event)
+        for chain in by_identity.values():
+            chain.sort(key=lambda item: item.sequence)
+            previous_sequence: int | None = None
+            for attempt, event in enumerate(chain, start=1):
+                if event.attempt is None:
+                    update: dict[str, Any] = {"attempt": attempt}
+                    if previous_sequence is not None:
+                        update["retry_of_sequence"] = previous_sequence
+                    event = event.model_copy(update=update)
+                    events[event.sequence] = event
+                elif (
+                    event.attempt != attempt
+                    or event.retry_of_sequence != previous_sequence
+                ):
+                    raise CheckpointError("selection paired retry lineage is inconsistent")
+                previous_sequence = event.sequence
+        return [events[sequence].model_dump(mode="json", exclude_none=True) for sequence in sorted(events)]
+
+    def _finish_paired_event(
+        self,
+        key: CheckpointKey,
+        sequence: int,
+        status: TrialStatus,
+        record_hash: str,
+    ) -> None:
+        for index, event in enumerate(self.document.paired_execution_events):
+            if event.sequence != sequence:
+                continue
+            if (event.cell, event.task_id, event.repeat_index, event.arm) != (
+                f"{key.model_class}:{key.transport}",
+                key.task_id,
+                key.repeat_index,
+                key.arm,
+            ):
+                raise CheckpointError("selection trial outcome points to another paired start event")
+            self.document.paired_execution_events[index] = event.model_copy(
+                update={"status": status, "record_hash": record_hash}
+            )
+            return
+        raise CheckpointError("selection trial outcome has no persisted paired start event")
+
+    def _close_abandoned_selection_starts(self) -> None:
+        recorded_sequences = {
+            record.outcome.paired_execution_sequence
+            for record in [*self.document.attempt_history, *self.document.records.values()]
+        }
+        changed = False
+        for index, event in enumerate(self.document.paired_execution_events):
+            if event.status == "started" and event.sequence not in recorded_sequences:
+                self.document.paired_execution_events[index] = event.model_copy(update={"status": "incomplete"})
+                changed = True
+        if changed:
+            self._write_atomic()
 
     def record_smoke_cell(
         self,
@@ -675,6 +839,60 @@ class CheckpointStore:
                 and not valid_completed_outcome(trial_record.outcome, self._task_for_key(trial_record.key))
             ):
                 raise CheckpointError("resume checkpoint contains an invalid completed trial")
+        if (document.attempt_history or document.paired_execution_events) and self.selection_preflight is None:
+            raise CheckpointError("non-selection checkpoint contains selection attempt history")
+        attempt_sequences: dict[int, TrialCheckpoint] = {}
+        for trial_record in document.attempt_history:
+            self._validate_key(trial_record.key)
+            if (
+                trial_record.record_hash != checkpoint_record_hash(
+                    trial_record.status,
+                    trial_record.key,
+                    trial_record.outcome,
+                )
+                or not self._outcome_matches_key(trial_record.outcome, trial_record.key)
+            ):
+                raise CheckpointError("selection attempt history record digest or identity does not match")
+            if (
+                trial_record.status not in {"failed", "incomplete"}
+                or trial_record.outcome.failure_kind != "interrupted"
+            ):
+                raise CheckpointError("selection attempt history contains a non-interrupted outcome")
+        for trial_record in [*document.attempt_history, *document.records.values()]:
+            sequence = trial_record.outcome.paired_execution_sequence
+            if sequence is None:
+                continue
+            if sequence in attempt_sequences:
+                raise CheckpointError("selection checkpoint duplicates a paired attempt sequence")
+            attempt_sequences[sequence] = trial_record
+        event_sequences: set[int] = set()
+        expected_identities = {
+            (f"{key.model_class}:{key.transport}", key.task_id, key.repeat_index, key.arm)
+            for key in self.expected_keys.values()
+        }
+        for event in document.paired_execution_events:
+            identity = (event.cell, event.task_id, event.repeat_index, event.arm)
+            if (
+                event.sequence in event_sequences
+                or event.arm != document.header.arm
+                or identity not in expected_identities
+                or (event.status == "started" and event.record_hash is not None)
+                or (
+                    event.status in {"completed", "failed"}
+                    and event.record_hash is None
+                )
+            ):
+                raise CheckpointError("selection checkpoint contains an invalid paired start event")
+            event_sequences.add(event.sequence)
+            record = attempt_sequences.get(event.sequence)
+            if event.status in {"started", "incomplete"} and record is None:
+                if event.record_hash is not None:
+                    raise CheckpointError("selection checkpoint has an unbound incomplete paired attempt")
+            elif event.status == "started":
+                if record is not None:
+                    raise CheckpointError("selection paired start remains open after its outcome was recorded")
+            elif record is None or event.record_hash != record.record_hash or event.status != record.status:
+                raise CheckpointError("selection paired event does not match its terminal checkpoint outcome")
         for cell_key, smoke_record in document.smoke_gate.items():
             if not self._smoke_cell_matches(cell_key, smoke_record):
                 raise CheckpointError(f"resume checkpoint contains an invalid smoke cell: {cell_key}")
@@ -775,6 +993,7 @@ class CheckpointStore:
 
         previous = self.document.spent
         outcomes = [
+            *(record.outcome for record in self.document.attempt_history),
             *(record.outcome for record in self.document.records.values()),
             *(record.outcome for record in self.document.smoke_gate.values()),
         ]
