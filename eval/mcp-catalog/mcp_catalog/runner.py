@@ -2415,6 +2415,15 @@ class BenchmarkRunner:
                     stage="provider_registry",
                 )
 
+            catalog_input_schemas = {
+                key: input_schemas_from_catalog(snapshot)
+                for key, snapshot in catalogs.items()
+            }
+            catalog_server_instructions = {
+                key: str(snapshot.server_discover["instructions"])
+                for key, snapshot in catalogs.items()
+            }
+
             if self.selection is not None:
                 self._smoke_gate = {
                     "status": "not_run",
@@ -2423,14 +2432,6 @@ class BenchmarkRunner:
                 }
             elif self._should_run_smoke_gate(pending_by_run):
                 current_stage = "smoke_gate"
-                catalog_input_schemas = {
-                    key: input_schemas_from_catalog(snapshot)
-                    for key, snapshot in catalogs.items()
-                }
-                catalog_server_instructions = {
-                    key: str(snapshot.server_discover["instructions"])
-                    for key, snapshot in catalogs.items()
-                }
                 await self._run_smoke_gate(
                     fixtures=fixtures,
                     resolver=resolver,
