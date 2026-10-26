@@ -25,6 +25,9 @@ Subcommands:
                                signing profile, and exact AKB recovery-admin
                                projection; then retire the temporary bootstrap
                                service account.
+    provision-platform-service-credential
+                               Bootstrap the one fixed service principal from
+                               a protected intent; write a secret-free receipt.
     reset-password <username>   Generate a temp password for the given user.
                                  Prints the temp password to stdout. Caller
                                  must share it with the user out-of-band.
@@ -1090,6 +1093,46 @@ def _okf_export(args: list[str]) -> int:
     return 0 if report.ok else 1
 
 
+async def _provision_platform_service_credential(args: list[str]) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--intent-file", required=True)
+    parser.add_argument("--output-file", required=True)
+    try:
+        parsed = parser.parse_args(args)
+    except _CLIUsageError:
+        print("Usage: python -m app.cli provision-platform-service-credential --intent-file PATH --output-file PATH", file=sys.stderr)
+        return 2
+    from app.db.postgres import close_pool
+    from app.services.platform_service_bootstrap import BootstrapRefused, read_intent, provision, write_receipt
+
+    error = None
+    report = None
+    try:
+        intent = read_intent(parsed.intent_file)
+        await _initialize_operator_database()
+        report = await provision(intent)
+    except BootstrapRefused as exc:
+        error = str(exc)
+    except Exception:
+        # Database/library messages may contain SQL parameters or credentials.
+        error = "platform_bootstrap_failed"
+    finally:
+        try:
+            await close_pool()
+        except Exception:
+            error = "platform_bootstrap_database_cleanup_failed"
+    if error is None:
+        assert report is not None
+        try:
+            write_receipt(parsed.output_file, report)
+        except BootstrapRefused as exc:
+            error = str(exc)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
@@ -1097,7 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Subcommands: generate-local-session-keyset, "
             "provision-recovery-admin {local|sso}, "
-            "issue-recovery-admin-credential, "
+            "issue-recovery-admin-credential, provision-platform-service-credential, "
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "prepare-native-config, preserve-revision-config, initialize-postgres-native, migrate-revision-backend, "
@@ -1108,6 +1151,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     cmd = argv[0]
+    if cmd == "provision-platform-service-credential":
+        return asyncio.run(_provision_platform_service_credential(argv[1:]))
     if cmd == "prepare-native-config":
         return _prepare_revision_config(argv[1:], native=True)
     if cmd == "preserve-revision-config":

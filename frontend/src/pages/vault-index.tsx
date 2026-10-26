@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { VaultDirectory } from "@/components/vault-directory";
 import { useOpenVaultCreateDialog } from "@/contexts/vault-create-dialog-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { useVaultDirectoryView } from "@/hooks/use-vault-directory-view";
 
 export default function VaultIndexPage() {
   const user = useCurrentUser();
@@ -59,12 +60,19 @@ function VaultIndexWorkspace({ checking }: { checking: boolean }) {
 }
 
 function VaultIndexLoading() {
-  return <div className="mx-auto w-full max-w-6xl p-3 sm:p-4 lg:p-6">
+  const { view } = useVaultDirectoryView();
+  return <div className="@container/directory mx-auto w-full max-w-6xl p-3 sm:p-4 lg:p-6">
     <LoadingState label="Loading available vaults">
       <Skeleton className="h-12 w-56" />
       <Skeleton className="mt-4 h-10 w-full" />
-      <div className="mt-4 divide-y divide-border rounded-[var(--radius-md)] border border-border">
-        {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-16 w-full rounded-none" />)}
+      <div className="my-3 flex h-[2.625rem] items-center justify-between max-sm:h-[3.125rem] [@media(pointer:coarse)]:h-[3.125rem]"><Skeleton className="h-4 w-24" /><Skeleton className="h-9 w-20 max-sm:h-11 max-sm:w-24 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-24" /></div>
+      <div className={view === "grid" ? "grid auto-rows-fr grid-cols-1 gap-3 @min-[30rem]/directory:grid-cols-2 @min-[48rem]/directory:grid-cols-3 @min-[64rem]/directory:grid-cols-4" : "divide-y divide-border overflow-hidden rounded-[var(--radius-md)] border border-border"} aria-hidden>
+        {Array.from({ length: 6 }, (_, index) => <div key={index} className={view === "grid" ? "vault-box vault-box-loading relative flex h-32 flex-col p-3" : "flex h-16 flex-col bg-surface p-3 pr-14"}>
+          {view === "grid" && <div className="vault-box-front" />}
+          {view === "grid" && <div className="mb-2 flex h-8 shrink-0 items-center"><Skeleton className="h-4 w-4" /></div>}
+          <Skeleton className="h-4 w-3/4" />
+          <Skeleton className="mt-auto h-3 w-full" />
+        </div>)}
       </div>
     </LoadingState>
   </div>;

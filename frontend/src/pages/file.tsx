@@ -17,7 +17,7 @@ import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { LoadingState } from "@/components/ui/loading-state";
+import { InlineLoadingState, LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
@@ -89,6 +89,8 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
   const previewController = useRef<AbortController | null>(null);
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [access, setAccess] = useState<FileAccess | null>(null);
+  // A renewed download grant must not reset the currently mounted reader.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [loadError, setLoadError] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [infoLoading, setInfoLoading] = useState(true);
@@ -152,6 +154,7 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
       if (!active.current || generation !== metadataGeneration.current) return;
       setLoadError(error instanceof Error ? error.message : String(error));
       setAccess(null);
+      setPreviewUrl(null);
       setCanDelete(false);
       permissionGeneration.current += 1;
     } finally {
@@ -161,7 +164,7 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
 
   useEffect(() => { void loadInfo(); }, [loadInfo]);
 
-  const loadPreview = useCallback(async () => {
+  const loadPreview = useCallback(async (restartViewer = false) => {
     if (!vault || !fileId || accessChecking || !active.current) return;
     const generation = ++previewGeneration.current;
     previewController.current?.abort();
@@ -169,7 +172,6 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
     previewController.current = controller;
     setPreviewLoading(true);
     setPreviewError("");
-    setAccess(null);
     try {
       const response = await authenticatedFetch(
         `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
@@ -182,15 +184,17 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
         throw new Error("The original file URL was not returned.");
       }
       setAccess(data);
+      setPreviewUrl(current => restartViewer || !current ? data.download_url : current);
       setExpiresAt(typeof data.expires_in === "number" && Number.isFinite(data.expires_in)
         ? Date.now() + Math.max(0, data.expires_in) * 1000 : null);
       setLinkExpired(false);
-      setPreviewVersion((version) => version + 1);
+      if (restartViewer) setPreviewVersion((version) => version + 1);
     } catch (error) {
       if (!active.current || generation !== previewGeneration.current) return;
-      setAccess(null);
       setPreviewError(error instanceof Error ? error.message : String(error));
-      if (error instanceof FileRequestError && [403, 404].includes(error.status)) {
+      if (error instanceof FileRequestError && [401, 403, 404].includes(error.status)) {
+        setAccess(null);
+        setPreviewUrl(null);
         setInfo(null);
         setCanDelete(false);
         permissionGeneration.current += 1;
@@ -230,7 +234,7 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
   const creator = readableCreator(info?.created_by);
   const resolved = Boolean(info && vault && !infoLoading && !loadError && !accessChecking);
   usePublishResourceLocation(
-    resolved ? { vault: vault!, title: info!.name, kind: "File", collectionPath: info!.collection } : null,
+    resolved ? { vault: vault!, title: info!.name, kind: "File", collectionPath: info!.collection, resourceRef: fileId } : null,
   );
 
   if (accessChecking || infoLoading) {
@@ -293,6 +297,9 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
               {!previewLoading && <RefreshCw className="h-4 w-4" aria-hidden />}
               Refresh link
             </Button>
+            {previewUrl && access?.download_url && previewUrl !== access.download_url && !linkExpired && (
+              <Button variant="ghost" size="sm" disabled={previewLoading} onClick={() => { setPreviewUrl(access.download_url!); setPreviewVersion(version => version + 1); }}>Reload preview</Button>
+            )}
             <Dialog>
               <DialogTrigger asChild>
                 <Button type="button" variant="ghost" size="sm" className="min-h-11 sm:min-h-0">
@@ -351,10 +358,10 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
               </Alert>
             </div>
           ) : (
-            <section aria-label="File preview" className="min-h-0 flex-1 overflow-auto">
-                {previewLoading ? (
+            <section aria-label="File preview" aria-busy={previewLoading} className="min-h-0 flex-1 overflow-auto">
+                {previewLoading && !access?.download_url ? (
                   <FilePreviewLoading />
-                ) : linkExpired || previewError || !access?.download_url ? (
+                ) : !access?.download_url ? (
                   <div className="mx-auto flex min-h-64 max-w-xl items-center px-4 py-10">
                     <Alert variant="warning" title="Preview unavailable" className="w-full">
                       <div className="space-y-3">
@@ -372,15 +379,22 @@ function FilePageContent({ accessChecking }: { accessChecking: boolean }) {
                     </Alert>
                   </div>
                 ) : (
+                  <>
+                  {previewLoading && <InlineLoadingState label="Refreshing file link; current preview remains visible" className="px-4 py-2" />}
+                  {(previewError || linkExpired) && <Alert variant="warning" className="m-4" title="File link needs attention">
+                    <p>{linkExpired ? "The file link has expired. Refresh it to preview or download again." : previewError}</p>
+                    <p className="mt-1 text-xs">The current preview is retained. Use Refresh link above to try again.</p>
+                  </Alert>}
                   <FilePreviewBody
-                    key={`${access.download_url}:${previewVersion}`}
+                    key={`${previewUrl}:${previewVersion}`}
                     mime={mime}
-                    directUrl={access.download_url}
-                    rawUrl={access.download_url}
+                    directUrl={previewUrl ?? access.download_url}
+                    rawUrl={previewUrl ?? access.download_url}
                     name={displayName}
                     sizeBytes={size}
-                    onRefreshLink={() => void loadPreview()}
+                    onRefreshLink={() => void loadPreview(true)}
                   />
+                  </>
                 )}
             </section>
           )}

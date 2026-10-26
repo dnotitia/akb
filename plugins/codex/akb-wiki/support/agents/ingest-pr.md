@@ -7,6 +7,9 @@ reasoning_effort: medium
 
 # AKB Git PR Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Record a **single PR merge event** as a `git-pr` document in the target AKB vault. Mechanical assembly — PR title/body quoted as author-authored compiled-truth; commit summaries pulled verbatim from `git-commit` documents already in the vault. No LLM synthesis. PR metadata is fetched live via `gh pr view`.
 
 Scope boundaries:
@@ -77,7 +80,7 @@ Call the resulting ordered list `sha_list` (chronologically ascending). If `sha_
 
 ### Step 3 — Dedup check
 
-`akb_search(query="PR #{pr_number} {repo_name}", vault={vault_name}, collection=git-prs, type=reference, tags=["git", "kind:pr", "project:{repo_name}"], limit=5)`. Among hits, find the one whose frontmatter has `repo == repo_name AND pr_number == pr_number`; on match capture `existing_doc_id` (update path), else create path.
+Enumerate `akb_browse(vault={vault_name}, collection="git-prs", content_type="documents", depth=-1, include_archived=true, limit=100, offset=0)`. Advance `offset` by each response's `returned` count until `offset >= total`; retain only document items (collection navigation rows may also appear). If a page is empty before that point or reports truncation that pagination cannot resolve, report incomplete enumeration and stop rather than infer absence. Read each candidate with `akb_get(uri={item.uri})` and inspect its metadata/body. Retain the returned canonical URI. Match `repo == repo_name AND pr_number == pr_number`; capture `existing_doc_id` and `existing_uri` on a unique match, otherwise create only after complete enumeration. Report multiple matches without writing.
 
 ### Step 4 — Fetch commit documents
 
@@ -96,17 +99,17 @@ mcp__akb__akb_search(
 )
 ```
 
-For each search, pick the hit whose title prefix matches `{short_sha}` — the per-commit summary doc's title is `{short_sha} {message_subject}`, and `akb_search` returns the title in its hit payload, so the search query (`query="{full_sha}"`) plus a title-prefix check uniquely identifies the matching commit. The downstream-needed fields below are all reachable from the `akb_search` hit (`path`, `title`, `summary`, `tags`); only fall back to `akb_get` if a specific consumer needs body content (e.g., for surfacing author detail in a human-readable table).
+For each search, treat a matching short-SHA title prefix as a candidate only. Read candidates with `akb_get(uri={hit.uri})` and verify the full `sha` and `repo` metadata before selecting a unique match. A ranked search miss is not proof of absence: if no candidate matches, enumerate `git-commits` with the paginated browse procedure used for dedup, then verify the same fields. Preserve the returned canonical `uri` in each commit record. Report ambiguity without writing.
 
 For each `commit_records[i]`, populate the downstream-needed fields from the AKB primitives that durably persist them:
 
-- `doc_id`, `path`, `title`, `summary` — from the search hit (whitelist fields exposed by `akb_search`).
+- `uri`, `doc_id`, `path`, `title`, `summary` — from the verified hit (whitelist fields exposed by `akb_search`).
 - `short_sha` — first 7 chars of the full SHA (already known from the search query); also recoverable from the title prefix.
 - `author` — parse from the row's `tags` array as `tag[len("author:"):]` for the first `author:*` tag emitted by `/ingest-commit` Step 6. Single-author commits emit one such tag; merge commits emit either the merging committer or whichever name `.mailmap` resolved. `null` if no `author:*` tag is present (defensive — the commit ingest always emits one).
 - `conv_type` — parse from the row's `tags` array as `tag[len("type:"):]` for the first `type:*` tag. `null` when the commit subject did not match the conventional-commit pattern.
 - `scope` — parse `tag[len("scope:"):]` for the first `scope:*` tag. Drives PR-level `pr_scope` aggregation downstream without re-deriving from a `paths` list.
 
-Skip the secondary `akb_get` whenever the search hit already exposes everything in the list above — PR / release ingest only needs `path` / `summary` / `tags`, all reachable from `akb_search`. A 30-commit PR is one batched `akb_search` round trip, not 30+30.
+Reuse the hydrated result after identity verification; do not fetch the same document again for its summary or tags.
 
 The full file list, per-commit stats, and diff scope are not aggregated across commits — the per-commit body's `### Paths` and `## Stats` sections are the audit surface, reachable via the PR's `depends_on` graph edge.
 
@@ -125,7 +128,7 @@ Collect the results into `commit_records`, aligned with `sha_list`.
 
 Compute from `commit_records`:
 
-- `commit_uris` — ordered list of full URIs `akb://{vault_name}/doc/{commit_doc_path}` (chronological). Passed as `depends_on` in Step 7. Always-URI convention even for single-vault deployments.
+- `commit_uris` — ordered list of canonical URIs returned for each commit document (chronological). Passed as `depends_on` in Step 7. Always-URI convention even for single-vault deployments.
 - `commit_shas` — ordered chronological SHAs, preserved for cheap lookup without graph traversal.
 - `pr_scope` — most-frequent non-null `scope` across records (parsed from each record's `scope:*` tag in `_fetch_commit_docs`; the per-commit summary derives it once at ingest as `conv_scope or top_level_paths[0]`). Ties → chronologically earliest contributor. `null` when all commits' scopes are null. Emitted as `scope:{pr_scope}` in Step 6.
 
@@ -199,7 +202,7 @@ Assembly rules: quote the PR body as a single block-quote (no paraphrase / trunc
 
 **Create** — `akb_put(vault={vault_name}, collection=git-prs, title="PR #{pr.number}: {pr.title}", type=reference, tags={tags}, content={assembled_body}, summary={pr.title}, depends_on={commit_uris})`.
 
-**Update** — `akb_update(doc_id={existing_doc_id}, vault={vault_name}, title="PR #{pr.number}: {pr.title}", tags={tags}, content={assembled_body}, summary={pr.title}, depends_on={commit_uris})`.
+**Update** — `akb_update(uri={existing_uri}, title="PR #{pr.number}: {pr.title}", tags={tags}, content={assembled_body}, summary={pr.title}, depends_on={commit_uris})`.
 
 `depends_on` passes as a top-level arg so AKB stores graph edges (queryable via `akb_relations`), not opaque frontmatter. PR-to-commits lives entirely on this edge — no commit-side backlink. Re-ingest rewrites the edge set idempotently. Capture `pr_doc_id` / `pr_doc_path`.
 

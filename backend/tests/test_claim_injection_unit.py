@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, cast
 
 import pytest
@@ -154,6 +155,12 @@ class _Conn:
 
     def transaction(self) -> _Txn:
         return _Txn()
+
+    async def fetchval(self, sql: str, user_id: uuid.UUID) -> bool:
+        # This claim-forwarding fixture represents an active human admin.
+        assert "FROM users WHERE id=$1 FOR SHARE" in sql
+        assert user_id == uuid.UUID("11111111-1111-1111-1111-111111111111")
+        return True
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))

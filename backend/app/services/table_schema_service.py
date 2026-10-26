@@ -89,20 +89,24 @@ def _build_table_schema(vault_name: str, table: dict, pg_types: dict[str, str]) 
                     "pg_type": actual_pg_type,
                 })
 
-        column_items.append({
+        item = {
             "name": name,
             "type": logical_type,
             "required": bool(col.get("required", False)),
             "default": col.get("default"),
             "check": col.get("check"),
-            "enum": col.get("enum"),
             "unique": bool(col.get("unique", False) or name in unique),
             "index": bool(col.get("index", False) or name in indexed),
             "references": col.get("references"),
             "on_delete": col.get("on_delete"),
             "pg_type": actual_pg_type,
             "drift": drift,
-        })
+        }
+        # The public contract makes enum an optional array: absence means
+        # unconstrained, not null or an empty set of permitted values.
+        if col.get("enum") is not None:
+            item["enum"] = col["enum"]
+        column_items.append(item)
 
     drift_summary = {
         "has_drift": bool(missing_columns or extra_columns or type_mismatches),

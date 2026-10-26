@@ -100,7 +100,7 @@ describe("vault index no-selection states", () => {
     renderPage();
     await screen.findByRole("heading", { name: "Your vaults" });
     expect(screen.getAllByRole("link")).toHaveLength(30);
-    await user.click(screen.getByRole("button", { name: "Show more vaults (35 remaining)" }));
+    await user.click(screen.getByRole("button", { name: "Show more vaults" }));
     expect(screen.getAllByRole("link")).toHaveLength(60);
     await user.type(screen.getByRole("textbox", { name: "Find a vault" }), "workspace-64");
     expect(screen.getAllByRole("link")).toHaveLength(1);

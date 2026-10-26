@@ -1,5 +1,5 @@
 # AKB's PostgreSQL: the pinned pgvector image plus the vchord_bm25 BM25 index
-# extension, compiled here from its source with five fixes.
+# extension, compiled here from its source with six fixes.
 #
 # The repository's install paths build this image where they run it: Compose,
 # deploy/k8s/deploy.sh, the Helm and Native Kubernetes install commands, and the
@@ -38,6 +38,12 @@
 #     IDF went negative: a search for that term alone found nothing (akb#687).
 #     The IDF now holds the statistic at the document count, and takes its
 #     ratio in f64, where in f32 it rounded to 0 past about 8.4M documents.
+#   * 0006: the growing segment admitted invisible and out-of-scope candidates
+#     into finite top-k before checking the executor's snapshot and quals.
+#     These rows could displace valid matches, forcing AKB's exact completion
+#     to read and sort all postings of common terms (akb#748). Growing and
+#     sealed candidates now use the same prefilter; zero-score and below-
+#     threshold rows still avoid heap checks. Index format is unchanged.
 # Drop a patch when an upstream release carries its fix; deploy/postgres/README.md
 # says how to check.
 #

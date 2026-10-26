@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode } from "react";
+import { useEffect, useState, type HTMLAttributes, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -7,6 +7,8 @@ interface LoadingStateProps
   extends Omit<HTMLAttributes<HTMLDivElement>, "children"> {
   /** A complete, user-facing description of the work in progress. */
   label: string;
+  /** Reserve layout immediately, but skip visual/status flashes for fast reads. */
+  delayMs?: number;
   /** Visual placeholder content. It is hidden from assistive technology. */
   children: ReactNode;
 }
@@ -18,18 +20,24 @@ interface LoadingStateProps
  * of the accessibility tree. This prevents a page made from many placeholder
  * blocks from producing repeated or meaningless announcements.
  */
-function LoadingState({ label, children, className, ...props }: LoadingStateProps) {
+function LoadingState({ label, children, className, delayMs = 0, ...props }: LoadingStateProps) {
+  const [revealed, setRevealed] = useState(delayMs === 0);
+  useEffect(() => {
+    if (delayMs === 0) return;
+    const timer = setTimeout(() => setRevealed(true), delayMs);
+    return () => clearTimeout(timer);
+  }, [delayMs]);
   return (
     <div
       {...props}
-      role="status"
-      aria-live="polite"
+      role={revealed ? "status" : undefined}
+      aria-live={revealed ? "polite" : undefined}
       aria-atomic="true"
       aria-busy="true"
       aria-label={label}
       className={className}
     >
-      <div aria-hidden>{children}</div>
+      <div aria-hidden style={revealed ? undefined : { visibility: "hidden" }}>{children}</div>
     </div>
   );
 }

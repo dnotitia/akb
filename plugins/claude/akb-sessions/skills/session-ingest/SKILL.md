@@ -8,6 +8,9 @@ allowed-tools: Bash(git *), Bash(claude *), Bash(codex *), Bash(find *), Bash(tr
 
 # AKB Session Ingest
 
+**Resource identity.** Retain the canonical `uri` returned by search, browse, get, or put alongside every document ID/path. Use it unchanged for `akb_get`, `akb_update`, relations, and graph edges; collection-scoped URIs cannot be reconstructed by prefixing a path with `/doc/`. Capture matched URIs as `matched_uri`, `dedup_uri`, `existing_uri`, or `existing_session_uri`; draft targets carry `append_uri` / `supersedes_uri`, tasks carry `task_uri`, and newly written documents carry `doc_uri` / `session_uri`. IDs remain display/tag values only.
+
+
 Multi-agent workflow that analyzes a session JSONL file and writes structured notes to an AKB vault.
 
 **Workflow classification.** LLM-wiki **Ingest** workflow. **Cognitive-debt** layer — it captures the in-flight reasoning of a coding session (how the team arrived at an understanding, the decisions and dead ends), turning ephemeral working context into persistent compiled-truth notes (TIL / decision / idea / task) before it evaporates. The four drafter subagents share this classification.
@@ -176,7 +179,7 @@ mcp__akb__akb_search(
 **Match found** → read the existing session note:
 
 ```text
-mcp__akb__akb_get(vault="{vault_name}", doc_id="{matched_doc_id}")
+mcp__akb__akb_get(uri="{matched_uri}")
 → existing_session_doc_id, existing_tags, existing_session_content
 ```
 
@@ -442,30 +445,30 @@ For newly-drafted sub-notes the link's `doc_path` is substituted at render time 
 
 ### 4-1. Write Session Note
 
-The session note is written first because sub-notes reference it via `depends_on`. Sub-notes always use the full URI `akb://{vault_name}/doc/{session_doc_path}` (always-URI cross-ref convention; future-proof against vault tier splits).
+The session note is written first because sub-notes reference it via `depends_on`. Sub-notes always use the full URI `session_uri` returned by AKB (always-URI cross-ref convention; future-proof against vault tier splits).
 
 **New mode (`sync_mode = "new"`).** Extract metadata from the draft's `---DRAFT---` block and `akb_put(vault="{vault_name}", ...)` with `type="session"`, `collection={draft.collection}`, `status={draft.status}`, `tags=["session", "claude-code", "session", "session:{session_id}", "project:{project_name}", "last-synced:{jsonl_last_timestamp}", ...topic_tags]`, and the finalized body from Phase 4-0. Capture `session_doc_id` and `session_doc_path`.
 
-**Update mode (`sync_mode = "update"`).** The session note already exists. Phase 2-3 + 4-0 produced a full compiled-truth replacement plus exactly one new timeline entry. Apply the **timeline merge procedure — Mode A (full-body merge)** (see appendix) against `existing_session_content`. Build the updated tag list (replace the old `last-synced:{old_timestamp}` with `last-synced:{jsonl_last_timestamp}`; preserve all other tags; add any new topic tags). Then `akb_update(vault="{vault_name}", doc_id=existing_session_doc_id, content={merged}, tags={updated}, summary={draft.summary}, message="Update from resumed session: {brief description}")`. Assemble `session_uri = akb://{vault_name}/doc/{existing_session_doc_path}` for sub-notes' `depends_on`.
+**Update mode (`sync_mode = "update"`).** The session note already exists. Phase 2-3 + 4-0 produced a full compiled-truth replacement plus exactly one new timeline entry. Apply the **timeline merge procedure — Mode A (full-body merge)** (see appendix) against `existing_session_content`. Build the updated tag list (replace the old `last-synced:{old_timestamp}` with `last-synced:{jsonl_last_timestamp}`; preserve all other tags; add any new topic tags). Then `akb_update(uri=existing_session_uri, content={merged}, tags={updated}, summary={draft.summary}, message="Update from resumed session: {brief description}")`. Reuse `session_uri = existing_session_uri` for sub-notes' `depends_on`.
 
 ### 4-2. Write Sub-Notes (Learning, Task, Idea, Decision)
 
 **Issue all sub-note `akb_put` calls in a single parallel tool-use block.** Sub-notes are independent of each other; only the session note's order matters (via `depends_on`).
 
-For each sub-note, extract metadata from the draft and call `akb_put(vault="{vault_name}", ...)` with `collection={draft.collection}`, `type={draft.type}`, `status={draft.status}`, `tags=["session", "claude-code", ...draft_tags]`, `depends_on=["akb://{vault_name}/doc/{session_doc_path}"]`, `related_to=[...draft.related_to]` (full URIs as emitted by drafters). Collection per type: TIL → `sessions/learnings`, Task → `sessions/tasks`, Idea → `sessions/ideas`, Decision → `sessions/decisions`.
+For each sub-note, extract metadata from the draft and call `akb_put(vault="{vault_name}", ...)` with `collection={draft.collection}`, `type={draft.type}`, `status={draft.status}`, `tags=["session", "claude-code", ...draft_tags]`, `depends_on=[session_uri]`, `related_to=[...draft.related_to]` (full URIs as emitted by drafters). Collection per type: TIL → `sessions/learnings`, Task → `sessions/tasks`, Idea → `sessions/ideas`, Decision → `sessions/decisions`.
 
 **Idea notes** — append four namespaced tags to `draft_tags` before put: `category:{draft.category}`, `impact:{draft.impact}`, `effort:{draft.effort}`, `confidence:{draft.confidence}`. Drop duplicates (the drafter may have already emitted some as tags). These four tags are the durable carriers for the external maintenance layer's consolidation synthesis and staleness checks.
 
-**`append` disposition** — the drafter has already merged compiled truth + one new timeline entry. Read the existing document with `akb_get(vault="{vault_name}", doc_id=draft.append_target)`, apply timeline merge **Mode A** against `draft.body`, and `akb_update(vault="{vault_name}", doc_id=draft.append_target, content={merged}, tags=[...existing, ...new from draft], summary=draft.summary, message="Appended from session ingest: {brief description}")`.
+**`append` disposition** — the drafter has already merged compiled truth + one new timeline entry. Read the existing document with `akb_get(uri=draft.append_uri)`, apply timeline merge **Mode A** against `draft.body`, and `akb_update(uri=draft.append_uri, content={merged}, tags=[...existing, ...new from draft], summary=draft.summary, message="Appended from session ingest: {brief description}")`.
 
-**`supersede` disposition (decisions only)** — write the new decision via `akb_put(vault="{vault_name}", ..., tags=[..., "supersedes:{old_doc_id}"])` (tags use bare doc_id; the `:` already binds `key:value`). Capture `new_doc_id` and `new_doc_path`; compose `new_doc_ref = akb://{vault_name}/doc/{new_doc_path}`. Then read the old decision via `akb_get(vault="{vault_name}", doc_id=draft.supersedes)`, apply timeline merge **Mode B** with `new_entry = "- **{today}** | Superseded by {new_title} ({new_doc_ref}). {reason}. [Source: session:{session_id}, {today}]"`, and `akb_update(vault="{vault_name}", doc_id=draft.supersedes, content={merged}, tags=[...old, "superseded-by:{new_doc_id}"], status="superseded", message="Superseded by {new_doc_ref} in session ingest")`. Setting `status="superseded"` removes the old decision from the external maintenance layer's active-document pools.
+**`supersede` disposition (decisions only)** — write the new decision via `akb_put(vault="{vault_name}", ..., tags=[..., "supersedes:{old_doc_id}"])` (tags use bare doc_id; the `:` already binds `key:value`). Capture `new_doc_id` and `new_doc_path`; capture `new_doc_ref` from the returned canonical URI. Then read the old decision via `akb_get(uri=draft.supersedes_uri)`, apply timeline merge **Mode B** with `new_entry = "- **{today}** | Superseded by {new_title} ({new_doc_ref}). {reason}. [Source: session:{session_id}, {today}]"`, and `akb_update(uri=draft.supersedes_uri, content={merged}, tags=[...old, "superseded-by:{new_doc_id}"], status="archived", message="Superseded by {new_doc_ref} in session ingest")`. Setting `status="archived"` removes the old decision from the external maintenance layer's active-document pools.
 
 ### 4-3. Resolve Completed Tasks
 
 For each task in `resolved_tasks`:
 
-1. Read the task document with `akb_get(vault="{vault_name}", doc_id={task_doc_id})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
-2. `akb_update(vault="{vault_name}", doc_id={task_doc_id}, content={merged}, tags=[...existing, "resolved"], status="archived", message="Resolved in session {session_doc_id}")`.
+1. Read the task document with `akb_get(uri={task_uri})`, then compose the resolution timeline entry `- **{today YYYY-MM-DD}** | Task resolved in session:{session_id}. {reason}. [Source: session:{session_id}, {today YYYY-MM-DD}]` and apply timeline merge **Mode B** against `task_content` (compiled-truth zone preserved as-is).
+2. `akb_update(uri={task_uri}, content={merged}, tags=[...existing, "resolved"], status="archived", message="Resolved in session {session_doc_id}")`.
 
 The archived task document is the record of resolution.
 

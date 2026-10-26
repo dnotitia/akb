@@ -13,6 +13,7 @@ export function WorkspaceSectionHeader({
   right,
   className,
   testId,
+  compact = false,
 }: {
   id: string;
   icon: LucideIcon;
@@ -22,27 +23,28 @@ export function WorkspaceSectionHeader({
   right?: ReactNode;
   className?: string;
   testId?: string;
+  compact?: boolean;
 }) {
   return (
     <div
       data-slot="workspace-section-header"
       data-testid={testId}
-      className={cn("mb-2.5 border-b border-border px-0.5 pb-3", className)}
+      className={cn("border-b border-border px-0.5 pb-3", compact ? "mb-4" : "mb-2.5", className)}
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div
           className={cn(
-            "flex min-w-0 gap-3",
+            "flex min-w-0", compact ? "gap-2" : "gap-3",
             description ? "items-start" : "items-center",
           )}
         >
-          <TonalIcon tone={tone}>
+          <TonalIcon tone={tone} size={compact ? "sm" : "md"}>
             <Icon className="h-4 w-4" aria-hidden />
           </TonalIcon>
           <div className="min-w-0">
             <h2
               id={id}
-              className="font-display text-base font-semibold tracking-tight text-foreground"
+              className={cn("font-display font-semibold tracking-tight text-foreground", compact ? "text-sm" : "text-base")}
             >
               {title}
             </h2>

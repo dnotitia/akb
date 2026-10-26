@@ -246,14 +246,14 @@ test("Connection invitation minimizes, survives reload, and preserves a new secr
   await expect(launcher).toBeFocused();
 });
 
-test("Transparent notifications and global search suspend floating chrome", async ({ page }) => {
+test("Nonmodal notifications keep background actions usable; global search suspends floating chrome", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
   const invitation = page.getByTestId("home-connection-invitation");
   await expect(invitation).toBeVisible();
   await page.getByRole("button", { name: /^Notifications,/ }).click();
   await expect(page.getByTestId("notification-panel")).toBeVisible();
-  await expect(invitation).toBeHidden();
+  await expect(invitation).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(invitation).toBeVisible();
   await page.getByRole("button", { name: "Search knowledge", exact: true }).click();

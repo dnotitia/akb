@@ -1,0 +1,27 @@
+[
+  {
+    "case": "overview-info-pending",
+    "overviewVisible": false,
+    "mainText": "fixture\nVaults\nAll collections\nCollections\n\nLoading vault overview…"
+  },
+  {
+    "case": "home-summary-refetch-503",
+    "before": "Resources in vaults you can access.\nVaults\n1\nDocuments\n36\nTables\n2\nFiles\n7",
+    "after": "Resources in vaults you can access.\nVaults\n1\nDocuments\n—\nTables\n—\nFiles\n—\n\nTotals unavailableRetry totals"
+  },
+  {
+    "case": "activity-initial-503",
+    "alert": "Failed to load",
+    "busy": 1
+  },
+  {
+    "case": "vault-templates-pending",
+    "selects": [
+      {
+        "text": "None — empty vault",
+        "disabled": false,
+        "busy": null
+      }
+    ]
+  }
+]

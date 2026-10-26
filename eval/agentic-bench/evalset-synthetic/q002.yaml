@@ -1,0 +1,13 @@
+id: q002
+category: decision-lookup
+query: "In the fictional Orchard demo, how does ADR-001 admit writes and what happens if the queue wait expires?"
+ground_truth:
+  must_mention:
+    - "coroutine"
+    - "429"
+    - "Retry-After"
+  forbidden:
+    - "rejected immediately without waiting"
+    - "holds a database connection while it waits"
+  source_docs:
+    - "akb://bench-synthetic/coll/fixtures/doc/adr-001-write-queue.md"

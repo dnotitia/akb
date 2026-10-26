@@ -89,16 +89,18 @@ async def _lock_provisioning(conn) -> None:
     )
 
 
-async def _designated_user(conn, *, auth_provider: Literal["local", "keycloak"]):
+async def _designated_user(conn, *, auth_provider: Literal["local", "keycloak"], target_id: uuid.UUID | None = None):
     return await conn.fetchrow(
         """
         SELECT id, username, email, password_hash, is_admin, is_recovery_admin,
                auth_provider, account_status, account_kind
           FROM users
          WHERE is_recovery_admin AND auth_provider = $1
+           AND sso_recovery_target_id IS NOT DISTINCT FROM $2::uuid
          FOR UPDATE
         """,
         auth_provider,
+        target_id,
     )
 
 
@@ -239,6 +241,7 @@ async def provision_sso_recovery_admin(
     email: str,
     issuer: str,
     subject: str,
+    target_id: uuid.UUID | None = None,
 ) -> dict:
     """Pre-bind the one SSO recovery admin to an exact issuer and subject."""
     _require_mode("sso")
@@ -248,6 +251,12 @@ async def provision_sso_recovery_admin(
     subject = _required(subject, "subject")
     if bounded_nonempty_claim(subject, maximum=OIDC_SUBJECT_MAX_LENGTH) is None:
         raise ValidationError("subject exceeds maximum length")
+    if target_id is not None and (
+        str(target_id) != getattr(settings, "sso_prepared_target_id", "")
+        or username != f"akb-recovery-{target_id.hex}"
+        or issuer != f"{settings.keycloak_server_url.rstrip('/')}/realms/{settings.keycloak_realm}"
+    ):
+        raise RecoveryAdminModeError()
     pool = await get_pool()
     created = False
 
@@ -255,7 +264,7 @@ async def provision_sso_recovery_admin(
         async with pool.acquire() as conn:
             async with role_authority_transaction(conn):
                 await _lock_provisioning(conn)
-                row = await _designated_user(conn, auth_provider="keycloak")
+                row = await _designated_user(conn, auth_provider="keycloak", target_id=target_id)
                 if row is not None:
                     identities = await conn.fetch(
                         """
@@ -312,8 +321,9 @@ async def provision_sso_recovery_admin(
                         """
                         INSERT INTO users (
                             id, username, email, password_hash, is_admin,
-                            is_recovery_admin, auth_provider, account_status, account_kind
-                        ) VALUES ($1, $2, $3, $4, true, true, 'keycloak', 'active', 'human')
+                            is_recovery_admin, auth_provider, account_status, account_kind,
+                            sso_recovery_target_id
+                        ) VALUES ($1, $2, $3, $4, true, true, 'keycloak', 'active', 'human', $5)
                         RETURNING id, username, email, password_hash, is_admin,
                                   is_recovery_admin, auth_provider, account_status, account_kind
                         """,
@@ -321,6 +331,7 @@ async def provision_sso_recovery_admin(
                         username,
                         email,
                         _SSO_PASSWORD_SENTINEL,
+                        target_id,
                     )
                     await conn.execute(
                         """
@@ -433,9 +444,12 @@ async def _locked_recovery_rows(conn):
                ) AS has_sso_browser_sessions
           FROM users u
          WHERE u.is_recovery_admin
+           AND (u.auth_provider = 'local' OR
+                u.sso_recovery_target_id IS NOT DISTINCT FROM $1::uuid)
          ORDER BY u.id
          FOR UPDATE OF u
-        """
+        """,
+        uuid.UUID(getattr(settings, "sso_prepared_target_id", "")) if getattr(settings, "sso_prepared_target_id", "") else None,
     )
 
 
@@ -446,9 +460,11 @@ async def _locked_sso_recovery_identities(conn):
           FROM external_identities e
           JOIN users u ON u.id = e.user_id
          WHERE u.is_recovery_admin AND u.auth_provider = 'keycloak'
+           AND u.sso_recovery_target_id IS NOT DISTINCT FROM $1::uuid
          ORDER BY e.user_id, e.issuer, e.subject
          FOR UPDATE OF e /* recovery-successor-authority-lock */
-        """
+        """,
+        uuid.UUID(getattr(settings, "sso_prepared_target_id", "")) if getattr(settings, "sso_prepared_target_id", "") else None,
     )
     identities: dict[uuid.UUID, list] = {}
     for row in rows:

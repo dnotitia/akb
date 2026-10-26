@@ -13,6 +13,7 @@ from app.exceptions import (
     AuthenticationError,
     ConflictError,
     ForbiddenError,
+    GrepScopeTooLargeError,
     NotFoundError,
     ValidationError,
     VaultNameUnavailableError,
@@ -56,6 +57,16 @@ def test_vault_name_conflict_keeps_specific_non_disclosing_code():
 
 def test_validation_maps_to_invalid_argument():
     assert exception_envelope(ValidationError("bad column"))["code"] == INVALID_ARGUMENT
+
+
+def test_protective_grep_rejection_has_actionable_stable_envelope():
+    error = GrepScopeTooLargeError("resources", 10_000)
+    envelope = exception_envelope(error)
+    assert envelope["code"] == "grep_scope_too_large"
+    assert envelope["details"] == {"limit_kind": "resources", "candidate_limit": 10_000}
+    assert "collection" in envelope["hint"]
+    assert "does not reduce candidate scanning" in envelope["error"]
+    assert error.status_code == 422
 
 
 def test_unknown_exception_stays_internal():

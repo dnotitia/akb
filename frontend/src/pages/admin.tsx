@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "react-router-dom";
 
 import { Alert } from "@/components/ui/alert";
@@ -23,6 +23,7 @@ import {
   setAdminSsoProviderEnabled,
   setToken,
   type AdminSsoProvider,
+  type AdminSsoCatalog,
 } from "@/lib/api";
 
 
@@ -216,6 +217,7 @@ function providerBadge(state: AdminSsoProvider["state"]) {
 }
 
 function SsoProviderControl() {
+  const queryClient = useQueryClient();
   const mounted = useRef(true);
   const editRevision = useRef(0);
   const saveGeneration = useRef(0);
@@ -229,12 +231,23 @@ function SsoProviderControl() {
   const [togglingAlias, setTogglingAlias] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const catalogQuery = useQuery({
+  const catalogQuery = useQuery<AdminSsoCatalog | null>({
     queryKey: ["admin-sso-catalog", 1],
-    queryFn: getAdminSsoCatalog,
+    queryFn: async ({ signal }) => {
+      try { return await getAdminSsoCatalog(); }
+      catch (error) {
+        if (!signal.aborted && [401, 403].includes((error as { status?: number })?.status ?? 0)) {
+          // Undefined would leave the old value untouched. An explicit empty
+          // cache also keeps protected configuration hidden after remounts.
+          queryClient.setQueryData<AdminSsoCatalog | null>(["admin-sso-catalog", 1], null);
+        }
+        throw error;
+      }
+    },
     staleTime: 10_000,
   });
-  const catalog = catalogQuery.data;
+  const catalogAccessDenied = [401, 403].includes((catalogQuery.error as { status?: number } | null)?.status ?? 0);
+  const catalog = catalogAccessDenied ? undefined : catalogQuery.data;
 
   function setField(field: keyof typeof form, value: string) {
     editRevision.current += 1;
@@ -320,10 +333,19 @@ function SsoProviderControl() {
     setNotice("");
     setTogglingAlias(provider.alias);
     try {
-      await setAdminSsoProviderEnabled(provider.alias, enabled);
+      const updated = await setAdminSsoProviderEnabled(provider.alias, enabled);
       if (!mounted.current) return;
+      // The mutation response is authoritative even if the following read fails.
+      // Cancel older catalog reads before publishing it so they cannot restore
+      // the pre-change toggle state.
+      await queryClient.cancelQueries({ queryKey: ["admin-sso-catalog", 1] });
+      if (!mounted.current) return;
+      queryClient.setQueryData<AdminSsoCatalog>(["admin-sso-catalog", 1], current => current ? {
+        ...current,
+        providers: current.providers.map(item => item.alias === updated.alias ? updated : item),
+      } : current);
       if (revision === editRevision.current && generation === toggleGeneration.current) {
-        setNotice(`${provider.display_name} was ${enabled ? "enabled" : "disabled"}.`);
+        setNotice(`${updated.display_name} was ${updated.enabled ? "enabled" : "disabled"}.`);
       }
       await catalogQuery.refetch();
     } catch (caught) {
@@ -338,8 +360,8 @@ function SsoProviderControl() {
   if (catalogQuery.isPending) {
     return <SsoProvidersLoading />;
   }
-  if (catalogQuery.isError || !catalog) {
-    return <Alert variant="destructive">SSO provider configuration could not be loaded.</Alert>;
+  if (!catalog) {
+    return <Alert variant="destructive">SSO provider configuration could not be loaded. <Button variant="outline" size="sm" loading={catalogQuery.isFetching} onClick={() => void catalogQuery.refetch()}>Retry providers</Button></Alert>;
   }
   if (catalog.control_mode === "delegated") {
     return (
@@ -355,7 +377,9 @@ function SsoProviderControl() {
   const selectedCapabilities = selectedProvider?.capabilities;
 
   return (
-    <div className="space-y-4" aria-labelledby="sso-providers-heading">
+    <div className="space-y-4" aria-labelledby="sso-providers-heading" aria-busy={catalogQuery.isFetching}>
+      {catalogQuery.isFetching && <p role="status" className="text-sm text-foreground-muted">Updating provider configuration…</p>}
+      {catalogQuery.isError && <Alert variant="warning">Could not update provider configuration. Previous settings are shown. Any completed change remains applied.<Button variant="outline" size="sm" loading={catalogQuery.isFetching} onClick={() => void catalogQuery.refetch()}>Retry providers</Button></Alert>}
       <div>
         <h2 id="sso-providers-heading" className="font-display text-xl font-semibold tracking-tight">
           SSO providers
@@ -395,7 +419,7 @@ function SsoProviderControl() {
                       type="button"
                       size="sm"
                       variant={provider.enabled ? "outline" : "default"}
-                      disabled={provider.state === "configuration_error" && !provider.enabled}
+                      disabled={togglingAlias !== null || (provider.state === "configuration_error" && !provider.enabled)}
                       loading={togglingAlias === provider.alias}
                       onClick={() => toggleProvider(provider)}
                     >

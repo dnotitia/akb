@@ -193,7 +193,7 @@ def stubbed_mcp_client(monkeypatch):
 
 
 def test_every_stage_resolves_the_same_evalset(monkeypatch, stubbed_mcp_client):
-    seed = BENCH_ROOT / "evalset-project-akb"
+    seed = BENCH_ROOT / "evalset-synthetic"
     monkeypatch.setenv("EVALSET_DIR", str(seed))
 
     import src.judge

@@ -25,6 +25,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SearchVaultPicker, VaultQuerySuggestions } from "@/components/search-vault-picker";
+import { InlineLoadingState } from "@/components/ui/loading-state";
 import { Alert } from "@/components/ui/alert";
 import { appRouteContract } from "@/app-route-contract";
 import { cn } from "@/lib/utils";
@@ -151,6 +152,11 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   const [recentDocuments, setRecentDocuments] = useState<RecentDocumentView[]>([]);
   const [retryKey, setRetryKey] = useState(0);
   const normalizedQuery = query.trim();
+  const resultScope = JSON.stringify([normalizedQuery, vaults]);
+  const [appliedSearch, setAppliedSearch] = useState<{ scope: string; source: SearchSourceFilter } | null>(null);
+  const appliedSearchRef = useRef(appliedSearch);
+  appliedSearchRef.current = appliedSearch;
+  const previousSource = appliedSearch?.source !== activeSource;
   const sourceCounts = results.reduce(
     (counts, result) => {
       const source = result.source_type || "document";
@@ -159,7 +165,8 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
     },
     { document: 0, table: 0, file: 0 } as Record<SearchSource, number>,
   );
-  const visibleResults = loading || error ? [] : results;
+  const visibleResults = appliedSearch?.scope === resultScope ? results : [];
+  const resultsActionable = !previousSource && !loading;
   const hasRecentSearches = recentSearches.length > 0;
   const hasRecentDocuments = recentDocuments.length > 0;
 
@@ -249,7 +256,11 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
       return;
     }
 
-    setResults([]);
+    const scope = JSON.stringify([normalizedQuery, vaults]);
+    if (appliedSearchRef.current?.scope !== scope) {
+      setResults([]);
+      setAppliedSearch(null);
+    }
     setError(null);
     setIncomplete(false);
     setActiveIndex(-1);
@@ -260,13 +271,16 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
           if (currentRequest !== requestId.current) return;
           const nextResults = (response.results || []) as GlobalSearchResult[];
           setResults(nextResults);
+          setAppliedSearch({ scope, source: activeSource });
           setActiveIndex(nextResults.length > 0 ? 0 : -1);
           setIncomplete(Boolean(response.degraded));
         })
         .catch((caught: unknown) => {
           if (currentRequest !== requestId.current) return;
           setError(caught instanceof Error ? caught.message : "Search failed");
-          setResults([]);
+          if (typeof caught === "object" && caught !== null && "status" in caught && (caught.status === 401 || caught.status === 403)) {
+            setResults([]); setAppliedSearch(null);
+          }
           setActiveIndex(-1);
         })
         .finally(() => {
@@ -274,6 +288,8 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
         });
     }, 220);
 
+    // Invalidate the live generation so late completions cannot update a new scope.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     return () => { window.clearTimeout(timer); ++requestId.current; };
   }, [normalizedQuery, open, retryKey, activeSource, vaults]);
 
@@ -341,7 +357,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
   }
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.nativeEvent.isComposing || visibleResults.length === 0) return;
+    if (event.nativeEvent.isComposing || !resultsActionable || visibleResults.length === 0) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       selectResultWithKeyboard((activeIndex + 1) % visibleResults.length);
@@ -676,7 +692,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             </>
           )}
 
-          {normalizedQuery && loading && (
+          {normalizedQuery && loading && visibleResults.length === 0 && (
             <div className="divide-y divide-border" aria-hidden>
               {[0, 1, 2].map((item) => (
                 <div key={item} className="flex gap-3 px-4 py-3 sm:px-5">
@@ -690,9 +706,11 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             </div>
           )}
 
+          {normalizedQuery && loading && visibleResults.length > 0 && <InlineLoadingState label="Updating search; previous results shown" className="px-4 py-3" />}
+          {visibleResults.length > 0 && previousSource && <p className="px-4 py-2 text-xs text-foreground-muted">Previous results for {appliedSearch?.source === "all" ? "all content kinds" : appliedSearch?.source}; waiting for the selected content kind. Open actions are unavailable until the selected filter loads.</p>}
           {normalizedQuery && !loading && error && (
-            <div className="flex min-h-56 flex-col items-center justify-center px-5 text-center">
-              <p className="text-sm font-semibold text-foreground">Search is unavailable</p>
+            <div className={cn("flex flex-col items-center justify-center px-5 py-3 text-center", visibleResults.length === 0 && "min-h-56")}>
+              <p className="text-sm font-semibold text-foreground">{visibleResults.length ? "Search could not be updated; previous results shown" : "Search is unavailable"}</p>
               <p className="mt-1 max-w-md text-xs leading-relaxed text-foreground-muted">{error}</p>
               <Button
                 type="button"
@@ -745,7 +763,7 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
             </div>
           )}
 
-          {visibleResults.length > 0 && !loading && !error && (
+          {visibleResults.length > 0 && (
             <section aria-labelledby={`${id}-search-results-heading`}>
               <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
                 <h2
@@ -779,7 +797,8 @@ function KnowledgeSearchDialog({ contextVault }: { contextVault?: string }) {
                         type="button"
                         id={`${id}-search-result-${index}`}
                         role="option"
-                        aria-selected={index === activeIndex}
+                        aria-selected={resultsActionable && index === activeIndex}
+                        disabled={!resultsActionable}
                         tabIndex={-1}
                         onMouseMove={() => setActiveIndex(index)}
                         onClick={() => openResult(result)}

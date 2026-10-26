@@ -1,11 +1,12 @@
-import { useMemo, useState } from "react";
-import { Check, Code2, Copy, Eye } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { readWithAccessBoundary } from "@/lib/query-access-boundary";
+import { Button } from "@/components/ui/button";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
-import { formatByteSize, formatLineCount, getDocumentStats } from "@/lib/document-statistics";
 import { MarkdownRender } from "@/components/markdown-render";
 import { Alert } from "@/components/ui/alert";
-import { TooltipText } from "@/components/ui/tooltip-text";
+import { DocumentCopyButton, DocumentReadModes, DocumentTimestamp } from "@/components/document-reading-controls";
+import { ResourceCommandRow } from "@/components/resource-command-row";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -31,7 +32,6 @@ interface DocumentViewProps {
   appearance?: "plain" | "file";
   /** The resource shell owns commands; render only the reading surface. */
   bodyOnly?: boolean;
-  readingWidth?: "standard" | "wide";
   idPrefix?: string;
 }
 
@@ -59,9 +59,9 @@ export function DocumentView({
   version,
   appearance = "plain",
   bodyOnly = false,
-  readingWidth = "standard",
   idPrefix = "docview",
 }: DocumentViewProps) {
+  const queryClient = useQueryClient();
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const [localView, setLocalView] = useState<ViewMode>("rendered");
@@ -76,38 +76,26 @@ export function DocumentView({
     }
   };
 
-  const { data: doc, isLoading, error } = useQuery({
+  const { data: doc, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ["document", vault, docId, version, user?.user_id, revision],
-    queryFn: () => getDocument(vault, docId, version),
+    queryFn: ({ queryKey, signal }) => readWithAccessBoundary(queryClient, queryKey, () => getDocument(vault, docId, version), signal),
     enabled: !!vault && !!docId && !checking,
     retry: false,
+    // The page already owns this query. Mounting its body must not immediately
+    // refetch the response that just replaced the page skeleton.
+    refetchOnMount: !bodyOnly,
   });
 
-  const [copiedRaw, setCopiedRaw] = useState(false);
-  const contentStats = useMemo(
-    () => getDocumentStats(doc?.content || ""),
-    [doc?.content],
-  );
-
-  async function copyRaw() {
-    try {
-      await navigator.clipboard.writeText(doc?.content || "");
-      setCopiedRaw(true);
-      setTimeout(() => setCopiedRaw(false), 1500);
-    } catch {
-      // clipboard API may be unavailable; silently no-op
-    }
-  }
-
   if (isLoading) {
-    return <DocumentViewLoading appearance={appearance} bodyOnly={bodyOnly} readingWidth={readingWidth} />;
+    return <DocumentViewLoading appearance={appearance} bodyOnly={bodyOnly} />;
   }
 
-  if (error || !doc) {
+  if (!doc) {
     return (
       <Alert variant="destructive" className="my-4">
         Couldn't load this document body.
         {error instanceof Error ? ` ${error.message}` : ""}
+        <Button variant="outline" size="sm" loading={isFetching} onClick={() => void refetch()}>Retry document body</Button>
       </Alert>
     );
   }
@@ -118,43 +106,35 @@ export function DocumentView({
     <section
       aria-label="Document content"
       className={cn(
-        fileAppearance && "document-reading-container",
+        "document-reading-container",
         fileAppearance && !bodyOnly &&
           "overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
       )}
     >
-      {/* ── Rendered/Raw segmented control ────────────────────────
-         WAI-ARIA tabs pattern: ArrowLeft/ArrowRight (and Home/End)
-         move focus between tabs; Enter/Space activates. Each tab
-         points at its panel via aria-controls so screen readers
-         announce the relationship. Editing is a document action in
-         the workspace header, not a third read-mode tab. */}
-      {!bodyOnly && <TabStrip
-        view={view}
-        onSelect={setView}
-        appearance={appearance}
-        copiedRaw={copiedRaw}
-        onCopyRaw={copyRaw}
-        lineCount={contentStats.lineCount}
-        byteCount={contentStats.byteCount}
-        summary={doc.summary}
-      />}
+      {!bodyOnly && <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={
+        <div className="document-reader-status">{!version && <DocumentTimestamp value={doc.updated_at} compact />}</div>
+      }>
+        <div role="group" aria-label="Document reading tools" className="document-reader-controls">
+          <DocumentReadModes view={view} onChange={setView} idPrefix={idPrefix} contentId={`${idPrefix}-content`} />
+        </div>
+        <DocumentCopyButton key={`${vault}:${docId}:${version ?? "latest"}`} content={doc.content || ""} />
+      </ResourceCommandRow>}
+
+      {!bodyOnly && error && <Alert variant="destructive">Document could not be updated. Previous content shown. <Button size="sm" variant="outline" loading={isFetching} onClick={() => void refetch()}>Retry document body</Button></Alert>}
 
       {/* ── Doc body ──────────────────────────────────────────────── */}
       {view === "rendered" ? (
         <div
-          id={`${idPrefix}-panel-rendered`}
-          role="tabpanel"
-          aria-labelledby={`${idPrefix}-tab-rendered`}
-          className={cn(
-            "min-w-0",
-            fileAppearance && "document-reading-inset",
-          )}
+          id={`${idPrefix}-content`}
+          role="region"
+          aria-label="Document preview"
+          className="document-reading-inset min-w-0"
           style={{ maxWidth: "100%" }}
         >
           <MarkdownRender
             markdown={doc.content || ""}
-            className={fileAppearance ? cn("document-reading-flow", readingWidth === "wide" && "document-reading-wide") : undefined}
+            summary={doc.summary}
+            className="document-reading-flow"
             assetContext={{
               mode: "authenticated",
               vault,
@@ -165,32 +145,14 @@ export function DocumentView({
         </div>
       ) : (
         <div
-          id={`${idPrefix}-panel-raw`}
-          role="tabpanel"
-          aria-labelledby={`${idPrefix}-tab-raw`}
-          className={cn(
-            "relative",
-            fileAppearance && "document-reading-inset bg-surface",
-          )}
+          id={`${idPrefix}-content`}
+          role="region"
+          aria-label="Raw markdown source"
+          className="document-reading-inset relative bg-surface"
         >
-          {!fileAppearance && !bodyOnly && (
-            <button
-              type="button"
-              onClick={copyRaw}
-              aria-label={copiedRaw ? "Markdown copied" : "Copy markdown"}
-              className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-foreground-muted hover:text-link border border-border bg-surface rounded-[var(--radius-sm)] transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            >
-              {copiedRaw ? "Copied" : "Copy"}
-            </button>
-          )}
           <pre
             data-testid="doc-raw"
-            className={cn(
-              "font-mono text-[13px] leading-[1.65] whitespace-pre-wrap overflow-x-auto",
-              fileAppearance
-                ? cn("document-reading-source m-0 wrap-anywhere text-foreground", readingWidth === "wide" && "document-reading-wide")
-                : "bg-surface-muted p-4 border border-border rounded-[var(--radius-lg)]",
-            )}
+            className="document-reading-source m-0 wrap-anywhere overflow-x-auto whitespace-pre-wrap font-mono text-[13px] leading-[1.65] text-foreground"
           >
             {doc.content || ""}
           </pre>
@@ -200,12 +162,13 @@ export function DocumentView({
   );
 }
 
-function DocumentViewLoading({ appearance, bodyOnly, readingWidth }: Pick<DocumentViewProps, "appearance" | "bodyOnly" | "readingWidth">) {
+function DocumentViewLoading({ appearance, bodyOnly }: Pick<DocumentViewProps, "appearance" | "bodyOnly">) {
   return (
     <LoadingState
       label="Loading document body"
+      delayMs={200}
       className={cn(
-        appearance === "file" && "document-reading-container",
+        "document-reading-container",
         appearance === "file" && !bodyOnly &&
           "min-h-[28rem] overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm",
       )}
@@ -216,8 +179,8 @@ function DocumentViewLoading({ appearance, bodyOnly, readingWidth }: Pick<Docume
           <Skeleton className="h-7 w-16 rounded-[var(--radius-sm)]" />
           <Skeleton className="ml-auto h-3 w-28 rounded-[var(--radius-sm)]" />
         </div>}
-        <div className={appearance === "file" ? "document-reading-inset" : "mx-auto max-w-4xl px-5 py-8 sm:px-8 lg:px-12"}>
-          <div className={cn("space-y-4", appearance === "file" && "document-reading-source", readingWidth === "wide" && "document-reading-wide")}>
+        <div className="document-reading-inset">
+          <div className="document-reading-source space-y-4">
             <Skeleton className="h-8 w-3/5 rounded-[var(--radius-md)]" />
             <Skeleton className="h-4 w-full rounded-[var(--radius-sm)]" />
             <Skeleton className="h-4 w-11/12 rounded-[var(--radius-sm)]" />
@@ -229,150 +192,5 @@ function DocumentViewLoading({ appearance, bodyOnly, readingWidth }: Pick<Docume
         </div>
       </div>
     </LoadingState>
-  );
-}
-
-// ── Segmented control with WAI-ARIA tabs keyboard handling ──────
-interface TabStripProps {
-  view: ViewMode;
-  onSelect: (next: ViewMode) => void;
-  appearance: "plain" | "file";
-  copiedRaw: boolean;
-  onCopyRaw: () => void;
-  lineCount: number;
-  byteCount: number;
-  summary?: string | null;
-}
-
-function TabStrip({
-  view,
-  onSelect,
-  appearance,
-  copiedRaw,
-  onCopyRaw,
-  lineCount,
-  byteCount,
-  summary,
-}: TabStripProps) {
-  const tabs: Array<{
-    key: ViewMode;
-    label: string;
-    selected: boolean;
-    onActivate: () => void;
-    icon: typeof Eye;
-  }> = [
-    { key: "rendered", label: "Rendered", selected: view === "rendered", onActivate: () => onSelect("rendered"), icon: Eye },
-    { key: "raw", label: "Raw", selected: view === "raw", onActivate: () => onSelect("raw"), icon: Code2 },
-  ];
-
-  function onKey(e: React.KeyboardEvent<HTMLButtonElement>, idx: number) {
-    let next: number;
-    if (e.key === "ArrowRight") next = (idx + 1) % tabs.length;
-    else if (e.key === "ArrowLeft") next = (idx - 1 + tabs.length) % tabs.length;
-    else if (e.key === "Home") next = 0;
-    else if (e.key === "End") next = tabs.length - 1;
-    else return;
-    e.preventDefault();
-    const target = e.currentTarget.parentElement?.children[next] as HTMLElement | undefined;
-    target?.focus();
-  }
-
-  const fileAppearance = appearance === "file";
-
-  return (
-    <div
-      className={cn(
-        "flex items-center",
-        fileAppearance
-          ? "min-h-11 flex-wrap justify-end gap-2 border-b border-border bg-surface-2/60 px-3 py-1.5 sm:gap-3"
-          : "justify-end mb-3",
-      )}
-    >
-      {fileAppearance && (
-        <>
-          <div className="mr-auto flex min-w-0 flex-1 items-center gap-3">
-            <div
-              aria-label={`Document statistics: ${formatLineCount(lineCount)}, ${formatByteSize(byteCount)}`}
-              className="inline-flex min-h-8 shrink-0 items-center gap-2 text-xs tabular-nums text-foreground-muted"
-            >
-              <span>{formatLineCount(lineCount)}</span>
-              <span aria-hidden>·</span>
-              <span>{formatByteSize(byteCount)}</span>
-            </div>
-            {summary && (
-              <div
-                role="note"
-                aria-label="Document summary"
-                className="hidden min-w-0 flex-1 items-center gap-2 border-l border-border pl-3 lg:flex"
-              >
-                <span className="coord shrink-0 font-medium text-foreground-muted">
-                  Summary
-                </span>
-                <TooltipText
-                  as="p"
-                  tip={summary}
-                  className="truncate text-xs leading-relaxed text-foreground-muted"
-                >
-                  {summary}
-                </TooltipText>
-              </div>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={onCopyRaw}
-            aria-label={copiedRaw ? "Markdown copied" : "Copy markdown"}
-            className="inline-flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-surface text-xs font-medium text-foreground-muted transition-token hover:border-border-strong hover:bg-surface-hover hover:text-link focus:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto sm:px-2.5"
-          >
-            {copiedRaw ? (
-              <Check className="h-3.5 w-3.5 text-success" aria-hidden />
-            ) : (
-              <Copy className="h-3.5 w-3.5" aria-hidden />
-            )}
-            <span className="hidden sm:inline">
-              {copiedRaw ? "Copied" : "Copy"}
-            </span>
-          </button>
-        </>
-      )}
-      <div
-        role="tablist"
-        aria-label="Document view"
-        className={cn(
-          "inline-flex items-center gap-1",
-          fileAppearance
-            ? "bg-transparent p-0"
-            : "rounded-[var(--radius-md)] bg-surface-2 p-1",
-        )}
-      >
-        {tabs.map((t, i) => {
-          const Icon = t.icon;
-          const cls = cn(
-            "inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-[var(--radius-sm)] transition-token cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            t.selected
-              ? fileAppearance
-                ? "bg-surface-selected text-surface-selected-foreground"
-                : "bg-surface text-foreground shadow-sm"
-              : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-          );
-          return (
-            <button
-              key={t.key}
-              role="tab"
-              id={`docview-tab-${t.key}`}
-              aria-selected={t.selected}
-              aria-controls={`docview-panel-${t.key}`}
-              tabIndex={t.selected || (!tabs.some((x) => x.selected) && i === 0) ? 0 : -1}
-              onClick={t.onActivate}
-              onKeyDown={(e) => onKey(e, i)}
-              className={cls}
-            >
-              {fileAppearance && <Icon className="h-3.5 w-3.5" aria-hidden />}
-              {t.label}
-            </button>
-          );
-        })}
-      </div>
-    </div>
   );
 }

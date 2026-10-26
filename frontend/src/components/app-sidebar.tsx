@@ -6,8 +6,8 @@ import {
   Boxes,
   House,
   CircleHelp,
-  PanelLeftClose,
-  PanelLeftOpen,
+  ChevronsLeft,
+  ChevronsRight,
   Search,
   Settings,
   type LucideIcon,
@@ -144,9 +144,9 @@ export function AppSidebar({
                     className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
                   >
                     {compact ? (
-                      <PanelLeftOpen className="h-4 w-4" aria-hidden />
+                      <ChevronsRight className="h-4 w-4" aria-hidden />
                     ) : (
-                      <PanelLeftClose className="h-4 w-4" aria-hidden />
+                      <ChevronsLeft className="h-4 w-4" aria-hidden />
                     )}
                   </button>
                 </TooltipTrigger>
@@ -194,10 +194,10 @@ export function AppSidebar({
                     <TooltipText className="min-w-0 truncate" tip={vault.name}>{vault.name}</TooltipText>
                   </Link>
                   <DropdownMenu.Root>
-                    <DropdownMenu.Trigger aria-label={`Options for ${vault.name}`} className="mr-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100 hover:bg-surface-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                    <DropdownMenu.Trigger aria-label={`Options for ${vault.name}`} className="mr-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-[var(--radius-sm)] opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:h-11 pointer-coarse:w-11 pointer-coarse:opacity-100 data-[state=open]:opacity-100 hover:bg-surface-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                       <MoreHorizontal className="h-3.5 w-3.5" aria-hidden />
                     </DropdownMenu.Trigger>
-                    <DropdownMenu.Portal><DropdownMenu.Content side="right" align="start" sideOffset={8} onCloseAutoFocus={event => { event.preventDefault(); focusFavorites(); }} className="z-[var(--z-popover)] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md">
+                    <DropdownMenu.Portal><DropdownMenu.Content side="right" align="start" sideOffset={8} className="z-[var(--z-popover)] rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md">
                       <DropdownMenu.Item onSelect={() => { toggleFavorite(vault.id); requestAnimationFrame(focusFavorites); }} className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover">
                         <StarOff className="h-4 w-4" aria-hidden />Remove from favorites
                       </DropdownMenu.Item>
@@ -263,19 +263,13 @@ function AppSidebarLink({
   compact: boolean;
   selected: boolean;
 }) {
-  const link = (
-    <Link
-      to={to}
-      id={to === "/vault" ? "workspace-vaults-link" : undefined}
-      aria-label={compact ? label : undefined}
-      aria-current={selected ? "page" : undefined}
-      className={cn(
+  const className = cn(
         "relative flex h-10 w-full min-w-0 shrink-0 items-center gap-3 rounded-[var(--radius-md)] px-3 text-sm font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         selected
           ? "bg-surface-selected text-surface-selected-foreground"
           : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-      )}
-    >
+      );
+  const content = <>
       {selected && (
         <span
           className="absolute bottom-2 left-0 top-2 w-0.5 rounded-full bg-primary"
@@ -284,8 +278,9 @@ function AppSidebarLink({
       )}
       <Icon className="h-4 w-4 shrink-0" aria-hidden />
       {!compact && <span>{label}</span>}
-    </Link>
-  );
+    </>;
+  const link = <Link to={to} id={to === "/vault" ? "workspace-vaults-link" : undefined} aria-label={compact ? label : undefined}
+    aria-current={selected ? "page" : undefined} className={className}>{content}</Link>;
 
   if (!compact) return link;
 

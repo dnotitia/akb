@@ -3,7 +3,7 @@
 One definition, three consumers. `runner.py`, `prep_judge_v3.py` and
 `judge.py` each used to resolve these on their own, so `EVALSET_DIR` could
 select the seed question set for one stage of a run and not the next —
-the runner would answer `evalset-project-akb/q001` and the judge would
+the runner would answer `evalset-synthetic/q001` and the judge would
 score it against a `evalset/q001` that means something else entirely, with
 nothing in the output saying so.
 
@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 #: Selects the question set. Default `evalset/` is the private hand-authored
-#: one the harness shipped against; `evalset-project-akb/` is the tracked
+#: one the harness shipped against; `evalset-synthetic/` is the tracked
 #: seed set in this repository.
 EVALSET_DIR_ENV = "EVALSET_DIR"
 #: Selects the run directory. Required for any version other than `runs/`.

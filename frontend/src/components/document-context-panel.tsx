@@ -1,209 +1,158 @@
-import { useCallback, useId, useLayoutEffect, useRef, useState, type FocusEventHandler, type MouseEventHandler, type ReactNode } from "react";
+import { useCallback, useId, useLayoutEffect, useRef, useState, type FocusEventHandler, type MouseEventHandler, type ReactNode, type RefObject } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { DismissableLayer } from "@radix-ui/react-dismissable-layer";
-import { History, Info, Link2, ListTree, X } from "lucide-react";
+import { ChevronDown, X } from "lucide-react";
 import { Dialog, DialogOverlay, DialogPortal, DialogTitle } from "@/components/ui/dialog";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useModalCount } from "@/lib/modal-visibility";
 
-const views = [
-  { id: "info", label: "Document info", heading: "Document info", icon: Info },
-  { id: "outline", label: "Table of contents", heading: "On this page", icon: ListTree },
-  { id: "relations", label: "Relations", heading: "Relations", icon: Link2 },
-  { id: "history", label: "Version history", heading: "Version history", icon: History },
-] as const;
+export type DocumentContextView = "info" | "outline" | "relations" | "history";
+const sections = [{ id: "info", label: "Properties" }, { id: "history", label: "Version history" }, { id: "relations", label: "Related documents" }] as const;
 
-type ContextView = typeof views[number]["id"];
-
-function scrollToHeading(heading: HTMLElement) {
-  // scrollIntoView also scrolls overflow:hidden ancestors. A tall collection
-  // tree can give the app shell hidden overflow even when this article is
-  // short, pulling both sidebars under the header and leaving a bottom gap.
-  // Only the reader owns heading navigation; never scroll its outer shells.
-  const canvas = heading.closest<HTMLElement>("#document-reading-canvas");
-  if (canvas) {
-    canvas.scrollTop += heading.getBoundingClientRect().top - canvas.getBoundingClientRect().top - canvas.clientTop;
-  }
-}
-
-/** Context floats above the article without changing its measure. Small or
- * short reading workspaces use a modal so its controls remain reachable. */
-export function DocumentContextPanel({ open, onOpenChange, view, onViewChange, children }: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  view: ContextView;
-  onViewChange: (view: ContextView) => void;
-  children: ReactNode;
+/** One inspector beside a wide article, or a modal sheet in a constrained reader. */
+export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view, onViewChange, triggerRef, outline, info, history, relations, focusRequest = 0, focusTargetRef, onFocusTarget }: {
+  id?: string; open: boolean; onOpenChange: (open: boolean) => void;
+  view: DocumentContextView; onViewChange: (view: DocumentContextView) => void;
+  triggerRef: RefObject<HTMLButtonElement | null>; outline: ReactNode; info: ReactNode; history: ReactNode; relations: ReactNode; focusRequest?: number;
+  /** An explicit return target takes precedence over opening/disclosure focus. */
+  focusTargetRef?: RefObject<HTMLElement | null>; onFocusTarget?: () => void;
 }) {
-  const id = useId();
-  const railRef = useRef<HTMLDivElement>(null);
+  const generatedId = useId();
+  const id = suppliedId ?? generatedId;
+  const markerRef = useRef<HTMLSpanElement>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const triggerRefs = useRef<Partial<Record<ContextView, HTMLButtonElement | null>>>({});
-  const [floating, setFloating] = useState(false);
-  const previousFloatingOpen = useRef(false);
-  const restoreTriggerFocus = useRef(true);
+  const [docked, setDocked] = useState(false);
   const latestOpen = useRef(open);
-  const current = views.find(item => item.id === view)!;
-  const modalCount = useModalCount();
-  const supportingDialog = useRef(false);
+  const previousDockedOpen = useRef(false);
   const lastPanelFocus = useRef<HTMLElement | null>(null);
-
+  const pendingInsideFocus = useRef<HTMLElement | null>(null);
+  const supportingDialog = useRef(false);
+  const modalCount = useModalCount();
+  const sectionRefs = useRef<Partial<Record<DocumentContextView, HTMLElement | null>>>({});
+  const previousRequest = useRef(0);
   const hasForegroundDialog = useCallback(() => {
-    const rail = railRef.current;
-    return Boolean(rail && Array.from(rail.ownerDocument.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
-      .some(dialog => dialog.id !== id && dialog.getAttribute("data-state") !== "closed" && dialog.getAttribute("aria-hidden") !== "true" && !dialog.contains(rail)));
+    const marker = markerRef.current;
+    return Boolean(marker && Array.from(marker.ownerDocument.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+      .some(dialog => dialog.id !== id && dialog.getAttribute("data-state") !== "closed" && dialog.getAttribute("aria-hidden") !== "true" && !dialog.contains(marker)));
   }, [id]);
-
-  const restoreFocus = useCallback(() => {
-    if (restoreTriggerFocus.current) triggerRefs.current[view]?.focus({ preventScroll: true });
-  }, [view]);
-
+  const restoreTrigger = useCallback(() => triggerRef.current?.focus({ preventScroll: true }), [triggerRef]);
+  const focusRequestedTarget = useCallback(() => {
+    const target = focusTargetRef?.current;
+    if (!open || !target?.isConnected || !panelRef.current?.contains(target)) return false;
+    target.focus({ preventScroll: true });
+    if (target.ownerDocument.activeElement !== target) return false;
+    onFocusTarget?.();
+    return true;
+  }, [focusTargetRef, onFocusTarget, open]);
+  const restoreInsideFocus = useCallback(() => {
+    // A presentation change remounts the panel. Its autofocus must not replace
+    // the supporting dialog's opener before we can find its new DOM instance.
+    const previous = pendingInsideFocus.current ?? lastPanelFocus.current;
+    const candidate = previous?.isConnected ? previous : previous && Array.from(panelRef.current?.querySelectorAll<HTMLElement>('button, a[href], summary, input, textarea, select') ?? [])
+      .find(element => element.tagName === previous.tagName && element.getAttribute("aria-label") === previous.getAttribute("aria-label") && element.textContent === previous.textContent);
+    pendingInsideFocus.current = null;
+    (candidate ?? closeRef.current)?.focus({ preventScroll: true });
+  }, []);
   useLayoutEffect(() => {
     latestOpen.current = open;
-    const floatingOpen = open && floating;
-    if (floatingOpen && !previousFloatingOpen.current) closeRef.current?.focus({ preventScroll: true });
-    if (!open && previousFloatingOpen.current) restoreFocus();
-    previousFloatingOpen.current = floatingOpen;
-  }, [open, floating, restoreFocus]);
-
+    const dockedOpen = open && docked;
+    if (dockedOpen && !previousDockedOpen.current && !focusRequestedTarget()) {
+      if (pendingInsideFocus.current) restoreInsideFocus();
+      else closeRef.current?.focus({ preventScroll: true });
+    }
+    if (!open && previousDockedOpen.current) restoreTrigger();
+    previousDockedOpen.current = dockedOpen;
+  }, [open, docked, focusRequestedTarget, restoreInsideFocus, restoreTrigger]);
   useLayoutEffect(() => {
-    const layout = railRef.current?.parentElement;
+    const layout = markerRef.current?.parentElement;
     if (!layout) return;
     const measure = () => {
-      // Changing the presentation remounts children. Defer that while a
-      // property/relation dialog owns a live draft or keyboard focus.
-      if (latestOpen.current && hasForegroundDialog()) {
-        supportingDialog.current = true;
-        return;
-      }
-      if (supportingDialog.current) {
-        supportingDialog.current = false;
-        // Supporting dialogs without a DialogTrigger cannot restore focus
-        // themselves. Keep their opener if this presentation survives resize.
-        const opener = lastPanelFocus.current;
-        requestAnimationFrame(() => {
-          if (latestOpen.current && opener?.isConnected && !hasForegroundDialog()) opener.focus({ preventScroll: true });
-        });
-      }
+      // Do not remount a relation/property editor during a child dialog's draft.
+      if (latestOpen.current && hasForegroundDialog()) { supportingDialog.current = true; return; }
+      const returningFromDialog = supportingDialog.current;
+      supportingDialog.current = false;
+      if (returningFromDialog) pendingInsideFocus.current = lastPanelFocus.current;
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
       const bounds = layout.getBoundingClientRect();
-      // Leave visible article space beside the 24rem popover and 3rem rail.
-      setFloating(bounds.width >= 48 * rem && bounds.height >= 20 * rem);
+      setDocked(bounds.width >= 48 * rem && bounds.height >= 20 * rem);
+      if (returningFromDialog) requestAnimationFrame(() => { if (latestOpen.current && !hasForegroundDialog()) restoreInsideFocus(); });
     };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(layout);
-    // Closing a supporting dialog restores focus even if no resize follows.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(layout);
     layout.ownerDocument.addEventListener("focusin", measure);
-    return () => {
-      observer.disconnect();
-      layout.ownerDocument.removeEventListener("focusin", measure);
+    return () => { observer?.disconnect(); layout.ownerDocument.removeEventListener("focusin", measure); };
+  }, [hasForegroundDialog, modalCount, restoreInsideFocus]);
+  useLayoutEffect(() => {
+    // History can arrive after the panel opens. Keep the request in its caller
+    // until the requested control is mounted and successfully receives focus.
+    focusRequestedTarget();
+  }, [focusRequestedTarget, docked, history]);
+  useLayoutEffect(() => {
+    if (!open || focusTargetRef) {
+      // Closing or an explicit return target cancels deferred section focus.
+      // Reopening after a comparison must respect the caller's focus restore;
+      // only a newly incremented request should focus a disclosure again.
+      previousRequest.current = focusRequest;
+      return;
+    }
+    if (!focusRequest || previousRequest.current === focusRequest) return;
+    let frame = 0;
+    const focusSection = (attempt = 0) => {
+      const target = sectionRefs.current[view];
+      if (!target) { if (attempt < 3) frame = requestAnimationFrame(() => focusSection(attempt + 1)); return; }
+      previousRequest.current = focusRequest;
+      target.focus({ preventScroll: true });
+      const scroll = target.closest<HTMLElement>('[data-slot="document-context-scroll"]');
+      if (scroll) scroll.scrollTop += target.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
     };
-  }, [hasForegroundDialog, modalCount]);
-
-  const controls = (insidePanel = false) => <TooltipProvider delayDuration={250}>
-    <div role="group" aria-label="Document context" className={cn("flex gap-1", insidePanel ? "border-b border-border px-3 py-1" : "flex-col items-center py-2")}>
-      {views.map(item => {
-        const active = open && view === item.id;
-        return <Tooltip key={item.id}>
-          <TooltipTrigger asChild>
-            <button
-              ref={insidePanel ? undefined : element => { triggerRefs.current[item.id] = element; }}
-              type="button"
-              aria-label={item.label}
-              aria-expanded={active}
-              aria-controls={active ? id : undefined}
-              onClick={() => {
-                restoreTriggerFocus.current = true;
-                onViewChange(item.id);
-                onOpenChange(insidePanel || !active);
-              }}
-              className={cn("relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-sm)] transition-token cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                active ? "bg-surface-selected text-surface-selected-foreground" : "text-foreground-muted hover:bg-surface-hover hover:text-foreground")}
-            >
-              <item.icon className="h-4 w-4" aria-hidden />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side={insidePanel ? "bottom" : "left"}>{item.label}</TooltipContent>
-        </Tooltip>;
-      })}
-    </div>
-  </TooltipProvider>;
-
+    frame = requestAnimationFrame(() => focusSection());
+    return () => cancelAnimationFrame(frame);
+  }, [focusRequest, focusTargetRef, open, view, docked]);
   const onPanelClick: MouseEventHandler<HTMLElement> = event => {
     if (!(event.target instanceof Element)) return;
     const href = event.target.closest("a")?.getAttribute("href");
     if (!href?.startsWith("#")) return;
-    const heading = railRef.current?.parentElement?.querySelector<HTMLElement>(`[id="${CSS.escape(href.slice(1))}"]`);
-    if (!heading) return;
-    // Native hash navigation discards the route-backed preview's history
-    // state. Navigate within this article without closing its parent preview.
+    const canvas = markerRef.current?.parentElement?.querySelector<HTMLElement>("#document-reading-canvas");
+    const heading = canvas?.querySelector<HTMLElement>(`[id="${CSS.escape(href.slice(1))}"]`);
+    if (!canvas || !heading) return;
     event.preventDefault();
-    // Keep focus on the outline link for repeated pointer/keyboard navigation.
-    // Focusing the article would dismiss the floating panel or escape the
-    // narrow overlay's focus scope. Only the document's scroll position changes.
-    scrollToHeading(heading);
+    canvas.scrollTop += heading.getBoundingClientRect().top - canvas.getBoundingClientRect().top - canvas.clientTop;
   };
-  const closePanel = () => {
-    restoreTriggerFocus.current = true;
-    onOpenChange(false);
-  };
-  const rememberPanelFocus: FocusEventHandler<HTMLElement> = event => {
-    // React focus events from portalled child dialogs also bubble here.
-    if (event.target instanceof HTMLElement && event.currentTarget.contains(event.target)) lastPanelFocus.current = event.target;
-  };
-  const panelClass = "flex min-h-0 flex-col overflow-hidden bg-surface text-foreground outline-none";
-  const panelBody = <>
-    <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-      {floating ? <h2 id={`${id}-heading`} className="text-sm font-semibold tracking-normal">{current.heading}</h2>
-        : <DialogTitle className="text-sm font-semibold tracking-normal">{current.heading}</DialogTitle>}
-      <button ref={closeRef} type="button" aria-label="Close document panel" onClick={closePanel}
-        className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-        <X className="h-4 w-4" aria-hidden />
-      </button>
+  const rememberFocus: FocusEventHandler<HTMLElement> = event => { if (event.target instanceof HTMLElement && event.currentTarget.contains(event.target)) lastPanelFocus.current = event.target; };
+  const body = <>
+    <div className="document-panel-heading">
+      {docked ? <h2 id={`${id}-heading`}>Document details</h2> : <DialogTitle>Document details</DialogTitle>}
+      <Button ref={closeRef} type="button" variant="ghost" size="icon" aria-label="Close document panel" onClick={() => onOpenChange(false)}><X className="h-4 w-4" aria-hidden /></Button>
     </div>
-    {!floating && controls(true)}
-    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 rail-scroll rail-scroll-auto">{children}</div>
+    <div data-slot="document-context-scroll" className="document-panel-scroll rail-scroll rail-scroll-auto">
+      <section className="document-panel-outline" aria-labelledby={`${id}-outline`}><h3 id={`${id}-outline`}>On this page</h3>{outline}</section>
+      <div className="document-panel-sections">{sections.map(section => <details key={section.id} data-context-section={section.id} open={view === section.id}
+        onToggle={event => { if (event.currentTarget.open && view !== section.id) onViewChange(section.id); else if (!event.currentTarget.open && view === section.id) onViewChange("outline"); }}>
+        <summary ref={element => { sectionRefs.current[section.id] = element; }}><span>{section.label}</span><ChevronDown className="h-3.5 w-3.5" aria-hidden /></summary>
+        {view === section.id && <div className="document-panel-section-body">{({ info, history, relations })[section.id]}</div>}
+      </details>)}</div>
+    </div>
   </>;
-
-  return <Dialog open={open} onOpenChange={onOpenChange} modal={!floating}>
-    {floating ? open && <DismissableLayer asChild onDismiss={() => onOpenChange(false)}
-      onEscapeKeyDown={() => { restoreTriggerFocus.current = true; }}
-      onInteractOutside={event => {
-        const rail = railRef.current;
-        // Edge controls switch/toggle without an intermediate dismissal.
-        // Properties editing is a sibling portal; a nested modal must not
-        // dismiss its supporting inspector when it takes focus.
-        if ((event.target instanceof Node && rail?.contains(event.target)) || hasForegroundDialog()) {
-          event.preventDefault();
-          return;
-        }
-        // Let outside clicks and Tab keep their intended target. Only explicit
-        // Close/Escape should return keyboard focus to the originating icon.
-        restoreTriggerFocus.current = false;
-      }}>
-      <aside id={id} tabIndex={-1} aria-labelledby={`${id}-heading`} data-slot="document-context-panel" data-mode="floating"
-        onFocusCapture={rememberPanelFocus} onClickCapture={onPanelClick} className={cn(panelClass, "absolute right-14 top-2 z-[var(--z-overlay)] max-h-[calc(100%-1rem)] w-96 rounded-[var(--radius-md)] border border-border-strong shadow-md")}>
-        {panelBody}
-      </aside>
-    </DismissableLayer> : <DialogPortal><DialogOverlay />
-      <DialogPrimitive.Content id={id} data-slot="document-context-panel" data-mode="overlay" aria-modal="true" aria-describedby={undefined}
-        onOpenAutoFocus={event => { event.preventDefault(); closeRef.current?.focus({ preventScroll: true }); }}
-        onCloseAutoFocus={event => {
-          event.preventDefault();
-          // Resizing an open overlay into a floating panel is not a dismissal.
-          if (latestOpen.current) { closeRef.current?.focus({ preventScroll: true }); return; }
-          requestAnimationFrame(restoreFocus);
-        }}
-        onFocusCapture={rememberPanelFocus} onClickCapture={onPanelClick}
-        className={cn(panelClass, "fixed inset-y-0 right-0 z-[var(--z-modal)] w-[calc(100%-2rem)] max-w-96 border-l border-border shadow-lg")}>
-        {panelBody}
-      </DialogPrimitive.Content>
-    </DialogPortal>}
-    <div ref={railRef} data-slot="document-context-rail" className="h-full w-12 shrink-0 overflow-y-auto border-l border-border bg-surface rail-scroll rail-scroll-auto">
-      {controls()}
-    </div>
-  </Dialog>;
+  return <><span ref={markerRef} hidden /><Dialog open={open} onOpenChange={onOpenChange} modal={!docked}>
+    {docked ? open && <DismissableLayer asChild
+      onEscapeKeyDown={event => {
+        // Register above an enclosing preview's capture listener so Escape
+        // closes this inspector before it can dismiss the document route.
+        event.preventDefault();
+        if (!hasForegroundDialog()) onOpenChange(false);
+      }}
+      onInteractOutside={event => event.preventDefault()}>
+      <aside ref={panelRef} id={id} tabIndex={-1} aria-labelledby={`${id}-heading`} data-slot="document-context-panel" data-mode="docked"
+      className="document-details-panel document-details-docked" onFocusCapture={rememberFocus} onClickCapture={onPanelClick}
+      >{body}</aside>
+    </DismissableLayer>
+      : <DialogPortal><DialogOverlay /><DialogPrimitive.Content ref={element => { panelRef.current = element; }} id={id}
+        data-slot="document-context-panel" data-mode="overlay" aria-modal="true" aria-describedby={undefined} className={cn("document-details-panel", "document-details-overlay")}
+        onOpenAutoFocus={event => { event.preventDefault(); if (focusRequestedTarget()) return; if (pendingInsideFocus.current) restoreInsideFocus(); else if (!panelRef.current?.contains(document.activeElement)) closeRef.current?.focus({ preventScroll: true }); }}
+        onCloseAutoFocus={event => { event.preventDefault(); requestAnimationFrame(() => { if (latestOpen.current) restoreInsideFocus(); else restoreTrigger(); }); }}
+        onFocusCapture={rememberFocus} onClickCapture={onPanelClick}>{body}</DialogPrimitive.Content></DialogPortal>}
+  </Dialog></>;
 }

@@ -21,6 +21,18 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("DeleteCollectionDialog", () => {
+  it("requires typed recursive confirmation when loaded counts are zero but incomplete", async () => {
+    const user = userEvent.setup();
+    deleteMock.mockResolvedValue({ ok: true });
+    render(<DeleteCollectionDialog vault="v" path="guides" open onOpenChange={() => {}}
+      docCount={0} fileCount={0} subCollectionCount={0} countsComplete={false} onDeleted={() => {}} />);
+    expect(screen.getByRole("dialog")).toHaveTextContent("including resources not loaded");
+    const button = screen.getByRole("button", { name: /^delete$/i });
+    expect(button).toBeDisabled();
+    await user.type(screen.getByLabelText(/type the path/i), "guides");
+    await user.click(button);
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("v", "guides", true));
+  });
   it("empty mode renders simple confirm and calls deleteCollection with recursive=false", async () => {
     deleteMock.mockResolvedValue({
       ok: true,

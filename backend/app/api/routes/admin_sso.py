@@ -41,6 +41,8 @@ from app.sso.models import (
     ProviderReadback,
 )
 from app.sso.registry import provider_types
+from app.sso.identity_operations import provider_mutation_guard
+from app.api.routes.admin_sso_operations import router as operations_router
 
 
 class ConfigureProviderRequest(BaseModel):
@@ -356,7 +358,9 @@ async def configure_sso_provider(
             client_id=request.client_id,
             client_secret=raw_secret,
         )
-        mutation = await get_keycloak_provider_control().configure(spec)
+        async with provider_mutation_guard(alias, actor) as complete:
+            mutation = await get_keycloak_provider_control().configure(spec)
+            await complete(mutation.after)
     except ProviderControlError as error:
         _audit(
             "admin.sso.provider.configure",
@@ -390,10 +394,12 @@ async def _toggle_sso_provider(
     verb = "enable" if enabled else "disable"
     _audit(f"admin.sso.provider.{verb}.requested", actor, alias)
     try:
-        mutation = await get_keycloak_provider_control().set_enabled(
-            alias,
-            enabled=enabled,
-        )
+        async with provider_mutation_guard(alias, actor, enabled=enabled) as complete:
+            mutation = await get_keycloak_provider_control().set_enabled(
+                alias,
+                enabled=enabled,
+            )
+            await complete(mutation.after)
     except ProviderControlError as error:
         _audit(
             f"admin.sso.provider.{verb}",
@@ -656,3 +662,9 @@ async def rollback_sso_identity_migration(
         actor,
         operation="rollback",
     )
+
+
+legacy_router = router
+router = APIRouter()
+router.include_router(legacy_router)
+router.include_router(operations_router)

@@ -1,235 +1,312 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { ResourceLocationProvider, usePublishResourceLocation } from "@/contexts/resource-location-context";
-
-import { VaultShell } from "@/components/vault-shell";
-
+import { Link, MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
+import { useState } from "react";
+import { VaultNavigationToggle } from "@/components/vault-navigation-controls";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  VaultShell,
+  type VaultNavigationControl,
+} from "@/components/vault-shell";
 vi.mock("@/components/vault-explorer", () => ({
-  VaultExplorer: ({ onCollapse }: { onCollapse?: () => void }) => <aside aria-label="Collections">
-    <button type="button" onClick={onCollapse}>Collapse collections</button>
-    Collection tree content
-  </aside>,
-}));
-
-vi.mock("@/components/vault-rail", () => ({
-  VaultRail: () => <nav aria-label="Vaults">Vault rail</nav>,
-}));
-
-vi.mock("@/components/title-bar", async (importOriginal) => ({
-  ...await importOriginal<typeof import("@/components/title-bar")>(),
-  TitleBar: ({ left, right, breadcrumb }: { left?: React.ReactNode; right?: React.ReactNode; breadcrumb?: React.ReactNode }) => (
-    <header data-testid="title-bar">
-      {left}
-      {breadcrumb}
-      {right}
-    </header>
+  VaultExplorer: ({ presentation }: { presentation: string }) => (
+    <nav aria-label="Content explorer" data-presentation={presentation}>
+      <button>Collection disclosure</button>Collection tree content
+    </nav>
   ),
-  VaultActions: () => null,
 }));
-
+vi.mock("@/components/vault-navigation-header", () => ({
+  VaultNavigationHeader: function MockVaultNavigationHeader({ navigationControl }: { navigationControl: VaultNavigationControl }) {
+    const [open, setOpen] = useState(false);
+    return (
+    <nav aria-label="Current vault">
+      <VaultNavigationToggle id="vault-navigation-collapse" {...navigationControl} />
+      <TooltipProvider delayDuration={0}><Tooltip><TooltipTrigger asChild>
+        <button data-vault-switcher-trigger="" aria-expanded={open} onClick={() => setOpen(value => !value)}>Switch vault: demo</button>
+      </TooltipTrigger><TooltipContent>demo</TooltipContent></Tooltip></TooltipProvider>
+      <Link to="/vault/demo">Vault overview</Link>
+    </nav>
+    );
+  },
+}));
+vi.mock("@/hooks/use-vaults", () => ({
+  useVaults: () => ({ vaults: [], refetch: vi.fn() }),
+}));
 vi.mock("@/components/vault-create-dialog", () => ({
   VaultCreateDialog: () => null,
 }));
-
 vi.mock("@/components/document-create-dialog", () => ({
   DocumentCreateDialog: () => null,
 }));
-
+vi.mock("@/components/app-page-location", () => ({
+  AppPageLocation: () => <span>Current location</span>,
+}));
 vi.mock("@/hooks/use-column-resize", () => ({
   useColumnResize: ({ default: width }: { default: number }) => ({
     width,
-    setWidth: vi.fn(),
-    reset: vi.fn(),
+    settledWidth: width,
+    isResizing: false,
+    cancel: vi.fn(),
     handlers: {},
   }),
 }));
-
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
-
-beforeEach(() => {
-  window.localStorage.clear();
-  window.localStorage.setItem("akb.treeVisible", "1");
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
 });
+beforeEach(() => {
+  localStorage.clear();
+  vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+    matches: true,
+    media: query,
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+});
+function Layout() { return <Outlet />; }
 
-function renderShell(entry = "/vault/demo/search") {
+function mount(entry = "/vault/demo") {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
-        <Route path="/vault/:name" element={<VaultShell />}>
-          <Route
-            index
-            element={
-              <div>
-                Overview page
-                <Link to="/vault/demo/search">Open search</Link>
-              </div>
-            }
-          />
-          <Route
-            path="search"
-            element={
-              <div>
-                Search page
-                <Link to="/vault/demo">Open overview</Link>
-              </div>
-            }
-          />
-          {["members", "publications", "settings", "graph"].map(route => <Route key={route} path={route}
-            element={<div>{route} page<Link to="/vault/demo">Open overview</Link></div>} />)}
-          <Route path="activity" element={<div>Activity page</div>} />
+        <Route element={<Layout />}>
+          <Route path="/vault/:name?" element={<VaultShell />}>
+            <Route
+              index
+              element={
+                <div>
+                  Overview page<Link to="/vault/demo/search">Open search</Link><Link to="/vault/demo">Open demo</Link><Link to="/vault">Open vaults</Link><Link to="/vault/demo?collection=guides" state={{ vaultPageNavigation: "/vault/demo?collection=guides", collectionView: "main" }}>Open collection in main</Link>
+                </div>
+              }
+            />
+            {[
+              "search",
+              "members",
+              "publications",
+              "settings",
+              "graph",
+              "activity",
+            ].map((route) => (
+              <Route
+                key={route}
+                path={route}
+                element={
+                  <div>
+                    {route} page<Link to="/vault/demo">Open overview</Link>
+                  </div>
+                }
+              />
+            ))}
+          </Route>
         </Route>
       </Routes>
     </MemoryRouter>,
   );
 }
-
-describe("VaultShell search collection tree", () => {
-  it("does not interpret the Search collection filter as a shortcut reveal", () => {
-    localStorage.setItem("akb.treeVisible", "0");
-    renderShell("/vault/demo/search?collection=guides");
-    expect(screen.queryByText("Collection tree content")).toBeNull();
+describe("Focused Vault navigation", () => {
+  it.each([
+    "",
+    "search",
+    "members",
+    "publications",
+    "settings",
+    "graph",
+    "activity",
+  ])("keeps one context navigator on /%s", (route) => {
+    mount(`/vault/demo/${route}`);
+    expect(
+      screen.getByRole("navigation", { name: "Content explorer" }),
+    ).toHaveAttribute("data-presentation", "focused");
+    expect(
+      screen.getByRole("navigation", { name: "Current vault" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("navigation", { name: "Vaults" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("navigation", { name: "Vault sections" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
   });
-  it("reveals a pinned collection without changing the saved preference", async () => {
+  it("preserves visibility through routes and returns focus to the persistent toggle", async () => {
+    const user = userEvent.setup();
+    mount("/vault/demo/search");
+    await user.click(screen.getByRole("button", { name: "Close vault navigation" }));
+    const trigger = screen.getByRole("button", { name: "Open vault navigation" });
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(
+      screen.queryByRole("navigation", { name: "Content explorer" }),
+    ).not.toBeInTheDocument();
+    expect(localStorage.getItem("akb.treeVisible")).toBe("0");
+    await user.click(screen.getByRole("link", { name: "Open overview" }));
+    expect(
+      screen.queryByRole("navigation", { name: "Content explorer" }),
+    ).not.toBeInTheDocument();
+    await user.click(trigger);
+    expect(
+      screen.getByRole("navigation", { name: "Content explorer" }),
+    ).toBeVisible();
+  });
+  it("reveals a Collection shortcut without changing the saved choice", () => {
     localStorage.setItem("akb.treeVisible", "0");
-    renderShell("/vault/demo?collection=guides");
-    expect(screen.getByText("Collection tree content")).toBeTruthy();
+    mount("/vault/demo?collection=guides");
+    expect(
+      screen.getByRole("navigation", { name: "Content explorer" }),
+    ).toBeVisible();
     expect(localStorage.getItem("akb.treeVisible")).toBe("0");
   });
-  it("keeps the chosen navigation density across Search and Overview", async () => {
-    const user = userEvent.setup();
-    renderShell();
-
-    expect(screen.getByText("Collection tree content")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Collapse collections" })).toBeTruthy();
-    expect(window.localStorage.getItem("akb.treeVisible")).toBe("1");
-
-    await user.click(screen.getByRole("button", { name: "Collapse collections" }));
-    expect(screen.queryByText("Collection tree content")).toBeNull();
-    expect(window.localStorage.getItem("akb.treeVisible")).toBe("0");
-
-    await user.click(screen.getByRole("link", { name: "Open overview" }));
-    expect(screen.queryByText("Collection tree content")).toBeNull();
-
-    await user.click(screen.getByRole("link", { name: "Open search" }));
-    expect(screen.queryByText("Collection tree content")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Expand collections" }));
-    expect(screen.getByText("Collection tree content")).toBeTruthy();
-    expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
-    expect(within(screen.getByRole("complementary", { name: "Collections" })).queryByRole("navigation")).not.toBeInTheDocument();
-  });
-
-  it.each(["activity"])(
-    "retains Collections without a second navigation row on the %s tool view",
-    async (route) => {
-      render(
-        <MemoryRouter initialEntries={[`/vault/demo/${route}`]}>
-          <Routes>
-            <Route path="/vault/:name" element={<VaultShell />}>
-              <Route path={route} element={<div>{route} page</div>} />
-            </Route>
-          </Routes>
-        </MemoryRouter>,
-      );
-
-      expect(screen.getByText("Collection tree content")).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Collapse collections" })).toBeTruthy();
-      expect(window.localStorage.getItem("akb.treeVisible")).toBe("1");
-
-      const routeViewport = document.querySelector('[data-slot="vault-route-viewport"]');
-      expect(routeViewport).not.toBeNull();
-      expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
-      expect(within(screen.getByRole("complementary", { name: "Collections" })).queryByRole("link")).not.toBeInTheDocument();
-      if (route === "settings") {
-        expect(routeViewport).toHaveClass("xl:overflow-hidden");
-      } else {
-        expect(routeViewport).not.toHaveClass("xl:overflow-hidden");
-      }
-
-      if (route === "activity" || route === "publications" || route === "members") {
-        expect(routeViewport?.firstElementChild).toHaveClass("px-3", "xl:px-5");
-      }
-    },
-  );
-});
-
-describe("VaultShell focused task presentation", () => {
-  it.each(["members", "publications", "settings", "graph", "settings/"])(
-    "omits both the tree and section row on %s without changing preferences",
-    async route => {
-      const user = userEvent.setup();
-      localStorage.setItem("akb.treeWidth.v2", "300");
-      renderShell(`/vault/demo/${route}`);
-      expect(screen.queryByText("Collection tree content")).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /collections/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
-      expect(screen.queryByRole("separator", { name: "Resize tree panel" })).not.toBeInTheDocument();
-      expect(screen.getByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-      expect(localStorage.getItem("akb.treeVisible")).toBe("1");
-      expect(localStorage.getItem("akb.treeWidth.v2")).toBe("300");
-      await user.click(screen.getByRole("link", { name: "Open overview" }));
-      expect(screen.getByText("Collection tree content")).toBeInTheDocument();
-      expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
-    },
-  );
-
-  it("retains a collapsed tree preference when returning to content", async () => {
-    const user = userEvent.setup();
+  it("lets a revealed Collection shortcut collapse without reopening an overlay", async () => {
     localStorage.setItem("akb.treeVisible", "0");
-    renderShell("/vault/demo/settings");
-    expect(screen.queryByRole("button", { name: "Expand collections" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("link", { name: "Open overview" }));
-    expect(screen.getByRole("button", { name: "Expand collections" })).toBeInTheDocument();
-    expect(screen.queryByText("Collection tree content")).not.toBeInTheDocument();
+    mount("/vault/demo?collection=guides");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Close vault navigation" }));
+    expect(screen.queryByRole("navigation", { name: "Content explorer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Dismiss vault navigation" })).not.toBeInTheDocument();
     expect(localStorage.getItem("akb.treeVisible")).toBe("0");
   });
 
-  it("does not mount Collections inside the mobile task navigator", async () => {
-    const user = userEvent.setup();
-    vi.spyOn(window, "matchMedia").mockImplementation(query => ({
-      matches: false, media: query, onchange: null,
-      addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn(),
-    }));
-    renderShell("/vault/demo/members");
-    await user.click(screen.getByRole("button", { name: "Open vault navigation" }));
-    expect(screen.getByRole("navigation", { name: "Vaults" })).toBeInTheDocument();
-    expect(screen.queryByText("Collection tree content")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Expand collections" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Navigate in demo" })).toBeInTheDocument();
-    expect(localStorage.getItem("akb.treeVisible")).toBe("1");
+  it("does not treat a Search scope as a Collection shortcut", () => {
+    localStorage.setItem("akb.treeVisible", "0");
+    mount("/vault/demo/search?collection=guides");
+    expect(
+      screen.queryByRole("navigation", { name: "Content explorer" }),
+    ).not.toBeInTheDocument();
   });
-});
-
-function ResolvedResource() {
-  usePublishResourceLocation({ vault: "demo", title: "Resolved resource title", kind: "Document" });
-  return <div>Resource content</div>;
-}
-
-describe("VaultShell resource navigation", () => {
-  it.each([true, false])("keeps the document tree but replaces the section row with a mobile-only header menu (desktop=%s)", desktop => {
-    vi.spyOn(window, "matchMedia").mockImplementation(query => ({
-      matches: desktop && query === "(min-width: 1024px)", media: query, onchange: null,
-      addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn(),
+  it("toggles the same panel with its shortcut from inside content", async () => {
+    mount();
+    screen.getByRole("button", { name: "Collection disclosure" }).focus();
+    fireEvent.keyDown(window, { key: "\\", ctrlKey: true });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Open vault navigation" }),
+      ).toHaveFocus(),
+    );
+    expect(
+      screen.queryByRole("navigation", { name: "Content explorer" }),
+    ).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "\\", ctrlKey: true });
+    expect(
+      screen.getByRole("navigation", { name: "Content explorer" }),
+    ).toBeVisible();
+  });
+  it("retains the Vault directory panel and swaps its contents when entering a Vault", async () => {
+    localStorage.setItem("akb.treeVisible", "0");
+    const user = userEvent.setup();
+    mount("/vault");
+    const panel = document.getElementById("vault-workspace-navigation");
+    expect(panel).toBeVisible();
+    expect(screen.getByRole("navigation", { name: "Vaults" })).toBeVisible();
+    expect(screen.getByRole("separator")).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Open demo" }));
+    expect(document.getElementById("vault-workspace-navigation")).toBe(panel);
+    expect(screen.getByRole("navigation", { name: "Content explorer" })).toBeVisible();
+    expect(screen.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Open vaults" }));
+    expect(document.getElementById("vault-workspace-navigation")).toBe(panel);
+    expect(screen.getByRole("navigation", { name: "Vaults" })).toBeVisible();
+  });
+  it("uses the same boundary opener and shortcut on the Vault directory without a parent-back link", async () => {
+    const user = userEvent.setup();
+    mount("/vault");
+    expect(screen.queryByRole("link", { name: "Back to all vaults" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close vault navigation" }));
+    const open = screen.getByRole("button", { name: "Open vault navigation" });
+    await waitFor(() => expect(open).toHaveFocus());
+    expect(screen.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "\\", ctrlKey: true });
+    expect(screen.getByRole("navigation", { name: "Vaults" })).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close vault navigation" })).toHaveFocus());
+    fireEvent.keyDown(window, { key: "\\", metaKey: true });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open vault navigation" })).toHaveFocus());
+    expect(localStorage.getItem("akb.treeVisible")).toBeNull();
+  });
+  it("keeps a main-content Collection destination out of the mobile drawer", async () => {
+    vi.mocked(window.matchMedia).mockImplementation(query => ({ matches: false, media: query, onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() }));
+    mount("/vault/demo");
+    await userEvent.click(screen.getByRole("button", { name: "Open vault navigation" }));
+    expect(screen.getByRole("navigation", { name: "Content explorer" })).toBeVisible();
+    await userEvent.click(screen.getByRole("link", { name: "Open collection in main" }));
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Content explorer" })).not.toBeInTheDocument());
+  });
+  it.each(["focused", "hovered"])("dismisses the mobile drawer with one Escape when a %s control has a tooltip", async mode => {
+    vi.mocked(window.matchMedia).mockImplementation((query) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
     }));
-    render(<QueryClientProvider client={new QueryClient()}><MemoryRouter initialEntries={["/vault/demo/doc/a-private-url-ref"]}>
-      <ResourceLocationProvider identity="reader"><Routes><Route path="/vault/:name" element={<VaultShell />}>
-        <Route path="doc/:ref" element={<ResolvedResource />} />
-      </Route></Routes></ResourceLocationProvider>
-    </MemoryRouter></QueryClientProvider>);
-    expect(screen.getByText("Resource content")).toBeInTheDocument();
-    expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
-    expect(localStorage.getItem("akb.treeVisible")).toBe("1");
-    expect(screen.queryByText("In this vault")).not.toBeInTheDocument();
-    if (desktop) {
-      expect(screen.queryByTestId("title-bar")).not.toBeInTheDocument();
-      expect(screen.getByText("Collection tree content")).toBeInTheDocument();
-    } else {
-      expect(screen.getByRole("navigation", { name: "Resource location" })).toHaveTextContent("Resolved resource title");
-      expect(screen.getByRole("button", { name: "Navigate in demo" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Open vault navigation" })).toBeInTheDocument();
-      expect(screen.queryByText("a-private-url-ref")).not.toBeInTheDocument();
+    mount("/vault/demo/members");
+    const user = userEvent.setup();
+    const mobile = screen.getByRole("button", {
+      name: "Open vault navigation",
+    });
+    expect(mobile).toHaveAttribute("id", "vault-navigation-trigger");
+    await user.click(mobile);
+    expect(
+      screen.getByRole("navigation", { name: "Content explorer" }),
+    ).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close vault navigation" })).toHaveFocus());
+    screen.getByRole("button", { name: "Switch vault: demo" }).focus();
+    if (mode === "hovered") {
+      screen.getByRole("button", { name: "Collection disclosure" }).focus();
+      await user.hover(screen.getByRole("button", { name: "Switch vault: demo" }));
     }
+    expect(await screen.findByRole("tooltip", { name: "demo" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(mobile).toHaveFocus());
+    expect(
+      screen.queryByRole("navigation", { name: "Content explorer" }),
+    ).not.toBeInTheDocument();
+  });
+  it("respects Escape cancellation by an interactive drawer control", async () => {
+    vi.mocked(window.matchMedia).mockImplementation(query => ({ matches: false, media: query, onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() }));
+    mount("/vault/demo/members");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Open vault navigation" }));
+    const control = screen.getByRole("button", { name: "Collection disclosure" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close vault navigation" })).toHaveFocus());
+    control.focus();
+    control.addEventListener("keydown", event => event.preventDefault(), { once: true });
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("navigation", { name: "Content explorer" })).toBeVisible();
+    expect(control).toHaveFocus();
+  });
+  it("retains the mobile drawer through picker focus restoration and dismisses after an intentional departure", async () => {
+    vi.mocked(window.matchMedia).mockImplementation((query) => ({
+      matches: false, media: query, onchange: null,
+      addEventListener: vi.fn(), removeEventListener: vi.fn(),
+      addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn(),
+    }));
+    mount("/vault/demo/members");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Open vault navigation" }));
+    const picker = screen.getByRole("button", { name: "Switch vault: demo" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close vault navigation" })).toHaveFocus());
+    await user.click(picker);
+    expect(picker).toHaveAttribute("aria-expanded", "true");
+    const outside = screen.getByRole("link", { name: "Open overview" });
+    outside.focus();
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    expect(screen.getByRole("navigation", { name: "Content explorer" })).toBeVisible();
+    await user.click(picker);
+    expect(picker).toHaveAttribute("aria-expanded", "false");
+    outside.focus();
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Content explorer" })).not.toBeInTheDocument());
+    expect(outside).toHaveFocus();
   });
 });

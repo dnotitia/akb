@@ -142,7 +142,7 @@ async def test_ensure_collection_indexes_vault_id():
 
 
 async def test_ensure_collection_indexes_source_type():
-    """`source_type` is a per-search pre-filter (workbench #1069) — it needs
+    """`source_type` is a per-search pre-filter — it needs
     the same keyword index as the ACL keys, on new AND pre-existing
     collections (ensure runs outside the create branch)."""
     from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE
@@ -291,7 +291,7 @@ async def test_ensure_collection_vault_index_programming_error_propagates(exc):
         await store.ensure_collection()
 
 
-# ── workbench #1069: driver-side source_type predicate ──
+# ── driver-side source_type predicate ──
 
 def test_source_type_filter_ands_onto_acl_branches():
     from app.services.vector_store.qdrant import PAYLOAD_SOURCE_TYPE

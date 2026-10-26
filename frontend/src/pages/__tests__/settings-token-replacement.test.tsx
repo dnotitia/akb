@@ -73,3 +73,16 @@ it("disables replacement when a legacy token omitted its scope metadata", () => 
   expect(screen.getByRole("button", { name: "Replace token legacy" })).toBeDisabled();
   expect(screen.getByText(/Vault write restriction unknown/)).toBeVisible();
 });
+
+
+it("retains token rows during refresh failure and gives retry a busy state", () => {
+  const reload = vi.fn();
+  const view = (loading: boolean) => <TokensSection pats={[original]} patsError mcpOauthEnabled={false} patsLoading={loading} onReloadPats={reload} />;
+  const { rerender } = render(view(false));
+  expect(screen.getByRole("button", { name: "Revoke token original" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(reload).toHaveBeenCalledTimes(1);
+  rerender(view(true));
+  expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+  expect(screen.getByRole("region", { name: "Saved tokens" })).toHaveAttribute("aria-busy", "true");
+});

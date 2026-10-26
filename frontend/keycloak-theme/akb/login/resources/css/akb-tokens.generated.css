@@ -72,8 +72,14 @@
   --akb-font-sans: "Pretendard Variable", "Pretendard", system-ui, -apple-system, sans-serif;
   --akb-font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
   --akb-font-display: "Pretendard Variable", "Pretendard", system-ui, sans-serif;
+  --akb-text-ui: .8125rem;
+  --akb-text-ui--line-height: 1.25rem;
   --akb-spacing-document-preview-edge: clamp(1rem, 2vw, 3rem);
   --akb-spacing-document-reading-gutter: clamp(1rem, 2cqi, 2rem);
+  --akb-spacing-document-command-row: 3rem;
+  --akb-spacing-document-command-touch-row: 4rem;
+  --akb-spacing-document-command-inset: 1.25rem;
+  --akb-spacing-vault-box-depth: 1rem;
   --akb-radius: 0.875rem;
   --akb-radius-xs: 0.1875rem;
   --akb-radius-sm: 0.5rem;
@@ -101,6 +107,9 @@
   --akb-duration-fast: 120ms;
   --akb-duration-base: 220ms;
   --akb-duration-slow: 420ms;
+  --akb-duration-title-reveal-wait: 600ms;
+  --akb-duration-title-reveal-min: 1800ms;
+  --akb-motion-title-reveal-speed: 28;
   --akb-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --akb-ease-in: cubic-bezier(0.4, 0, 1, 1);
   --akb-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);

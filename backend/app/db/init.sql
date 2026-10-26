@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT false,
     is_recovery_admin BOOLEAN NOT NULL DEFAULT false,
+    sso_recovery_target_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- JWT revocation cutoff. A JWT is rejected if its `iat` claim is
@@ -71,6 +72,29 @@ CREATE TABLE IF NOT EXISTS users (
         CHECK (NOT is_recovery_admin OR auth_provider IN ('local', 'keycloak'))
 );
 
+-- Private account images; intentionally independent of Vault inventory/search.
+CREATE TABLE IF NOT EXISTS user_avatars (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    revision UUID NOT NULL,
+    object_key TEXT UNIQUE,
+    content_type TEXT,
+    size_bytes INTEGER,
+    width INTEGER,
+    height INTEGER,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CHECK ((object_key IS NULL AND content_type IS NULL AND size_bytes IS NULL
+            AND width IS NULL AND height IS NULL) OR
+           (object_key IS NOT NULL AND content_type IS NOT NULL AND size_bytes IS NOT NULL
+            AND width IS NOT NULL AND height IS NOT NULL
+            AND object_key LIKE '.akb-account-assets/avatars/%' AND content_type='image/webp'
+            AND size_bytes BETWEEN 1 AND 262144 AND width=512 AND height=512))
+);
+CREATE TABLE IF NOT EXISTS user_avatar_write_budget (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    window_start TIMESTAMPTZ NOT NULL,
+    attempts INTEGER NOT NULL CHECK (attempts > 0)
+);
+
 -- Guarded: `is_recovery_admin` arrives with migration 071 on existing
 -- installations. init.sql runs before migrations, so an unconditional index
 -- here would abort the upgrade before migration 071 can add the column.
@@ -82,9 +106,17 @@ BEGIN
            AND table_name = 'users'
            AND column_name = 'is_recovery_admin'
     ) THEN
-        CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
-            ON users (auth_provider)
-            WHERE is_recovery_admin;
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='users'
+                      AND column_name='sso_recovery_target_id') THEN
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+                ON users (auth_provider) WHERE is_recovery_admin AND sso_recovery_target_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_target
+                ON users (sso_recovery_target_id) WHERE is_recovery_admin AND sso_recovery_target_id IS NOT NULL;
+        ELSE
+            CREATE UNIQUE INDEX IF NOT EXISTS users_one_recovery_admin_per_provider
+                ON users (auth_provider) WHERE is_recovery_admin;
+        END IF;
     END IF;
 END $$;
 
@@ -1054,4 +1086,170 @@ CREATE TABLE IF NOT EXISTS sso_account_sync_state (
     last_error_code TEXT,
     checked INTEGER NOT NULL DEFAULT 0,
     suspended INTEGER NOT NULL DEFAULT 0
+);
+
+-- Bounded SSO identity operations (migration 121).
+-- An installation UUID belongs to this database, independently of revision backend.
+CREATE TABLE IF NOT EXISTS sso_operation_installation (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+    installation_id UUID NOT NULL UNIQUE DEFAULT gen_random_uuid()
+);
+INSERT INTO sso_operation_installation(singleton) VALUES(true) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS sso_provider_ownership (
+    alias TEXT PRIMARY KEY,
+    owner_id TEXT,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    fingerprint TEXT NOT NULL,
+    emergency_disabled BOOLEAN NOT NULL DEFAULT false,
+    updated_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS sso_identity_operations (
+    operation_id UUID PRIMARY KEY,
+    installation_id UUID NOT NULL,
+    credential_hash TEXT NOT NULL UNIQUE,
+    granted_by UUID NOT NULL,
+    actor_id UUID NOT NULL,
+    actor_token_id UUID NOT NULL,
+    provider_alias TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    provider_revision BIGINT NOT NULL,
+    provider_fingerprint TEXT NOT NULL,
+    current_provider_revision BIGINT NOT NULL,
+    current_provider_fingerprint TEXT NOT NULL,
+    provider_payload_sha256 JSONB NOT NULL,
+    runtime_generation BIGINT NOT NULL,
+    session_epoch UUID NOT NULL,
+    cohort JSONB NOT NULL,
+    cohort_sha256 TEXT NOT NULL,
+    verbs TEXT[] NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    retired_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (expires_at > created_at AND expires_at <= created_at + INTERVAL '10 minutes')
+);
+
+CREATE TABLE IF NOT EXISTS sso_identity_operation_requests (
+    operation_id UUID NOT NULL REFERENCES sso_identity_operations(operation_id),
+    nonce UUID NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    result JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (operation_id, nonce)
+);
+
+-- Only bindings inserted by this operation are eligible for its compensation.
+CREATE TABLE IF NOT EXISTS sso_identity_operation_bindings (
+    operation_id UUID NOT NULL REFERENCES sso_identity_operations(operation_id),
+    item_index INTEGER NOT NULL,
+    identity_id UUID NOT NULL,
+    PRIMARY KEY (operation_id, item_index)
+);
+
+-- Keep the original active realm's ownership UUID stable across epoch changes.
+ALTER TABLE sso_operation_installation ADD COLUMN IF NOT EXISTS legacy_target_id UUID NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE sso_operation_installation ADD COLUMN IF NOT EXISTS legacy_issuer TEXT;
+ALTER TABLE sso_provider_ownership ADD COLUMN IF NOT EXISTS target_id UUID;
+UPDATE sso_provider_ownership SET target_id=(SELECT legacy_target_id FROM sso_operation_installation) WHERE target_id IS NULL;
+ALTER TABLE sso_provider_ownership ALTER COLUMN target_id SET NOT NULL;
+ALTER TABLE sso_provider_ownership DROP CONSTRAINT IF EXISTS sso_provider_ownership_pkey;
+ALTER TABLE sso_provider_ownership ADD PRIMARY KEY(target_id,alias);
+ALTER TABLE sso_identity_operations ALTER COLUMN session_epoch DROP NOT NULL;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS target_id UUID;
+UPDATE sso_identity_operations SET target_id=(SELECT legacy_target_id FROM sso_operation_installation) WHERE target_id IS NULL;
+ALTER TABLE sso_identity_operations ALTER COLUMN target_id SET NOT NULL;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS target_fingerprint TEXT;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS target_realm_id TEXT;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS source_tuple JSONB;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS target_tuple JSONB;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'granted';
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS prepared_identity_ids_hash TEXT;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS existing_identity_ids_hash TEXT;
+ALTER TABLE sso_provider_ownership ADD COLUMN IF NOT EXISTS secret_revision TEXT;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS provider_secret_revision TEXT;
+-- Identity namespaces survive config removal; an issuer cannot be silently
+-- re-registered under a new UUID to hide its existing ownership rows.
+CREATE TABLE IF NOT EXISTS sso_management_target_pins (
+    target_id UUID PRIMARY KEY,
+    issuer TEXT NOT NULL UNIQUE
+);
+-- A pre-target grant has no immutable target/source pin. Never reinterpret it
+-- against new settings; retain its journal as retired metadata for a human.
+UPDATE sso_identity_operations SET retired_at=COALESCE(retired_at,clock_timestamp()),phase='retired' WHERE source_tuple IS NULL;
+
+-- Browser challenge possession is not evidence. Only the verified callback's
+-- successful session transaction may consume it and write an event.
+CREATE TABLE IF NOT EXISTS sso_operation_login_challenges (
+    challenge_id UUID PRIMARY KEY,
+    operation_id UUID NOT NULL REFERENCES sso_identity_operations(operation_id),
+    akb_user_id UUID NOT NULL,
+    credential_hash TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE IF NOT EXISTS sso_callback_login_events (
+    event_id UUID PRIMARY KEY,
+    operation_id UUID NOT NULL REFERENCES sso_identity_operations(operation_id),
+    challenge_id UUID NOT NULL UNIQUE REFERENCES sso_operation_login_challenges(challenge_id),
+    installation_id UUID NOT NULL,
+    target_id UUID NOT NULL,
+    akb_user_id UUID NOT NULL,
+    issuer TEXT NOT NULL,
+    provider_alias TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    runtime_generation BIGINT NOT NULL,
+    sso_session_epoch UUID NOT NULL,
+    source_revision TEXT,
+    cohort_sha256 TEXT NOT NULL,
+    provider_revision BIGINT,
+    provider_secret_revision TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Fresh human authorization creates a new credential/nonce namespace. It never
+-- extends the old grant or rewrites the original source/target intent.
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS parent_operation_id UUID REFERENCES sso_identity_operations(operation_id);
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS intent_sha256 TEXT;
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS authority_attempt BIGINT NOT NULL DEFAULT 1 CHECK(authority_attempt > 0);
+ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS lineage_closed_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS sso_identity_operation_attempt_unique
+    ON sso_identity_operations(parent_operation_id,authority_attempt) WHERE parent_operation_id IS NOT NULL;
+-- Preserve deliberate retirement made before attempts existed. Superseded
+-- roots already have a child and remain recoverable until explicitly closed.
+UPDATE sso_identity_operations p SET lineage_closed_at=p.retired_at
+ WHERE p.parent_operation_id IS NULL AND p.retired_at IS NOT NULL AND p.lineage_closed_at IS NULL
+   AND NOT EXISTS(SELECT 1 FROM sso_identity_operations c WHERE c.parent_operation_id=p.operation_id);
+-- Prepared target adoption (migration 124); source receipts remain untouched.
+CREATE TABLE IF NOT EXISTS prepared_sso_target_adoptions (
+    target_id UUID PRIMARY KEY,
+    operation_id UUID NOT NULL UNIQUE,
+    realm_id TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL CHECK (config_sha256 ~ '^[0-9a-f]{64}$'),
+    preparation_sha256 TEXT NOT NULL CHECK (preparation_sha256 ~ '^[0-9a-f]{64}$'),
+    akb_user_id UUID NOT NULL REFERENCES users(id),
+    retirement_receipt JSONB NOT NULL CHECK (jsonb_typeof(retirement_receipt)='object'),
+    host_preparation JSONB NOT NULL CHECK (jsonb_typeof(host_preparation)='object'),
+    adopted_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Permanent issuance intent, independent of deletable user/token rows and audit retention.
+CREATE TABLE IF NOT EXISTS platform_service_bootstrap (
+    purpose TEXT PRIMARY KEY CHECK (purpose = 'platform-service-v1'),
+    operation_id UUID NOT NULL UNIQUE,
+    org_id UUID NOT NULL,
+    tenant_slug TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    owner_uid UUID NOT NULL,
+    user_id UUID NOT NULL UNIQUE,
+    token_id UUID NOT NULL UNIQUE,
+    intent_sha256 TEXT NOT NULL CHECK (intent_sha256 ~ '^[a-f0-9]{64}$'),
+    credential_sha256 TEXT NOT NULL CHECK (credential_sha256 ~ '^[a-f0-9]{64}$'),
+    runtime_identity JSONB NOT NULL,
+    service_authority_client_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );

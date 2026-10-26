@@ -7,25 +7,19 @@ import {
   LogOut,
   Settings as SettingsIcon,
 } from "lucide-react";
-import { getMe, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
+import { authSessionSnapshot, getMe, isCurrentAuthSession, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
+import { useCurrentUser, useAccessVerification } from "@/contexts/current-user-context";
+import { UserAvatar } from "@/components/user-avatar";
 
 const THEME_LABELS: Record<Theme, string> = {
   light: "Light",
   dark: "Dark",
   system: "System",
 };
-
-function initialsFor(label: string): string {
-  const words = label.trim().split(/\s+/).filter(Boolean);
-  if (words.length > 1) {
-    return `${Array.from(words[0])[0] ?? ""}${Array.from(words[words.length - 1])[0] ?? ""}`;
-  }
-  return Array.from(words[0] ?? "?").slice(0, 2).join("");
-}
 
 /**
  * Unified user menu — avatar trigger, dropdown with identity + account actions.
@@ -42,20 +36,23 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
   const trigger = useRef<HTMLButtonElement>(null);
   const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
-  const [user, setUser] = useState<CurrentUser | null>(initialUser ?? null);
+  const currentUser = useCurrentUser();
+  const verification = useAccessVerification();
+  const [fallbackUser, setFallbackUser] = useState<CurrentUser | null>(initialUser ?? null);
+  const user = currentUser ?? initialUser ?? fallbackUser;
   const [signOutError, setSignOutError] = useState("");
   const [signingOut, setSigningOut] = useState(false);
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    if (initialUser) {
-      setUser(initialUser);
-      return;
-    }
+    if (currentUser || initialUser) return;
+    let cancelled = false;
+    const session = authSessionSnapshot();
     getMe()
-      .then(setUser)
-      .catch(() => setUser(null));
-  }, [initialUser]);
+      .then(value => { if (!cancelled && isCurrentAuthSession(session)) setFallbackUser(value); })
+      .catch(() => { if (!cancelled && isCurrentAuthSession(session)) setFallbackUser(null); });
+    return () => { cancelled = true; };
+  }, [initialUser, currentUser]);
 
   async function signOut() {
     setSignOutError("");
@@ -80,9 +77,6 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
   const identityLabel = user?.username
     ? `${label} (@${user.username})${user.email ? `, ${user.email}` : ""}`
     : label;
-  // Glyph casing is CSS-only (`uppercase` on the avatar), not a JS transform of
-  // the user-supplied display name (§8).
-  const initials = initialsFor(label);
 
   return (
     <DropdownMenu.Root
@@ -102,12 +96,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
         title={identityLabel}
         className="group inline-flex h-9 min-w-9 shrink-0 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] bg-transparent p-1 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=open]:bg-surface-selected sm:max-w-52 sm:pr-1.5"
       >
-        <span
-          className="inline-grid h-7 w-7 shrink-0 place-items-center rounded-full bg-surface-selected font-display text-xs font-semibold uppercase text-surface-selected-foreground"
-          aria-hidden
-        >
-          {initials}
-        </span>
+        <UserAvatar user={verification.checking ? null : user} size="sm" />
         <span data-slot="account-name" className="hidden min-w-0 truncate text-sm font-medium normal-case text-foreground sm:block">
           {label}
         </span>
@@ -127,12 +116,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
           {/* Identity card: the compact header trigger expands into the full
               account context here, where there is enough room to read it. */}
           <div className="mb-1 flex items-center gap-3 border-b border-border px-3 py-3">
-            <span
-              className="inline-grid h-10 w-10 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border-strong bg-surface-selected font-display text-xs font-bold uppercase text-surface-selected-foreground"
-              aria-hidden
-            >
-              {initials}
-            </span>
+            <UserAvatar user={verification.checking ? null : user} size="md" />
             <div className="min-w-0 flex-1">
               <TooltipText as="div" className="truncate text-sm font-semibold text-foreground">
                 {label}

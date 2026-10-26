@@ -6,7 +6,8 @@ import { VaultRefreshProvider } from "@/contexts/vault-refresh-context";
 import DocumentPage from "@/pages/document";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
   authenticatedFetch: vi.fn(),
   getDocument: vi.fn(),
   getDocumentHistoryWithFallback: vi.fn(),
@@ -84,12 +85,14 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("canonical vault-guide routing", () => {
-  it("redirects the plain viewer to the settings guide editor", async () => {
+  it("keeps the plain guide URL on the shared reader", async () => {
     renderAt(`/vault/v/doc/${encodeURIComponent(VAULT_SKILL_PATH)}`);
     await waitFor(() =>
-      expect(screen.getByTestId("location")).toHaveTextContent("/vault/v/settings#skill"),
+      expect(screen.getByRole("link", { name: "Edit guide" })).toHaveAttribute("href", "/vault/v/settings?edit=guide#skill"),
     );
-    expect(screen.queryByRole("heading", { level: 1, name: "Vault guide" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Vault guide" })).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("/vault/v/doc/overview%2Fvault-skill.md");
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
   });
 
   it("keeps a ?commit= pinned version readable in the viewer", async () => {

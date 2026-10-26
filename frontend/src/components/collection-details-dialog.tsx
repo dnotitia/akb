@@ -27,6 +27,7 @@ interface CollectionDetailsDialogProps {
   path: string;
   summary?: string | null;
   counts: CollectionResourceCounts;
+  countsComplete?: boolean;
   editable: boolean;
   onUpdated: () => void;
 }
@@ -38,6 +39,7 @@ export function CollectionDetailsDialog({
   path,
   summary,
   counts,
+  countsComplete = true,
   editable,
   onUpdated,
 }: CollectionDetailsDialogProps) {
@@ -112,7 +114,7 @@ export function CollectionDetailsDialog({
             <div key={label} className="min-w-0 px-3 py-2.5">
               <div className="flex items-center gap-1.5 text-xs text-foreground-muted">
                 <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-                <span className="truncate">{label}</span>
+                <span className="truncate">{countsComplete ? label : `Loaded ${label.toLowerCase()}`}</span>
               </div>
               <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">
                 {value}
@@ -120,6 +122,7 @@ export function CollectionDetailsDialog({
             </div>
           ))}
         </div>
+        {!countsComplete && <p className="text-xs text-foreground-muted">Counts describe the loaded view, not the complete Collection. Unloaded or filtered resources may also exist.</p>}
 
         <div>
           {editable ? (

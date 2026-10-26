@@ -6,6 +6,9 @@ export interface ResourceLocation {
   title: string;
   kind: "Document" | "File" | "Table";
   collectionPath?: string;
+  /** Canonical ref from the authorized resource response, not a guessed title. */
+  resourceRef?: string;
+  status?: string;
 }
 
 interface Publication {
@@ -51,11 +54,13 @@ export function usePublishResourceLocation(location: ResourceLocation | null, en
   const title = location?.title;
   const kind = location?.kind;
   const collectionPath = location?.collectionPath;
+  const resourceRef = location?.resourceRef;
+  const status = location?.status;
   useLayoutEffect(() => {
     if (!enabled || !publish) return;
     const owner = Symbol("resource-location");
-    return publish(owner, vault && title && kind ? { vault, title, kind, collectionPath } : null);
-  }, [publish, enabled, vault, title, kind, collectionPath]);
+    return publish(owner, vault && title && kind ? { vault, title, kind, collectionPath, resourceRef, status } : null);
+  }, [publish, enabled, vault, title, kind, collectionPath, resourceRef, status]);
 }
 
 // eslint-disable-next-line react-refresh/only-export-components

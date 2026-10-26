@@ -835,8 +835,10 @@ Each item includes its `uri` for use with akb_link, akb_relations, etc.
 |-------|----------|-------------|
 | vault | ✓ | Vault name |
 | collection | | Collection path (omit for top-level) |
-| depth | | 1 = collections only, 2 = collections + documents |
-| content_type | | all, documents, tables, files (default: all) |
+| depth | | 0 = direct children; N = descend N collection levels; -1 = entire subtree |
+| content_type | | all, collections, documents, tables, files (default: all) |
+| page_size | | Opt into identity-bounded pages (1–200); do not combine with legacy limit/offset |
+| cursor | | Previous next_cursor for the same Vault, collection, depth and kind |
 
 ## Examples
 ```
@@ -846,6 +848,18 @@ akb_browse(vault="eng", collection="specs")     # Drill into specs/, direct chil
 akb_browse(vault="eng", depth=-1)               # Entire vault subtree (unbounded)
 akb_browse(vault="eng", depth=0)                # Strict: vault root contents only
 ```
+
+## Large Vaults
+Start with `akb_browse(vault="eng", depth=0, page_size=100)`, then follow
+`next_cursor` until `complete=true`, or drill into a returned Collection URI.
+Paged depth applies to collection rows too. `scanned` is the number of identities
+examined on this page; archive/name filters can leave an empty page with a cursor.
+There is no exact total. Stable order is kind, bytewise path, then identity;
+concurrent changes require a refresh, not a snapshot guarantee. Page size bounds
+identities/body reads, not encoded response bytes: request fewer items or omit
+hashes/summaries when your client has a response budget. A client budget failure
+after HTTP 200 is not a server failure. Legacy limit/offset only slices the full
+listing after materialization and is not suitable for bounded database work.
 
 💡 Use content_type to filter when you only need one data type.""",
 
@@ -915,7 +929,18 @@ akb_grep(pattern="PostgreSQL")
 akb_grep(pattern="api/v1/users", vault="eng")
 akb_grep(pattern="TODO|FIXME", regex=true)
 akb_grep(pattern="Bearer", case_sensitive=true)
+akb_grep(pattern="Bearer", vault="eng", collection="specs", limit=25)
 ```
+
+## Protective scope limits
+On Native storage, candidate resources (10,000) and canonical search bytes
+(128 MiB) are checked before bodies are read. `limit` caps returned previews,
+not the scanned corpus; `count_only` does not bypass this protection either.
+HTTP 422 / `grep_scope_too_large` means narrow the Vault or supported `collection`
+scope (including descendants). `path` is not a supported grep parameter.
+Do not retry an unchanged oversized scope or report it as zero matches/service
+unavailable. An unknown client-side response-byte budget is separate from these
+server scan limits and from 5xx backend/dependency failures.
 
 ## Replace Examples
 ```

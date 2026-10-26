@@ -17,7 +17,7 @@ async function mockWorkspace(page: Page) {
   });
 }
 
-async function assertQuerySpace(scope: Locator, query: Locator, count: number, width: number) {
+async function assertChipQuerySpace(scope: Locator, query: Locator, count: number, width: number) {
   await expect(scope.getByRole("button", { name: /^Remove .* from search scope$/ })).toHaveCount(Math.min(count, 2));
   await expect(query).toBeInViewport();
   const scopeBox = (await scope.boundingBox())!;
@@ -33,7 +33,54 @@ async function assertQuerySpace(scope: Locator, query: Locator, count: number, w
   }
 }
 
-for (const width of [375, 1440, 2560]) {
+async function assertSummaryQuerySpace(page: Page, count: number, width: number) {
+  const entry = page.getByTestId("search-query-entry");
+  const scope = entry.getByRole("group", { name: "Vault search scope" });
+  const query = entry.getByRole("searchbox", { name: "Search query", exact: true });
+  const method = entry.getByRole("button", { name: "Search method", exact: true });
+  const submit = entry.getByRole("button", { name: "Search", exact: true });
+  await expect(scope.getByRole("button")).toHaveCount(1);
+  await expect(scope.getByRole("button", { name: `Search scope: ${count} vaults`, exact: true })).toHaveText(`${count} vaults`);
+  await expect(page.getByRole("button", { name: "Search method", exact: true })).toHaveCount(1);
+  await expect(query).toBeInViewport();
+  const workspaceWidth = await page.getByTestId("search-workspace").evaluate(element => {
+    const style = getComputedStyle(element);
+    return element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  });
+  const scopeBox = (await scope.boundingBox())!;
+  const queryBox = (await query.boundingBox())!;
+  const methodBox = (await method.boundingBox())!;
+  const submitBox = (await submit.boundingBox())!;
+  const centerY = (box: typeof queryBox) => box.y + box.height / 2;
+  expect(queryBox.width).toBeGreaterThanOrEqual(width === 375 ? 120 : 240);
+  expect(Math.abs(centerY(queryBox) - centerY(submitBox))).toBeLessThanOrEqual(4);
+  expect(queryBox.x + queryBox.width).toBeLessThanOrEqual(submitBox.x);
+  if (workspaceWidth >= 720) {
+    expect(scopeBox.x + scopeBox.width).toBeLessThanOrEqual(queryBox.x);
+    expect(queryBox.x + queryBox.width).toBeLessThanOrEqual(methodBox.x);
+    expect(methodBox.x + methodBox.width).toBeLessThanOrEqual(submitBox.x);
+    expect(Math.abs(centerY(queryBox) - centerY(scopeBox))).toBeLessThanOrEqual(4);
+    expect(Math.abs(centerY(queryBox) - centerY(methodBox))).toBeLessThanOrEqual(4);
+  } else {
+    expect(scopeBox.x + scopeBox.width).toBeLessThanOrEqual(methodBox.x);
+    expect(Math.abs(centerY(scopeBox) - centerY(methodBox))).toBeLessThanOrEqual(4);
+    expect(queryBox.y).toBeGreaterThanOrEqual(scopeBox.y + scopeBox.height);
+    expect(queryBox.y).toBeGreaterThanOrEqual(methodBox.y + methodBox.height);
+  }
+
+  const title = page.getByRole("heading", { level: 1, name: "Search", exact: true });
+  const titleBox = (await title.boundingBox())!;
+  await expect(title.locator("svg")).toHaveCount(0);
+  if (width >= 1024) {
+    expect(titleBox.width).toBeLessThanOrEqual(1);
+    expect(titleBox.height).toBeLessThanOrEqual(1);
+  } else {
+    expect(titleBox.height).toBeGreaterThan(1);
+    expect(titleBox.height).toBeLessThanOrEqual(28);
+  }
+}
+
+for (const width of [375, 680, 820, 1440, 2560]) {
   test(`Search scope preserves query width with 2, 3 and 40 long Vault names at ${width}px`, async ({ page }, testInfo) => {
     test.setTimeout(60_000);
     await page.setViewportSize({ width, height: 1000 });
@@ -42,13 +89,19 @@ for (const width of [375, 1440, 2560]) {
     for (const count of [2, 3, 40]) {
       await page.goto(`/search?q=guide&v=${encodeURIComponent(vaults.slice(0, count).join(","))}`);
       const query = page.getByRole("searchbox", { name: "Search query", exact: true });
-      const scope = page.getByRole("group", { name: "Vault search scope" });
       await expect(query).toHaveValue("guide");
-      await assertQuerySpace(scope, query, count, width);
-      if (count > 2) await expect(scope.getByText(`+${count - 2}`, { exact: true })).toBeVisible();
+      await assertSummaryQuerySpace(page, count, width);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      const commandFrame = (await page.getByTestId("search-command-header").boundingBox())!;
+      const resultFrame = (await page.getByTestId("search-results-panel").boundingBox())!;
+      expect(Math.abs(resultFrame.x - commandFrame.x)).toBeLessThanOrEqual(1);
+      expect(Math.abs(resultFrame.x + resultFrame.width - commandFrame.x - commandFrame.width)).toBeLessThanOrEqual(1);
     }
     await page.screenshot({ path: testInfo.outputPath("page-forty-scopes.png") });
+
+    // The unchanged quick-search chips need mobile and desktop coverage; the
+    // intermediate widths above exercise the full page's 720px breakpoint.
+    if (width === 680 || width === 820) return;
 
     await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
     const dialog = page.getByRole("dialog");
@@ -58,7 +111,7 @@ for (const width of [375, 1440, 2560]) {
     const query = dialog.getByRole("combobox");
     await query.fill("guide");
     const scope = dialog.getByRole("group", { name: "Vault search scope" });
-    await assertQuerySpace(scope, query, 40, width);
+    await assertChipQuerySpace(scope, query, 40, width);
     await expect(scope.getByText("+38", { exact: true })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Close search" })).toBeInViewport();
     await page.screenshot({ path: testInfo.outputPath("modal-forty-scopes.png") });

@@ -1,5 +1,6 @@
 import {
   type ComponentType,
+  useLayoutEffect,
   useCallback,
   useEffect,
   useMemo,
@@ -13,25 +14,29 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import {
+  ArrowRight,
   ArrowUpRight,
-  Braces,
-  Check,
-  ChevronDown,
   Clock3,
   File,
   FileText,
-  Layers3,
   Search as SearchIcon,
   SlidersHorizontal,
-  Sparkles,
   Table,
   Tag,
   X,
 } from "lucide-react";
-import { searchDocs, grepDocs, listVaults, type GrepDoc } from "@/lib/api";
+import { searchDocs, grepDocs, listVaults, type ApiError, type GrepDoc } from "@/lib/api";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Panel } from "@/components/ui/panel";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -116,12 +121,11 @@ const TYPE_META: Record<
 const SOURCE_FILTERS: Array<{
   key: SourceFilter;
   label: string;
-  icon: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
 }> = [
-  { key: "all", label: "All", icon: Layers3 },
-  { key: "document", label: "Documents", icon: FileText },
-  { key: "table", label: "Tables", icon: Table },
-  { key: "file", label: "Files", icon: File },
+  { key: "all", label: "All" },
+  { key: "document", label: "Documents" },
+  { key: "table", label: "Tables" },
+  { key: "file", label: "Files" },
 ];
 
 const inlineActionClass =
@@ -188,6 +192,7 @@ function SearchWorkspace() {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [scopeTooLarge, setScopeTooLarge] = useState(false);
   const [vaults, setVaults] = useState<string[] | null>(null);
   const [vaultsError, setVaultsError] = useState(false);
   const [vaultsRetry, setVaultsRetry] = useState(0);
@@ -207,15 +212,41 @@ function SearchWorkspace() {
     [],
   );
   const reqId = useRef(0);
+  const successfulScope = useRef<string | null>(null);
+  const [appliedOptions, setAppliedOptions] = useState<string | null>(null);
+  const [appliedFilterSummary, setAppliedFilterSummary] = useState("");
   const queryInputRef = useRef<HTMLInputElement>(null);
+  const collectionInputRef = useRef<HTMLInputElement>(null);
+  const focusCollectionOnOpen = useRef(false);
+  const filtersButtonRef = useRef<HTMLButtonElement>(null);
+  const filterContentRef = useRef<HTMLDivElement>(null);
+  const activeFiltersRef = useRef<HTMLDivElement>(null);
+  const pendingChipFocus = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (pendingChipFocus.current === null) return;
+    const buttons = activeFiltersRef.current?.querySelectorAll<HTMLButtonElement>(
+      "button[data-filter-chip]",
+    );
+    const target = buttons?.[Math.min(pendingChipFocus.current, buttons.length - 1)];
+    (target ?? filtersButtonRef.current)?.focus({ preventScroll: true });
+    pendingChipFocus.current = null;
+  }, [searchParams]);
 
   const doSearch = useCallback(
     async (searchQuery: string, searchMode: Mode, selectedVaults: string[]) => {
       if (!searchQuery.trim()) return;
       const id = ++reqId.current;
+      const scope = JSON.stringify([searchQuery.trim(), searchMode, selectedVaults]);
+      if (successfulScope.current !== scope) {
+        setDenseResults([]); setLiteralResults([]); setTotal(0); setTotalMatches(0);
+        setReturnedDocs(0); setReturnedMatches(0); setTruncated(false); setDegraded(false);
+        setAppliedOptions(null); setArchiveUnsupported(false);
+      }
       setLoading(true);
       setSearched(true);
       setError(null);
+      setScopeTooLarge(false);
 
       try {
         if (searchMode === "dense") {
@@ -274,6 +305,16 @@ function SearchWorkspace() {
           setTruncated(Boolean(response.truncated));
           setDegraded(false);
         }
+        successfulScope.current = scope;
+        setAppliedOptions(JSON.stringify(options));
+        setAppliedFilterSummary([
+          options.source_type || "all content kinds",
+          options.doc_types?.length ? `types: ${options.doc_types.join(", ")}` : "all document types",
+          options.tags?.length ? `tags: ${options.tags.join(", ")}` : "all tags",
+          options.collection ? `collection: ${options.collection}` : "all collections",
+          `document state: ${options.archive_scope ?? (options.include_archived ? "all" : "unarchived")}`,
+          ...(searchMode === "literal" ? [options.regex ? "regular expression" : "plain text", options.case_sensitive ? "case sensitive" : "case insensitive", options.include_text_files ? "including text files" : "documents only"] : []),
+        ].join(" · "));
         // Legacy history cannot replay a Collection predicate. Do not turn a
         // scoped search into an unfiltered Vault query on a later visit.
         if (id === reqId.current && currentUserId && !options.collection) {
@@ -288,14 +329,13 @@ function SearchWorkspace() {
       } catch (caught) {
         if (id !== reqId.current) return;
         setError(caught instanceof Error ? caught.message : "Search failed");
-        setDenseResults([]);
-        setLiteralResults([]);
-        setTotal(0);
-        setTotalMatches(0);
-        setReturnedDocs(0);
-        setReturnedMatches(0);
-        setTruncated(false);
-        setDegraded(false);
+        const apiError = caught as ApiError<{ code?: string }> | null;
+        setScopeTooLarge(apiError?.status === 422 && apiError?.detail?.code === "grep_scope_too_large");
+        if (typeof caught === "object" && caught !== null && "status" in caught && (caught.status === 401 || caught.status === 403)) {
+          setDenseResults([]); setLiteralResults([]); setTotal(0); setTotalMatches(0);
+          setReturnedDocs(0); setReturnedMatches(0); setTruncated(false); setDegraded(false);
+          successfulScope.current = null; setAppliedOptions(null);
+        }
       } finally {
         if (id === reqId.current) setLoading(false);
       }
@@ -356,6 +396,8 @@ function SearchWorkspace() {
     } else {
       reqId.current += 1;
       setArchiveUnsupported(false);
+      successfulScope.current = null;
+      setAppliedOptions(null);
       setDenseResults([]);
       setLiteralResults([]);
       setTotal(0);
@@ -367,6 +409,7 @@ function SearchWorkspace() {
       setLoading(false);
       setSearched(false);
       setError(null);
+      setScopeTooLarge(false);
     }
 
     return () => {
@@ -504,13 +547,13 @@ function SearchWorkspace() {
       ? `${returnedDocs} of ${total} ${literalUnit} · ${returnedMatches} of ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`
       : `${total} ${literalUnit} · ${totalMatches} ${totalMatches === 1 ? "match" : "matches"}`;
   const activeFilterCount =
-    (activeSource === "all" ? 0 : 1) +
+    (mode === "literal" || activeSource === "all" ? 0 : 1) +
     (allTypesActive ? 0 : 1) +
     (activeTags.size === 0 ? 0 : 1) +
     Number(Boolean(options.collection)) +
     Number(archiveScope !== "unarchived") +
-    Number(options.regex) +
-    Number(options.case_sensitive) +
+    Number(mode === "literal" && options.regex) +
+    Number(mode === "literal" && options.case_sensitive) +
     Number(mode === "literal" && options.include_text_files);
   const accessibleVaultNames = new Set(vaults ?? []);
   const visibleRecentDocuments = recentDocuments
@@ -526,7 +569,7 @@ function SearchWorkspace() {
   const resultStatus = loading
     ? "Searching…"
     : error
-      ? "Search unavailable"
+      ? scopeTooLarge ? "Search scope too large" : "Search unavailable"
       : archiveUnsupported
         ? "Document state filter unavailable"
         : !searched
@@ -602,7 +645,7 @@ function SearchWorkspace() {
   const queryForm = (
     <form
       data-testid="search-command-header"
-      className="flex w-full min-w-0 items-start gap-2.5"
+      className="w-full min-w-0 space-y-2"
       onSubmit={(event) => {
         event.preventDefault();
         commitQuery(draft);
@@ -610,26 +653,28 @@ function SearchWorkspace() {
       role="search"
       aria-label={`Search in ${scopeLabel}`}
     >
+      <h1 className="text-sm font-semibold text-foreground lg:sr-only">Search</h1>
       <span id="search-query-help" className="sr-only">
         {mode === "dense"
           ? "Semantic search matches meaning and keywords."
           : "Literal search matches exact text or a regular expression."}
       </span>
-      <div className="@container/scope-query flex min-h-10 min-w-0 flex-1 flex-wrap items-center gap-2 rounded-[var(--radius-md)] border border-border-strong bg-surface px-2 py-1 shadow-xs transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-surface">
-        <SearchVaultPicker
-          selected={scopeVaults}
-          contextVault={scopedVault}
-          vaults={vaults}
-          error={vaultsError}
-          onRetry={() => setVaultsRetry((retry) => retry + 1)}
-          onChange={setScopeVaults}
-        />
-        <div className="flex min-h-8 min-w-0 flex-[1_0_100%] items-center gap-2 px-1 @min-[30rem]/scope-query:flex-[1_1_12rem]">
+      <div data-testid="search-query-entry" className="search-query-entry grid min-h-13 min-w-0 grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-x-2 gap-y-1 rounded-[var(--radius-md)] border border-border bg-surface px-2 py-1 shadow-xs transition-token focus-within:border-primary focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background @min-[45rem]/search:grid-cols-[auto_minmax(0,1fr)_auto_auto]">
+        <div className="col-start-1 row-start-1 min-w-0">
+          <SearchVaultPicker
+            variant="summary"
+            selected={scopeVaults}
+            contextVault={scopedVault}
+            vaults={vaults}
+            error={vaultsError}
+            onRetry={() => setVaultsRetry((retry) => retry + 1)}
+            onChange={setScopeVaults}
+          />
+        </div>
+        <div className="search-query-control col-span-2 col-start-1 row-start-2 flex min-h-11 min-w-0 items-center gap-2 @min-[45rem]/search:col-span-1 @min-[45rem]/search:col-start-2 @min-[45rem]/search:row-start-1">
           <SearchIcon className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
-          <label htmlFor="vault-search" className="sr-only">
-            Search query
-          </label>
-          <input
+          <label htmlFor="vault-search" className="sr-only">Search query</label>
+          <Input
             ref={queryInputRef}
             id="vault-search"
             type="search"
@@ -644,43 +689,57 @@ function SearchWorkspace() {
                 commitQuery("");
               }
             }}
-            className="min-w-0 flex-1 appearance-none bg-transparent text-sm text-foreground placeholder:text-foreground-muted focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+            className="search-compact-control h-11 min-w-0 flex-1 rounded-none border-0 bg-transparent px-0 text-base shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 @min-[45rem]/search:text-sm [&::-webkit-search-cancel-button]:hidden"
           />
           {draft && !loading && (
             <button
               type="button"
               aria-label="Clear search query"
               onClick={() => commitQuery("")}
-              className="ml-1 inline-flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] px-1 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="search-compact-control search-compact-icon inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X className="h-3.5 w-3.5" aria-hidden />
             </button>
           )}
         </div>
+        <SelectMenu
+          aria-label="Search method"
+          variant="navigation"
+          value={mode}
+          onValueChange={(value) => switchMode(value as Mode)}
+          className="search-compact-control col-span-2 col-start-2 row-start-1 h-11 w-fit justify-self-end gap-1.5 px-2 text-xs text-foreground-muted @min-[45rem]/search:col-span-1 @min-[45rem]/search:col-start-3"
+          collisionPadding={8}
+          wrapHints
+          contentClassName="search-compact-menu w-72 max-w-[calc(100vw-1rem)] [&_[role=menuitemradio]]:min-h-11"
+          options={[
+            { value: "dense", label: "By meaning", hint: "Semantic search with meaning and keywords." },
+            { value: "literal", label: "Exact text", hint: "Literal search, including regular expressions." },
+          ]}
+        />
+        <Button
+          type="submit"
+          variant="ghost"
+          aria-label="Search"
+          loading={loading}
+          className="search-compact-control col-start-3 row-start-2 h-11 w-11 shrink-0 gap-1.5 justify-self-end px-0 text-link @min-[45rem]/search:col-start-4 @min-[45rem]/search:row-start-1 @min-[45rem]/search:w-auto @min-[45rem]/search:px-3"
+        >
+          <span className="hidden @min-[45rem]/search:inline">Search</span>
+          {!loading && <ArrowRight className="h-4 w-4" aria-hidden />}
+        </Button>
       </div>
-      <Button
-        type="submit"
-        variant="default"
-        size="md"
-        loading={loading}
-        className="h-10 shrink-0 px-4"
-      >
-        Search
-      </Button>
     </form>
   );
 
   return (
     <div
       data-testid="search-workspace"
-      className="@container/search flex h-full min-h-0 w-full max-w-none flex-col overflow-hidden bg-surface"
+      className="@container/search flex h-full min-h-0 w-full max-w-none flex-col overflow-hidden bg-background p-3 sm:p-4 lg:p-5"
     >
-      <h1 className="sr-only">Search</h1>
       <p role="status" aria-live="polite" className="sr-only">
         {loading
           ? "Searching…"
           : error
-            ? "Search failed"
+            ? scopeTooLarge ? "Search scope too large; choose a narrower Collection" : "Search failed"
             : !searched
               ? ""
               : degraded
@@ -692,555 +751,500 @@ function SearchWorkspace() {
 
       <section
         aria-label="Search workspace"
-        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+        className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col gap-3"
       >
         <header
           aria-label="Page search controls"
-          className="shrink-0 border-b border-border bg-surface px-4 py-3 sm:px-6"
+          className="shrink-0"
         >
-          {queryForm}
-          <VaultQuerySuggestions
-            query={draft}
-            selected={scopeVaults}
-            vaults={vaults}
-            onSelect={(vault) => {
-              setScopeVaults([...scopeVaults, vault], true);
-              queryInputRef.current?.focus({ preventScroll: true });
-            }}
-          />
+          <div className="w-full">
+            {queryForm}
+            <VaultQuerySuggestions
+              query={draft}
+              selected={scopeVaults}
+              vaults={vaults}
+              onSelect={(vault) => {
+                setScopeVaults([...scopeVaults, vault], true);
+                queryInputRef.current?.focus({ preventScroll: true });
+              }}
+            />
+          </div>
         </header>
-        <div className="flex min-h-0 flex-1 flex-col @min-[56rem]/search:flex-row">
-          <aside
-            aria-label="Search refinements"
-            className="rail-scroll grid max-h-[55%] shrink-0 grid-cols-[1fr_auto] content-start gap-x-2 overflow-y-auto border-b border-border bg-surface p-3 @min-[56rem]/search:block @min-[56rem]/search:max-h-none @min-[56rem]/search:w-64 @min-[56rem]/search:border-b-0 @min-[56rem]/search:border-r @min-[56rem]/search:p-5"
-          >
-            <h2 className="mb-5 hidden items-center gap-2 text-sm font-semibold @min-[56rem]/search:flex">
-              <SlidersHorizontal
-                className="h-4 w-4 text-foreground-muted"
-                aria-hidden
-              />
-              Filters
-            </h2>
-            <div className="flex flex-wrap items-center justify-between gap-2 @min-[56rem]/search:flex-col @min-[56rem]/search:items-start">
-              <span className="hidden text-xs font-medium text-foreground-muted @min-[56rem]/search:block">
-                Search mode
-              </span>
-              <div
-                role="group"
-                aria-label="Search mode"
-                className="inline-flex min-h-10 shrink-0 items-stretch border-b border-border @min-[56rem]/search:w-full"
-              >
-                <button
-                  type="button"
-                  aria-label="Semantic"
-                  aria-pressed={mode === "dense"}
-                  onClick={() => switchMode("dense")}
-                  className={searchModeClass(mode === "dense")}
-                >
-                  <Sparkles className="h-3.5 w-3.5" aria-hidden />
-                  Semantic
-                </button>
-                <button
-                  type="button"
-                  aria-label="Literal"
-                  aria-pressed={mode === "literal"}
-                  onClick={() => switchMode("literal")}
-                  className={searchModeClass(mode === "literal")}
-                >
-                  <Braces className="h-3.5 w-3.5" aria-hidden />
-                  Literal
-                </button>
-              </div>
-
-              <p className="hidden text-xs leading-relaxed text-foreground-muted @min-[56rem]/search:block">
-                {mode === "dense"
-                  ? "Find by meaning and keywords."
-                  : "Match exact text or a pattern."}
+        <Panel variant="workspace" flush data-testid="search-results-panel" className="flex min-h-0 flex-col rounded-[var(--radius-sm)]">
+          <div data-testid="search-tool-row" className="rail-scroll min-h-10 shrink-0 overflow-hidden border-b border-border bg-background">
+            <div className="grid min-h-11 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 px-4 py-1 @min-[40rem]/search:grid-cols-[auto_minmax(0,1fr)_auto]">
+              <h2 id="search-results-heading" className="order-1 text-sm font-semibold text-foreground">
+                {mode === "dense" ? "Results" : "Exact matches"}
+                <span className="sr-only">{q ? ` for ${q}` : ""}</span>
+              </h2>
+              <p className="order-3 col-span-2 text-xs leading-relaxed text-foreground-muted @min-[40rem]/search:order-2 @min-[40rem]/search:col-span-1">
+                <span className="tabular-nums">{resultStatus}</span>
+                <span data-testid="search-scope-row" className="sr-only">{scopeVaults.length === 0 ? "Across all accessible vaults" : `Across ${scopeVaults.length} ${scopeVaults.length === 1 ? "vault" : "vaults"}`}</span>
               </p>
-            </div>
-            <div className="col-span-2 row-start-2 mt-3 @min-[56rem]/search:mt-5 @min-[56rem]/search:border-t @min-[56rem]/search:border-border @min-[56rem]/search:pt-4">
-              {mode === "dense" && (
-                <fieldset>
-                  <legend className="mb-2 text-xs font-semibold">
-                    Content type
-                  </legend>
-                  <div
-                    className="flex flex-wrap gap-1.5 @min-[56rem]/search:flex-col"
-                    role="group"
-                    aria-label="Filter by content kind"
-                  >
-                    {SOURCE_FILTERS.map(({ key, label, icon: Icon }) => (
-                      <button
-                        key={key}
-                        type="button"
-                        aria-label={label}
-                        aria-pressed={activeSource === key}
-                        onClick={() =>
-                          setFilter("source", key === "all" ? [] : [key])
-                        }
-                        className={sourceFilterClass(activeSource === key)}
-                      >
-                        <Icon className="h-3.5 w-3.5" aria-hidden />
-                        <span className="flex-1">{label}</span>
-                        {activeSource === key && (
-                          <Check className="h-3.5 w-3.5 shrink-0" aria-hidden />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                </fieldset>
-              )}
-            </div>
-            <div className="col-start-2 row-start-1 @min-[56rem]/search:mt-5">
-              <button
-                type="button"
-                aria-label="More filters"
-                aria-expanded={filtersOpen}
-                aria-controls="search-filter-tray"
-                onClick={() => setFiltersOpen((open) => !open)}
-                className={cn(
-                  "inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border border-border px-3 text-xs font-medium transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring @min-[56rem]/search:w-full",
-                  filtersOpen
-                    ? "bg-surface-2 text-foreground"
-                    : "bg-surface text-foreground-muted",
-                )}
-              >
-                <span className="flex-1 text-left">More filters</span>
-                {activeFilterCount > 0 && (
-                  <Badge variant="secondary">{activeFilterCount}</Badge>
-                )}
-                <ChevronDown
-                  className={cn(
-                    "h-3.5 w-3.5 shrink-0 transition-transform motion-reduce:transition-none",
-                    filtersOpen && "rotate-180",
-                  )}
-                  aria-hidden
-                />
-              </button>
-            </div>
-            {filtersOpen && (
-              <aside
-                id="search-filter-tray"
-                aria-label="Search filters"
-                className="col-span-2 mt-4 border-t border-border pt-4"
-              >
-                <div className="grid gap-5 sm:grid-cols-2 @min-[56rem]/search:grid-cols-1">
-                  <fieldset>
-                    <legend className="mb-2 text-xs font-semibold">
-                      Document type
-                    </legend>
-                    <div
-                      className="flex flex-wrap gap-1.5"
-                      role="group"
-                      aria-label="Filter by document type"
-                    >
-                      <button
-                        type="button"
-                        aria-label="Show all types"
-                        aria-pressed={allTypesActive}
-                        onClick={() => setFilter("doc_type", [])}
-                        className={filterButtonClass(allTypesActive)}
-                      >
-                        All types
-                      </button>
-                      {ALL_TYPES.map((type) => (
-                        <button
-                          key={type}
-                          type="button"
-                          aria-label={`Toggle ${type}`}
-                          aria-pressed={activeTypes.has(type)}
-                          onClick={() => toggleType(type)}
-                          className={filterButtonClass(activeTypes.has(type))}
-                        >
-                          <span className="capitalize">{type}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </fieldset>
-                  <div>
-                    <label
-                      htmlFor="search-tags"
-                      className="mb-2 block text-xs font-semibold"
-                    >
-                      Tags (match any)
-                    </label>
-                    <TagInput
-                      id="search-tags"
-                      value={[...activeTags]}
-                      onChange={(tags) => setFilter("tag", tags)}
-                    />
-                    {availableTags.length > 0 && (
-                      <div
-                        className="mt-2 flex flex-wrap gap-1.5"
-                        role="group"
-                        aria-label="Suggested tags from loaded results"
-                      >
-                        {availableTags.slice(0, 12).map(([tag]) => (
-                          <button
-                            key={tag}
-                            type="button"
-                            aria-label={`Toggle tag ${tag}`}
-                            aria-pressed={activeTags.has(tag)}
-                            onClick={() => toggleTag(tag)}
-                            className={filterButtonClass(activeTags.has(tag))}
-                          >
-                            <Tag className="h-3 w-3" aria-hidden />
-                            {tag}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <form
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      setFilter("collection", [
-                        collectionDraft.trim().replace(/^\/+|\/+$/g, ""),
-                      ]);
-                    }}
-                  >
-                    <label
-                      htmlFor="search-collection"
-                      className="mb-2 block text-xs font-semibold"
-                    >
-                      Collection path (including children)
-                    </label>
-                    <div className="flex gap-2">
-                      <Input
-                        id="search-collection"
-                        value={collectionDraft}
-                        onChange={(event) =>
-                          setCollectionDraft(event.target.value)
-                        }
-                        placeholder="e.g. guides/api"
-                      />
-                      <Button type="submit" variant="outline" size="sm">
-                        Apply
-                      </Button>
-                    </div>
-                    <p className="mt-1 text-xs text-foreground-muted">
-                      The same path is used in each selected Vault.
-                    </p>
-                  </form>
-                  <div className="flex flex-col gap-3 text-sm">
-                    <div>
-                      <label
-                        htmlFor="search-document-state"
-                        className="mb-2 block text-xs font-semibold"
-                      >
-                        Document state
-                      </label>
-                      <SelectMenu
-                        id="search-document-state"
-                        aria-label="Document state"
-                        value={archiveScope}
-                        onValueChange={(value) =>
-                          setFilter("archive_scope", [value])
-                        }
-                        options={[
-                          { value: "unarchived", label: "Current documents" },
-                          { value: "archived", label: "Archived documents" },
-                          { value: "all", label: "All documents" },
-                        ]}
-                      />
-                      <p className="mt-1 text-xs text-foreground-muted">
-                        Current includes drafts. Archived searches documents
-                        only.
-                      </p>
-                    </div>
-                    {mode === "literal" && (
-                      <>
-                        <label className="flex min-h-9 items-center gap-2">
-                          <input
-                            type="checkbox"
-                            className="accent-primary focus-visible:outline-ring"
-                            checked={Boolean(options.include_text_files)}
-                            onChange={(event) =>
-                              setFilter(
-                                "include_text_files",
-                                event.target.checked ? ["true"] : [],
-                              )
-                            }
-                          />
-                          Include text Files
-                        </label>
-                        <label className="flex min-h-9 items-center gap-2">
-                          <input
-                            type="checkbox"
-                            className="accent-primary focus-visible:outline-ring"
-                            checked={Boolean(options.regex)}
-                            onChange={(event) =>
-                              setFilter(
-                                "regex",
-                                event.target.checked ? ["true"] : [],
-                              )
-                            }
-                          />
-                          Regular expression
-                        </label>
-                        <label className="flex min-h-9 items-center gap-2">
-                          <input
-                            type="checkbox"
-                            className="accent-primary focus-visible:outline-ring"
-                            checked={Boolean(options.case_sensitive)}
-                            onChange={(event) =>
-                              setFilter(
-                                "case_sensitive",
-                                event.target.checked ? ["true"] : [],
-                              )
-                            }
-                          />
-                          Case sensitive
-                        </label>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <div className="mt-4 flex flex-col items-start gap-3 border-t border-border pt-3">
-                  <p className="text-xs text-foreground-muted">
-                    {mode === "literal"
-                      ? "Literal search includes text Files when enabled. Document type, tag, and archived-only filters exclude Files. Content-kind selection is retained for Semantic search."
-                      : "Document type and tag filters search documents only. Filters apply on the server before the result limit."}
-                  </p>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={resetFilters}
-                  >
-                    Reset filters
-                  </Button>
-                </div>
-              </aside>
-            )}
-          </aside>
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-surface">
-            <div
-              data-testid="search-tool-row"
-              className="flex min-h-10 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border px-4 py-3 text-xs sm:px-6"
-            >
-              <p className="text-sm font-semibold tabular-nums text-foreground">
-                {resultStatus}
-              </p>
-              <p
-                data-testid="search-scope-row"
-                className="min-w-0 break-words text-foreground-muted"
-              >
-                {scopeVaults.length === 0 ? "Across all accessible vaults" : `Across ${scopeVaults.length} ${scopeVaults.length === 1 ? "vault" : "vaults"}`}
-              </p>
-            </div>
-
-            <div
-              role="region"
-              aria-label="Search results"
-              aria-busy={loading}
-              data-testid="search-results-pane"
-              className="rail-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-surface px-4 py-5 sm:px-6"
-            >
-              <div className="mx-auto w-full max-w-[76rem] space-y-4">
-                {activeFilters.length > 0 && (
-                  <div
-                    aria-label="Active search filters"
-                    className="flex flex-wrap items-center gap-2"
-                  >
-                    {activeFilters.map((filter) => (
-                      <button
-                        key={filter.label}
-                        type="button"
-                        onClick={filter.remove}
-                        aria-label={`Remove filter ${filter.label}`}
-                        className="inline-flex min-h-8 max-w-full items-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-surface-2 px-2 text-xs text-foreground-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <span className="truncate">{filter.label}</span>
-                        <X className="h-3 w-3 shrink-0" aria-hidden />
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      onClick={resetFilters}
-                      className={inlineActionClass}
-                    >
-                      Clear filters
-                    </button>
-                  </div>
-                )}
-                {degraded && !loading && (
-                  <Alert
-                    variant="warning"
-                    className="rounded-[var(--radius-md)]"
-                  >
-                    Search is incomplete.{" "}
-                    {degradationReason === "sparse_encoder_degraded"
-                      ? "Keyword retrieval is temporarily unavailable."
-                      : "The retrieval service is temporarily unavailable."}{" "}
-                    <button
-                      type="button"
-                      onClick={() => void doSearch(q, mode, scopeVaults)}
-                      className={inlineActionClass}
-                    >
-                      Retry
-                    </button>{" "}
-                    or switch to{" "}
-                    <button
-                      type="button"
-                      onClick={() => switchMode("literal")}
-                      className={inlineActionClass}
-                    >
-                      Literal
-                    </button>{" "}
-                    search.
-                  </Alert>
-                )}
-
-                {showLiteralHint && (
-                  <Alert variant="info" className="rounded-[var(--radius-md)]">
-                    Short identifiers are usually easier to find with{" "}
-                    <button
-                      type="button"
-                      onClick={() => switchMode("literal")}
-                      className={inlineActionClass}
-                    >
-                      Literal
-                    </button>{" "}
-                    search.
-                  </Alert>
-                )}
-
-                {loading &&
-                  (hasResults ? (
-                    <InlineLoadingState label="Updating search; previous results shown" />
-                  ) : (
-                    <SearchLoadingState />
-                  ))}
-
-                {error && !loading && (
-                  <Alert
-                    variant="destructive"
-                    title="Search unavailable"
-                    className="rounded-[var(--radius-md)]"
-                  >
-                    {error}.{" "}
-                    <button
-                      type="button"
-                      onClick={() => void doSearch(q, mode, scopeVaults)}
-                      className={inlineActionClass}
-                    >
-                      Retry
-                    </button>
-                  </Alert>
-                )}
-
-                {archiveUnsupported && !loading && !error && (
-                  <Alert
-                    variant="warning"
-                    title="Document state filter unavailable"
-                    className="rounded-[var(--radius-md)]"
-                  >
-                    This server could not confirm the selected document state
-                    filter. Results are hidden to avoid showing the wrong scope.
-                    Update the server or{" "}
-                    <button
-                      type="button"
-                      className={inlineActionClass}
-                      onClick={() => setFilter("archive_scope", [])}
-                    >
-                      search current documents
-                    </button>
-                    .
-                  </Alert>
-                )}
-
-                {!searched && (
-                  <SearchStartState
-                    mode={mode}
-                    recentSearches={visibleRecentSearches}
-                    recentDocuments={visibleRecentDocuments}
-                    onRepeatSearch={repeatRecentSearch}
-                    onClearSearches={clearSearchHistory}
-                    onSuggestion={commitQuery}
+              <div className="order-2 flex shrink-0 items-center gap-1 @min-[40rem]/search:order-3">
+                {mode === "dense" && (
+                  <SelectMenu
+                    aria-label="Result type"
+                    variant="navigation"
+                    value={activeSource}
+                    onValueChange={(value) => setFilter("source", value === "all" ? [] : [value])}
+                    className="search-compact-control h-11 w-fit max-w-full gap-1 px-2 text-xs font-medium"
+                    collisionPadding={8}
+                    contentClassName="search-compact-menu min-w-48 [&_[role=menuitemradio]]:min-h-11"
+                    options={SOURCE_FILTERS.map(({ key, label }) => ({ value: key, label: key === "all" ? "All content" : label }))}
                   />
                 )}
-
-                {searched &&
-                  !loading &&
-                  !error &&
-                  !degraded &&
-                  !archiveUnsupported &&
-                  !hasResults && (
-                    <section
-                      aria-labelledby="no-search-results-heading"
-                      className="mx-auto my-4 max-w-3xl rounded-[var(--radius-md)] border border-border p-5 sm:my-10 sm:p-8"
-                    >
-                      <div className="border-b border-border pb-5">
-                        <h2
-                          id="no-search-results-heading"
-                          className="text-sm font-semibold text-foreground"
-                        >
-                          No results for “{q}”
-                        </h2>
-                        <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
-                          {mode === "dense"
-                            ? "Try fewer terms, broaden the Vault scope, or look for the exact phrase."
-                            : "Check the phrase or switch to meaning-based search."}
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap gap-2 pt-5">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() =>
-                            switchMode(mode === "dense" ? "literal" : "dense")
-                          }
-                        >
-                          Try {mode === "dense" ? "Literal" : "Semantic"}
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => commitQuery("")}
-                        >
-                          Clear query
-                        </Button>
-                      </div>
-                    </section>
-                  )}
-
-                {truncated && !loading && !error && !archiveUnsupported && (
-                  <div
-                    role="note"
-                    className="text-xs leading-relaxed text-foreground-muted"
-                  >
-                    <span className="font-medium text-foreground">
-                      {mode === "dense"
-                        ? "Showing the strongest matches"
-                        : "Showing some matching documents"}
-                    </span>
-                    .{" "}
-                    {mode === "dense"
-                      ? "Ranked results, not a complete count. Refine filters or use Literal for exact text."
-                      : `${returnedDocs} of ${total} documents and ${returnedMatches} of ${totalMatches} matching lines returned. Narrow the query or filters to see the remaining matches.`}
-                  </div>
-                )}
-
-                {hasResults && !archiveUnsupported && (
-                  <section aria-labelledby="search-results-heading">
-                    <h2 id="search-results-heading" className="sr-only">
-                      Results for {q}
-                    </h2>
-                    {mode === "dense" ? (
-                      <DenseResultList items={visibleDense} />
-                    ) : (
-                      <LiteralResultList items={literalResults} />
-                    )}
-                  </section>
-                )}
+                <Button
+                  ref={filtersButtonRef}
+                  type="button"
+                  variant="ghost"
+                  aria-label="Filters"
+                  aria-haspopup="dialog"
+                  aria-expanded={filtersOpen}
+                  aria-controls={filtersOpen ? "search-filter-panel" : undefined}
+                  onClick={() => setFiltersOpen(true)}
+                  className="search-compact-control h-11 shrink-0 gap-1.5 px-2 text-xs text-foreground-muted"
+                >
+                  <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden />
+                  Filters
+                  {activeFilterCount > 0 && <Badge variant="secondary">{activeFilterCount}</Badge>}
+                </Button>
               </div>
             </div>
           </div>
-        </div>
+
+          <div
+            role="region"
+            aria-label="Search results"
+            aria-busy={loading}
+            data-testid="search-results-pane"
+            className={cn("rail-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-surface", !searched && "rail-scroll-auto")}
+          >
+            <div className={cn("w-full space-y-3", searched && "p-4")}>
+              {activeFilters.length > 0 && (
+                <div
+                  ref={activeFiltersRef}
+                  aria-label="Active search filters"
+                  className={cn("flex flex-wrap items-center gap-2", !searched && "px-4 pt-4")}
+                >
+                  {activeFilters.map((filter, index) => (
+                    <button
+                      key={filter.label}
+                      type="button"
+                      data-filter-chip
+                      onClick={() => {
+                        pendingChipFocus.current = index;
+                        filter.remove();
+                      }}
+                      aria-label={`Remove filter ${filter.label}`}
+                      className="search-compact-control inline-flex min-h-11 max-w-full items-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-surface-2 px-2 text-xs text-foreground-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <span className="truncate">{filter.label}</span>
+                      <X className="h-3 w-3 shrink-0" aria-hidden />
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetFilters();
+                      filtersButtonRef.current?.focus({ preventScroll: true });
+                    }}
+                    className={inlineActionClass}
+                  >
+                    Clear filters
+                  </button>
+                </div>
+              )}
+              {degraded && !loading && (
+                <Alert
+                  variant="warning"
+                  className="rounded-[var(--radius-md)]"
+                >
+                  Search is incomplete.{" "}
+                  {degradationReason === "sparse_encoder_degraded"
+                    ? "Keyword retrieval is temporarily unavailable."
+                    : "The retrieval service is temporarily unavailable."}{" "}
+                  <button
+                    type="button"
+                    onClick={() => void doSearch(q, mode, scopeVaults)}
+                    className={inlineActionClass}
+                  >
+                    Retry
+                  </button>{" "}
+                  or switch to{" "}
+                  <button
+                    type="button"
+                    onClick={() => switchMode("literal")}
+                    className={inlineActionClass}
+                  >
+                    Literal
+                  </button>{" "}
+                  search.
+                </Alert>
+              )}
+
+              {showLiteralHint && (
+                <Alert variant="info" className="rounded-[var(--radius-md)]">
+                  Short identifiers are usually easier to find with{" "}
+                  <button
+                    type="button"
+                    onClick={() => switchMode("literal")}
+                    className={inlineActionClass}
+                  >
+                    Literal
+                  </button>{" "}
+                  search.
+                </Alert>
+              )}
+
+              {loading &&
+                (hasResults ? (
+                  <InlineLoadingState label="Updating search; previous results shown" />
+                ) : (
+                  <SearchLoadingState />
+                ))}
+
+              {error && !loading && (
+                <Alert
+                  variant={scopeTooLarge ? "warning" : "destructive"}
+                  title={scopeTooLarge ? "Narrow the search scope" : hasResults ? "Search could not be updated; previous results shown" : "Search unavailable"}
+                  className="rounded-[var(--radius-md)]"
+                >
+                  {error}{" "}
+                  {scopeTooLarge ? <button type="button" onClick={() => {
+                    focusCollectionOnOpen.current = true;
+                    setFiltersOpen(true);
+                  }} className={inlineActionClass}>Choose a Collection in Filters</button> : <button
+                    type="button"
+                    onClick={() => void doSearch(q, mode, scopeVaults)}
+                    className={inlineActionClass}
+                  >
+                    Retry
+                  </button>}
+                </Alert>
+              )}
+
+              {archiveUnsupported && !loading && !error && (
+                <Alert
+                  variant="warning"
+                  title="Document state filter unavailable"
+                  className={cn("rounded-[var(--radius-md)]", !searched && "mx-4 mt-4")}
+                >
+                  This server could not confirm the selected document state
+                  filter. Results are hidden to avoid showing the wrong scope.
+                  Update the server or{" "}
+                  <button
+                    type="button"
+                    className={inlineActionClass}
+                    onClick={() => setFilter("archive_scope", [])}
+                  >
+                    search current documents
+                  </button>
+                  .
+                </Alert>
+              )}
+
+              {!searched && (
+                <SearchStartState
+                  mode={mode}
+                  recentSearches={visibleRecentSearches}
+                  recentDocuments={visibleRecentDocuments}
+                  onRepeatSearch={repeatRecentSearch}
+                  onClearSearches={clearSearchHistory}
+                  onSuggestion={commitQuery}
+                />
+              )}
+
+              {searched &&
+                !loading &&
+                !error &&
+                !degraded &&
+                !archiveUnsupported &&
+                !hasResults && (
+                  <section
+                    aria-labelledby="no-search-results-heading"
+                    className="mx-auto my-3 max-w-xl py-4 sm:py-5"
+                  >
+                    <div className="border-b border-border pb-4">
+                      <h2
+                        id="no-search-results-heading"
+                        className="text-sm font-semibold text-foreground"
+                      >
+                        No results for “{q}”
+                      </h2>
+                      <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
+                        {mode === "dense"
+                          ? "Try fewer terms, broaden the Vault scope, or look for the exact phrase."
+                          : "Check the phrase or switch to meaning-based search."}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 pt-4">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="search-compact-control h-11"
+                        onClick={() =>
+                          switchMode(mode === "dense" ? "literal" : "dense")
+                        }
+                      >
+                        Try {mode === "dense" ? "Literal" : "Semantic"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="search-compact-control h-11"
+                        onClick={() => commitQuery("")}
+                      >
+                        Clear query
+                      </Button>
+                    </div>
+                  </section>
+                )}
+
+              {truncated && !loading && !error && !archiveUnsupported && (
+                <div
+                  role="note"
+                  className="text-xs leading-relaxed text-foreground-muted"
+                >
+                  <span className="font-medium text-foreground">
+                    {mode === "dense"
+                      ? "Showing the strongest matches"
+                      : "Showing some matching documents"}
+                  </span>
+                  .{" "}
+                  {mode === "dense"
+                    ? "Ranked results, not a complete count. Refine filters or use Literal for exact text."
+                    : `${returnedDocs} of ${total} documents and ${returnedMatches} of ${totalMatches} matching lines returned. Narrow the query or filters to see the remaining matches.`}
+                </div>
+              )}
+
+              {hasResults && appliedOptions !== JSON.stringify(options) && <p className="text-sm text-foreground-muted">Previous results use: {appliedFilterSummary}. The selected filters have not been applied yet.</p>}
+              {hasResults && !archiveUnsupported && (
+                <section aria-labelledby="search-results-heading" className="-mx-4">
+                  {mode === "dense" ? (
+                    <DenseResultList items={visibleDense} />
+                  ) : (
+                    <LiteralResultList items={literalResults} />
+                  )}
+                </section>
+              )}
+            </div>
+          </div>
+        </Panel>
       </section>
+      <Dialog open={filtersOpen} onOpenChange={setFiltersOpen}>
+        <DialogContent
+          id="search-filter-panel"
+          ref={filterContentRef}
+          className="search-filter-panel flex max-w-lg flex-col gap-0 overflow-hidden p-0 [&>button]:h-11 [&>button]:w-11"
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            if (focusCollectionOnOpen.current) {
+              collectionInputRef.current?.focus();
+              focusCollectionOnOpen.current = false;
+            } else {
+              filterContentRef.current?.querySelector<HTMLElement>("[data-filter-title]")?.focus();
+            }
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            filtersButtonRef.current?.focus({ preventScroll: true });
+          }}
+        >
+          <div className="shrink-0 border-b border-border p-4 pr-14">
+            <DialogTitle data-filter-title tabIndex={-1} className="text-sm focus:outline-none">Search filters</DialogTitle>
+            <DialogDescription className="mt-1 text-xs">Changes apply as you select them. Use Apply for a collection path.</DialogDescription>
+          </div>
+          <div className="rail-scroll min-h-0 space-y-4 overflow-y-auto p-4">
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                setFilter("collection", [
+                  collectionDraft.trim().replace(/^\/+|\/+$/g, ""),
+                ]);
+              }}
+            >
+              <label
+                htmlFor="search-collection"
+                className="mb-1.5 block text-ui font-semibold"
+              >
+                Collection path (including children)
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  className="search-compact-control min-h-11 text-ui"
+                  id="search-collection"
+                  ref={collectionInputRef}
+                  value={collectionDraft}
+                  onChange={(event) =>
+                    setCollectionDraft(event.target.value)
+                  }
+                  placeholder="e.g. guides/api"
+                />
+                <Button type="submit" variant="outline" size="sm" className="search-compact-control min-h-11">
+                  Apply
+                </Button>
+              </div>
+              <p className="mt-1 text-xs text-foreground-muted">
+                The same path is used in each selected Vault.
+              </p>
+            </form>
+            <fieldset>
+              <legend className="mb-1.5 text-ui font-semibold">
+                Document type
+              </legend>
+              <div
+                className="flex flex-wrap gap-1.5"
+                role="group"
+                aria-label="Filter by document type"
+              >
+                <button
+                  type="button"
+                  id="search-all-types"
+                  aria-label="Show all types"
+                  aria-pressed={allTypesActive}
+                  onClick={() => setFilter("doc_type", [])}
+                  className={filterButtonClass(allTypesActive)}
+                >
+                  All types
+                </button>
+                {ALL_TYPES.map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    aria-label={`Toggle ${type}`}
+                    aria-pressed={activeTypes.has(type)}
+                    onClick={() => toggleType(type)}
+                    className={filterButtonClass(activeTypes.has(type))}
+                  >
+                    <span className="capitalize">{type}</span>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+            <div className="search-filter-tags [&_input]:min-h-11 [&_input]:text-ui">
+              <label
+                htmlFor="search-tags"
+                className="mb-1.5 block text-ui font-semibold"
+              >
+                Tags (match any)
+              </label>
+              <TagInput
+                id="search-tags"
+                value={[...activeTags]}
+                onChange={(tags) => setFilter("tag", tags)}
+              />
+              {availableTags.length > 0 && (
+                <div
+                  className="mt-2 flex flex-wrap gap-1.5"
+                  role="group"
+                  aria-label="Suggested tags from loaded results"
+                >
+                  {availableTags.slice(0, 12).map(([tag]) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      aria-label={`Toggle tag ${tag}`}
+                      aria-pressed={activeTags.has(tag)}
+                      onClick={() => toggleTag(tag)}
+                      className={filterButtonClass(activeTags.has(tag))}
+                    >
+                      <Tag className="h-3 w-3" aria-hidden />
+                      {tag}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex flex-col gap-2 text-ui">
+              <div>
+                <label
+                  htmlFor="search-document-state"
+                  className="mb-1.5 block text-ui font-semibold"
+                >
+                  Document state
+                </label>
+                <SelectMenu
+                  id="search-document-state"
+                  className="search-compact-control min-h-11 text-ui"
+                  contentClassName="search-compact-menu [&_[role=menuitemradio]]:min-h-11"
+                  aria-label="Document state"
+                  value={archiveScope}
+                  onValueChange={(value) =>
+                    setFilter("archive_scope", [value])
+                  }
+                  options={[
+                    { value: "unarchived", label: "Current documents" },
+                    { value: "archived", label: "Archived documents" },
+                    { value: "all", label: "All documents" },
+                  ]}
+                />
+                <p className="mt-1 text-xs text-foreground-muted">
+                  Current includes drafts. Archived searches documents
+                  only.
+                </p>
+              </div>
+              {mode === "literal" && (
+                <>
+                  <label className="search-compact-control flex min-h-11 cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="accent-primary focus-visible:outline-ring"
+                      checked={Boolean(options.include_text_files)}
+                      onChange={(event) =>
+                        setFilter(
+                          "include_text_files",
+                          event.target.checked ? ["true"] : [],
+                        )
+                      }
+                    />
+                    Include text Files
+                  </label>
+                  <label className="search-compact-control flex min-h-11 cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="accent-primary focus-visible:outline-ring"
+                      checked={Boolean(options.regex)}
+                      onChange={(event) =>
+                        setFilter(
+                          "regex",
+                          event.target.checked ? ["true"] : [],
+                        )
+                      }
+                    />
+                    Regular expression
+                  </label>
+                  <label className="search-compact-control flex min-h-11 cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="accent-primary focus-visible:outline-ring"
+                      checked={Boolean(options.case_sensitive)}
+                      onChange={(event) =>
+                        setFilter(
+                          "case_sensitive",
+                          event.target.checked ? ["true"] : [],
+                        )
+                      }
+                    />
+                    Case sensitive
+                  </label>
+                </>
+              )}
+            </div>
+            <p className="border-t border-border pt-4 text-xs leading-relaxed text-foreground-muted">
+              {mode === "literal"
+                ? "Literal search includes text Files when enabled. Document type, tag, and archived-only filters exclude Files. Content-kind selection is retained for Semantic search."
+                : "Document type and tag filters search documents only. Filters apply on the server before the result limit."}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center justify-between gap-3 border-t border-border px-4 py-2">
+            <Button type="button" variant="ghost" className="search-compact-control min-h-11" onClick={resetFilters}>Reset filters</Button>
+            <DialogClose asChild><Button type="button" className="search-compact-control min-h-11">Done</Button></DialogClose>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1255,9 +1259,9 @@ function SearchLoadingState() {
       {[0, 1, 2].map((item) => (
         <div
           key={item}
-          className="grid grid-cols-[2rem_minmax(0,1fr)] gap-3 px-4 py-4"
+          className="grid grid-cols-[1.75rem_minmax(0,1fr)] gap-2.5 px-4 py-3"
         >
-          <Skeleton className="h-8 w-8 rounded-[var(--radius-md)]" />
+          <Skeleton className="h-7 w-7 rounded-[var(--radius-md)]" />
           <div className="min-w-0 space-y-2">
             <Skeleton className="h-4 w-1/3" />
             <Skeleton className="h-3 w-3/5" />
@@ -1291,49 +1295,34 @@ function SearchStartState({
   const hasDocuments = visibleDocuments.length > 0;
 
   return (
-    <div className="mx-auto w-full max-w-4xl py-4 sm:py-8">
-      <div className="mb-6 flex items-start gap-3">
-        <SearchIcon
-          className="mt-0.5 h-5 w-5 shrink-0 text-foreground-muted"
-          aria-hidden
-        />
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight">
-            Find your next starting point
-          </h2>
-          <p className="mt-1 text-sm leading-relaxed text-foreground-muted">
-            Search your knowledge, pick up a recent query, or revisit a
-            document.
-          </p>
-        </div>
-      </div>
-      <div className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface">
+    <div data-testid="search-start-state" className="w-full">
+      <div className="min-w-0 bg-surface">
         {(hasSearches || hasDocuments) && (
           <div
             className={cn(
               "grid border-b border-border-strong bg-surface",
-              hasSearches && hasDocuments && "lg:grid-cols-2",
+              hasSearches && hasDocuments && "@min-[40rem]/search:grid-cols-2",
             )}
           >
             {hasSearches && (
               <section aria-labelledby="recent-searches-heading">
-                <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+                <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4">
                   <div className="flex min-w-0 items-center gap-2">
                     <Clock3
                       className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
                       aria-hidden
                     />
-                    <h2
+                    <h3
                       id="recent-searches-heading"
                       className="text-xs font-semibold text-foreground"
                     >
                       Recent searches
-                    </h2>
+                    </h3>
                   </div>
                   <button
                     type="button"
                     onClick={onClearSearches}
-                    className="inline-flex h-8 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="search-compact-control inline-flex h-11 cursor-pointer items-center rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     Clear
                   </button>
@@ -1347,9 +1336,9 @@ function SearchStartState({
                       key={`${search.surface}:${search.mode}:${search.vaults.join(",")}:${search.query}`}
                       type="button"
                       onClick={() => onRepeatSearch(search)}
-                      className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 py-2.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+                      className="group flex min-h-12 w-full cursor-pointer items-center gap-2.5 px-4 py-1.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                     >
-                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
                         <SearchIcon className="h-4 w-4" aria-hidden />
                       </span>
                       <span className="min-w-0 flex-1">
@@ -1387,21 +1376,21 @@ function SearchStartState({
                 aria-labelledby="recent-documents-heading"
                 className={cn(
                   hasSearches &&
-                    "border-t border-border lg:border-l lg:border-t-0",
+                    "border-t border-border @min-[40rem]/search:border-l @min-[40rem]/search:border-t-0",
                 )}
               >
-                <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+                <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4">
                   <div className="flex min-w-0 items-center gap-2">
                     <FileText
                       className="h-3.5 w-3.5 shrink-0 text-foreground-muted"
                       aria-hidden
                     />
-                    <h2
+                    <h3
                       id="recent-documents-heading"
                       className="text-xs font-semibold text-foreground"
                     >
                       Recently viewed
-                    </h2>
+                    </h3>
                   </div>
                   <span className="text-xs text-foreground-muted">
                     This browser
@@ -1419,9 +1408,9 @@ function SearchStartState({
                         id={returnFocusId}
                         to={`/vault/${document.vault}/doc/${encodeURIComponent(document.path)}`}
                         state={documentPreviewState(location, returnFocusId)}
-                        className="group flex min-h-14 items-center gap-3 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+                        className="group flex min-h-12 items-center gap-2.5 px-4 py-1.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                       >
-                        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
+                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-2 text-foreground-muted transition-colors group-hover:text-link">
                           <FileText className="h-4 w-4" aria-hidden />
                         </span>
                         <span className="min-w-0 flex-1">
@@ -1446,14 +1435,14 @@ function SearchStartState({
         )}
 
         <section>
-          <div className="flex min-h-11 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4 sm:px-5">
+          <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border bg-surface-2/60 px-4">
             <div>
-              <h2
+              <h3
                 id="search-start-heading"
                 className="text-xs font-semibold text-foreground"
               >
                 Suggested searches
-              </h2>
+              </h3>
               <p className="mt-0.5 hidden text-xs text-foreground-muted sm:block">
                 Start with an outcome, topic, or question.
               </p>
@@ -1464,7 +1453,7 @@ function SearchStartState({
           </div>
           <div
             aria-label="Suggested searches"
-            className="grid divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0"
+            className="grid divide-y divide-border @min-[40rem]/search:grid-cols-3 @min-[40rem]/search:divide-x @min-[40rem]/search:divide-y-0"
           >
             {SUGGESTED_QUERIES.map((suggestion) => (
               <button
@@ -1472,17 +1461,17 @@ function SearchStartState({
                 type="button"
                 aria-label={suggestion}
                 onClick={() => onSuggestion(suggestion)}
-                className="group flex min-h-14 w-full cursor-pointer items-center gap-3 px-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+                className="group flex min-h-12 w-full cursor-pointer items-center gap-2.5 px-4 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
                 <SearchIcon
                   className="h-4 w-4 shrink-0 text-foreground-muted"
                   aria-hidden
                 />
-                <span className="min-w-0 flex-1 truncate text-sm text-foreground">
+                <span className="min-w-0 flex-1 py-2 text-sm leading-5 text-foreground [overflow-wrap:anywhere]">
                   {suggestion}
                 </span>
-                <ArrowUpRight
-                  className="hidden h-3.5 w-3.5 shrink-0 text-foreground-muted transition-colors group-hover:text-link lg:block"
+                <ArrowRight
+                  className="h-3.5 w-3.5 shrink-0 text-foreground-muted transition-colors group-hover:text-link"
                   aria-hidden
                 />
               </button>
@@ -1498,7 +1487,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
   const location = useLocation();
 
   return (
-    <ol className="space-y-3" aria-label="Semantic search results">
+    <ol className="divide-y divide-border" aria-label="Semantic search results">
       {items.map((result, index) => {
         const sourceType = result.source_type || "document";
         const { icon: SourceIcon, label: sourceLabel } = TYPE_META[sourceType];
@@ -1509,7 +1498,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
         return (
           <li
             key={result.uri}
-            className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface"
+            className="min-w-0 bg-surface"
           >
             <Link
               id={`search-dense-result-${index}`}
@@ -1522,9 +1511,28 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                     )
                   : undefined
               }
-              className="group block px-4 py-3 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+              className="group grid grid-cols-[1rem_minmax(0,1fr)] gap-x-2.5 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
             >
-              <div className="mb-1.5 flex min-w-0 items-center justify-between gap-3 text-xs text-foreground-muted">
+              <SourceIcon
+                className="col-start-1 row-start-1 mt-0.5 h-4 w-4 text-link"
+                aria-hidden
+              />
+              <div className="col-start-2 flex min-w-0 items-start justify-between gap-3">
+                <span className="min-w-0 text-sm font-semibold leading-5 text-foreground [overflow-wrap:anywhere] group-hover:text-link">
+                  <span className="sr-only">Result {index + 1}: </span>
+                  {result.title}
+                </span>
+                <span className="flex shrink-0 items-center gap-1 text-xs text-foreground-muted group-hover:text-link">
+                  {sourceType === "document" ? "Preview" : "Open"}
+                  <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+                </span>
+              </div>
+              {detail && (
+                <p className="col-start-2 mt-1 max-w-[88ch] line-clamp-2 whitespace-pre-line text-sm leading-5 text-foreground-muted">
+                  {detail}
+                </p>
+              )}
+              <div className="col-start-2 mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground-muted">
                 <span
                   className="min-w-0 truncate"
                   title={`${result.vault} / ${result.path}`}
@@ -1539,27 +1547,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                     </>
                   )}
                 </span>
-                <span className="flex shrink-0 items-center gap-1 group-hover:text-link">
-                  {sourceType === "document" ? "Preview" : "Open"}
-                  <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-                </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <SourceIcon
-                  className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted"
-                  aria-hidden
-                />
-                <span className="sr-only">Result {index + 1}: </span>
-                <span className="min-w-0 text-sm font-semibold text-link [overflow-wrap:anywhere] group-hover:underline">
-                  {result.title}
-                </span>
-              </div>
-              {detail && (
-                <p className="mt-2 line-clamp-2 whitespace-pre-line text-sm leading-relaxed text-foreground">
-                  {detail}
-                </p>
-              )}
-              <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs text-foreground-muted">
+                <span aria-hidden>·</span>
                 <span>{sourceLabel}</span>
                 {result.doc_type && (
                   <Badge variant="outline">{result.doc_type}</Badge>
@@ -1573,7 +1561,7 @@ function DenseResultList({ items }: { items: DenseResult[] }) {
                   </Badge>
                 ))}
                 {tags.length > 2 && <span>+{tags.length - 2} tags</span>}
-                {index === 0 && <span className="ml-auto">Top match</span>}
+                {index === 0 && <span className="text-foreground-muted">Top match</span>}
               </div>
             </Link>
           </li>
@@ -1587,11 +1575,11 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
   const location = useLocation();
 
   return (
-    <ol className="space-y-3" aria-label="Literal search results">
+    <ol className="divide-y divide-border" aria-label="Literal search results">
       {items.map((result, index) => (
         <li
           key={result.uri}
-          className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface"
+          className="min-w-0 bg-surface"
         >
           <Link
             id={`search-literal-result-${index}`}
@@ -1606,7 +1594,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                     `search-literal-result-${index}`,
                   )
             }
-            className="group grid grid-cols-[1rem_minmax(0,1fr)] gap-3 p-4 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[1rem_minmax(0,1fr)_6.5rem] sm:px-5"
+            className="group grid grid-cols-[1rem_minmax(0,1fr)] gap-2.5 px-4 py-2.5 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[1rem_minmax(0,1fr)_6.5rem]"
           >
             <span className="mt-0.5 text-foreground-muted">
               {result.resource_type === "file" ? (
@@ -1621,7 +1609,7 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
                 <span className="sr-only" aria-label={`Result ${index + 1}`}>
                   {index + 1}
                 </span>
-                <span className="text-sm font-semibold text-link [overflow-wrap:anywhere] group-hover:underline">
+                <span className="text-sm font-semibold text-foreground [overflow-wrap:anywhere] group-hover:text-link">
                   {result.title}
                 </span>
                 {result.status === "archived" && (
@@ -1699,27 +1687,9 @@ function LiteralResultList({ items }: { items: GrepDoc[] }) {
   );
 }
 
-function searchModeClass(active: boolean) {
-  return cn(
-    "-mb-px inline-flex min-h-10 flex-1 cursor-pointer items-center justify-center gap-1.5 border-b-2 px-2.5 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-    active
-      ? "border-primary text-link"
-      : "border-transparent text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-  );
-}
-
-function sourceFilterClass(active: boolean) {
-  return cn(
-    "relative inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2.5 text-left text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring @min-[56rem]/search:w-full @min-[56rem]/search:text-sm",
-    active
-      ? "bg-surface-selected text-surface-selected-foreground before:absolute before:inset-y-2.5 before:left-0 before:w-0.5 before:rounded-full before:bg-primary"
-      : "text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-  );
-}
-
 function filterButtonClass(active: boolean) {
   return cn(
-    "inline-flex h-8 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border px-2.5 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-50",
+    "search-compact-control inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] border px-2.5 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-50",
     active
       ? "border-border-strong bg-surface-selected text-surface-selected-foreground"
       : "border-border bg-surface text-foreground-muted hover:border-border-strong hover:bg-surface-hover hover:text-foreground",

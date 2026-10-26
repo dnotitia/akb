@@ -25,12 +25,20 @@ type AssetFlight = {
   settled: boolean;
 };
 const privateAssetFlights = new Map<string, AssetFlight>();
+const privateAssetResetListeners = new Set<() => void>();
+
+/** In-memory private media follows the same session/proof boundary as assets. */
+export function subscribePrivateAssetReset(listener: () => void): () => void {
+  privateAssetResetListeners.add(listener);
+  return () => { privateAssetResetListeners.delete(listener); };
+}
 
 export function clearPrivateAssetCache() {
   privateAssetCache.clear();
   privateAssetCacheBytes = 0;
   for (const flight of privateAssetFlights.values()) flight.controller.abort();
   privateAssetFlights.clear();
+  for (const listener of privateAssetResetListeners) listener();
 }
 
 type StoredTokenRead =
@@ -335,7 +343,7 @@ export async function authenticatedFetch(
   return res;
 }
 
-async function throwJsonApiError(res: Response): Promise<never> {
+export async function throwJsonApiError(res: Response): Promise<never> {
   const body = await res.json().catch(() => ({}));
   if (body && typeof body.detail === "object" && body.detail !== null) {
     const detail = body.detail as { message?: string };
@@ -345,7 +353,7 @@ async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? null);
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? (typeof body?.code === "string" ? body : null));
 }
 
 async function api<T>(
@@ -1041,6 +1049,22 @@ export function setAdminSsoProviderEnabled(
 }
 
 // ── Auth (ordinary browser session) ──
+export interface AvatarState {
+  revision: string | null;
+  url: string | null;
+  width?: number;
+  height?: number;
+}
+
+export interface ProfileAvatarCapabilities {
+  supported: boolean;
+  can_upload: boolean;
+  can_remove: boolean;
+  reason: string | null;
+  max_upload_bytes: number;
+  allowed_content_types: string[];
+}
+
 export interface CurrentUser {
   user_id: string;
   username: string;
@@ -1050,7 +1074,11 @@ export interface CurrentUser {
   auth_method: string;
   account_kind?: "human" | "service";
   key_class: string | null;
+  avatar?: AvatarState;
+  profile_capabilities?: { avatar?: ProfileAvatarCapabilities };
 }
+
+export { getProfilePhotoBlob, uploadProfilePhoto, removeProfilePhoto } from "./api-profile-photo";
 
 export const getMe = (
   { redirectOnUnauthorized = true }: { redirectOnUnauthorized?: boolean } = {},
@@ -1919,7 +1947,7 @@ export interface VaultTableInfo {
   name: string;
   description?: string;
   columns: VaultTableColumnInput[];
-  row_count: number;
+  row_count?: number;
   created_at?: string;
 }
 
@@ -1933,6 +1961,7 @@ export interface VaultTableQueryResult {
 }
 
 export interface VaultTableRowsQueryOptions {
+  countExact?: boolean;
   limit?: number;
   offset?: number;
   order?: string;
@@ -1967,8 +1996,8 @@ export const createVaultTable = (
     }),
   });
 
-export const listVaultTables = (vault: string) =>
-  api<{ items: VaultTableInfo[] }>(`/tables/${encodeURIComponent(vault)}`);
+export const listVaultTables = (vault: string, { includeRowCounts = true } = {}) =>
+  api<{ items: VaultTableInfo[] }>(`/tables/${encodeURIComponent(vault)}${includeRowCounts ? "" : "?include_row_counts=false"}`);
 
 export const listVaultTableRows = (
   vault: string,
@@ -1978,6 +2007,7 @@ export const listVaultTableRows = (
     offset = 0,
     order = "created_at.desc,id.desc",
     filters = [],
+    countExact = true,
     signal,
   }: VaultTableRowsQueryOptions = {},
 ) => {
@@ -1989,7 +2019,7 @@ export const listVaultTableRows = (
   for (const filter of filters) query.append(filter.column, filter.expression);
   return api<VaultTableQueryResult>(
     `/tables/${encodeURIComponent(vault)}/${encodeURIComponent(table)}/rows?${query}`,
-    { headers: { Prefer: "count=exact" }, signal },
+    { headers: countExact ? { Prefer: "count=exact" } : undefined, signal },
   );
 };
 
@@ -2000,6 +2030,7 @@ export async function getVaultTableRow(
   signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
   const result = await listVaultTableRows(vault, table, {
+    countExact: false,
     limit: 1,
     order: "id.asc",
     filters: [{ column: "id", expression: `eq.${rowId}` }],
@@ -2081,10 +2112,23 @@ export const deleteVaultTable = (vault: string, tableName: string) =>
 // ── Browse ──
 export type ArchiveScope = "unarchived" | "archived" | "all";
 
-export const browseVault = (vault: string, collection?: string, depth = 1, options: { archive_scope?: ArchiveScope } = {}) => {
+export interface BrowseOptions {
+  archive_scope?: ArchiveScope;
+  page_size?: number;
+  cursor?: string;
+  content_type?: "all" | "collections" | "resources" | "documents" | "tables" | "files";
+  name_query?: string;
+  signal?: AbortSignal;
+}
+
+export const browseVault = (vault: string, collection?: string, depth = 1, options: BrowseOptions = {}) => {
   const p = new URLSearchParams({ depth: String(depth) });
   if (collection) p.set("collection", collection);
   if (options.archive_scope) p.set("archive_scope", options.archive_scope);
+  if (options.page_size !== undefined) p.set("page_size", String(options.page_size));
+  if (options.cursor) p.set("cursor", options.cursor);
+  if (options.content_type) p.set("content_type", options.content_type);
+  if (options.name_query) p.set("name_query", options.name_query);
   return api<{
     archive_scope?: ArchiveScope;
     vault: string;
@@ -2096,9 +2140,14 @@ export const browseVault = (vault: string, collection?: string, depth = 1, optio
       path: string;
       summary?: string | null;
       description?: string | null;
+      ancestry?: { path: string; name: string }[] | null;
     } | null;
     items: any[];
-  }>(`/browse/${vault}?${p}`);
+    scanned?: number | null;
+    complete?: boolean | null;
+    next_cursor?: string | null;
+    name_query?: string | null;
+  }>(`/browse/${encodeURIComponent(vault)}?${p}`, { signal: options.signal });
 };
 
 export interface KnowledgeImportResult {

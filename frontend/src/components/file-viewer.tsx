@@ -136,7 +136,7 @@ export function FilePreviewBody({ mime, directUrl, rawUrl, name, sizeBytes, onRe
   }
 
   if (mime === "application/pdf") {
-    return <PdfFileBody key={directUrl} directUrl={directUrl} name={name} />;
+    return <PdfFileBody key={directUrl} directUrl={directUrl} name={name} onRefreshLink={onRefreshLink} />;
   }
 
   if (mime === "text/html") {
@@ -206,10 +206,23 @@ function ImageFileBody({ directUrl, name, onRefreshLink }: { directUrl: string; 
   );
 }
 
-function PdfFileBody({ directUrl, name }: { directUrl: string; name: string }) {
+function PdfFileBody({ directUrl, name, onRefreshLink }: { directUrl: string; name: string; onRefreshLink?: () => void }) {
   const [loading, setLoading] = useState(true);
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!loading) return;
+    const timer = setTimeout(() => setSlow(true), 10_000);
+    return () => clearTimeout(timer);
+  }, [loading]);
   return (
     <div className="relative min-h-[80vh]">
+      {slow && loading && <div role="status" className="relative z-[var(--z-raised)] border-b border-border bg-surface p-4 text-sm">
+        <p>The PDF is taking longer to load. You can refresh its link or open the file directly.</p>
+        <div className="mt-2 flex gap-2">
+          {onRefreshLink && <Button variant="outline" size="sm" onClick={onRefreshLink}>Refresh link</Button>}
+          <Button variant="outline" size="sm" asChild><a href={directUrl} target="_blank" rel="noopener noreferrer">Open PDF</a></Button>
+        </div>
+      </div>}
       {loading && (
         <LoadingState label="Loading PDF preview" className="absolute inset-0 p-4">
           <Skeleton className="h-full w-full rounded-[var(--radius-md)]" />

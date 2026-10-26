@@ -7,6 +7,8 @@ updated: 2026-08-20
 
 # Vault-skill system collection: reservation, auto-injection, and a single editing surface
 
+> Accepted design record: this original proposal path is retained for existing references. The status above records acceptance; it is not a new unreviewed proposal. Consult the current MCP tool schemas for invocation details.
+
 ## What this is
 
 Successor to the accepted `2026-05-14-akb-help-skill-bootstrap` design. That

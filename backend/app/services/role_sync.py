@@ -399,17 +399,35 @@ class RoleSync:
         """Create `akb_user_<uid>` (NOLOGIN) and add it to the
         `akb_authenticated` wildcard so public-vault access works.
         Idempotent."""
-        role = user_role_name(user_id)
         try:
             async with self.pool.acquire() as conn:
                 async with role_authority_transaction(conn):
                     if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", uuid.UUID(str(user_id))):
                         return
-                    await self._create_role_if_missing(conn, role)
-                    await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
-                    await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
+                    await self.on_user_create_in_conn(conn, user_id)
         except Exception as e:  # noqa: BLE001
             self._record_failure("on_user_create", e, user_id)
+
+    async def on_user_create_in_conn(
+        self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
+    ) -> None:
+        """Strict projection on the caller's guarded catalog transaction.
+
+        The caller establishes the user row and holds role authority first.
+        No connection acquisition or best-effort exception handling is allowed.
+        """
+        role = user_role_name(uuid.UUID(str(user_id)))
+        await self._create_role_if_missing(conn, role)
+        await self._create_role_if_missing(conn, AUTHENTICATED_ROLE)
+        await self._grant_membership(conn, AUTHENTICATED_ROLE, role)
+
+    async def user_role_projected_in_conn(
+        self, conn: asyncpg.Connection, user_id: uuid.UUID | str,
+    ) -> bool:
+        """Read the canonical authenticated edge without repairing authority."""
+        role = user_role_name(uuid.UUID(str(user_id)))
+        return (await self._has_direct_membership(conn, AUTHENTICATED_ROLE, role)
+                and await self._membership_options_valid(conn, AUTHENTICATED_ROLE, role))
 
     async def on_user_delete(self, user_id: uuid.UUID | str) -> None:
         """Drop `akb_user_<uid>`. Memberships in vault group roles are

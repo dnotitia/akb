@@ -5,6 +5,7 @@ description: Ingest whatever you point at into an AKB vault — a local file, a 
 
 # AKB Ingest
 
+
 Ingest **one target** into the target AKB vault. Point at a local file, a web URL, a GitHub PR / release / commit, a Confluence page, or a Jira issue — this skill classifies the source type and dispatches to a specialized ingest subagent. It is the single ingest entry point of the `akb-wiki` plugin.
 
 **Workflow classification.** LLM-wiki **Ingest** workflow. This is a **router**: it classifies a target and delegates the actual fetch + write to one subagent. Document-style sources pay down **intent debt** (and substrate health) as five-section synthesis pages; decision-record sources (PR / release / commit / issue) pay down **intent debt** as faithful mechanical episodic records. The archetype split (synthesis vs mechanical) is a dispatch decision, invisible to the caller.
@@ -21,7 +22,7 @@ Scope boundaries:
 /akb-ingest <target> --vault {vault_name} [--repo {path}] [--prev-tag {tag}] [--lang {language}] [--project {name}] [--raw | --no-raw]
 ```
 
-- `<target>` (required, positional) — what to ingest. A local path (absolute, `./…`, `~/…`, or a glob), an `http(s)://` URL, a bare git commit SHA, or a Jira issue key (e.g. `SDDEV-360`).
+- `<target>` (required, positional) — what to ingest. A local path (absolute, `./…`, `~/…`, or a glob), an `http(s)://` URL, a bare git commit SHA, or a Jira issue key (e.g. `PROJ-123`).
 - `--vault` (required) — target AKB vault name; forwarded to every subagent.
 - `--repo {path}` (optional) — local git clone path for commit / PR / release targets. Defaults to the current working directory.
 - `--prev-tag {tag}` (optional) — previous release tag; release targets only.
@@ -82,7 +83,6 @@ Launch **one** subagent with `fork_context: false` — the one the classificatio
 - `./support/agents/<chosen-agent>.md`
 
 Prepend an `[Ingest Context]` block instructing the worker to treat the resolved target, `--vault {vault_name}`, and any forwarded flags as its positional + named arguments. The worker owns the fetch path and the AKB write; the router fetches and writes nothing. Relay the worker's status report block unchanged.
-
 
 ### Step 5 — Report
 

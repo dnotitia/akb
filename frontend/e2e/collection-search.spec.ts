@@ -23,7 +23,8 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "collection-reader", username: "reader", display_name: "Collection reader", email: "reader@example.invalid", auth_method: "local", is_admin: false } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "alpha", name: "alpha", role: "reader" }] } });
       if (path.endsWith("/info")) return route.fulfill({ json: { name: "alpha", role: "reader", document_count: 1, collection_count: 2, is_archived: false, is_external_git: false } });
-      if (path.includes("/browse/")) return route.fulfill({ json: { vault: "alpha", items: [
+      if (path.includes("/browse/")) {
+        const items = [
         { type: "collection", name: "Notes", path: "notes" },
         { type: "collection", name: "팀 자료 & 운영", path: collection },
         { type: "collection", name: "Other", path: `${collection}-old` },
@@ -33,7 +34,24 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
         { type: "document", name: "Deployment outside", path: `${collection}-old/outside.md` },
         { type: "table", name: "deployment_table", path: "deployment_table", collection },
         { type: "file", name: "Deployment checklist", path: "checklist.txt", collection, uri: `akb://alpha/coll/${collection}/file/file-1` },
-      ] } });
+        ];
+        const scope = url.searchParams.get("collection") || "";
+        const kind = url.searchParams.get("content_type") || "all";
+        const nameQuery = url.searchParams.get("name_query") || "";
+        const selected = items.filter(item => {
+          const itemPath = (item.type === "table" || item.type === "file")
+            ? `${item.collection || ""}/${item.name}` : item.path;
+          const inScope = !scope || itemPath.startsWith(`${scope}/`);
+          const inKind = kind === "all" || `${item.type}s` === kind || (kind === "documents" && item.type === "collection");
+          return inScope && inKind && (!nameQuery || `${item.name} ${itemPath}`.toLowerCase().includes(nameQuery.toLowerCase()));
+        });
+        return route.fulfill({ json: { vault: "alpha", path: scope,
+          name_query: nameQuery || null, archive_scope: "unarchived", scanned: selected.length, complete: true, next_cursor: null,
+          context: scope ? { type: "collection", name: items.find(item => item.type === "collection" && item.path === scope)?.name || scope, path: scope,
+            uri: `akb://alpha/coll/${scope}` } : { type: "vault", name: "alpha", path: "", uri: "akb://alpha" },
+          items: selected,
+        } });
+      }
       if (path.endsWith("/search")) {
         searches.push(url);
         return route.fulfill({ json: { results: [{ source_type: "file", title: "Deployment checklist", vault: "alpha", collection, path: "checklist.txt", uri: `akb://alpha/coll/${collection}/file/file-1`, score: 1 }], total: 1, returned: 1 } });
@@ -46,17 +64,24 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     if (width < 1024) await drawer.click();
     const scope = page.getByRole("button", { name: "Collection search scope", exact: true });
     await expect(scope).toHaveCount(0);
-    const documents = page.getByRole("treeitem", { name: "Documents, 1 item", exact: true });
+    await expect(page.getByRole("button", { name: "Filter content", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Reset filters", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: `Collection actions for ${collection}-old`, exact: true })).toBeVisible();
+    const documents = page.getByRole("button", { name: "Documents, 1 item", exact: true });
     await expect(documents).toHaveAttribute("aria-expanded", "true");
     await documents.click();
     await expect(documents).toHaveAttribute("aria-expanded", "false");
-    await page.getByRole("button", { name: "Refresh collections", exact: true }).click();
-    await expect(page.getByRole("tree", { name: "alpha explorer" })).not.toHaveAttribute("aria-busy", "true");
+    await page.getByRole("button", { name: "Refresh content", exact: true }).click();
+    await expect(page.getByRole("navigation", { name: "alpha explorer" })).not.toHaveAttribute("aria-busy", "true");
     await expect(documents).toHaveAttribute("aria-expanded", "false");
     await documents.focus();
     await page.keyboard.press("ArrowRight");
     await expect(documents).toHaveAttribute("aria-expanded", "true");
     const launcher = page.getByRole("button", { name: `Collection actions for ${collection}`, exact: true });
+    // Desktop row actions become pointer targets only after the row is hovered.
+    await launcher.locator("..").hover();
+    await expect(launcher).toHaveCSS("pointer-events", "auto");
+    await expect(launcher).toHaveCSS("opacity", "1");
     await launcher.click();
     await page.getByRole("menuitem", { name: "Search in collection", exact: true }).click();
     const input = page.getByRole("searchbox", { name: "Filter resources" });
@@ -64,30 +89,37 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await expect(scope).toContainText(collection);
     await expect(page.getByRole("dialog", { name: "Search knowledge" })).toHaveCount(0);
     await input.fill("deploy");
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment guide", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "File: Deployment checklist", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Table: deployment_table", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Document: Deployment guide", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "File: Deployment checklist", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Table: deployment_table", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Clear collection scope" })).toBeInViewport();
-    const scopedFilters = page.getByRole("button", { name: "Filter collections, 1 active", exact: true });
+    const scopedFilters = page.getByRole("button", { name: "Filter content, 2 active", exact: true });
     await expect(scopedFilters).toHaveAttribute("aria-expanded", "true");
     await scopedFilters.click();
     await expect(scope).toHaveCount(0);
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
+    await expect(input).toBeVisible();
+    await expect(input).toHaveValue("deploy");
+    await expect(page.getByText(`Name: deploy · Collection: ${collection}`, { exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
     await scopedFilters.click();
     await expect(scope).toContainText(collection);
     await page.getByRole("button", { name: "Resource type", exact: true }).click();
     await page.getByRole("menuitemradio", { name: /^Files/ }).click();
-    await expect(page.getByRole("treeitem", { name: "File: Deployment checklist", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment guide", exact: true })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Filter collections, 2 active", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "File: Deployment checklist", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment guide", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Filter content, 3 active", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Reset filters", exact: true }).click();
     await expect(scope).toContainText("All collections");
-    await expect(input).toHaveValue("deploy");
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment outside", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Filter collections", exact: true })).toBeVisible();
+    await expect(input).toHaveValue("");
+    await input.fill("deploy");
+    await expect(page.getByRole("link", { name: "Document: Deployment outside", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Filter content, 1 active", exact: true })).toBeVisible();
+    await launcher.locator("..").hover();
+    await expect(launcher).toHaveCSS("pointer-events", "auto");
+    await expect(launcher).toHaveCSS("opacity", "1");
     await launcher.click();
     await page.getByRole("menuitem", { name: "Search in collection", exact: true }).click();
     await expect(scope).toContainText(collection);
@@ -98,15 +130,15 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await expect(scope).toContainText(collection);
     await page.getByRole("button", { name: "Clear collection scope" }).click();
     await input.fill("deploy");
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment outside", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment outside", exact: true })).toBeVisible();
     await scope.click();
     const picker = page.getByRole("combobox", { name: "Find a collection", exact: true });
     await picker.fill(`${collection}/child`);
     await picker.press("ArrowDown");
     await picker.press("Enter");
     await expect(scope).toContainText(`${collection}/child`);
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Document: Deployment nested guide", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Document: Deployment outside", exact: true })).toHaveCount(0);
     expect(searches).toHaveLength(0);
     expect(decodeURIComponent(new URL(page.url()).pathname)).toBe(`/vault/alpha/doc/${docPath}`);
   });
