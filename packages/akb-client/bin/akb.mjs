@@ -112,7 +112,7 @@ function requireValue(args, index, option) {
 async function fetchVaultSchema(options) {
   if (!options.vault) throw new Error("Missing vault.");
   if (typeof fetch !== "function") {
-    throw new Error("Global fetch is required. Use Node.js 18+ or --schema-file.");
+    throw new Error("Global fetch is required. Use a supported, security-patched Node.js runtime or --schema-file.");
   }
   const response = await fetch(`${apiBaseUrl(options.url)}/tables/${encodeURIComponent(options.vault)}/schema`, {
     headers: options.token ? { authorization: `Bearer ${options.token}` } : {},

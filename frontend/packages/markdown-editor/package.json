@@ -6,7 +6,7 @@
   "sideEffects": false,
   "packageManager": "pnpm@11.21.0",
   "engines": {
-    "node": "22.19.0"
+    "node": "22.23.4"
   },
   "exports": {
     ".": {

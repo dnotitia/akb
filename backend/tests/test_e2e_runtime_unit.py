@@ -253,7 +253,8 @@ def test_frontend_owns_package_script_and_toolchain_contract():
     package = json.loads((REPO_ROOT / "frontend" / "package.json").read_text())
 
     assert package["packageManager"] == "pnpm@11.21.0"
-    assert package["engines"]["node"] == "22.19.0"
+    assert package["engines"]["node"] == "22.23.4"
+    assert (REPO_ROOT / ".nvmrc").read_text().strip() == package["engines"]["node"]
     assert package["scripts"]["dev"] == "vite"
 
 
@@ -1890,7 +1891,12 @@ def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     assert "pnpm install --frozen-lockfile" in text
     assert "FRONTEND_PACKAGE_MANAGER" in text
     assert "FRONTEND_NODE_VERSION" in text
-    assert '"node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION"' in text
+    assert '"node@$FRONTEND_NODE_VERSION"' in text
+    assert '"pnpm@$FRONTEND_PNPM_VERSION"' in text
+    # The stdio-only path must install and verify the same patched runtime.
+    frontend_branch = text.index('if [ "$WITH_FRONTEND" -eq 1 ]; then')
+    assert text.index('"node@$FRONTEND_NODE_VERSION"') < frontend_branch
+    assert text.index('[ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ]') < frontend_branch
     assert "command -v pnpm" in text
     assert 'apt-get install -y nodejs npm' in text
     assert 'command -v node' in text

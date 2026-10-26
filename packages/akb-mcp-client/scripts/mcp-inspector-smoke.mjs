@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 
 export const INSPECTOR_VERSION = "2.4.0";
-export const MIN_NODE_VERSION = "22.19.0";
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const SERVER_NAME = "akb";
 
@@ -36,14 +35,11 @@ function string(value, label) {
   return value;
 }
 
-function nodeVersionMeetsFloor(value, floor = MIN_NODE_VERSION) {
-  const actual = String(value).replace(/^v/, "").split(".").map(Number);
-  const minimum = floor.split(".").map(Number);
-  if (actual.length !== 3 || minimum.length !== 3 || actual.some(Number.isNaN)) return false;
-  for (let index = 0; index < 3; index += 1) {
-    if (actual[index] !== minimum[index]) return actual[index] > minimum[index];
-  }
-  return true;
+export function nodeVersionMeetsFloor(value) {
+  if (!/^v?\d+\.\d+\.\d+$/.test(String(value))) return false;
+  const [major, minor, patch] = String(value).replace(/^v/, "").split(".").map(Number);
+  const floor = { 22: [23, 4], 24: [22, 1], 26: [12, 1] }[major];
+  return Boolean(floor && (minor > floor[0] || (minor === floor[0] && patch >= floor[1])));
 }
 
 function originUrl(value, label) {
@@ -85,7 +81,7 @@ export function parseArguments(argv) {
 }
 
 export async function inspectInstallation({ packageRoot = PACKAGE_ROOT, nodeVersion = process.versions.node } = {}) {
-  if (!nodeVersionMeetsFloor(nodeVersion)) error(`Node.js ${MIN_NODE_VERSION} or newer is required`);
+  if (!nodeVersionMeetsFloor(nodeVersion)) error(`Security-patched Node.js ^22.23.4 || ^24.22.1 || ^26.12.1 is required`);
   const inspectorRoot = resolve(packageRoot, "node_modules/@modelcontextprotocol/inspector");
   let manifest;
   try {
@@ -96,7 +92,8 @@ export async function inspectInstallation({ packageRoot = PACKAGE_ROOT, nodeVers
   if (manifest.name !== "@modelcontextprotocol/inspector" || manifest.version !== INSPECTOR_VERSION) {
     error("installed MCP Inspector is not exactly version 2.4.0");
   }
-  if (manifest.engines?.node !== `>=${MIN_NODE_VERSION}`) error("MCP Inspector Node.js engine contract is unexpected");
+  // Validate the published Inspector metadata separately from our security floor.
+  if (manifest.engines?.node !== ">=22.19.0") error("MCP Inspector Node.js engine contract is unexpected");
   const declaredBin = manifest.bin?.["mcp-inspector"];
   if (String(declaredBin).replace(/^\.\//, "") !== INSPECTOR_BIN) error("MCP Inspector public bin is unexpected");
   const entry = resolve(inspectorRoot, declaredBin);

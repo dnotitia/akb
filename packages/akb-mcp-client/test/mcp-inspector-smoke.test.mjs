@@ -8,6 +8,7 @@ import {
   INSPECTOR_VERSION,
   PACKAGE_ROOT,
   inspectInstallation,
+  nodeVersionMeetsFloor,
   parseArguments,
   runSmoke,
 } from "../scripts/mcp-inspector-smoke.mjs";
@@ -246,5 +247,14 @@ test("missing credentials and read-call errors cannot pass", async () => {
     if (oldPassword === undefined) delete process.env.AKB_TEST_PASSWORD; else process.env.AKB_TEST_PASSWORD = oldPassword;
     if (oldPat === undefined) delete process.env.AKB_TEST_PAT; else process.env.AKB_TEST_PAT = oldPat;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Node security floor rejects unpatched and unsupported release lines", () => {
+  for (const version of ["22.23.4", "22.24.0", "24.22.1", "26.12.1"]) {
+    assert.equal(nodeVersionMeetsFloor(version), true, version);
+  }
+  for (const version of ["18.20.0", "22.23.3", "24.22.0", "26.12.0", "23.0.0", "25.0.0", "27.0.0", "22.23.4-rc.1", "invalid"]) {
+    assert.equal(nodeVersionMeetsFloor(version), false, version);
   }
 });
