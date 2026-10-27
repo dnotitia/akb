@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+import yaml  # type: ignore[import-untyped]
 
 from .contracts import StateCheckpointContract, StateContract, StateExpectation, StateExpectationSet
 from .runtime import StateObservation
 
 MISSING = object()
+_OKF_FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,10 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
         return (actual is not MISSING) is bool(expectation.value)
     if actual is MISSING:
         return False
+    if expectation.operator == "nonempty":
+        return isinstance(actual, str) and bool(actual.strip())
+    if expectation.operator == "okf_document":
+        return _matches_okf_document(actual, expectation.value)
     if expectation.operator == "equals":
         return actual == expectation.value
     if expectation.operator == "contains":
@@ -58,6 +66,64 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
     if expectation.operator == "not_contains":
         return not recursively_contains(actual, expectation.value)
     raise AssertionError(f"unknown state operator: {expectation.operator}")
+
+
+def _matches_okf_document(actual: Any, expected: Any) -> bool:
+    if not isinstance(actual, str) or not isinstance(expected, dict):
+        return False
+    parsed = _parse_okf_document(actual)
+    if parsed is None:
+        return False
+    metadata, body = parsed
+    resource_uri = expected.get("resource_uri")
+    if (
+        metadata.get("type") != expected.get("type")
+        or metadata.get("resource") != resource_uri
+        or metadata.get("akb_uri") != resource_uri
+    ):
+        return False
+    body = body.replace("\r\n", "\n")
+    if not body.startswith("\n") or not body.endswith("\n"):
+        return False
+    return body[1:-1] == expected.get("body")
+
+
+def _parse_okf_document(actual: str) -> tuple[dict[str, Any], str] | None:
+    match = _OKF_FRONTMATTER.match(actual)
+    if match is None:
+        return None
+    try:
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    return metadata, actual[match.end():]
+
+
+def okf_import_files_match(actual: Any, expected: Any) -> bool:
+    """Compare imported OKF files using the product's parsed document body."""
+
+    if not isinstance(actual, dict) or not isinstance(expected, dict) or set(actual) != set(expected):
+        return False
+    for path, expected_text in expected.items():
+        actual_text = actual.get(path)
+        if not isinstance(path, str) or not isinstance(actual_text, str) or not isinstance(expected_text, str):
+            return False
+        actual_document = _parse_okf_document(actual_text)
+        expected_document = _parse_okf_document(expected_text)
+        if actual_document is None or expected_document is None:
+            return False
+        actual_metadata, actual_body = actual_document
+        expected_metadata, expected_body = expected_document
+        expected_type = expected_metadata.get("type")
+        if not isinstance(expected_type, str) or actual_metadata.get("type") != expected_type:
+            return False
+        if any(actual_metadata.get(key) != value for key, value in expected_metadata.items()):
+            return False
+        if actual_body.strip() != expected_body.strip():
+            return False
+    return True
 
 
 def evaluate_state_contract(
@@ -85,6 +151,15 @@ def _evaluate_expectations(
     checks: list[StateCheckResult] = []
     if not after.available:
         return [StateCheckResult(False, "", "available", after.error or "after-state observation unavailable")]
+    if after.status_code != contract.probe.expected_status:
+        checks.append(
+            StateCheckResult(
+                False,
+                "",
+                "http_status",
+                f"expected HTTP {contract.probe.expected_status}; actual {after.status_code}",
+            )
+        )
     for expectation in contract.must:
         actual = json_pointer(after.payload, expectation.pointer)
         checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "must"))
@@ -94,6 +169,15 @@ def _evaluate_expectations(
     if contract.check_before:
         if not before.available:
             checks.append(StateCheckResult(False, "", "available_before", before.error or "before-state observation unavailable"))
+        if before.status_code != contract.resolved_before_expected_status:
+            checks.append(
+                StateCheckResult(
+                    False,
+                    "",
+                    "http_status_before",
+                    f"expected HTTP {contract.resolved_before_expected_status}; actual {before.status_code}",
+                )
+            )
         for expectation in contract.before_must:
             actual = json_pointer(before.payload, expectation.pointer)
             checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "before_must"))
@@ -129,6 +213,15 @@ def evaluate_checkpoint_contract(
             )
         ]
     checks: list[StateCheckResult] = []
+    if observation.status_code != contract.probe.expected_status:
+        checks.append(
+            StateCheckResult(
+                False,
+                "",
+                f"checkpoint:{contract.after_attempt}:http_status",
+                f"expected HTTP {contract.probe.expected_status}; actual {observation.status_code}",
+            )
+        )
     for expectation in contract.must:
         actual = json_pointer(observation.payload, expectation.pointer)
         checks.append(_result(expectation, expectation_holds(actual, expectation), actual, "checkpoint_must"))

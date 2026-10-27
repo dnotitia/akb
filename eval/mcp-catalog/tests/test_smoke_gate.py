@@ -1,20 +1,48 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import runpy
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic_ai.messages import InstructionPart, ModelRequest
 
 import mcp_catalog.runner as runner_module
-from mcp_catalog.contracts import load_run_manifest, load_task_corpus
-from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
+from mcp_catalog.checkpoint import (
+    CheckpointHeader,
+    CheckpointKey,
+    CheckpointStore,
+    valid_smoke_outcome,
+)
+from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
+from mcp_catalog.execution import (
+    BudgetExceeded,
+    BudgetLedger,
+    ToolCallRecord,
+    TrialOutcome,
+    _model_input_evidence_for,
+)
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import (
+    SYNTHETIC_SERVER_INSTRUCTIONS,
+    provider_name_for_model,
+    provider_registry_snapshot,
+    synthetic_model_input_evidence,
+)
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+
+
+def _runner(manifest: Any, tasks: Any, descriptor: RuntimeDescriptor, **kwargs: Any) -> BenchmarkRunner:
+    runner = BenchmarkRunner(manifest, tasks, descriptor, **kwargs)
+    runner.provider_registry = provider_registry_snapshot(manifest)
+    return runner
 
 
 class _SmokeResolver:
@@ -49,6 +77,7 @@ def _smoke_outcome(
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_id or model_spec.model_id,
@@ -75,7 +104,14 @@ def _smoke_outcome(
             {
                 "model": model_spec.model_id,
                 "routing": {
-                    "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}
+                    "requested": model_spec.model_id,
+                    "endpoints": {
+                        "available": [{
+                            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+                            "provider": provider_name_for_model(model_spec),
+                            "selected": True,
+                        }]
+                    },
                 },
                 "usage": {"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.000005},
             }
@@ -85,6 +121,8 @@ def _smoke_outcome(
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        server_instructions_sha256=hashlib.sha256(SYNTHETIC_SERVER_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        model_input_evidence=synthetic_model_input_evidence(2),
         state_available_before=True,
         state_available_after=True,
         state_before={},
@@ -117,11 +155,80 @@ def _parallel_descriptor() -> RuntimeDescriptor:
     return RuntimeDescriptor.from_dict(descriptor)
 
 
+def test_completed_http_smoke_with_sdk_trimmed_final_newline_survives_checkpoint(
+    tmp_path: Path,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    task = next(task for task in tasks if "http" in task.fixture.transports)
+    model_spec = manifest.models[0]
+    source = runpy.run_path(str(ROOT.parents[1] / "backend" / "mcp_server" / "instructions.py"))["INSTRUCTIONS"]
+    assert isinstance(source, str) and source.endswith("\n")
+    sdk_text = source.rstrip("\r\n")
+    evidence = [
+        _model_input_evidence_for(
+            [ModelRequest(parts=[InstructionPart(content=sdk_text)])],
+            source,
+            request_index,
+        )
+        for request_index in (1, 2)
+    ]
+    outcome = _smoke_outcome(task, model_spec, "http").model_copy(
+        update={
+            "success": True,
+            "server_instructions_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "model_input_evidence": evidence,
+        }
+    )
+
+    assert valid_smoke_outcome(outcome, task)
+
+    source_revision = "a" * 40
+    header = CheckpointHeader(
+        source_revision=source_revision,
+        run_manifest_hash=hash_json(manifest.model_dump(mode="json")),
+        task_corpus_hash=hash_json([item.model_dump(mode="json") for item in tasks]),
+        arm="baseline",
+    )
+    key = CheckpointKey(
+        source_revision=source_revision,
+        run_manifest_hash=header.run_manifest_hash,
+        task_corpus_hash=header.task_corpus_hash,
+        arm="baseline",
+        model_class=model_spec.class_name,
+        model_id=model_spec.model_id,
+        transport="http",
+        task_id=task.id,
+        repeat_index=1,
+        locale=task.locale,
+    )
+    expected_keys = {hash_json(key.model_dump(mode="json")): key}
+    smoke_cells = {"primary:http": ("primary", model_spec.model_id, "http")}
+
+    def open_store(*, resume: bool = False) -> CheckpointStore:
+        store = CheckpointStore(
+            tmp_path / "checkpoint.json",
+            header=header,
+            expected_keys=expected_keys,
+            expected_tasks={item.id: item for item in tasks},
+            expected_smoke_cells=smoke_cells,
+            resume=resume,
+        )
+        if not resume:
+            store.bind_pre_smoke_seal("e" * 64, {"status": "unavailable", "reason": "test fixture"})
+        return store
+
+    store = open_store()
+    store.record_smoke_cell("primary:http", outcome, status="completed")
+    store.set_smoke_status("passed")
+    assert open_store(resume=True).smoke_is_complete()
+
+
 @pytest.mark.asyncio
 async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     fixture = _SmokeFixture()
     calls: list[tuple[str, str]] = []
 
@@ -154,7 +261,57 @@ async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest
         assert outcome["cost_source"] == "provider_response"
         assert outcome["provider_cost_usd"] > 0
         selected_provider = outcome["provider_evidence"][0]["routing"]["endpoints"]["available"][0]
-        assert selected_provider == {"provider": "OpenInference", "selected": True}
+        assert selected_provider == {
+            "model": runner_module._expected_openrouter_canonical_slug(model_spec),
+            "provider": provider_name_for_model(model_spec),
+            "selected": True,
+        }
+
+
+@pytest.mark.asyncio
+async def test_smoke_gate_failure_names_instruction_evidence_when_that_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+
+    async def smoke_with_wrong_instructions(task, *, model_spec, transport, **_kwargs):
+        return _smoke_outcome(task, model_spec, transport)
+
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke_with_wrong_instructions)
+    server_instructions = runpy.run_path(
+        str(ROOT.parents[1] / "backend" / "mcp_server" / "instructions.py")
+    )["INSTRUCTIONS"]
+    profiles = {
+        transport: {
+            task.fixture.credential_profile
+            for task in tasks
+            if transport in task.fixture.transports
+        }
+        for transport in ("http", "stdio")
+    }
+    catalog_instructions = {
+        f"{transport}:{profile}": (
+            server_instructions if transport == "http" else SYNTHETIC_SERVER_INSTRUCTIONS
+        )
+        for transport, credential_profiles in profiles.items()
+        for profile in credential_profiles
+    }
+
+    with pytest.raises(RuntimeContractError, match="sealed server instructions"):
+        await runner._run_smoke_gate(
+            fixture=_SmokeFixture(),
+            resolver=_SmokeResolver(),
+            ledger=BudgetLedger(manifest),
+            catalog_server_instructions=catalog_instructions,
+        )
+
+    failed_http = [cell for cell in runner._smoke_gate["cells"] if cell["cell"].endswith(":http")]
+    assert len(failed_http) == 2
+    assert all(cell["status"] == "failed" for cell in failed_http)
+    assert all("sealed server instructions" in cell["outcome"]["error"] for cell in failed_http)
 
 
 @pytest.mark.asyncio
@@ -163,7 +320,7 @@ async def test_smoke_gate_rejects_outcome_for_a_different_requested_model(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def mismatched_smoke(task, *, model_spec, transport, **_kwargs):
@@ -190,7 +347,7 @@ async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def missing_terminal_request_evidence(task, *, model_spec, transport, **_kwargs):
@@ -221,7 +378,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def incomplete_usage_smoke(task, *, model_spec, transport, **_kwargs):
@@ -244,7 +401,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def failed_smoke(task, *, model_spec, transport, **_kwargs):
@@ -284,7 +441,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
         for transport in manifest.transports
     ]
 
-    first_runner = BenchmarkRunner(
+    first_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),
@@ -302,6 +459,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     failure_recorded_for_sibling = asyncio.Event()
     first_store = first_runner._checkpoint_store
     assert first_store is not None
+    first_store.bind_pre_smoke_seal("e" * 64, first_runner.provider_registry)
 
     async def wait_for_failed_cell_checkpoint() -> None:
         while True:
@@ -387,7 +545,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     assert first_store.document.reserved_cost_usd == 0
     assert first_ledger.reserved_cost_usd == Decimal("0")
 
-    resumed_runner = BenchmarkRunner(
+    resumed_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),

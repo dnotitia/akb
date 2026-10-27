@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import json
 import math
 import os
 import platform
 import re
 import sys
 import time
+import tomllib
 from collections.abc import Mapping
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 
@@ -24,18 +26,27 @@ import httpx
 from .catalog import capture_catalog, input_schemas_from_catalog
 from .checkpoint import (
     CheckpointHeader,
+    CheckpointPairedEvent,
     CheckpointDocument,
     CheckpointKey,
     CheckpointStore,
     SmokeModelClass,
     SmokeTransport,
+    TrialCheckpoint,
+    checkpoint_key_digest,
+    checkpoint_record_hash,
+    provider_registry_snapshot_hash,
+    smoke_record_hash,
+    spent_hash,
     valid_completed_outcome,
-    valid_smoke_outcome,
+    smoke_outcome_failure_reason,
+    timing_hash,
 )
 from .contracts import (
     ArmName,
     BenchmarkRunManifest,
     CatalogSnapshot,
+    ExpectedMaterialAttempt,
     ModelSpec,
     PublicOperation,
     TaskManifest,
@@ -43,31 +54,228 @@ from .contracts import (
     load_run_manifest,
     load_task_corpus,
     load_tool_coverage,
+    public_arguments_match_schema,
     validate_public_catalog,
 )
-from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
+from .evidence import (
+    redact_exception,
+    redact_text,
+    safe_json,
+    serialize_report,
+    validate_model_input_evidence,
+    write_json,
+)
+from .historical_continuation import validate_artifact_lineage
 from .execution import (
     BudgetLedger,
     BudgetExceeded,
+    ToolCallRecord,
     TrialExecutor,
     TrialOutcome,
+    MetricsReportEvaluator,
+    TrialEvaluator,
     build_model,
     canonicalize_arguments,
     decode_raw_args,
+    eligible_openrouter_endpoints,
     evaluate_dataset,
     execute_smoke,
     has_measured_evidence,
+    has_server_instructions_evidence,
+    _captured_material_positions_by_stage,
+    _expected_call_target_matches,
+    _resolved_material_stage_calls,
+    _sequence_target_mismatches,
     provider_response_cost,
     provider_token_totals,
+    registered_route_target,
     summarize_outcomes,
     summarize_outcomes_by_locale,
     validate_routing_evidence,
+    validate_openrouter_endpoint_price_ceiling,
     validate_model_configuration,
     worst_case_cost,
 )
+from .selection import ToolGuidanceSelection
+from .pairing import planned_arm_order
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
 from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
+
+
+_OPENROUTER_CANONICAL_IDENTITIES = {
+    ("deepseek/deepseek-v4-flash-0731", "20260731"): "deepseek/deepseek-v4-flash-20260731",
+    ("qwen/qwen3.8-27b", "20260814"): "qwen/qwen3.8-27b-20260814",
+}
+
+
+def _expected_openrouter_canonical_slug(spec: ModelSpec) -> str:
+    canonical_slug = _OPENROUTER_CANONICAL_IDENTITIES.get((spec.model_id, spec.version))
+    if canonical_slug is None:
+        raise ValueError(f"provider model alias/version is not pinned for {spec.class_name}")
+    return canonical_slug
+
+
+def _validate_openrouter_model_identity(spec: ModelSpec, model_record: dict[str, Any]) -> None:
+    if model_record.get("id") != spec.model_id:
+        raise ValueError(f"provider model alias drifted for {spec.class_name}")
+    canonical_slug = model_record.get("canonical_slug")
+    if canonical_slug != _expected_openrouter_canonical_slug(spec):
+        raise ValueError(f"provider model canonical identity drifted for {spec.class_name}")
+
+
+def _revalidate_selection_route_failure(
+    outcome: TrialOutcome,
+    task: TaskManifest,
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[TrialOutcome, dict[str, str | bool]] | None:
+    """Correct the one route-only result whose sealed v1 projection omitted Near AI."""
+
+    if (
+        outcome.arm != "candidate"
+        or outcome.model_class != "lightweight"
+        or outcome.model_id != "qwen/qwen3.8-27b"
+        or outcome.transport != "http"
+        or outcome.task_id != "table-publication-ko"
+        or outcome.repeat_index != 1
+        or model_spec.model_id != outcome.model_id
+        or task.id != outcome.task_id
+        or outcome.error != "OpenRouter response did not match the registered model/provider route"
+        or outcome.failure_kind != "unknown"
+        or not outcome.routing_observed
+        or outcome.routing_valid
+        or outcome.trial_error
+        or not outcome.user_outcome_completed
+    ):
+        return None
+    route = registered_route_target(model_spec, registered_model)
+    if route is None or not route.reconciled_legacy_projection:
+        return None
+    observed, valid = validate_routing_evidence(
+        outcome.provider_evidence,
+        model_spec,
+        registered_model,
+    )
+    if not observed or not valid:
+        return None
+    success = (
+        outcome.user_outcome_completed
+        and outcome.first_material_action_accuracy
+        and outcome.argument_validity
+        and outcome.safety
+        and (outcome.stopping_accuracy or not task.stopping.enforce_for_task_success)
+    )
+    corrected = outcome.model_copy(
+        update={
+            "error": None,
+            "failure_kind": "none",
+            "routing_valid": True,
+            "success": success,
+        }
+    )
+    if (
+        not has_measured_evidence(corrected, task)
+        or not has_server_instructions_evidence(corrected)
+    ):
+        return None
+    return corrected, route.lineage()
+
+
+_DYNAMIC_PROVIDER_REGISTRY_FIELDS = frozenset(
+    {
+        "throughput",
+        "latency",
+        "uptime",
+        "request_count",
+        "latency_last_30m",
+        "throughput_last_30m",
+        "uptime_last_1d",
+        "uptime_last_30m",
+        "uptime_last_5m",
+        "perf_last_30m_by_workload",
+    }
+)
+
+
+def _provider_registry_invariant_snapshot(
+    registry: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+) -> dict[str, Any]:
+    if registry.get("status") != "verified":
+        raise RuntimeContractError("fresh provider registry verification is unavailable", stage="provider_registry")
+    models = registry.get("models")
+    expected_model_ids = {spec.model_id for spec in manifest.models}
+    if not isinstance(models, dict) or set(models) != expected_model_ids:
+        raise RuntimeContractError("provider registry model set drifted", stage="provider_registry")
+
+    def without_dynamic_metrics(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: without_dynamic_metrics(item)
+                for key, item in value.items()
+                if key not in _DYNAMIC_PROVIDER_REGISTRY_FIELDS
+            }
+        if isinstance(value, list):
+            return [without_dynamic_metrics(item) for item in value]
+        return value
+
+    invariant_models: dict[str, Any] = {}
+    for spec in manifest.models:
+        registered = models[spec.model_id]
+        model_record = registered.get("model_record") if isinstance(registered, dict) else None
+        selected_endpoint = registered.get("selected_endpoint") if isinstance(registered, dict) else None
+        eligible_endpoints = registered.get("eligible_endpoints") if isinstance(registered, dict) else None
+        if (
+            not isinstance(model_record, dict)
+            or not isinstance(selected_endpoint, dict)
+            or not isinstance(eligible_endpoints, list)
+            or not eligible_endpoints
+        ):
+            raise RuntimeContractError(
+                f"provider registry identity is incomplete for {spec.class_name}",
+                stage="provider_registry",
+            )
+        try:
+            _validate_openrouter_model_identity(spec, model_record)
+            for endpoint in eligible_endpoints:
+                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
+        except ValueError as exc:
+            raise RuntimeContractError(str(exc), stage="provider_registry") from exc
+        if registered_route_target(spec, registered) is None:
+            raise RuntimeContractError(
+                f"provider registry route or endpoint parameters drifted for {spec.class_name}",
+                stage="provider_registry",
+            )
+        invariant_models[spec.model_id] = {
+            "manifest_version": registered.get("manifest_version"),
+            "model_record": without_dynamic_metrics(model_record),
+            "selected_endpoint": without_dynamic_metrics(selected_endpoint),
+            "eligible_endpoints": without_dynamic_metrics(eligible_endpoints),
+        }
+    return {"status": "verified", "models": invariant_models}
+
+
+def _provider_registry_invariant_hash(
+    registry: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+) -> str:
+    return hash_json(_provider_registry_invariant_snapshot(registry, manifest))
+
+
+def _verify_provider_registry_revalidation(
+    frozen: dict[str, Any],
+    current: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+) -> str:
+    frozen_invariants = _provider_registry_invariant_snapshot(frozen, manifest)
+    current_invariants = _provider_registry_invariant_snapshot(current, manifest)
+    if current_invariants != frozen_invariants:
+        raise RuntimeContractError(
+            "fresh provider registry route, model, parameters, prices, or endpoint ceiling drifted",
+            stage="provider_registry",
+        )
+    return hash_json(frozen_invariants)
 
 
 class NeedsUserInput(RuntimeError):
@@ -190,7 +398,7 @@ class CredentialResolver:
         return value
 
     def secrets_for(self, profile: str) -> tuple[str, ...]:
-        return tuple(dict.fromkeys((*self.model_secrets, self.token_for(profile))))
+        return tuple(dict.fromkeys((*self.secret_values(), self.token_for(profile))))
 
     def required_profiles(self, tasks: list[TaskManifest]) -> list[str]:
         return sorted({task.fixture.credential_profile for task in tasks})
@@ -340,14 +548,24 @@ class PairedExecutionTurn:
     arm: ArmName
     order_position: int
     execution_sequence: int
+    attempt: int
+    retry_of_sequence: int | None
 
 
 class PairedArmCoordinator:
     """Gate real trial execution by the preregistered per-cell arm order."""
 
-    def __init__(self, manifest: BenchmarkRunManifest, tasks: list[TaskManifest]) -> None:
+    def __init__(
+        self,
+        manifest: BenchmarkRunManifest,
+        tasks: list[TaskManifest],
+        *,
+        initial_events: list[dict[str, Any]] | None = None,
+        selection: ToolGuidanceSelection | None = None,
+    ) -> None:
         self.manifest = manifest
         self.tasks = tasks
+        self.selection = selection
         self._schedule: dict[str, list[tuple[str, int, ArmName]]] = {}
         for model in manifest.models:
             for transport in manifest.transports:
@@ -358,6 +576,8 @@ class PairedArmCoordinator:
                     for task in tasks
                     if transport in task.fixture.transports
                     for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)
+                    if selection is None
+                    or selection.contains(arm, model.class_name, transport, task.id, repeat_index)
                 ]
         self._positions = {cell: 0 for cell in self._schedule}
         self._registered: set[ArmName] = set()
@@ -365,22 +585,52 @@ class PairedArmCoordinator:
             "baseline": set(),
             "candidate": set(),
         }
-        self._events: list[dict[str, Any]] = []
-        self._sequence = 0
+        self._reused_outcomes: dict[ArmName, dict[tuple[str, str, int], TrialOutcome]] = {
+            "baseline": {},
+            "candidate": {},
+        }
+        self._selection_history_events: dict[ArmName, list[dict[str, Any]]] = {}
+        self._unknown_start_gaps: list[dict[str, int | str]] = []
+        self._events = [dict(event) for event in (initial_events or [])]
+        sequences = [event.get("sequence") for event in self._events]
+        if sequences != list(range(1, len(self._events) + 1)):
+            raise RuntimeContractError("paired continuation history must have a contiguous execution sequence")
+        self._sequence = len(self._events)
+        self._events_by_identity: dict[tuple[str, str, int, ArmName], list[dict[str, Any]]] = defaultdict(list)
+        self._terminal_event_sequences: set[int] = set()
+        for event in self._events:
+            identity = (
+                event["cell"],
+                event["task_id"],
+                event["repeat_index"],
+                cast(ArmName, event["arm"]),
+            )
+            self._events_by_identity[identity].append(event)
+        self._historical_identities = set(self._events_by_identity)
         self._condition = asyncio.Condition()
         self._provider_registry: dict[str, Any] | None = None
         self._provider_registry_lock = asyncio.Lock()
         self._pre_smoke_seals: dict[ArmName, str] = {}
         self._pre_smoke_ready: set[ArmName] = set()
+        self._continued_seal_hash: str | None = None
 
     async def register_arm(
         self,
         arm: ArmName,
         reused: Mapping[tuple[str, str, int], TrialOutcome],
+        *,
+        history_events: list[dict[str, Any]] | None = None,
     ) -> None:
         async with self._condition:
             if arm in self._registered:
                 raise RuntimeContractError(f"paired arm {arm} registered twice")
+            if self.selection is not None:
+                if history_events is None:
+                    raise RuntimeContractError("selection resume is missing checkpoint attempt history")
+                self._selection_history_events[arm] = [dict(event) for event in history_events]
+            elif history_events is not None:
+                raise RuntimeContractError("checkpoint attempt history is only valid for selected runs")
+            self._reused_outcomes[arm] = dict(reused)
             for identity, outcome in reused.items():
                 cell, task_id, repeat_index = identity
                 expected = planned_arm_order(task_id, repeat_index, self.manifest.paired_order_seed)
@@ -389,12 +639,59 @@ class PairedArmCoordinator:
                         f"paired resume evidence is missing or invalid for {cell}:{task_id}:{repeat_index}:{arm}"
                     )
                 self._reused[arm].add(identity)
+                sequence = outcome.paired_execution_sequence
+                if sequence is not None and self.selection is None:
+                    event = next(
+                        (item for item in self._events if item.get("sequence") == sequence),
+                        None,
+                    )
+                    if event is not None:
+                        event_identity = (
+                            event.get("cell"),
+                            event.get("task_id"),
+                            event.get("repeat_index"),
+                            event.get("arm"),
+                        )
+                        if event_identity != (cell, task_id, repeat_index, arm):
+                            raise RuntimeContractError("paired resume outcome points at another execution event")
+                        self._terminal_event_sequences.add(sequence)
             self._registered.add(arm)
             if self._registered == {"baseline", "candidate"}:
-                self._validate_reused_prefixes()
+                if self.selection is not None:
+                    self._restore_selection_events()
+                else:
+                    self._validate_reused_prefixes()
                 for cell in self._schedule:
                     self._advance_reused(cell)
             self._condition.notify_all()
+
+    def mark_terminal_outcome(
+        self,
+        outcome: TrialOutcome,
+        status: Literal["completed", "failed", "incomplete"] = "completed",
+    ) -> None:
+        """Bind a persisted outcome to the exact paired event that produced it."""
+
+        sequence = outcome.paired_execution_sequence
+        if sequence is None:
+            return
+        event = next((item for item in self._events if item.get("sequence") == sequence), None)
+        identity = (
+            f"{outcome.model_class}:{outcome.transport}",
+            outcome.task_id,
+            outcome.repeat_index,
+            outcome.arm,
+        )
+        if event is None or (
+            event.get("cell"),
+            event.get("task_id"),
+            event.get("repeat_index"),
+            event.get("arm"),
+        ) != identity:
+            raise RuntimeContractError("trial checkpoint does not match its paired execution event")
+        if self.selection is not None:
+            event["status"] = status
+        self._terminal_event_sequences.add(sequence)
 
     def _validate_reused_prefixes(self) -> None:
         for cell, schedule in self._schedule.items():
@@ -407,6 +704,102 @@ class PairedArmCoordinator:
                     raise RuntimeContractError(
                         f"paired resume checkpoint order is not a completed prefix for {cell}"
                     )
+
+    def _restore_selection_events(self) -> None:
+        by_sequence: dict[int, dict[str, Any]] = {}
+        by_identity: dict[tuple[str, str, int, ArmName], list[dict[str, Any]]] = defaultdict(list)
+        for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+            for raw_event in self._selection_history_events[arm]:
+                event = dict(raw_event)
+                identity = (
+                    event.get("cell"),
+                    event.get("task_id"),
+                    event.get("repeat_index"),
+                    event.get("arm"),
+                )
+                sequence = event.get("sequence")
+                if (
+                    not isinstance(identity[0], str)
+                    or not isinstance(identity[1], str)
+                    or type(identity[2]) is not int
+                    or identity[3] != arm
+                    or type(sequence) is not int
+                    or type(event.get("order_position")) is not int
+                    or event.get("status") not in {"started", "completed", "failed", "incomplete"}
+                    or identity[0] not in self._schedule
+                ):
+                    raise RuntimeContractError("selection checkpoint attempt history has an invalid identity")
+                typed_identity = cast(tuple[str, str, int, ArmName], identity)
+                if sequence in by_sequence:
+                    raise RuntimeContractError("selection checkpoint duplicates a paired attempt sequence")
+                model_class, transport = identity[0].split(":", 1)
+                if self.selection is None or not self.selection.contains(
+                    arm,
+                    model_class,
+                    transport,
+                    identity[1],
+                    identity[2],
+                ):
+                    raise RuntimeContractError("selection checkpoint attempt is outside the authorized identities")
+                expected_order = planned_arm_order(
+                    identity[1], identity[2], self.manifest.paired_order_seed
+                ).index(arm)
+                if event["order_position"] != expected_order:
+                    raise RuntimeContractError("selection checkpoint changed the paired arm order")
+                by_sequence[sequence] = event
+                by_identity[typed_identity].append(event)
+
+        for chain in by_identity.values():
+            chain.sort(key=lambda event: event["sequence"])
+            previous_sequence: int | None = None
+            for attempt, event in enumerate(chain, start=1):
+                if event.get("attempt", attempt) != attempt:
+                    raise RuntimeContractError("selection checkpoint retry attempt index is invalid")
+                if attempt == 1:
+                    if event.get("retry_of_sequence") is not None:
+                        raise RuntimeContractError("first selection attempt cannot reference a retry")
+                elif event.get("retry_of_sequence") != previous_sequence:
+                    raise RuntimeContractError("selection checkpoint retry does not link to its previous attempt")
+                previous_sequence = event["sequence"]
+
+        restored = [by_sequence[sequence] for sequence in sorted(by_sequence)]
+        sequences = [event["sequence"] for event in restored]
+        maximum_sequence = max(sequences, default=0)
+        self._unknown_start_gaps = [
+            {"sequence": sequence, "status": "unknown_start"}
+            for sequence in range(1, maximum_sequence + 1)
+            if sequence not in by_sequence
+        ]
+        self._events = restored
+        self._sequence = maximum_sequence
+        self._events_by_identity.clear()
+        self._terminal_event_sequences = set()
+        self._historical_identities = set(by_identity)
+        for event in restored:
+            identity = (
+                event["cell"],
+                event["task_id"],
+                event["repeat_index"],
+                cast(ArmName, event["arm"]),
+            )
+            self._events_by_identity[identity].append(event)
+            if event["status"] != "started":
+                self._terminal_event_sequences.add(event["sequence"])
+
+        for arm, reused in self._reused_outcomes.items():
+            for (cell, task_id, repeat_index), outcome in reused.items():
+                sequence = outcome.paired_execution_sequence
+                if type(sequence) is not int or sequence not in by_sequence:
+                    raise RuntimeContractError("reused selection outcome is missing its paired attempt history")
+                event = by_sequence[sequence]
+                if (
+                    event["cell"],
+                    event["task_id"],
+                    event["repeat_index"],
+                    event["arm"],
+                ) != (cell, task_id, repeat_index, arm) or event["status"] == "started":
+                    raise RuntimeContractError("reused selection outcome does not match a terminal paired attempt")
+                self._terminal_event_sequences.add(sequence)
 
     async def wait_until_registered(self) -> None:
         async with self._condition:
@@ -421,14 +814,26 @@ class PairedArmCoordinator:
                 self._provider_registry = await loader()
             return dict(self._provider_registry)
 
-    async def register_pre_smoke_seal(self, arm: ArmName, seal_hash: str) -> str:
+    async def register_pre_smoke_seal(
+        self,
+        arm: ArmName,
+        seal_hash: str,
+        *,
+        continued_seal_hash: str | None = None,
+    ) -> str:
         async with self._condition:
             previous = self._pre_smoke_seals.get(arm)
             if previous is not None and previous != seal_hash:
                 raise RuntimeContractError("paired arm changed its pre-smoke seal during resume")
             self._pre_smoke_seals[arm] = seal_hash
+            if continued_seal_hash is not None:
+                if self._continued_seal_hash is not None and self._continued_seal_hash != continued_seal_hash:
+                    raise RuntimeContractError("paired continuation changed the immutable parent seal")
+                self._continued_seal_hash = continued_seal_hash
             self._condition.notify_all()
             await self._condition.wait_for(lambda: set(self._pre_smoke_seals) == {"baseline", "candidate"})
+            if self._continued_seal_hash is not None:
+                return self._continued_seal_hash
             return hash_json(dict(sorted(self._pre_smoke_seals.items())))
 
     async def mark_pre_smoke_ready(self, arm: ArmName) -> None:
@@ -474,17 +879,29 @@ class PairedArmCoordinator:
                 arm=arm,
                 order_position=expected_position,
                 execution_sequence=self._sequence,
+                attempt=len(self._events_by_identity.get((cell, task_id, repeat_index, arm), [])) + 1,
+                retry_of_sequence=(
+                    self._events_by_identity[(cell, task_id, repeat_index, arm)][-1]["sequence"]
+                    if self._events_by_identity.get((cell, task_id, repeat_index, arm))
+                    else None
+                ),
             )
-            self._events.append(
-                {
-                    "sequence": turn.execution_sequence,
-                    "cell": cell,
-                    "task_id": task_id,
-                    "repeat_index": repeat_index,
-                    "arm": arm,
-                    "order_position": expected_position,
-                }
-            )
+            identity = (cell, task_id, repeat_index, arm)
+            event = {
+                "sequence": turn.execution_sequence,
+                "cell": cell,
+                "task_id": task_id,
+                "repeat_index": repeat_index,
+                "arm": arm,
+                "order_position": expected_position,
+            }
+            if self.selection is not None:
+                event["status"] = "started"
+            if turn.attempt > 1:
+                event["attempt"] = turn.attempt
+                event["retry_of_sequence"] = turn.retry_of_sequence
+            self._events.append(event)
+            self._events_by_identity[identity].append(event)
         completed = False
         try:
             yield turn
@@ -501,11 +918,16 @@ class PairedArmCoordinator:
             position == len(self._schedule[cell])
             for cell, position in self._positions.items()
         )
-        return {
+        evidence = {
             "mode": "counterbalanced_task_repeat",
             "seed": self.manifest.paired_order_seed,
             "complete": complete,
             "events": list(self._events),
+            "unfinished_starts": [
+                dict(event)
+                for event in self._events
+                if event["sequence"] not in self._terminal_event_sequences
+            ],
             "reused": [
                 {
                     "cell": cell,
@@ -520,8 +942,12 @@ class PairedArmCoordinator:
                 }
                 for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate"))
                 for cell, task_id, repeat_index in sorted(self._reused[arm])
+                if (cell, task_id, repeat_index, arm) not in self._historical_identities
             ],
         }
+        if self.selection is not None:
+            evidence["unknown_start_gaps"] = list(self._unknown_start_gaps)
+        return evidence
 
 
 @asynccontextmanager
@@ -541,6 +967,8 @@ class BenchmarkRunner:
         resume_path: Path | None = None,
         paired_coordinator: PairedArmCoordinator | None = None,
         shared_ledger: BudgetLedger | None = None,
+        selection: ToolGuidanceSelection | None = None,
+        paired_budget_restored: bool = False,
     ) -> None:
         if checkpoint_path is not None and resume_path is not None and checkpoint_path != resume_path:
             raise ValueError("--checkpoint and --resume must reference the same path")
@@ -552,6 +980,8 @@ class BenchmarkRunner:
         self.resume_path = resume_path
         self.paired_coordinator = paired_coordinator
         self.shared_ledger = shared_ledger
+        self.selection = selection
+        self.paired_budget_restored = paired_budget_restored
         self.secrets: tuple[str, ...] = ()
         self._completed_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         self._checkpoint_store: CheckpointStore | None = None
@@ -631,6 +1061,14 @@ class BenchmarkRunner:
                     if transport not in task.fixture.transports:
                         continue
                     for repeat_index in range(1, self.manifest.repeats + 1):
+                        if self.selection is not None and not self.selection.contains(
+                            cast(ArmName, self.arm),
+                            model_spec.class_name,
+                            transport,
+                            task.id,
+                            repeat_index,
+                        ):
+                            continue
                         key = CheckpointKey(
                             source_revision=source_revision,
                             run_manifest_hash=manifest_hash,
@@ -645,6 +1083,9 @@ class BenchmarkRunner:
                         )
                         planned[hash_json(key.model_dump(mode="json"))] = key
         return planned
+
+    def _should_run_smoke_gate(self, pending_by_run: Mapping[str, Any]) -> bool:
+        return self.selection is None and (any(pending_by_run.values()) or self._checkpoint_store is not None)
 
     def _checkpoint_store_for(
         self,
@@ -670,9 +1111,12 @@ class BenchmarkRunner:
             self.checkpoint_path,
             header=header,
             expected_keys=planned_keys,
+            expected_tasks={task.id: task for task in self.tasks},
             expected_smoke_cells=expected_smoke,
             secrets=resolver.secret_values(),
+            selection_preflight=(self.selection.checkpoint_preflight() if self.selection is not None else None),
             resume=self.resume_path is not None,
+            reuse_terminal_trials=self.selection is not None,
         )
 
     @staticmethod
@@ -717,6 +1161,7 @@ class BenchmarkRunner:
         smoke_gate: dict[str, Any] | None = None,
         checkpoint_snapshot: CheckpointDocument | None = None,
     ) -> dict[str, Any]:
+        tasks_by_id = {task.id: task for task in self.tasks}
         snapshot_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         snapshot_statuses: dict[str, list[dict[str, Any]]] = defaultdict(list)
         if checkpoint_snapshot is not None:
@@ -741,7 +1186,11 @@ class BenchmarkRunner:
                 quality_reasons.append(reason)
         for run_key, outcomes in source_trials.items():
             for outcome in outcomes:
-                if outcome.error and not valid_completed_outcome(outcome):
+                task = tasks_by_id.get(outcome.task_id)
+                if task is None:
+                    incomplete_reasons.add(f"benchmark incomplete: trial {outcome.task_id} is not registered")
+                    continue
+                if outcome.error and not valid_completed_outcome(outcome, task):
                     reason = (
                         f"benchmark incomplete: {run_key} trial {outcome.task_id} "
                         f"repeat {outcome.repeat_index} failed: {redact_text(outcome.error, self.secrets)}"
@@ -765,13 +1214,17 @@ class BenchmarkRunner:
             }
         completed_trials = sum(len(outcomes) for outcomes in source_trials.values())
         all_outcomes = [outcome for outcomes in source_trials.values() for outcome in outcomes]
-        expected_trials = sum(
-            1
-            for model_spec in self.manifest.models
-            for transport in self.manifest.transports
-            for task in self.tasks
-            if transport in task.fixture.transports
-            for _repeat_index in range(1, self.manifest.repeats + 1)
+        expected_trials = (
+            self.selection.expected_trials_by_arm[cast(ArmName, self.arm)]
+            if self.selection is not None
+            else sum(
+                1
+                for model_spec in self.manifest.models
+                for transport in self.manifest.transports
+                for task in self.tasks
+                if transport in task.fixture.transports
+                for _repeat_index in range(1, self.manifest.repeats + 1)
+            )
         )
         if completed_trials != expected_trials:
             incomplete_reasons.add(
@@ -828,14 +1281,15 @@ class BenchmarkRunner:
                 sum(
                     1
                     for record in checkpoint_snapshot.records.values()
-                    if record.status == "completed" and valid_completed_outcome(record.outcome)
+                    if record.status == "completed"
+                    and valid_completed_outcome(record.outcome, tasks_by_id[record.key.task_id])
                 )
                 if checkpoint_snapshot is not None
                 else sum(
                     1
                     for outcomes in self._completed_trials.values()
                     for outcome in outcomes
-                    if valid_completed_outcome(outcome)
+                    if valid_completed_outcome(outcome, tasks_by_id[outcome.task_id])
                 )
             ),
         }
@@ -856,6 +1310,25 @@ class BenchmarkRunner:
             checkpoint_evidence["lifecycle"] = checkpoint_doc.lifecycle
             checkpoint_evidence["record_count"] = len(checkpoint_doc.records)
             checkpoint_evidence["reserved_cost_usd"] = checkpoint_doc.reserved_cost_usd
+            checkpoint_evidence["smoke_status"] = checkpoint_doc.smoke_status
+            checkpoint_evidence["smoke_cell_count"] = len(checkpoint_doc.smoke_gate)
+            checkpoint_evidence["provider_registry_hash"] = checkpoint_doc.header.provider_registry_hash
+            checkpoint_evidence["selection_preflight"] = checkpoint_doc.selection_preflight
+            if checkpoint_doc.attempt_history:
+                checkpoint_evidence["attempt_history"] = [
+                    item.model_dump(mode="json") for item in checkpoint_doc.attempt_history
+                ]
+            if checkpoint_doc.selection_route_revalidations:
+                checkpoint_evidence["selection_route_revalidations"] = [
+                    item.model_dump(mode="json") for item in checkpoint_doc.selection_route_revalidations
+                ]
+            checkpoint_evidence["provider_registry_revalidation"] = [
+                {
+                    "snapshot_hash": item["snapshot_hash"],
+                    "invariant_sha256": item.get("invariant_sha256"),
+                }
+                for item in checkpoint_doc.provider_registry_revalidation
+            ]
             checkpoint_evidence["spent"] = checkpoint_doc.spent.model_dump(mode="json")
             checkpoint_evidence["spent_hash"] = checkpoint_doc.spent_hash
             checkpoint_evidence["timing_hash"] = checkpoint_doc.timing_hash
@@ -868,7 +1341,8 @@ class BenchmarkRunner:
         if ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
-            budget_model_requests = checkpoint_doc.spent.model_requests
+            budget_provider_setup_requests = checkpoint_doc.spent.provider_setup_requests
+            budget_model_requests = checkpoint_doc.spent.model_requests - budget_provider_setup_requests
             budget_input_tokens = checkpoint_doc.spent.input_tokens
             budget_output_tokens = checkpoint_doc.spent.output_tokens
             budget_cost_usd = Decimal(str(checkpoint_doc.spent.cost_usd))
@@ -876,7 +1350,8 @@ class BenchmarkRunner:
             budget_model_work_seconds = checkpoint_doc.spent.model_work_seconds
             budget_reserved = Decimal(str(checkpoint_doc.reserved_cost_usd))
         else:
-            budget_model_requests = ledger.requests
+            budget_provider_setup_requests = ledger.provider_setup_requests
+            budget_model_requests = ledger.requests - budget_provider_setup_requests
             budget_input_tokens = ledger.input_tokens
             budget_output_tokens = ledger.output_tokens
             budget_cost_usd = ledger.cost_usd
@@ -939,11 +1414,7 @@ class BenchmarkRunner:
             "end_to_end_wall_seconds": timing_payload.get("cumulative_wall_seconds", end_to_end_wall_seconds),
             "budget_used": {
                 "model_requests": budget_model_requests,
-                "provider_setup_requests": (
-                    checkpoint_doc.spent.provider_setup_requests
-                    if checkpoint_doc is not None
-                    else ledger.provider_setup_requests
-                ),
+                "provider_setup_requests": budget_provider_setup_requests,
                 "input_tokens": budget_input_tokens,
                 "output_tokens": budget_output_tokens,
                 "total_tokens": budget_input_tokens + budget_output_tokens,
@@ -954,6 +1425,27 @@ class BenchmarkRunner:
                 "request_timeout_seconds": self.manifest.budget.request_timeout_seconds,
             },
         }
+        if self.selection is not None:
+            artifact["selection"] = self.selection.artifact_metadata()
+            route_models: dict[str, Any] = {}
+            registered_models = self.provider_registry.get("models")
+            for model_spec in self.manifest.models:
+                registered_model = (
+                    registered_models.get(model_spec.model_id)
+                    if isinstance(registered_models, dict)
+                    else None
+                )
+                target = (
+                    registered_route_target(model_spec, registered_model)
+                    if isinstance(registered_model, dict)
+                    else None
+                )
+                if target is not None:
+                    route_models[model_spec.model_id] = target.lineage()
+            artifact["routing_verification"] = {
+                "status": "verified" if len(route_models) == len(self.manifest.models) else "incomplete",
+                "models": route_models,
+            }
         if failure is not None:
             cleanup = cleanup_errors or []
             stage = failure_stage or _exception_stage(failure, "run")
@@ -987,28 +1479,66 @@ class BenchmarkRunner:
         outcome: TrialOutcome,
         status: Literal["completed", "failed", "incomplete"],
     ) -> None:
+        cancelled_during_write = False
         if self._checkpoint_store is not None:
             async with self._checkpoint_lock:
                 self._refresh_store_secrets()
                 checkpoint_started = time.perf_counter()
-                existed = await asyncio.to_thread(
-                    self._checkpoint_store.record_trial,
-                    key,
-                    outcome,
-                    status=status,
-                    timing=self._timing_snapshot(),
-                    elapsed_wall_seconds=(
-                        self._ledger.current_wall_seconds()
-                        if self._ledger is not None
-                        else None
-                    ),
-                    reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
+                write_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._checkpoint_store.record_trial,
+                        key,
+                        outcome,
+                        status=status,
+                        timing=self._timing_snapshot(),
+                        elapsed_wall_seconds=(
+                            self._ledger.current_wall_seconds()
+                            if self._ledger is not None
+                            else None
+                        ),
+                        reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
+                    )
                 )
+                try:
+                    existed = await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    existed = await write_task
+                    cancelled_during_write = True
                 if self._timing is not None:
                     self._timing.record("checkpoint", checkpoint_started)
             if not existed:
                 self._checkpoint_new_trials += 1
+        if self.paired_coordinator is not None:
+            self.paired_coordinator.mark_terminal_outcome(outcome, status)
         self._record_trial(run_key, outcome)
+        if cancelled_during_write:
+            raise asyncio.CancelledError
+
+    async def finalize_cancelled_checkpoint(self) -> None:
+        """Close an opened checkpoint when cancellation precedes run finalization."""
+
+        store = self._checkpoint_store
+        if store is None or store.document.lifecycle == "finalized":
+            return
+        async with self._checkpoint_lock:
+            lifecycle = store.document.lifecycle
+            if lifecycle == "open":
+                await asyncio.to_thread(store.set_reserved_cost, 0.0)
+                await asyncio.to_thread(
+                    store.set_run_counters,
+                    reused_trials=self._checkpoint_reused_trials,
+                    rerun_trials=self._checkpoint_rerun_trials,
+                )
+            timing = self._timing_snapshot()
+            if timing is None:
+                timing = store.document.timing.active_attempt.model_dump(mode="json") if (
+                    store.document.timing.active_attempt is not None
+                ) else {
+                    "attempt_index": self._timing_attempt_index,
+                    "wall_seconds": store.document.spent.wall_seconds,
+                    "breakdown": {"other": store.document.spent.wall_seconds},
+                }
+            await asyncio.to_thread(store.finalize_timing, timing)
 
     def _refresh_store_secrets(self) -> None:
         if self._checkpoint_store is not None:
@@ -1034,6 +1564,7 @@ class BenchmarkRunner:
         resolver: CredentialResolver,
         ledger: BudgetLedger,
         catalog_input_schemas: Mapping[str, dict[str, dict[str, Any]]] | None = None,
+        catalog_server_instructions: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         self._resolver = resolver
         required_cells = [
@@ -1057,12 +1588,40 @@ class BenchmarkRunner:
             cell_key = f"{model_spec.class_name}:{transport}"
             cell_fixture = cell_fixtures[cell_key]
             assert cell_fixture is not None
+            task = self._smoke_task(transport)
+            catalog_key = f"{transport}:{task.fixture.credential_profile}"
+            server_instructions = (
+                catalog_server_instructions.get(catalog_key)
+                if catalog_server_instructions is not None
+                else None
+            )
+            if catalog_server_instructions is not None and not server_instructions:
+                raise RuntimeContractError(
+                    f"captured catalog is missing server instructions for {catalog_key}",
+                    stage="catalog_capture",
+                )
             cached = (
                 self._checkpoint_store.smoke_outcome_for(cell_key)
                 if self._checkpoint_store is not None
                 else None
             )
             if cached is not None:
+                if not has_server_instructions_evidence(cached, server_instructions):
+                    raise RuntimeContractError(
+                        f"cached smoke gate cell {cell_key} does not prove sealed server instructions reached the model",
+                        stage="smoke_gate",
+                    )
+                registered_model = self.provider_registry["models"][model_spec.model_id]
+                route_observed, route_valid = validate_routing_evidence(
+                    cached.provider_evidence,
+                    model_spec,
+                    registered_model,
+                )
+                if (cached.routing_observed, cached.routing_valid) != (route_observed, route_valid) or not route_valid:
+                    raise RuntimeContractError(
+                        f"cached smoke gate cell {cell_key} does not match its registered provider route",
+                        stage="smoke_gate",
+                    )
                 return {
                     "cell": cell_key,
                     "status": "completed",
@@ -1070,9 +1629,7 @@ class BenchmarkRunner:
                     "outcome": safe_json(cached.model_dump(mode="json"), self.secrets),
                 }
 
-            task = self._smoke_task(transport)
             model = build_model(model_spec)
-            catalog_key = f"{transport}:{task.fixture.credential_profile}"
             if catalog_input_schemas is None:
                 input_schemas = None
             else:
@@ -1084,6 +1641,57 @@ class BenchmarkRunner:
                     )
             reservation = worst_case_cost(model_spec, self.manifest.budget)
             outcome: TrialOutcome | None = None
+
+            async def checkpoint_smoke(
+                settled_outcome: TrialOutcome,
+                status: Literal["completed", "failed", "incomplete"],
+            ) -> None:
+                if self._checkpoint_store is None:
+                    return
+                async with self._checkpoint_lock:
+                    self._refresh_store_secrets()
+                    write_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._checkpoint_store.record_smoke_cell,
+                            cell_key,
+                            settled_outcome,
+                            status=status,
+                            timing=self._timing_snapshot(),
+                            elapsed_wall_seconds=(
+                                self._ledger.current_wall_seconds()
+                                if self._ledger is not None
+                                else None
+                            ),
+                            reserved_cost_usd=(
+                                float(self._ledger.reserved_cost_usd)
+                                if self._ledger is not None
+                                else 0.0
+                            ),
+                        )
+                    )
+                    try:
+                        await asyncio.shield(write_task)
+                    except asyncio.CancelledError:
+                        await write_task
+                        raise
+
+            async def settle_smoke_charge(settled_outcome: TrialOutcome) -> None:
+                charge_task = asyncio.create_task(ledger.charge(settled_outcome, guard=request_guard))
+                try:
+                    await asyncio.shield(charge_task)
+                except asyncio.CancelledError:
+                    try:
+                        await charge_task
+                    except BudgetExceeded as exc:
+                        settled_outcome.error = f"benchmark incomplete: {exc}"
+                        settled_outcome.failure_kind = "budget"
+                    await checkpoint_smoke(settled_outcome, "failed")
+                    raise
+                except BudgetExceeded as exc:
+                    settled_outcome.error = f"benchmark incomplete: {exc}"
+                    settled_outcome.failure_kind = "budget"
+                await checkpoint_smoke(settled_outcome, "failed")
+
             try:
                 request_guard = await ledger.reserve_trial(reservation)
             except Exception as exc:
@@ -1124,26 +1732,24 @@ class BenchmarkRunner:
                 self._resolver = resolver
                 token = await self._refresh_token(cell_fixture, task.fixture.credential_profile)
                 self._refresh_secrets(resolver)
-                remaining_wall_seconds = ledger.remaining_wall_seconds()
-                request_timeout_seconds = min(
-                    float(self.manifest.budget.request_timeout_seconds),
-                    remaining_wall_seconds,
-                )
+                request_timeout_seconds = ledger.request_timeout_seconds()
                 if self._timing is None:
                     outcome = await execute_smoke(
                         task,
                         manifest=self.manifest,
                         arm=self.arm,
                         model_spec=model_spec,
+                        registered_model=self.provider_registry["models"][model_spec.model_id],
                         model=model,
                         transport=transport,
                         fixture=cell_fixture,
                         token=token,
                         secrets=self.secrets,
+                        secret_values=resolver.secret_values,
                         request_timeout_seconds=request_timeout_seconds,
-                        remaining_wall_seconds=remaining_wall_seconds,
                         request_guard=request_guard,
                         input_schemas=input_schemas,
+                        expected_server_instructions=server_instructions,
                         timing_sink=self._timing.record if self._timing is not None else None,
                     )
                 else:
@@ -1153,18 +1759,20 @@ class BenchmarkRunner:
                             manifest=self.manifest,
                             arm=self.arm,
                             model_spec=model_spec,
+                            registered_model=self.provider_registry["models"][model_spec.model_id],
                             model=model,
                             transport=transport,
                             fixture=cell_fixture,
                             token=token,
                             secrets=self.secrets,
+                            secret_values=resolver.secret_values,
                             request_timeout_seconds=request_timeout_seconds,
-                            remaining_wall_seconds=remaining_wall_seconds,
                             request_guard=request_guard,
                             input_schemas=input_schemas,
+                            expected_server_instructions=server_instructions,
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
-                await ledger.charge(outcome, guard=request_guard)
+                await settle_smoke_charge(outcome)
             except Exception as exc:
                 with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
                     f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
@@ -1189,26 +1797,49 @@ class BenchmarkRunner:
                 await request_guard.release()
 
             assert outcome is not None
-            identity_matches = (
+            registered_model = self.provider_registry["models"][model_spec.model_id]
+            route_observed, route_valid = validate_routing_evidence(
+                outcome.provider_evidence,
+                model_spec,
+                registered_model,
+            )
+            model_identity_matches = (
                 outcome.model_class == model_spec.class_name
                 and outcome.model_id == model_spec.model_id
                 and outcome.transport == transport
-                and all(
-                    item.get("model") == model_spec.model_id
-                    for item in outcome.provider_evidence
-                )
             )
-            valid = identity_matches and valid_smoke_outcome(outcome)
+            route_matches = (
+                (outcome.routing_observed, outcome.routing_valid) == (route_observed, route_valid)
+                and route_valid
+            )
+            provider_models_match = all(
+                item.get("model") == model_spec.model_id
+                for item in outcome.provider_evidence
+            )
+            smoke_failure = smoke_outcome_failure_reason(outcome, task, server_instructions)
+            valid = model_identity_matches and route_matches and provider_models_match and smoke_failure is None
             if not valid and outcome.error is None:
-                if not identity_matches:
+                if not model_identity_matches:
                     outcome.error = "smoke gate outcome did not match the requested model and transport"
                     outcome.failure_kind = "provider"
-                elif outcome.successful_mcp_tool_calls == 0:
-                    outcome.error = "smoke gate did not observe a successful MCP tool call"
-                    outcome.failure_kind = "tool"
+                elif not route_matches:
+                    outcome.error = "smoke gate provider route did not match the registered route"
+                    outcome.failure_kind = "provider"
+                elif not provider_models_match:
+                    outcome.error = "smoke gate provider receipt model did not match the requested model"
+                    outcome.failure_kind = "provider"
+                elif smoke_failure is not None:
+                    outcome.error = f"smoke gate {smoke_failure}"
+                    outcome.failure_kind = (
+                        "tool"
+                        if smoke_failure == "does not contain a successful MCP tool call"
+                        else "terminal_response"
+                        if smoke_failure == "does not contain a follow-up terminal response"
+                        else "provider"
+                    )
                 else:
-                    outcome.error = "smoke gate did not observe a follow-up terminal response"
-                    outcome.failure_kind = "terminal_response"
+                    outcome.error = "smoke gate outcome failed an unclassified model or evidence check"
+                    outcome.failure_kind = "provider"
             status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
                 "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
             )
@@ -1257,8 +1888,13 @@ class BenchmarkRunner:
                 "required_cells": required_cells,
                 "cells": [cells[key] for key in required_cells if key in cells],
             }
+            raw_outcome = item.get("outcome")
+            failure_detail = raw_outcome.get("error") if isinstance(raw_outcome, dict) else None
+            detail = failure_detail if isinstance(failure_detail, str) and failure_detail else (
+                "returned incomplete model, provider, instruction, or terminal-response evidence"
+            )
             raise RuntimeContractError(
-                f"smoke gate cell {cell_key} did not produce model usage and a terminal routed outcome",
+                f"smoke gate cell {cell_key} failed: {detail}",
                 stage="smoke_gate",
             )
 
@@ -1381,12 +2017,13 @@ class BenchmarkRunner:
                                 stage="provider_registry",
                             )
                         row = matches[0]
-                        canonical_slug = row.get("canonical_slug", row.get("id"))
-                        if canonical_slug != spec.model_id:
+                        try:
+                            _validate_openrouter_model_identity(spec, row)
+                        except ValueError as exc:
                             raise RuntimeContractError(
-                                f"provider model alias drifted for {spec.class_name}",
+                                str(exc),
                                 stage="provider_registry",
-                            )
+                            ) from exc
                         author, slug = spec.model_id.split("/", 1)
                         endpoints_response = await get_json(
                             f"{base_url}/models/{author}/{slug}/endpoints"
@@ -1398,24 +2035,46 @@ class BenchmarkRunner:
                                 f"provider endpoint registry is invalid for {spec.class_name}",
                                 stage="provider_registry",
                             )
-                        selected = [
-                            endpoint
-                            for endpoint in endpoints
-                            if isinstance(endpoint, dict)
-                            and str(endpoint.get("provider_name", "")).casefold() == "parasail"
-                            and endpoint.get("quantization") == "fp8"
-                        ]
-                        if len(selected) != 1:
+                        canonical_slug = _expected_openrouter_canonical_slug(spec)
+                        eligible, price_rejections = eligible_openrouter_endpoints(
+                            spec,
+                            canonical_slug,
+                            endpoints,
+                        )
+                        if not eligible:
+                            reason = price_rejections[0] if price_rejections else (
+                                "no registered fp8 endpoint satisfies the model, parameter, and routing constraints "
+                                f"for {spec.class_name}"
+                            )
                             raise RuntimeContractError(
-                                f"pinned Parasail fp8 endpoint is unavailable or ambiguous for {spec.class_name}",
+                                reason,
                                 stage="provider_registry",
                             )
-                        registry_models[spec.model_id] = {
+                        preferred = [
+                            endpoint
+                            for endpoint in eligible
+                            if str(endpoint.get("provider_name", "")).casefold()
+                            == spec.routing.order[0].casefold()
+                        ]
+                        if len(preferred) > 1:
+                            raise RuntimeContractError(
+                                f"preferred fp8 endpoint is ambiguous for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        selected_endpoint = preferred[0] if preferred else eligible[0]
+                        registered_model = {
                             "manifest_version": spec.version,
                             "model_record": row,
                             "endpoint_snapshot": endpoints_response,
-                            "selected_endpoint": selected[0],
+                            "selected_endpoint": selected_endpoint,
+                            "eligible_endpoints": eligible,
                         }
+                        if registered_route_target(spec, registered_model) is None:
+                            raise RuntimeContractError(
+                                f"provider registry endpoint identity drifted for {spec.class_name}",
+                                stage="provider_registry",
+                            )
+                        registry_models[spec.model_id] = registered_model
                         endpoint_snapshots[spec.model_id] = endpoints_response
                 payload = {
                     "status": "verified",
@@ -1448,7 +2107,7 @@ class BenchmarkRunner:
                 package_versions[package] = None
         lock_path = Path(__file__).parents[1] / "uv.lock"
         lock_hash = hashlib.sha256(lock_path.read_bytes()).hexdigest()
-        return {
+        seal = {
             "schema_version": 1,
             "arm": self.arm,
             "source_revision": runtime["source_revision"],
@@ -1478,19 +2137,28 @@ class BenchmarkRunner:
                 for repeat_index in range(1, self.manifest.repeats + 1)
                 for task in self.tasks
             ],
+            "paired_order_mode": self.manifest.paired_order,
+            "paired_order_seed": self.manifest.paired_order_seed,
             "provider_registry_hash": self.provider_registry.get("snapshot_hash"),
             "provider_registry_status": self.provider_registry.get("status"),
         }
+        if self.selection is not None:
+            seal["selection"] = self.selection.artifact_metadata()
+        return seal
 
     async def _bind_pre_smoke_seal(
         self,
         runtime: dict[str, Any],
         catalogs: dict[str, CatalogSnapshot],
     ) -> None:
-        self.pre_smoke_seal_inputs = self._local_pre_smoke_seal(runtime, catalogs)
-        local_hash = hash_json(self.pre_smoke_seal_inputs)
+        local_inputs = self._local_pre_smoke_seal(runtime, catalogs)
+        local_hash = hash_json(local_inputs)
+        self.pre_smoke_seal_inputs = local_inputs
         self.pre_smoke_seal_hash = (
-            await self.paired_coordinator.register_pre_smoke_seal(cast(ArmName, self.arm), local_hash)
+            await self.paired_coordinator.register_pre_smoke_seal(
+                cast(ArmName, self.arm),
+                local_hash,
+            )
             if self.paired_coordinator is not None
             else hash_json({self.arm: local_hash})
         )
@@ -1499,6 +2167,7 @@ class BenchmarkRunner:
                 await asyncio.to_thread(
                     self._checkpoint_store.bind_pre_smoke_seal,
                     self.pre_smoke_seal_hash,
+                    self.provider_registry,
                 )
         if self.paired_coordinator is not None:
             await self.paired_coordinator.mark_pre_smoke_ready(cast(ArmName, self.arm))
@@ -1519,12 +2188,27 @@ class BenchmarkRunner:
         incomplete_reasons: set[str],
         reports: dict[str, Any],
         catalog_input_schemas: Mapping[str, dict[str, dict[str, Any]]] | None = None,
+        catalog_server_instructions: Mapping[str, str] | None = None,
     ) -> None:
         model = build_model(model_spec)
+
+        async def checkpoint_settled_outcome(outcome: TrialOutcome) -> None:
+            identity = self._trial_identity(outcome)
+            checkpoint_key = planned_by_identity.get(identity)
+            if checkpoint_key is None:
+                raise RuntimeContractError("settled trial is not an exact planned checkpoint input")
+            await self._checkpoint_trial(
+                run_key,
+                checkpoint_key,
+                outcome,
+                status="failed",
+            )
+
         executor = TrialExecutor(
             self.manifest,
             arm=self.arm,
             model_spec=model_spec,
+            registered_model=self.provider_registry["models"][model_spec.model_id],
             model=model,
             transport=transport,
             fixture=fixture,
@@ -1539,6 +2223,15 @@ class BenchmarkRunner:
                 if catalog_input_schemas is not None
                 else None
             ),
+            server_instructions_by_profile=(
+                {
+                    profile: catalog_server_instructions[f"{transport}:{profile}"]
+                    for profile in profiles
+                }
+                if catalog_server_instructions is not None
+                else None
+            ),
+            outcome_sink=(checkpoint_settled_outcome if self._checkpoint_store is not None else None),
             timing_sink=self._timing.record if self._timing is not None else None,
         )
         report_fragments: list[dict[str, Any]] = []
@@ -1584,11 +2277,47 @@ class BenchmarkRunner:
                 else _uncoordinated_turn()
             )
             async with turn_context as paired_turn:
+                executor.set_repeat_index(repeat_index)
                 if paired_turn is not None:
                     executor.set_paired_turn(
                         order_position=paired_turn.order_position,
                         execution_sequence=paired_turn.execution_sequence,
                     )
+                    if self.selection is not None and self._checkpoint_store is not None:
+                        checkpoint_key = planned_by_identity.get(
+                            (
+                                model_spec.class_name,
+                                transport,
+                                paired_turn.task_id,
+                                paired_turn.repeat_index,
+                            )
+                        )
+                        if checkpoint_key is None:
+                            raise RuntimeContractError(
+                                "selection paired start is not an exact planned checkpoint input"
+                            )
+                        start_event = CheckpointPairedEvent(
+                            sequence=paired_turn.execution_sequence,
+                            cell=paired_turn.cell,
+                            task_id=paired_turn.task_id,
+                            repeat_index=paired_turn.repeat_index,
+                            arm=paired_turn.arm,
+                            order_position=paired_turn.order_position,
+                            attempt=paired_turn.attempt,
+                            retry_of_sequence=paired_turn.retry_of_sequence,
+                        )
+                        async with self._checkpoint_lock:
+                            write_task = asyncio.create_task(
+                                asyncio.to_thread(
+                                    self._checkpoint_store.record_paired_event,
+                                    start_event,
+                                )
+                            )
+                            try:
+                                await asyncio.shield(write_task)
+                            except asyncio.CancelledError:
+                                await write_task
+                                raise
                 local_failures: list[Exception] = []
                 try:
                     if self._timing is None:
@@ -1642,7 +2371,9 @@ class BenchmarkRunner:
                     (
                         outcome
                         for outcome in outcomes
-                        if outcome.failure_kind in {"request_timeout", "global_deadline", "interrupted"}
+                        if outcome.failure_kind in {"interrupted", "budget"}
+                        or outcome.unsafe_mutation
+                        or (outcome.provider_evidence and not outcome.routing_valid)
                     ),
                     None,
                 )
@@ -1721,7 +2452,7 @@ class BenchmarkRunner:
                     model_work_seconds=spent.model_work_seconds,
                     budget_failure=self._checkpoint_store.budget_failure_reason(),
                 )
-            else:
+            elif not self.paired_budget_restored:
                 await ledger.restore_additive(
                     model_requests=spent.model_requests,
                     provider_setup_requests=spent.provider_setup_requests,
@@ -1735,8 +2466,39 @@ class BenchmarkRunner:
             initial_timing = self._timing_snapshot()
             assert initial_timing is not None
             await asyncio.to_thread(self._checkpoint_store.update_timing, initial_timing)
+            frozen_registry = self._checkpoint_store.document.provider_registry_snapshot
+            frozen_models = frozen_registry.get("models") if isinstance(frozen_registry, dict) else None
+            if self.selection is not None and isinstance(frozen_models, dict):
+                tasks_by_id = {task.id: task for task in self.tasks}
+                models_by_id = {model.model_id: model for model in self.manifest.models}
+                for planned_key in planned_keys.values():
+                    digest = checkpoint_key_digest(planned_key)
+                    source_record = self._checkpoint_store.document.records.get(digest)
+                    if source_record is None or source_record.status != "failed":
+                        continue
+                    task = tasks_by_id[planned_key.task_id]
+                    model_spec = models_by_id[planned_key.model_id]
+                    registered_model = frozen_models.get(planned_key.model_id)
+                    if not isinstance(registered_model, dict):
+                        continue
+                    revalidation = _revalidate_selection_route_failure(
+                        source_record.outcome,
+                        task,
+                        model_spec,
+                        registered_model,
+                    )
+                    if revalidation is None:
+                        continue
+                    corrected, route_lineage = revalidation
+                    async with self._checkpoint_lock:
+                        await asyncio.to_thread(
+                            self._checkpoint_store.revalidate_selection_route_failure,
+                            planned_key,
+                            corrected,
+                            route_lineage=route_lineage,
+                        )
             for planned_key in planned_keys.values():
-                outcome = self._checkpoint_store.completed_outcome_for(planned_key)
+                outcome = self._checkpoint_store.reusable_outcome_for(planned_key)
                 if outcome is not None:
                     self._record_trial(f"{planned_key.model_class}:{planned_key.transport}", outcome)
                     self._checkpoint_reused_trials += 1
@@ -1747,16 +2509,25 @@ class BenchmarkRunner:
                 (f"{key.model_class}:{key.transport}", key.task_id, key.repeat_index): outcome
                 for key in planned_keys.values()
                 if self._checkpoint_store is not None
-                and (outcome := self._checkpoint_store.completed_outcome_for(key)) is not None
+                and (outcome := self._checkpoint_store.reusable_outcome_for(key)) is not None
             }
-            await self.paired_coordinator.register_arm(cast(ArmName, self.arm), reused)
+            history_events = (
+                self._checkpoint_store.selection_execution_history()
+                if self.selection is not None and self._checkpoint_store is not None
+                else None
+            )
+            await self.paired_coordinator.register_arm(
+                cast(ArmName, self.arm),
+                reused,
+                history_events=history_events,
+            )
             await self.paired_coordinator.wait_until_registered()
         planned_by_run = self._planned_trials_by_run(planned_keys)
         pending_by_run = {
             run_key: [
                 (task, repeat_index, key)
                 for task, repeat_index, key in trials
-                if self._checkpoint_store is None or self._checkpoint_store.completed_outcome_for(key) is None
+                if self._checkpoint_store is None or self._checkpoint_store.reusable_outcome_for(key) is None
             ]
             for run_key, trials in planned_by_run.items()
         }
@@ -1784,7 +2555,40 @@ class BenchmarkRunner:
                 await resolver.prepare(fixture, profiles)
             self._refresh_secrets(resolver)
             current_stage = "provider_registry"
-            await self._capture_provider_registry(ledger)
+            if self._checkpoint_store is not None and self.resume_path is not None:
+                frozen_registry = self._checkpoint_store.document.provider_registry_snapshot
+                if frozen_registry is None:
+                    raise RuntimeContractError(
+                        "resume checkpoint is missing its frozen provider registry snapshot",
+                        stage="provider_registry",
+                    )
+                if self._checkpoint_store.resumed_from_finalized:
+                    self.provider_registry = frozen_registry
+                else:
+                    current_registry = await self._capture_provider_registry(ledger)
+                    try:
+                        current_hash = _verify_provider_registry_revalidation(
+                            frozen_registry,
+                            current_registry,
+                            self.manifest,
+                        )
+                    except Exception:
+                        async with self._checkpoint_lock:
+                            await asyncio.to_thread(
+                                self._checkpoint_store.record_provider_registry_revalidation,
+                                current_registry,
+                                invariant_sha256=None,
+                            )
+                        raise
+                    async with self._checkpoint_lock:
+                        await asyncio.to_thread(
+                            self._checkpoint_store.record_provider_registry_revalidation,
+                            current_registry,
+                            invariant_sha256=current_hash,
+                        )
+                    self.provider_registry = frozen_registry
+            else:
+                await self._capture_provider_registry(ledger)
             for transport in self.manifest.transports:
                 for profile in profiles:
                     selected_tasks = [task for task in self.tasks if transport in task.fixture.transports and task.fixture.credential_profile == profile]
@@ -1825,17 +2629,29 @@ class BenchmarkRunner:
                     stage="provider_registry",
                 )
 
-            if any(pending_by_run.values()) or self._checkpoint_store is not None:
-                current_stage = "smoke_gate"
-                catalog_input_schemas = {
-                    key: input_schemas_from_catalog(snapshot)
-                    for key, snapshot in catalogs.items()
+            catalog_input_schemas = {
+                key: input_schemas_from_catalog(snapshot)
+                for key, snapshot in catalogs.items()
+            }
+            catalog_server_instructions = {
+                key: str(snapshot.server_discover["instructions"])
+                for key, snapshot in catalogs.items()
+            }
+
+            if self.selection is not None:
+                self._smoke_gate = {
+                    "status": "not_run",
+                    "required_cells": [],
+                    "cells": [],
                 }
+            elif self._should_run_smoke_gate(pending_by_run):
+                current_stage = "smoke_gate"
                 await self._run_smoke_gate(
                     fixtures=fixtures,
                     resolver=resolver,
                     ledger=ledger,
                     catalog_input_schemas=catalog_input_schemas,
+                    catalog_server_instructions=catalog_server_instructions,
                 )
             else:
                 self._smoke_gate = {
@@ -1868,6 +2684,7 @@ class BenchmarkRunner:
                                 incomplete_reasons=incomplete_reasons,
                                 reports=reports,
                                 catalog_input_schemas=catalog_input_schemas,
+                                catalog_server_instructions=catalog_server_instructions,
                             )
                         )
             else:
@@ -1886,6 +2703,7 @@ class BenchmarkRunner:
                         incomplete_reasons=incomplete_reasons,
                         reports=reports,
                         catalog_input_schemas=catalog_input_schemas,
+                        catalog_server_instructions=catalog_server_instructions,
                     )
         except asyncio.CancelledError:
             primary_error = RuntimeContractError(
@@ -2022,14 +2840,6 @@ def outcomes_from_report(
     return outcomes
 
 
-def planned_arm_order(task_id: str, repeat_index: int, seed: str) -> tuple[ArmName, ArmName]:
-    """Return a stable, preregistered counterbalanced arm order for one pair."""
-
-    digest = hashlib.sha256(f"{seed}:{task_id}".encode()).digest()
-    baseline_first = (digest[0] + repeat_index) % 2 == 0
-    return ("baseline", "candidate") if baseline_first else ("candidate", "baseline")
-
-
 def load_inputs(
     manifest_path: Path,
     corpus_path: Path,
@@ -2095,6 +2905,7 @@ _DERIVED_TRIAL_FIELDS = (
     "required_attempts_completed",
     "tool_outcome_match",
     "expected_error_match",
+    "completion_path_matched",
     "user_outcome_completed",
     "protocol_handshake_valid",
     "clarification_accuracy",
@@ -2141,19 +2952,34 @@ def _state_observations(
         error = raw["error"]
         if not isinstance(available, bool):
             raise ValueError(f"{label}-state availability is invalid")
-        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+        if status_code is not None and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
-        expected_status = (
-            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
-        )
-        if available and status_code != expected_status:
-            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if before and not expectation.check_before and raw == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
+        if available and (
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+        ):
+            raise ValueError(f"{label}-state HTTP status is missing or invalid")
         if available and error is not None:
             raise ValueError(f"{label}-state observation reports an error despite being available")
         if not available and not error:
             raise ValueError(f"{label}-state observation is unavailable without an error")
+        if before and not expectation.check_before and not available:
+            raise ValueError("unchecked before-state observations must be omitted explicitly")
         observations.append(
             StateObservation(
                 available=available,
@@ -2171,6 +2997,7 @@ def _validate_trial_evidence(
     *,
     arm: str,
     model_spec: Any,
+    registered_model: dict[str, Any],
     transport: str,
     public_operations: list[PublicOperation],
     input_schemas: dict[str, dict[str, Any]],
@@ -2187,13 +3014,17 @@ def _validate_trial_evidence(
         or outcome.transport != transport
     ):
         raise ValueError("trial identity differs from its registered task, model, transport, or arm")
-    if not has_measured_evidence(outcome):
+    if not has_measured_evidence(outcome, task):
         raise ValueError("trial is missing provider, state, or raw call evidence")
     if outcome.error is not None:
         raise ValueError("trial outcome contains an execution error")
     if not all(math.isfinite(value) for value in (outcome.cost_usd, outcome.latency_seconds)):
         raise ValueError("trial usage contains a non-finite cost or latency")
-    observed_routing, valid_routing = validate_routing_evidence(outcome.provider_evidence, model_spec)
+    observed_routing, valid_routing = validate_routing_evidence(
+        outcome.provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if (outcome.routing_observed, outcome.routing_valid) != (observed_routing, valid_routing) or not valid_routing:
         raise ValueError("trial routing flags do not match its provider responses")
     input_tokens, output_tokens = provider_token_totals(outcome.provider_evidence)
@@ -2211,15 +3042,27 @@ def _validate_trial_evidence(
 
     before = _state_observations(outcome, task, before=True)
     after = _state_observations(outcome, task, before=False)
-    expected_checkpoints = [checkpoint.after_attempt for checkpoint in task.expected_final_state.checkpoints]
+    capture_positions, captured_material_count = _captured_material_positions_by_stage(task, outcome.tool_calls)
+    expected_checkpoints = [
+        capture_positions.get(task.expected_material_attempts[checkpoint.after_attempt - 1].stage_id)
+        for checkpoint in task.expected_final_state.checkpoints
+    ]
     raw_checkpoints = outcome.state_checkpoint_observations
     recorded_checkpoints = [item.get("after_attempt") for item in raw_checkpoints if isinstance(item, dict)]
-    if recorded_checkpoints != expected_checkpoints or len(raw_checkpoints) != len(expected_checkpoints):
+    if (
+        any(position is None for position in expected_checkpoints)
+        or recorded_checkpoints != expected_checkpoints
+        or len(raw_checkpoints) != len(expected_checkpoints)
+    ):
         raise ValueError("state checkpoint observations do not cover the registered checkpoints")
     for item in raw_checkpoints:
         if (
             not isinstance(item, dict)
             or set(item) != {"after_attempt", "available", "status_code", "payload", "error"}
+            or not isinstance(item.get("after_attempt"), int)
+            or isinstance(item.get("after_attempt"), bool)
+            or item["after_attempt"] < 1
+            or item["after_attempt"] > captured_material_count
             or not isinstance(item.get("available"), bool)
             or (item.get("error") is not None and not isinstance(item.get("error"), str))
         ):
@@ -2229,6 +3072,14 @@ def _validate_trial_evidence(
         decoded, raw_valid = decode_raw_args(call.raw_model_args)
         if call.raw_args_valid != raw_valid:
             raise ValueError("raw tool argument validity flag does not match the recorded call")
+        schema = input_schemas.get(call.tool_name)
+        expected_schema_valid = (
+            public_arguments_match_schema(decoded, schema)
+            if schema is not None
+            else None
+        )
+        if call.public_schema_valid != expected_schema_valid:
+            raise ValueError("public tool argument schema flag does not match the captured schema")
         if call.server_args is None:
             if call.server_args_equal_raw or call.effective_server_args is not None:
                 raise ValueError("unobserved tool call claims server-side arguments")
@@ -2236,7 +3087,6 @@ def _validate_trial_evidence(
             equal = raw_valid and call.server_args == decoded
             if call.server_args_equal_raw != equal:
                 raise ValueError("raw and server tool arguments disagree with the recorded equality flag")
-            schema = input_schemas.get(call.tool_name)
             if schema is not None and call.effective_server_args != canonicalize_arguments(call.server_args, schema):
                 raise ValueError("effective tool arguments do not match the captured input schema")
         action = decoded.get("action") if isinstance(decoded, dict) else None
@@ -2285,6 +3135,70 @@ def _validate_trial_evidence(
             raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
 
 
+def _validate_provider_registry_identity(
+    registry: dict[str, Any],
+    manifest: BenchmarkRunManifest,
+    *,
+    arm: str,
+) -> None:
+    model_list_snapshot = registry.get("model_list_snapshot")
+    model_rows = model_list_snapshot.get("data") if isinstance(model_list_snapshot, dict) else None
+    if (
+        not isinstance(model_rows, list)
+        or registry.get("model_list_hash") != hash_json(model_list_snapshot)
+    ):
+        raise ValueError(f"{arm} provider model-list snapshot is missing or invalid")
+
+    registered_models = registry.get("models")
+    endpoint_snapshots = registry.get("endpoint_snapshots")
+    expected_aliases = {spec.model_id for spec in manifest.models}
+    if (
+        not isinstance(registered_models, dict)
+        or set(registered_models) != expected_aliases
+        or not isinstance(endpoint_snapshots, dict)
+        or set(endpoint_snapshots) != expected_aliases
+    ):
+        raise ValueError(f"{arm} provider registry does not cover the pinned model aliases")
+
+    for spec in manifest.models:
+        matches = [
+            row
+            for row in model_rows
+            if isinstance(row, dict) and row.get("id") == spec.model_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{arm} provider registry does not contain exactly one pinned alias for {spec.class_name}")
+        model_record = matches[0]
+        try:
+            _validate_openrouter_model_identity(spec, model_record)
+        except ValueError as exc:
+            raise ValueError(f"{arm} provider registry identity is invalid: {exc}") from exc
+
+        captured_model = registered_models[spec.model_id]
+        if (
+            not isinstance(captured_model, dict)
+            or captured_model.get("manifest_version") != spec.version
+            or captured_model.get("model_record") != model_record
+            or captured_model.get("endpoint_snapshot") != endpoint_snapshots.get(spec.model_id)
+        ):
+            raise ValueError(f"{arm} provider registry model evidence differs from the pinned alias and canonical identity")
+        selected_endpoint = captured_model.get("selected_endpoint")
+        eligible_endpoints = captured_model.get("eligible_endpoints")
+        if (
+            not isinstance(selected_endpoint, dict)
+            or not isinstance(eligible_endpoints, list)
+            or not eligible_endpoints
+        ):
+            raise ValueError(f"{arm} provider registry eligible endpoints are invalid")
+        try:
+            for endpoint in eligible_endpoints:
+                validate_openrouter_endpoint_price_ceiling(spec, endpoint)
+        except ValueError as exc:
+            raise ValueError(f"{arm} provider registry pricing is invalid: {exc}") from exc
+        if registered_route_target(spec, captured_model) is None:
+            raise ValueError(f"{arm} provider registry endpoint evidence differs from the pinned {spec.routing.order[0]} fp8 route")
+
+
 def _catalog_input_schemas(artifact: dict[str, Any], transport: str, profile: str) -> dict[str, dict[str, Any]]:
     key = f"{transport}:{profile}"
     raw = artifact.get("catalogs", {}).get(key)
@@ -2331,10 +3245,21 @@ def _validate_preregistered_inputs(
     inputs = artifact.get("pre_smoke_seal_inputs")
     if not isinstance(inputs, dict) or inputs.get("schema_version") != 1:
         raise ValueError(f"{arm} pre-smoke seal inputs are missing or invalid")
+    continuation_lineage = artifact.get("continuation_lineage")
+    sealed_manifest_hash = (
+        validate_artifact_lineage(artifact)
+        if continuation_lineage is not None
+        else artifact.get("run_manifest_hash")
+    )
+    selection = artifact.get("selection")
+    if selection is not None and inputs.get("selection") != selection:
+        raise ValueError(f"{arm} selection differs from its pre-smoke seal")
+    if selection is None and "selection" in inputs:
+        raise ValueError(f"{arm} pre-smoke seal contains an unbound selection")
     if (
         inputs.get("arm") != arm
         or inputs.get("source_revision") != artifact.get("source_revision")
-        or inputs.get("run_manifest_hash") != artifact.get("run_manifest_hash")
+        or inputs.get("run_manifest_hash") != sealed_manifest_hash
         or inputs.get("task_corpus_hash") != task_corpus_hash
         or inputs.get("oracle_hash") != oracle_hash
         or inputs.get("catalogs") != artifact.get("catalogs")
@@ -2347,15 +3272,18 @@ def _validate_preregistered_inputs(
         raise ValueError(f"{arm} provider registry snapshot is unavailable")
     registry_hash = registry.get("snapshot_hash")
     registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+    registry_models = registry.get("models")
     expected_models = {model.model_id for model in manifest.models}
     if (
         not isinstance(registry_hash, str)
         or hash_json(registry_payload) != registry_hash
-        or set(registry.get("models", {})) != expected_models
+        or not isinstance(registry_models, dict)
+        or set(registry_models) != expected_models
         or inputs.get("provider_registry_hash") != registry_hash
         or inputs.get("provider_registry_status") != registry.get("status")
     ):
         raise ValueError(f"{arm} provider registry seal does not match the captured registry")
+    _validate_provider_registry_identity(registry, manifest, arm=arm)
 
     fixture_inputs = inputs.get("fixture")
     fixture = artifact.get("fixture")
@@ -2419,10 +3347,40 @@ def _validate_shared_budget(
     budget = baseline.get("paired_budget_used")
     if not isinstance(budget, dict):
         raise ValueError("shared paired budget evidence is missing")
+    if candidate.get("paired_budget_used") != budget:
+        raise ValueError("paired artifacts do not share identical budget evidence")
+    expected_budget_fields = {
+        "model_requests",
+        "provider_setup_requests",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
+        "wall_seconds",
+        "model_work_seconds",
+        "max_total_cost_usd",
+        "final_reserved_cost_usd",
+    }
+    selection = baseline.get("selection")
+    if isinstance(selection, dict):
+        expected_budget_fields.add("new_execution_limit_usd")
+    if set(budget) != expected_budget_fields:
+        raise ValueError("shared paired budget evidence has unexpected fields")
+    if isinstance(selection, dict):
+        selection_budget = selection.get("budget")
+        if (
+            not isinstance(selection_budget, dict)
+            or budget.get("new_execution_limit_usd") != selection_budget.get("new_execution_limit_usd")
+        ):
+            raise ValueError("shared budget does not match the approved selection limit")
+    try:
+        final_reserved_cost = Decimal(str(budget["final_reserved_cost_usd"]))
+    except (InvalidOperation, TypeError):
+        raise ValueError("shared budget final reservation is invalid") from None
+    if not final_reserved_cost.is_finite() or final_reserved_cost != 0:
+        raise ValueError("shared budget retained an unsettled terminal reservation")
     exact_limits = {
-        "max_model_requests": manifest.budget.max_model_requests,
         "max_total_cost_usd": manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": manifest.budget.max_wall_seconds,
     }
     for key, expected in exact_limits.items():
         observed = budget.get(key)
@@ -2471,6 +3429,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
@@ -2505,6 +3464,7 @@ def _validate_shared_budget(
                 task,
                 arm=arm,
                 model_spec=model_spec,
+                registered_model=artifact["provider_registry"]["models"][model_spec.model_id],
                 transport=outcome.transport,
                 public_operations=manifest.public_operations,
                 input_schemas=schemas,
@@ -2532,7 +3492,6 @@ def _validate_shared_budget(
         or isinstance(wall, bool)
         or not math.isfinite(wall)
         or wall <= 0
-        or wall > manifest.budget.max_wall_seconds
         or not isinstance(work, (int, float))
         or isinstance(work, bool)
         or not math.isfinite(work)
@@ -2542,7 +3501,7 @@ def _validate_shared_budget(
         or setup_requests < 0
     ):
         raise ValueError("shared paired budget costs, time, or setup-request evidence is invalid")
-    if aggregate["model_requests"] > manifest.budget.max_model_requests or cost > manifest.budget.max_total_cost_usd:
+    if cost > manifest.budget.max_total_cost_usd:
         raise ValueError("shared paired usage exceeds a registered budget limit")
 
 
@@ -2610,13 +3569,530 @@ def _provider_distribution_sensitivity(
 
 
 def _empty_comparison(baseline: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
-    return {
-        "schema_version": 4,
+    result = {
+        "schema_version": 5,
         "baseline_source_revision": baseline.get("source_revision"),
         "candidate_source_revision": candidate.get("source_revision"),
         "verdict": "inconclusive",
         "gate": {"status": "inconclusive", "reasons": [reason]},
     }
+    if isinstance(baseline.get("selection"), dict) and isinstance(candidate.get("selection"), dict):
+        result["observed_selected_diagnostics"] = _selected_diagnostic_summary(baseline, candidate)
+    return result
+
+
+def _selected_diagnostic_summary(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Rescore selected calls from captured evidence without changing the inconclusive gate."""
+
+    plans: dict[str, set[tuple[str, str, str, int]]] = {}
+    for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
+        selection = artifact.get("selection")
+        raw_plan = selection.get("selected_trials") if isinstance(selection, dict) else None
+        identities: set[tuple[str, str, str, int]] = set()
+        for item in raw_plan if isinstance(raw_plan, list) else []:
+            if not isinstance(item, dict) or item.get("arm") != arm:
+                continue
+            model_class, transport, task_id, repeat_index = (
+                item.get("model_class"),
+                item.get("transport"),
+                item.get("task_id"),
+                item.get("repeat_index"),
+            )
+            if (
+                isinstance(model_class, str)
+                and isinstance(transport, str)
+                and isinstance(task_id, str)
+                and type(repeat_index) is int
+            ):
+                identities.add((model_class, transport, task_id, repeat_index))
+        plans[arm] = identities
+
+    totals: dict[str, dict[str, Any]] = {}
+    parsed_by_arm: dict[str, list[TrialOutcome]] = {}
+    count_fields = (
+        "observed_trials",
+        "evaluated_trials",
+        "excluded_invalid_condition_trials",
+        "successes",
+        "task_errors",
+        "any_task_error_trials",
+        "observed_model_error_trials",
+        "invalid_condition_error_trials",
+        "safe_trials",
+        "unsafe_mutation_trials",
+        "tool_attempts",
+        "model_requests",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    )
+    for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
+        runs = artifact.get("runs")
+        plan = plans[arm]
+        raw_contracts = artifact.get("task_contracts")
+        try:
+            tasks_by_id = {
+                task.id: task
+                for task in (
+                    TaskManifest.model_validate(item)
+                    for item in raw_contracts
+                )
+            } if isinstance(raw_contracts, list) else {}
+        except (TypeError, ValueError):
+            tasks_by_id = {}
+        raw_rows: list[dict[str, Any]] = []
+        model_summaries: dict[str, dict[str, Any]] = {}
+        excluded = 0
+        if isinstance(runs, dict):
+            for run in runs.values():
+                if not isinstance(run, dict):
+                    continue
+                trials = run.get("trials")
+                if not isinstance(trials, list):
+                    continue
+                for row in trials:
+                    if not isinstance(row, dict):
+                        excluded += 1
+                        continue
+                    identity = (
+                        row.get("model_class"),
+                        row.get("transport"),
+                        row.get("task_id"),
+                        row.get("repeat_index"),
+                    )
+                    if (
+                        isinstance(identity[0], str)
+                        and isinstance(identity[1], str)
+                        and isinstance(identity[2], str)
+                        and type(identity[3]) is int
+                        and identity in plan
+                    ):
+                        raw_rows.append(row)
+                        model_class = identity[0]
+                        model_summaries.setdefault(
+                            model_class,
+                            {
+                                "observed_trials": 0,
+                                "evaluated_trials": 0,
+                                "successes": 0,
+                                "any_task_error_trials": 0,
+                                "observed_model_error_trials": 0,
+                                "invalid_condition_error_trials": 0,
+                                "excluded_invalid_condition_trials": 0,
+                                "malformed_trials": 0,
+                                "invalid_condition_reasons": {},
+                            },
+                        )["observed_trials"] += 1
+                    else:
+                        excluded += 1
+
+        totals[arm] = {key: 0 for key in count_fields}
+        totals[arm]["observed_trials"] = len(raw_rows)
+        totals[arm]["malformed_outcomes"] = 0
+        totals[arm]["invalid_cost_rows"] = 0
+        totals[arm]["unselected_or_unidentified_rows"] = excluded
+        totals[arm]["invalid_condition_trials"] = []
+        totals[arm]["reassessment_errors"] = []
+        totals[arm]["rescored_trials"] = []
+        cost = Decimal("0")
+        parsed: list[TrialOutcome] = []
+        for row in raw_rows:
+            tool_calls = row.get("tool_calls")
+            totals[arm]["tool_attempts"] += len(tool_calls) if isinstance(tool_calls, list) else 0
+            for metric_name in ("model_requests", "input_tokens", "output_tokens", "total_tokens"):
+                value = row.get(metric_name, 0)
+                if type(value) is int and value >= 0:
+                    totals[arm][metric_name] += value
+            raw_cost = row.get("cost_usd", 0)
+            try:
+                row_cost = Decimal(str(raw_cost))
+                if not row_cost.is_finite() or row_cost < 0:
+                    raise InvalidOperation
+                cost += row_cost
+            except (InvalidOperation, TypeError, ValueError):
+                totals[arm]["invalid_cost_rows"] += 1
+            row_identity = {
+                "model_class": row.get("model_class"),
+                "transport": row.get("transport"),
+                "task_id": row.get("task_id"),
+                "repeat_index": row.get("repeat_index"),
+            }
+            record_sha256 = hash_json(row)
+            try:
+                task_id = row.get("task_id")
+                task = tasks_by_id.get(task_id) if isinstance(task_id, str) else None
+                if task is None:
+                    raise ValueError("captured task contract is missing")
+                outcome = TrialOutcome.model_validate(row)
+                schemas = _catalog_input_schemas(artifact, outcome.transport, task.fixture.credential_profile)
+                for call in outcome.tool_calls:
+                    decoded, _raw_valid = decode_raw_args(call.raw_model_args)
+                    schema = schemas.get(call.tool_name)
+                    call.public_schema_valid = (
+                        public_arguments_match_schema(decoded, schema)
+                        if schema is not None
+                        else None
+                    )
+                outcome.finalize(
+                    task,
+                    _state_observations(outcome, task, before=True),
+                    _state_observations(outcome, task, before=False),
+                )
+            except (TypeError, ValueError, KeyError) as exc:
+                totals[arm]["malformed_outcomes"] += 1
+                model_class = row.get("model_class")
+                if isinstance(model_class, str) and model_class in model_summaries:
+                    model_summaries[model_class]["malformed_trials"] += 1
+                totals[arm]["reassessment_errors"].append(
+                    {
+                        **row_identity,
+                        "record_sha256": record_sha256,
+                        "reason": f"reassessment failed: {type(exc).__name__}",
+                    }
+                )
+                continue
+            invalid_reason = _selected_invalid_condition_reason(task, outcome)
+            observed_error_kinds = list(outcome.trial_error_kinds)
+            condition_error_kinds = _selected_condition_error_kinds(task, outcome, invalid_reason)
+            model_error_kinds = _selected_model_error_kinds(task, outcome, invalid_reason)
+            model_error = bool(model_error_kinds)
+            totals[arm]["observed_model_error_trials"] += model_error
+            model_summary = model_summaries[outcome.model_class]
+            model_summary["observed_model_error_trials"] += model_error
+            rescored_trial = {
+                **row_identity,
+                "record_sha256": record_sha256,
+                "record_hash_scheme": "canonical_json_sha256",
+                "success": outcome.success,
+                "recorded_trial_error": row.get("trial_error"),
+                "recorded_trial_error_kinds": row.get("trial_error_kinds"),
+                "observed_trial_error": outcome.trial_error,
+                "observed_trial_error_kinds": observed_error_kinds,
+                "trial_error": model_error,
+                "any_task_error": model_error,
+                "trial_error_kinds": model_error_kinds,
+                "condition_error_kinds": condition_error_kinds,
+                "evaluated": invalid_reason is None,
+                "invalid_condition_reason": invalid_reason,
+                "state_contract_passed": outcome.state_contract_passed,
+                "response_rubric_passed": outcome.response_rubric_passed,
+                "completion_path_matched": outcome.completion_path_matched,
+                "user_outcome_completed": outcome.user_outcome_completed,
+                "first_material_action_accuracy": outcome.first_material_action_accuracy,
+                "tool_outcome_match": outcome.tool_outcome_match,
+                "argument_validity": outcome.argument_validity,
+                "protocol_handshake_valid": outcome.protocol_handshake_valid,
+                "multi_step_ordering": outcome.multi_step_ordering,
+                "result_binding_accuracy": outcome.result_binding_accuracy,
+                "wrong_target_calls": outcome.wrong_target_calls,
+                "post_completion_overshoot": outcome.post_completion_overshoot,
+                "recorded_model_requests": row.get("model_requests", 0),
+                "recorded_input_tokens": row.get("input_tokens", 0),
+                "recorded_output_tokens": row.get("output_tokens", 0),
+                "recorded_total_tokens": row.get("total_tokens", 0),
+                "recorded_cost_usd": row.get("cost_usd", 0),
+            }
+            totals[arm]["rescored_trials"].append(rescored_trial)
+            if invalid_reason is not None:
+                totals[arm]["excluded_invalid_condition_trials"] += 1
+                model_summary["excluded_invalid_condition_trials"] += 1
+                totals[arm]["invalid_condition_error_trials"] += model_error
+                model_summary["invalid_condition_error_trials"] += model_error
+                reasons = model_summary["invalid_condition_reasons"]
+                reasons[invalid_reason] = reasons.get(invalid_reason, 0) + 1
+                totals[arm]["invalid_condition_trials"].append(
+                    {
+                        **row_identity,
+                        "record_sha256": record_sha256,
+                        "reason": invalid_reason,
+                        "rescored_success": outcome.success,
+                        "recorded_trial_error": row.get("trial_error"),
+                        "observed_trial_error": outcome.trial_error,
+                        "observed_trial_error_kinds": observed_error_kinds,
+                        "rescored_trial_error": model_error,
+                        "trial_error_kinds": model_error_kinds,
+                        "condition_error_kinds": condition_error_kinds,
+                    }
+                )
+                continue
+            totals[arm]["evaluated_trials"] += 1
+            totals[arm]["successes"] += outcome.success
+            totals[arm]["task_errors"] += model_error
+            totals[arm]["any_task_error_trials"] += model_error
+            totals[arm]["safe_trials"] += outcome.safety
+            totals[arm]["unsafe_mutation_trials"] += outcome.unsafe_mutation
+            model_summary["evaluated_trials"] += 1
+            model_summary["successes"] += outcome.success
+            model_summary["any_task_error_trials"] += model_error
+            parsed.append(outcome)
+        totals[arm]["cost_usd"] = str(cost)
+        totals[arm]["parsed_outcomes"] = len(parsed)
+        totals[arm]["efficiency_metrics"] = summarize_outcomes(parsed)
+        totals[arm]["model_summaries"] = {
+            model_class: {
+                **summary,
+                "invalid_condition_reasons": dict(sorted(summary["invalid_condition_reasons"].items())),
+            }
+            for model_class, summary in sorted(model_summaries.items())
+        }
+        parsed_by_arm[arm] = parsed
+
+    combined: dict[str, Any] = {
+        key: sum(int(totals[arm][key]) for arm in ("baseline", "candidate")) for key in count_fields
+    }
+    combined.update(
+        {
+            "malformed_outcomes": sum(int(totals[arm]["malformed_outcomes"]) for arm in ("baseline", "candidate")),
+            "invalid_cost_rows": sum(int(totals[arm]["invalid_cost_rows"]) for arm in ("baseline", "candidate")),
+            "unselected_or_unidentified_rows": sum(
+                int(totals[arm]["unselected_or_unidentified_rows"]) for arm in ("baseline", "candidate")
+            ),
+            "cost_usd": str(sum((Decimal(totals[arm]["cost_usd"]) for arm in ("baseline", "candidate")), start=Decimal("0"))),
+            "parsed_outcomes": sum(int(totals[arm]["parsed_outcomes"]) for arm in ("baseline", "candidate")),
+            "invalid_condition_trials": [
+                item
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["invalid_condition_trials"]
+            ],
+            "reassessment_errors": [
+                item
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["reassessment_errors"]
+            ],
+            "rescored_trials": [
+                {"arm": arm, **item}
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["rescored_trials"]
+            ],
+            "efficiency_metrics": summarize_outcomes(parsed_by_arm["baseline"] + parsed_by_arm["candidate"]),
+        }
+    )
+    combined_models: dict[str, dict[str, Any]] = {}
+    for arm in ("baseline", "candidate"):
+        for model_class, summary in totals[arm]["model_summaries"].items():
+            combined_summary = combined_models.setdefault(
+                model_class,
+                {
+                    "observed_trials": 0,
+                    "evaluated_trials": 0,
+                    "successes": 0,
+                    "any_task_error_trials": 0,
+                    "observed_model_error_trials": 0,
+                    "invalid_condition_error_trials": 0,
+                    "excluded_invalid_condition_trials": 0,
+                    "malformed_trials": 0,
+                    "invalid_condition_reasons": {},
+                    "arms": {},
+                },
+            )
+            for key in (
+                "observed_trials",
+                "evaluated_trials",
+                "successes",
+                "any_task_error_trials",
+                "observed_model_error_trials",
+                "invalid_condition_error_trials",
+                "excluded_invalid_condition_trials",
+                "malformed_trials",
+            ):
+                combined_summary[key] += summary[key]
+            for reason, count in summary["invalid_condition_reasons"].items():
+                combined_summary["invalid_condition_reasons"][reason] = (
+                    combined_summary["invalid_condition_reasons"].get(reason, 0) + count
+                )
+            combined_summary["arms"][arm] = summary
+    for summary in combined_models.values():
+        summary["invalid_condition_reasons"] = dict(sorted(summary["invalid_condition_reasons"].items()))
+
+    source_provenance: dict[str, Any] = {}
+    for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
+        selection = artifact.get("selection")
+        source_provenance[arm] = {
+            "source_revision": artifact.get("source_revision"),
+            "artifact_versions": artifact.get("artifact_versions"),
+            "execution_environment": artifact.get("execution_environment"),
+            "protocol_revision": artifact.get("protocol_revision"),
+            "run_manifest_hash": artifact.get("run_manifest_hash"),
+            "artifact_semantic_sha256": artifact.get("artifact_hash"),
+            "selection": {
+                "authorization": selection.get("authorization"),
+                "selection_sha256": selection.get("selection_sha256"),
+            }
+            if isinstance(selection, dict)
+            else None,
+        }
+    return {
+        "classification": "diagnostic_only",
+        "adoption_eligible": False,
+        "rescored_from_recorded_evidence": True,
+        "provenance": {
+            "hash_scheme": "canonical_json_sha256",
+            "sources": source_provenance,
+            "verifier": {
+                "package": "akb-mcp-catalog-benchmark",
+                "version": _catalog_benchmark_version(),
+            },
+        },
+        "model_summaries": {
+            "baseline": totals["baseline"]["model_summaries"],
+            "candidate": totals["candidate"]["model_summaries"],
+            "combined": combined_models,
+        },
+        "arms": totals,
+        "combined": combined,
+    }
+
+
+def _catalog_benchmark_version() -> str:
+    try:
+        return importlib.metadata.version("akb-mcp-catalog-benchmark")
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+            with project_file.open("rb") as stream:
+                return str(tomllib.load(stream)["project"]["version"])
+        except (KeyError, OSError, tomllib.TOMLDecodeError):
+            return "unknown"
+
+
+def _selected_invalid_condition_reason(task: TaskManifest, outcome: TrialOutcome) -> str | None:
+    if task.id.startswith("history-provenance-"):
+        revision_bodies: list[str] = []
+        for attempt in task.expected_material_attempts:
+            content = attempt.arguments.get("content")
+            if attempt.logical_operation in {"create", "update"} and isinstance(content, str):
+                revision_bodies.append(content)
+        if len(revision_bodies) >= 2 and not all(body in task.prompt for body in revision_bodies):
+            return "task prompt omitted the exact preregistered revision bodies"
+
+    if (owner_transfer := _selected_fixture_owner_transfer(task, outcome)) is not None:
+        attempt, _transfer = owner_transfer
+        owner = attempt.arguments["new_owner"]
+        return f"fixture user {owner!r} was absent during the ownership transfer"
+    return None
+
+
+def _selected_fixture_owner_transfer(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+) -> tuple[ExpectedMaterialAttempt, ToolCallRecord] | None:
+    if not task.id.startswith("access-ownership-public-"):
+        return None
+    attempts = [
+        attempt
+        for attempt in task.expected_material_attempts
+        if attempt.logical_operation == "update"
+        and attempt.resource_type == "access"
+        and attempt.outcome == "success"
+        and isinstance(attempt.arguments.get("new_owner"), str)
+    ]
+    if len(attempts) != 1:
+        return None
+    attempt = attempts[0]
+    owner = attempt.arguments["new_owner"]
+    transfers = []
+    for call in outcome.tool_calls:
+        arguments = call.effective_server_args or call.server_args
+        if arguments is not None:
+            arguments = {key: value for key, value in arguments.items() if key != "_vault_skill_ack"}
+        if (
+            call.tool_exists
+            and call.stage_id == attempt.stage_id
+            and call.logical_operation == attempt.logical_operation
+            and call.resource_type == attempt.resource_type
+            and (attempt.tool_name is None or call.tool_name == attempt.tool_name)
+            and arguments == attempt.arguments
+            and not call.server_succeeded
+            and call.server_error_code == "not_found"
+        ):
+            transfers.append(call)
+    if len(transfers) != 1:
+        return None
+    for search in outcome.tool_calls:
+        search_arguments = search.effective_server_args or search.server_args
+        if (
+            search.tool_name != "akb_identity"
+            or not search.tool_exists
+            or search.logical_operation != "list"
+            or search.resource_type != "access"
+            or search.operation_kind != "preparatory"
+            or not search.server_succeeded
+            or search.server_error_code is not None
+            or search_arguments != {"action": "search_users", "query": owner}
+            or not isinstance(search.result_preview, str)
+        ):
+            continue
+        try:
+            result = json.loads(search.result_preview)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict) and result.get("users") == []:
+            return attempt, transfers[0]
+    return None
+
+
+def _selected_condition_error_kinds(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+    invalid_reason: str | None,
+) -> list[str]:
+    if invalid_reason is None:
+        return []
+    owner_transfer = _selected_fixture_owner_transfer(task, outcome)
+    if owner_transfer is None:
+        return []
+    attempt, transfer = owner_transfer
+    owner = attempt.arguments["new_owner"]
+    if invalid_reason != f"fixture user {owner!r} was absent during the ownership transfer":
+        return []
+    attributed: set[str] = set()
+
+    schema_error_codes = {"invalid_argument", "validation_error", "invalid_params", "schema_error"}
+    has_other_unexpected_error = any(
+        call is not transfer
+        and not call.server_succeeded
+        and call.server_error_code is not None
+        and call.server_error_code != "vault_skill_required"
+        and call.server_error_code not in schema_error_codes
+        and call.server_status_code not in {400, 422}
+        and not (
+            call.operation_kind == "preparatory"
+            and call.server_error_code == "not_found"
+            and call.logical_operation in {"read", "list", "search"}
+        )
+        for call in outcome.tool_calls
+    )
+    if "unexpected_tool_error" in outcome.trial_error_kinds and not has_other_unexpected_error:
+        attributed.add("unexpected_tool_error")
+
+    stage_calls, _stages_valid = _resolved_material_stage_calls(task, outcome.tool_calls)
+    mismatches = _sequence_target_mismatches(stage_calls, task, outcome.tool_calls)
+    mismatches.update(
+        index
+        for index, call in enumerate(stage_calls, start=1)
+        if not _expected_call_target_matches(call, task, outcome.tool_calls)
+    )
+    mismatch_sources = [call for index, call in enumerate(stage_calls, start=1) if index in mismatches]
+    if (
+        "wrong_target_payload" in outcome.trial_error_kinds
+        and outcome.wrong_target_calls == len(mismatches) == 1
+        and len(mismatch_sources) == 1
+        and mismatch_sources[0] is transfer
+    ):
+        attributed.add("wrong_target_payload")
+    return sorted(attributed)
+
+
+def _selected_model_error_kinds(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+    invalid_reason: str | None,
+) -> list[str]:
+    condition_errors = set(_selected_condition_error_kinds(task, outcome, invalid_reason))
+    return [kind for kind in outcome.trial_error_kinds if kind not in condition_errors]
 
 
 def _finite_interval_bound(interval: dict[str, Any], side: str) -> float:
@@ -2713,6 +4189,11 @@ def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | N
     manifest = artifact.get("manifest")
     if not isinstance(hash_input, dict) or not isinstance(artifact_hash, str) or not isinstance(manifest, dict):
         return f"{arm} artifact is missing its integrity envelope"
+    try:
+        validate_model_input_evidence(artifact.get("runs", {}))
+        validate_model_input_evidence(artifact.get("smoke_gate", {}))
+    except ValueError:
+        return f"{arm} model input evidence integrity digest does not match"
     trial_order = hash_input.get("trial_order")
     if not isinstance(trial_order, list):
         return f"{arm} artifact trial plan is missing"
@@ -2729,6 +4210,55 @@ def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | N
     return None
 
 
+def _instruction_text_for_outcome(
+    artifact: dict[str, Any],
+    outcome: TrialOutcome,
+    tasks_by_id: Mapping[str, TaskManifest],
+) -> str | None:
+    task = tasks_by_id.get(outcome.task_id)
+    catalogs = artifact.get("catalogs")
+    if task is None or not isinstance(catalogs, dict):
+        return None
+    snapshot = catalogs.get(f"{outcome.transport}:{task.fixture.credential_profile}")
+    discovery = snapshot.get("server_discover") if isinstance(snapshot, dict) else None
+    instructions = discovery.get("instructions") if isinstance(discovery, dict) else None
+    return instructions if isinstance(instructions, str) else None
+
+
+def _artifact_has_instruction_input_proof(
+    artifact: dict[str, Any],
+    tasks: list[TaskManifest],
+) -> bool:
+    tasks_by_id = {task.id: task for task in tasks}
+    outcomes = _all_run_outcomes(artifact.get("runs", {}))
+    if not outcomes or any(
+        not has_server_instructions_evidence(
+            outcome,
+            _instruction_text_for_outcome(artifact, outcome, tasks_by_id),
+        )
+        for outcome in outcomes
+    ):
+        return False
+    smoke_gate = artifact.get("smoke_gate")
+    cells = smoke_gate.get("cells") if isinstance(smoke_gate, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return False
+    for cell in cells:
+        raw_outcome = cell.get("outcome") if isinstance(cell, dict) else None
+        if not isinstance(raw_outcome, dict):
+            return False
+        try:
+            outcome = TrialOutcome.model_validate(raw_outcome)
+        except ValueError:
+            return False
+        if not has_server_instructions_evidence(
+            outcome,
+            _instruction_text_for_outcome(artifact, outcome, tasks_by_id),
+        ):
+            return False
+    return True
+
+
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """Compare a sealed paired run using only the preregistered BCa gates."""
 
@@ -2736,6 +4266,12 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         integrity_error = _artifact_integrity_error(artifact, arm)
         if integrity_error is not None:
             return _empty_comparison(baseline, candidate, integrity_error)
+    if "selection" in baseline or "selection" in candidate:
+        return _empty_comparison(
+            baseline,
+            candidate,
+            "selected trial evidence cannot support the full benchmark adoption verdict",
+        )
     manifest = baseline["manifest"]
     try:
         validated_manifest = BenchmarkRunManifest.model_validate(manifest)
@@ -2836,6 +4372,14 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         return _empty_comparison(baseline, candidate, f"trial evidence is invalid: {exc}")
     if set(baseline_map) != set(candidate_map):
         return _empty_comparison(baseline, candidate, "paired trial identities differ")
+    if not _artifact_has_instruction_input_proof(baseline, tasks) or not _artifact_has_instruction_input_proof(
+        candidate, tasks
+    ):
+        return _empty_comparison(
+            baseline,
+            candidate,
+            "model-input evidence does not prove the sealed server instructions reached every request",
+        )
     task_pairs = {
         item["id"]: item["pair_id"]
         for item in baseline.get("task_locales", [])
@@ -3031,7 +4575,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     all_base_cost = sum(item.cost_usd for item in baseline_outcomes)
     all_candidate_cost = sum(item.cost_usd for item in candidate_outcomes)
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "baseline_source_revision": baseline["source_revision"],
         "candidate_source_revision": candidate["source_revision"],
         "protocol_revision": baseline["protocol_revision"],
@@ -3098,7 +4642,28 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         }
     if not isinstance(smoke_gate, dict):
         raise ValueError("artifact smoke gate is invalid")
-    return {
+    checkpoint = artifact.get("checkpoint")
+    checkpoint_receipt = (
+        {
+            key: checkpoint.get(key)
+            for key in (
+                "enabled",
+                "lifecycle",
+                "record_count",
+                "valid_completed_trials",
+                "reserved_cost_usd",
+                "smoke_status",
+                "smoke_cell_count",
+            )
+        }
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if isinstance(checkpoint_receipt, dict) and isinstance(checkpoint, dict):
+        for field in ("attempt_history", "selection_route_revalidations"):
+            if field in checkpoint:
+                checkpoint_receipt[field] = checkpoint[field]
+    hash_input = {
         "schema_version": artifact["schema_version"],
         "status": artifact.get("status", "complete"),
         "arm": artifact["arm"],
@@ -3110,6 +4675,7 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "paired_order_plan": artifact.get("paired_order_plan", []),
         "paired_execution": artifact.get("paired_execution"),
         "paired_budget_used": artifact.get("paired_budget_used"),
+        "checkpoint_receipt": checkpoint_receipt,
         "provider_registry": artifact.get("provider_registry"),
         "pre_smoke_seal_inputs": artifact.get("pre_smoke_seal_inputs"),
         "pre_smoke_seal_hash": artifact.get("pre_smoke_seal_hash"),
@@ -3133,6 +4699,1704 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
         "locale_metrics": artifact["locale_metrics"],
         "smoke_gate_status": smoke_gate.get("status"),
     }
+    if "continuation_lineage" in artifact:
+        hash_input["continuation_lineage"] = artifact["continuation_lineage"]
+    if "continuation_runtime_provenance" in artifact:
+        hash_input["continuation_runtime_provenance"] = artifact["continuation_runtime_provenance"]
+    if "selection" in artifact:
+        hash_input["selection"] = artifact["selection"]
+    if "routing_verification" in artifact:
+        hash_input["routing_verification"] = artifact["routing_verification"]
+    if "resume_source" in artifact:
+        hash_input["resume_source"] = artifact["resume_source"]
+    return hash_input
+
+
+def _load_resume_sources(
+    *,
+    artifact_paths: Mapping[ArmName, Path],
+    checkpoint_paths: Mapping[ArmName, Path],
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    trial_order: Mapping[ArmName, list[dict[str, Any]]],
+) -> tuple[
+    dict[ArmName, dict[str, Any]],
+    dict[ArmName, CheckpointDocument],
+    dict[ArmName, dict[str, Any]],
+]:
+    """Validate the common artifact and checkpoint identity before resume-specific checks."""
+
+    manifest_data = manifest.model_dump(mode="json")
+    manifest_digest = hash_json(manifest_data)
+    task_data = [task.model_dump(mode="json") for task in tasks]
+    corpus_digest = hash_json(task_data)
+    expected_order_plan = [
+        {
+            "task_id": task.id,
+            "repeat_index": repeat_index,
+            "arm_order": list(planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)),
+        }
+        for repeat_index in range(1, manifest.repeats + 1)
+        for task in tasks
+    ]
+    source_artifacts: dict[ArmName, dict[str, Any]] = {}
+    source_checkpoints: dict[ArmName, CheckpointDocument] = {}
+    source_hashes: dict[ArmName, dict[str, Any]] = {}
+
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        try:
+            artifact_bytes = artifact_paths[arm].read_bytes()
+            checkpoint_bytes = checkpoint_paths[arm].read_bytes()
+            artifact = json.loads(artifact_bytes)
+            checkpoint_raw = json.loads(checkpoint_bytes)
+        except OSError as exc:
+            raise ValueError(f"cannot read {arm} resume source: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{arm} resume source is invalid JSON") from exc
+        if not isinstance(artifact, dict) or not isinstance(checkpoint_raw, dict):
+            raise ValueError(f"{arm} resume source must be JSON objects")
+        try:
+            checkpoint = CheckpointDocument.model_validate(checkpoint_raw)
+        except Exception as exc:
+            raise ValueError(f"{arm} resume checkpoint contract validation failed: {exc}") from exc
+
+        if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
+            raise ValueError(f"{arm} resume artifact identity is invalid")
+        if artifact.get("run_manifest_hash") != manifest_digest or artifact.get("manifest") != manifest_data:
+            raise ValueError(f"{arm} resume artifact does not match the current run manifest")
+        if artifact.get("task_corpus_hash") != corpus_digest or artifact.get("task_contracts") != task_data:
+            raise ValueError(f"{arm} resume artifact does not match the current task corpus")
+        if artifact.get("task_ids") != [task.id for task in tasks]:
+            raise ValueError(f"{arm} resume artifact task order changed")
+        if artifact.get("source_revision") != manifest.arm_source_revisions[arm]:
+            raise ValueError(f"{arm} resume artifact source revision changed")
+        if artifact.get("paired_order_plan") != expected_order_plan:
+            raise ValueError(f"{arm} resume artifact paired order changed")
+        hash_input = artifact.get("artifact_hash_input")
+        if not isinstance(hash_input, dict) or hash_input.get("trial_order") != trial_order[arm]:
+            raise ValueError(f"{arm} resume artifact trial order changed")
+        try:
+            recalculated_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order[arm])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{arm} resume artifact hash input is invalid") from exc
+        if recalculated_hash_input != hash_input or artifact.get("artifact_hash") != hash_json(hash_input):
+            raise ValueError(f"{arm} resume artifact hash does not match its contents")
+
+        header = checkpoint.header
+        provider_registry = artifact.get("provider_registry")
+        if not isinstance(provider_registry, dict):
+            raise ValueError(f"{arm} resume artifact provider registry is invalid")
+        if (
+            checkpoint.lifecycle != "finalized"
+            or checkpoint.reserved_cost_usd != 0
+            or checkpoint.continuation is not None
+            or header.arm != arm
+            or header.source_revision != manifest.arm_source_revisions[arm]
+            or header.run_manifest_hash != manifest_digest
+            or header.task_corpus_hash != corpus_digest
+            or header.pre_smoke_seal_hash != artifact.get("pre_smoke_seal_hash")
+            or header.provider_registry_hash != provider_registry.get("snapshot_hash")
+            or checkpoint.spent_hash != spent_hash(checkpoint.spent)
+            or checkpoint.timing_hash != timing_hash(checkpoint.timing)
+        ):
+            raise ValueError(f"{arm} resume checkpoint header or accounting digest changed")
+        if checkpoint.provider_registry_snapshot is None or (
+            provider_registry_snapshot_hash(checkpoint.provider_registry_snapshot) != header.provider_registry_hash
+        ):
+            raise ValueError(f"{arm} resume checkpoint provider registry seal is invalid")
+
+        receipt = artifact.get("checkpoint")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"{arm} resume artifact is missing its checkpoint receipt")
+        for name, value in (
+            ("lifecycle", checkpoint.lifecycle),
+            ("record_count", len(checkpoint.records)),
+            ("reserved_cost_usd", checkpoint.reserved_cost_usd),
+            ("smoke_status", checkpoint.smoke_status),
+            ("smoke_cell_count", len(checkpoint.smoke_gate)),
+            ("provider_registry_hash", header.provider_registry_hash),
+            ("spent", checkpoint.spent.model_dump(mode="json")),
+            ("spent_hash", checkpoint.spent_hash),
+            ("timing", checkpoint.timing.model_dump(mode="json")),
+            ("timing_hash", checkpoint.timing_hash),
+        ):
+            if receipt.get(name) != value:
+                raise ValueError(f"{arm} resume checkpoint receipt does not match {name}")
+
+        source_artifacts[arm] = artifact
+        source_checkpoints[arm] = checkpoint
+        source_hashes[arm] = {
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "artifact_hash": artifact.get("artifact_hash"),
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "checkpoint_spent_hash": checkpoint.spent_hash,
+            "source_revision": artifact.get("source_revision"),
+            "protocol_revision": artifact.get("protocol_revision"),
+            "parent_evaluator_commit": (
+                artifact.get("evaluator_commit") if isinstance(artifact.get("evaluator_commit"), str) else None
+            ),
+            "parent_evaluator_commit_recorded": isinstance(artifact.get("evaluator_commit"), str),
+        }
+
+    return source_artifacts, source_checkpoints, source_hashes
+
+
+def load_paired_resume_source(
+    *,
+    artifact_paths: Mapping[ArmName, Path],
+    checkpoint_paths: Mapping[ArmName, Path],
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+) -> dict[str, Any]:
+    """Read and validate the paired artifacts/checkpoints before a resume can write."""
+
+    manifest_data = manifest.model_dump(mode="json")
+    manifest_digest = hash_json(manifest_data)
+    task_data = [task.model_dump(mode="json") for task in tasks]
+    corpus_digest = hash_json(task_data)
+    expected_keys: dict[ArmName, dict[tuple[str, str, int, str], CheckpointKey]] = {
+        "baseline": {},
+        "candidate": {},
+    }
+    trial_order: dict[ArmName, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    expected_schedule: dict[str, list[tuple[str, int, ArmName]]] = {}
+    for model in manifest.models:
+        for transport in manifest.transports:
+            cell = f"{model.class_name}:{transport}"
+            schedule: list[tuple[str, int, ArmName]] = []
+            for repeat_index in range(1, manifest.repeats + 1):
+                for task in tasks:
+                    if transport not in task.fixture.transports:
+                        continue
+                    for arm in planned_arm_order(task.id, repeat_index, manifest.paired_order_seed):
+                        schedule.append((task.id, repeat_index, arm))
+                        source_revision = manifest.arm_source_revisions[arm]
+                        key = CheckpointKey(
+                            source_revision=source_revision,
+                            run_manifest_hash=manifest_digest,
+                            task_corpus_hash=corpus_digest,
+                            arm=arm,
+                            model_class=model.class_name,
+                            model_id=model.model_id,
+                            transport=transport,
+                            task_id=task.id,
+                            repeat_index=repeat_index,
+                            locale=task.locale,
+                        )
+                        identity = (cell, task.id, repeat_index, arm)
+                        expected_keys[arm][identity] = key
+            expected_schedule[cell] = schedule
+    for model in manifest.models:
+        for transport in manifest.transports:
+            cell = f"{model.class_name}:{transport}"
+            for task in tasks:
+                if transport not in task.fixture.transports:
+                    continue
+                for repeat_index in range(1, manifest.repeats + 1):
+                    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+                        trial_order[arm].append(
+                            expected_keys[arm][(cell, task.id, repeat_index, arm)].model_dump(mode="json")
+                        )
+
+    source_artifacts, source_checkpoints, source_hashes = _load_resume_sources(
+        artifact_paths=artifact_paths,
+        checkpoint_paths=checkpoint_paths,
+        manifest=manifest,
+        tasks=tasks,
+        trial_order=trial_order,
+    )
+    outcome_costs: dict[ArmName, Decimal] = {"baseline": Decimal("0"), "candidate": Decimal("0")}
+    execution: dict[str, Any] | None = None
+    shared_budget: dict[str, Any] | None = None
+
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        artifact = source_artifacts[arm]
+        checkpoint = source_checkpoints[arm]
+        if checkpoint.smoke_status != "passed" or checkpoint.selection_preflight is not None:
+            raise ValueError(f"{arm} paired resume checkpoint is not a finalized full-run source")
+        if len(checkpoint.smoke_gate) != 4 or set(checkpoint.smoke_gate) != {
+            f"{model.class_name}:{transport}"
+            for model in manifest.models
+            for transport in manifest.transports
+        }:
+            raise ValueError(f"{arm} paired resume checkpoint smoke gate is incomplete")
+
+        raw_trials: dict[tuple[str, str, int, ArmName], dict[str, Any]] = {}
+        raw_statuses: dict[tuple[str, str, int, ArmName], str] = {}
+        runs = artifact.get("runs")
+        if not isinstance(runs, dict):
+            raise ValueError(f"{arm} paired resume artifact runs are invalid")
+        for cell, report in runs.items():
+            if cell not in expected_schedule or not isinstance(report, dict):
+                raise ValueError(f"{arm} paired resume artifact contains an unknown run cell")
+            model_class, transport = cell.split(":", 1)
+            trials = report.get("trials")
+            statuses = report.get("statuses")
+            if not isinstance(trials, list) or not isinstance(statuses, list):
+                raise ValueError(f"{arm} paired resume artifact rows are malformed for {cell}")
+            for raw_outcome in trials:
+                if not isinstance(raw_outcome, dict):
+                    raise ValueError(f"{arm} paired resume trial row is malformed")
+                try:
+                    outcome = TrialOutcome.model_validate(raw_outcome)
+                except Exception as exc:
+                    raise ValueError(f"{arm} paired resume trial outcome contract validation failed: {exc}") from exc
+                identity = (cell, outcome.task_id, outcome.repeat_index, arm)
+                expected_key = expected_keys[arm].get(identity)
+                if (
+                    expected_key is None
+                    or outcome.arm != arm
+                    or outcome.model_class != model_class
+                    or outcome.model_id != expected_key.model_id
+                    or outcome.transport != transport
+                    or outcome.locale != expected_key.locale
+                    or identity in raw_trials
+                ):
+                    raise ValueError(f"{arm} paired resume trial identity is invalid or duplicated")
+                raw_trials[identity] = raw_outcome
+                if type(outcome.paired_execution_sequence) is not int:
+                    raise ValueError(f"{arm} paired resume trial is missing its execution sequence")
+                outcome_costs[arm] += max(
+                    Decimal(str(outcome.cost_usd)),
+                    Decimal(str(outcome.provider_cost_usd or 0.0)),
+                )
+            for raw_status in statuses:
+                if not isinstance(raw_status, dict):
+                    raise ValueError(f"{arm} paired resume status row is malformed")
+                status_task_id = raw_status.get("task_id")
+                status_repeat_index = raw_status.get("repeat_index")
+                status = raw_status.get("status")
+                if (
+                    not isinstance(status_task_id, str)
+                    or type(status_repeat_index) is not int
+                    or status not in {"completed", "failed"}
+                ):
+                    raise ValueError(f"{arm} paired resume status identity is invalid or nonterminal")
+                identity = (cell, status_task_id, status_repeat_index, arm)
+                if identity not in expected_keys[arm] or identity in raw_statuses:
+                    raise ValueError(f"{arm} paired resume status identity is invalid or nonterminal")
+                raw_statuses[identity] = cast(str, status)
+
+        if set(raw_trials) != set(raw_statuses) or set(raw_trials) != {
+            (f"{record.key.model_class}:{record.key.transport}", record.key.task_id, record.key.repeat_index, arm)
+            for record in checkpoint.records.values()
+        }:
+            raise ValueError(f"{arm} paired resume artifact rows do not match checkpoint identities")
+        for digest, record in checkpoint.records.items():
+            identity = (
+                f"{record.key.model_class}:{record.key.transport}",
+                record.key.task_id,
+                record.key.repeat_index,
+                arm,
+            )
+            if (
+                digest != checkpoint_key_digest(record.key)
+                or record.status not in {"completed", "failed"}
+                or record.record_hash != checkpoint_record_hash(record.status, record.key, record.outcome)
+                or identity not in raw_trials
+                or record.status != raw_statuses[identity]
+                or record.outcome.model_dump(mode="json") != raw_trials[identity]
+            ):
+                raise ValueError(f"{arm} paired resume checkpoint trial row changed")
+            key_expected = expected_keys[arm].get(identity)
+            if key_expected is None or record.key != key_expected:
+                raise ValueError(f"{arm} paired resume checkpoint trial key changed")
+
+        smoke_cells = artifact.get("smoke_gate", {}).get("cells") if isinstance(artifact.get("smoke_gate"), dict) else None
+        if not isinstance(smoke_cells, list) or len(smoke_cells) != 4:
+            raise ValueError(f"{arm} paired resume artifact smoke gate is incomplete")
+        artifact_smoke = {cell.get("cell"): cell for cell in smoke_cells if isinstance(cell, dict)}
+        if len(artifact_smoke) != 4 or set(artifact_smoke) != set(checkpoint.smoke_gate):
+            raise ValueError(f"{arm} paired resume artifact smoke identities changed")
+        for cell_key, smoke_record in checkpoint.smoke_gate.items():
+            raw_cell = artifact_smoke[cell_key]
+            if (
+                smoke_record.status != "completed"
+                or raw_cell.get("status") != smoke_record.status
+                or raw_cell.get("outcome") != smoke_record.outcome.model_dump(mode="json")
+                or smoke_record.record_hash
+                != smoke_record_hash(
+                    smoke_record.status,
+                    smoke_record.model_class,
+                    smoke_record.model_id,
+                    smoke_record.transport,
+                    smoke_record.outcome,
+                )
+            ):
+                raise ValueError(f"{arm} paired resume checkpoint smoke row changed")
+            outcome_costs[arm] += max(
+                Decimal(str(smoke_record.outcome.cost_usd)),
+                Decimal(str(smoke_record.outcome.provider_cost_usd or 0.0)),
+            )
+
+        paired = artifact.get("paired_execution")
+        budget = artifact.get("paired_budget_used")
+        if not isinstance(paired, dict) or not isinstance(budget, dict):
+            raise ValueError(f"{arm} paired resume artifact is missing shared execution accounting")
+        if execution is None:
+            execution = paired
+            shared_budget = budget
+        elif paired != execution or budget != shared_budget:
+            raise ValueError("paired resume artifacts disagree on shared execution or budget evidence")
+    assert execution is not None and shared_budget is not None
+    if execution.get("mode") != manifest.paired_order or execution.get("seed") != manifest.paired_order_seed:
+        raise ValueError("paired resume source changed its preregistered order")
+    events = execution.get("events")
+    if not isinstance(events, list):
+        raise ValueError("paired resume source events are invalid")
+    sequences = [event.get("sequence") for event in events if isinstance(event, dict)]
+    if len(sequences) != len(events) or sequences != list(range(1, len(events) + 1)):
+        raise ValueError("paired resume source event sequence is not contiguous")
+    events_by_identity: dict[tuple[str, str, int, ArmName], list[dict[str, Any]]] = defaultdict(list)
+    events_by_sequence: dict[int, dict[str, Any]] = {}
+    first_attempts_by_cell: dict[str, list[tuple[str, int, ArmName]]] = defaultdict(list)
+    for event in events:
+        cell = event.get("cell")
+        task_id = event.get("task_id")
+        repeat_index = event.get("repeat_index")
+        arm = event.get("arm")
+        identity = (cell, task_id, repeat_index, arm)
+        if (
+            not isinstance(cell, str)
+            or not isinstance(task_id, str)
+            or arm not in {"baseline", "candidate"}
+            or type(repeat_index) is not int
+            or type(event.get("sequence")) is not int
+            or cell not in expected_schedule
+            or identity not in expected_keys[cast(ArmName, arm)]
+            or type(event.get("order_position")) is not int
+            or event.get("order_position")
+            != planned_arm_order(task_id, repeat_index, manifest.paired_order_seed).index(arm)
+        ):
+            raise ValueError("paired resume source contains an invalid execution identity")
+        chain = events_by_identity[cast(tuple[str, str, int, ArmName], identity)]
+        attempt = event.get("attempt", 1)
+        if type(attempt) is not int or attempt != len(chain) + 1:
+            raise ValueError("paired resume source retry attempt index is invalid")
+        if attempt == 1:
+            if "retry_of_sequence" in event:
+                raise ValueError("first paired execution attempt cannot reference a retry")
+            first_attempts_by_cell[cell].append((task_id, repeat_index, cast(ArmName, arm)))
+        elif event.get("retry_of_sequence") != chain[-1].get("sequence"):
+            raise ValueError("paired resume source retry does not link to its previous start")
+        chain.append(event)
+        events_by_sequence[event["sequence"]] = event
+    for cell, observed in first_attempts_by_cell.items():
+        if observed != expected_schedule[cell][: len(observed)]:
+            raise ValueError(f"paired resume source did not preserve the scheduled prefix for {cell}")
+
+    terminal_sequences: set[int] = set()
+    for arm, artifact in source_artifacts.items():
+        for cell, report in artifact["runs"].items():
+            for raw in report["trials"]:
+                outcome = TrialOutcome.model_validate(raw)
+                identity = (cell, outcome.task_id, outcome.repeat_index, arm)
+                chain = events_by_identity.get(identity, [])
+                sequence = outcome.paired_execution_sequence
+                if (
+                    not chain
+                    or type(sequence) is not int
+                    or sequence != chain[-1].get("sequence")
+                    or events_by_sequence.get(sequence) is None
+                ):
+                    raise ValueError("paired resume source trial does not map to its latest execution start")
+                terminal_sequences.add(sequence)
+    unfinished_starts = [dict(event) for event in events if event["sequence"] not in terminal_sequences]
+    declared_unfinished = execution.get("unfinished_starts")
+    if declared_unfinished is not None and declared_unfinished != unfinished_starts:
+        raise ValueError("paired resume source unfinished-start evidence does not match its trial rows")
+    expected_total = sum(len(schedule) for schedule in expected_schedule.values())
+    terminal_count = sum(len(checkpoint.records) for checkpoint in source_checkpoints.values())
+    if execution.get("complete") is not (terminal_count == expected_total):
+        raise ValueError("paired resume source completion flag does not match checkpoint rows")
+
+    paired_model_requests = shared_budget.get("model_requests")
+    paired_setup_requests = shared_budget.get("provider_setup_requests")
+    if (
+        type(paired_model_requests) is not int
+        or type(paired_setup_requests) is not int
+        or paired_model_requests < 0
+        or paired_setup_requests < 0
+        or shared_budget.get("max_total_cost_usd") != manifest.budget.max_total_cost_usd
+    ):
+        raise ValueError("paired resume source ledger does not match the registered budget")
+    joint_cost_value = shared_budget.get("cost_usd")
+    joint_model_work_value = shared_budget.get("model_work_seconds")
+    joint_wall_value = shared_budget.get("wall_seconds")
+    if type(joint_cost_value) not in {int, float, str} or type(joint_model_work_value) not in {int, float} or type(
+        joint_wall_value
+    ) not in {int, float}:
+        raise ValueError("paired resume source ledger totals are invalid")
+    try:
+        joint_cost = Decimal(str(joint_cost_value))
+        joint_model_work = float(cast(int | float, joint_model_work_value))
+        joint_wall = float(cast(int | float, joint_wall_value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("paired resume source ledger totals are invalid") from exc
+    joint_inputs = shared_budget.get("input_tokens")
+    joint_outputs = shared_budget.get("output_tokens")
+    joint_total_tokens = shared_budget.get("total_tokens")
+    if not joint_cost.is_finite() or joint_cost < 0:
+        raise ValueError("paired resume source cost is invalid")
+    if (
+        type(joint_inputs) is not int
+        or type(joint_outputs) is not int
+        or type(joint_total_tokens) is not int
+        or min(joint_inputs, joint_outputs, joint_total_tokens) < 0
+        or joint_total_tokens != joint_inputs + joint_outputs
+        or not math.isfinite(joint_model_work)
+        or joint_model_work < 0
+        or not math.isfinite(joint_wall)
+        or joint_wall < 0
+    ):
+        raise ValueError("paired resume source ledger totals are invalid")
+    joint_inputs = cast(int, joint_inputs)
+    joint_outputs = cast(int, joint_outputs)
+    joint_total_tokens = cast(int, joint_total_tokens)
+    if any(
+        checkpoint.spent.provider_setup_requests > checkpoint.spent.model_requests
+        for checkpoint in source_checkpoints.values()
+    ):
+        raise ValueError("paired resume checkpoint setup requests exceed total requests")
+    checkpoint_model_requests = sum(
+        checkpoint.spent.model_requests - checkpoint.spent.provider_setup_requests
+        for checkpoint in source_checkpoints.values()
+    )
+    checkpoint_setup_requests = sum(
+        checkpoint.spent.provider_setup_requests for checkpoint in source_checkpoints.values()
+    )
+    checkpoint_inputs = sum(checkpoint.spent.input_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_outputs = sum(checkpoint.spent.output_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_cost = sum(
+        (Decimal(str(checkpoint.spent.cost_usd)) for checkpoint in source_checkpoints.values()),
+        Decimal("0"),
+    )
+    checkpoint_work = sum(checkpoint.spent.model_work_seconds for checkpoint in source_checkpoints.values())
+    residual_model_requests = paired_model_requests - checkpoint_model_requests
+    residual_setup_requests = paired_setup_requests - checkpoint_setup_requests
+    residual_inputs = joint_inputs - checkpoint_inputs
+    residual_outputs = joint_outputs - checkpoint_outputs
+    residual_cost = joint_cost - checkpoint_cost
+    residual_conservative_cost = joint_cost - sum(outcome_costs.values(), Decimal("0"))
+    residual_model_work = joint_model_work - checkpoint_work
+    residual_wall = joint_wall - max(checkpoint.spent.wall_seconds for checkpoint in source_checkpoints.values())
+    if (
+        min(residual_model_requests, residual_setup_requests, residual_inputs, residual_outputs) < 0
+        or residual_cost < 0
+        or residual_conservative_cost < 0
+        or not math.isfinite(residual_model_work)
+        or residual_model_work < -1e-9
+        or not math.isfinite(residual_wall)
+        or residual_wall < -1e-9
+    ):
+        raise ValueError("paired resume source ledger is below its checkpoint accounting")
+    residual: dict[str, int | float | str] = {
+        "model_requests": residual_model_requests,
+        "provider_setup_requests": residual_setup_requests,
+        "input_tokens": residual_inputs,
+        "output_tokens": residual_outputs,
+        "cost_usd": str(residual_cost),
+        "conservative_cost_usd": str(residual_conservative_cost),
+        "model_work_seconds": residual_model_work,
+        "wall_seconds_above_max_checkpoint": residual_wall,
+    }
+    if joint_total_tokens != joint_inputs + joint_outputs:
+        raise ValueError("paired resume source token total is inconsistent")
+
+    prior_lineage = source_artifacts["baseline"].get("resume_source")
+    if prior_lineage != source_artifacts["candidate"].get("resume_source"):
+        raise ValueError("paired resume source ancestry differs between artifacts")
+    writer_hashes = {}
+    for filename in ("runner.py", "cli.py", "execution.py"):
+        source_path = Path(__file__).with_name(filename)
+        writer_hashes[filename] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    metadata = {
+        "schema_version": 1,
+        "parents": source_hashes,
+        "input_contract": {
+            "manifest_source": "parent_artifacts",
+            "run_manifest_hash": manifest_digest,
+            "task_corpus_hash": corpus_digest,
+        },
+        "parent_resume_source_sha256": hash_json(prior_lineage) if prior_lineage is not None else None,
+        "source_execution": {
+            "event_count": len(events),
+            "terminal_outcome_count": terminal_count,
+            "unfinished_starts": unfinished_starts,
+        },
+        "source_accounting": {
+            "joint_budget_used": shared_budget,
+            "checkpoint_model_requests": checkpoint_model_requests,
+            "checkpoint_provider_setup_requests": checkpoint_setup_requests,
+            "checkpoint_input_tokens": checkpoint_inputs,
+            "checkpoint_output_tokens": checkpoint_outputs,
+            "checkpoint_cost_usd": str(checkpoint_cost),
+            "checkpoint_model_work_seconds": checkpoint_work,
+            "raw_mixed_field_request_difference_audit_only": (
+                paired_model_requests
+                - sum(checkpoint.spent.model_requests for checkpoint in source_checkpoints.values())
+            ),
+            "model_request_equation": (
+                f"{paired_model_requests} = {checkpoint_model_requests} + {residual['model_requests']}"
+            ),
+            "residual": residual,
+        },
+        "writer": {
+            "semantic_evaluator_version": TrialEvaluator().get_evaluator_version(),
+            "report_evaluator_version": MetricsReportEvaluator().get_evaluator_version(),
+            "source_sha256": writer_hashes,
+        },
+    }
+    return {
+        "events": [dict(event) for event in events],
+        "budget_used": dict(shared_budget),
+        "metadata": metadata,
+    }
+
+
+def _selection_history_for_checkpoint(document: CheckpointDocument) -> list[dict[str, Any]]:
+    if document.selection_preflight is None:
+        raise ValueError("selection resume checkpoint is missing its selection preflight")
+    events = {item.sequence: item for item in document.paired_execution_events}
+    records = [*document.attempt_history, *document.records.values()]
+    for record in records:
+        outcome = record.outcome
+        sequence = outcome.paired_execution_sequence
+        order_position = outcome.paired_order_position
+        if type(sequence) is not int or type(order_position) is not int:
+            raise ValueError("selection resume checkpoint row is missing paired sequence evidence")
+        identity = (
+            f"{record.key.model_class}:{record.key.transport}",
+            record.key.task_id,
+            record.key.repeat_index,
+            record.key.arm,
+        )
+        previous = events.get(sequence)
+        if previous is None:
+            events[sequence] = CheckpointPairedEvent(
+                sequence=sequence,
+                cell=identity[0],
+                task_id=identity[1],
+                repeat_index=identity[2],
+                arm=identity[3],
+                order_position=order_position,
+                status=record.status,
+                record_hash=record.record_hash,
+            )
+            continue
+        if (
+            (previous.cell, previous.task_id, previous.repeat_index, previous.arm) != identity
+            or previous.order_position != order_position
+            or previous.record_hash not in (None, record.record_hash)
+        ):
+            raise ValueError("selection resume checkpoint event does not match its outcome")
+        events[sequence] = previous.model_copy(
+            update={"status": record.status, "record_hash": record.record_hash}
+        )
+
+    by_identity: dict[tuple[str, str, int, ArmName], list[CheckpointPairedEvent]] = defaultdict(list)
+    for event in events.values():
+        by_identity[(event.cell, event.task_id, event.repeat_index, event.arm)].append(event)
+    for chain in by_identity.values():
+        chain.sort(key=lambda item: item.sequence)
+        previous_sequence: int | None = None
+        for attempt, event in enumerate(chain, start=1):
+            if event.attempt is None:
+                event = event.model_copy(
+                    update={
+                        "attempt": attempt,
+                        **({"retry_of_sequence": previous_sequence} if previous_sequence is not None else {}),
+                    }
+                )
+                events[event.sequence] = event
+            elif event.attempt != attempt or event.retry_of_sequence != previous_sequence:
+                raise ValueError("selection resume checkpoint retry chain is invalid")
+            previous_sequence = event.sequence
+    return [events[sequence].model_dump(mode="json", exclude_none=True) for sequence in sorted(events)]
+
+
+def load_selection_resume_source(
+    *,
+    artifact_paths: Mapping[ArmName, Path],
+    checkpoint_paths: Mapping[ArmName, Path],
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    selection: ToolGuidanceSelection,
+) -> dict[str, Any]:
+    """Validate an interrupted selected run before its checkpoint can be resumed."""
+
+    manifest_data = manifest.model_dump(mode="json")
+    manifest_digest = hash_json(manifest_data)
+    task_data = [task.model_dump(mode="json") for task in tasks]
+    corpus_digest = hash_json(task_data)
+    task_by_id = {task.id: task for task in tasks}
+    model_by_class = {model.class_name: model for model in manifest.models}
+    expected_keys: dict[ArmName, dict[tuple[str, str, int, ArmName], CheckpointKey]] = {
+        "baseline": {},
+        "candidate": {},
+    }
+    trial_order: dict[ArmName, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        for model in manifest.models:
+            for transport in manifest.transports:
+                for task in tasks:
+                    if transport not in task.fixture.transports:
+                        continue
+                    for repeat_index in range(1, manifest.repeats + 1):
+                        if not selection.contains(arm, model.class_name, transport, task.id, repeat_index):
+                            continue
+                        key = CheckpointKey(
+                            source_revision=manifest.arm_source_revisions[arm],
+                            run_manifest_hash=manifest_digest,
+                            task_corpus_hash=corpus_digest,
+                            arm=arm,
+                            model_class=model.class_name,
+                            model_id=model.model_id,
+                            transport=transport,
+                            task_id=task.id,
+                            repeat_index=repeat_index,
+                            locale=task.locale,
+                        )
+                        identity = (f"{model.class_name}:{transport}", task.id, repeat_index, arm)
+                        expected_keys[arm][identity] = key
+                        trial_order[arm].append(key.model_dump(mode="json"))
+
+    source_artifacts, source_checkpoints, source_hashes = _load_resume_sources(
+        artifact_paths=artifact_paths,
+        checkpoint_paths=checkpoint_paths,
+        manifest=manifest,
+        tasks=tasks,
+        trial_order=trial_order,
+    )
+    selection_events: dict[int, dict[str, Any]] = {}
+    shared_execution: dict[str, Any] | None = None
+    shared_budget: dict[str, Any] | None = None
+    outcome_costs: list[Decimal] = []
+
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        artifact = source_artifacts[arm]
+        checkpoint = source_checkpoints[arm]
+        if artifact.get("selection") != selection.artifact_metadata():
+            raise ValueError(f"{arm} selection resume artifact does not match the approved selection")
+        provider_registry = artifact.get("provider_registry")
+        if (
+            checkpoint.smoke_status is not None
+            or checkpoint.smoke_gate
+            or checkpoint.selection_preflight != selection.checkpoint_preflight()
+            or checkpoint.provider_registry_snapshot != provider_registry
+        ):
+            raise ValueError(f"{arm} selection resume checkpoint seal or lifecycle is invalid")
+
+        receipt = artifact.get("checkpoint")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"{arm} selection resume artifact is missing its checkpoint receipt")
+        if receipt.get("selection_preflight") != checkpoint.selection_preflight:
+            raise ValueError(f"{arm} selection resume checkpoint receipt changed")
+        if "attempt_history" in receipt and receipt["attempt_history"] != [
+            item.model_dump(mode="json") for item in checkpoint.attempt_history
+        ]:
+            raise ValueError(f"{arm} selection resume attempt history receipt changed")
+        if "selection_route_revalidations" in receipt and receipt["selection_route_revalidations"] != [
+            item.model_dump(mode="json") for item in checkpoint.selection_route_revalidations
+        ]:
+            raise ValueError(f"{arm} selection resume route revalidation receipt changed")
+        if (
+            type(receipt.get("new_trials")) is not int
+            or type(receipt.get("reused_trials")) is not int
+            or type(receipt.get("rerun_trials")) is not int
+            or receipt["new_trials"] + receipt["reused_trials"] != len(checkpoint.records)
+            or receipt["rerun_trials"] > receipt["new_trials"]
+        ):
+            raise ValueError(f"{arm} selection resume trial counters are invalid")
+
+        raw_trials: dict[tuple[str, str, int, ArmName], dict[str, Any]] = {}
+        raw_statuses: dict[tuple[str, str, int, ArmName], str] = {}
+        runs = artifact.get("runs")
+        if not isinstance(runs, dict):
+            raise ValueError(f"{arm} selection resume artifact runs are invalid")
+        for cell, report in runs.items():
+            if cell not in {identity[0] for identity in expected_keys[arm]} or not isinstance(report, dict):
+                raise ValueError(f"{arm} selection resume artifact contains an unselected run cell")
+            raw_rows = report.get("trials")
+            raw_cell_statuses = report.get("statuses")
+            if not isinstance(raw_rows, list) or not isinstance(raw_cell_statuses, list):
+                raise ValueError(f"{arm} selection resume rows are malformed")
+            for raw_outcome in raw_rows:
+                if not isinstance(raw_outcome, dict):
+                    raise ValueError(f"{arm} selection resume outcome row is malformed")
+                try:
+                    validate_model_input_evidence(raw_outcome)
+                    outcome = TrialOutcome.model_validate(raw_outcome)
+                except Exception as exc:
+                    raise ValueError(f"{arm} selection resume outcome contract is invalid") from exc
+                identity = (cell, outcome.task_id, outcome.repeat_index, arm)
+                expected_key = expected_keys[arm].get(identity)
+                if (
+                    expected_key is None
+                    or outcome.arm != arm
+                    or outcome.model_class != expected_key.model_class
+                    or outcome.model_id != expected_key.model_id
+                    or outcome.transport != expected_key.transport
+                    or outcome.locale != expected_key.locale
+                    or identity in raw_trials
+                    or type(outcome.paired_execution_sequence) is not int
+                ):
+                    raise ValueError(f"{arm} selection resume outcome identity is invalid")
+                raw_trials[identity] = raw_outcome
+                outcome_costs.append(
+                    max(Decimal(str(outcome.cost_usd)), Decimal(str(outcome.provider_cost_usd or 0.0)))
+                )
+            for raw_status in raw_cell_statuses:
+                if not isinstance(raw_status, dict):
+                    raise ValueError(f"{arm} selection resume status row is malformed")
+                status_task_id = raw_status.get("task_id")
+                status_repeat_index = raw_status.get("repeat_index")
+                status = raw_status.get("status")
+                if (
+                    not isinstance(status_task_id, str)
+                    or type(status_repeat_index) is not int
+                    or status not in {"completed", "failed"}
+                ):
+                    raise ValueError(f"{arm} selection resume status identity is invalid")
+                identity = (cell, status_task_id, status_repeat_index, arm)
+                if identity not in expected_keys[arm] or identity in raw_statuses:
+                    raise ValueError(f"{arm} selection resume status identity is invalid")
+                raw_statuses[identity] = status
+
+        checkpoint_identities = {
+            (f"{record.key.model_class}:{record.key.transport}", record.key.task_id, record.key.repeat_index, arm)
+            for record in checkpoint.records.values()
+        }
+        if set(raw_trials) != set(raw_statuses) or set(raw_trials) != checkpoint_identities:
+            raise ValueError(f"{arm} selection resume artifact rows do not match checkpoint identities")
+        for digest, record in checkpoint.records.items():
+            identity = (
+                f"{record.key.model_class}:{record.key.transport}",
+                record.key.task_id,
+                record.key.repeat_index,
+                arm,
+            )
+            expected_key = expected_keys[arm].get(identity)
+            if (
+                digest != checkpoint_key_digest(record.key)
+                or expected_key != record.key
+                or record.status not in {"completed", "failed"}
+                or record.record_hash != checkpoint_record_hash(record.status, record.key, record.outcome)
+                or record.status != raw_statuses[identity]
+                or record.outcome.model_dump(mode="json") != raw_trials[identity]
+                or (
+                    record.status == "completed"
+                    and not valid_completed_outcome(record.outcome, task_by_id[record.key.task_id])
+                )
+            ):
+                raise ValueError(f"{arm} selection resume checkpoint row changed")
+
+        outcomes = [record.outcome for record in [*checkpoint.attempt_history, *checkpoint.records.values()]]
+        setup_requests = checkpoint.spent.provider_setup_requests
+        if (
+            checkpoint.spent.model_requests != setup_requests + sum(item.model_requests for item in outcomes)
+            or checkpoint.spent.input_tokens != sum(item.input_tokens for item in outcomes)
+            or checkpoint.spent.output_tokens != sum(item.output_tokens for item in outcomes)
+            or not math.isclose(
+                checkpoint.spent.cost_usd,
+                sum((Decimal(str(item.cost_usd)) for item in outcomes), Decimal("0")),
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                checkpoint.spent.model_work_seconds,
+                sum(item.latency_seconds for item in outcomes),
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(f"{arm} selection resume checkpoint spend does not match its outcomes")
+        arm_budget = artifact.get("budget_used")
+        if (
+            not isinstance(arm_budget, dict)
+            or arm_budget.get("model_requests")
+            != checkpoint.spent.model_requests - checkpoint.spent.provider_setup_requests
+            or arm_budget.get("provider_setup_requests") != checkpoint.spent.provider_setup_requests
+            or arm_budget.get("input_tokens") != checkpoint.spent.input_tokens
+            or arm_budget.get("output_tokens") != checkpoint.spent.output_tokens
+            or not math.isclose(
+                float(arm_budget.get("cost_usd", math.nan)),
+                checkpoint.spent.cost_usd,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                float(arm_budget.get("wall_seconds", math.nan)),
+                checkpoint.spent.wall_seconds,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                float(arm_budget.get("model_work_seconds", math.nan)),
+                checkpoint.spent.model_work_seconds,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or arm_budget.get("reserved_cost_usd") != checkpoint.reserved_cost_usd
+        ):
+            raise ValueError(f"{arm} selection resume arm budget does not match its checkpoint")
+
+        history = _selection_history_for_checkpoint(checkpoint)
+        for event in history:
+            identity = (event["cell"], event["task_id"], event["repeat_index"], event["arm"])
+            model_class, transport = event["cell"].split(":", 1)
+            if (
+                event["arm"] != arm
+                or identity not in expected_keys[arm]
+                or event["order_position"]
+                != planned_arm_order(event["task_id"], event["repeat_index"], manifest.paired_order_seed).index(arm)
+            ):
+                raise ValueError(f"{arm} selection resume event identity or paired order changed")
+            if model_class not in model_by_class or transport not in manifest.transports:
+                raise ValueError(f"{arm} selection resume event cell is invalid")
+            if event["sequence"] in selection_events:
+                raise ValueError("selection resume paired sequence is duplicated across arms")
+            selection_events[event["sequence"]] = event
+
+        paired = artifact.get("paired_execution")
+        budget = artifact.get("paired_budget_used")
+        if not isinstance(paired, dict) or not isinstance(budget, dict):
+            raise ValueError(f"{arm} selection resume artifact is missing paired execution accounting")
+        if shared_execution is None:
+            shared_execution = paired
+            shared_budget = budget
+        elif paired != shared_execution or budget != shared_budget:
+            raise ValueError("selection resume arm artifacts disagree on shared execution or budget")
+        source_hashes[arm]["selection_sha256"] = selection.sha256
+
+    assert shared_execution is not None and shared_budget is not None
+    if shared_execution.get("mode") != manifest.paired_order or shared_execution.get("seed") != manifest.paired_order_seed:
+        raise ValueError("selection resume execution order differs from preregistration")
+    artifact_events = shared_execution.get("events")
+    if not isinstance(artifact_events, list):
+        raise ValueError("selection resume paired event history is invalid")
+    artifact_sequences: list[int] = []
+    for event in artifact_events:
+        if not isinstance(event, dict):
+            raise ValueError("selection resume paired event sequence is invalid")
+        sequence = event.get("sequence")
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("selection resume paired event sequence is invalid")
+        artifact_sequences.append(sequence)
+    if artifact_sequences != sorted(set(artifact_sequences)):
+        raise ValueError("selection resume paired event sequence is invalid")
+    maximum_sequence = max(artifact_sequences, default=0)
+    missing_sequences = sorted(set(range(1, maximum_sequence + 1)) - set(artifact_sequences))
+    expected_gaps = [{"sequence": sequence, "status": "unknown_start"} for sequence in missing_sequences]
+    if shared_execution.get("unknown_start_gaps") != expected_gaps:
+        raise ValueError("selection resume unknown-start gaps changed")
+    if set(artifact_sequences) != set(selection_events):
+        raise ValueError("selection resume artifact and checkpoint event sequences differ")
+    for raw_event in artifact_events:
+        assert isinstance(raw_event, dict)
+        sequence = raw_event["sequence"]
+        checkpoint_event = selection_events[sequence]
+        for field_name in ("sequence", "cell", "task_id", "repeat_index", "arm", "order_position"):
+            if raw_event.get(field_name) != checkpoint_event.get(field_name):
+                raise ValueError("selection resume paired event differs from checkpoint lineage")
+        for field_name in ("attempt", "retry_of_sequence"):
+            if field_name in raw_event and raw_event[field_name] != checkpoint_event.get(field_name):
+                raise ValueError("selection resume retry lineage changed")
+        if raw_event.get("status") != checkpoint_event.get("status") and not (
+            raw_event.get("status") == "started"
+            and checkpoint_event.get("status") in {"completed", "failed", "incomplete"}
+            and any(
+                record.outcome.paired_execution_sequence == sequence
+                for checkpoint in source_checkpoints.values()
+                for record in [*checkpoint.attempt_history, *checkpoint.records.values()]
+            )
+        ):
+            raise ValueError("selection resume event status differs from checkpoint evidence")
+        if raw_event.get("record_hash") not in (None, checkpoint_event.get("record_hash")):
+            raise ValueError("selection resume paired event record hash changed")
+    canonical_events = [selection_events[sequence] for sequence in sorted(selection_events)]
+    canonical_unfinished = [
+        event
+        for event in canonical_events
+        if event["status"] in {"started", "incomplete"}
+        and not any(
+            record.outcome.paired_execution_sequence == event["sequence"]
+            for checkpoint in source_checkpoints.values()
+            for record in [*checkpoint.attempt_history, *checkpoint.records.values()]
+        )
+    ]
+    artifact_unfinished = [event for event in artifact_events if event.get("status") == "started"]
+    if shared_execution.get("unfinished_starts") != artifact_unfinished:
+        raise ValueError("selection resume artifact unfinished-start receipt changed")
+    total_expected = len(selection.identities)
+    terminal_count = sum(len(checkpoint.records) for checkpoint in source_checkpoints.values())
+    if shared_execution.get("complete") is not (terminal_count == total_expected):
+        raise ValueError("selection resume completion flag differs from checkpoint rows")
+
+    paired_requests = shared_budget.get("model_requests")
+    paired_setup = shared_budget.get("provider_setup_requests")
+    paired_inputs = shared_budget.get("input_tokens")
+    paired_outputs = shared_budget.get("output_tokens")
+    paired_cost_value = shared_budget.get("cost_usd")
+    paired_work = shared_budget.get("model_work_seconds")
+    paired_wall = shared_budget.get("wall_seconds")
+    if (
+        type(paired_requests) is not int
+        or type(paired_setup) is not int
+        or type(paired_inputs) is not int
+        or type(paired_outputs) is not int
+        or not isinstance(paired_cost_value, (str, int, float))
+        or isinstance(paired_cost_value, bool)
+        or not isinstance(paired_work, (int, float))
+        or isinstance(paired_work, bool)
+        or not isinstance(paired_wall, (int, float))
+        or isinstance(paired_wall, bool)
+        or shared_budget.get("total_tokens") != paired_inputs + paired_outputs
+        or shared_budget.get("max_total_cost_usd") != manifest.budget.max_total_cost_usd
+        or shared_budget.get("new_execution_limit_usd") != str(selection.budget.new_execution_limit_usd)
+        or shared_budget.get("final_reserved_cost_usd") not in ("0", "0.0", 0)
+    ):
+        raise ValueError("selection resume shared budget does not match its approved limits")
+    try:
+        paired_cost = Decimal(str(paired_cost_value))
+        paired_work_value = float(paired_work)
+        paired_wall_value = float(paired_wall)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("selection resume shared budget totals are invalid") from exc
+    if (
+        not paired_cost.is_finite()
+        or paired_cost < 0
+        or not math.isfinite(paired_work_value)
+        or paired_work_value < 0
+        or not math.isfinite(paired_wall_value)
+        or paired_wall_value < 0
+    ):
+        raise ValueError("selection resume shared budget totals are invalid")
+    checkpoint_model_requests = sum(
+        checkpoint.spent.model_requests - checkpoint.spent.provider_setup_requests
+        for checkpoint in source_checkpoints.values()
+    )
+    checkpoint_setup = sum(checkpoint.spent.provider_setup_requests for checkpoint in source_checkpoints.values())
+    checkpoint_inputs = sum(checkpoint.spent.input_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_outputs = sum(checkpoint.spent.output_tokens for checkpoint in source_checkpoints.values())
+    checkpoint_cost = sum(
+        (Decimal(str(checkpoint.spent.cost_usd)) for checkpoint in source_checkpoints.values()),
+        Decimal("0"),
+    )
+    checkpoint_work = sum(checkpoint.spent.model_work_seconds for checkpoint in source_checkpoints.values())
+    residual_model_requests = paired_requests - checkpoint_model_requests
+    residual_provider_setup_requests = paired_setup - checkpoint_setup
+    residual_input_tokens = paired_inputs - checkpoint_inputs
+    residual_output_tokens = paired_outputs - checkpoint_outputs
+    residual_cost = paired_cost - checkpoint_cost
+    residual_conservative_cost = paired_cost - sum(outcome_costs, Decimal("0"))
+    residual_model_work = paired_work_value - checkpoint_work
+    residual_wall = paired_wall_value - max(
+        checkpoint.spent.wall_seconds for checkpoint in source_checkpoints.values()
+    )
+    residual = {
+        "model_requests": residual_model_requests,
+        "provider_setup_requests": residual_provider_setup_requests,
+        "input_tokens": residual_input_tokens,
+        "output_tokens": residual_output_tokens,
+        "cost_usd": str(residual_cost),
+        "conservative_cost_usd": str(residual_conservative_cost),
+        "model_work_seconds": residual_model_work,
+        "wall_seconds_above_max_checkpoint": residual_wall,
+    }
+    if (
+        min(
+            residual_model_requests,
+            residual_provider_setup_requests,
+            residual_input_tokens,
+            residual_output_tokens,
+        )
+        < 0
+        or residual_cost < 0
+        or residual_conservative_cost < 0
+        or residual_model_work < -1e-9
+        or residual_wall < -1e-9
+    ):
+        raise ValueError("selection resume shared budget is below its checkpoint accounting")
+
+    writer_hashes = {
+        filename: hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
+        for filename in ("runner.py", "cli.py", "execution.py", "selection.py")
+    }
+    metadata = {
+        "schema_version": 1,
+        "selection_sha256": selection.sha256,
+        "parents": source_hashes,
+        "source_execution": {
+            "event_count": len(canonical_events),
+            "terminal_outcome_count": terminal_count,
+            "attempt_history_count": sum(len(checkpoint.attempt_history) for checkpoint in source_checkpoints.values()),
+            "unfinished_starts": canonical_unfinished,
+            "artifact_unfinished_starts": artifact_unfinished,
+            "unknown_start_gaps": expected_gaps,
+        },
+        "source_accounting": {
+            "joint_budget_used": shared_budget,
+            "checkpoint_model_requests": checkpoint_model_requests,
+            "checkpoint_provider_setup_requests": checkpoint_setup,
+            "checkpoint_input_tokens": checkpoint_inputs,
+            "checkpoint_output_tokens": checkpoint_outputs,
+            "checkpoint_cost_usd": str(checkpoint_cost),
+            "checkpoint_model_work_seconds": checkpoint_work,
+            "model_request_equation": (
+                f"{paired_requests} = {checkpoint_model_requests} + {residual['model_requests']}"
+            ),
+            "residual": residual,
+        },
+        "writer": {
+            "semantic_evaluator_version": TrialEvaluator().get_evaluator_version(),
+            "report_evaluator_version": MetricsReportEvaluator().get_evaluator_version(),
+            "source_sha256": writer_hashes,
+        },
+    }
+    return {
+        "events": canonical_events,
+        "budget_used": dict(shared_budget),
+        "metadata": metadata,
+    }
+
+
+def _paired_artifact_receipts_reconcile(
+    artifacts: dict[str, dict[str, Any]],
+    paired_budget_used: dict[str, Any],
+) -> bool:
+    if set(artifacts) != {"baseline", "candidate"}:
+        return False
+    if artifacts["baseline"].get("resume_source") != artifacts["candidate"].get("resume_source"):
+        return False
+
+    residual_model_requests = 0
+    residual_setup_requests = 0
+    residual_input_tokens = 0
+    residual_output_tokens = 0
+    residual_conservative_cost = Decimal("0")
+    residual_model_work = 0.0
+    resume_source = artifacts["baseline"].get("resume_source")
+    if resume_source is not None:
+        source_accounting = resume_source.get("source_accounting") if isinstance(resume_source, dict) else None
+        source_residual = source_accounting.get("residual") if isinstance(source_accounting, dict) else None
+        if not isinstance(source_residual, dict):
+            return False
+        for key in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens"):
+            value = source_residual.get(key)
+            if type(value) is not int or value < 0:
+                return False
+            if key == "model_requests":
+                residual_model_requests = value
+            elif key == "provider_setup_requests":
+                residual_setup_requests = value
+            elif key == "input_tokens":
+                residual_input_tokens = value
+            else:
+                residual_output_tokens = value
+        try:
+            residual_conservative_cost = Decimal(str(source_residual["conservative_cost_usd"]))
+            residual_model_work = float(source_residual["model_work_seconds"])
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return False
+        if (
+            not residual_conservative_cost.is_finite()
+            or residual_conservative_cost < 0
+            or not math.isfinite(residual_model_work)
+            or residual_model_work < -1e-9
+        ):
+            return False
+
+    totals = {
+        "model_requests": 0,
+        "provider_setup_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    total_cost = Decimal("0")
+    total_work = 0.0
+    max_checkpoint_wall = 0.0
+
+    for arm in ("baseline", "candidate"):
+        artifact = artifacts[arm]
+        checkpoint = artifact.get("checkpoint")
+        smoke_gate = artifact.get("smoke_gate")
+        runs = artifact.get("runs")
+        hash_input = artifact.get("artifact_hash_input")
+        if (
+            artifact.get("arm") != arm
+            or not isinstance(checkpoint, dict)
+            or checkpoint.get("enabled") is not True
+            or checkpoint.get("lifecycle") != "finalized"
+            or checkpoint.get("smoke_status") != "passed"
+            or checkpoint.get("smoke_cell_count") != 4
+            or not isinstance(smoke_gate, dict)
+            or smoke_gate.get("status") != "passed"
+            or not isinstance(runs, dict)
+            or not isinstance(hash_input, dict)
+        ):
+            return False
+
+        expected_checkpoint_receipt = {
+            key: checkpoint.get(key)
+            for key in (
+                "enabled",
+                "lifecycle",
+                "record_count",
+                "valid_completed_trials",
+                "reserved_cost_usd",
+                "smoke_status",
+                "smoke_cell_count",
+            )
+        }
+        if hash_input.get("checkpoint_receipt") != expected_checkpoint_receipt:
+            return False
+
+        expected_cells = ["primary:http", "primary:stdio", "lightweight:http", "lightweight:stdio"]
+        if smoke_gate.get("required_cells") != expected_cells:
+            return False
+        smoke_cells = smoke_gate.get("cells")
+        if not isinstance(smoke_cells, list) or [
+            item.get("cell") for item in smoke_cells if isinstance(item, dict)
+        ] != expected_cells:
+            return False
+
+        outcomes: list[TrialOutcome] = []
+        for cell in smoke_cells:
+            if not isinstance(cell, dict) or cell.get("status") != "completed":
+                return False
+            raw_outcome = cell.get("outcome")
+            if not isinstance(raw_outcome, dict):
+                return False
+            try:
+                outcome = TrialOutcome.model_validate(raw_outcome)
+            except ValueError:
+                return False
+            model_class, transport = cell["cell"].split(":", 1)
+            if outcome.arm != arm or outcome.model_class != model_class or outcome.transport != transport:
+                return False
+            outcomes.append(outcome)
+
+        trial_order = hash_input.get("trial_order")
+        if not isinstance(trial_order, list):
+            return False
+        expected: set[tuple[str, str, str, int]] = set()
+        for item in trial_order:
+            if not isinstance(item, dict):
+                return False
+            model_class = item.get("model_class")
+            transport = item.get("transport")
+            task_id = item.get("task_id")
+            repeat_index = item.get("repeat_index")
+            if not (
+                isinstance(model_class, str)
+                and isinstance(transport, str)
+                and isinstance(task_id, str)
+                and type(repeat_index) is int
+            ):
+                return False
+            expected.add((model_class, transport, task_id, repeat_index))
+        if len(expected) != len(trial_order):
+            return False
+
+        trial_rows: dict[tuple[str, str, str, int], TrialOutcome] = {}
+        status_rows: dict[tuple[str, str, str, int], str] = {}
+        for cell, report in runs.items():
+            if not isinstance(cell, str) or ":" not in cell or not isinstance(report, dict):
+                return False
+            model_class, transport = cell.split(":", 1)
+            raw_trials = report.get("trials")
+            raw_statuses = report.get("statuses")
+            if not isinstance(raw_trials, list) or not isinstance(raw_statuses, list):
+                return False
+            for raw_outcome in raw_trials:
+                if not isinstance(raw_outcome, dict):
+                    return False
+                try:
+                    outcome = TrialOutcome.model_validate(raw_outcome)
+                except ValueError:
+                    return False
+                identity = (model_class, transport, outcome.task_id, outcome.repeat_index)
+                if (
+                    outcome.arm != arm
+                    or outcome.model_class != model_class
+                    or outcome.transport != transport
+                    or identity in trial_rows
+                ):
+                    return False
+                trial_rows[identity] = outcome
+                outcomes.append(outcome)
+            for raw_status in raw_statuses:
+                if not isinstance(raw_status, dict):
+                    return False
+                task_id = raw_status.get("task_id")
+                repeat_index = raw_status.get("repeat_index")
+                status = raw_status.get("status")
+                if (
+                    not isinstance(task_id, str)
+                    or type(repeat_index) is not int
+                    or status not in {"completed", "failed"}
+                ):
+                    return False
+                identity = (model_class, transport, task_id, repeat_index)
+                if identity in status_rows:
+                    return False
+                status_rows[identity] = status
+        if set(trial_rows) != expected or set(status_rows) != expected:
+            return False
+        if any(status not in {"completed", "failed"} for status in status_rows.values()):
+            return False
+        completed_statuses = sum(status == "completed" for status in status_rows.values())
+        if (
+            artifact.get("completed_trials") != len(expected)
+            or checkpoint.get("record_count") != len(expected)
+            or checkpoint.get("valid_completed_trials") != completed_statuses
+        ):
+            return False
+
+        spent = checkpoint.get("spent")
+        arm_budget = artifact.get("budget_used")
+        if not isinstance(spent, dict) or not isinstance(arm_budget, dict):
+            return False
+        if checkpoint.get("spent_hash") != hash_json(spent):
+            return False
+        try:
+            checkpoint_reserved = Decimal(str(checkpoint["reserved_cost_usd"]))
+            arm_reserved = Decimal(str(arm_budget["reserved_cost_usd"]))
+        except (InvalidOperation, KeyError, TypeError):
+            return False
+        if (
+            not checkpoint_reserved.is_finite()
+            or not arm_reserved.is_finite()
+            or checkpoint_reserved != 0
+            or arm_reserved != 0
+        ):
+            return False
+
+        arm_outcomes = [outcome for outcome in outcomes]
+        arm_requests = sum(outcome.model_requests for outcome in arm_outcomes)
+        arm_input_tokens = sum(outcome.input_tokens for outcome in arm_outcomes)
+        arm_output_tokens = sum(outcome.output_tokens for outcome in arm_outcomes)
+        arm_raw_cost = sum((Decimal(str(outcome.cost_usd)) for outcome in arm_outcomes), Decimal("0"))
+        arm_conservative_cost = sum(
+            (
+                max(
+                    Decimal(str(outcome.cost_usd)),
+                    Decimal(str(outcome.provider_cost_usd or 0.0)),
+                )
+                for outcome in arm_outcomes
+            ),
+            Decimal("0"),
+        )
+        arm_work = sum(outcome.latency_seconds for outcome in arm_outcomes)
+        setup_requests = spent.get("provider_setup_requests")
+        if type(setup_requests) is not int or setup_requests < 0:
+            return False
+        if spent.get("model_requests") != arm_requests + setup_requests:
+            return False
+        if spent.get("input_tokens") != arm_input_tokens or spent.get("output_tokens") != arm_output_tokens:
+            return False
+        if not math.isclose(float(spent.get("cost_usd", math.nan)), float(arm_raw_cost), rel_tol=0.0, abs_tol=1e-9):
+            return False
+        if not math.isclose(float(spent.get("model_work_seconds", math.nan)), arm_work, rel_tol=0.0, abs_tol=1e-9):
+            return False
+        for key, expected_value in (
+            ("model_requests", arm_requests),
+            ("provider_setup_requests", setup_requests),
+            ("input_tokens", arm_input_tokens),
+            ("output_tokens", arm_output_tokens),
+            ("total_tokens", arm_input_tokens + arm_output_tokens),
+        ):
+            if arm_budget.get(key) != expected_value:
+                return False
+        for key in ("cost_usd", "wall_seconds", "model_work_seconds"):
+            try:
+                spent_value = float(spent[key])
+                arm_value = float(arm_budget[key])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not math.isfinite(spent_value) or not math.isfinite(arm_value):
+                return False
+            if not math.isclose(spent_value, arm_value, rel_tol=0.0, abs_tol=1e-9):
+                return False
+        max_checkpoint_wall = max(max_checkpoint_wall, float(spent.get("wall_seconds", 0.0)))
+        totals["model_requests"] += arm_requests
+        totals["provider_setup_requests"] += setup_requests
+        totals["input_tokens"] += arm_input_tokens
+        totals["output_tokens"] += arm_output_tokens
+        total_cost += arm_conservative_cost
+        total_work += arm_work
+
+    expected_totals = {
+        "model_requests": totals["model_requests"] + residual_model_requests,
+        "provider_setup_requests": totals["provider_setup_requests"] + residual_setup_requests,
+        "input_tokens": totals["input_tokens"] + residual_input_tokens,
+        "output_tokens": totals["output_tokens"] + residual_output_tokens,
+    }
+    if any(paired_budget_used.get(key) != value for key, value in expected_totals.items()):
+        return False
+    if paired_budget_used.get("total_tokens") != expected_totals["input_tokens"] + expected_totals["output_tokens"]:
+        return False
+    try:
+        paired_cost = float(paired_budget_used["cost_usd"])
+        paired_wall = float(paired_budget_used["wall_seconds"])
+        paired_work = float(paired_budget_used["model_work_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(paired_cost)
+        and math.isclose(
+            paired_cost,
+            float(total_cost + residual_conservative_cost),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        and math.isfinite(paired_wall)
+        and paired_wall >= max_checkpoint_wall
+        and math.isfinite(paired_work)
+        and math.isclose(
+            paired_work,
+            total_work + residual_model_work,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    )
+
+
+def _selection_artifact_receipts_reconcile(
+    artifacts: dict[str, dict[str, Any]],
+    paired_budget_used: dict[str, Any],
+) -> bool:
+    if set(artifacts) != {"baseline", "candidate"}:
+        return False
+    selection = artifacts["baseline"].get("selection")
+    resume_source = artifacts["baseline"].get("resume_source")
+    if (
+        not isinstance(selection, dict)
+        or artifacts["candidate"].get("selection") != selection
+        or artifacts["candidate"].get("resume_source") != resume_source
+    ):
+        return False
+    arm_counts = selection.get("expected_trials_by_arm")
+    selected_trials = selection.get("selected_trials")
+    if not isinstance(arm_counts, dict) or not isinstance(selected_trials, list):
+        return False
+    expected_identities: dict[str, set[tuple[str, str, str, int]]] = {
+        "baseline": set(),
+        "candidate": set(),
+    }
+    for selected in selected_trials:
+        if not isinstance(selected, dict):
+            return False
+        arm = selected.get("arm")
+        identity = (
+            selected.get("model_class"),
+            selected.get("transport"),
+            selected.get("task_id"),
+            selected.get("repeat_index"),
+        )
+        if (
+            arm not in expected_identities
+            or not isinstance(identity[0], str)
+            or not isinstance(identity[1], str)
+            or not isinstance(identity[2], str)
+            or type(identity[3]) is not int
+            or identity in expected_identities[arm]
+        ):
+            return False
+        expected_identities[arm].add(cast(tuple[str, str, str, int], identity))
+
+    residual: dict[str, Any] = {
+        "model_requests": 0,
+        "provider_setup_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": "0",
+        "model_work_seconds": 0.0,
+    }
+    if resume_source is not None:
+        accounting = resume_source.get("source_accounting") if isinstance(resume_source, dict) else None
+        source_residual = accounting.get("residual") if isinstance(accounting, dict) else None
+        if not isinstance(source_residual, dict):
+            return False
+        residual = source_residual
+
+    totals = {
+        "model_requests": 0,
+        "provider_setup_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    total_cost = Decimal("0")
+    total_work = 0.0
+    max_checkpoint_wall = 0.0
+    for arm in ("baseline", "candidate"):
+        artifact = artifacts[arm]
+        checkpoint = artifact.get("checkpoint")
+        spent = checkpoint.get("spent") if isinstance(checkpoint, dict) else None
+        runs = artifact.get("runs")
+        smoke = artifact.get("smoke_gate")
+        if (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("enabled") is not True
+            or checkpoint.get("lifecycle") != "finalized"
+            or checkpoint.get("record_count") != arm_counts.get(arm)
+            or checkpoint.get("reserved_cost_usd") != 0
+            or checkpoint.get("smoke_status") is not None
+            or checkpoint.get("smoke_cell_count") != 0
+            or not isinstance(spent, dict)
+            or not isinstance(runs, dict)
+            or smoke != {"status": "not_run", "required_cells": [], "cells": []}
+        ):
+            return False
+        if checkpoint.get("spent_hash") != hash_json(spent):
+            return False
+        checkpoint_receipt = artifact.get("artifact_hash_input", {}).get("checkpoint_receipt")
+        expected_receipt = {
+            key: checkpoint.get(key)
+            for key in (
+                "enabled",
+                "lifecycle",
+                "record_count",
+                "valid_completed_trials",
+                "reserved_cost_usd",
+                "smoke_status",
+                "smoke_cell_count",
+            )
+        }
+        if isinstance(checkpoint, dict) and "selection_route_revalidations" in checkpoint:
+            expected_receipt["selection_route_revalidations"] = checkpoint["selection_route_revalidations"]
+        if isinstance(checkpoint, dict) and "attempt_history" in checkpoint:
+            expected_receipt["attempt_history"] = checkpoint["attempt_history"]
+        if checkpoint_receipt != expected_receipt:
+            return False
+        if (
+            type(checkpoint.get("new_trials")) is not int
+            or type(checkpoint.get("reused_trials")) is not int
+            or type(checkpoint.get("rerun_trials")) is not int
+            or checkpoint["new_trials"] + checkpoint["reused_trials"] != checkpoint["record_count"]
+            or checkpoint["rerun_trials"] > checkpoint["new_trials"]
+        ):
+            return False
+
+        completed = 0
+        observed = 0
+        observed_identities: set[tuple[str, str, str, int]] = set()
+        status_identities: dict[tuple[str, str, str, int], str] = {}
+        arm_requests = 0
+        arm_inputs = 0
+        arm_outputs = 0
+        arm_cost = Decimal("0")
+        arm_work = 0.0
+        for cell, run in runs.items():
+            if (
+                not isinstance(run, dict)
+                or not isinstance(run.get("trials"), list)
+                or not isinstance(run.get("statuses"), list)
+            ):
+                return False
+            for row in run["statuses"]:
+                if not isinstance(row, dict):
+                    return False
+                if not isinstance(cell, str) or ":" not in cell:
+                    return False
+                model_class, transport = cell.split(":", 1)
+                task_id = row.get("task_id")
+                repeat_index = row.get("repeat_index")
+                status = row.get("status")
+                if (
+                    not isinstance(task_id, str)
+                    or type(repeat_index) is not int
+                    or not isinstance(status, str)
+                    or status not in {"completed", "failed"}
+                ):
+                    return False
+                status_identity: tuple[str, str, str, int] = (model_class, transport, task_id, repeat_index)
+                if status_identity in status_identities:
+                    return False
+                status_identities[status_identity] = status
+            for raw in run["trials"]:
+                if not isinstance(raw, dict):
+                    return False
+                try:
+                    outcome = TrialOutcome.model_validate(raw)
+                except ValueError:
+                    return False
+                if outcome.arm != arm:
+                    return False
+                identity = (outcome.model_class, outcome.transport, outcome.task_id, outcome.repeat_index)
+                if identity in observed_identities:
+                    return False
+                observed_identities.add(identity)
+                observed += 1
+                if status_identities.get(identity) is None:
+                    return False
+                completed += status_identities[identity] == "completed"
+                arm_requests += outcome.model_requests
+                arm_inputs += outcome.input_tokens
+                arm_outputs += outcome.output_tokens
+                arm_cost += Decimal(str(outcome.cost_usd))
+                arm_work += outcome.latency_seconds
+        attempt_history_raw = checkpoint.get("attempt_history", [])
+        if not isinstance(attempt_history_raw, list):
+            return False
+        attempt_history: list[TrialCheckpoint] = []
+        for raw_record in attempt_history_raw:
+            try:
+                record = TrialCheckpoint.model_validate(raw_record)
+            except Exception:
+                return False
+            if (
+                record.status not in {"failed", "incomplete"}
+                or record.outcome.failure_kind != "interrupted"
+                or record.record_hash != checkpoint_record_hash(record.status, record.key, record.outcome)
+                or record.key.arm != arm
+            ):
+                return False
+            attempt_history.append(record)
+            arm_requests += record.outcome.model_requests
+            arm_inputs += record.outcome.input_tokens
+            arm_outputs += record.outcome.output_tokens
+            arm_cost += Decimal(str(record.outcome.cost_usd))
+            arm_work += record.outcome.latency_seconds
+        if (
+            observed != checkpoint.get("record_count")
+            or set(status_identities) != observed_identities
+            or observed_identities != expected_identities[arm]
+        ):
+            return False
+        for name, type_check in (
+            ("model_requests", int),
+            ("provider_setup_requests", int),
+            ("input_tokens", int),
+            ("output_tokens", int),
+        ):
+            value = spent.get(name)
+            if type(value) is not type_check or value < 0:
+                return False
+        setup_requests = spent["provider_setup_requests"]
+        if (
+            spent["model_requests"] != arm_requests + setup_requests
+            or spent["input_tokens"] != arm_inputs
+            or spent["output_tokens"] != arm_outputs
+            or not math.isclose(float(spent.get("cost_usd", math.nan)), float(arm_cost), rel_tol=0, abs_tol=1e-9)
+            or not math.isclose(
+                float(spent.get("model_work_seconds", math.nan)),
+                arm_work,
+                rel_tol=0,
+                abs_tol=1e-9,
+            )
+            or checkpoint.get("valid_completed_trials") != completed
+        ):
+            return False
+        arm_budget = artifact.get("budget_used")
+        if not isinstance(arm_budget, dict) or any(
+            arm_budget.get(name) != value
+            for name, value in (
+                ("model_requests", arm_requests),
+                ("provider_setup_requests", setup_requests),
+                ("input_tokens", arm_inputs),
+                ("output_tokens", arm_outputs),
+                ("total_tokens", arm_inputs + arm_outputs),
+            )
+        ):
+            return False
+        for name in ("cost_usd", "wall_seconds", "model_work_seconds"):
+            try:
+                spent_value = float(spent[name])
+                arm_value = float(arm_budget[name])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not math.isfinite(spent_value) or not math.isfinite(arm_value):
+                return False
+            if not math.isclose(spent_value, arm_value, rel_tol=0, abs_tol=1e-9):
+                return False
+
+        totals["model_requests"] += arm_requests
+        totals["provider_setup_requests"] += setup_requests
+        totals["input_tokens"] += arm_inputs
+        totals["output_tokens"] += arm_outputs
+        total_cost += Decimal(str(spent["cost_usd"]))
+        total_work += float(spent["model_work_seconds"])
+        max_checkpoint_wall = max(max_checkpoint_wall, float(spent["wall_seconds"]))
+
+    try:
+        residual_cost = Decimal(str(residual["cost_usd"]))
+        residual_work = float(residual["model_work_seconds"])
+        paired_cost = Decimal(str(paired_budget_used["cost_usd"]))
+        paired_work = float(paired_budget_used["model_work_seconds"])
+        paired_wall = float(paired_budget_used["wall_seconds"])
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
+    for field_name in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens"):
+        value = residual.get(field_name)
+        if type(value) is not int or value < 0:
+            return False
+        if paired_budget_used.get(field_name) != totals[field_name] + value:
+            return False
+    return (
+        paired_budget_used.get("total_tokens")
+        == paired_budget_used.get("input_tokens", 0) + paired_budget_used.get("output_tokens", 0)
+        and Decimal(str(paired_budget_used.get("max_total_cost_usd")))
+        == Decimal(str(selection.get("budget", {}).get("session_max_usd")))
+        and paired_budget_used.get("new_execution_limit_usd") == selection.get("budget", {}).get("new_execution_limit_usd")
+        and paired_budget_used.get("final_reserved_cost_usd") in ("0", "0.0", 0)
+        and paired_cost.is_finite()
+        and math.isclose(float(paired_cost), float(total_cost + residual_cost), rel_tol=0, abs_tol=1e-9)
+        and math.isfinite(paired_work)
+        and math.isclose(paired_work, total_work + residual_work, rel_tol=0, abs_tol=1e-9)
+        and math.isfinite(paired_wall)
+        and paired_wall >= max_checkpoint_wall
+    )
+
+
+def _reconcile_paired_artifact_reservations(
+    artifacts: dict[str, dict[str, Any]],
+    *,
+    paired_budget_used: dict[str, Any],
+    paired_run_terminal: bool,
+) -> None:
+    orphan_reason = "benchmark incomplete: artifact has an orphaned reservation"
+
+    def mark_incomplete(reason: str) -> None:
+        for artifact in artifacts.values():
+            reasons = artifact.get("incomplete_reasons")
+            reasons = list(reasons) if isinstance(reasons, list) else []
+            if reason not in reasons:
+                reasons.append(reason)
+            artifact["incomplete_reasons"] = sorted(reasons)
+            artifact["status"] = "incomplete"
+
+    if not paired_run_terminal:
+        mark_incomplete("benchmark incomplete: paired arms did not reach a terminal state")
+        return
+    try:
+        final_reserved = Decimal(str(paired_budget_used["final_reserved_cost_usd"]))
+    except (InvalidOperation, KeyError, TypeError):
+        mark_incomplete("benchmark incomplete: paired ledger reservation evidence is invalid")
+        return
+    if not final_reserved.is_finite() or final_reserved != 0:
+        mark_incomplete("benchmark incomplete: paired ledger ended with a reserved cost")
+        return
+    selection_mode = isinstance(artifacts.get("baseline", {}).get("selection"), dict)
+    receipts_reconcile = (
+        _selection_artifact_receipts_reconcile(artifacts, paired_budget_used)
+        if selection_mode
+        else _paired_artifact_receipts_reconcile(artifacts, paired_budget_used)
+    )
+    if not receipts_reconcile:
+        mark_incomplete("benchmark incomplete: paired ledger receipts do not reconcile with arm checkpoints")
+        return
+
+    for artifact in artifacts.values():
+        reasons = artifact.get("incomplete_reasons")
+        reasons = list(reasons) if isinstance(reasons, list) else []
+        had_orphan_reason = orphan_reason in reasons
+        artifact["incomplete_reasons"] = sorted(reason for reason in reasons if reason != orphan_reason)
+        if artifact.get("failure") or artifact["incomplete_reasons"]:
+            artifact["status"] = "incomplete"
+        elif artifact.get("status") == "incomplete" and had_orphan_reason:
+            artifact["status"] = "complete"
 
 
 def attach_paired_execution_evidence(
@@ -3166,61 +6430,141 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
         raise ValueError("paired execution evidence does not match preregistration")
     events = evidence.get("events")
     reused = evidence.get("reused")
-    if not isinstance(events, list) or not isinstance(reused, list):
+    unfinished = evidence.get("unfinished_starts", [])
+    if not isinstance(events, list) or not isinstance(reused, list) or not isinstance(unfinished, list):
         raise ValueError("paired execution records are invalid")
     event_sequences = [item.get("sequence") for item in events if isinstance(item, dict)]
     if event_sequences != list(range(1, len(events) + 1)):
         raise ValueError("paired execution sequence is not contiguous")
-    records: dict[tuple[str, str, int, str], tuple[str, int | None]] = {}
-    for status, items in (("executed", events), ("reused", reused)):
-        for item in items:
-            if not isinstance(item, dict):
-                raise ValueError("paired execution record is invalid")
-            identity = (
-                item.get("cell"),
-                item.get("task_id"),
-                item.get("repeat_index"),
-                item.get("arm"),
-            )
-            if not (
-                isinstance(identity[0], str)
-                and isinstance(identity[1], str)
-                and isinstance(identity[2], int)
-                and identity[3] in {"baseline", "candidate"}
-            ) or identity in records:
-                raise ValueError("paired execution identity is invalid or duplicated")
-            records[cast(tuple[str, str, int, str], identity)] = (
-                status,
-                item.get("sequence") if status == "executed" else None,
-            )
+    event_chains: dict[tuple[str, str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    event_by_sequence: dict[int, dict[str, Any]] = {}
+    first_attempts_by_cell: dict[str, list[tuple[str, int, ArmName]]] = defaultdict(list)
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("paired execution event is invalid")
+        identity = (
+            event.get("cell"),
+            event.get("task_id"),
+            event.get("repeat_index"),
+            event.get("arm"),
+        )
+        if not (
+            isinstance(identity[0], str)
+            and isinstance(identity[1], str)
+            and type(identity[2]) is int
+            and identity[3] in {"baseline", "candidate"}
+            and type(event.get("sequence")) is int
+            and type(event.get("order_position")) is int
+        ):
+            raise ValueError("paired execution identity is invalid")
+        cell, task_id, repeat_index, arm = cast(tuple[str, str, int, ArmName], identity)
+        typed_identity = (cell, task_id, repeat_index, arm)
+        expected_order = planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
+        if event["order_position"] != expected_order.index(arm):
+            raise ValueError("paired execution changed the preregistered arm order")
+        chain = event_chains[typed_identity]
+        attempt = event.get("attempt", 1)
+        if type(attempt) is not int or attempt != len(chain) + 1:
+            raise ValueError("paired execution retry index is invalid")
+        if attempt == 1:
+            if "retry_of_sequence" in event:
+                raise ValueError("first paired execution attempt cannot reference a retry")
+            first_attempts_by_cell[cell].append((task_id, repeat_index, arm))
+        elif event.get("retry_of_sequence") != chain[-1].get("sequence"):
+            raise ValueError("paired execution retry does not link to its preceding start")
+        chain.append(event)
+        event_by_sequence[event["sequence"]] = event
+
+    task_contracts = baseline.get("task_contracts")
+    if not isinstance(task_contracts, list):
+        raise ValueError("paired execution task contracts are missing")
+    tasks = [TaskManifest.model_validate(item) for item in task_contracts]
+    expected_schedule_by_cell: dict[str, list[tuple[str, int, ArmName]]] = {}
+    for model_spec in manifest["models"]:
+        for transport in manifest["transports"]:
+            cell = f"{model_spec['class_name']}:{transport}"
+            expected_schedule_by_cell[cell] = [
+                (task.id, repeat_index, arm)
+                for repeat_index in range(1, int(manifest["repeats"]) + 1)
+                for task in tasks
+                if transport in task.fixture.transports
+                for arm in planned_arm_order(task.id, repeat_index, manifest["paired_order_seed"])
+            ]
+    for cell, first_attempts in first_attempts_by_cell.items():
+        schedule = expected_schedule_by_cell.get(cell)
+        if schedule is None or first_attempts != schedule[: len(first_attempts)]:
+            raise ValueError("paired execution did not preserve the per-cell schedule prefix")
+
+    reused_identities: set[tuple[str, str, int, str]] = set()
+    for item in reused:
+        if not isinstance(item, dict):
+            raise ValueError("paired reuse record is invalid")
+        identity = (item.get("cell"), item.get("task_id"), item.get("repeat_index"), item.get("arm"))
+        if (
+            not isinstance(identity[0], str)
+            or not isinstance(identity[1], str)
+            or type(identity[2]) is not int
+            or identity[3] not in {"baseline", "candidate"}
+            or identity in reused_identities
+            or identity in event_chains
+        ):
+            raise ValueError("paired reuse identity is invalid or duplicated")
+        expected_order = planned_arm_order(identity[1], identity[2], manifest["paired_order_seed"])
+        if item.get("order_position") != expected_order.index(identity[3]):
+            raise ValueError("paired reuse changed the preregistered arm order")
+        reused_identities.add(cast(tuple[str, str, int, str], identity))
+
     outcomes: dict[tuple[str, str, int, str], TrialOutcome] = {}
+    terminal_event_sequences: set[int] = set()
     for artifact in (baseline, candidate):
         for cell, run in artifact["runs"].items():
             for raw in run.get("trials", []):
                 outcome = TrialOutcome.model_validate(raw)
-                identity = (cell, outcome.task_id, outcome.repeat_index, artifact["arm"])
+                identity = (cell, outcome.task_id, outcome.repeat_index, cast(ArmName, artifact["arm"]))
+                if identity in outcomes:
+                    raise ValueError("paired execution has duplicate terminal outcomes")
                 outcomes[identity] = outcome
-    if set(records) != set(outcomes):
+                chain_events = event_chains.get(identity)
+                if chain_events:
+                    if outcome.paired_execution_sequence != chain_events[-1].get("sequence"):
+                        raise ValueError("trial execution sequence does not match its latest paired attempt")
+                    terminal_event_sequences.add(cast(int, chain_events[-1]["sequence"]))
+                elif identity not in reused_identities:
+                    raise ValueError("paired execution evidence does not cover every trial")
+    if set(outcomes) != set(event_chains) | reused_identities:
         raise ValueError("paired execution evidence does not cover every trial")
+    expected_unfinished = [
+        event for event in events if event["sequence"] not in terminal_event_sequences
+    ]
+    if unfinished != expected_unfinished:
+        raise ValueError("paired unfinished-start evidence does not match terminal trial rows")
+    if any(
+        chain[-1]["sequence"] not in terminal_event_sequences
+        for chain in event_chains.values()
+    ):
+        raise ValueError("complete paired execution has an unfinished latest attempt")
+
     for identity, outcome in outcomes.items():
-        cell, task_id, repeat_index, arm = identity
+        cell, task_id, repeat_index, outcome_arm = identity
         expected = planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
-        if outcome.paired_order_position != expected.index(cast(ArmName, arm)):
+        if outcome.paired_order_position != expected.index(cast(ArmName, outcome_arm)):
             raise ValueError("trial paired order position does not match preregistration")
-        status, sequence = records[identity]
-        if status == "executed" and outcome.paired_execution_sequence != sequence:
-            raise ValueError("trial execution sequence does not match paired evidence")
-        counterpart = "candidate" if arm == "baseline" else "baseline"
+        counterpart: ArmName = "candidate" if outcome_arm == "baseline" else "baseline"
         counterpart_identity = (cell, task_id, repeat_index, counterpart)
-        if counterpart_identity not in records:
+        if counterpart_identity not in outcomes:
             raise ValueError("paired execution counterpart is missing")
-    for cell, task_id, repeat_index, _arm in records:
+
+    for cell, task_id, repeat_index, _arm in outcomes:
         expected = planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
-        first = records[(cell, task_id, repeat_index, expected[0])]
-        second = records[(cell, task_id, repeat_index, expected[1])]
-        if first[0] == "executed" and second[0] == "executed" and not cast(int, first[1]) < cast(int, second[1]):
+        first_identity = (cell, task_id, repeat_index, expected[0])
+        second_identity = (cell, task_id, repeat_index, expected[1])
+        first_chain = event_chains.get(first_identity)
+        second_chain = event_chains.get(second_identity)
+        if first_chain and second_chain and not (
+            first_chain[0]["sequence"] < second_chain[0]["sequence"]
+        ):
             raise ValueError("paired execution violated the preregistered arm order")
-        if first[0] == "executed" and second[0] == "reused":
+        if first_chain and second_identity in reused_identities:
             raise ValueError("paired resume reused the second arm before the first arm completed")
 
 
@@ -3263,6 +6607,8 @@ def _validate_artifact_pair(baseline: dict[str, Any], candidate: dict[str, Any])
         "paired_order_plan",
         "paired_execution",
         "paired_budget_used",
+        "resume_source",
+        "continuation_lineage",
         "provider_registry",
         "pre_smoke_seal_hash",
         "execution_environment",
@@ -3354,7 +6700,7 @@ def _capability_profile(
             "cache_tools": False,
             "cache_resources": False,
             "cache_prompts": False,
-            "include_instructions": False,
+            "include_instructions": True,
             "prefer_tasks": False,
             "automatic_tool_retry": False,
         },

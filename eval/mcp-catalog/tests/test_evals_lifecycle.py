@@ -9,6 +9,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import serialize_report
 from mcp_catalog.execution import CURRENT_TRIAL, TrialOutcome, evaluate_dataset
 from mcp_catalog.runtime import RuntimeContractError, RuntimeFixture, StateObservation
+from paired_artifact_factory import provider_name_for_model
 from test_runtime_contract import _TimedResetClient, descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -75,6 +76,7 @@ class _ReadinessGuardExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -107,6 +109,7 @@ class _TokenRecordingExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -155,6 +158,7 @@ class FakeExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -228,6 +232,7 @@ async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsu
             return TrialOutcome(
                 task_id=task.id,
                 category=task.category,
+                locale=task.locale,
                 arm=self.arm,
                 model_class=self.model_spec.class_name,
                 model_id=model_id,
@@ -243,7 +248,14 @@ async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsu
                 provider_evidence=[
                     {
                         "model": model_id,
-                        "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                        "routing": {
+                            "endpoints": {
+                                "available": [{
+                                    "provider": provider_name_for_model(self.model_spec),
+                                    "selected": True,
+                                }]
+                            }
+                        },
                         "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
                     }
                 ],

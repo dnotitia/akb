@@ -353,7 +353,8 @@
             "arguments": {
               "name": "catalog-bench-knowledge"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -362,7 +363,8 @@
               "vault": "catalog-bench-knowledge",
               "path": "notes"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_collection_1"
           },
           {
             "logical_operation": "create",
@@ -373,35 +375,38 @@
               "title": "quick-update",
               "content": "A short note for the team."
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_2"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 3,
             "source_field": "uri",
-            "target_attempt": 4,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
           },
           {
-            "source_attempt": 3,
             "source_field": "uri",
-            "target_attempt": 5,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_2"
           }
         ],
         "expected_final_state": {
@@ -416,7 +421,10 @@
               "pointer": "/items",
               "operator": "contains",
               "value": {
-                "name": "quick-update.md"
+                "type": "document",
+                "name": "quick-update",
+                "path": "notes/quick-update.md",
+                "uri": "akb://catalog-bench-knowledge/coll/notes/doc/quick-update.md"
               }
             }
           ]
@@ -587,7 +595,8 @@
             "arguments": {
               "name": "catalog-bench-data"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -602,7 +611,8 @@
                 }
               ]
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_table_1"
           },
           {
             "logical_operation": "search",
@@ -611,7 +621,8 @@
               "vault": "catalog-bench-data",
               "sql": "SELECT * FROM scores LIMIT 5"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "search_table_1"
           },
           {
             "logical_operation": "create",
@@ -624,7 +635,8 @@
             "outcome": "success",
             "capture_result_fields": [
               "slug"
-            ]
+            ],
+            "stage_id": "create_publication_1"
           },
           {
             "logical_operation": "list",
@@ -632,15 +644,15 @@
             "arguments": {
               "vault": "catalog-bench-data"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "list_publication_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "publication",
-            "arguments": {
-              "vault": "catalog-bench-data"
-            },
-            "outcome": "success"
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "read_publication_1"
           },
           {
             "logical_operation": "list",
@@ -648,29 +660,31 @@
             "arguments": {
               "vault": "catalog-bench-data"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "list_publication_2"
           },
           {
             "logical_operation": "delete",
             "resource_type": "publication",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "delete_publication_1"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 4,
             "source_field": "slug",
-            "target_attempt": 6,
             "target_argument": "slug",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_publication_1",
+            "target_stage": "read_publication_1"
           },
           {
-            "source_attempt": 4,
             "source_field": "slug",
-            "target_attempt": 8,
             "target_argument": "slug",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_publication_1",
+            "target_stage": "delete_publication_1"
           }
         ],
         "expected_final_state": {
@@ -696,20 +710,14 @@
                 "method": "GET",
                 "path": "/api/v1/publications/catalog-bench-data?resource_type=table_query"
               },
-              "before_must": [
-                {
-                  "pointer": "/publications",
-                  "operator": "equals",
-                  "value": []
-                }
-              ],
               "must": [
                 {
                   "pointer": "/publications",
                   "operator": "equals",
                   "value": []
                 }
-              ]
+              ],
+              "before_expected_status": 404
             },
             {
               "probe": {
@@ -718,9 +726,9 @@
                 "path": "/api/v1/public/{slug}/meta",
                 "expected_status": 404,
                 "result_binding": {
-                  "source_attempt": 4,
                   "source_field": "slug",
-                  "transform": "publication_slug"
+                  "transform": "publication_slug",
+                  "source_stage": "create_publication_1"
                 }
               },
               "check_before": false
@@ -904,7 +912,8 @@
             "logical_operation": "identity",
             "resource_type": "identity",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "identity_identity_1"
           },
           {
             "logical_operation": "list",
@@ -912,7 +921,8 @@
             "arguments": {
               "vault": "catalog-bench-vault-authorization"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "list_access_1"
           },
           {
             "logical_operation": "read",
@@ -920,7 +930,8 @@
             "arguments": {
               "vault": "catalog-bench-vault-authorization"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_access_1"
           }
         ],
         "expected_final_state": {
@@ -1038,7 +1049,8 @@
             "arguments": {
               "name": "catalog-bench-io"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -1050,7 +1062,8 @@
                 "notes/imported.md": "---\ntype: note\n---\n# Imported\nportable"
               }
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_archive_1"
           },
           {
             "logical_operation": "read",
@@ -1059,7 +1072,8 @@
               "vault": "catalog-bench-io",
               "format": "okf"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_archive_1"
           }
         ],
         "expected_final_state": {
@@ -1074,7 +1088,9 @@
               "pointer": "/items",
               "operator": "contains",
               "value": {
-                "name": "imported.md"
+                "type": "document",
+                "path": "notes/imported.md",
+                "uri": "akb://catalog-bench-io/coll/notes/doc/imported.md"
               }
             }
           ],
@@ -1088,8 +1104,42 @@
               "must": [
                 {
                   "pointer": "/files/notes~1imported.md",
+                  "operator": "okf_document",
+                  "value": {
+                    "type": "note",
+                    "resource_uri": "akb://catalog-bench-io/coll/notes/doc/imported.md",
+                    "body": "# Imported\nportable"
+                  }
+                }
+              ],
+              "before_expected_status": 404
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/documents/catalog-bench-io/notes/imported.md"
+              },
+              "before_expected_status": 404,
+              "must": [
+                {
+                  "pointer": "/path",
                   "operator": "equals",
-                  "value": "---\ntype: note\n---\n# Imported\nportable"
+                  "value": "notes/imported.md"
+                },
+                {
+                  "pointer": "/uri",
+                  "operator": "equals",
+                  "value": "akb://catalog-bench-io/coll/notes/doc/imported.md"
+                },
+                {
+                  "pointer": "/content",
+                  "operator": "equals",
+                  "value": "# Imported\nportable"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "nonempty"
                 }
               ]
             }
@@ -1241,43 +1291,46 @@
             "logical_operation": "file_upload",
             "resource_type": "file",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization",
+              "vault": "catalog-bench-vault-authorization",
               "collection": ""
             },
             "local_file_arguments": {
               "file_path": "sample-note.txt"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "file_upload_file_1"
           },
           {
             "logical_operation": "image_upload",
             "resource_type": "image",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization",
+              "vault": "catalog-bench-vault-authorization",
               "alt_text": "benchmark sample image"
             },
             "local_file_arguments": {
               "file_path": "sample-image.png"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "image_upload_image_1"
           },
           {
             "logical_operation": "create",
             "resource_type": "document",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization",
+              "vault": "catalog-bench-vault-authorization",
               "title": "catalog-bench-stdio-document"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "markdown",
-            "target_attempt": 3,
             "target_argument": "content",
-            "relation": "contains"
+            "relation": "contains",
+            "source_stage": "image_upload_image_1",
+            "target_stage": "create_document_1"
           }
         ],
         "expected_final_state": {
@@ -1951,7 +2004,8 @@
               "public_access": "none"
             },
             "outcome": "rejected",
-            "error_code": "invalid_argument"
+            "error_code": "invalid_argument",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -1960,7 +2014,8 @@
               "name": "catalog-bench-recovery",
               "public_access": "none"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_2"
           }
         ],
         "expected_final_state": {
@@ -2140,7 +2195,8 @@
             "arguments": {
               "name": "catalog-bench-overlap"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -2150,13 +2206,15 @@
               "title": "status-note",
               "content": "# Status\nDraft\n# Owner\nTeam A"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "update",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_document_1"
           },
           {
             "logical_operation": "read",
@@ -2164,23 +2222,24 @@
             "arguments": {
               "section": "Status"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_1"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 3,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_1"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 4,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
           }
         ],
         "expected_final_state": {
@@ -2195,7 +2254,10 @@
               "pointer": "/items",
               "operator": "contains",
               "value": {
-                "name": "status-note.md"
+                "type": "document",
+                "name": "status-note",
+                "path": "status-note.md",
+                "uri": "akb://catalog-bench-overlap/doc/status-note.md"
               }
             }
           ]
@@ -2358,7 +2420,10 @@
               "pointer": "/items",
               "operator": "contains",
               "value": {
-                "name": "grep-target.md"
+                "type": "document",
+                "name": "grep-target",
+                "path": "grep-target.md",
+                "uri": "akb://catalog-bench-grep/doc/grep-target.md"
               }
             }
           ],
@@ -2371,7 +2436,8 @@
             "arguments": {
               "name": "catalog-bench-grep"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -2381,7 +2447,8 @@
               "title": "grep-target",
               "content": "status: draft"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "search",
@@ -2391,7 +2458,8 @@
               "vault": "catalog-bench-grep",
               "pattern": "status: draft"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "search_document_1"
           },
           {
             "logical_operation": "update",
@@ -2402,22 +2470,24 @@
               "pattern": "status: draft",
               "replace": "status: active"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_document_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_1"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 5,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
           }
         ],
         "expected_material_outcomes": [
@@ -2568,7 +2638,10 @@
               "pointer": "/items",
               "operator": "not_contains",
               "value": {
-                "name": "revision-note.md"
+                "type": "document",
+                "name": "revision-note",
+                "path": "moved/revision-note.md",
+                "uri": "akb://catalog-bench-revisions/coll/moved/doc/revision-note.md"
               }
             }
           ],
@@ -2581,7 +2654,8 @@
             "arguments": {
               "name": "catalog-bench-revisions"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -2591,13 +2665,15 @@
               "title": "revision-note",
               "content": "revision: one"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_1"
           },
           {
             "logical_operation": "update",
@@ -2607,7 +2683,8 @@
               "old_string": "revision: one",
               "new_string": "revision: two"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_document_1"
           },
           {
             "logical_operation": "update",
@@ -2616,43 +2693,45 @@
             "arguments": {
               "collection": "moved"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_document_2"
           },
           {
             "logical_operation": "delete",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "delete_document_1"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 3,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 4,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_1"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 5,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_2"
           },
           {
-            "source_attempt": 5,
             "source_field": "uri",
-            "target_attempt": 6,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "update_document_2",
+            "target_stage": "delete_document_1"
           }
         ],
         "expected_material_outcomes": [
@@ -2807,7 +2886,8 @@
             "arguments": {
               "name": "catalog-bench-history"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -2817,7 +2897,8 @@
               "title": "history-note",
               "content": "current: one"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "update",
@@ -2825,14 +2906,16 @@
             "arguments": {
               "content": "current: two"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_document_1"
           },
           {
             "logical_operation": "read",
             "tool_name": "akb_history",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_1"
           },
           {
             "logical_operation": "read",
@@ -2841,58 +2924,61 @@
             "arguments": {
               "uri": "akb://catalog-bench-history/doc/history-note.md"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_2"
           },
           {
             "logical_operation": "read",
             "tool_name": "akb_provenance",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_3"
           },
           {
             "logical_operation": "read",
             "tool_name": "akb_get",
             "resource_type": "document",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_document_4"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 3,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_1"
           },
           {
-            "source_attempt": 3,
             "source_field": "commit",
-            "target_attempt": 5,
             "target_argument": "commit",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "update_document_1",
+            "target_stage": "read_document_2"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 4,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 6,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_3"
           },
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 7,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_4"
           }
         ],
         "expected_material_outcomes": [
@@ -2913,14 +2999,14 @@
       "locales": {
         "ko-KR": {
           "id": "history-provenance-ko",
-          "prompt": "`catalog-bench-history`에 `history-note` 문서를 두 revision으로 만들어. 이전과 현재 revision의 차이와 provenance를 확인하고 현재 본문이 그대로인지 확인해.",
+          "prompt": "`catalog-bench-history`에 `history-note` 문서를 만들어 첫 본문을 정확히 `current: one`으로 저장한 다음 본문을 정확히 `current: two`로 수정해. 두 revision의 history, diff, provenance를 확인하고 현재 본문이 정확히 `current: two`인지 검증해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "history-provenance-en",
-          "prompt": "Create two revisions of `history-note` in `catalog-bench-history`. Inspect its history, the diff between revisions, and provenance, then verify the current body is unchanged.",
+          "prompt": "Create `history-note` in `catalog-bench-history` with the exact first body `current: one`, then update its body to exactly `current: two`. Inspect the history, diff, and provenance for both revisions, and verify that the current body is exactly `current: two`.",
           "response_rubric": {
             "require_non_empty": true
           }
@@ -2946,7 +3032,8 @@
               "create",
               "update",
               "delete",
-              "read"
+              "read",
+              "list"
             ],
             "required_resources": [
               "vault",
@@ -2991,14 +3078,14 @@
         },
         "allowed_preparatory_operations": [
           "identity",
-          "list",
           "search"
         ],
         "allowed_material_operations": [
           "create",
           "update",
           "delete",
-          "read"
+          "read",
+          "list"
         ],
         "allowed_first_operations": [
           "create"
@@ -3010,39 +3097,60 @@
           "create",
           "update",
           "delete",
-          "read"
+          "read",
+          "list"
         ],
         "material_attempt_limits": {
           "create": 8,
           "update": 8,
           "delete": 1,
-          "read": 8
+          "read": 8,
+          "list": 8
         },
         "material_attempt_minimums": {
           "create": 1,
           "update": 1,
           "delete": 1,
-          "read": 1
+          "read": 1,
+          "list": 1
         },
         "required_operations": [
           "create",
           "update",
           "delete",
-          "read"
+          "read",
+          "list"
         ],
         "expected_final_state": {
           "probe": {
             "service": "app",
             "method": "GET",
-            "path": "/api/v1/collections/catalog-bench-relations"
+            "path": "/api/v1/browse/catalog-bench-relations?depth=-1"
           },
           "before_expected_status": 404,
           "must": [
             {
-              "pointer": "/collections",
+              "pointer": "/items",
               "operator": "contains",
               "value": {
+                "type": "collection",
                 "path": "notes"
+              }
+            },
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "type": "document",
+                "path": "notes/left.md"
+              }
+            },
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "type": "document",
+                "path": "notes/right.md"
               }
             }
           ],
@@ -3051,31 +3159,7 @@
               "probe": {
                 "service": "app",
                 "method": "GET",
-                "path": "/api/v1/browse/catalog-bench-relations?depth=-1"
-              },
-              "before_expected_status": 404,
-              "must": [
-                {
-                  "pointer": "/items",
-                  "operator": "contains",
-                  "value": {
-                    "name": "left"
-                  }
-                },
-                {
-                  "pointer": "/items",
-                  "operator": "contains",
-                  "value": {
-                    "name": "right"
-                  }
-                }
-              ]
-            },
-            {
-              "probe": {
-                "service": "app",
-                "method": "GET",
-                "path": "/api/v1/documents/catalog-bench-relations/notes/left"
+                "path": "/api/v1/documents/catalog-bench-relations/notes/left.md"
               },
               "before_expected_status": 404,
               "must": [
@@ -3083,6 +3167,11 @@
                   "pointer": "/content",
                   "operator": "equals",
                   "value": "left"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "exists",
+                  "value": true
                 }
               ]
             },
@@ -3090,7 +3179,7 @@
               "probe": {
                 "service": "app",
                 "method": "GET",
-                "path": "/api/v1/documents/catalog-bench-relations/notes/right"
+                "path": "/api/v1/documents/catalog-bench-relations/notes/right.md"
               },
               "before_expected_status": 404,
               "must": [
@@ -3098,6 +3187,11 @@
                   "pointer": "/content",
                   "operator": "equals",
                   "value": "right"
+                },
+                {
+                  "pointer": "/current_commit",
+                  "operator": "exists",
+                  "value": true
                 }
               ]
             },
@@ -3107,9 +3201,9 @@
                 "method": "GET",
                 "path": "/api/v1/relations?uri={uri}",
                 "result_binding": {
-                  "source_attempt": 3,
                   "source_field": "uri",
-                  "transform": "uri_query"
+                  "transform": "uri_query",
+                  "source_stage": "create_document_1"
                 }
               },
               "before_expected_status": 404,
@@ -3131,7 +3225,8 @@
             "arguments": {
               "name": "catalog-bench-relations"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -3140,7 +3235,8 @@
               "vault": "catalog-bench-relations",
               "path": "notes"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_collection_1"
           },
           {
             "logical_operation": "create",
@@ -3154,7 +3250,8 @@
             "outcome": "success",
             "capture_result_fields": [
               "uri"
-            ]
+            ],
+            "stage_id": "create_document_1"
           },
           {
             "logical_operation": "create",
@@ -3168,24 +3265,49 @@
             "outcome": "success",
             "capture_result_fields": [
               "uri"
-            ]
+            ],
+            "stage_id": "create_document_2"
           },
           {
             "logical_operation": "update",
             "resource_type": "relation",
-            "arguments": {},
-            "outcome": "success"
+            "arguments": {
+              "relation": "related_to"
+            },
+            "outcome": "success",
+            "stage_id": "update_relation_1"
           },
           {
             "logical_operation": "read",
             "resource_type": "relation",
-            "arguments": {},
-            "outcome": "success"
+            "arguments": {
+              "direction": "both"
+            },
+            "outcome": "success",
+            "stage_id": "read_relation_1"
           },
           {
             "logical_operation": "delete",
             "resource_type": "relation",
-            "arguments": {},
+            "arguments": {
+              "relation": "related_to"
+            },
+            "outcome": "success",
+            "stage_id": "delete_relation_1"
+          },
+          {
+            "stage_id": "verify_collection",
+            "logical_operation": "list",
+            "resource_type": "document",
+            "outcome": "success"
+          },
+          {
+            "stage_id": "verify_unlinked_relationships",
+            "logical_operation": "read",
+            "resource_type": "relation",
+            "arguments": {
+              "direction": "both"
+            },
             "outcome": "success"
           }
         ],
@@ -3205,29 +3327,61 @@
           {
             "logical_operation": "read",
             "outcome": "success"
+          },
+          {
+            "logical_operation": "list",
+            "outcome": "success"
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 3,
             "source_field": "uri",
-            "target_attempt": 5,
+            "target_argument": "source",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_relation_1"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "target",
+            "relation": "equals",
+            "source_stage": "create_document_2",
+            "target_stage": "update_relation_1"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_relation_1"
+          },
+          {
+            "source_stage": "create_document_1",
+            "source_field": "uri",
+            "target_stage": "delete_relation_1",
             "target_argument": "source",
             "relation": "equals"
           },
           {
-            "source_attempt": 4,
+            "source_stage": "create_document_2",
             "source_field": "uri",
-            "target_attempt": 5,
+            "target_stage": "delete_relation_1",
             "target_argument": "target",
             "relation": "equals"
           },
           {
-            "source_attempt": 3,
+            "source_stage": "create_document_1",
             "source_field": "uri",
-            "target_attempt": 6,
+            "target_stage": "verify_unlinked_relationships",
             "target_argument": "uri",
             "relation": "equals"
+          },
+          {
+            "source_stage": "create_document_1",
+            "source_field": "uri",
+            "target_stage": "verify_collection",
+            "target_argument": "uri",
+            "relation": "collection_uri"
           }
         ],
         "forbidden_mutations": [
@@ -3241,14 +3395,14 @@
       "locales": {
         "ko-KR": {
           "id": "collection-relation-lifecycle-ko",
-          "prompt": "`catalog-bench-relations` 보관함과 `notes` collection을 만들고 그 안에 본문이 각각 `left`, `right`인 문서를 만들어. 두 문서의 반환된 URI로 연결하고 관계를 조회해. 같은 연결만 해제한 뒤 문서 본문 두 개와 collection은 남아 있고 관계가 없는지 확인해.",
+          "prompt": "`catalog-bench-relations` 보관함과 `notes` collection을 만들고 그 안에 제목이 각각 `left`, `right`이고 본문도 각각 `left`, `right`인 문서를 만들어. 두 문서의 반환된 URI로 연결하고 관계를 조회해. 같은 연결만 해제한 뒤 문서 본문 두 개와 collection은 남아 있고 관계가 없는지 확인해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "collection-relation-lifecycle-en",
-          "prompt": "Create vault `catalog-bench-relations`, collection `notes`, and documents with bodies `left` and `right`. Link them using the returned document URIs, inspect the relation, unlink only that edge, and verify both bodies and the collection remain with no relation.",
+          "prompt": "Create vault `catalog-bench-relations`, collection `notes`, and documents titled `left` and `right`, with bodies `left` and `right`. Link them using the returned document URIs, inspect the relation, unlink only that edge, and verify both bodies and the collection remain with no relation.",
           "response_rubric": {
             "require_non_empty": true
           }
@@ -3264,20 +3418,19 @@
           "document_mutation"
         ],
         "risk_hypotheses": [],
-        "user_outcome": "Create a table, observe a rejected duplicate-column schema change, and verify the retained schema.",
+        "user_outcome": "Create a table, attempt a duplicate-column addition, and verify the retained schema.",
         "accepted_behaviors": [
           {
             "id": "observed-state",
-            "description": "The declared public operations and independent final-state oracle agree with the request.",
+            "description": "The duplicate-column response is reported accurately and the independent schema oracle confirms exactly one existing column.",
             "mode": "complete",
             "required_operations": [
               "create",
-              "update",
-              "read"
+              "update"
             ],
             "required_resources": [
               "vault",
-              "document"
+              "table"
             ]
           }
         ],
@@ -3302,7 +3455,9 @@
           "akb_create_vault",
           "akb_create_table",
           "akb_alter_table",
-          "akb_sql"
+          "akb_sql",
+          "akb_browse",
+          "akb_vault_info"
         ],
         "fixture": {
           "scenario": "app-control-plane",
@@ -3313,14 +3468,14 @@
           ]
         },
         "allowed_preparatory_operations": [
-          "identity",
-          "list",
-          "search"
+          "identity"
         ],
         "allowed_material_operations": [
           "create",
           "update",
-          "read"
+          "read",
+          "list",
+          "search"
         ],
         "allowed_first_operations": [
           "create"
@@ -3330,23 +3485,22 @@
         ],
         "required_attempted_operations": [
           "create",
-          "update",
-          "read"
+          "update"
         ],
         "material_attempt_limits": {
           "create": 8,
           "update": 8,
-          "read": 8
+          "read": 8,
+          "search": 8,
+          "list": 8
         },
         "material_attempt_minimums": {
           "create": 1,
-          "update": 1,
-          "read": 1
+          "update": 1
         },
         "required_operations": [
           "create",
-          "update",
-          "read"
+          "update"
         ],
         "expected_final_state": {
           "probe": {
@@ -3356,20 +3510,19 @@
           },
           "must": [
             {
-              "pointer": "/columns",
-              "operator": "contains",
-              "value": {
-                "name": "id",
-                "type": "text"
-              }
+              "pointer": "/columns/0/name",
+              "operator": "equals",
+              "value": "event_id"
             },
             {
-              "pointer": "/columns",
-              "operator": "contains",
-              "value": {
-                "name": "name",
-                "type": "text"
-              }
+              "pointer": "/columns/0/type",
+              "operator": "equals",
+              "value": "text"
+            },
+            {
+              "pointer": "/columns/1",
+              "operator": "exists",
+              "value": false
             }
           ],
           "before_expected_status": 404
@@ -3381,7 +3534,8 @@
             "arguments": {
               "name": "catalog-bench-schema"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "create",
@@ -3391,46 +3545,40 @@
               "name": "events",
               "columns": [
                 {
-                  "name": "id",
-                  "type": "text"
-                },
-                {
-                  "name": "name",
+                  "name": "event_id",
                   "type": "text"
                 }
               ]
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_table_1"
           },
           {
             "logical_operation": "update",
             "tool_name": "akb_alter_table",
             "resource_type": "table",
             "arguments": {
-              "rename_columns": {
-                "id": "name"
-              }
+              "add_columns": [
+                {
+                  "name": "event_id",
+                  "type": "text"
+                }
+              ]
             },
-            "outcome": "rejected",
-            "status_code": 400,
-            "error_code": "invalid_argument"
-          },
-          {
-            "logical_operation": "read",
-            "resource_type": "table",
-            "arguments": {
-              "vault": "catalog-bench-schema"
-            },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_table_1",
+            "capture_result_fields": [
+              "columns"
+            ]
           }
         ],
         "expected_result_bindings": [
           {
-            "source_attempt": 2,
             "source_field": "uri",
-            "target_attempt": 3,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "create_table_1",
+            "target_stage": "update_table_1"
           }
         ],
         "expected_material_outcomes": [
@@ -3441,26 +3589,66 @@
           {
             "logical_operation": "update",
             "outcome": "success"
-          },
-          {
-            "logical_operation": "read",
-            "outcome": "success"
           }
         ]
       },
       "locales": {
         "ko-KR": {
           "id": "table-schema-conflict-ko",
-          "prompt": "`catalog-bench-schema`에 `events` 표와 `id` 열을 만들어. 같은 이름의 열을 추가하려는 변경을 한 번 시도해. 충돌을 알리고 표를 남긴 뒤 현재 스키마를 확인해.",
+          "prompt": "`catalog-bench-schema` 새 보관함을 먼저 만들고 그 안에 `events` 표와 텍스트 열 `event_id`를 만들어. 같은 `event_id` 텍스트 열을 한 번 더 추가해 보고 도구가 실제로 반환한 내용을 설명해. 마지막 스키마에 `event_id` 텍스트 열이 정확히 하나 남아 있는지 확인해.",
           "response_rubric": {
-            "require_non_empty": true
+            "require_non_empty": true,
+            "required_any_of": [
+              [
+                "오류가 나지",
+                "오류가 없",
+                "성공 응답",
+                "멱등"
+              ],
+              [
+                "event_id 텍스트 열이 하나",
+                "event_id 열은 하나",
+                "event_id가 한 번만",
+                "정확히 하나의 event_id 텍스트 열"
+              ]
+            ],
+            "forbidden_terms": [
+              "중복 추가가 거부",
+              "중복 열 추가가 거부",
+              "중복 추가를 거부",
+              "두 번째 추가가 거부",
+              "오류를 반환",
+              "오류로 거부"
+            ]
           }
         },
         "en-US": {
           "id": "table-schema-conflict-en",
-          "prompt": "Create table `events` with an `id` text column in `catalog-bench-schema`. Attempt once to add another `id` column, report the conflict, keep the table, and verify its schema.",
+          "prompt": "Create a new vault named `catalog-bench-schema` first, then create an `events` table there with one text column named `event_id`. Attempt to add that same text column again and explain exactly what the tool returned. Confirm the final schema contains exactly one text `event_id` column.",
           "response_rubric": {
-            "require_non_empty": true
+            "require_non_empty": true,
+            "required_any_of": [
+              [
+                "did not error",
+                "not an error",
+                "success response",
+                "idempotent"
+              ],
+              [
+                "one text column: event_id",
+                "one user column: `event_id` (type `text`)",
+                "exactly one `event_id` column of type `text`",
+                "exactly one text event_id column"
+              ]
+            ],
+            "forbidden_terms": [
+              "duplicate add was rejected",
+              "duplicate column add was rejected",
+              "rejected the duplicate add",
+              "rejected my duplicate add",
+              "second add was rejected",
+              "returned an error"
+            ]
           }
         }
       }
@@ -3591,7 +3779,8 @@
             "arguments": {
               "name": "catalog-bench-access"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "create_vault_1"
           },
           {
             "logical_operation": "read",
@@ -3599,7 +3788,8 @@
             "arguments": {
               "vault": "catalog-bench-access"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_access_1"
           },
           {
             "logical_operation": "update",
@@ -3608,7 +3798,8 @@
               "vault": "catalog-bench-access",
               "level": "none"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_access_1"
           },
           {
             "logical_operation": "update",
@@ -3617,7 +3808,8 @@
               "vault": "catalog-bench-access",
               "new_owner": "fixture-owner"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "update_access_2"
           },
           {
             "logical_operation": "read",
@@ -3625,7 +3817,8 @@
             "arguments": {
               "vault": "catalog-bench-access"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "read_vault_1"
           }
         ],
         "expected_material_outcomes": [
@@ -3758,39 +3951,43 @@
             "logical_operation": "file_upload",
             "resource_type": "file",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization",
+              "vault": "catalog-bench-vault-authorization",
               "collection": ""
             },
             "local_file_arguments": {
               "file_path": "sample-note.txt"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "file_upload_file_1"
           },
           {
             "logical_operation": "image_upload",
             "resource_type": "image",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization",
+              "vault": "catalog-bench-vault-authorization",
               "alt_text": "cleanup probe"
             },
             "local_file_arguments": {
               "file_path": "sample-image.png"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "image_upload_image_1"
           },
           {
             "logical_operation": "cleanup",
             "resource_type": "image",
             "arguments": {
-              "parent": "akb://catalog-bench-vault-authorization"
+              "vault": "catalog-bench-vault-authorization"
             },
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "cleanup_image_1"
           },
           {
             "logical_operation": "delete",
             "resource_type": "file",
             "arguments": {},
-            "outcome": "success"
+            "outcome": "success",
+            "stage_id": "delete_file_1"
           }
         ],
         "expected_final_state": {
@@ -3842,9 +4039,9 @@
                 "path": "/api/v1/assets/catalog-bench-vault-authorization/{asset_id}/metadata",
                 "expected_status": 404,
                 "result_binding": {
-                  "source_attempt": 2,
                   "source_field": "url",
-                  "transform": "document_asset_id_from_url"
+                  "transform": "document_asset_id_from_url",
+                  "source_stage": "image_upload_image_1"
                 }
               },
               "check_before": false
@@ -3853,18 +4050,18 @@
         },
         "expected_result_bindings": [
           {
-            "source_attempt": 1,
             "source_field": "uri",
-            "target_attempt": 4,
             "target_argument": "uri",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "file_upload_file_1",
+            "target_stage": "delete_file_1"
           },
           {
-            "source_attempt": 2,
             "source_field": "url",
-            "target_attempt": 3,
             "target_argument": "url",
-            "relation": "equals"
+            "relation": "equals",
+            "source_stage": "image_upload_image_1",
+            "target_stage": "cleanup_image_1"
           }
         ],
         "expected_material_outcomes": [
@@ -3889,14 +4086,14 @@
       "locales": {
         "ko-KR": {
           "id": "stdio-image-files-ko",
-          "prompt": "`sample-note.txt`를 `catalog-bench-vault-authorization` 루트에 올려. `sample-image.png`도 대체 텍스트 `cleanup probe`로 준비하되 문서에 넣지 말고 staging 이미지를 폐기해. 파일도 삭제한 뒤 둘 다 남지 않았는지 확인해.",
+          "prompt": "`sample-note.txt` 원본 파일 자체를 `catalog-bench-vault-authorization` 루트의 파일 리소스로 올리고, `sample-image.png`는 대체 텍스트 `cleanup probe`로 문서에 넣지 않은 채 staging해. 반환된 파일 URI와 이미지 URL을 이용해 파일과 staging 이미지를 각각 정리해. 두 정리 작업의 순서는 상관없고, 마지막에 둘 다 남지 않았는지 확인해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "stdio-image-files-en",
-          "prompt": "Upload `sample-note.txt` to the root of `catalog-bench-vault-authorization`. Stage `sample-image.png` with alt text `cleanup probe` but do not insert it into a document; discard the staged image and delete the uploaded file, then verify both are absent.",
+          "prompt": "Upload the original `sample-note.txt` as a file resource at the root of `catalog-bench-vault-authorization`. Stage `sample-image.png` with alt text `cleanup probe` without inserting it into a document. Use the returned file URI and image URL to clean up the file and staged image separately. Either cleanup order is fine; finally verify both are absent.",
           "response_rubric": {
             "require_non_empty": true
           }

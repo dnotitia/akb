@@ -6,8 +6,19 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome, _vault_skill_handshakes_are_valid
+from mcp_catalog.runner import (
+    _build_artifact_hash_input,
+    _selected_condition_error_kinds,
+    _selected_diagnostic_summary,
+    _selected_invalid_condition_reason,
+    _selected_model_error_kinds,
+    compare_artifacts,
+    planned_arm_order,
+)
 from mcp_catalog.statistics import InconclusiveBootstrap, paired_cluster_bca
 from paired_artifact_factory import complete_paired_artifacts, mark_candidate_unsafe
 
@@ -19,6 +30,52 @@ def _seal(artifact: dict) -> None:
     trial_order = current.get("trial_order", []) if isinstance(current, dict) else []
     artifact["artifact_hash_input"] = deepcopy(_build_artifact_hash_input(artifact, trial_order=trial_order))
     artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
+
+
+def _attach_selection_metadata(baseline: dict, candidate: dict) -> None:
+    selection = {
+        "selection_sha256": "a" * 64,
+        "selected_trials": [
+            {
+                "arm": arm,
+                "model_class": "primary",
+                "transport": "http",
+                "task_id": "read-vaults-en",
+                "repeat_index": 1,
+            }
+            for arm in ("baseline", "candidate")
+        ],
+    }
+    for artifact in (baseline, candidate):
+        artifact["selection"] = deepcopy(selection)
+        artifact["pre_smoke_seal_inputs"]["selection"] = deepcopy(selection)
+    seal_hash = hash_json({
+        arm: hash_json(artifact["pre_smoke_seal_inputs"])
+        for arm, artifact in (("baseline", baseline), ("candidate", candidate))
+    })
+    for artifact in (baseline, candidate):
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _seal(artifact)
+
+
+def _reseal_provider_registry_pair(baseline: dict, candidate: dict) -> None:
+    artifacts = {"baseline": baseline, "candidate": candidate}
+    for artifact in artifacts.values():
+        registry = artifact["provider_registry"]
+        registry["model_list_hash"] = hash_json(registry["model_list_snapshot"])
+        registry_payload = {key: value for key, value in registry.items() if key != "snapshot_hash"}
+        registry["snapshot_hash"] = hash_json(registry_payload)
+        artifact["pre_smoke_seal_inputs"]["provider_registry_hash"] = registry["snapshot_hash"]
+
+    seal_hash = hash_json(
+        {
+            arm: hash_json(artifact["pre_smoke_seal_inputs"])
+            for arm, artifact in artifacts.items()
+        }
+    )
+    for artifact in artifacts.values():
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _seal(artifact)
 
 
 def test_preregistered_arm_order_is_counterbalanced_across_repeats() -> None:
@@ -52,6 +109,348 @@ def test_complete_artifacts_compare_all_608_paired_outcomes_and_apply_every_gate
         and interval["seed"] == 358
         for interval in [result["overall"]["success"], result["overall"]["task_error_rate"], *result["cells"].values()]
     )
+
+
+def test_selected_artifacts_keep_the_full_corpus_verdict_inconclusive() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert result["gate"]["reasons"] == [
+        "selected trial evidence cannot support the full benchmark adoption verdict"
+    ]
+    diagnostics = result["observed_selected_diagnostics"]
+    assert diagnostics["classification"] == "diagnostic_only"
+    assert diagnostics["adoption_eligible"] is False
+    assert diagnostics["arms"]["baseline"]["observed_trials"] == 1
+    assert diagnostics["arms"]["candidate"]["observed_trials"] == 1
+    assert diagnostics["combined"]["observed_trials"] == 2
+    assert diagnostics["combined"]["efficiency_metrics"]["trials"] == 2
+    assert "cost_usd" in diagnostics["combined"]
+    assert diagnostics["combined"]["any_task_error_trials"] == diagnostics["combined"]["task_errors"]
+    assert diagnostics["model_summaries"]["combined"]["primary"]["evaluated_trials"] == 2
+    assert diagnostics["model_summaries"]["combined"]["primary"]["arms"]["baseline"]["successes"] == 1
+    assert diagnostics["provenance"]["hash_scheme"] == "canonical_json_sha256"
+    assert diagnostics["provenance"]["sources"]["baseline"]["artifact_semantic_sha256"] == baseline["artifact_hash"]
+    assert diagnostics["provenance"]["verifier"]["version"] == "0.1.0"
+
+
+def test_selected_diagnostics_rescore_recorded_calls_instead_of_trusting_derived_fields() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+    for artifact in (baseline, candidate):
+        trial = artifact["runs"]["primary:http"]["trials"][0]
+        trial["success"] = False
+        trial["trial_error"] = False
+        trial["safety"] = False
+        _seal(artifact)
+
+    result = compare_artifacts(baseline, candidate)
+    diagnostics = result["observed_selected_diagnostics"]
+
+    assert result["schema_version"] == 5
+    assert diagnostics["rescored_from_recorded_evidence"] is True
+    assert diagnostics["arms"]["baseline"]["successes"] == 1
+    assert diagnostics["arms"]["baseline"]["task_errors"] == 1
+    assert diagnostics["arms"]["baseline"]["safe_trials"] == 1
+    assert diagnostics["arms"]["baseline"]["rescored_trials"][0]["success"] is True
+    assert diagnostics["arms"]["baseline"]["rescored_trials"][0]["trial_error_kinds"] == [
+        "unintended_tool_action"
+    ]
+    rescored = diagnostics["arms"]["baseline"]["rescored_trials"][0]
+    assert rescored["record_hash_scheme"] == "canonical_json_sha256"
+    assert len(rescored["record_sha256"]) == 64
+    assert rescored["any_task_error"] is True
+    assert rescored["evaluated"] is True
+    assert diagnostics["arms"]["baseline"]["any_task_error_trials"] == 1
+    assert diagnostics["model_summaries"]["baseline"]["primary"]["any_task_error_trials"] == 1
+    assert diagnostics["combined"]["efficiency_metrics"]["success_rate"] == 1.0
+
+
+def test_selected_diagnostics_count_invalid_fixture_errors_separately_from_model_errors() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    artifacts = {"baseline": baseline, "candidate": candidate}
+    for arm, artifact in artifacts.items():
+        artifact["selection"] = {
+            "selected_trials": [
+                {
+                    "arm": arm,
+                    "model_class": "primary",
+                    "transport": "stdio",
+                    "task_id": "access-ownership-public-en",
+                    "repeat_index": 1,
+                }
+            ]
+        }
+        row = next(
+            row
+            for run in artifact["runs"].values()
+            for row in run["trials"]
+            if row["task_id"] == "access-ownership-public-en"
+            and row["model_class"] == "primary"
+            and row["transport"] == "stdio"
+            and row["repeat_index"] == 1
+        )
+        calls = [ToolCallRecord.model_validate(call) for call in row["tool_calls"]]
+        if arm == "baseline":
+            row["tool_calls"] = [call.model_dump(mode="json") for call in calls[:-1]]
+            continue
+
+        create, _read_access, update, _transfer, final_read = calls
+        ack = "owner-check-ack"
+        binding = "a" * 64
+        challenge_args = {"level": "none", "vault": "catalog-bench-access"}
+        retry_args = {**challenge_args, "_vault_skill_ack": ack}
+        challenge = update.model_copy(
+            update={
+                "order": 3,
+                "stage_id": "update_access_1",
+                "server_succeeded": False,
+                "server_error_code": "vault_skill_required",
+                "operation_kind": "preparatory",
+                "vault_skill_ack": ack,
+                "vault_skill_binding_sha256": binding,
+            }
+        )
+        owner_search = ToolCallRecord(
+            order=4,
+            tool_name="akb_identity",
+            canonical_operation="akb_identity",
+            logical_operation="list",
+            resource_type="access",
+            operation_kind="preparatory",
+            raw_model_args={"action": "search_users", "query": "fixture-owner"},
+            server_args={"action": "search_users", "query": "fixture-owner"},
+            effective_server_args={"action": "search_users", "query": "fixture-owner"},
+            raw_args_valid=True,
+            server_args_equal_raw=True,
+            tool_exists=True,
+            transport_succeeded=True,
+            server_succeeded=True,
+            result_preview='{"users":[]}',
+        )
+        retry = update.model_copy(
+            update={
+                "order": 5,
+                "stage_id": "update_access_1",
+                "raw_model_args": retry_args,
+                "server_args": retry_args,
+                "effective_server_args": retry_args,
+                "server_succeeded": True,
+                "server_error_code": None,
+                "operation_kind": "material",
+                "vault_skill_ack": None,
+                "vault_skill_retry_ack": ack,
+                "vault_skill_binding_sha256": binding,
+            }
+        )
+        transfer_args = {"new_owner": "fixture-owner", "vault": "catalog-bench-access"}
+        transfer = update.model_copy(
+            update={
+                "order": 6,
+                "tool_name": "akb_transfer_ownership",
+                "canonical_operation": "akb_transfer_ownership",
+                "stage_id": "update_access_2",
+                "raw_model_args": transfer_args,
+                "server_args": transfer_args,
+                "effective_server_args": transfer_args,
+                "server_succeeded": False,
+                "server_error_code": "not_found",
+                "server_error_identity": {},
+                "operation_kind": "material",
+            }
+        )
+        initial_vault_read = final_read.model_copy(
+            update={"order": 2, "stage_id": "read_vault_1", "operation_kind": "material"}
+        )
+        final_vault_read = final_read.model_copy(
+            update={"order": 7, "stage_id": None, "operation_kind": "preparatory"}
+        )
+        row["tool_calls"] = [
+            call.model_dump(mode="json")
+            for call in (create, initial_vault_read, challenge, owner_search, retry, transfer, final_vault_read)
+        ]
+
+    diagnostics = _selected_diagnostic_summary(baseline, candidate)
+
+    candidate_trial = diagnostics["arms"]["candidate"]["rescored_trials"][0]
+    assert candidate_trial["invalid_condition_reason"] == (
+        "fixture user 'fixture-owner' was absent during the ownership transfer"
+    )
+    assert candidate_trial["observed_trial_error"] is True
+    assert candidate_trial["observed_trial_error_kinds"] == ["unexpected_tool_error", "wrong_target_payload"]
+    assert candidate_trial["protocol_handshake_valid"] is True
+    assert candidate_trial["trial_error"] is False
+    assert candidate_trial["condition_error_kinds"] == ["unexpected_tool_error", "wrong_target_payload"]
+    assert diagnostics["combined"]["invalid_condition_error_trials"] == 0
+    assert diagnostics["combined"]["observed_model_error_trials"] == 0
+
+
+def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failures() -> None:
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    history = next(task for task in tasks if task.id == "history-provenance-en")
+    incomplete_history = TrialOutcome(
+        task_id=history.id,
+        category=history.category,
+        locale=history.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="http",
+    )
+    old_history_contract = history.model_copy(update={"prompt": "Inspect history and provenance, then verify it."})
+    assert _selected_invalid_condition_reason(old_history_contract, incomplete_history) == (
+        "task prompt omitted the exact preregistered revision bodies"
+    )
+
+    access = next(task for task in tasks if task.id == "access-ownership-public-en")
+    absent_owner = TrialOutcome(
+        task_id=access.id,
+        category=access.category,
+        locale=access.locale,
+        arm="candidate",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="stdio",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="akb_identity",
+                logical_operation="list",
+                resource_type="access",
+                    operation_kind="preparatory",
+                effective_server_args={"action": "search_users", "query": "fixture-owner"},
+                server_succeeded=True,
+                result_preview='{"users":[]}',
+            ),
+            ToolCallRecord(
+                order=2,
+                tool_name="akb_transfer_ownership",
+                logical_operation="update",
+                resource_type="access",
+                stage_id="update_access_2",
+                server_args={"new_owner": "fixture-owner", "vault": "catalog-bench-access"},
+                effective_server_args={"new_owner": "fixture-owner", "vault": "catalog-bench-access"},
+                server_succeeded=False,
+                server_error_code="not_found",
+            ),
+        ],
+    )
+    assert _selected_invalid_condition_reason(access, absent_owner) == (
+        "fixture user 'fixture-owner' was absent during the ownership transfer"
+    )
+
+
+def test_selected_diagnostics_keep_real_errors_in_invalid_history_trials() -> None:
+    history = next(
+        task for task in load_task_corpus(ROOT / "corpus" / "tasks.json")
+        if task.id == "history-provenance-en"
+    )
+    invalid_history = history.model_copy(update={"prompt": "Inspect history and provenance, then verify it."})
+    retry_args = {"vault": "catalog-bench-history", "_vault_skill_ack": "reused-ack"}
+    unbound_retry = ToolCallRecord(
+        order=1,
+        tool_name="akb_update",
+        logical_operation="update",
+        resource_type="document",
+        raw_model_args=retry_args,
+        server_args=retry_args,
+        effective_server_args=retry_args,
+        server_succeeded=True,
+        vault_skill_binding_sha256="b" * 64,
+        vault_skill_retry_ack="reused-ack",
+    )
+    outcome = TrialOutcome(
+        task_id=history.id,
+        category=history.category,
+        locale=history.locale,
+        arm="candidate",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="stdio",
+        tool_calls=[unbound_retry],
+        trial_error=True,
+        trial_error_kinds=["protocol_handshake_invalid"],
+    )
+
+    reason = _selected_invalid_condition_reason(invalid_history, outcome)
+
+    assert reason == "task prompt omitted the exact preregistered revision bodies"
+    assert _vault_skill_handshakes_are_valid(outcome.tool_calls, invalid_history) is False
+    assert _selected_condition_error_kinds(invalid_history, outcome, reason) == []
+    assert _selected_model_error_kinds(invalid_history, outcome, reason) == ["protocol_handshake_invalid"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["instructions", "selection_repeat", "source_revision", "execution_event", "artifact_hash"],
+)
+def test_selected_artifact_tampering_is_rejected_before_partial_verdict(mutation: str) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+
+    if mutation == "instructions":
+        candidate["catalogs"]["http:default"]["server_discover"]["instructions"] += " tampered"
+    elif mutation == "selection_repeat":
+        candidate["selection"]["selected_trials"][0]["repeat_index"] = 2
+    elif mutation == "source_revision":
+        candidate["source_revision"] = "tampered-source-revision"
+    elif mutation == "execution_event":
+        candidate["paired_execution"]["events"][0]["sequence"] += 1
+    else:
+        candidate["artifact_hash"] = "0" * 64
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert result["gate"]["reasons"] == ["candidate artifact integrity digest does not match"]
+    assert result["observed_selected_diagnostics"]["classification"] == "diagnostic_only"
+
+
+def test_complete_artifacts_over_retired_request_and_wall_caps_still_compare() -> None:
+    baseline, candidate = complete_paired_artifacts(request_count=25)
+    for artifact in (baseline, candidate):
+        artifact["paired_budget_used"]["wall_seconds"] = 10801.0
+        _seal(artifact)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert baseline["paired_budget_used"]["model_requests"] > 3000
+    assert baseline["paired_budget_used"]["wall_seconds"] > 10800
+    assert result["observed_paired_outcomes"] == 608
+    assert result["verdict"] == "adopt"
+
+
+def test_missing_one_of_action_branch_is_rejected_by_compare_admission() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    catalog_key = "http:default"
+    catalog = CatalogSnapshot.model_validate(candidate["catalogs"][catalog_key])
+    tools = deepcopy(catalog.tools)
+    identity_tool = next(tool for tool in tools if tool.get("name") == "akb_identity")
+    identity_tool["inputSchema"]["oneOf"] = [
+        branch
+        for branch in identity_tool["inputSchema"]["oneOf"]
+        if branch["properties"]["action"]["const"] != "whoami"
+    ]
+    updated_catalog = CatalogSnapshot.model_validate(
+        {
+            **catalog.model_dump(mode="json"),
+            "tools": tools,
+            "catalog_hash": hash_json(tools),
+            "catalog_token_estimate": token_estimate(tools),
+        }
+    ).model_dump(mode="json")
+    candidate["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    candidate["pre_smoke_seal_inputs"]["catalogs"][catalog_key] = deepcopy(updated_catalog)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "redesign"
+    assert result["gate"]["checks"]["logical_function_omissions_zero"] is False
+    assert any("candidate catalog action akb_identity:whoami" in item for item in result["gate"]["logical_function_omissions"])
 
 
 def test_clear_failure_classification_uses_finite_opposite_one_sided_bounds() -> None:
@@ -132,6 +531,18 @@ def test_mutated_or_incomplete_artifacts_produce_inconclusive_verdicts() -> None
     assert "incomplete baseline" in incomplete["gate"]["reasons"][0]
 
 
+def test_compare_rejects_resealed_artifact_with_model_input_hash_drift() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    evidence = candidate["runs"]["primary:http"]["trials"][0]["model_input_evidence"][0]
+    evidence["model_input_canonical_json"] += " "
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "model input evidence integrity" in result["gate"]["reasons"][0]
+
+
 def test_independent_arm_evidence_cannot_be_adopted() -> None:
     baseline, candidate = complete_paired_artifacts()
     baseline.pop("paired_execution")
@@ -154,6 +565,47 @@ def test_provider_registry_drift_produces_inconclusive_verdict() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "provider_registry" in result["gate"]["reasons"][0]
+
+
+def test_different_model_routes_between_arms_are_not_paired() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    candidate["manifest"] = deepcopy(candidate["manifest"])
+    candidate["manifest"]["models"][0]["routing"]["order"] = ["akashml"]
+    candidate["run_manifest_hash"] = hash_json(candidate["manifest"])
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "paired artifacts differ in run_manifest_hash" in result["gate"]["reasons"][0]
+
+
+def test_compare_recomputes_response_route_against_the_sealed_provider_registry() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    evidence = candidate["runs"]["primary:http"]["trials"][0]["provider_evidence"][0]
+    evidence["routing"]["endpoints"]["available"][0]["model"] = evidence["model"]
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert any("trial routing flags" in reason for reason in result["gate"]["reasons"])
+
+
+def test_resealed_provider_canonical_identity_drift_is_not_admitted() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    model_id = "deepseek/deepseek-v4-flash-0731"
+
+    for artifact in (baseline, candidate):
+        model_row = artifact["provider_registry"]["model_list_snapshot"]["data"][0]
+        model_row["canonical_slug"] = "deepseek/deepseek-v4-flash-20260831"
+        artifact["provider_registry"]["models"][model_id]["model_record"] = deepcopy(model_row)
+    _reseal_provider_registry_pair(baseline, candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "canonical identity" in result["gate"]["reasons"][0]
 
 
 def test_missing_state_or_raw_call_evidence_is_rejected_after_resealing() -> None:
@@ -219,6 +671,20 @@ def test_resealed_shared_budget_mismatch_is_rejected() -> None:
 
     assert result["verdict"] == "inconclusive"
     assert "budget" in result["gate"]["reasons"][0]
+
+
+@pytest.mark.parametrize("retired_limit", ("max_model_requests", "max_wall_seconds"))
+def test_resealed_shared_budget_rejects_retired_limits(retired_limit: str) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    baseline["paired_budget_used"][retired_limit] = 3000
+    candidate["paired_budget_used"][retired_limit] = 3000
+    _seal(baseline)
+    _seal(candidate)
+
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "unexpected fields" in result["gate"]["reasons"][0]
 
 
 def test_external_compare_cli_writes_all_four_verdicts(tmp_path: Path) -> None:

@@ -173,7 +173,7 @@ const FILE_TOOLS = [
   {
     name: "akb_put_file",
     description:
-      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_update_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
+      "Upload the original local file as a standalone File resource in the vault's S3-backed file storage. Use this for PDFs, images, datasets, and any file that should remain an original file resource. This differs from the proxy-only `file` argument on akb_put, which reads local text into a Markdown document body. The response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` under a collection or `akb://{vault}/file/{uuid}` at the vault root; pass that exact URI to akb_delete_file to remove the uploaded file. MIME type is auto-detected from the filename extension unless overridden.",
     inputSchema: {
       type: "object",
       properties: {
@@ -271,7 +271,7 @@ const FILE_TOOLS = [
   },
   {
     name: "akb_get_file",
-    description: "Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from akb_browse or akb_put_file.",
+    description: 'Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from `akb_discover(action="browse")` or `akb_put_file`.',
     inputSchema: {
       type: "object",
       properties: {
@@ -847,17 +847,21 @@ export class AKBProxy {
   _decorateTools(resp) {
     const tools = (resp.tools || []).map((t) => {
       if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
+        const localFileDescription =
+          t.name === "akb_put"
+            ? "Local text-file path to read into the new Markdown document body. This creates a document, not a standalone File resource; use akb_put_file to upload the original file."
+            : "Local text-file path to read as the replacement Markdown document body. This updates a document, not a standalone File resource; use akb_put_file to upload the original file.";
         return {
           ...t,
+          description:
+            `${t.description || ""} The proxy-only file argument reads local text into the Markdown document body; it does not upload a standalone File resource. Use akb_put_file for the original file.`,
           inputSchema: {
             ...t.inputSchema,
             properties: {
               ...t.inputSchema.properties,
               file: {
                 type: "string",
-                description:
-                  "Local file path to read as document body (alternative to content). " +
-                  "Provide either file or content, not both.",
+                description: `${localFileDescription} Provide either file or content, not both.`,
               },
             },
           },

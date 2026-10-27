@@ -22,19 +22,26 @@ outcomes; task prompts do not name MCP tools.
   ordinary permission refusals, and a valid vault-skill acknowledgement retry
   are excluded. Harmless extra reads are recorded as overshoot. Forbidden
   mutation attempts and verified state-changing risk mutations are separate.
-- Provider routing is pinned to OpenRouter's `parasail` provider with `fp8`
-  quantization, no fallback, required parameter support, temperature 0, and an
-  8,192-token output limit. Model aliases and versions are pinned in
-  `config/run.json`. A provider model/endpoint registry snapshot is captured
-  before sealing; observed model or route drift makes the result inconclusive.
+- Provider routing is pinned per model in OpenRouter: `deepinfra` for the
+  primary model and `akashml` for the lightweight model. Both require `fp8`
+  quantization, disable fallback, and require support for tools, tool choice,
+  temperature, and max tokens. Model aliases and versions remain pinned in
+  `config/run.json`; the registered prompt/completion price ceilings are
+  `$0.06/$0.18` per million tokens for primary and `$0.225/$1.98` for
+  lightweight. A model/endpoint registry snapshot is captured before sealing.
+  Each response's selected canonical model and provider must match its unique
+  registered endpoint and usage receipt; compare recomputes that binding from
+  the sealed snapshot, and route drift makes the result inconclusive. Provider
+  slugs and fallback behavior follow OpenRouter's
+  [provider selection contract](https://openrouter.ai/docs/guides/routing/provider-selection).
 - SciPy `1.18.1` performs the registered paired, equal-weight cluster BCa
   bootstrap: 20,000 resamples, seed 358, one-sided 95% intervals. A degenerate
   or non-finite interval is inconclusive; no alternate interval is substituted.
-- The shared ledger caps the run at 3,000 provider requests, $50, and three
-  hours. Each trial is limited to 24 requests, $0.10, and 300 seconds. Provider
-  registry setup requests, smoke, failed requests, and resumed work count in
-  the shared request ledger. Arm order uses `akb-358-v1`; a completed paired
-  trial is reused on resume without retrying or selecting around outcomes.
+- The shared ledger enforces a $50 run ceiling and a $0.10 per-trial ceiling
+  with atomic worst-case reservations. Each individual provider request has a
+  300-second timeout. Request counts and elapsed time remain recorded as usage
+  evidence. Arm order uses `akb-358-v1`; a completed paired trial is reused on
+  resume without retrying or selecting around outcomes.
 
 ## Adoption gate and verdicts
 
@@ -116,11 +123,25 @@ uv run --locked --project eval/mcp-catalog \
   --candidate-checkpoint /private/run/candidate.checkpoint.json
 ```
 
-Each arm has its own checkpoint. Resume with the same checkpoint paths and
-`--resume`. The pre-smoke seal must match before any prior trial or smoke
-evidence is reused. Only complete outcomes with provider usage, cost, selected
-route, and state evidence are reused. The coordinator enforces the registered
-arm order and adds both checkpoints' prior usage to the shared ledger.
+Each arm has its own checkpoint. For a full paired resume, copy both parent
+artifacts and checkpoints to a working directory, pass the copied artifact
+paths as `--baseline-output` and `--candidate-output`, pass the copied
+checkpoints, and add `--resume`. The runner validates both artifacts and
+checkpoints before opening either checkpoint for writing; after validation,
+those working copies become the child outputs. The parent artifact supplies
+the exact manifest when the default `--manifest` is used, while the current
+task corpus and tool coverage must still match it.
+
+Completed and failed terminal outcomes are reused without retry. Smoke cells
+are reused from their sealed checkpoint. The coordinator continues the
+original event sequence and links a retry attempt to any start that has no
+terminal outcome. The paired ledger is restored once from its shared parent
+receipt, and the child records parent artifact/checkpoint hashes plus any
+accounting residual separately from per-trial receipts. It does not assign an
+unattributed residual to a trial.
+
+`--selection` runs an approved source-bound subset with its own operator plan
+and resume validation. It does not use the full-resume input contract above.
 
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.
@@ -143,5 +164,5 @@ cd ../..
 bash scripts/check.sh
 ```
 
-This implementation validates the benchmark contract without invoking paid
-provider requests or running the 608-outcome experiment.
+These checks validate the benchmark contract without invoking provider
+requests or starting the benchmark runtime.

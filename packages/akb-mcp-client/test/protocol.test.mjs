@@ -134,6 +134,15 @@ const CANDIDATE_BACKEND_TOOLS = CANDIDATE_BACKEND_NAMES.map((name) => ({
     : { type: "object", properties: {} },
 }));
 
+function collectDescriptions(value) {
+  if (Array.isArray(value)) return value.flatMap(collectDescriptions);
+  if (!value || typeof value !== "object") return [];
+  return Object.entries(value).flatMap(([key, child]) => [
+    ...(key === "description" && typeof child === "string" ? [child] : []),
+    ...collectDescriptions(child),
+  ]);
+}
+
 function waitForLine(lines, id, timeoutMs = 3000) {
   const existing = lines.find((line) => line?.id === id);
   if (existing) return Promise.resolve(existing);
@@ -365,6 +374,20 @@ async function testMixedCatalogProcess() {
     assert.ok(tools.some((tool) => tool.name === "akb_put_file"));
     assert.ok(!tools.some((tool) => tool.name === "akb_search"));
     assert.ok(!tools.some((tool) => tool.name === "akb_browse"));
+
+    const descriptions = collectDescriptions(tools);
+    assert.ok(descriptions.length > 0, "stdio catalog exposes tool descriptions");
+    assert.ok(
+      descriptions.every((description) => !/\bakb_browse\b/.test(description)),
+      "stdio tool descriptions must not name the retired akb_browse tool",
+    );
+    const getFile = tools.find((tool) => tool.name === "akb_get_file");
+    assert.ok(getFile);
+    assert.match(
+      getFile.description,
+      /akb_discover\(action="browse"\)/,
+      "file download points to the canonical browse action",
+    );
   } finally {
     await backend.close();
   }

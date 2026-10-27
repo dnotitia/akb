@@ -68,3 +68,22 @@ def test_reset_keeps_runtime_processes_and_reseeds_without_bootstrap() -> None:
     assert "_start_stdio_proxy" not in called
     assert {"_reset_postgres_in_place", "_seed_external_credential", "_mint_runtime_pat"} <= called
     assert "_clear_minio_objects" in referenced
+
+
+def test_reset_drops_only_run_owned_catalog_dynamic_tables_before_row_reset() -> None:
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    reset = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == "_reset_postgres_in_place"
+    )
+    sql = "\n".join(
+        node.value
+        for node in ast.walk(reset)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+    assert "schemaname = 'public'" in sql
+    assert "^vt_catalog_bench_[a-z0-9_]+$" in sql
+    assert "DROP TABLE %s CASCADE" in sql
+    assert "TRUNCATE TABLE %s RESTART IDENTITY CASCADE" in sql

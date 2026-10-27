@@ -679,6 +679,10 @@ akb_help(topic="link-resources")    # Workflow guide
 | depends_on | | Same-vault URIs of prerequisite documents |
 | related_to | | Same-vault URIs of related documents |
 
+In the stdio proxy, `file` is a local text-file path read into this Markdown
+document body. It creates a document; it does not upload the original file as a
+standalone File resource. Use `akb_put_file` for that.
+
 ## Examples
 
 **Simple note:**
@@ -1722,13 +1726,15 @@ For an image that should render *inside* Markdown, use `akb_put_image` instead.
 That path creates a hidden document attachment and returns the Markdown to embed.
 
 File tools (`akb_put_file`, `akb_get_file`, `akb_update_file`, `akb_delete_file`) work with local file paths —
-they are handled by the akb-mcp stdio proxy which streams files directly to/from S3.
+they are handled by the akb-mcp stdio proxy which streams files directly to/from S3. `akb_put_file`
+uploads the original file as a standalone File resource. This differs from
+`akb_put(file=...)`, which reads local text into a Markdown document body.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `akb_put_file` | Upload a local file to vault storage |
+| `akb_put_file` | Upload the original local file as a standalone File resource |
 | `akb_get_file` | Download a file to a local path |
 | `akb_update_file` | Replace a file with optional hash/version preconditions |
 | `akb_delete_file` | Delete a file |
@@ -1765,7 +1771,10 @@ akb_link(
 
     "akb_put_file": """# akb_put_file — Upload a Local File
 
-Uploads a file from local disk to vault storage. Handled by akb-mcp proxy (streams directly to S3).
+Uploads the original file from local disk to vault storage as a standalone File
+resource. Handled by akb-mcp proxy (streams directly to S3). This differs from
+the proxy-only `file` parameter on `akb_put`, which reads local text into a
+Markdown document body.
 
 ## Parameters
 | Param | Required | Description |
@@ -1782,7 +1791,7 @@ akb_put_file(vault="eng", file_path="/path/to/report.pdf", collection="reports",
 → {"uri": "akb://eng/file/abc123", "name": "report.pdf", "collection": "reports", "size_bytes": 128000}
 ```
 
-After upload, the file appears in `akb_discover (action: browse)` and can be linked with `akb_link` (use the returned `uri`).""",
+After upload, the file appears in `akb_discover (action: browse)` and can be linked with `akb_link`. Keep the returned canonical `uri` and pass that exact URI to `akb_delete_file` when removing this upload.""",
 
     "akb_link": """# akb_link — Connect Any Two Resources
 

@@ -5,24 +5,38 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
+import importlib.metadata
 import json
 import signal
+import subprocess
 import sys
 import time
+import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .contracts import load_json
+from .contracts import (
+    BenchmarkRunManifest,
+    TaskManifest,
+    load_run_manifest,
+    load_task_corpus,
+    load_tool_coverage,
+)
 from .evidence import write_json
 from .execution import BudgetLedger
+from .selection import ToolGuidanceSelection, build_selection_summary
 from .runner import (
     BenchmarkRunFailure,
     BenchmarkRunner,
     NeedsUserInput,
     PairedArmCoordinator,
+    _reconcile_paired_artifact_reservations,
     attach_paired_execution_evidence,
     compare_artifacts,
+    load_paired_resume_source,
+    load_selection_resume_source,
     load_inputs,
 )
 from .runtime import RuntimeContractError, RuntimeDescriptor
@@ -72,6 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
     paired.add_argument("--baseline-checkpoint", type=Path, required=True)
     paired.add_argument("--candidate-checkpoint", type=Path, required=True)
     paired.add_argument("--resume", action="store_true", help="resume both independent arm checkpoints")
+    paired.add_argument(
+        "--selection",
+        type=Path,
+        help="run only the approved AKB-361 tool-guidance regression identities",
+    )
+    paired.add_argument(
+        "--selection-summary-output",
+        type=Path,
+        help="write the selected trial and parent comparison summary separately from the full-corpus comparison",
+    )
 
     compare = subparsers.add_parser("compare", help="compare two completed arm artifacts")
     compare.add_argument("--baseline", type=Path, required=True)
@@ -222,33 +246,167 @@ async def run(args: argparse.Namespace) -> int:
     return 0 if artifact["status"] == "complete" else 1
 
 
+def _load_paired_resume_inputs(
+    args: argparse.Namespace,
+) -> tuple[BenchmarkRunManifest, list[TaskManifest], RuntimeDescriptor, RuntimeDescriptor]:
+    try:
+        source_artifact = json.loads(args.baseline_output.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read baseline paired resume manifest: {exc}") from exc
+    if not isinstance(source_artifact, dict):
+        raise ValueError("baseline paired resume artifact must be a JSON object")
+    try:
+        manifest = BenchmarkRunManifest.model_validate(source_artifact["manifest"])
+        raw_tasks = source_artifact["task_contracts"]
+        if not isinstance(raw_tasks, list):
+            raise ValueError("paired resume task contracts must be a list")
+        tasks = [TaskManifest.model_validate(item) for item in raw_tasks]
+    except Exception as exc:
+        raise ValueError(f"paired resume source run contract is invalid: {exc}") from exc
+
+    if args.manifest.resolve(strict=False) != DEFAULT_MANIFEST.resolve(strict=False):
+        if load_run_manifest(args.manifest) != manifest:
+            raise ValueError("explicit --manifest does not match the paired resume source")
+    if load_task_corpus(args.corpus) != tasks:
+        raise ValueError("--corpus does not match the paired resume source task contracts")
+    coverage = load_tool_coverage(args.coverage)
+    manifest.validate_tasks(tasks)
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
+    return (
+        manifest,
+        tasks,
+        RuntimeDescriptor.from_file(args.baseline_descriptor),
+        RuntimeDescriptor.from_file(args.candidate_descriptor),
+    )
+
+
 async def run_paired(args: argparse.Namespace) -> int:
-    baseline_manifest, baseline_tasks, baseline_descriptor = load_inputs(
-        args.manifest,
-        args.corpus,
-        args.baseline_descriptor,
-        args.coverage,
-    )
-    candidate_manifest, candidate_tasks, candidate_descriptor = load_inputs(
-        args.manifest,
-        args.corpus,
-        args.candidate_descriptor,
-        args.coverage,
-    )
+    full_resume = args.resume and getattr(args, "selection", None) is None
+    source_resume: dict[str, Any] | None = None
+    if full_resume:
+        source_paths = {
+            "baseline": args.baseline_output,
+            "candidate": args.candidate_output,
+        }
+        missing_sources = [arm for arm, path in source_paths.items() if not path.is_file()]
+        if missing_sources:
+            missing = ", ".join(
+                f"{arm} artifact ({source_paths[arm]})" for arm in missing_sources
+            )
+            raise ValueError(f"paired --resume requires both existing arm artifacts; missing {missing}")
+        baseline_manifest, baseline_tasks, baseline_descriptor, candidate_descriptor = (
+            _load_paired_resume_inputs(args)
+        )
+        source_resume = load_paired_resume_source(
+            artifact_paths={
+                "baseline": args.baseline_output,
+                "candidate": args.candidate_output,
+            },
+            checkpoint_paths={
+                "baseline": args.baseline_checkpoint,
+                "candidate": args.candidate_checkpoint,
+            },
+            manifest=baseline_manifest,
+            tasks=baseline_tasks,
+        )
+    else:
+        baseline_manifest, baseline_tasks, baseline_descriptor = load_inputs(
+            args.manifest,
+            args.corpus,
+            args.baseline_descriptor,
+            args.coverage,
+        )
+        candidate_manifest, candidate_tasks, candidate_descriptor = load_inputs(
+            args.manifest,
+            args.corpus,
+            args.candidate_descriptor,
+            args.coverage,
+        )
+        if baseline_manifest != candidate_manifest or baseline_tasks != candidate_tasks:
+            raise ValueError("paired arms must use identical manifest and corpus inputs")
+    if full_resume:
+        candidate_manifest, candidate_tasks = baseline_manifest, baseline_tasks
     if baseline_manifest != candidate_manifest or baseline_tasks != candidate_tasks:
         raise ValueError("paired arms must use identical manifest and corpus inputs")
-    if args.baseline_checkpoint == args.candidate_checkpoint:
-        raise ValueError("paired arms require independent checkpoint paths")
-    output_paths = {args.baseline_output, args.candidate_output, args.comparison_output}
-    if len(output_paths) != 3:
-        raise ValueError("paired arm and comparison outputs must use distinct paths")
+    selection_path = getattr(args, "selection", None)
+    summary_path = getattr(args, "selection_summary_output", None)
+    if selection_path is not None and summary_path is None:
+        raise ValueError("--selection requires --selection-summary-output")
+    if selection_path is None and summary_path is not None:
+        raise ValueError("--selection-summary-output requires --selection")
+    selection = (
+        ToolGuidanceSelection.load(selection_path, manifest=baseline_manifest, tasks=baseline_tasks)
+        if selection_path is not None
+        else None
+    )
+    if selection is not None:
+        baseline_manifest = selection.execution_manifest
+        candidate_manifest = selection.execution_manifest
+        if args.resume:
+            source_resume = load_selection_resume_source(
+                artifact_paths={
+                    "baseline": args.baseline_output,
+                    "candidate": args.candidate_output,
+                },
+                checkpoint_paths={
+                    "baseline": args.baseline_checkpoint,
+                    "candidate": args.candidate_checkpoint,
+                },
+                manifest=baseline_manifest,
+                tasks=baseline_tasks,
+                selection=selection,
+            )
+    destination_paths = {
+        args.baseline_output.resolve(strict=False),
+        args.candidate_output.resolve(strict=False),
+        args.comparison_output.resolve(strict=False),
+        args.baseline_checkpoint.resolve(strict=False),
+        args.candidate_checkpoint.resolve(strict=False),
+    }
+    if summary_path is not None:
+        destination_paths.add(summary_path.resolve(strict=False))
+    if len(destination_paths) != 5 + int(summary_path is not None):
+        raise ValueError("paired artifacts, checkpoints, and selection summary must use distinct paths")
+    if selection is not None:
+        protected_paths = {
+            selection.path.resolve(strict=False),
+            *(Path(parent["path"]).resolve(strict=False) for parent in selection.parents.values()),
+        }
+        if protected_paths.intersection(destination_paths):
+            raise ValueError("selection outputs must not overwrite the selection or parent artifacts")
+        selection_outputs = [args.baseline_output, args.candidate_output, args.comparison_output, summary_path]
+        if not args.resume and any(path.exists() for path in selection_outputs if path is not None):
+            raise ValueError("AKB-361 selection outputs must be new paths unless resuming its checkpoints")
 
     started = time.perf_counter()
-    coordinator = PairedArmCoordinator(baseline_manifest, baseline_tasks)
+    initial_events = (
+        source_resume["events"]
+        if source_resume is not None and selection is None
+        else None
+    )
+    coordinator = PairedArmCoordinator(
+        baseline_manifest,
+        baseline_tasks,
+        initial_events=initial_events,
+        selection=selection,
+    )
     ledger = BudgetLedger(
         baseline_manifest,
         wall_clock=lambda: max(0.0, time.perf_counter() - started),
+        total_cost_limit_usd=selection.budget.new_execution_limit_usd if selection is not None else None,
     )
+    if source_resume is not None:
+        source_budget = source_resume["budget_used"]
+        await ledger.restore_additive(
+            model_requests=source_budget["model_requests"] + source_budget["provider_setup_requests"],
+            provider_setup_requests=source_budget["provider_setup_requests"],
+            input_tokens=source_budget["input_tokens"],
+            output_tokens=source_budget["output_tokens"],
+            cost_usd=source_budget["cost_usd"],
+            wall_seconds=source_budget["wall_seconds"],
+            model_work_seconds=source_budget["model_work_seconds"],
+        )
     baseline_runner = BenchmarkRunner(
         baseline_manifest,
         baseline_tasks,
@@ -258,6 +416,8 @@ async def run_paired(args: argparse.Namespace) -> int:
         resume_path=args.baseline_checkpoint if args.resume else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
+        selection=selection,
+        paired_budget_restored=source_resume is not None,
     )
     candidate_runner = BenchmarkRunner(
         candidate_manifest,
@@ -268,21 +428,53 @@ async def run_paired(args: argparse.Namespace) -> int:
         resume_path=args.candidate_checkpoint if args.resume else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
+        selection=selection,
+        paired_budget_restored=source_resume is not None,
     )
+    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     run_tasks = {
         "baseline": asyncio.create_task(baseline_runner.run(), name="catalog-benchmark-baseline"),
         "candidate": asyncio.create_task(candidate_runner.run(), name="catalog-benchmark-candidate"),
     }
-    done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
-    primary_failure = next(
-        (exception for task in done if (exception := task.exception()) is not None),
-        None,
-    )
-    if primary_failure is not None:
-        for task in pending:
-            task.cancel()
-    results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
+    signal_received = asyncio.Event()
+
+    def handle_signal() -> None:
+        signal_received.set()
+        for task in run_tasks.values():
+            if not task.done():
+                task.cancel()
+
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signum, handle_signal)
+    try:
+        done, pending = await asyncio.wait(run_tasks.values(), return_when=asyncio.FIRST_EXCEPTION)
+        primary_failure: BaseException | None = None
+        for task in done:
+            try:
+                exception = task.exception()
+            except asyncio.CancelledError as exc:
+                exception = exc
+            if exception is not None:
+                primary_failure = exception
+                break
+        if primary_failure is not None:
+            for task in pending:
+                task.cancel()
+        results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
+    finally:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signum)
+    terminal_reserved_cost = ledger.reserved_cost_usd
     await ledger.release_all_reservations()
+
+    for arm, result in zip(run_tasks, results, strict=True):
+        if isinstance(result, asyncio.CancelledError):
+            finalize_checkpoint = getattr(runners[arm], "finalize_cancelled_checkpoint", None)
+            if callable(finalize_checkpoint):
+                await finalize_checkpoint()
 
     artifacts: dict[str, dict[str, Any]] = {}
     failures: list[BaseException] = []
@@ -291,13 +483,30 @@ async def run_paired(args: argparse.Namespace) -> int:
             artifacts[arm] = result.artifact
             failures.append(result)
         elif isinstance(result, BaseException):
+            checkpoints = {
+                "baseline": args.baseline_checkpoint,
+                "candidate": args.candidate_checkpoint,
+            }
+            artifacts[arm] = _paired_arm_failure_artifact(
+                arm,
+                result,
+                baseline_manifest,
+                checkpoints[arm],
+                runner=runners[arm],
+            )
+            if selection is not None:
+                artifacts[arm]["selection"] = selection.artifact_metadata()
             failures.append(result)
         else:
             artifacts[arm] = result
 
+    if source_resume is not None:
+        for artifact in artifacts.values():
+            artifact["resume_source"] = source_resume["metadata"]
+
     evidence = coordinator.evidence()
-    paired_budget = {
-        "model_requests": ledger.requests,
+    paired_budget: dict[str, int | float | str] = {
+        "model_requests": ledger.requests - ledger.provider_setup_requests,
         "provider_setup_requests": ledger.provider_setup_requests,
         "input_tokens": ledger.input_tokens,
         "output_tokens": ledger.output_tokens,
@@ -305,20 +514,41 @@ async def run_paired(args: argparse.Namespace) -> int:
         "cost_usd": float(ledger.cost_usd),
         "wall_seconds": ledger.observe_wall(),
         "model_work_seconds": ledger.model_work_seconds,
-        "max_model_requests": baseline_manifest.budget.max_model_requests,
         "max_total_cost_usd": baseline_manifest.budget.max_total_cost_usd,
-        "max_wall_seconds": baseline_manifest.budget.max_wall_seconds,
+        "final_reserved_cost_usd": str(terminal_reserved_cost),
     }
-    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
+    if selection is not None:
+        paired_budget["new_execution_limit_usd"] = str(selection.budget.new_execution_limit_usd)
+    _reconcile_paired_artifact_reservations(
+        artifacts,
+        paired_budget_used=paired_budget,
+        paired_run_terminal=all(task.done() for task in run_tasks.values()),
+    )
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
     for arm, artifact in artifacts.items():
-        attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
+        if selection is not None:
+            artifact.setdefault("selection", selection.artifact_metadata())
+        if isinstance(artifact.get("artifact_hash_input"), dict):
+            attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
+        else:
+            artifact["paired_execution"] = evidence
+            artifact["paired_budget_used"] = paired_budget
         write_json(outputs[arm], artifact, runners[arm].secrets)
     comparison = compare_artifacts(
         artifacts.get("baseline", {}),
         artifacts.get("candidate", {}),
     )
     write_json(args.comparison_output, comparison)
+    selection_summary: dict[str, Any] | None = None
+    if selection is not None and summary_path is not None:
+        selection_summary = build_selection_summary(
+            selection,
+            artifacts,
+            comparison,
+            manifest=baseline_manifest,
+            tasks=baseline_tasks,
+        )
+        write_json(summary_path, selection_summary)
     print(
         json.dumps(
             {
@@ -327,23 +557,143 @@ async def run_paired(args: argparse.Namespace) -> int:
                 "candidate": str(args.candidate_output),
                 "comparison": str(args.comparison_output),
                 "cost_usd": paired_budget["cost_usd"],
+                **(
+                    {
+                        "selection_status": selection_summary["status"],
+                        "selection_summary": str(summary_path),
+                    }
+                    if selection_summary is not None
+                    else {}
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
         )
     )
+    if selection_summary is not None:
+        return 0 if selection_summary["status"] == "complete" and not failures else 1
     return 0 if comparison["verdict"] == "adopt" and not failures else 1
 
 
+def _paired_arm_failure_artifact(
+    arm: str,
+    error: BaseException,
+    manifest: Any,
+    checkpoint_path: Path,
+    *,
+    runner: BenchmarkRunner | None = None,
+) -> dict[str, Any]:
+    cancelled = isinstance(error, asyncio.CancelledError)
+    artifact: dict[str, Any] = {
+        "schema_version": 2,
+        "status": "incomplete",
+        "arm": arm,
+        "source_revision": manifest.arm_source_revisions[arm],
+        "checkpoint_path": str(checkpoint_path),
+        "failure": {
+            "stage": "paired_execution",
+            "type": type(error).__name__,
+            "message": (
+                "paired arm was stopped after its peer failed before this arm produced a run artifact"
+                if cancelled
+                else "paired arm terminated before producing a run artifact"
+            ),
+        },
+        "incomplete_reasons": ["paired arm did not produce a benchmark artifact"],
+    }
+    store = getattr(runner, "_checkpoint_store", None) if runner is not None else None
+    if store is not None:
+        document = store.document
+        artifact["checkpoint"] = {
+            "enabled": True,
+            "path": str(checkpoint_path),
+            "new_trials": len(document.records) - document.reused_trial_count,
+            "reused_trials": document.reused_trial_count,
+            "rerun_trials": document.rerun_trial_count,
+            "record_count": len(document.records),
+            "lifecycle": document.lifecycle,
+            "reserved_cost_usd": document.reserved_cost_usd,
+            "smoke_status": document.smoke_status,
+            "smoke_cell_count": len(document.smoke_gate),
+            "selection_preflight": document.selection_preflight,
+            "spent": document.spent.model_dump(mode="json"),
+            "spent_hash": document.spent_hash,
+            "timing_hash": document.timing_hash,
+        }
+    return artifact
+
+
 def compare(args: argparse.Namespace) -> int:
-    baseline = load_json(args.baseline)
-    candidate = load_json(args.candidate)
+    baseline_path = Path(args.baseline).resolve(strict=True)
+    candidate_path = Path(args.candidate).resolve(strict=True)
+    baseline_bytes = baseline_path.read_bytes()
+    candidate_bytes = candidate_path.read_bytes()
+    baseline = json.loads(baseline_bytes)
+    candidate = json.loads(candidate_bytes)
     if not isinstance(baseline, dict) or not isinstance(candidate, dict):
         raise ValueError("run artifacts must be JSON objects")
     result = compare_artifacts(baseline, candidate)
+    result["comparison_provenance"] = {
+        "hash_scheme": "sha256_raw_file_bytes",
+        "inputs": {
+            "baseline": {
+                "path": str(baseline_path),
+                "file_sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+                "artifact_semantic_sha256": baseline.get("artifact_hash"),
+            },
+            "candidate": {
+                "path": str(candidate_path),
+                "file_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+                "artifact_semantic_sha256": candidate.get("artifact_hash"),
+            },
+        },
+        "verifier": _comparison_verifier_provenance(),
+    }
     write_json(args.output, result)
     print(json.dumps({"status": result["verdict"], "output": str(args.output)}, ensure_ascii=False, sort_keys=True))
     return 0 if result["verdict"] == "adopt" else 1
+
+
+def _comparison_verifier_provenance() -> dict[str, Any]:
+    try:
+        version = importlib.metadata.version("akb-mcp-catalog-benchmark")
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            with (PROJECT_ROOT / "pyproject.toml").open("rb") as stream:
+                version = str(tomllib.load(stream)["project"]["version"])
+        except (KeyError, OSError, tomllib.TOMLDecodeError):
+            version = "unknown"
+
+    repository_root = PROJECT_ROOT.parent.parent
+    try:
+        revision_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dirty_paths = [line[3:] for line in status_result.stdout.splitlines() if len(line) >= 4]
+        revision = revision_result.stdout.strip()
+        dirty: bool | None = bool(dirty_paths)
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+        dirty = None
+        dirty_paths = []
+    return {
+        "package": "akb-mcp-catalog-benchmark",
+        "version": version,
+        "git_revision": revision,
+        "tracked_worktree_dirty": dirty,
+        "tracked_dirty_paths": dirty_paths,
+    }
 
 
 if __name__ == "__main__":

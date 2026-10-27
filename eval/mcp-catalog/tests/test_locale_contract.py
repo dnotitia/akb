@@ -20,6 +20,7 @@ from mcp_catalog.execution import (
 )
 from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
 from mcp_catalog.runtime import StateObservation
+from paired_artifact_factory import provider_name_for_model
 from paired_artifact_factory import complete_paired_artifacts
 
 
@@ -142,6 +143,49 @@ def test_authorization_rubric_is_locale_specific_without_cross_language_terms() 
     assert not response_matches_rubric("Access is denied; I cannot change it.", korean)
     assert response_matches_rubric("Access is denied; I cannot change it.", english)
     assert not response_matches_rubric("권한이 없어 변경할 수 없습니다.", english)
+
+
+@pytest.mark.asyncio
+async def test_raw_arguments_must_match_the_captured_public_schema_without_coercion() -> None:
+    schema = {
+        "akb_identity": {
+            "type": "object",
+            "properties": {
+                "action": {"const": "search_users"},
+                "include_archived": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action", "include_archived", "limit"],
+            "additionalProperties": False,
+        }
+    }
+
+    async def succeed(_name: str, _arguments: dict[str, object]) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def bind(arguments: dict[str, object]) -> ToolCallRecord:
+        recorder = ToolCallRecorder(operation_map={"search": ["akb_identity"]}, secrets=())
+        recorder.set_input_schemas(schema)
+        await recorder(None, succeed, "akb_identity", arguments)
+        raw = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        return bind_tool_calls(
+            [("akb_identity", raw)],
+            recorder.calls,
+            recorder.operation_map,
+            (),
+            input_schemas=recorder.input_schemas,
+        )[0]
+
+    valid = await bind({"action": "search_users", "include_archived": True, "limit": 50})
+    stringified = await bind({"action": "search_users", "include_archived": "True", "limit": "50"})
+
+    assert valid.raw_args_valid is True
+    assert valid.public_schema_valid is True
+    assert valid.argument_valid is True
+    assert stringified.raw_args_valid is True
+    assert stringified.server_args_equal_raw is True
+    assert stringified.public_schema_valid is False
+    assert stringified.argument_valid is False
 
 
 @pytest.mark.asyncio
@@ -325,7 +369,11 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
     _manifest, tasks = _loaded()
     recovery_task = next(task for task in tasks if task.id == "invalid-recovery-en")
     auth_task = next(task for task in tasks if task.id == "authorization-readonly-en")
-    recovery_recorder = ToolCallRecorder(operation_map={"create": ["akb_create_vault"]}, secrets=())
+    recovery_recorder = ToolCallRecorder(
+        operation_map={"create": ["akb_create_vault"]},
+        secrets=(),
+        task=recovery_task,
+    )
     recovery_recorder.set_input_schemas(
         {"akb_create_vault": {"properties": {"public_access": {"default": "none"}}}}
     )
@@ -488,11 +536,20 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
     before = StateObservation(True, 200, {"vaults": []})
     after = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-recovery"}]})
 
-    def call(order: int, name: str, *, succeeded: bool, status_code: int | None = None, error_code: str | None = None) -> ToolCallRecord:
+    def call(
+        order: int,
+        name: str,
+        *,
+        stage_id: str,
+        succeeded: bool,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> ToolCallRecord:
         return ToolCallRecord(
             order=order,
             tool_name="akb_create_vault",
             logical_operation="create",
+            operation_kind="material",
             raw_model_args={"name": name},
             server_args={"name": name},
             effective_server_args={"name": name, "public_access": "none"},
@@ -501,6 +558,7 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
             server_succeeded=succeeded,
             server_status_code=status_code,
             server_error_code=error_code,
+            stage_id=stage_id,
         )
 
     skipped = TrialOutcome(
@@ -513,7 +571,7 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
         transport="http",
         final_answer_text="Created the recovery vault.",
         first_logical_operation="create",
-        tool_calls=[call(1, "catalog-bench-recovery", succeeded=True)],
+        tool_calls=[call(1, "catalog-bench-recovery", stage_id="create_vault_2", succeeded=True)],
     )
     skipped.finalize(task, before, after)
     assert skipped.tool_outcome_match is False
@@ -521,8 +579,8 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
 
     recovered = skipped.model_copy(deep=True)
     recovered.tool_calls = [
-        call(1, "bad/name", succeeded=False, status_code=400, error_code="invalid_argument"),
-        call(2, "catalog-bench-recovery", succeeded=True),
+        call(1, "bad/name", stage_id="create_vault_1", succeeded=False, status_code=400, error_code="invalid_argument"),
+        call(2, "catalog-bench-recovery", stage_id="create_vault_2", succeeded=True),
     ]
     recovered.final_answer_text = "The invalid name was rejected, then the recovery vault was created."
     recovered.finalize(task, before, after)
@@ -723,21 +781,21 @@ def test_stdio_pair_requires_the_ordered_file_image_document_trace(tmp_path: Pat
     for filename in ("sample-note.txt", "sample-image.png"):
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     markdown = "![benchmark sample image](/api/assets/fixture-image)"
-    file_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-note.txt"), "collection": ""}
-    image_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-image.png"), "alt_text": "benchmark sample image"}
-    document_args = {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "content": markdown, "type": "note", "status": "draft"}
+    file_args = {"vault": "catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-note.txt"), "collection": ""}
+    image_args = {"vault": "catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-image.png"), "alt_text": "benchmark sample image"}
+    document_args = {"vault": "catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "content": markdown, "type": "note", "status": "draft"}
     outcome = TrialOutcome(
         task_id=task.id, category=task.category, locale=task.locale, arm="baseline",
         model_class="primary", model_id="model", transport="stdio",
         final_answer_text="Uploaded the file, attached the image, and created the document.",
         first_logical_operation="identity",
         tool_calls=[
-            {"order": 1, "tool_name": "akb_whoami", "logical_operation": "identity", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 2, "tool_name": "akb_list_vaults", "logical_operation": "list", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 3, "tool_name": "akb_get", "logical_operation": "read", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 4, "tool_name": "akb_put_file", "logical_operation": "file_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": file_args},
-            {"order": 5, "tool_name": "akb_put_image", "logical_operation": "image_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": image_args, "result_fields": {"markdown": markdown}},
-            {"order": 6, "tool_name": "akb_put", "logical_operation": "create", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": document_args},
+            {"order": 1, "tool_name": "akb_whoami", "logical_operation": "identity", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 2, "tool_name": "akb_list_vaults", "logical_operation": "list", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 3, "tool_name": "akb_get", "logical_operation": "read", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 4, "tool_name": "akb_put_file", "logical_operation": "file_upload", "operation_kind": "material", "stage_id": "file_upload_file_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": file_args},
+            {"order": 5, "tool_name": "akb_put_image", "logical_operation": "image_upload", "operation_kind": "material", "stage_id": "image_upload_image_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": image_args, "result_fields": {"markdown": markdown}},
+            {"order": 6, "tool_name": "akb_put", "logical_operation": "create", "operation_kind": "material", "stage_id": "create_document_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": document_args},
         ],
     )
     state_before = StateObservation(True, 200, {"items": []})
@@ -834,6 +892,7 @@ def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -
                     server_args=arguments,
                     effective_server_args=effective_arguments,
                     raw_args_valid=True,
+                        public_schema_valid=True,
                     server_args_equal_raw=True,
                     transport_succeeded=True,
                     server_succeeded=True,
@@ -920,7 +979,17 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         total_tokens=12,
         model_requests=1,
         cost_usd=0.00001,
-        provider_evidence=[{"routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}}, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001}}],
+        provider_evidence=[{
+            "routing": {
+                "endpoints": {
+                    "available": [{
+                        "provider": provider_name_for_model(manifest.models[0]),
+                        "selected": True,
+                    }]
+                }
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+        }],
         provider_cost_usd=0.00001,
         cost_source="provider_response",
         routing_observed=True,
@@ -952,8 +1021,10 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         tmp_path / "checkpoint.json",
         header=header,
         expected_keys={hash_json(key.model_dump(mode="json")): key},
+        expected_tasks={task.id: task for task in tasks},
         expected_smoke_cells={},
     )
+    store.bind_pre_smoke_seal("e" * 64, {"status": "unavailable", "reason": "test fixture"})
     store.record_trial(key, outcome, status="completed")
     raw = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
     raw["records"][next(iter(raw["records"]))]["key"]["locale"] = "en-US"
@@ -964,6 +1035,7 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
             tmp_path / "checkpoint.json",
             header=header,
             expected_keys={hash_json(key.model_dump(mode="json")): key},
+            expected_tasks={task.id: task for task in tasks},
             expected_smoke_cells={},
             resume=True,
         )

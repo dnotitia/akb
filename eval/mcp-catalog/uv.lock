@@ -29,7 +29,9 @@ dependencies = [
     { name = "mcp-types" },
     { name = "pydantic-ai-slim", extra = ["mcp", "openai"] },
     { name = "pydantic-evals" },
+    { name = "pyyaml" },
     { name = "scipy" },
+    { name = "sqlglot" },
 ]
 
 [package.optional-dependencies]
@@ -55,8 +57,10 @@ requires-dist = [
     { name = "pydantic-evals", specifier = "==2.41.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.3" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "==1.3.0" },
+    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.16" },
     { name = "scipy", specifier = "==1.18.1" },
+    { name = "sqlglot", specifier = "==30.22.0" },
 ]
 provides-extras = ["dev", "server"]
 
@@ -1733,6 +1737,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
+
+[[package]]
+name = "sqlglot"
+version = "30.22.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e0/db58fbf2527426758dc1e862ce538736978e100e4e78fc9657e9661826ee/sqlglot-30.22.0.tar.gz", hash = "sha256:ec4b83ca8236ea8867f574a382dc15ce35b071c977fecfcc66482d9a3f500661", size = 6088770, upload-time = "2026-10-09T16:09:01.04Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/4c/b8474b02b572d9c7a2903e364335d566d52b6128b834b92a7cdfe5597823/sqlglot-30.22.0-py3-none-any.whl", hash = "sha256:90aa461490fcd95d14ec3842a97506ae20f6d3e9313307ad31be793d479cca65", size = 777816, upload-time = "2026-10-09T16:08:59.07Z" },
 ]
 
 [[package]]
