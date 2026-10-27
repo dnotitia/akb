@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import { UserMenu } from "@/components/user-menu";
 import { Logo } from "@/components/logo";
+import { ReadingWorkspaceProvider } from "@/contexts/reading-workspace-context";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { GlobalSearchDialog } from "@/components/global-search-dialog";
 import { HeaderIndexingStatus } from "@/components/header-indexing-status";
@@ -266,6 +267,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
     <SearchStatusProvider identity={activeFingerprint!} enabled={!revalidating}>
     <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
     <ResourceNavigationProvider>
+    <ReadingWorkspaceProvider>
     <VaultSwitcherProvider>
     <ResourceLocationProvider identity={activeFingerprint!} checking={revalidating} revision={accessRevision}>
     <SettingsDialogProvider identity={session.user.user_id}>
@@ -410,6 +412,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
         consult that workspace's guard without sharing breadcrumb state. */}
     {protectBackgroundDrafts && routeOverlay}
     </VaultSwitcherProvider>
+    </ReadingWorkspaceProvider>
     </ResourceNavigationProvider>
     {/* Route-backed previews share the shell's identity/access proof, but keep
         their own location and navigation scope. The inactive background must

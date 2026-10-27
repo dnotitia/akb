@@ -1,6 +1,6 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { Button } from "@/components/ui/button";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
@@ -33,6 +33,7 @@ interface DocumentViewProps {
   /** The resource shell owns commands; render only the reading surface. */
   bodyOnly?: boolean;
   idPrefix?: string;
+  leadingMetadata?: ReactNode;
 }
 
 /**
@@ -60,6 +61,7 @@ export function DocumentView({
   appearance = "plain",
   bodyOnly = false,
   idPrefix = "docview",
+  leadingMetadata,
 }: DocumentViewProps) {
   const queryClient = useQueryClient();
   const user = useCurrentUser();
@@ -134,6 +136,8 @@ export function DocumentView({
           <MarkdownRender
             markdown={doc.content || ""}
             summary={doc.summary}
+            leadingMetadata={leadingMetadata}
+            fallbackTitle={leadingMetadata ? doc.title : undefined}
             className="document-reading-flow"
             assetContext={{
               mode: "authenticated",
@@ -150,6 +154,7 @@ export function DocumentView({
           aria-label="Raw markdown source"
           className="document-reading-inset relative bg-surface"
         >
+          {leadingMetadata && <div className="document-reading-source document-source-identity"><h2>{doc.title}</h2>{leadingMetadata}</div>}
           <pre
             data-testid="doc-raw"
             className="document-reading-source m-0 wrap-anywhere overflow-x-auto whitespace-pre-wrap font-mono text-[13px] leading-[1.65] text-foreground"

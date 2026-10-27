@@ -2,7 +2,8 @@ import {
   MarkdownLocaleProvider,
   MarkdownViewer,
 } from "@akb/markdown-editor/react";
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
+import { parseMarkdown } from "@akb/markdown-editor";
 import "katex/dist/katex.min.css";
 import {
   createAkbMarkdownAdapters,
@@ -39,6 +40,8 @@ export interface MarkdownRenderProps {
   /** Embedded readers need unique anchors and headings below their section. */
   headingIdPrefix?: string;
   headingLevelOffset?: number;
+  leadingMetadata?: ReactNode;
+  fallbackTitle?: string;
 }
 
 export function MarkdownRender({
@@ -48,6 +51,8 @@ export function MarkdownRender({
   assetContext,
   headingIdPrefix = "",
   headingLevelOffset = 1,
+  leadingMetadata,
+  fallbackTitle,
 }: MarkdownRenderProps) {
   const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
   const authenticated =
@@ -83,12 +88,28 @@ export function MarkdownRender({
     }),
     [body, headingIdPrefix, headingLevelOffset],
   );
+  // A leading authored heading remains the title and keeps its original ID.
+  // Documents starting with another block receive a UI-only identity instead.
+  const structure = useMemo(() => {
+    if (!fallbackTitle) return null;
+    const blocks = parseMarkdown(body).content || [];
+    const first = blocks[0];
+    const paragraph = first?.type === "heading" ? blocks[1] : first;
+    const textOf = (node: typeof first): string => node?.text ?? node?.content?.map(textOf).join("") ?? "";
+    return { heading: first?.type === "heading", opening: paragraph?.type === "paragraph" ? textOf(paragraph) : "" };
+  }, [body, fallbackTitle]);
+  const summaryRepeatsOpening = Boolean(structure?.opening && summary?.trim().replace(/\s+/g, " ") === structure.opening.trim().replace(/\s+/g, " "));
+  const adornment = leadingMetadata || summary?.trim() ? <>
+    {!structure?.heading && fallbackTitle && <h2 className="document-fallback-title">{fallbackTitle}</h2>}
+    {leadingMetadata}
+    {summary?.trim() && !summaryRepeatsOpening && <DocumentSummary key={summary} summary={summary} />}
+  </> : undefined;
 
   return (
     <MarkdownLocaleProvider locale="en">
       <MarkdownViewer
         markdown={body}
-        afterLeadingHeading={summary?.trim() ? <DocumentSummary key={summary} summary={summary} /> : undefined}
+        afterLeadingHeading={adornment}
         className={cn(
           "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
           className,

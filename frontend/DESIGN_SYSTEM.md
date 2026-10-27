@@ -1,5 +1,28 @@
 # AKB Web — Design System
 
+Document pages use the Reading Studio layout with the shared AKB surface,
+text and teal interaction tokens in both themes. Bottom document tabs own navigation and per-view
+reading positions. A continuous command header spans the document and context columns. Direct
+relations open in an unframed right rail when actual workspace width permits;
+otherwise the labelled reference icon opens a sheet. The panel starts closed on
+entry and document-tab navigation. The icon shows the confirmed relation count,
+including zero; loading/error never implies a zero. Its visible word label is omitted;
+its accessible name, count description, tooltip and expanded state remain. The primary toolbar follows
+Preview/Raw → references + count → Copy → Edit → More. Edit is icon-only.
+More has one Document details entry containing the outline and Properties,
+plus copy fallbacks and lifecycle actions; the document rail has no whole-graph exploration action.
+Author, update time and
+draft/archive state sit under the document title on the reading measure. Internal document
+references open a read-only right pane (a modal sheet in narrow workspaces),
+with a separate Back history and explicit Keep in tabs action. Reference lists,
+previews and document details share one context column; map/list are exclusive
+views. The header keeps its baseline while that column changes. Search previews
+retain their existing route-backed modal and draft navigation guards.
+Tabs use a 40px bar with 12px labels on fine pointers and a 48px bar with
+44px targets on coarse pointers. Header and tab-bar hairlines have 12px side
+insets; tab separators stop short of the bar edges. Metadata remains below the
+title and is never part of copied Markdown.
+
 Unified with the **akb-platform family** (akb-platform + seahorse-mcp-agent-server):
 the Dnotitia palette, Pretendard typography, soft cool-gray surfaces, rounded
 corners, glass + aurora atmosphere.
@@ -1289,10 +1312,11 @@ an `sr-only` summary, never the only signal.
   text color, weight and cursor in both themes; product names such as
   `ConnectX-7` must not imply navigation. Explicit Markdown links keep their
   existing destination and availability feedback.
-  One flat command row keeps a quiet Author / Last edited byline on the left, with
-  icon-only Preview / Raw selection, Copy markdown, Edit, Document details
-  and overflow grouped on the right in that order. Edit and guide editing have named
-  tooltips and no visible text label. Read modes use a white/slate surface,
+  Full-page readers use the shared Reading Studio composition described above:
+  a continuous header with Preview / Raw, reference count, Copy, icon-only Edit and More.
+  Author, Last edited and lifecycle state sit below the authored title. Search
+  previews retain their compact byline in the command row with direct copy and
+  details controls. All icon-only actions keep named tooltips. Read modes use a white/slate surface,
   neutral outer stroke and sliding teal selection outline, without a gray inset
   or shadow. Keep radiogroup semantics, arrow/Home/End selection and one tab stop.
   Mode tooltips require a deliberate 600ms pointer hover. Focus and keyboard
@@ -1352,8 +1376,9 @@ an `sr-only` summary, never the only signal.
   Target the actual `.ProseMirror` / `.tableWrapper` DOM. Images retain aspect
   and natural size and shrink within the reading measure without stretching.
   Toolbar and canvas share `surface` without outer cards or duplicate title bands.
-  Document details has one labelled icon entry in the toolbar; there is no
-  permanent edge rail. It contains On this page followed by native Properties,
+  Full-page readers open the single Document details entry from More into the
+  shared context column, replacing references or a reference preview. Search
+  previews retain their labelled details icon. It contains On this page followed by native Properties,
   Version history and Related documents disclosures. Only the expanded section
   mounts its interactive content. Overflow Version history opens that disclosure
   and focuses its heading. With at least 48rem of actual reading width and

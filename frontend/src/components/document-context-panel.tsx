@@ -1,4 +1,6 @@
 import { useCallback, useId, useLayoutEffect, useRef, useState, type FocusEventHandler, type MouseEventHandler, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
+import { useReadingChrome } from "@/contexts/reading-chrome-context";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { DismissableLayer } from "@radix-ui/react-dismissable-layer";
 import { ChevronDown, X } from "lucide-react";
@@ -18,6 +20,8 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
   /** An explicit return target takes precedence over opening/disclosure focus. */
   focusTargetRef?: RefObject<HTMLElement | null>; onFocusTarget?: () => void;
 }) {
+  const readingChrome = useReadingChrome();
+  const embedded = Boolean(readingChrome && !readingChrome.narrow);
   const generatedId = useId();
   const id = suppliedId ?? generatedId;
   const markerRef = useRef<HTMLSpanElement>(null);
@@ -76,7 +80,7 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
       if (returningFromDialog) pendingInsideFocus.current = lastPanelFocus.current;
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
       const bounds = layout.getBoundingClientRect();
-      setDocked(bounds.width >= 48 * rem && bounds.height >= 20 * rem);
+      setDocked(embedded || bounds.width >= 48 * rem && bounds.height >= 20 * rem);
       if (returningFromDialog) requestAnimationFrame(() => { if (latestOpen.current && !hasForegroundDialog()) restoreInsideFocus(); });
     };
     measure();
@@ -84,7 +88,7 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
     observer?.observe(layout);
     layout.ownerDocument.addEventListener("focusin", measure);
     return () => { observer?.disconnect(); layout.ownerDocument.removeEventListener("focusin", measure); };
-  }, [hasForegroundDialog, modalCount, restoreInsideFocus]);
+  }, [hasForegroundDialog, modalCount, restoreInsideFocus, embedded]);
   useLayoutEffect(() => {
     // History can arrive after the panel opens. Keep the request in its caller
     // until the requested control is mounted and successfully receives focus.
@@ -115,18 +119,19 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
     if (!(event.target instanceof Element)) return;
     const href = event.target.closest("a")?.getAttribute("href");
     if (!href?.startsWith("#")) return;
-    const canvas = markerRef.current?.parentElement?.querySelector<HTMLElement>("#document-reading-canvas");
+    const canvas = (markerRef.current?.closest(".reading-studio") ?? markerRef.current?.parentElement)?.querySelector<HTMLElement>("#document-reading-canvas");
     const heading = canvas?.querySelector<HTMLElement>(`[id="${CSS.escape(href.slice(1))}"]`);
     if (!canvas || !heading) return;
     event.preventDefault();
     canvas.scrollTop += heading.getBoundingClientRect().top - canvas.getBoundingClientRect().top - canvas.clientTop;
   };
   const rememberFocus: FocusEventHandler<HTMLElement> = event => { if (event.target instanceof HTMLElement && event.currentTarget.contains(event.target)) lastPanelFocus.current = event.target; };
-  const body = <>
-    <div className="document-panel-heading">
+  const heading = <div className="document-panel-heading">
       {docked ? <h2 id={`${id}-heading`}>Document details</h2> : <DialogTitle>Document details</DialogTitle>}
       <Button ref={closeRef} type="button" variant="ghost" size="icon" aria-label="Close document panel" onClick={() => onOpenChange(false)}><X className="h-4 w-4" aria-hidden /></Button>
-    </div>
+    </div>;
+  const body = <>
+    {embedded && readingChrome?.contextHeaderHost ? createPortal(heading, readingChrome.contextHeaderHost) : heading}
     <div data-slot="document-context-scroll" className="document-panel-scroll rail-scroll rail-scroll-auto">
       <section className="document-panel-outline" aria-labelledby={`${id}-outline`}><h3 id={`${id}-outline`}>On this page</h3>{outline}</section>
       <div className="document-panel-sections">{sections.map(section => <details key={section.id} data-context-section={section.id} open={view === section.id}
@@ -136,7 +141,7 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
       </details>)}</div>
     </div>
   </>;
-  return <><span ref={markerRef} hidden /><Dialog open={open} onOpenChange={onOpenChange} modal={!docked}>
+  const panel = <><span ref={markerRef} hidden /><Dialog open={open} onOpenChange={onOpenChange} modal={!docked}>
     {docked ? open && <DismissableLayer asChild
       onEscapeKeyDown={event => {
         // Register above an enclosing preview's capture listener so Escape
@@ -155,4 +160,5 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
         onCloseAutoFocus={event => { event.preventDefault(); requestAnimationFrame(() => { if (latestOpen.current) restoreInsideFocus(); else restoreTrigger(); }); }}
         onFocusCapture={rememberFocus} onClickCapture={onPanelClick}>{body}</DialogPrimitive.Content></DialogPortal>}
   </Dialog></>;
+  return readingChrome?.detailsHost ? createPortal(panel, readingChrome.detailsHost) : panel;
 }

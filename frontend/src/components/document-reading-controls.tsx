@@ -111,8 +111,8 @@ export function DocumentCopyButton({ content, actionRef, returnFocusRef, hidden 
   </>;
 }
 
-export function DocumentReadModes({ view, onChange, idPrefix, contentId }: {
-  view: "rendered" | "raw"; onChange: (view: "rendered" | "raw") => void; idPrefix: string; contentId?: string;
+export function DocumentReadModes({ view, onChange, idPrefix, contentId, labelled = false }: {
+  view: "rendered" | "raw"; onChange: (view: "rendered" | "raw") => void; idPrefix: string; contentId?: string; labelled?: boolean;
 }) {
   const buttons = useRef<Array<HTMLButtonElement | null>>([]);
   const suppressTooltip = useRef(false);
@@ -122,7 +122,7 @@ export function DocumentReadModes({ view, onChange, idPrefix, contentId }: {
     { value: "raw" as const, label: "Raw markdown", Icon: Code2 },
   ];
   return <TooltipProvider delayDuration={600} skipDelayDuration={0}>
-    <div role="radiogroup" aria-label="Document view mode" className="document-read-modes shrink-0" data-mode={view}
+    <div role="radiogroup" aria-label="Document view mode" className="document-read-modes shrink-0" data-mode={view} data-labelled={labelled}
       onKeyDown={event => {
         const direction = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : ["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 0;
         const next = event.key === "Home" ? 0 : event.key === "End" ? modes.length - 1
@@ -145,7 +145,8 @@ export function DocumentReadModes({ view, onChange, idPrefix, contentId }: {
           <Button ref={element => { buttons.current[index] = element; }} type="button" variant="ghost" size="icon" role="radio"
             id={`${idPrefix}-mode-${mode.value}`} aria-label={mode.label} aria-checked={view === mode.value} aria-controls={contentId}
             tabIndex={view === mode.value ? 0 : -1} onClick={() => { suppressTooltip.current = true; setTooltipMode(null); onChange(mode.value); }} data-reader-control data-reader-icon>
-            <mode.Icon className="h-4 w-4" aria-hidden />
+            <mode.Icon className={labelled ? "document-mode-icon h-4 w-4" : "h-4 w-4"} aria-hidden />
+            {labelled && <span>{mode.value === "rendered" ? "Preview" : "Raw"}</span>}
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{mode.label}</TooltipContent>
