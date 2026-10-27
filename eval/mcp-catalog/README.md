@@ -140,9 +140,8 @@ receipt, and the child records parent artifact/checkpoint hashes plus any
 accounting residual separately from per-trial receipts. It does not assign an
 unattributed residual to a trial.
 
-`--amendment` and `--selection` are separate source-bound execution modes.
-They accept their own operator plans and do not use the full-resume input
-contract described above.
+`--selection` runs an approved source-bound subset with its own operator plan
+and resume validation. It does not use the full-resume input contract above.
 
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.
@@ -165,5 +164,5 @@ cd ../..
 bash scripts/check.sh
 ```
 
-This implementation validates the benchmark contract without invoking paid
-provider requests or running the 28-trial remeasurement.
+These checks validate the benchmark contract without invoking provider
+requests or starting the benchmark runtime.

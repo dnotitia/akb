@@ -14,6 +14,8 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_ai.models.openrouter import OpenRouterProviderConfig
 
+from .evidence import canonical_json
+
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 2
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -1354,10 +1356,6 @@ def public_arguments_match_schema(arguments: Any, schema: dict[str, Any]) -> boo
     except SchemaError:
         return False
     return validator_type(schema).is_valid(arguments)
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def hash_json(value: Any) -> str:

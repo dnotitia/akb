@@ -17,9 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .amendment import AmendmentPlan, CONTINUATION_RUN_CAP_USD
 from .contracts import (
-    ArmName,
     BenchmarkRunManifest,
     TaskManifest,
     load_run_manifest,
@@ -88,13 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     paired.add_argument("--baseline-checkpoint", type=Path, required=True)
     paired.add_argument("--candidate-checkpoint", type=Path, required=True)
     paired.add_argument("--resume", action="store_true", help="resume both independent arm checkpoints")
-    execution_plan = paired.add_mutually_exclusive_group()
-    execution_plan.add_argument(
-        "--amendment",
-        type=Path,
-        help="continue only the AKB-361 authorized missing outcomes into new child artifacts",
-    )
-    execution_plan.add_argument(
+    paired.add_argument(
         "--selection",
         type=Path,
         help="run only the approved AKB-361 tool-guidance regression identities",
@@ -290,11 +282,7 @@ def _load_paired_resume_inputs(
 
 
 async def run_paired(args: argparse.Namespace) -> int:
-    full_resume = (
-        args.resume
-        and getattr(args, "amendment", None) is None
-        and getattr(args, "selection", None) is None
-    )
+    full_resume = args.resume and getattr(args, "selection", None) is None
     source_resume: dict[str, Any] | None = None
     if full_resume:
         source_paths = {
@@ -380,33 +368,6 @@ async def run_paired(args: argparse.Namespace) -> int:
         destination_paths.add(summary_path.resolve(strict=False))
     if len(destination_paths) != 5 + int(summary_path is not None):
         raise ValueError("paired artifacts, checkpoints, and selection summary must use distinct paths")
-    amendment_path = getattr(args, "amendment", None)
-    continuation = (
-        AmendmentPlan.load(amendment_path, manifest=baseline_manifest, tasks=baseline_tasks)
-        if amendment_path is not None
-        else None
-    )
-    if continuation is not None and selection is not None:
-        raise ValueError("--selection and --amendment cannot be combined")
-    if continuation is not None:
-        output_paths = {
-            args.baseline_output.resolve(strict=False),
-            args.candidate_output.resolve(strict=False),
-            args.comparison_output.resolve(strict=False),
-            args.baseline_checkpoint.resolve(strict=False),
-            args.candidate_checkpoint.resolve(strict=False),
-        }
-        if continuation.source_paths.intersection(output_paths):
-            raise ValueError("AKB-361 continuation destinations must not overwrite parent evidence")
-        artifact_outputs = (args.baseline_output, args.candidate_output, args.comparison_output)
-        if not args.resume and any(path.exists() for path in artifact_outputs):
-            raise ValueError("AKB-361 continuation artifact outputs must be new paths")
-        child_checkpoints: dict[ArmName, Path] = {
-            "baseline": args.baseline_checkpoint,
-            "candidate": args.candidate_checkpoint,
-        }
-        continuation.seed_child_checkpoints(child_checkpoints, resume=args.resume)
-
     if selection is not None:
         protected_paths = {
             selection.path.resolve(strict=False),
@@ -419,20 +380,11 @@ async def run_paired(args: argparse.Namespace) -> int:
             raise ValueError("AKB-361 selection outputs must be new paths unless resuming its checkpoints")
 
     started = time.perf_counter()
-    if continuation is None:
-        initial_events = (
-            None
-            if selection is not None
-            else source_resume["events"]
-            if source_resume is not None
-            else None
-        )
-    elif args.resume:
-        initial_events = continuation.history_events_for_resume(
-            {"baseline": args.baseline_checkpoint, "candidate": args.candidate_checkpoint}
-        )
-    else:
-        initial_events = continuation.source_events
+    initial_events = (
+        source_resume["events"]
+        if source_resume is not None and selection is None
+        else None
+    )
     coordinator = PairedArmCoordinator(
         baseline_manifest,
         baseline_tasks,
@@ -442,13 +394,7 @@ async def run_paired(args: argparse.Namespace) -> int:
     ledger = BudgetLedger(
         baseline_manifest,
         wall_clock=lambda: max(0.0, time.perf_counter() - started),
-        total_cost_limit_usd=(
-            CONTINUATION_RUN_CAP_USD
-            if continuation is not None
-            else selection.budget.new_execution_limit_usd
-            if selection is not None
-            else None
-        ),
+        total_cost_limit_usd=selection.budget.new_execution_limit_usd if selection is not None else None,
     )
     if source_resume is not None:
         source_budget = source_resume["budget_used"]
@@ -467,10 +413,9 @@ async def run_paired(args: argparse.Namespace) -> int:
         baseline_descriptor,
         arm="baseline",
         checkpoint_path=args.baseline_checkpoint,
-        resume_path=args.baseline_checkpoint if args.resume or continuation is not None else None,
+        resume_path=args.baseline_checkpoint if args.resume else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
-        continuation=continuation,
         selection=selection,
         paired_budget_restored=source_resume is not None,
     )
@@ -480,10 +425,9 @@ async def run_paired(args: argparse.Namespace) -> int:
         candidate_descriptor,
         arm="candidate",
         checkpoint_path=args.candidate_checkpoint,
-        resume_path=args.candidate_checkpoint if args.resume or continuation is not None else None,
+        resume_path=args.candidate_checkpoint if args.resume else None,
         paired_coordinator=coordinator,
         shared_ledger=ledger,
-        continuation=continuation,
         selection=selection,
         paired_budget_restored=source_resume is not None,
     )
@@ -550,8 +494,6 @@ async def run_paired(args: argparse.Namespace) -> int:
                 checkpoints[arm],
                 runner=runners[arm],
             )
-            if continuation is not None:
-                artifacts[arm]["continuation_lineage"] = continuation.lineage
             if selection is not None:
                 artifacts[arm]["selection"] = selection.artifact_metadata()
             failures.append(result)
@@ -584,8 +526,6 @@ async def run_paired(args: argparse.Namespace) -> int:
     )
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
     for arm, artifact in artifacts.items():
-        if continuation is not None:
-            artifact.setdefault("continuation_lineage", continuation.lineage)
         if selection is not None:
             artifact.setdefault("selection", selection.artifact_metadata())
         if isinstance(artifact.get("artifact_hash_input"), dict):

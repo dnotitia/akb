@@ -279,7 +279,6 @@ class CheckpointStore:
         expected_tasks: Mapping[str, TaskManifest],
         expected_smoke_cells: Mapping[str, tuple[SmokeModelClass, str, SmokeTransport]],
         secrets: tuple[str, ...] = (),
-        continuation: dict[str, Any] | None = None,
         selection_preflight: dict[str, Any] | None = None,
         resume: bool = False,
         reuse_terminal_trials: bool = False,
@@ -294,7 +293,6 @@ class CheckpointStore:
             raise CheckpointError("checkpoint requires the registered task contracts")
         self.expected_smoke_cells = dict(expected_smoke_cells)
         self.secrets = secrets
-        self.continuation = continuation
         self.selection_preflight = selection_preflight
         self.reuse_terminal_trials = reuse_terminal_trials
         self.resumed_from_finalized = False
@@ -316,7 +314,6 @@ class CheckpointStore:
                 timing=initial_timing,
                 timing_hash=timing_hash(initial_timing),
                 selection_preflight=selection_preflight,
-                continuation=continuation,
             )
         if resume and self.document.lifecycle == "finalized":
             self.document.lifecycle = "open"
@@ -346,62 +343,6 @@ class CheckpointStore:
             raise CheckpointError("checkpoint run counters cannot be negative")
         self.document.reused_trial_count = reused_trials
         self.document.rerun_trial_count = rerun_trials
-        self._write_atomic()
-
-    def seed_continuation(self, document: CheckpointDocument) -> None:
-        """Atomically initialize a new child checkpoint from verified parent evidence."""
-
-        if self.continuation is None or document.continuation != self.continuation:
-            raise CheckpointError("continuation checkpoint lineage is missing or does not match")
-        if self.path.exists() or self.document.records or self.document.smoke_gate:
-            raise CheckpointError("continuation checkpoint seed requires a new empty destination")
-        if document.lifecycle != "open" or document.reserved_cost_usd != 0:
-            raise CheckpointError("continuation checkpoint seed must be open with no reservation")
-        if document.header.model_dump(exclude={"pre_smoke_seal_hash", "provider_registry_hash"}) != self.header.model_dump(
-            exclude={"pre_smoke_seal_hash", "provider_registry_hash"}
-        ):
-            raise CheckpointError("continuation checkpoint header does not match this run")
-        if (
-            document.provider_registry_snapshot is None
-            or document.header.provider_registry_hash != provider_registry_snapshot_hash(document.provider_registry_snapshot)
-            or document.header.pre_smoke_seal_hash is None
-        ):
-            raise CheckpointError("continuation checkpoint is missing its frozen provider registry seal")
-        if document.spent_hash != spent_hash(document.spent) or document.timing_hash != timing_hash(document.timing):
-            raise CheckpointError("continuation checkpoint accounting digest does not match")
-        for trial_record in document.records.values():
-            self._validate_key(trial_record.key)
-            if trial_record.record_hash != checkpoint_record_hash(
-                trial_record.status,
-                trial_record.key,
-                trial_record.outcome,
-            ):
-                raise CheckpointError("continuation checkpoint source record digest does not match")
-            if (
-                trial_record.status == "completed"
-                and not valid_completed_outcome(trial_record.outcome, self._task_for_outcome(trial_record.outcome))
-            ):
-                raise CheckpointError("continuation checkpoint contains an invalid completed trial")
-        for cell_key, smoke_record in document.smoke_gate.items():
-            if not self._smoke_cell_matches(cell_key, smoke_record):
-                raise CheckpointError(f"continuation checkpoint contains an invalid smoke cell: {cell_key}")
-            if smoke_record.record_hash != smoke_record_hash(
-                smoke_record.status,
-                smoke_record.model_class,
-                smoke_record.model_id,
-                smoke_record.transport,
-                smoke_record.outcome,
-            ):
-                raise CheckpointError("continuation checkpoint smoke record digest does not match")
-            if smoke_record.status == "completed" and not valid_smoke_outcome(
-                smoke_record.outcome,
-                self._task_for_outcome(smoke_record.outcome),
-            ):
-                raise CheckpointError(f"continuation checkpoint contains an invalid smoke cell: {cell_key}")
-        if set(document.smoke_gate) != set(self.expected_smoke_cells) or document.smoke_status != "passed":
-            raise CheckpointError("continuation checkpoint requires the complete parent smoke gate")
-        self.header = document.header
-        self.document = document
         self._write_atomic()
 
     def status_for(self, key: CheckpointKey) -> TrialStatus | None:
@@ -439,36 +380,22 @@ class CheckpointStore:
     def reusable_outcome_for(self, key: CheckpointKey) -> TrialOutcome | None:
         """Return a prior result eligible for reuse in this run mode."""
 
-        if self.continuation is None:
-            if self.reuse_terminal_trials:
-                record = self.document.records.get(checkpoint_key_digest(key))
-                if record is None or record.outcome.failure_kind == "interrupted":
-                    return None
-                if (
-                    record.status == "completed"
-                    and (
-                        not valid_completed_outcome(record.outcome, self._task_for_key(key))
-                        or not has_server_instructions_evidence(record.outcome)
-                    )
-                ):
-                    raise CheckpointError("selection checkpoint contains an invalid completed trial")
-                return record.outcome
-            record = self.document.records.get(checkpoint_key_digest(key))
-            if record is None or record.status == "incomplete":
-                return None
-            if record.status == "completed" and not valid_completed_outcome(
-                record.outcome,
-                self._task_for_key(key),
-            ):
-                raise CheckpointError("checkpoint contains an invalid completed trial")
-            return record.outcome
         record = self.document.records.get(checkpoint_key_digest(key))
-        if record is None:
+        if self.reuse_terminal_trials:
+            if record is None or record.outcome.failure_kind == "interrupted":
+                return None
+            if (
+                record.status == "completed"
+                and (
+                    not valid_completed_outcome(record.outcome, self._task_for_key(key))
+                    or not has_server_instructions_evidence(record.outcome)
+                )
+            ):
+                raise CheckpointError("selection checkpoint contains an invalid completed trial")
+            return record.outcome
+        if record is None or record.status == "incomplete":
             return None
-        if (
-            record.status == "completed"
-            and not valid_completed_outcome(record.outcome, self._task_for_key(key))
-        ):
+        if record.status == "completed" and not valid_completed_outcome(record.outcome, self._task_for_key(key)):
             raise CheckpointError("checkpoint contains an invalid completed trial")
         return record.outcome
 
@@ -871,8 +798,8 @@ class CheckpointStore:
             exclude={"pre_smoke_seal_hash", "provider_registry_hash"}
         ):
             raise CheckpointError("resume checkpoint exact-input header does not match this run")
-        if document.continuation != self.continuation:
-            raise CheckpointError("resume checkpoint amendment lineage does not match this run")
+        if document.continuation is not None:
+            raise CheckpointError("resume checkpoint contains retired amendment lineage")
         if document.selection_preflight != self.selection_preflight:
             raise CheckpointError("resume checkpoint selection preflight does not match this run")
         if document.provider_registry_snapshot is None:

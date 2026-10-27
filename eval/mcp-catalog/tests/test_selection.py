@@ -801,7 +801,6 @@ async def test_selection_run_passes_captured_catalog_evidence_through_real_runne
         candidate_checkpoint=tmp_path / "candidate-checkpoint.json",
         selection=selection.path,
         selection_summary_output=tmp_path / "selection-summary.json",
-        amendment=None,
         resume=False,
     )
     result = await cli_module.run_paired(args)

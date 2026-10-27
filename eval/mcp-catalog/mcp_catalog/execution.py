@@ -2568,43 +2568,45 @@ def error_details(
     secrets: tuple[str, ...] = (),
 ) -> tuple[int | None, str | None, dict[str, str]]:
     response = getattr(error, "response", None)
-    status_code = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    status_code = getattr(error, "status_code", None)
+    if type(status_code) is not int:
+        status_code = getattr(response, "status_code", None)
+    if type(status_code) is not int or not 100 <= status_code <= 599:
+        status_code = None
     error_code = getattr(error, "code", None)
     if error_code is None:
         error_code = getattr(response, "code", None)
-    if error_code is None and response is not None:
+    payloads: list[dict[str, Any]] = []
+    if response is not None:
         try:
             payload = response.json()
         except Exception:
             payload = None
         if isinstance(payload, dict):
-            detail = payload.get("detail")
-            if isinstance(detail, dict):
-                error_code = detail.get("code")
-            error_code = error_code or payload.get("code")
-    message = str(error)
+            payloads.append(payload)
+    if isinstance(error, ToolFailed):
+        try:
+            payload = json.loads(error.message)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            payloads.append(payload)
+
     identity: dict[str, str] = {}
-    for payload in _embedded_json_values(message):
-        if not isinstance(payload, dict):
-            continue
+    for payload in payloads:
         nested_error = payload.get("error")
-        payload_code = payload.get("code")
-        if payload_code is None and isinstance(nested_error, dict):
-            payload_code = nested_error.get("code")
-        if error_code is None and isinstance(payload_code, str):
-            error_code = payload_code
-        for source in (payload, nested_error if isinstance(nested_error, dict) else {}):
+        detail = payload.get("detail")
+        for source in (
+            detail if isinstance(detail, dict) else {},
+            nested_error if isinstance(nested_error, dict) else {},
+            payload,
+        ):
+            if error_code is None and isinstance(source.get("code"), str):
+                error_code = source["code"]
             for key in ("vault", "name", "table", "collection", "uri", "slug", "resource"):
                 value = source.get(key)
                 if isinstance(value, str) and value and len(value) <= 512:
                     identity[key] = redact_text(value, secrets)
-    if status_code is None and "403" in message:
-        status_code = 403
-    if error_code is None:
-        for candidate in ("permission_denied", "forbidden"):
-            if candidate in message.casefold():
-                error_code = candidate
-                break
     # PydanticAI raises ToolFailed only after receiving an MCP result with
     # isError=true. That is a completed application error, not an HTTP error.
     if isinstance(error, ToolFailed):

@@ -34,7 +34,6 @@ def _paired_resume_args(tmp_path: Path) -> argparse.Namespace:
         candidate_checkpoint=tmp_path / "candidate.checkpoint.json",
         selection=None,
         selection_summary_output=None,
-        amendment=None,
         resume=True,
     )
 
@@ -51,32 +50,29 @@ def _parent_file_state(paths: tuple[Path, ...]) -> dict[Path, tuple[bool, str | 
     return result
 
 
-def test_run_paired_accepts_the_akb361_amendment_operator() -> None:
-    args = cli_module.build_parser().parse_args(
-        [
-            "run-paired",
-            "--baseline-descriptor",
-            "baseline-descriptor.json",
-            "--candidate-descriptor",
-            "candidate-descriptor.json",
-            "--baseline-output",
-            "baseline.json",
-            "--candidate-output",
-            "candidate.json",
-            "--comparison-output",
-            "comparison.json",
-            "--baseline-checkpoint",
-            "baseline.checkpoint.json",
-            "--candidate-checkpoint",
-            "candidate.checkpoint.json",
-            "--amendment",
-            "operator.json",
-        ]
-    )
-
-    assert args.command == "run-paired"
-    assert args.amendment == Path("operator.json")
-    assert args.resume is False
+def test_run_paired_rejects_the_retired_amendment_flag() -> None:
+    with pytest.raises(SystemExit):
+        cli_module.build_parser().parse_args(
+            [
+                "run-paired",
+                "--baseline-descriptor",
+                "baseline-descriptor.json",
+                "--candidate-descriptor",
+                "candidate-descriptor.json",
+                "--baseline-output",
+                "baseline.json",
+                "--candidate-output",
+                "candidate.json",
+                "--comparison-output",
+                "comparison.json",
+                "--baseline-checkpoint",
+                "baseline.checkpoint.json",
+                "--candidate-checkpoint",
+                "candidate.checkpoint.json",
+                "--amendment",
+                "operator.json",
+            ]
+        )
 
 
 def test_compare_records_input_and_verifier_provenance(tmp_path: Path) -> None:
@@ -334,7 +330,6 @@ async def test_paired_sigint_finalizes_open_checkpoints_and_writes_available_out
         candidate_checkpoint=tmp_path / "candidate.checkpoint.json",
         selection=None,
         selection_summary_output=None,
-        amendment=None,
         resume=False,
     )
 

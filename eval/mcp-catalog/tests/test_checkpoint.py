@@ -425,49 +425,6 @@ def test_replacing_settled_checkpoint_row_does_not_double_spent_usage(tmp_path: 
     assert store.document.spent.output_tokens == completed.output_tokens
 
 
-def test_explicit_continuation_reuses_failed_parent_outcomes_without_retry(tmp_path: Path) -> None:
-    path = tmp_path / "continuation.checkpoint.json"
-    lineage = {"schema_version": 1, "work_item": "AKB-361"}
-    manifest, tasks, header, key, expected = _inputs()
-    store = CheckpointStore(
-        path,
-        header=header,
-        expected_keys=expected,
-        expected_tasks={task.id: task for task in tasks},
-        expected_smoke_cells={
-            "primary:http": ("primary", key.model_id, "http"),
-            "primary:stdio": ("primary", key.model_id, "stdio"),
-            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
-            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
-        },
-        continuation=lineage,
-    )
-    store.bind_pre_smoke_seal("e" * 64, _TEST_PROVIDER_REGISTRY)
-    failed = _outcome(key, error="recorded parent failure")
-    store.record_trial(key, failed, status="failed")
-
-    resumed = CheckpointStore(
-        path,
-        header=header,
-        expected_keys=expected,
-        expected_tasks={task.id: task for task in tasks},
-        expected_smoke_cells={
-            "primary:http": ("primary", key.model_id, "http"),
-            "primary:stdio": ("primary", key.model_id, "stdio"),
-            "lightweight:http": ("lightweight", "qwen/qwen3.8-27b", "http"),
-            "lightweight:stdio": ("lightweight", "qwen/qwen3.8-27b", "stdio"),
-        },
-        continuation=lineage,
-        resume=True,
-    )
-
-    assert resumed.completed_outcome_for(key) is None
-    assert resumed.reusable_outcome_for(key) == failed
-    assert resumed.status_for(key) == "failed"
-    assert resumed.document.continuation == lineage
-    assert manifest.budget.max_cost_per_trial_usd > 0
-
-
 def test_retired_request_limit_failure_kind_is_not_a_trial_compatibility_value() -> None:
     raw = _outcome(_inputs()[3], error="benchmark incomplete: max_model_requests exceeded").model_dump(mode="json")
     raw["failure_kind"] = "request_limit"

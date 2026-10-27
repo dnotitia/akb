@@ -24,7 +24,6 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 import httpx
 
 from .catalog import capture_catalog, input_schemas_from_catalog
-from .amendment import AmendmentPlan, validate_artifact_lineage
 from .checkpoint import (
     CheckpointHeader,
     CheckpointPairedEvent,
@@ -66,6 +65,7 @@ from .evidence import (
     validate_model_input_evidence,
     write_json,
 )
+from .historical_continuation import validate_artifact_lineage
 from .execution import (
     BudgetLedger,
     BudgetExceeded,
@@ -967,7 +967,6 @@ class BenchmarkRunner:
         resume_path: Path | None = None,
         paired_coordinator: PairedArmCoordinator | None = None,
         shared_ledger: BudgetLedger | None = None,
-        continuation: AmendmentPlan | None = None,
         selection: ToolGuidanceSelection | None = None,
         paired_budget_restored: bool = False,
     ) -> None:
@@ -981,13 +980,8 @@ class BenchmarkRunner:
         self.resume_path = resume_path
         self.paired_coordinator = paired_coordinator
         self.shared_ledger = shared_ledger
-        self.continuation = continuation
         self.selection = selection
         self.paired_budget_restored = paired_budget_restored
-        if continuation is not None and selection is not None:
-            raise ValueError("AKB-361 selection cannot reuse amendment continuation inputs")
-        if continuation is not None and paired_coordinator is None:
-            raise ValueError("AKB-361 continuation requires the paired execution coordinator")
         self.secrets: tuple[str, ...] = ()
         self._completed_trials: dict[str, list[TrialOutcome]] = defaultdict(list)
         self._checkpoint_store: CheckpointStore | None = None
@@ -1120,7 +1114,6 @@ class BenchmarkRunner:
             expected_tasks={task.id: task for task in self.tasks},
             expected_smoke_cells=expected_smoke,
             secrets=resolver.secret_values(),
-            continuation=(self.continuation.checkpoint_lineage[cast(ArmName, self.arm)] if self.continuation else None),
             selection_preflight=(self.selection.checkpoint_preflight() if self.selection is not None else None),
             resume=self.resume_path is not None,
             reuse_terminal_trials=self.selection is not None,
@@ -1345,11 +1338,6 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
             if checkpoint_doc.reserved_cost_usd != 0:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
-            if self.continuation is not None:
-                parent_count = self.continuation.parent_trial_count(cast(ArmName, self.arm))
-                checkpoint_evidence["reused_trials"] = parent_count
-                checkpoint_evidence["new_trials"] = max(0, checkpoint_record_count - parent_count)
-                checkpoint_evidence["rerun_trials"] = 0
         if ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
@@ -1475,11 +1463,6 @@ class BenchmarkRunner:
                 "error": redact_text(reason, self.secrets),
                 "cleanup_errors": [],
             }
-        if self.continuation is not None:
-            artifact["continuation_lineage"] = self.continuation.lineage
-            runtime_provenance = self.continuation.runtime_provenance_for(cast(ArmName, self.arm))
-            if runtime_provenance is not None:
-                artifact["continuation_runtime_provenance"] = runtime_provenance
         safe_artifact = safe_json(artifact, self.secrets)
         trial_order = [key.model_dump(mode="json") for key in self._planned_keys(runtime["source_revision"]).values()]
         hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order)
@@ -2170,25 +2153,11 @@ class BenchmarkRunner:
     ) -> None:
         local_inputs = self._local_pre_smoke_seal(runtime, catalogs)
         local_hash = hash_json(local_inputs)
-        continued_seal_hash: str | None = None
-        if self.continuation is not None:
-            arm = cast(ArmName, self.arm)
-            self.continuation.validate_pre_smoke_inputs(
-                arm,
-                local_inputs,
-                current_descriptor_raw=self.descriptor.raw,
-                runtime=runtime,
-                secrets=self.secrets,
-            )
-            continued_seal_hash = str(self.continuation.lineage["source_pre_smoke_seal_hash"])
-            self.pre_smoke_seal_inputs = self.continuation.parent_pre_smoke_inputs(arm)
-        else:
-            self.pre_smoke_seal_inputs = local_inputs
+        self.pre_smoke_seal_inputs = local_inputs
         self.pre_smoke_seal_hash = (
             await self.paired_coordinator.register_pre_smoke_seal(
                 cast(ArmName, self.arm),
                 local_hash,
-                continued_seal_hash=continued_seal_hash,
             )
             if self.paired_coordinator is not None
             else hash_json({self.arm: local_hash})
@@ -2586,9 +2555,7 @@ class BenchmarkRunner:
                 await resolver.prepare(fixture, profiles)
             self._refresh_secrets(resolver)
             current_stage = "provider_registry"
-            if self.continuation is not None:
-                self.provider_registry = self.continuation.parent_provider_registry()
-            elif self._checkpoint_store is not None and self.resume_path is not None:
+            if self._checkpoint_store is not None and self.resume_path is not None:
                 frozen_registry = self._checkpoint_store.document.provider_registry_snapshot
                 if frozen_registry is None:
                     raise RuntimeContractError(
@@ -2770,12 +2737,8 @@ class BenchmarkRunner:
                         await asyncio.to_thread(self._checkpoint_store.set_reserved_cost, 0.0)
                         await asyncio.to_thread(
                             self._checkpoint_store.set_run_counters,
-                            reused_trials=(
-                                self.continuation.parent_trial_count(cast(ArmName, self.arm))
-                                if self.continuation is not None
-                                else self._checkpoint_reused_trials
-                            ),
-                            rerun_trials=(0 if self.continuation is not None else self._checkpoint_rerun_trials),
+                            reused_trials=self._checkpoint_reused_trials,
+                            rerun_trials=self._checkpoint_rerun_trials,
                         )
                         await asyncio.to_thread(self._checkpoint_store.begin_closing)
             except Exception as exc:
@@ -4749,6 +4712,135 @@ def _build_artifact_hash_input(artifact: dict[str, Any], *, trial_order: list[di
     return hash_input
 
 
+def _load_resume_sources(
+    *,
+    artifact_paths: Mapping[ArmName, Path],
+    checkpoint_paths: Mapping[ArmName, Path],
+    manifest: BenchmarkRunManifest,
+    tasks: list[TaskManifest],
+    trial_order: Mapping[ArmName, list[dict[str, Any]]],
+) -> tuple[
+    dict[ArmName, dict[str, Any]],
+    dict[ArmName, CheckpointDocument],
+    dict[ArmName, dict[str, Any]],
+]:
+    """Validate the common artifact and checkpoint identity before resume-specific checks."""
+
+    manifest_data = manifest.model_dump(mode="json")
+    manifest_digest = hash_json(manifest_data)
+    task_data = [task.model_dump(mode="json") for task in tasks]
+    corpus_digest = hash_json(task_data)
+    expected_order_plan = [
+        {
+            "task_id": task.id,
+            "repeat_index": repeat_index,
+            "arm_order": list(planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)),
+        }
+        for repeat_index in range(1, manifest.repeats + 1)
+        for task in tasks
+    ]
+    source_artifacts: dict[ArmName, dict[str, Any]] = {}
+    source_checkpoints: dict[ArmName, CheckpointDocument] = {}
+    source_hashes: dict[ArmName, dict[str, Any]] = {}
+
+    for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
+        try:
+            artifact_bytes = artifact_paths[arm].read_bytes()
+            checkpoint_bytes = checkpoint_paths[arm].read_bytes()
+            artifact = json.loads(artifact_bytes)
+            checkpoint_raw = json.loads(checkpoint_bytes)
+        except OSError as exc:
+            raise ValueError(f"cannot read {arm} resume source: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{arm} resume source is invalid JSON") from exc
+        if not isinstance(artifact, dict) or not isinstance(checkpoint_raw, dict):
+            raise ValueError(f"{arm} resume source must be JSON objects")
+        try:
+            checkpoint = CheckpointDocument.model_validate(checkpoint_raw)
+        except Exception as exc:
+            raise ValueError(f"{arm} resume checkpoint contract validation failed: {exc}") from exc
+
+        if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
+            raise ValueError(f"{arm} resume artifact identity is invalid")
+        if artifact.get("run_manifest_hash") != manifest_digest or artifact.get("manifest") != manifest_data:
+            raise ValueError(f"{arm} resume artifact does not match the current run manifest")
+        if artifact.get("task_corpus_hash") != corpus_digest or artifact.get("task_contracts") != task_data:
+            raise ValueError(f"{arm} resume artifact does not match the current task corpus")
+        if artifact.get("task_ids") != [task.id for task in tasks]:
+            raise ValueError(f"{arm} resume artifact task order changed")
+        if artifact.get("source_revision") != manifest.arm_source_revisions[arm]:
+            raise ValueError(f"{arm} resume artifact source revision changed")
+        if artifact.get("paired_order_plan") != expected_order_plan:
+            raise ValueError(f"{arm} resume artifact paired order changed")
+        hash_input = artifact.get("artifact_hash_input")
+        if not isinstance(hash_input, dict) or hash_input.get("trial_order") != trial_order[arm]:
+            raise ValueError(f"{arm} resume artifact trial order changed")
+        try:
+            recalculated_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order[arm])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{arm} resume artifact hash input is invalid") from exc
+        if recalculated_hash_input != hash_input or artifact.get("artifact_hash") != hash_json(hash_input):
+            raise ValueError(f"{arm} resume artifact hash does not match its contents")
+
+        header = checkpoint.header
+        provider_registry = artifact.get("provider_registry")
+        if not isinstance(provider_registry, dict):
+            raise ValueError(f"{arm} resume artifact provider registry is invalid")
+        if (
+            checkpoint.lifecycle != "finalized"
+            or checkpoint.reserved_cost_usd != 0
+            or checkpoint.continuation is not None
+            or header.arm != arm
+            or header.source_revision != manifest.arm_source_revisions[arm]
+            or header.run_manifest_hash != manifest_digest
+            or header.task_corpus_hash != corpus_digest
+            or header.pre_smoke_seal_hash != artifact.get("pre_smoke_seal_hash")
+            or header.provider_registry_hash != provider_registry.get("snapshot_hash")
+            or checkpoint.spent_hash != spent_hash(checkpoint.spent)
+            or checkpoint.timing_hash != timing_hash(checkpoint.timing)
+        ):
+            raise ValueError(f"{arm} resume checkpoint header or accounting digest changed")
+        if checkpoint.provider_registry_snapshot is None or (
+            provider_registry_snapshot_hash(checkpoint.provider_registry_snapshot) != header.provider_registry_hash
+        ):
+            raise ValueError(f"{arm} resume checkpoint provider registry seal is invalid")
+
+        receipt = artifact.get("checkpoint")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"{arm} resume artifact is missing its checkpoint receipt")
+        for name, value in (
+            ("lifecycle", checkpoint.lifecycle),
+            ("record_count", len(checkpoint.records)),
+            ("reserved_cost_usd", checkpoint.reserved_cost_usd),
+            ("smoke_status", checkpoint.smoke_status),
+            ("smoke_cell_count", len(checkpoint.smoke_gate)),
+            ("provider_registry_hash", header.provider_registry_hash),
+            ("spent", checkpoint.spent.model_dump(mode="json")),
+            ("spent_hash", checkpoint.spent_hash),
+            ("timing", checkpoint.timing.model_dump(mode="json")),
+            ("timing_hash", checkpoint.timing_hash),
+        ):
+            if receipt.get(name) != value:
+                raise ValueError(f"{arm} resume checkpoint receipt does not match {name}")
+
+        source_artifacts[arm] = artifact
+        source_checkpoints[arm] = checkpoint
+        source_hashes[arm] = {
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "artifact_hash": artifact.get("artifact_hash"),
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "checkpoint_spent_hash": checkpoint.spent_hash,
+            "source_revision": artifact.get("source_revision"),
+            "protocol_revision": artifact.get("protocol_revision"),
+            "parent_evaluator_commit": (
+                artifact.get("evaluator_commit") if isinstance(artifact.get("evaluator_commit"), str) else None
+            ),
+            "parent_evaluator_commit_recorded": isinstance(artifact.get("evaluator_commit"), str),
+        }
+
+    return source_artifacts, source_checkpoints, source_hashes
+
+
 def load_paired_resume_source(
     *,
     artifact_paths: Mapping[ArmName, Path],
@@ -4806,112 +4898,28 @@ def load_paired_resume_source(
                             expected_keys[arm][(cell, task.id, repeat_index, arm)].model_dump(mode="json")
                         )
 
-    expected_order_plan = [
-        {
-            "task_id": task.id,
-            "repeat_index": repeat_index,
-            "arm_order": list(planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)),
-        }
-        for repeat_index in range(1, manifest.repeats + 1)
-        for task in tasks
-    ]
-    source_artifacts: dict[ArmName, dict[str, Any]] = {}
-    source_checkpoints: dict[ArmName, CheckpointDocument] = {}
-    source_hashes: dict[ArmName, dict[str, Any]] = {}
+    source_artifacts, source_checkpoints, source_hashes = _load_resume_sources(
+        artifact_paths=artifact_paths,
+        checkpoint_paths=checkpoint_paths,
+        manifest=manifest,
+        tasks=tasks,
+        trial_order=trial_order,
+    )
     outcome_costs: dict[ArmName, Decimal] = {"baseline": Decimal("0"), "candidate": Decimal("0")}
     execution: dict[str, Any] | None = None
     shared_budget: dict[str, Any] | None = None
 
     for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
-        try:
-            artifact_bytes = artifact_paths[arm].read_bytes()
-            checkpoint_bytes = checkpoint_paths[arm].read_bytes()
-            artifact = json.loads(artifact_bytes)
-            checkpoint_raw = json.loads(checkpoint_bytes)
-        except OSError as exc:
-            raise ValueError(f"cannot read {arm} paired resume source: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{arm} paired resume source is invalid JSON") from exc
-        if not isinstance(artifact, dict) or not isinstance(checkpoint_raw, dict):
-            raise ValueError(f"{arm} paired resume source must be JSON objects")
-        try:
-            checkpoint = CheckpointDocument.model_validate(checkpoint_raw)
-        except Exception as exc:
-            raise ValueError(f"{arm} paired resume checkpoint contract validation failed: {exc}") from exc
-
-        if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
-            raise ValueError(f"{arm} paired resume artifact identity is invalid")
-        if artifact.get("run_manifest_hash") != manifest_digest or artifact.get("manifest") != manifest_data:
-            raise ValueError(f"{arm} paired resume artifact does not match the current run manifest")
-        if artifact.get("task_corpus_hash") != corpus_digest or artifact.get("task_contracts") != task_data:
-            raise ValueError(f"{arm} paired resume artifact does not match the current task corpus")
-        if artifact.get("task_ids") != [task.id for task in tasks]:
-            raise ValueError(f"{arm} paired resume artifact task order changed")
-        if artifact.get("source_revision") != manifest.arm_source_revisions[arm]:
-            raise ValueError(f"{arm} paired resume artifact source revision changed")
-        if artifact.get("paired_order_plan") != expected_order_plan:
-            raise ValueError(f"{arm} paired resume artifact paired order changed")
-        hash_input = artifact.get("artifact_hash_input")
-        if not isinstance(hash_input, dict) or hash_input.get("trial_order") != trial_order[arm]:
-            raise ValueError(f"{arm} paired resume artifact trial order changed")
-        try:
-            recalculated_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order[arm])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{arm} paired resume artifact hash input is invalid") from exc
-        if recalculated_hash_input != hash_input or artifact.get("artifact_hash") != hash_json(hash_input):
-            raise ValueError(f"{arm} paired resume artifact hash does not match its contents")
-
-        if (
-            checkpoint.lifecycle != "finalized"
-            or checkpoint.reserved_cost_usd != 0
-            or checkpoint.smoke_status != "passed"
-            or checkpoint.continuation is not None
-            or checkpoint.selection_preflight is not None
-        ):
+        artifact = source_artifacts[arm]
+        checkpoint = source_checkpoints[arm]
+        if checkpoint.smoke_status != "passed" or checkpoint.selection_preflight is not None:
             raise ValueError(f"{arm} paired resume checkpoint is not a finalized full-run source")
-        header = checkpoint.header
-        provider_registry = artifact.get("provider_registry")
-        if not isinstance(provider_registry, dict):
-            raise ValueError(f"{arm} paired resume artifact provider registry is invalid")
-        if (
-            header.arm != arm
-            or header.source_revision != manifest.arm_source_revisions[arm]
-            or header.run_manifest_hash != manifest_digest
-            or header.task_corpus_hash != corpus_digest
-            or header.pre_smoke_seal_hash != artifact.get("pre_smoke_seal_hash")
-            or header.provider_registry_hash != provider_registry.get("snapshot_hash")
-            or checkpoint.spent_hash != spent_hash(checkpoint.spent)
-            or checkpoint.timing_hash != timing_hash(checkpoint.timing)
-        ):
-            raise ValueError(f"{arm} paired resume checkpoint header or accounting digest changed")
-        if checkpoint.provider_registry_snapshot is None or (
-            provider_registry_snapshot_hash(checkpoint.provider_registry_snapshot) != header.provider_registry_hash
-        ):
-            raise ValueError(f"{arm} paired resume checkpoint provider registry seal is invalid")
         if len(checkpoint.smoke_gate) != 4 or set(checkpoint.smoke_gate) != {
             f"{model.class_name}:{transport}"
             for model in manifest.models
             for transport in manifest.transports
         }:
             raise ValueError(f"{arm} paired resume checkpoint smoke gate is incomplete")
-
-        receipt = artifact.get("checkpoint")
-        if not isinstance(receipt, dict):
-            raise ValueError(f"{arm} paired resume artifact is missing its checkpoint receipt")
-        for name, value in (
-            ("lifecycle", checkpoint.lifecycle),
-            ("record_count", len(checkpoint.records)),
-            ("reserved_cost_usd", checkpoint.reserved_cost_usd),
-            ("smoke_status", checkpoint.smoke_status),
-            ("smoke_cell_count", len(checkpoint.smoke_gate)),
-            ("provider_registry_hash", header.provider_registry_hash),
-            ("spent", checkpoint.spent.model_dump(mode="json")),
-            ("spent_hash", checkpoint.spent_hash),
-            ("timing", checkpoint.timing.model_dump(mode="json")),
-            ("timing_hash", checkpoint.timing_hash),
-        ):
-            if receipt.get(name) != value:
-                raise ValueError(f"{arm} paired resume checkpoint receipt does not match {name}")
 
         raw_trials: dict[tuple[str, str, int, ArmName], dict[str, Any]] = {}
         raw_statuses: dict[tuple[str, str, int, ArmName], str] = {}
@@ -5030,21 +5038,6 @@ def load_paired_resume_source(
             shared_budget = budget
         elif paired != execution or budget != shared_budget:
             raise ValueError("paired resume artifacts disagree on shared execution or budget evidence")
-        source_artifacts[arm] = artifact
-        source_checkpoints[arm] = checkpoint
-        source_hashes[arm] = {
-            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-            "artifact_hash": artifact.get("artifact_hash"),
-            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
-            "checkpoint_spent_hash": checkpoint.spent_hash,
-            "source_revision": artifact.get("source_revision"),
-            "protocol_revision": artifact.get("protocol_revision"),
-            "parent_evaluator_commit": (
-                artifact.get("evaluator_commit") if isinstance(artifact.get("evaluator_commit"), str) else None
-            ),
-            "parent_evaluator_commit_recorded": isinstance(artifact.get("evaluator_commit"), str),
-        }
-
     assert execution is not None and shared_budget is not None
     if execution.get("mode") != manifest.paired_order or execution.get("seed") != manifest.paired_order_seed:
         raise ValueError("paired resume source changed its preregistered order")
@@ -5368,109 +5361,36 @@ def load_selection_resume_source(
                         expected_keys[arm][identity] = key
                         trial_order[arm].append(key.model_dump(mode="json"))
 
-    expected_order_plan = [
-        {
-            "task_id": task.id,
-            "repeat_index": repeat_index,
-            "arm_order": list(planned_arm_order(task.id, repeat_index, manifest.paired_order_seed)),
-        }
-        for repeat_index in range(1, manifest.repeats + 1)
-        for task in tasks
-    ]
-    source_artifacts: dict[ArmName, dict[str, Any]] = {}
-    source_checkpoints: dict[ArmName, CheckpointDocument] = {}
-    source_hashes: dict[ArmName, dict[str, Any]] = {}
+    source_artifacts, source_checkpoints, source_hashes = _load_resume_sources(
+        artifact_paths=artifact_paths,
+        checkpoint_paths=checkpoint_paths,
+        manifest=manifest,
+        tasks=tasks,
+        trial_order=trial_order,
+    )
     selection_events: dict[int, dict[str, Any]] = {}
     shared_execution: dict[str, Any] | None = None
     shared_budget: dict[str, Any] | None = None
     outcome_costs: list[Decimal] = []
 
     for arm in (cast(ArmName, "baseline"), cast(ArmName, "candidate")):
-        try:
-            artifact_bytes = artifact_paths[arm].read_bytes()
-            checkpoint_bytes = checkpoint_paths[arm].read_bytes()
-            artifact = json.loads(artifact_bytes)
-            checkpoint_raw = json.loads(checkpoint_bytes)
-        except OSError as exc:
-            raise ValueError(f"cannot read {arm} selection resume source: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{arm} selection resume source is invalid JSON") from exc
-        if not isinstance(artifact, dict) or not isinstance(checkpoint_raw, dict):
-            raise ValueError(f"{arm} selection resume source must be JSON objects")
-        try:
-            checkpoint = CheckpointDocument.model_validate(checkpoint_raw)
-        except Exception as exc:
-            raise ValueError(f"{arm} selection resume checkpoint contract validation failed: {exc}") from exc
-
-        if artifact.get("schema_version") != 2 or artifact.get("arm") != arm:
-            raise ValueError(f"{arm} selection resume artifact identity is invalid")
+        artifact = source_artifacts[arm]
+        checkpoint = source_checkpoints[arm]
         if artifact.get("selection") != selection.artifact_metadata():
             raise ValueError(f"{arm} selection resume artifact does not match the approved selection")
-        if artifact.get("manifest") != manifest_data or artifact.get("run_manifest_hash") != manifest_digest:
-            raise ValueError(f"{arm} selection resume artifact does not match the execution manifest")
-        if artifact.get("task_contracts") != task_data or artifact.get("task_corpus_hash") != corpus_digest:
-            raise ValueError(f"{arm} selection resume artifact does not match the task corpus")
-        if artifact.get("task_ids") != [task.id for task in tasks]:
-            raise ValueError(f"{arm} selection resume artifact task order changed")
-        if artifact.get("source_revision") != manifest.arm_source_revisions[arm]:
-            raise ValueError(f"{arm} selection resume artifact source revision changed")
-        if artifact.get("paired_order_plan") != expected_order_plan:
-            raise ValueError(f"{arm} selection resume artifact paired order changed")
-        hash_input = artifact.get("artifact_hash_input")
-        if not isinstance(hash_input, dict) or hash_input.get("trial_order") != trial_order[arm]:
-            raise ValueError(f"{arm} selection resume artifact trial order changed")
-        try:
-            recalculated_hash_input = _build_artifact_hash_input(artifact, trial_order=trial_order[arm])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{arm} selection resume artifact hash input is invalid") from exc
-        if recalculated_hash_input != hash_input or artifact.get("artifact_hash") != hash_json(hash_input):
-            raise ValueError(f"{arm} selection resume artifact hash does not match its contents")
-
-        header = checkpoint.header
         provider_registry = artifact.get("provider_registry")
         if (
-            checkpoint.lifecycle != "finalized"
-            or checkpoint.reserved_cost_usd != 0
-            or checkpoint.smoke_status is not None
+            checkpoint.smoke_status is not None
             or checkpoint.smoke_gate
-            or checkpoint.continuation is not None
             or checkpoint.selection_preflight != selection.checkpoint_preflight()
-            or header.arm != arm
-            or header.source_revision != manifest.arm_source_revisions[arm]
-            or header.run_manifest_hash != manifest_digest
-            or header.task_corpus_hash != corpus_digest
-            or header.pre_smoke_seal_hash != artifact.get("pre_smoke_seal_hash")
-            or not isinstance(provider_registry, dict)
             or checkpoint.provider_registry_snapshot != provider_registry
-            or header.provider_registry_hash != provider_registry.get("snapshot_hash")
-            or checkpoint.spent_hash != spent_hash(checkpoint.spent)
-            or checkpoint.timing_hash != timing_hash(checkpoint.timing)
         ):
             raise ValueError(f"{arm} selection resume checkpoint seal or lifecycle is invalid")
-        try:
-            registry_hash = provider_registry_snapshot_hash(checkpoint.provider_registry_snapshot or {})
-        except Exception as exc:
-            raise ValueError(f"{arm} selection resume provider registry seal is invalid") from exc
-        if registry_hash != header.provider_registry_hash:
-            raise ValueError(f"{arm} selection resume provider registry hash changed")
 
         receipt = artifact.get("checkpoint")
         if not isinstance(receipt, dict):
             raise ValueError(f"{arm} selection resume artifact is missing its checkpoint receipt")
-        receipt_fields = {
-            "lifecycle": checkpoint.lifecycle,
-            "record_count": len(checkpoint.records),
-            "reserved_cost_usd": checkpoint.reserved_cost_usd,
-            "smoke_status": checkpoint.smoke_status,
-            "smoke_cell_count": len(checkpoint.smoke_gate),
-            "provider_registry_hash": header.provider_registry_hash,
-            "spent": checkpoint.spent.model_dump(mode="json"),
-            "spent_hash": checkpoint.spent_hash,
-            "timing": checkpoint.timing.model_dump(mode="json"),
-            "timing_hash": checkpoint.timing_hash,
-            "selection_preflight": checkpoint.selection_preflight,
-        }
-        if any(receipt.get(name) != value for name, value in receipt_fields.items()):
+        if receipt.get("selection_preflight") != checkpoint.selection_preflight:
             raise ValueError(f"{arm} selection resume checkpoint receipt changed")
         if "attempt_history" in receipt and receipt["attempt_history"] != [
             item.model_dump(mode="json") for item in checkpoint.attempt_history
@@ -5647,16 +5567,7 @@ def load_selection_resume_source(
             shared_budget = budget
         elif paired != shared_execution or budget != shared_budget:
             raise ValueError("selection resume arm artifacts disagree on shared execution or budget")
-        source_artifacts[arm] = artifact
-        source_checkpoints[arm] = checkpoint
-        source_hashes[arm] = {
-            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-            "artifact_hash": artifact.get("artifact_hash"),
-            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
-            "checkpoint_spent_hash": checkpoint.spent_hash,
-            "source_revision": artifact.get("source_revision"),
-            "selection_sha256": selection.sha256,
-        }
+        source_hashes[arm]["selection_sha256"] = selection.sha256
 
     assert shared_execution is not None and shared_budget is not None
     if shared_execution.get("mode") != manifest.paired_order or shared_execution.get("seed") != manifest.paired_order_seed:

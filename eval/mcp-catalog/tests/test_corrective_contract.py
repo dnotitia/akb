@@ -17,9 +17,21 @@ from mcp_catalog.execution import (
     _vault_skill_handshakes_are_valid,
     bind_tool_calls,
     capture_result_fields_for_task,
+    error_details,
 )
 
 ROOT = Path(__file__).parents[1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError('Document "report403-forbidden" was not found'),
+        ToolFailed('Document "report403-forbidden" was not found'),
+    ],
+)
+def test_error_details_do_not_infer_denial_from_echoed_resource_text(error: BaseException) -> None:
+    assert error_details(error) == (None, None, {})
 
 
 @pytest.mark.asyncio
@@ -27,10 +39,7 @@ async def test_tool_failed_is_a_completed_mcp_application_error() -> None:
     recorder = ToolCallRecorder(operation_map={}, secrets=())
 
     async def failed_call(_name: str, _arguments: dict[str, object]) -> object:
-        raise ToolFailed(
-            'ToolReturnPart(tool_name="akb_put", content='
-            '{"code":"invalid_argument","vault":"catalog-bench","name":"scores"})'
-        )
+        raise ToolFailed('{"code":"invalid_argument","vault":"catalog-bench","name":"scores"}')
 
     with pytest.raises(ToolFailed):
         await recorder(None, failed_call, "akb_put", {"vault": "catalog-bench"})
