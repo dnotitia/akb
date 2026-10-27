@@ -210,3 +210,28 @@ test("reader copy controls preserve source and restore their visible trigger", a
     await expect(more).toBeFocused();
   }
 });
+
+test("tab close has no hover background and closes the intended document", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await fixture(page, true);
+  await page.goto("/vault/fixture/doc/reading.md");
+  await page.getByRole("link", { name: "Inspect reference", exact: true }).click();
+  await page.getByRole("button", { name: "Keep in tabs", exact: true }).click();
+  await page.getByRole("button", { name: "Close reference preview", exact: true }).click();
+  const close = page.getByRole("button", { name: "Close Reference notes", exact: true });
+  const before = (await close.boundingBox())!;
+  await close.hover();
+  await expect(close).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  const hovered = (await close.boundingBox())!;
+  expect(hovered).toEqual(before);
+  const tab = (await close.locator("..").boundingBox())!;
+  expect(hovered.y - tab.y).toBeGreaterThanOrEqual(4);
+  expect(tab.y + tab.height - hovered.y - hovered.height).toBeGreaterThanOrEqual(4);
+  await page.screenshot({ path: testInfo.outputPath("inset-tab-close-hover.png") });
+  await close.click();
+  await expect(page.getByRole("tab", { name: "Reference notes", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Reading workflow", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page).toHaveURL(/\/doc\/reading.md$/);
+  await page.getByRole("button", { name: "Close Reading workflow", exact: true }).click();
+  await expect(page).toHaveURL(/\/vault\/fixture$/);
+});

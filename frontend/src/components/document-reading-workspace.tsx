@@ -147,7 +147,7 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
     if ("button" in event && event.button !== 0) return;
     if ("key" in event && event.key !== "Enter") return;
     const anchor = (event.target as Element).closest<HTMLAnchorElement>("a");
-    if (!anchor || anchor.hasAttribute("download") || anchor.target && anchor.target !== "_self") return;
+    if (!anchor || anchor.hasAttribute("download")) return;
     // Same-document anchors keep native heading navigation. Inert reference
     // labels have neither a href nor a verified runtime URL and stay plain text.
     const href = anchor.getAttribute("data-markdown-reference-runtime-url") || anchor.getAttribute("href");
@@ -352,7 +352,7 @@ function ReferencePreview({ target, narrow, headerHost, compare, canGoBack, onBa
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     if ("button" in event && event.button !== 0 || "key" in event && event.key !== "Enter") return;
     const anchor = (event.target as Element).closest<HTMLAnchorElement>("a");
-    if (!anchor || anchor.hasAttribute("download") || anchor.target && anchor.target !== "_self") return;
+    if (!anchor || anchor.hasAttribute("download")) return;
     const href = anchor.getAttribute("data-markdown-reference-runtime-url") || anchor.getAttribute("href");
     if (!href) return;
     if (href.startsWith("#")) {

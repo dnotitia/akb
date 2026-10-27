@@ -2347,29 +2347,24 @@ function DocumentDiffModuleLoading() {
 
 function DocumentPageLoading({ presentation }: { presentation: "page" | "preview" }) {
   const chrome = useReadingChrome();
+  const toolbar = <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={!chrome ?
+    <div className="document-reader-status"><Skeleton className="h-3 w-32" /></div> : undefined}>
+    <div className="document-reader-controls"><Skeleton data-reader-control className="w-16 rounded-[var(--radius-md)]" /></div>
+    {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} data-reader-control data-reader-icon />)}
+  </ResourceCommandRow>;
   return (
     <LoadingState delayMs={200} label="Loading document" className="@container/reader flex h-full min-h-0 flex-col overflow-hidden bg-surface [&>div]:contents">
       {presentation === "preview" && <div className="flex h-14 items-center gap-3 border-b border-border px-4"><Skeleton className="h-4 w-2/3" /></div>}
       <div data-slot="document-viewer-frame" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
-        {chrome?.toolbarHost ? createPortal(<LoadingState delayMs={200} label="Loading document tools">        <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={
-          <div className="document-reader-status"><Skeleton className="h-3 w-32" /></div>
-        }>
-          <div className="document-reader-controls"><Skeleton data-reader-control className="w-16 rounded-[var(--radius-md)]" /></div>
-          {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} data-reader-control data-reader-icon />)}
-        </ResourceCommandRow></LoadingState>, chrome.toolbarHost) : (        <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={
-          <div className="document-reader-status"><Skeleton className="h-3 w-32" /></div>
-        }>
-          <div className="document-reader-controls"><Skeleton data-reader-control className="w-16 rounded-[var(--radius-md)]" /></div>
-          {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} data-reader-control data-reader-icon />)}
-        </ResourceCommandRow>)}
-          <div className="flex min-h-0 flex-1 overflow-hidden">
-            <div className="mx-auto min-w-0 flex-1 max-w-5xl space-y-4 px-4 py-5 sm:px-6">
-              <Skeleton className="h-8 w-3/5" />
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-11/12" />
-              <Skeleton className="h-4 w-4/5" />
-            </div>
+        {chrome?.toolbarHost ? createPortal(<LoadingState delayMs={200} label="Loading document tools">{toolbar}</LoadingState>, chrome.toolbarHost) : toolbar}
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <div className="mx-auto min-w-0 flex-1 max-w-5xl space-y-4 px-4 py-5 sm:px-6">
+            <Skeleton className="h-8 w-3/5" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-11/12" />
+            <Skeleton className="h-4 w-4/5" />
           </div>
+        </div>
       </div>
     </LoadingState>
   );

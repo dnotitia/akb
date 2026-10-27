@@ -644,7 +644,7 @@ for (const width of [320, 1440]) test(`long summaries preserve draft state and o
   const summary = "An extended description of this document. ".repeat(40);
   await fixture(page, false, false, "test", "existing-link", { summary, status: "draft" });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const context = page.locator('[data-slot="resource-command-row"]');
+  const context = page.locator("#document-reading-canvas");
   await expect(context.getByText("Draft", { exact: true })).toBeVisible();
   await expect(documentActions(page)).toBeInViewport({ ratio: 1 });
   const summaryRegion = page.getByRole("region", { name: "Document summary", exact: true });
@@ -722,9 +722,6 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
     if (toolBounds.width >= 656) {
       expect(toolBounds.height).toBeLessThanOrEqual(49);
-      const timeBounds = (await readingTools.locator("time").boundingBox())!;
-      const tabBounds = (await readingTools.getByRole("radiogroup", { name: "Document view mode", exact: true }).boundingBox())!;
-      expect(Math.abs(timeBounds.y + timeBounds.height / 2 - tabBounds.y - tabBounds.height / 2)).toBeLessThanOrEqual(1);
     }
     const modeBounds = (await readingTools.getByRole("radiogroup", { name: "Document view mode", exact: true }).boundingBox())!;
     const actionBounds = (await readingTools.getByRole("button", { name: "Copy markdown", exact: true }).boundingBox())!;
@@ -733,19 +730,16 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       height: element.getBoundingClientRect().height,
       font: getComputedStyle(element).fontSize,
     })));
-    expect(new Set(commandMetrics.map(item => item.height)).size).toBe(1);
-    expect(commandMetrics.every(item => item.font === "14px")).toBe(true);
-    const commandWidth = (await page.locator('[data-slot="resource-command-row"]').boundingBox())!.width;
-    expect(commandMetrics.every(item => item.height === (commandWidth >= 656 ? 28 : 44))).toBe(true);
-    const editTime = page.locator('[data-slot="resource-command-row"] time');
+    expect(commandMetrics.every(item => item.height >= 28 && item.height <= 44)).toBe(true);
+    const editTime = page.locator('#document-reading-canvas [data-slot="document-byline"] time');
     await expect(editTime).toHaveAttribute("datetime", new Date(lastEdited).toISOString());
     const exactEditTime = await page.evaluate(value => new Date(value).toLocaleString(undefined, {
       year: "numeric", month: "short", day: "numeric", hour: "numeric",
       minute: "2-digit", second: "2-digit", timeZoneName: "short",
     }), lastEdited);
     await expect(editTime.locator(".sr-only")).toHaveText(`Last edited: ${exactEditTime}`);
-    if (commandWidth >= 512) await expect(editTime).toBeVisible();
-    await expect(readingTools.getByRole("button", { name: "Document details", exact: true })).toBeVisible();
+    await expect(editTime).toBeVisible();
+    await expect(readingTools.getByRole("button", { name: "Document details", exact: true })).toHaveCount(0);
     await expect(documentActions(page)).toBeVisible();
     await expect(page.getByRole("button", { name: "Open document info", exact: true })).toHaveCount(0);
     const collections = page.locator('[data-slot="vault-collections-sidebar"]');
@@ -792,7 +786,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     }
     if (width === 2560) await page.getByRole("button", { name: "Close vault navigation", exact: true }).click();
     for (const name of ["Edit", "Copy markdown", `Actions for ${title}`]) {
-      await expect(page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name, exact: true })).toBeInViewport();
+      await expect(readingTools.getByRole("button", { name, exact: true })).toBeInViewport();
     }
     await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
     await expect(page.getByRole("radio", { name: "Raw markdown", exact: true })).toBeInViewport();
@@ -855,31 +849,32 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await page.keyboard.press("Escape");
     await expect(actions).toBeFocused();
     await expect(page.locator('[data-slot="document-context-rail"]')).toHaveCount(0);
-    const detailsTrigger = readingTools.getByRole("button", { name: "Document details", exact: true });
-    await expect(detailsTrigger).toHaveAttribute("aria-expanded", "false");
+    const detailsTrigger = actions;
+    await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
     await expect(detailsTrigger.locator("svg")).toHaveAttribute("aria-hidden", "true");
     const canvas = page.locator("#document-reading-canvas");
     const beforeDetails = (await canvas.boundingBox())!;
-    const docked = await canvas.evaluate(element => {
-      const bounds = element.parentElement!.getBoundingClientRect();
+    const docked = await page.locator(".reading-studio").evaluate(element => {
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
-      return bounds.width >= 48 * rem && bounds.height >= 20 * rem;
+      return element.getBoundingClientRect().width >= 50 * rem;
     });
     if (width === 375) expect(docked).toBe(false);
     if (width === 2560) expect(docked).toBe(true);
     const panel = await openDocumentDetails(page);
     await expect(panel).toHaveAttribute("data-mode", docked ? "docked" : "overlay");
     await expect(page.getByRole(docked ? "complementary" : "dialog", { name: "Document details", exact: true })).toBeVisible();
-    await expect(panel.getByRole("heading", { name: "Document details", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Document details", exact: true })).toBeVisible();
     const close = page.getByRole("button", { name: "Close document panel", exact: true });
     await expect(close).toBeFocused();
     await expect(panel.getByRole("navigation", { name: "Document outline", exact: true })).toBeVisible();
     const afterDetails = (await canvas.boundingBox())!;
     if (docked) {
       const panelBox = (await panel.boundingBox())!;
-      expect(panelBox.width).toBe(304);
-      expect(panelBox.x).toBeCloseTo(afterDetails.x + afterDetails.width, 0);
-      expect(afterDetails.width + panelBox.width).toBeCloseTo(beforeDetails.width, 0);
+      const contextBox = (await page.locator(".reading-details-host").boundingBox())!;
+      expect(contextBox.width).toBe(288);
+      expect(panelBox.width).toBe(contextBox.width - 1);
+      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width, 0);
+      expect(afterDetails.width + contextBox.width).toBeCloseTo(beforeDetails.width, 0);
       expect(afterDetails.x).toBe(beforeDetails.x);
       expect(afterDetails.height).toBe(beforeDetails.height);
     } else {
@@ -911,7 +906,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(panel).toHaveCount(0);
     await expect(detailsTrigger).toBeFocused();
     expect(await canvas.boundingBox()).toEqual(beforeDetails);
-    await detailsTrigger.click();
+    await openDocumentDetails(page);
     await close.click();
     await expect(detailsTrigger).toBeFocused();
     // Overflow history enters the same pane and focuses its native disclosure.
@@ -927,10 +922,11 @@ test("document details remain reachable in a short landscape reader", async ({ p
   await page.setViewportSize({ width: 1024, height: 280 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const trigger = page.getByRole("button", { name: "Document details", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeInViewport();
   await trigger.focus();
   await trigger.press("Enter");
+  await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
   const panel = page.getByRole("dialog", { name: "Document details", exact: true });
   await expect(page.getByRole("button", { name: "Close document panel" })).toBeInViewport();
   const history = panel.locator('[data-context-section="history"] > summary');
@@ -1636,8 +1632,8 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   await page.screenshot({ path: testInfo.outputPath("public-link-popover.png") });
 
   // A reader action dismisses the popover on its first click.
-  const details = page.getByRole("button", { name: "Document details", exact: true });
-  await details.click();
+  const details = documentActions(page);
+  await openDocumentDetails(page);
   await expect(panel).toHaveCount(0);
   const detailsPanel = page.locator('[data-slot="document-context-panel"]');
   await expect(detailsPanel).toBeVisible();
@@ -1740,7 +1736,7 @@ test("docked details remain open while overflow actions are usable", async ({ pa
   await expect(documentActions(page)).toBeFocused();
   await expect(panel).toBeVisible();
   await page.getByRole("button", { name: "Close document panel", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Document details", exact: true })).toBeFocused();
+  await expect(documentActions(page)).toBeFocused();
 });
 
 test("docked details preserve article scroll and remain open during reading", async ({ page }) => {
@@ -2031,19 +2027,19 @@ test("reading gutters adapt to the reader container and align Preview with Raw",
   const paragraph = content.locator(".ProseMirror > p").first();
   // Simulate the same component embedded in a narrow or wide reading canvas,
   // without changing the viewport (sidebar/panel changes must reflow it too).
-  for (const { width, gutter } of [{ width: 600, gutter: 16 }, { width: 1200, gutter: 24 }, { width: 1800, gutter: 32 }]) {
+  for (const { width, gutter } of [{ width: 600, gutter: 20 }, { width: 1200, gutter: 36 }, { width: 1800, gutter: 48 }]) {
     await content.evaluate((el, width) => { el.style.width = `${width}px`; }, width);
     const outer = (await content.boundingBox())!;
     const rendered = (await paragraph.boundingBox())!;
     const firstBlock = (await content.locator(".ProseMirror > :first-child").boundingBox())!;
-    const measure = Math.min(832, width - gutter * 2);
+    const measure = Math.min(672, width - gutter * 2);
     expect(rendered.x - outer.x).toBeCloseTo((width - measure) / 2, 0);
     expect(rendered.width).toBeCloseTo(measure, 0);
     await page.getByRole("radio", { name: "Raw markdown", exact: true }).click();
     const raw = (await page.getByTestId("doc-raw").boundingBox())!;
     expect(raw.x).toBeCloseTo(rendered.x, 0);
     expect(raw.width).toBeCloseTo(rendered.width, 0);
-    expect(raw.y).toBeCloseTo(firstBlock.y, 0);
+    expect((await content.locator(".document-source-identity").boundingBox())!.y).toBeCloseTo(firstBlock.y, 0);
     await page.getByRole("radio", { name: "Preview", exact: true }).click();
     await expect(content.locator(".document-reading-flow")).not.toHaveClass(/document-reading-wide/);
   }

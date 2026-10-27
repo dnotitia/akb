@@ -230,7 +230,7 @@ test.describe("shared Markdown link search in the document composer", () => {
     await page.goto(reopenedRaw);
     const rawMarkdown = page.getByTestId("doc-raw");
     await expect(rawMarkdown).toContainText(`[${FILE_LABEL}](${FILE_TARGET})`);
-    await expect(page.getByRole("heading", { name: "File link E2E proof", exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Raw markdown source", exact: true }).getByRole("heading", { name: "File link E2E proof", exact: true })).toBeVisible();
     expect(await rawMarkdown.textContent()).not.toContain("signed.example");
     await page.getByRole("button", { name: "Edit", exact: true }).click();
     await expect(page.getByRole("textbox", { name: "Document body (markdown)" })).toBeVisible();

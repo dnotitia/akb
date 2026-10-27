@@ -30,7 +30,7 @@ function Primary({ blocked }: { blocked: boolean }) {
   return <>{chrome?.toolbarHost && createPortal(chrome.referenceControl, chrome.toolbarHost)}<output data-testid="location">{location.pathname}</output><div id="document-reading-canvas" tabIndex={-1}>
     Primary {id}<a href="/vault/alpha/doc/b.md">Reference B</a><a href="/vault/alpha/doc/c.md">Reference C</a>
     <a href="https://example.org/doc">External source</a><a>Inert model name</a>
-    <a href="/vault/alpha/doc/b.md" target="_blank">Reference in new tab</a>
+    <a href="/vault/alpha/doc/b.md" target="_blank" data-markdown-reference-runtime-url="/vault/alpha/doc/b.md">Resolved reference</a>
     <a href="/vault/alpha/doc/b.md" download>Download reference</a>
     <a href="/vault/alpha/doc/b.md?commit=older">Historical reference</a>
   </div></>;
@@ -55,14 +55,21 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe("Reading Studio", () => {
-  it("preserves native new-tab and download destinations", async () => {
+  it("preserves modified-click and download destinations", async () => {
     setup(); await screen.findByRole("tab", { name: "Document A" });
-    for (const name of ["Reference in new tab", "Download reference"]) {
-      const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    for (const name of ["Reference B", "Download reference"]) {
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: name === "Reference B" });
       screen.getByRole("link", { name }).dispatchEvent(event);
       expect(event.defaultPrevented).toBe(false);
     }
     expect(screen.queryByRole("complementary", { name: "Document B" })).not.toBeInTheDocument();
+  });
+
+  it("opens a resolved resource in preview despite the renderer's default blank target", async () => {
+    const user = userEvent.setup(); setup(); await screen.findByRole("tab", { name: "Document A" });
+    await user.click(screen.getByRole("link", { name: "Resolved reference" }));
+    expect(await screen.findByRole("complementary", { name: "Document B" })).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/a.md");
   });
 
   it("does not label current metadata time as a historical reference's edit time", async () => {

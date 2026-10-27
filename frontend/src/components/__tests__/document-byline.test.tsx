@@ -13,8 +13,8 @@ describe("document identity metadata", () => {
     expect(byline.querySelector("time")).toHaveAttribute("datetime", "2026-10-27T03:00:00.000Z");
   });
   it("distinguishes a pinned version from the current lifecycle state", () => {
-    render(<DocumentByline author="Ada" status="draft" historical version="1234567890abcdef" timestampLabel="Version saved" updatedAt="2026-10-21T03:00:00Z" />);
-    expect(screen.getByText("Version 12345678")).toBeInTheDocument();
+    render(<DocumentByline author="Ada" status="draft" historical version="1111111122222222" timestampLabel="Version saved" updatedAt="2026-10-21T03:00:00Z" />);
+    expect(screen.getByText("Version 11111111")).toBeInTheDocument();
     expect(screen.queryByText("Draft")).toBeNull();
     expect(screen.getByText(/Version saved:/)).toBeInTheDocument();
   });

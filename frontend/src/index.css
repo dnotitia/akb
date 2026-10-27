@@ -1457,6 +1457,7 @@ body::before {
 }
 .reading-studio .document-reading-inset { padding: 2.5rem clamp(1.25rem, 4cqi, 4rem) 4rem; }
 .reading-studio .document-reading-flow { --document-reading-measure: 42rem; font-size: 1rem; line-height: 1.8; }
+.reading-studio .document-reading-source { --document-reading-measure: 42rem; }
 .reading-studio .document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.65rem; margin-block: 2rem .9rem; letter-spacing: -.025em; }
 .reading-studio .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
 .reading-studio .document-reading-flow .ProseMirror > h3 { font-size: 1.2rem; margin-block: 1.8rem .7rem; }
@@ -1643,7 +1644,8 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reading-tab-wrap { max-width: 14rem; border-right: 0; }
 .reading-tab-wrap::after { content: ''; position: absolute; right: 0; top: .6rem; bottom: .6rem; width: 1px; background: var(--color-border); pointer-events: none; }
 .reading-tab { max-width: 12rem; padding: .4rem .25rem .4rem .65rem; gap: .4rem; font-size: .75rem; }
-.reading-tab-close { width: 1.5rem; min-height: 2rem; }
+.reading-tab-close { align-self: center; width: 1.5rem; height: 1.75rem; min-height: 1.75rem; margin-inline: .125rem; }
+.reading-tab-close:hover, .reading-tab-close:active { background: transparent; color: var(--color-foreground); }
 .reading-tab-wrap[data-selected=true] { background: var(--color-surface-selected); box-shadow: inset 0 2px 0 var(--color-primary); }
 .reading-tab-wrap[data-selected=true] .reading-tab { color: var(--color-surface-selected-foreground); }
 .reading-preview-footer { position: relative; border-top: 0; }
@@ -1651,6 +1653,6 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 @media (pointer: coarse) {
   .reading-workspace-bottom { height: 3rem; }
   .reading-tab, .reading-tab-close { min-height: 2.75rem; }
-  .reading-tab-close { width: 2.75rem; }
+  .reading-tab-close { width: 2.75rem; height: 2.75rem; }
   .reading-workspace-bottom > .reading-icon-button { width: 2.75rem; height: 2.75rem; min-height: 2.75rem; }
 }
