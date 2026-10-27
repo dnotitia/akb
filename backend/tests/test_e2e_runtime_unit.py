@@ -296,6 +296,61 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
 
 
 @pytest.mark.asyncio
+async def test_app_control_plane_seeds_the_ownership_transfer_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), scenario="app-control-plane"))
+    monkeypatch.setenv("TEST_USERNAME_ENV", "runtime-owner-test")
+    monkeypatch.setenv("TEST_PASSWORD_ENV", "runtime-owner-password")
+    admin_id = uuid.uuid4()
+    users: dict[str, uuid.UUID] = {"runtime-owner-test": admin_id}
+    inserts = 0
+    updates: list[tuple[object, ...]] = []
+
+    class Connection:
+        async def fetchval(self, _query: str, username: str) -> uuid.UUID | None:
+            return users.get(username)
+
+        async def execute(self, query: str, *args: object) -> str:
+            nonlocal inserts
+            if query.lstrip().startswith("INSERT INTO users"):
+                users[str(args[1])] = args[0]  # type: ignore[assignment]
+                inserts += 1
+            elif "UPDATE users" in query:
+                updates.append(args)
+            return "OK"
+
+        async def close(self) -> None:
+            return None
+
+    connection = Connection()
+
+    async def connect(**_kwargs: object) -> Connection:
+        return connection
+
+    async def no_op(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+    monkeypatch.setitem(
+        sys.modules,
+        "bcrypt",
+        SimpleNamespace(hashpw=lambda *_args: b"fixture-hash", gensalt=lambda: b"salt"),
+    )
+    monkeypatch.setattr(runtime, "_seed_app_release_rollout", no_op)
+    monkeypatch.setattr(runtime, "_seed_control_plane_installation_lifecycle", no_op)
+    monkeypatch.setattr(runtime, "_seed_control_plane_legacy_adoption", no_op)
+
+    await runtime._seed_external_credential()
+    await runtime._seed_external_credential()
+
+    assert "fixture-owner" in users
+    assert inserts == 1
+    assert len(updates) == 4
+
+
+@pytest.mark.asyncio
 async def test_postgres_reset_preserves_diagnostic_and_recovers_on_next_attempt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

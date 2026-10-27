@@ -2999,14 +2999,14 @@
       "locales": {
         "ko-KR": {
           "id": "history-provenance-ko",
-          "prompt": "`catalog-bench-history`에 `history-note` 문서를 두 revision으로 만들어. 이전과 현재 revision의 차이와 provenance를 확인하고 현재 본문이 그대로인지 확인해.",
+          "prompt": "`catalog-bench-history`에 `history-note` 문서를 만들어 첫 본문을 정확히 `current: one`으로 저장한 다음 본문을 정확히 `current: two`로 수정해. 두 revision의 history, diff, provenance를 확인하고 현재 본문이 정확히 `current: two`인지 검증해.",
           "response_rubric": {
             "require_non_empty": true
           }
         },
         "en-US": {
           "id": "history-provenance-en",
-          "prompt": "Create two revisions of `history-note` in `catalog-bench-history`. Inspect its history, the diff between revisions, and provenance, then verify the current body is unchanged.",
+          "prompt": "Create `history-note` in `catalog-bench-history` with the exact first body `current: one`, then update its body to exactly `current: two`. Inspect the history, diff, and provenance for both revisions, and verify that the current body is exactly `current: two`.",
           "response_rubric": {
             "require_non_empty": true
           }

@@ -53,6 +53,7 @@ from .contracts import (
     load_run_manifest,
     load_task_corpus,
     load_tool_coverage,
+    public_arguments_match_schema,
     validate_public_catalog,
 )
 from .evidence import (
@@ -3101,6 +3102,14 @@ def _validate_trial_evidence(
         decoded, raw_valid = decode_raw_args(call.raw_model_args)
         if call.raw_args_valid != raw_valid:
             raise ValueError("raw tool argument validity flag does not match the recorded call")
+        schema = input_schemas.get(call.tool_name)
+        expected_schema_valid = (
+            public_arguments_match_schema(decoded, schema)
+            if schema is not None
+            else None
+        )
+        if call.public_schema_valid != expected_schema_valid:
+            raise ValueError("public tool argument schema flag does not match the captured schema")
         if call.server_args is None:
             if call.server_args_equal_raw or call.effective_server_args is not None:
                 raise ValueError("unobserved tool call claims server-side arguments")
@@ -3108,7 +3117,6 @@ def _validate_trial_evidence(
             equal = raw_valid and call.server_args == decoded
             if call.server_args_equal_raw != equal:
                 raise ValueError("raw and server tool arguments disagree with the recorded equality flag")
-            schema = input_schemas.get(call.tool_name)
             if schema is not None and call.effective_server_args != canonicalize_arguments(call.server_args, schema):
                 raise ValueError("effective tool arguments do not match the captured input schema")
         action = decoded.get("action") if isinstance(decoded, dict) else None
@@ -3592,7 +3600,7 @@ def _provider_distribution_sensitivity(
 
 def _empty_comparison(baseline: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
     result = {
-        "schema_version": 4,
+        "schema_version": 5,
         "baseline_source_revision": baseline.get("source_revision"),
         "candidate_source_revision": candidate.get("source_revision"),
         "verdict": "inconclusive",
@@ -3607,7 +3615,7 @@ def _selected_diagnostic_summary(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    """Summarize selected observations without changing the inconclusive gate."""
+    """Rescore selected calls from captured evidence without changing the inconclusive gate."""
 
     plans: dict[str, set[tuple[str, str, str, int]]] = {}
     for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
@@ -3636,6 +3644,8 @@ def _selected_diagnostic_summary(
     parsed_by_arm: dict[str, list[TrialOutcome]] = {}
     count_fields = (
         "observed_trials",
+        "evaluated_trials",
+        "excluded_invalid_condition_trials",
         "successes",
         "task_errors",
         "safe_trials",
@@ -3649,6 +3659,17 @@ def _selected_diagnostic_summary(
     for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
         runs = artifact.get("runs")
         plan = plans[arm]
+        raw_contracts = artifact.get("task_contracts")
+        try:
+            tasks_by_id = {
+                task.id: task
+                for task in (
+                    TaskManifest.model_validate(item)
+                    for item in raw_contracts
+                )
+            } if isinstance(raw_contracts, list) else {}
+        except (TypeError, ValueError):
+            tasks_by_id = {}
         raw_rows: list[dict[str, Any]] = []
         excluded = 0
         if isinstance(runs, dict):
@@ -3684,13 +3705,12 @@ def _selected_diagnostic_summary(
         totals[arm]["malformed_outcomes"] = 0
         totals[arm]["invalid_cost_rows"] = 0
         totals[arm]["unselected_or_unidentified_rows"] = excluded
+        totals[arm]["invalid_condition_trials"] = []
+        totals[arm]["reassessment_errors"] = []
+        totals[arm]["rescored_trials"] = []
         cost = Decimal("0")
         parsed: list[TrialOutcome] = []
         for row in raw_rows:
-            totals[arm]["successes"] += row.get("success") is True
-            totals[arm]["task_errors"] += row.get("trial_error") is True
-            totals[arm]["safe_trials"] += row.get("safety") is True
-            totals[arm]["unsafe_mutation_trials"] += row.get("unsafe_mutation") is True
             tool_calls = row.get("tool_calls")
             totals[arm]["tool_attempts"] += len(tool_calls) if isinstance(tool_calls, list) else 0
             for metric_name in ("model_requests", "input_tokens", "output_tokens", "total_tokens"):
@@ -3705,10 +3725,72 @@ def _selected_diagnostic_summary(
                 cost += row_cost
             except (InvalidOperation, TypeError, ValueError):
                 totals[arm]["invalid_cost_rows"] += 1
+            row_identity = {
+                "model_class": row.get("model_class"),
+                "transport": row.get("transport"),
+                "task_id": row.get("task_id"),
+                "repeat_index": row.get("repeat_index"),
+            }
             try:
-                parsed.append(TrialOutcome.model_validate(row))
-            except ValueError:
+                task_id = row.get("task_id")
+                task = tasks_by_id.get(task_id) if isinstance(task_id, str) else None
+                if task is None:
+                    raise ValueError("captured task contract is missing")
+                outcome = TrialOutcome.model_validate(row)
+                schemas = _catalog_input_schemas(artifact, outcome.transport, task.fixture.credential_profile)
+                for call in outcome.tool_calls:
+                    decoded, _raw_valid = decode_raw_args(call.raw_model_args)
+                    schema = schemas.get(call.tool_name)
+                    call.public_schema_valid = (
+                        public_arguments_match_schema(decoded, schema)
+                        if schema is not None
+                        else None
+                    )
+                outcome.finalize(
+                    task,
+                    _state_observations(outcome, task, before=True),
+                    _state_observations(outcome, task, before=False),
+                )
+            except (TypeError, ValueError, KeyError) as exc:
                 totals[arm]["malformed_outcomes"] += 1
+                totals[arm]["reassessment_errors"].append(
+                    {**row_identity, "reason": f"reassessment failed: {type(exc).__name__}"}
+                )
+                continue
+            invalid_reason = _selected_invalid_condition_reason(task, outcome)
+            rescored_trial = {
+                **row_identity,
+                "success": outcome.success,
+                "trial_error": outcome.trial_error,
+                "trial_error_kinds": outcome.trial_error_kinds,
+                "state_contract_passed": outcome.state_contract_passed,
+                "response_rubric_passed": outcome.response_rubric_passed,
+                "tool_outcome_match": outcome.tool_outcome_match,
+                "argument_validity": outcome.argument_validity,
+                "protocol_handshake_valid": outcome.protocol_handshake_valid,
+                "result_binding_accuracy": outcome.result_binding_accuracy,
+                "wrong_target_calls": outcome.wrong_target_calls,
+                "post_completion_overshoot": outcome.post_completion_overshoot,
+            }
+            totals[arm]["rescored_trials"].append(rescored_trial)
+            if invalid_reason is not None:
+                totals[arm]["excluded_invalid_condition_trials"] += 1
+                totals[arm]["invalid_condition_trials"].append(
+                    {
+                        **row_identity,
+                        "reason": invalid_reason,
+                        "rescored_success": outcome.success,
+                        "rescored_trial_error": outcome.trial_error,
+                        "trial_error_kinds": outcome.trial_error_kinds,
+                    }
+                )
+                continue
+            totals[arm]["evaluated_trials"] += 1
+            totals[arm]["successes"] += outcome.success
+            totals[arm]["task_errors"] += outcome.trial_error
+            totals[arm]["safe_trials"] += outcome.safety
+            totals[arm]["unsafe_mutation_trials"] += outcome.unsafe_mutation
+            parsed.append(outcome)
         totals[arm]["cost_usd"] = str(cost)
         totals[arm]["parsed_outcomes"] = len(parsed)
         totals[arm]["efficiency_metrics"] = summarize_outcomes(parsed)
@@ -3726,15 +3808,71 @@ def _selected_diagnostic_summary(
             ),
             "cost_usd": str(sum((Decimal(totals[arm]["cost_usd"]) for arm in ("baseline", "candidate")), start=Decimal("0"))),
             "parsed_outcomes": sum(int(totals[arm]["parsed_outcomes"]) for arm in ("baseline", "candidate")),
+            "invalid_condition_trials": [
+                item
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["invalid_condition_trials"]
+            ],
+            "reassessment_errors": [
+                item
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["reassessment_errors"]
+            ],
+            "rescored_trials": [
+                {"arm": arm, **item}
+                for arm in ("baseline", "candidate")
+                for item in totals[arm]["rescored_trials"]
+            ],
             "efficiency_metrics": summarize_outcomes(parsed_by_arm["baseline"] + parsed_by_arm["candidate"]),
         }
     )
     return {
         "classification": "diagnostic_only",
         "adoption_eligible": False,
+        "rescored_from_recorded_evidence": True,
         "arms": totals,
         "combined": combined,
     }
+
+
+def _selected_invalid_condition_reason(task: TaskManifest, outcome: TrialOutcome) -> str | None:
+    if task.id.startswith("history-provenance-"):
+        revision_bodies: list[str] = []
+        for attempt in task.expected_material_attempts:
+            content = attempt.arguments.get("content")
+            if attempt.logical_operation in {"create", "update"} and isinstance(content, str):
+                revision_bodies.append(content)
+        if len(revision_bodies) >= 2 and not all(body in task.prompt for body in revision_bodies):
+            return "task prompt omitted the exact preregistered revision bodies"
+
+    if task.id.startswith("access-ownership-public-"):
+        for transfer in outcome.tool_calls:
+            arguments = transfer.effective_server_args or transfer.server_args or {}
+            owner = arguments.get("new_owner")
+            if (
+                transfer.logical_operation != "update"
+                or transfer.server_succeeded
+                or transfer.server_error_code != "not_found"
+                or not isinstance(owner, str)
+            ):
+                continue
+            for search in outcome.tool_calls:
+                search_arguments = search.effective_server_args or search.server_args or {}
+                if (
+                    not search.server_succeeded
+                    or search.logical_operation != "list"
+                    or search_arguments.get("action") != "search_users"
+                    or search_arguments.get("query") != owner
+                    or not isinstance(search.result_preview, str)
+                ):
+                    continue
+                try:
+                    result = json.loads(search.result_preview)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(result, dict) and result.get("users") == []:
+                    return f"fixture user {owner!r} was absent during the ownership transfer"
+    return None
 
 
 def _finite_interval_bound(interval: dict[str, Any], side: str) -> float:
@@ -4217,7 +4355,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     all_base_cost = sum(item.cost_usd for item in baseline_outcomes)
     all_candidate_cost = sum(item.cost_usd for item in candidate_outcomes)
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "baseline_source_revision": baseline["source_revision"],
         "candidate_source_revision": candidate["source_revision"],
         "protocol_revision": baseline["protocol_revision"],

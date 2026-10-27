@@ -383,6 +383,7 @@ def mark_candidate_unsafe(
             server_args=arguments,
             effective_server_args=arguments,
             raw_args_valid=True,
+            public_schema_valid=True,
             server_args_equal_raw=True,
             transport_succeeded=True,
             server_succeeded=True,
@@ -632,6 +633,7 @@ def _tool_call(
         server_args=deepcopy(server_args),
         effective_server_args=deepcopy(server_args),
         raw_args_valid=True,
+        public_schema_valid=True,
         server_args_equal_raw=True,
         transport_succeeded=True,
         server_succeeded=succeeded,
@@ -955,7 +957,7 @@ def _catalog_snapshot(manifest: Any, arm: str, transport: str) -> CatalogSnapsho
                         "type": "object",
                         "properties": {"action": {"type": "string", "const": action}},
                         "required": ["action"],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     }
                     for action in sorted(selectors)
                 ],

@@ -1345,6 +1345,17 @@ def _input_schema_exposes_action(schema: dict[str, Any], action: str) -> bool:
     return matching_branches == 1
 
 
+def public_arguments_match_schema(arguments: Any, schema: dict[str, Any]) -> bool:
+    """Validate decoded model arguments against the captured public JSON Schema."""
+
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+    return validator_type(schema).is_valid(arguments)
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 

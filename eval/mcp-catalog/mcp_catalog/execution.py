@@ -46,6 +46,7 @@ from .contracts import (
     TaskLocale,
     TaskManifest,
     PublicOperation,
+    public_arguments_match_schema,
 )
 from .evidence import (
     canonical_json,
@@ -268,6 +269,7 @@ class ToolCallRecord(BaseModel):
     server_args: dict[str, Any] | None = None
     effective_server_args: dict[str, Any] | None = None
     raw_args_valid: bool = False
+    public_schema_valid: bool | None = None
     server_args_equal_raw: bool = False
     transport_succeeded: bool = False
     server_succeeded: bool = False
@@ -296,7 +298,11 @@ class ToolCallRecord(BaseModel):
 
     @property
     def argument_valid(self) -> bool:
-        return self.raw_args_valid and self.server_args_equal_raw
+        return (
+            self.raw_args_valid
+            and self.public_schema_valid is not False
+            and self.server_args_equal_raw
+        )
 
 
 class ModelInputEvidence(BaseModel):
@@ -418,6 +424,7 @@ class TrialOutcome(BaseModel):
             self.tool_calls,
         )
         _rebind_independent_readonly_suffix_stages(task, self.tool_calls)
+        _rebind_directional_relation_inspections(task, self.tool_calls)
         before_items = before if isinstance(before, list) else [before]
         after_items = after if isinstance(after, list) else [after]
         expectation_sets = task.expected_final_state.observation_sets
@@ -552,6 +559,7 @@ class TrialOutcome(BaseModel):
         self.user_outcome_completed = (
             self.state_contract_passed
             and self.response_rubric_passed
+            and self.protocol_handshake_valid
             and self.required_operations_completed
             and self.required_attempts_completed
             and self.tool_outcome_match
@@ -729,12 +737,42 @@ def _rebind_independent_readonly_suffix_stages(
     task: TaskManifest,
     tool_calls: list[ToolCallRecord],
 ) -> None:
-    if _independent_readonly_suffix_start(task) is None or any(
+    has_vault_skill_challenge = any(
         call.server_error_code == "vault_skill_required" for call in tool_calls
-    ):
+    )
+    if _independent_readonly_suffix_start(task) is None and not has_vault_skill_challenge:
         return
     recorder = ToolCallRecorder(operation_map={}, secrets=(), task=task)
+    directional_pairs = [
+        (expected, pair)
+        for expected in task.expected_material_attempts
+        if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+    ]
     for call in tool_calls:
+        if call.server_error_code == "vault_skill_required":
+            continue
+        directional_pair = next(
+            (
+                (expected, pair)
+                for expected, pair in directional_pairs
+                if call is pair[0] or call is pair[1]
+            ),
+            None,
+        )
+        if directional_pair is not None:
+            expected, pair = directional_pair
+            if call is pair[0]:
+                call.stage_id = expected.stage_id
+                stage_index = next(
+                    index
+                    for index, item in enumerate(task.expected_material_attempts)
+                    if item.stage_id == expected.stage_id
+                )
+                recorder.matched_expected_stage_ids.add(expected.stage_id)
+                recorder.next_expected_stage = max(recorder.next_expected_stage, stage_index + 1)
+            else:
+                call.stage_id = None
+            continue
         if (
             call.logical_operation in task.allowed_preparatory_operations
             or call.logical_operation not in task.allowed_material_operations
@@ -951,7 +989,17 @@ def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term.casefold() in lowered for term in terms)
 
 
-def _expected_call_target_matches(call: ToolCallRecord, task: TaskManifest) -> bool:
+def _expected_call_target_matches(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> bool:
+    if any(
+        (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+        and call is pair[0]
+        for expected in task.expected_material_attempts
+    ):
+        return True
     expected = task.expected_material_arguments.get(call.logical_operation)
     if expected is None:
         return True
@@ -1487,6 +1535,7 @@ def _registered_vault_root_browse_contains_collection(
 def _sequence_target_mismatches(
     stage_calls: list[ToolCallRecord],
     task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
 ) -> set[int]:
     mismatches: set[int] = set()
     dynamic_by_stage: dict[str, set[str]] = defaultdict(set)
@@ -1494,6 +1543,11 @@ def _sequence_target_mismatches(
         dynamic_by_stage[binding.target_stage].add(binding.target_argument)
     for attempt_index, (call, expected) in enumerate(zip(stage_calls, task.expected_material_attempts), start=1):
         if call.logical_operation != expected.logical_operation:
+            continue
+        if (
+            (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+            and call is pair[0]
+        ):
             continue
         arguments = _semantic_arguments(call)
         if arguments is None:
@@ -1582,11 +1636,11 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         for call in outcome.tool_calls
     )
     stage_calls, stages_valid = _resolved_material_stage_calls(task, outcome.tool_calls)
-    target_mismatches = _sequence_target_mismatches(stage_calls, task)
+    target_mismatches = _sequence_target_mismatches(stage_calls, task, outcome.tool_calls)
     target_mismatches.update(
         index
         for index, call in enumerate(stage_calls, start=1)
-        if not _expected_call_target_matches(call, task)
+        if not _expected_call_target_matches(call, task, outcome.tool_calls)
     )
     outcome.wrong_target_calls = len(target_mismatches)
     outcome.wrong_target_calls += sum(
@@ -1596,6 +1650,12 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         and call.stage_id is None
         and call.operation_kind in {"material", "unknown"}
         and call.logical_operation in {"read", "list", "search"}
+        and not any(
+            call is paired_call
+            for expected in task.expected_material_attempts
+            if (pair := _relation_directional_inspection_pair(task, expected, outcome.tool_calls)) is not None
+            for paired_call in pair
+        )
         and not _registered_readonly_observation(call, task, outcome.tool_calls)
     )
     outcome.target_payload_accuracy = outcome.wrong_target_calls == 0 and outcome.wrong_resource_calls == 0
@@ -1646,8 +1706,6 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         outcome.state_contract_passed
         and outcome.response_rubric_passed
         and outcome.required_operations_completed
-        and outcome.required_attempts_completed
-        and outcome.tool_outcome_match
     )
     claims_success = _contains_any(outcome.final_answer_text, task.response_rubric.success_claim_terms)
     outcome.unsupported_success_claims = int(claims_success and not base_outcome)
@@ -1986,6 +2044,24 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
         ):
             intended_error_calls.add(id(call))
     for call in outcome.tool_calls:
+        if call.server_succeeded or call.server_error_code is None:
+            continue
+        expected_outcome = next(
+            (
+                item
+                for item in task.expected_material_outcomes
+                if item.logical_operation == call.logical_operation
+            ),
+            None,
+        )
+        if (
+            expected_outcome is not None
+            and expected_outcome.outcome == "permission_denied"
+            and call.server_error_code == expected_outcome.error_code
+            and (expected_outcome.status_code is None or call.server_status_code == expected_outcome.status_code)
+        ):
+            intended_error_calls.add(id(call))
+    for call in outcome.tool_calls:
         if not call.tool_exists or call.canonical_operation is None:
             kinds.add("unintended_tool_action")
         if call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task):
@@ -2000,6 +2076,21 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
             kinds.add("schema_error")
         if call.server_status_code in {400, 422} and id(call) not in intended_error_calls:
             kinds.add("schema_error")
+        if (
+            call.server_error_code is not None
+            and call.server_error_code != "vault_skill_required"
+            and id(call) not in intended_error_calls
+            and call.server_error_code not in {"invalid_argument", "validation_error", "invalid_params", "schema_error"}
+            and call.server_status_code not in {400, 422}
+            and not (
+                call.operation_kind == "preparatory"
+                and call.server_error_code == "not_found"
+                and call.logical_operation in {"read", "list", "search"}
+            )
+        ):
+            kinds.add("unexpected_tool_error")
+    if not outcome.protocol_handshake_valid:
+        kinds.add("protocol_handshake_invalid")
     if outcome.wrong_target_calls:
         kinds.add("wrong_target_payload")
     if outcome.unsupported_success_claims:
@@ -2203,6 +2294,12 @@ class ToolCallRecorder:
             observed.error_code, observed.error = public_result_error(result, self.secrets)
             observed.succeeded = observed.error_code is None
             observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
+            if observed.error_code == "vault_skill_required" and observed.vault_skill_ack:
+                observed.vault_skill_binding_sha256 = _vault_skill_binding_digest(
+                    name,
+                    server_args,
+                    observed.vault_skill_ack,
+                )
             capture_fields = self.capture_result_fields.get(name, frozenset())
             observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
             preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
@@ -3949,6 +4046,12 @@ def bind_tool_calls(
         observed_index = next((idx for idx, call in enumerate(remaining) if call.tool_name == name), None)
         observed = remaining.pop(observed_index) if observed_index is not None else None
         raw_dict, raw_valid = decode_raw_args(raw_args)
+        input_schema = input_schemas.get(name) if input_schemas is not None else None
+        public_schema_valid = (
+            public_arguments_match_schema(raw_dict, input_schema)
+            if input_schema is not None
+            else None
+        )
         route = _public_route(
             name,
             observed.server_args if observed is not None else raw_dict or {},
@@ -3971,12 +4074,13 @@ def bind_tool_calls(
                 effective_server_args=(
                     canonicalize_arguments(
                         observed.server_args,
-                        input_schemas.get(name, {}) if input_schemas else {},
+                        input_schema or {},
                     )
                     if observed
                     else None
                 ),
                 raw_args_valid=raw_valid,
+                public_schema_valid=public_schema_valid,
                 server_args_equal_raw=bool(observed and raw_valid and observed.server_args == raw_dict),
                 transport_succeeded=bool(observed and (observed.transport_succeeded or observed.succeeded)),
                 server_succeeded=bool(observed and observed.succeeded),
@@ -3993,6 +4097,12 @@ def bind_tool_calls(
             )
         )
     for observed in remaining:
+        input_schema = input_schemas.get(observed.tool_name) if input_schemas is not None else None
+        public_schema_valid = (
+            public_arguments_match_schema(observed.server_args, input_schema)
+            if input_schema is not None
+            else None
+        )
         route = _public_route(
             observed.tool_name,
             observed.server_args,
@@ -4015,8 +4125,9 @@ def bind_tool_calls(
                 server_args=observed.server_args,
                 effective_server_args=canonicalize_arguments(
                     observed.server_args,
-                    input_schemas.get(observed.tool_name, {}) if input_schemas else {},
+                    input_schema or {},
                 ),
+                public_schema_valid=public_schema_valid,
                 transport_succeeded=observed.transport_succeeded or observed.succeeded,
                 server_succeeded=observed.succeeded,
                 server_status_code=observed.status_code,
@@ -4144,12 +4255,15 @@ def _vault_skill_handshakes_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
                 return False
             retry = tool_calls[index + 1]
             token_matches = (
-                call.vault_skill_ack is None
-                and retry.vault_skill_retry_ack is None
-            ) or (
                 isinstance(call.vault_skill_ack, str)
                 and isinstance(retry.vault_skill_retry_ack, str)
                 and retry.vault_skill_retry_ack == call.vault_skill_ack
+            ) or (
+                call.vault_skill_ack is None
+                and retry.vault_skill_retry_ack is None
+                and isinstance(call.vault_skill_binding_sha256, str)
+                and bool(call.vault_skill_binding_sha256)
+                and retry.vault_skill_binding_sha256 == call.vault_skill_binding_sha256
             )
             if (
                 retry.tool_name != call.tool_name
@@ -4164,6 +4278,230 @@ def _vault_skill_handshakes_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
             if index == 0 or tool_calls[index - 1].server_error_code != "vault_skill_required":
                 return False
     return True
+
+
+def _relation_result_contains_edge(
+    call: ToolCallRecord,
+    *,
+    direction: str,
+    relation: str,
+    uri: str,
+) -> bool:
+    if not isinstance(call.result_preview, str):
+        return False
+    try:
+        payload = json.loads(call.result_preview)
+    except json.JSONDecodeError:
+        return False
+    relations = payload.get("relations") if isinstance(payload, dict) else None
+    return isinstance(relations, list) and any(
+        isinstance(item, dict)
+        and item.get("direction") == direction
+        and item.get("relation") == relation
+        and item.get("uri") == uri
+        for item in relations
+    )
+
+
+def _relation_directional_inspection_pair(
+    task: TaskManifest,
+    expected: ExpectedMaterialAttempt,
+    tool_calls: list[ToolCallRecord],
+) -> tuple[ToolCallRecord, ToolCallRecord] | None:
+    """Match outgoing/incoming reads that inspect the same registered edge."""
+
+    if (
+        expected.logical_operation != "read"
+        or expected.resource_type != "relation"
+        or expected.arguments.get("direction") != "both"
+    ):
+        return None
+    expected_index = next(
+        (index for index, item in enumerate(task.expected_material_attempts) if item.stage_id == expected.stage_id),
+        None,
+    )
+    if expected_index is None:
+        return None
+    link_attempt = next(
+        (
+            item
+            for item in task.expected_material_attempts[:expected_index]
+            if item.logical_operation == "update" and item.resource_type == "relation"
+        ),
+        None,
+    )
+    delete_attempt = next(
+        (
+            item
+            for item in task.expected_material_attempts[expected_index + 1 :]
+            if item.logical_operation == "delete" and item.resource_type == "relation"
+        ),
+        None,
+    )
+    source_binding = next(
+        (
+            item
+            for item in task.expected_result_bindings
+            if item.target_stage == expected.stage_id
+            and item.target_argument == "uri"
+            and item.source_field == "uri"
+            and item.relation == "equals"
+        ),
+        None,
+    )
+    if link_attempt is None or delete_attempt is None or source_binding is None:
+        return None
+    calls_by_stage = {
+        call.stage_id: call
+        for call in tool_calls
+        if call.stage_id is not None and call.server_succeeded
+    }
+    source_call = calls_by_stage.get(source_binding.source_stage)
+    if source_call is None:
+        return None
+    source_uri = source_call.result_fields.get(source_binding.source_field)
+    if not isinstance(source_uri, str):
+        return None
+
+    def satisfies_bindings(stage_id: str, arguments: dict[str, Any]) -> bool:
+        for binding in task.expected_result_bindings:
+            if binding.target_stage != stage_id:
+                continue
+            bound_source = calls_by_stage.get(binding.source_stage)
+            value = bound_source.result_fields.get(binding.source_field) if bound_source is not None else None
+            actual = arguments.get(binding.target_argument)
+            if not isinstance(value, str) or not value:
+                return False
+            if binding.relation == "equals" and actual != value:
+                return False
+            if binding.relation == "collection_uri":
+                if "/doc/" not in value or not isinstance(actual, str) or actual != value.split("/doc/", 1)[0]:
+                    return False
+            if binding.relation == "contains" and (
+                not isinstance(actual, str) or value not in actual
+            ):
+                return False
+        return True
+
+    link_candidates = []
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != link_attempt.logical_operation
+            or not _resource_matches(call.resource_type, link_attempt.resource_type)
+            or (link_attempt.tool_name is not None and call.tool_name != link_attempt.tool_name)
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        if _arguments_include(arguments, link_attempt.arguments) and satisfies_bindings(link_attempt.stage_id, arguments):
+            link_candidates.append((call, arguments))
+    if len(link_candidates) != 1:
+        return None
+    link_call, link_args = link_candidates[0]
+    target_uri = link_args.get("target")
+    relation = link_args.get("relation")
+    if (
+        not isinstance(target_uri, str)
+        or not isinstance(relation, str)
+        or relation != link_attempt.arguments.get("relation")
+        or link_args.get("source") != source_uri
+    ):
+        return None
+
+    delete_candidates = []
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != delete_attempt.logical_operation
+            or not _resource_matches(call.resource_type, delete_attempt.resource_type)
+            or (delete_attempt.tool_name is not None and call.tool_name != delete_attempt.tool_name)
+            or call.order <= link_call.order
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        if _arguments_include(arguments, delete_attempt.arguments) and satisfies_bindings(delete_attempt.stage_id, arguments):
+            delete_candidates.append(call)
+    if len(delete_candidates) != 1:
+        return None
+    delete_call = delete_candidates[0]
+    edge_reads: dict[str, list[ToolCallRecord]] = {"outgoing": [], "incoming": []}
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != "read"
+            or call.resource_type != "relation"
+            or call.tool_name != "akb_relations"
+            or call.stage_id not in {None, expected.stage_id}
+            or call.order <= link_call.order
+            or call.order >= delete_call.order
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        direction = arguments.get("direction")
+        uri = arguments.get("uri")
+        if (
+            direction == "outgoing"
+            and uri == source_uri
+            and _relation_result_contains_edge(
+                call,
+                direction="outgoing",
+                relation=relation,
+                uri=target_uri,
+            )
+        ):
+            edge_reads["outgoing"].append(call)
+        elif (
+            direction == "incoming"
+            and uri == target_uri
+            and _relation_result_contains_edge(
+                call,
+                direction="incoming",
+                relation=relation,
+                uri=source_uri,
+            )
+        ):
+            edge_reads["incoming"].append(call)
+    if len(edge_reads["outgoing"]) != 1 or len(edge_reads["incoming"]) != 1:
+        return None
+    outgoing, incoming = edge_reads["outgoing"][0], edge_reads["incoming"][0]
+    if outgoing.order >= incoming.order:
+        return None
+    return outgoing, incoming
+
+
+def _rebind_directional_relation_inspections(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> None:
+    for expected in task.expected_material_attempts:
+        pair = _relation_directional_inspection_pair(task, expected, tool_calls)
+        if pair is None:
+            continue
+        outgoing, _incoming = pair
+        delete_attempt = next(
+            item
+            for item in task.expected_material_attempts
+            if item.logical_operation == "delete" and item.resource_type == "relation"
+        )
+        delete_call = next(
+            (
+                call
+                for call in tool_calls
+                if call.stage_id == delete_attempt.stage_id and call.server_succeeded
+            ),
+            None,
+        )
+        if delete_call is None:
+            continue
+        if any(
+            call.stage_id == expected.stage_id and call.order < delete_call.order
+            for call in tool_calls
+        ):
+            continue
+        for call in tool_calls:
+            if call.stage_id == expected.stage_id and call.order > delete_call.order:
+                call.stage_id = None
+        outgoing.stage_id = expected.stage_id
 
 
 def _local_file_arguments_match(
@@ -4308,6 +4646,12 @@ def _resolved_material_stage_calls(
         return [], True
     expected_set = set(expected_ids)
     groups: dict[str, list[ToolCallRecord]] = defaultdict(list)
+    directional_relation_calls = {
+        id(call)
+        for expected in task.expected_material_attempts
+        if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+        for call in pair
+    }
     ordered_ids: list[str] = []
     valid = True
     for call in tool_calls:
@@ -4319,7 +4663,10 @@ def _resolved_material_stage_calls(
             if call.stage_id not in ordered_ids:
                 ordered_ids.append(call.stage_id)
         elif call.operation_kind == "material":
-            if not _registered_readonly_observation(call, task, tool_calls):
+            if (
+                id(call) not in directional_relation_calls
+                and not _registered_readonly_observation(call, task, tool_calls)
+            ):
                 valid = False
     if not _registered_stage_order_matches(task, ordered_ids, expected_ids):
         valid = False
@@ -4391,11 +4738,15 @@ def material_outcome_matches(
         for binding in task.expected_result_bindings:
             dynamic_arguments[binding.target_stage].add(binding.target_argument)
         attempts_match = all(
-            _material_attempt_matches(
-                call,
-                expected,
-                dynamic_arguments=dynamic_arguments[expected.stage_id],
-                consumer_root=consumer_root,
+            (
+                call is pair[0] and call.stage_id == expected.stage_id
+                if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+                else _material_attempt_matches(
+                    call,
+                    expected,
+                    dynamic_arguments=dynamic_arguments[expected.stage_id],
+                    consumer_root=consumer_root,
+                )
             )
             for call, expected in zip(stage_calls, task.expected_material_attempts)
         )

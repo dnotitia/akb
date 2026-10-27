@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome
+from mcp_catalog.runner import (
+    _build_artifact_hash_input,
+    _selected_invalid_condition_reason,
+    compare_artifacts,
+    planned_arm_order,
+)
 from mcp_catalog.statistics import InconclusiveBootstrap, paired_cluster_bca
 from paired_artifact_factory import complete_paired_artifacts, mark_candidate_unsafe
 
@@ -120,6 +126,83 @@ def test_selected_artifacts_keep_the_full_corpus_verdict_inconclusive() -> None:
     assert diagnostics["combined"]["observed_trials"] == 2
     assert diagnostics["combined"]["efficiency_metrics"]["trials"] == 2
     assert "cost_usd" in diagnostics["combined"]
+
+
+def test_selected_diagnostics_rescore_recorded_calls_instead_of_trusting_derived_fields() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    _attach_selection_metadata(baseline, candidate)
+    for artifact in (baseline, candidate):
+        trial = artifact["runs"]["primary:http"]["trials"][0]
+        trial["success"] = False
+        trial["trial_error"] = False
+        trial["safety"] = False
+        _seal(artifact)
+
+    result = compare_artifacts(baseline, candidate)
+    diagnostics = result["observed_selected_diagnostics"]
+
+    assert result["schema_version"] == 5
+    assert diagnostics["rescored_from_recorded_evidence"] is True
+    assert diagnostics["arms"]["baseline"]["successes"] == 1
+    assert diagnostics["arms"]["baseline"]["task_errors"] == 1
+    assert diagnostics["arms"]["baseline"]["safe_trials"] == 1
+    assert diagnostics["arms"]["baseline"]["rescored_trials"][0]["success"] is True
+    assert diagnostics["arms"]["baseline"]["rescored_trials"][0]["trial_error_kinds"] == [
+        "unintended_tool_action"
+    ]
+    assert diagnostics["combined"]["efficiency_metrics"]["success_rate"] == 1.0
+
+
+def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failures() -> None:
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    history = next(task for task in tasks if task.id == "history-provenance-en")
+    incomplete_history = TrialOutcome(
+        task_id=history.id,
+        category=history.category,
+        locale=history.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="http",
+    )
+    old_history_contract = history.model_copy(update={"prompt": "Inspect history and provenance, then verify it."})
+    assert _selected_invalid_condition_reason(old_history_contract, incomplete_history) == (
+        "task prompt omitted the exact preregistered revision bodies"
+    )
+
+    access = next(task for task in tasks if task.id == "access-ownership-public-en")
+    absent_owner = TrialOutcome(
+        task_id=access.id,
+        category=access.category,
+        locale=access.locale,
+        arm="candidate",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="stdio",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="akb_identity",
+                logical_operation="list",
+                resource_type="access",
+                effective_server_args={"action": "search_users", "query": "fixture-owner"},
+                server_succeeded=True,
+                result_preview='{"users":[]}',
+            ),
+            ToolCallRecord(
+                order=2,
+                tool_name="akb_transfer_ownership",
+                logical_operation="update",
+                resource_type="access",
+                server_args={"new_owner": "fixture-owner"},
+                server_succeeded=False,
+                server_error_code="not_found",
+            ),
+        ],
+    )
+    assert _selected_invalid_condition_reason(access, absent_owner) == (
+        "fixture user 'fixture-owner' was absent during the ownership transfer"
+    )
 
 
 @pytest.mark.parametrize(

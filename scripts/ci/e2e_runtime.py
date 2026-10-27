@@ -4502,6 +4502,33 @@ class E2ERuntime:
                         system_admin_id=system_admin_id,
                     )
                 elif self.config.scenario == "app-control-plane":
+                    fixture_owner_id = await connection.fetchval(
+                        "SELECT id FROM users WHERE username = $1",
+                        "fixture-owner",
+                    )
+                    if fixture_owner_id is None:
+                        fixture_owner_id = await self._insert_fixture_user(
+                            connection,
+                            username="fixture-owner",
+                            password_hash=password_hash,
+                            label="fixture-owner",
+                        )
+                    await connection.execute(
+                        """
+                        UPDATE users
+                           SET is_admin = FALSE,
+                               account_status = 'active',
+                               credential_change_required = FALSE,
+                               updated_at = NOW()
+                         WHERE id = $1
+                        """,
+                        fixture_owner_id,
+                    )
+                    if await connection.fetchval(
+                        "SELECT id FROM users WHERE username = $1",
+                        "fixture-owner",
+                    ) is None:
+                        raise ProvisioningFailure("ownership-transfer fixture user was not seeded")
                     await self._seed_app_release_rollout(
                         connection,
                         password_hash=password_hash,

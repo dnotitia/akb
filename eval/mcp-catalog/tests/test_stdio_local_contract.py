@@ -11,6 +11,7 @@ from mcp_catalog.execution import (
     ToolCallRecord,
     ToolCallRecorder,
     TrialOutcome,
+    _vault_skill_binding_digest,
     bind_tool_calls,
     capture_result_fields_for_task,
     render_task_prompt,
@@ -456,6 +457,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     calls = _stdio_calls(consumer_root, document_content=IMAGE_MARKDOWN)
     file_args = dict(calls[0].server_args or {})
+    binding_digest = _vault_skill_binding_digest("akb_put_file", file_args, "fixture-ack")
     retry_file_args = {**file_args, "_vault_skill_ack": "fixture-ack"}
     calls[0] = calls[0].model_copy(
         update={
@@ -463,6 +465,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
             "server_args": retry_file_args,
             "effective_server_args": retry_file_args,
             "vault_skill_retry_ack": "fixture-ack",
+            "vault_skill_binding_sha256": binding_digest,
         }
     )
     recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
@@ -494,6 +497,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
     )
 
     assert challenge[0].vault_skill_ack == "fixture-ack"
+    assert challenge[0].vault_skill_binding_sha256 == binding_digest
     assert challenge[0].result_preview is not None
     assert "fixture-ack" not in challenge[0].result_preview
     assert "ack_token" in challenge[0].result_preview

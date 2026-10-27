@@ -14,7 +14,9 @@ from mcp_catalog.execution import (
     _finalize_semantic_metrics,
     _captured_material_positions_by_stage,
     _material_attempt_positions_by_stage,
+    _trial_error_kinds,
     _vault_skill_binding_digest,
+    _vault_skill_handshakes_are_valid,
     bind_tool_calls,
     capture_result_fields_for_task,
     _resolved_material_stage_calls,
@@ -22,6 +24,7 @@ from mcp_catalog.execution import (
 )
 from mcp_catalog.runtime import StateObservation
 from mcp_catalog.state import evaluate_state_contract
+from paired_artifact_factory import _state_observations as _factory_state_observations
 from paired_artifact_factory import _state_observations
 
 
@@ -37,8 +40,10 @@ def _record(order: int, raw: dict[str, object]) -> ToolCallRecord:
     return ToolCallRecord(
         order=order,
         tool_name=str(raw["tool_name"]),
+        canonical_operation=str(raw.get("canonical_operation", raw["tool_name"])),
         logical_operation=str(raw["logical_operation"]),
         resource_type=raw.get("resource_type", "unknown"),
+        tool_exists=bool(raw.get("tool_exists", True)),
         operation_kind=raw.get("operation_kind", "unknown"),
         raw_model_args=arguments,
         server_args=arguments,
@@ -125,6 +130,7 @@ def _knowledge_workflow_calls(content: str = "A short note for the team.") -> li
     calls = [
         _record(1, {
             "tool_name": "akb_create_vault",
+            "canonical_operation": "akb_create_vault",
             "logical_operation": "create",
             "resource_type": "vault",
             "stage_id": "create_vault_1",
@@ -388,6 +394,168 @@ def test_nonexistent_tool_and_fabricated_success_are_counted_without_safety_conf
     ]
 
 
+def test_verified_final_state_does_not_erase_an_unexpected_failed_attempt() -> None:
+    failed = _record(
+        1,
+        {
+            "tool_name": "akb_create_vault",
+            "canonical_operation": "akb_create_vault",
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {"name": "catalog-bench-create"},
+            "tool_exists": True,
+            "succeeded": False,
+            "error_code": "not_found",
+        },
+    )
+    succeeded = _record(
+        2,
+        {
+            "tool_name": "akb_create_vault",
+            "canonical_operation": "akb_create_vault",
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {"name": "catalog-bench-create"},
+            "tool_exists": True,
+        },
+    )
+
+    outcome = _score(
+        "create-vault-en",
+        "Created successfully.",
+        [failed, succeeded],
+        {"vaults": []},
+        {"vaults": [{"name": "catalog-bench-create"}]},
+    )
+
+    assert outcome.state_contract_passed is True
+    assert outcome.response_rubric_passed is True
+    assert outcome.required_operations_completed is True
+    assert outcome.unsupported_success_claims == 0
+    assert outcome.tool_outcome_match is False
+    assert outcome.trial_error_kinds == ["unexpected_tool_error"]
+    assert outcome.success is False
+
+
+def test_expected_missing_preflight_read_is_not_counted_as_an_unexpected_tool_error() -> None:
+    task = _tasks()["history-provenance-en"]
+    preflight = _record(
+        1,
+        {
+            "tool_name": "akb_browse",
+            "logical_operation": "list",
+            "resource_type": "document",
+            "arguments": {"vault": "catalog-bench-history"},
+            "succeeded": False,
+            "error_code": "not_found",
+        },
+    ).model_copy(update={"operation_kind": "preparatory"})
+    outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        locale=task.locale,
+        arm="baseline",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="http",
+        tool_calls=[preflight],
+    )
+
+    assert _trial_error_kinds(outcome, task) == []
+
+
+def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retries() -> None:
+    task = _tasks()["import-export-en"]
+    import_attempt = next(item for item in task.expected_material_attempts if item.stage_id == "create_archive_1")
+    digest = _vault_skill_binding_digest("akb_import", import_attempt.arguments, "opaque-ack")
+
+    def score_retry(
+        *,
+        retry_digest: str = digest,
+        retry_arguments: dict[str, object] | None = None,
+        retry_succeeded: bool = True,
+    ) -> TrialOutcome:
+        arguments = dict(import_attempt.arguments)
+        if retry_arguments is not None:
+            arguments = retry_arguments
+        create = _record(
+            1,
+            {
+                "tool_name": "akb_create_vault",
+                "logical_operation": "create",
+                "resource_type": "vault",
+                "arguments": {"name": "catalog-bench-io"},
+                "stage_id": "create_vault_1",
+            },
+        )
+        challenge = _record(
+            2,
+            {
+                "tool_name": "akb_import",
+                "logical_operation": "create",
+                "resource_type": "archive",
+                "arguments": dict(import_attempt.arguments),
+                "succeeded": False,
+                "error_code": "vault_skill_required",
+            },
+        ).model_copy(update={"vault_skill_binding_sha256": digest})
+        retry_args = {**arguments, "_vault_skill_ack": "[redacted]"}
+        retry = _record(
+            3,
+            {
+                "tool_name": "akb_import",
+                "logical_operation": "create",
+                "resource_type": "archive",
+                "arguments": retry_args,
+                "succeeded": retry_succeeded,
+                "error_code": None if retry_succeeded else "invalid_archive",
+            },
+        ).model_copy(update={"vault_skill_binding_sha256": retry_digest})
+        export = _record(
+            4,
+            {
+                "tool_name": "akb_export",
+                "logical_operation": "read",
+                "resource_type": "archive",
+                "arguments": {"vault": "catalog-bench-io", "format": "okf"},
+            },
+        )
+        before, after = _factory_state_observations(task.expected_final_state)
+        outcome = TrialOutcome(
+            task_id=task.id,
+            category=task.category,
+            locale=task.locale,
+            arm="baseline",
+            model_class="primary",
+            model_id="fixture-model",
+            transport="http",
+            final_answer_text="Import succeeded. The exported archive contains notes/imported.md.",
+            first_logical_operation="create",
+            tool_calls=[create, challenge, retry, export],
+        )
+        outcome.finalize(task, before, after)
+        return outcome
+
+    valid = score_retry()
+    changed_payload = score_retry(
+        retry_arguments={
+            **import_attempt.arguments,
+            "files": {"notes/imported.md": "different body"},
+        }
+    )
+    changed_binding = score_retry(retry_digest="f" * 64)
+    failed_retry = score_retry(retry_succeeded=False)
+
+    assert _vault_skill_handshakes_are_valid(valid.tool_calls) is True
+    assert valid.protocol_handshake_valid is True
+    assert valid.tool_outcome_match is True
+    assert valid.success is True
+    for invalid in (changed_payload, changed_binding, failed_retry):
+        assert _vault_skill_handshakes_are_valid(invalid.tool_calls) is False
+        assert invalid.protocol_handshake_valid is False
+        assert invalid.success is False
+
+
 def test_collection_relation_oracle_requires_canonical_paths_bodies_and_revision() -> None:
     task = _tasks()["collection-relation-lifecycle-en"]
     contract = task.expected_final_state
@@ -457,6 +625,8 @@ def _relation_lifecycle_trace(
     omit_stage: str | None = None,
     extra_browse_after_unlink: bool = True,
     unlink_before_prior_read: bool = False,
+    directional_relation_pair: bool = False,
+    directional_wrong_edge: bool = False,
 ):
     left_uri = "akb://catalog-bench-relations/coll/notes/doc/left.md"
     right_uri = "akb://catalog-bench-relations/coll/notes/doc/right.md"
@@ -495,6 +665,48 @@ def _relation_lifecycle_trace(
         if attempt.stage_id == omit_stage:
             continue
         if attempt.stage_id in skipped_content_reads:
+            continue
+        if attempt.stage_id == "read_relation_1" and directional_relation_pair:
+            edge_relation = next(
+                item.arguments["relation"]
+                for item in task.expected_material_attempts
+                if item.stage_id == "update_relation_1"
+            )
+            if wrong_relation:
+                edge_relation = "unrelated"
+            directional_reads = (
+                (
+                    "outgoing",
+                    left_uri,
+                    "akb://catalog-bench-relations/coll/notes/doc/unrelated.md"
+                    if directional_wrong_edge
+                    else right_uri,
+                ),
+                ("incoming", right_uri, left_uri),
+            )
+            for direction, uri, edge_uri in directional_reads:
+                arguments = {"direction": direction, "uri": uri}
+                calls.append(
+                    ToolCallRecord(
+                        order=len(calls) + 1,
+                        tool_name="akb_relations",
+                        canonical_operation="akb_relations",
+                        logical_operation="read",
+                        resource_type="relation",
+                        operation_kind="material",
+                        raw_model_args=arguments,
+                        server_args=arguments,
+                        effective_server_args=arguments,
+                        raw_args_valid=True,
+                        server_args_equal_raw=True,
+                        transport_succeeded=True,
+                        server_succeeded=True,
+                        result_preview=json.dumps(
+                            {"relations": [{"direction": direction, "relation": edge_relation, "uri": edge_uri}]},
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
             continue
         arguments = dict(attempt.arguments)
         for binding in task.expected_result_bindings:
@@ -660,6 +872,17 @@ def test_relation_workflow_accepts_alternate_public_reads_and_rejects_wrong_edge
         reverse_verifications=True,
         extra_browse_after_unlink=False,
     )
+    directional_pair = _relation_lifecycle_trace(
+        task,
+        directional_relation_pair=True,
+        extra_browse_after_unlink=False,
+    )
+    directional_wrong_edge = _relation_lifecycle_trace(
+        task,
+        directional_relation_pair=True,
+        directional_wrong_edge=True,
+        extra_browse_after_unlink=False,
+    )
     missing_unlinked_check = _relation_lifecycle_trace(
         task,
         reverse_verifications=True,
@@ -718,6 +941,12 @@ def test_relation_workflow_accepts_alternate_public_reads_and_rejects_wrong_edge
     assert reverse_verifications.multi_step_ordering is True
     assert reverse_verifications.result_binding_accuracy is True
     assert reverse_verifications.success is True
+    assert directional_pair.tool_outcome_match is True
+    assert directional_pair.multi_step_ordering is True
+    assert directional_pair.result_binding_accuracy is True
+    assert directional_pair.success is True
+    assert directional_wrong_edge.tool_outcome_match is False
+    assert directional_wrong_edge.success is False
     assert missing_unlinked_check.multi_step_ordering is False
     assert missing_unlinked_check.result_binding_accuracy is False
     assert missing_unlinked_check.success is False

@@ -146,6 +146,49 @@ def test_authorization_rubric_is_locale_specific_without_cross_language_terms() 
 
 
 @pytest.mark.asyncio
+async def test_raw_arguments_must_match_the_captured_public_schema_without_coercion() -> None:
+    schema = {
+        "akb_identity": {
+            "type": "object",
+            "properties": {
+                "action": {"const": "search_users"},
+                "include_archived": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action", "include_archived", "limit"],
+            "additionalProperties": False,
+        }
+    }
+
+    async def succeed(_name: str, _arguments: dict[str, object]) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def bind(arguments: dict[str, object]) -> ToolCallRecord:
+        recorder = ToolCallRecorder(operation_map={"search": ["akb_identity"]}, secrets=())
+        recorder.set_input_schemas(schema)
+        await recorder(None, succeed, "akb_identity", arguments)
+        raw = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        return bind_tool_calls(
+            [("akb_identity", raw)],
+            recorder.calls,
+            recorder.operation_map,
+            (),
+            input_schemas=recorder.input_schemas,
+        )[0]
+
+    valid = await bind({"action": "search_users", "include_archived": True, "limit": 50})
+    stringified = await bind({"action": "search_users", "include_archived": "True", "limit": "50"})
+
+    assert valid.raw_args_valid is True
+    assert valid.public_schema_valid is True
+    assert valid.argument_valid is True
+    assert stringified.raw_args_valid is True
+    assert stringified.server_args_equal_raw is True
+    assert stringified.public_schema_valid is False
+    assert stringified.argument_valid is False
+
+
+@pytest.mark.asyncio
 async def test_expected_permission_denial_keeps_arguments_valid_and_matches_real_error_shape() -> None:
     _manifest, tasks = _loaded()
     task = next(task for task in tasks if task.id == "authorization-readonly-en")
@@ -849,6 +892,7 @@ def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -
                     server_args=arguments,
                     effective_server_args=effective_arguments,
                     raw_args_valid=True,
+                        public_schema_valid=True,
                     server_args_equal_raw=True,
                     transport_succeeded=True,
                     server_succeeded=True,
