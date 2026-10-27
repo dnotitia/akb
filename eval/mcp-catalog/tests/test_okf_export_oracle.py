@@ -8,7 +8,7 @@ import pytest
 
 from mcp_catalog.contracts import StateExpectation, load_task_corpus
 from mcp_catalog.runtime import StateObservation
-from mcp_catalog.state import evaluate_state_contract, expectation_holds, json_pointer
+from mcp_catalog.state import evaluate_state_contract, expectation_holds, json_pointer, okf_import_files_match
 
 
 ROOT = Path(__file__).parents[1]
@@ -158,6 +158,35 @@ def test_import_export_oracle_normalizes_only_canonical_body_line_endings() -> N
     crlf_body = frontmatter + separator + body.replace("\n", "\r\n")
 
     assert expectation_holds(crlf_body, expectation) is True
+
+
+def test_import_attempt_matches_product_normalized_okf_document_content() -> None:
+    expected = {
+        "notes/imported.md": "---\ntype: note\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\n"
+        "akb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable"
+    }
+    actual = {"notes/imported.md": expected["notes/imported.md"] + "\n"}
+
+    assert okf_import_files_match(actual, expected) is True
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda item: {"notes/other.md": item["notes/imported.md"]}, id="path-changed"),
+        pytest.param(lambda item: {**item, "notes/extra.md": item["notes/imported.md"]}, id="extra-path"),
+        pytest.param(lambda item: {"notes/imported.md": item["notes/imported.md"].replace("type: note", "type: table")}, id="type-changed"),
+        pytest.param(lambda item: {"notes/imported.md": item["notes/imported.md"].replace("portable", "changed")}, id="body-changed"),
+        pytest.param(lambda item: {"notes/imported.md": item["notes/imported.md"].replace("\n", r"\n")}, id="escaped-newlines"),
+    ],
+)
+def test_import_attempt_rejects_changed_okf_input(mutate) -> None:
+    expected = {
+        "notes/imported.md": "---\ntype: note\nresource: akb://catalog-bench-io/coll/notes/doc/imported.md\n"
+        "akb_uri: akb://catalog-bench-io/coll/notes/doc/imported.md\n---\n\n# Imported\nportable"
+    }
+
+    assert okf_import_files_match(mutate(expected), expected) is False
 
 
 def test_import_export_document_read_requires_canonical_path_uri_body_and_nonempty_revision() -> None:

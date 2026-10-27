@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
+import importlib.metadata
 import json
 import signal
+import subprocess
 import sys
 import time
+import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,7 +22,6 @@ from .contracts import (
     ArmName,
     BenchmarkRunManifest,
     TaskManifest,
-    load_json,
     load_run_manifest,
     load_task_corpus,
     load_tool_coverage,
@@ -681,14 +684,76 @@ def _paired_arm_failure_artifact(
 
 
 def compare(args: argparse.Namespace) -> int:
-    baseline = load_json(args.baseline)
-    candidate = load_json(args.candidate)
+    baseline_path = Path(args.baseline).resolve(strict=True)
+    candidate_path = Path(args.candidate).resolve(strict=True)
+    baseline_bytes = baseline_path.read_bytes()
+    candidate_bytes = candidate_path.read_bytes()
+    baseline = json.loads(baseline_bytes)
+    candidate = json.loads(candidate_bytes)
     if not isinstance(baseline, dict) or not isinstance(candidate, dict):
         raise ValueError("run artifacts must be JSON objects")
     result = compare_artifacts(baseline, candidate)
+    result["comparison_provenance"] = {
+        "hash_scheme": "sha256_raw_file_bytes",
+        "inputs": {
+            "baseline": {
+                "path": str(baseline_path),
+                "file_sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+                "artifact_semantic_sha256": baseline.get("artifact_hash"),
+            },
+            "candidate": {
+                "path": str(candidate_path),
+                "file_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+                "artifact_semantic_sha256": candidate.get("artifact_hash"),
+            },
+        },
+        "verifier": _comparison_verifier_provenance(),
+    }
     write_json(args.output, result)
     print(json.dumps({"status": result["verdict"], "output": str(args.output)}, ensure_ascii=False, sort_keys=True))
     return 0 if result["verdict"] == "adopt" else 1
+
+
+def _comparison_verifier_provenance() -> dict[str, Any]:
+    try:
+        version = importlib.metadata.version("akb-mcp-catalog-benchmark")
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            with (PROJECT_ROOT / "pyproject.toml").open("rb") as stream:
+                version = str(tomllib.load(stream)["project"]["version"])
+        except (KeyError, OSError, tomllib.TOMLDecodeError):
+            version = "unknown"
+
+    repository_root = PROJECT_ROOT.parent.parent
+    try:
+        revision_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dirty_paths = [line[3:] for line in status_result.stdout.splitlines() if len(line) >= 4]
+        revision = revision_result.stdout.strip()
+        dirty: bool | None = bool(dirty_paths)
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+        dirty = None
+        dirty_paths = []
+    return {
+        "package": "akb-mcp-catalog-benchmark",
+        "version": version,
+        "git_revision": revision,
+        "tracked_worktree_dirty": dirty,
+        "tracked_dirty_paths": dirty_paths,
+    }
 
 
 if __name__ == "__main__":

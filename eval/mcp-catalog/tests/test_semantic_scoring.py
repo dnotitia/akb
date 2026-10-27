@@ -437,6 +437,120 @@ def test_verified_final_state_does_not_erase_an_unexpected_failed_attempt() -> N
     assert outcome.success is False
 
 
+@pytest.mark.parametrize("arm", ["baseline", "candidate"])
+def test_selected_successful_path_can_complete_with_independent_task_errors(arm: str) -> None:
+    task = _tasks()["overlapping-document-en"]
+    uri = "akb://catalog-bench-overlap/doc/status-note.md"
+    calls = [
+        _record(
+            1,
+            {
+                "tool_name": "akb_create_vault",
+                "logical_operation": "create",
+                "resource_type": "vault",
+                "stage_id": "create_vault_1",
+                "arguments": {"name": "catalog-bench-overlap"},
+            },
+        ),
+        _record(
+            2,
+            {
+                "tool_name": "akb_put",
+                "logical_operation": "create",
+                "resource_type": "document",
+                "arguments": {"vault": "catalog-bench-overlap", "title": "wrong-target", "content": "Draft"},
+                "succeeded": False,
+                "error_code": "not_found",
+            },
+        ),
+        _record(
+            3,
+            {
+                "tool_name": "akb_put",
+                "logical_operation": "create",
+                "resource_type": "document",
+                "stage_id": "create_document_1",
+                "arguments": {
+                    "vault": "catalog-bench-overlap",
+                    "title": "status-note",
+                    "content": "# Status\nDraft\n# Owner\nTeam A",
+                },
+            },
+        ),
+        _record(
+            4,
+            {
+                "tool_name": "akb_update",
+                "logical_operation": "update",
+                "resource_type": "document",
+                "stage_id": "update_document_1",
+                "arguments": {"uri": uri, "content": "# Status\nFinal\n# Owner\nTeam A"},
+            },
+        ),
+        _record(
+            5,
+            {
+                "tool_name": "akb_get",
+                "logical_operation": "read",
+                "resource_type": "document",
+                "stage_id": "read_document_1",
+                "arguments": {"uri": uri, "section": "Status"},
+            },
+        ),
+    ]
+    calls[2].result_fields["uri"] = uri
+    if arm == "candidate":
+        for order in (6, 7, 8):
+            invalid_query = _record(
+                order,
+                {
+                    "tool_name": "akb_discover",
+                    "logical_operation": "search",
+                    "resource_type": "unknown",
+                    "operation_kind": "preparatory",
+                    "arguments": {"invalid": "argument"},
+                    "succeeded": False,
+                    "error_code": "schema_error",
+                },
+            )
+            invalid_query.public_schema_valid = False
+            calls.append(invalid_query)
+
+    outcome = TrialOutcome(
+        task_id=task.id,
+        category=task.category,
+        locale=task.locale,
+        arm=arm,
+        model_class="lightweight",
+        model_id="fixture-model",
+        transport="http",
+        final_answer_text="Final is shown in the requested Status section.",
+        first_logical_operation="create",
+        tool_calls=calls,
+    )
+    outcome.finalize(
+        task,
+        StateObservation(True, 404, {"detail": "not found"}),
+        StateObservation(
+            True,
+            200,
+            {"items": [{"name": "status-note", "path": "status-note.md", "type": "document", "uri": uri}]},
+        ),
+    )
+
+    assert outcome.completion_path_matched is True
+    assert outcome.user_outcome_completed is True
+    assert outcome.tool_outcome_match is False
+    assert outcome.trial_error is True
+    assert outcome.trial_error_kinds == (
+        ["unexpected_tool_error"]
+        if arm == "baseline"
+        else ["schema_error", "unexpected_tool_error"]
+    )
+    assert outcome.argument_validity is (arm == "baseline")
+    assert outcome.success is True
+
+
 def test_expected_missing_preflight_read_is_not_counted_as_an_unexpected_tool_error() -> None:
     task = _tasks()["history-provenance-en"]
     preflight = _record(
@@ -464,18 +578,24 @@ def test_expected_missing_preflight_read_is_not_counted_as_an_unexpected_tool_er
     assert _trial_error_kinds(outcome, task) == []
 
 
-def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retries() -> None:
+@pytest.mark.parametrize("arm", ["baseline", "candidate"])
+def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retries(arm: str) -> None:
     task = _tasks()["import-export-en"]
     import_attempt = next(item for item in task.expected_material_attempts if item.stage_id == "create_archive_1")
-    digest = _vault_skill_binding_digest("akb_import", import_attempt.arguments, "opaque-ack")
+    captured_arguments = json.loads(json.dumps(import_attempt.arguments))
+    captured_arguments["files"]["notes/imported.md"] += "\n"
+    digest = _vault_skill_binding_digest("akb_import", captured_arguments, "opaque-ack")
 
     def score_retry(
         *,
         retry_digest: str = digest,
         retry_arguments: dict[str, object] | None = None,
+        challenge_arguments: dict[str, object] | None = None,
         retry_succeeded: bool = True,
     ) -> TrialOutcome:
-        arguments = dict(import_attempt.arguments)
+        bound_arguments = challenge_arguments or captured_arguments
+        bound_digest = _vault_skill_binding_digest("akb_import", bound_arguments, "opaque-ack")
+        arguments = bound_arguments
         if retry_arguments is not None:
             arguments = retry_arguments
         create = _record(
@@ -494,11 +614,11 @@ def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retrie
                 "tool_name": "akb_import",
                 "logical_operation": "create",
                 "resource_type": "archive",
-                "arguments": dict(import_attempt.arguments),
+                "arguments": bound_arguments,
                 "succeeded": False,
                 "error_code": "vault_skill_required",
             },
-        ).model_copy(update={"vault_skill_binding_sha256": digest})
+        ).model_copy(update={"vault_skill_binding_sha256": bound_digest})
         retry_args = {**arguments, "_vault_skill_ack": "[redacted]"}
         retry = _record(
             3,
@@ -525,7 +645,7 @@ def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retrie
             task_id=task.id,
             category=task.category,
             locale=task.locale,
-            arm="baseline",
+            arm=arm,
             model_class="primary",
             model_id="fixture-model",
             transport="http",
@@ -545,15 +665,31 @@ def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retrie
     )
     changed_binding = score_retry(retry_digest="f" * 64)
     failed_retry = score_retry(retry_succeeded=False)
+    changed_payload_arguments = {
+        **captured_arguments,
+        "files": {"notes/imported.md": "different body"},
+    }
+    altered_but_acknowledged = score_retry(
+        retry_digest=_vault_skill_binding_digest("akb_import", changed_payload_arguments, "opaque-ack"),
+        challenge_arguments=changed_payload_arguments,
+        retry_arguments=changed_payload_arguments,
+    )
 
     assert _vault_skill_handshakes_are_valid(valid.tool_calls) is True
     assert valid.protocol_handshake_valid is True
+    assert valid.tool_calls[2].stage_id == "create_archive_1"
     assert valid.tool_outcome_match is True
+    assert valid.user_outcome_completed is True
     assert valid.success is True
     for invalid in (changed_payload, changed_binding, failed_retry):
         assert _vault_skill_handshakes_are_valid(invalid.tool_calls) is False
         assert invalid.protocol_handshake_valid is False
         assert invalid.success is False
+    assert _vault_skill_handshakes_are_valid(altered_but_acknowledged.tool_calls) is True
+    assert altered_but_acknowledged.protocol_handshake_valid is True
+    assert altered_but_acknowledged.completion_path_matched is False
+    assert altered_but_acknowledged.user_outcome_completed is False
+    assert altered_but_acknowledged.success is False
 
 
 def test_collection_relation_oracle_requires_canonical_paths_bodies_and_revision() -> None:
@@ -1787,6 +1923,17 @@ async def _schema_conflict_outcome(
 ):
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     table_uri = "akb://catalog-bench-schema/table/events"
+    returned_schema = {
+        "kind": "table",
+        "uri": table_uri,
+        "name": "events",
+        "columns": [
+            {key: column[key] for key in ("name", "type") if key in column}
+            for column in schema_payload["columns"]
+        ],
+        "unique_keys": [],
+        "indexes": [],
+    }
     tool_by_stage = {
         "create_vault_1": "akb_create_vault",
         "create_table_1": "akb_create_table",
@@ -1817,7 +1964,7 @@ async def _schema_conflict_outcome(
             if _name == "akb_create_table":
                 return {"structuredContent": {"uri": table_uri}, "content": []}
             if _name == "akb_alter_table":
-                return {"structuredContent": {"columns": schema_payload["columns"]}, "content": []}
+                return {"structuredContent": returned_schema, "content": []}
             return {"structuredContent": {"ok": True}, "content": []}
 
         await recorder(None, successful_call, tool_name, arguments)
@@ -1836,7 +1983,7 @@ async def _schema_conflict_outcome(
     assert alter_call.tool_name == "akb_alter_table"
     assert alter_call.stage_id == "update_table_1"
     assert alter_call.resource_type == "table"
-    assert json.loads(alter_call.result_fields["columns"]) == schema_payload["columns"]
+    assert json.loads(alter_call.result_fields["columns"]) == returned_schema["columns"]
     if metadata_sql is not None:
         metadata_args = {"vault": metadata_vault, "sql": metadata_sql}
         calls.append(
@@ -1865,8 +2012,8 @@ async def _schema_conflict_outcome(
         model_id="fixture-model",
         transport="http",
         final_answer_text=(
-            "The tool returned a normal success response, not an error. The duplicate add was a no-op; "
-            "the unchanged schema has exactly one text event_id column."
+            "The duplicate add returned this table result:\n\n```json\n"
+            f"{json.dumps(returned_schema, ensure_ascii=False, indent=2)}\n```"
         ),
         first_logical_operation="create",
         tool_calls=calls,

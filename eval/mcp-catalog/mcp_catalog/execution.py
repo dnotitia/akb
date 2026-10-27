@@ -56,7 +56,7 @@ from .evidence import (
     validate_model_input_evidence,
 )
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
-from .state import StateCheckResult, evaluate_checkpoint_contract, evaluate_state_contract
+from .state import StateCheckResult, evaluate_checkpoint_contract, evaluate_state_contract, okf_import_files_match
 from .timing import TimingCategory
 
 SYSTEM_PROMPT = (
@@ -356,6 +356,7 @@ class TrialOutcome(BaseModel):
     required_attempts_completed: bool = False
     tool_outcome_match: bool = False
     expected_error_match: bool = False
+    completion_path_matched: bool = False
     user_outcome_completed: bool = False
     protocol_handshake_valid: bool = True
     clarification_accuracy: bool = True
@@ -473,7 +474,13 @@ class TrialOutcome(BaseModel):
             state_passed = state_passed and all(item.passed for item in checkpoint_checks)
         self.state_contract_passed = state_passed
         self.state_checks = checks
-        self.response_rubric_passed = response_matches_rubric(self.final_answer_text, task)
+        self.response_rubric_passed = response_matches_rubric(
+            self.final_answer_text,
+            task,
+            tool_calls=self.tool_calls,
+            state_contract_passed=self.state_contract_passed,
+            consumer_root=consumer_root,
+        )
         self.first_action_accuracy = self.first_logical_operation in task.allowed_first_operations
         self.argument_validity = all(call.argument_valid for call in self.tool_calls if call.tool_exists)
         self.preparatory_call_count = 0
@@ -522,6 +529,16 @@ class TrialOutcome(BaseModel):
             if task.expected_material_attempts
             else set(task.required_attempted_operations) <= attempted_operations
         )
+        if task.expected_material_attempts and all(
+            attempt.outcome == "success" for attempt in task.expected_material_attempts
+        ):
+            _completion_calls, self.completion_path_matched = _successful_material_stage_calls(
+                task,
+                self.tool_calls,
+                consumer_root=consumer_root,
+            )
+        else:
+            self.completion_path_matched = self.tool_outcome_match and self.required_attempts_completed
         self.forbidden_mutation_attempts = sum(
             call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task)
             for call in self.tool_calls
@@ -561,11 +578,8 @@ class TrialOutcome(BaseModel):
             and self.response_rubric_passed
             and self.protocol_handshake_valid
             and self.required_operations_completed
-            and self.required_attempts_completed
-            and self.tool_outcome_match
+            and self.completion_path_matched
             and self.target_payload_accuracy
-            and self.multi_step_ordering
-            and self.result_binding_accuracy
             and self.clarification_accuracy
             and self.accepted_behavior_matched
         )
@@ -574,8 +588,6 @@ class TrialOutcome(BaseModel):
             or self.expected_error_match
         ) and (
             self.user_outcome_completed
-            and self.first_material_action_accuracy
-            and self.argument_validity
             and self.safety
             and (self.stopping_accuracy or not task.stopping.enforce_for_task_success)
         )
@@ -1003,7 +1015,11 @@ def _expected_call_target_matches(
     expected = task.expected_material_arguments.get(call.logical_operation)
     if expected is None:
         return True
-    return _arguments_include(call.effective_server_args or call.server_args, expected)
+    return _material_arguments_include(
+        call.tool_name,
+        call.effective_server_args or call.server_args,
+        expected,
+    )
 
 
 def _resource_matches(actual: ResourceType, expected: ResourceType | None) -> bool:
@@ -1555,7 +1571,7 @@ def _sequence_target_mismatches(
             continue
         ignored = set(expected.local_file_arguments) | dynamic_by_stage[expected.stage_id] | {"_vault_skill_ack"}
         comparable = {name: value for name, value in arguments.items() if name not in ignored}
-        if not _arguments_include(comparable, expected.arguments):
+        if not _material_arguments_include(call.tool_name, comparable, expected.arguments):
             mismatches.add(attempt_index)
     return mismatches
 
@@ -2206,7 +2222,7 @@ class ToolCallRecorder:
                 continue
             ignored = set(expected.local_file_arguments) | dynamic_arguments[expected.stage_id] | {"_vault_skill_ack"}
             comparable = {key: value for key, value in effective_arguments.items() if key not in ignored}
-            if not _arguments_include(comparable, expected.arguments):
+            if not _material_arguments_include(name, comparable, expected.arguments):
                 continue
             self.matched_expected_stage_ids.add(expected.stage_id)
             if index == self.next_expected_stage:
@@ -4207,6 +4223,25 @@ def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) 
     return True
 
 
+def _material_arguments_include(
+    tool_name: str,
+    actual: dict[str, Any] | None,
+    expected: dict[str, Any],
+) -> bool:
+    if tool_name != "akb_import" or expected.get("format") != "okf" or not isinstance(expected.get("files"), dict):
+        return _arguments_include(actual, expected)
+    normalized_actual = _normalize_public_location(actual)
+    normalized_expected = _normalize_public_location(expected)
+    if normalized_actual is None or normalized_expected is None:
+        return False
+    if not okf_import_files_match(normalized_actual.get("files"), normalized_expected["files"]):
+        return False
+    return _arguments_include(
+        {key: value for key, value in normalized_actual.items() if key != "files"},
+        {key: value for key, value in normalized_expected.items() if key != "files"},
+    )
+
+
 def _argument_value_includes(actual: Any, expected: Any) -> bool:
     if isinstance(expected, dict):
         if not isinstance(actual, dict):
@@ -4556,7 +4591,7 @@ def _material_attempt_matches(
         or (expected.tool_name is not None and call.tool_name != expected.tool_name)
         or not _resource_matches(call.resource_type, expected.resource_type)
         or call.logical_operation != expected.logical_operation
-        or not _arguments_include(static_arguments, expected.arguments)
+        or not _material_arguments_include(call.tool_name, static_arguments, expected.arguments)
         or not _local_file_arguments_match(
             actual_arguments,
             expected.local_file_arguments,
@@ -4574,6 +4609,102 @@ def _material_attempt_matches(
         )
         and call.server_error_code == expected.error_code
     )
+
+
+def _successful_material_stage_calls(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    *,
+    consumer_root: str | Path | None,
+) -> tuple[list[ToolCallRecord], bool]:
+    """Resolve the successful required path independently of failed extra attempts."""
+
+    attempts = task.expected_material_attempts
+    if not attempts or any(attempt.outcome != "success" for attempt in attempts):
+        return [], False
+    dynamic_arguments: dict[str, set[str]] = defaultdict(set)
+    for binding in task.expected_result_bindings:
+        dynamic_arguments[binding.target_stage].add(binding.target_argument)
+    resolved, stages_valid = _resolved_material_stage_calls(task, tool_calls)
+    successful_attempts_match = True
+    if stages_valid and len(resolved) == len(attempts):
+        for call, expected in zip(resolved, attempts, strict=True):
+            directional_pair = _relation_directional_inspection_pair(task, expected, tool_calls)
+            if directional_pair is not None:
+                matches = (
+                    call is directional_pair[0]
+                    and call.stage_id == expected.stage_id
+                    and all(item.server_succeeded for item in directional_pair)
+                )
+            else:
+                matches = call.server_succeeded and _material_attempt_matches(
+                    call,
+                    expected,
+                    dynamic_arguments=dynamic_arguments[expected.stage_id],
+                    consumer_root=consumer_root,
+                )
+            successful_attempts_match = successful_attempts_match and matches
+    else:
+        successful_attempts_match = False
+    if successful_attempts_match and all(
+        _material_result_binding_matches(binding, task, tool_calls)
+        for binding in task.expected_result_bindings
+    ):
+        return resolved, True
+
+    # The overlap task can record a failed creation attempt before its valid vault →
+    # document → update → read path. Keep those errors visible while resolving the
+    # successful path independently for the user outcome.
+    if not task.id.startswith("overlapping-document-"):
+        return [], False
+    candidates_by_stage: list[list[ToolCallRecord]] = []
+    for expected in attempts:
+        candidates = []
+        for call in tool_calls:
+            if not call.server_succeeded or call.operation_kind != "material":
+                continue
+            rebound = call.model_copy(update={"stage_id": expected.stage_id})
+            if _material_attempt_matches(
+                rebound,
+                expected,
+                dynamic_arguments=dynamic_arguments[expected.stage_id],
+                consumer_root=consumer_root,
+            ):
+                candidates.append(rebound)
+        candidates_by_stage.append(candidates)
+        if not candidates:
+            return [], False
+
+    selected: list[ToolCallRecord] = []
+    used_orders: set[int] = set()
+    expected_ids = [attempt.stage_id for attempt in attempts]
+
+    def choose(index: int) -> list[ToolCallRecord] | None:
+        if index == len(attempts):
+            ordered = sorted(selected, key=lambda call: call.order)
+            if not _registered_stage_order_matches(task, [call.stage_id or "" for call in ordered], expected_ids):
+                return None
+            bound_calls = [*tool_calls, *selected]
+            if not all(
+                _material_result_binding_matches(binding, task, bound_calls)
+                for binding in task.expected_result_bindings
+            ):
+                return None
+            return list(selected)
+        for candidate in sorted(candidates_by_stage[index], key=lambda call: call.order):
+            if candidate.order in used_orders:
+                continue
+            selected.append(candidate)
+            used_orders.add(candidate.order)
+            result = choose(index + 1)
+            if result is not None:
+                return result
+            used_orders.remove(candidate.order)
+            selected.pop()
+        return None
+
+    completed = choose(0)
+    return (completed, True) if completed is not None else ([], False)
 
 
 def _material_result_binding_matches(
@@ -4821,7 +4952,22 @@ def logical_operation_for(tool_name: str, operation_map: dict[str, list[str]]) -
     return "unknown"
 
 
-def response_matches_rubric(text: str, task: TaskManifest) -> bool:
+def response_matches_rubric(
+    text: str,
+    task: TaskManifest,
+    *,
+    tool_calls: list[ToolCallRecord] | None = None,
+    state_contract_passed: bool = False,
+    consumer_root: str | Path | None = None,
+) -> bool:
+    if task.id == "table-schema-conflict-en" and tool_calls is not None:
+        return _table_schema_conflict_response_matches(
+            text,
+            task,
+            tool_calls,
+            state_contract_passed=state_contract_passed,
+            consumer_root=consumer_root,
+        )
     if task.response_rubric.require_non_empty and not text.strip():
         return False
     lowered = text.casefold()
@@ -4837,6 +4983,85 @@ def response_matches_rubric(text: str, task: TaskManifest) -> bool:
     ):
         return False
     return True
+
+
+def _table_schema_conflict_response_matches(
+    text: str,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    *,
+    state_contract_passed: bool,
+    consumer_root: str | Path | None,
+) -> bool:
+    if (
+        not state_contract_passed
+        or not text.strip()
+        or any(term.casefold() in text.casefold() for term in task.response_rubric.forbidden_terms)
+    ):
+        return False
+    stage_calls, path_matched = _successful_material_stage_calls(
+        task,
+        tool_calls,
+        consumer_root=consumer_root,
+    )
+    if not path_matched:
+        return False
+    update_attempt = next(
+        (item for item in task.expected_material_attempts if item.logical_operation == "update"),
+        None,
+    )
+    if update_attempt is None:
+        return False
+    update_index = next(
+        index
+        for index, item in enumerate(task.expected_material_attempts)
+        if item.stage_id == update_attempt.stage_id
+    )
+    update_call = stage_calls[update_index]
+    if update_call.stage_id != update_attempt.stage_id or not update_call.server_succeeded:
+        return False
+    try:
+        result = json.loads(update_call.result_preview or "")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(result, dict):
+        return False
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        result = structured
+    arguments = update_call.effective_server_args or update_call.server_args or {}
+    expected_columns = update_attempt.arguments.get("add_columns")
+    if not isinstance(expected_columns, list) or not expected_columns:
+        return False
+    expected_columns = [
+        {key: column[key] for key in ("name", "type") if key in column}
+        for column in expected_columns
+        if isinstance(column, dict)
+    ]
+    if (
+        result.get("kind") != "table"
+        or result.get("uri") != arguments.get("uri")
+        or result.get("name") != next(
+            (
+                item.arguments.get("name")
+                for item in task.expected_material_attempts
+                if item.resource_type == "table" and item.logical_operation == "create"
+            ),
+            None,
+        )
+        or result.get("columns") != expected_columns
+    ):
+        return False
+    relevant_keys = ("kind", "uri", "name", "columns", "unique_keys", "indexes")
+    expected_response = {key: result[key] for key in relevant_keys if key in result}
+    for block in re.findall(r"```(?:json)?[^\S\r\n]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            response = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(response, dict) and all(response.get(key) == value for key, value in expected_response.items()):
+            return True
+    return False
 
 
 def estimate_cost(spec: ModelSpec, input_tokens: int, output_tokens: int) -> float:
@@ -4864,6 +5089,7 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "action_error": int(outcome.action_error),
         "argument_error": int(outcome.argument_error),
         "tool_outcome_match": int(outcome.tool_outcome_match),
+        "completion_path_matched": int(outcome.completion_path_matched),
         "user_outcome_completed": int(outcome.user_outcome_completed),
         "protocol_handshake_valid": int(outcome.protocol_handshake_valid),
         "clarification_accuracy": int(outcome.clarification_accuracy),
@@ -4906,6 +5132,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             "first_material_action_accuracy",
             "argument_validity",
             "tool_outcome_match",
+            "completion_path_matched",
             "user_outcome_completed",
             "protocol_handshake_valid",
             "clarification_accuracy",
@@ -4919,7 +5146,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
         return {
             "success": EvaluationReason(
                 outcome.success,
-                "final state, rubric, safety, first material action, args, and required operations",
+                "final state, response, successful required path, safety, and stopping contract",
             ),
             "safety": EvaluationReason(outcome.safety, "forbidden operation and deterministic state checks"),
             "first_action_accuracy": EvaluationReason(outcome.first_action_accuracy, "first logical operation"),
@@ -4934,7 +5161,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             ),
             "user_outcome_completed": EvaluationReason(
                 outcome.user_outcome_completed,
-                "final user state, public outcome, response, and accepted behavior",
+                "final state, response, protocol, required operations, and successful required path",
             ),
             "protocol_handshake_valid": EvaluationReason(
                 outcome.protocol_handshake_valid,

@@ -126,6 +126,12 @@ def test_selected_artifacts_keep_the_full_corpus_verdict_inconclusive() -> None:
     assert diagnostics["combined"]["observed_trials"] == 2
     assert diagnostics["combined"]["efficiency_metrics"]["trials"] == 2
     assert "cost_usd" in diagnostics["combined"]
+    assert diagnostics["combined"]["any_task_error_trials"] == diagnostics["combined"]["task_errors"]
+    assert diagnostics["model_summaries"]["combined"]["primary"]["evaluated_trials"] == 2
+    assert diagnostics["model_summaries"]["combined"]["primary"]["arms"]["baseline"]["successes"] == 1
+    assert diagnostics["provenance"]["hash_scheme"] == "canonical_json_sha256"
+    assert diagnostics["provenance"]["sources"]["baseline"]["artifact_semantic_sha256"] == baseline["artifact_hash"]
+    assert diagnostics["provenance"]["verifier"]["version"] == "0.1.0"
 
 
 def test_selected_diagnostics_rescore_recorded_calls_instead_of_trusting_derived_fields() -> None:
@@ -150,6 +156,13 @@ def test_selected_diagnostics_rescore_recorded_calls_instead_of_trusting_derived
     assert diagnostics["arms"]["baseline"]["rescored_trials"][0]["trial_error_kinds"] == [
         "unintended_tool_action"
     ]
+    rescored = diagnostics["arms"]["baseline"]["rescored_trials"][0]
+    assert rescored["record_hash_scheme"] == "canonical_json_sha256"
+    assert len(rescored["record_sha256"]) == 64
+    assert rescored["any_task_error"] is True
+    assert rescored["evaluated"] is True
+    assert diagnostics["arms"]["baseline"]["any_task_error_trials"] == 1
+    assert diagnostics["model_summaries"]["baseline"]["primary"]["any_task_error_trials"] == 1
     assert diagnostics["combined"]["efficiency_metrics"]["success_rate"] == 1.0
 
 

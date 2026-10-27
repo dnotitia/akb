@@ -12,6 +12,7 @@ import platform
 import re
 import sys
 import time
+import tomllib
 from collections.abc import Mapping
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
@@ -2936,6 +2937,7 @@ _DERIVED_TRIAL_FIELDS = (
     "required_attempts_completed",
     "tool_outcome_match",
     "expected_error_match",
+    "completion_path_matched",
     "user_outcome_completed",
     "protocol_handshake_valid",
     "clarification_accuracy",
@@ -3648,6 +3650,7 @@ def _selected_diagnostic_summary(
         "excluded_invalid_condition_trials",
         "successes",
         "task_errors",
+        "any_task_error_trials",
         "safe_trials",
         "unsafe_mutation_trials",
         "tool_attempts",
@@ -3671,6 +3674,7 @@ def _selected_diagnostic_summary(
         except (TypeError, ValueError):
             tasks_by_id = {}
         raw_rows: list[dict[str, Any]] = []
+        model_summaries: dict[str, dict[str, Any]] = {}
         excluded = 0
         if isinstance(runs, dict):
             for run in runs.values():
@@ -3697,6 +3701,19 @@ def _selected_diagnostic_summary(
                         and identity in plan
                     ):
                         raw_rows.append(row)
+                        model_class = identity[0]
+                        model_summaries.setdefault(
+                            model_class,
+                            {
+                                "observed_trials": 0,
+                                "evaluated_trials": 0,
+                                "successes": 0,
+                                "any_task_error_trials": 0,
+                                "excluded_invalid_condition_trials": 0,
+                                "malformed_trials": 0,
+                                "invalid_condition_reasons": {},
+                            },
+                        )["observed_trials"] += 1
                     else:
                         excluded += 1
 
@@ -3731,6 +3748,7 @@ def _selected_diagnostic_summary(
                 "task_id": row.get("task_id"),
                 "repeat_index": row.get("repeat_index"),
             }
+            record_sha256 = hash_json(row)
             try:
                 task_id = row.get("task_id")
                 task = tasks_by_id.get(task_id) if isinstance(task_id, str) else None
@@ -3753,31 +3771,57 @@ def _selected_diagnostic_summary(
                 )
             except (TypeError, ValueError, KeyError) as exc:
                 totals[arm]["malformed_outcomes"] += 1
+                model_class = row.get("model_class")
+                if isinstance(model_class, str) and model_class in model_summaries:
+                    model_summaries[model_class]["malformed_trials"] += 1
                 totals[arm]["reassessment_errors"].append(
-                    {**row_identity, "reason": f"reassessment failed: {type(exc).__name__}"}
+                    {
+                        **row_identity,
+                        "record_sha256": record_sha256,
+                        "reason": f"reassessment failed: {type(exc).__name__}",
+                    }
                 )
                 continue
             invalid_reason = _selected_invalid_condition_reason(task, outcome)
             rescored_trial = {
                 **row_identity,
+                "record_sha256": record_sha256,
+                "record_hash_scheme": "canonical_json_sha256",
                 "success": outcome.success,
                 "trial_error": outcome.trial_error,
+                "any_task_error": outcome.trial_error,
                 "trial_error_kinds": outcome.trial_error_kinds,
+                "evaluated": invalid_reason is None,
+                "invalid_condition_reason": invalid_reason,
                 "state_contract_passed": outcome.state_contract_passed,
                 "response_rubric_passed": outcome.response_rubric_passed,
+                "completion_path_matched": outcome.completion_path_matched,
+                "user_outcome_completed": outcome.user_outcome_completed,
+                "first_material_action_accuracy": outcome.first_material_action_accuracy,
                 "tool_outcome_match": outcome.tool_outcome_match,
                 "argument_validity": outcome.argument_validity,
                 "protocol_handshake_valid": outcome.protocol_handshake_valid,
+                "multi_step_ordering": outcome.multi_step_ordering,
                 "result_binding_accuracy": outcome.result_binding_accuracy,
                 "wrong_target_calls": outcome.wrong_target_calls,
                 "post_completion_overshoot": outcome.post_completion_overshoot,
+                "recorded_model_requests": row.get("model_requests", 0),
+                "recorded_input_tokens": row.get("input_tokens", 0),
+                "recorded_output_tokens": row.get("output_tokens", 0),
+                "recorded_total_tokens": row.get("total_tokens", 0),
+                "recorded_cost_usd": row.get("cost_usd", 0),
             }
             totals[arm]["rescored_trials"].append(rescored_trial)
+            model_summary = model_summaries[outcome.model_class]
             if invalid_reason is not None:
                 totals[arm]["excluded_invalid_condition_trials"] += 1
+                model_summary["excluded_invalid_condition_trials"] += 1
+                reasons = model_summary["invalid_condition_reasons"]
+                reasons[invalid_reason] = reasons.get(invalid_reason, 0) + 1
                 totals[arm]["invalid_condition_trials"].append(
                     {
                         **row_identity,
+                        "record_sha256": record_sha256,
                         "reason": invalid_reason,
                         "rescored_success": outcome.success,
                         "rescored_trial_error": outcome.trial_error,
@@ -3788,12 +3832,23 @@ def _selected_diagnostic_summary(
             totals[arm]["evaluated_trials"] += 1
             totals[arm]["successes"] += outcome.success
             totals[arm]["task_errors"] += outcome.trial_error
+            totals[arm]["any_task_error_trials"] += outcome.trial_error
             totals[arm]["safe_trials"] += outcome.safety
             totals[arm]["unsafe_mutation_trials"] += outcome.unsafe_mutation
+            model_summary["evaluated_trials"] += 1
+            model_summary["successes"] += outcome.success
+            model_summary["any_task_error_trials"] += outcome.trial_error
             parsed.append(outcome)
         totals[arm]["cost_usd"] = str(cost)
         totals[arm]["parsed_outcomes"] = len(parsed)
         totals[arm]["efficiency_metrics"] = summarize_outcomes(parsed)
+        totals[arm]["model_summaries"] = {
+            model_class: {
+                **summary,
+                "invalid_condition_reasons": dict(sorted(summary["invalid_condition_reasons"].items())),
+            }
+            for model_class, summary in sorted(model_summaries.items())
+        }
         parsed_by_arm[arm] = parsed
 
     combined: dict[str, Any] = {
@@ -3826,13 +3881,88 @@ def _selected_diagnostic_summary(
             "efficiency_metrics": summarize_outcomes(parsed_by_arm["baseline"] + parsed_by_arm["candidate"]),
         }
     )
+    combined_models: dict[str, dict[str, Any]] = {}
+    for arm in ("baseline", "candidate"):
+        for model_class, summary in totals[arm]["model_summaries"].items():
+            combined_summary = combined_models.setdefault(
+                model_class,
+                {
+                    "observed_trials": 0,
+                    "evaluated_trials": 0,
+                    "successes": 0,
+                    "any_task_error_trials": 0,
+                    "excluded_invalid_condition_trials": 0,
+                    "malformed_trials": 0,
+                    "invalid_condition_reasons": {},
+                    "arms": {},
+                },
+            )
+            for key in (
+                "observed_trials",
+                "evaluated_trials",
+                "successes",
+                "any_task_error_trials",
+                "excluded_invalid_condition_trials",
+                "malformed_trials",
+            ):
+                combined_summary[key] += summary[key]
+            for reason, count in summary["invalid_condition_reasons"].items():
+                combined_summary["invalid_condition_reasons"][reason] = (
+                    combined_summary["invalid_condition_reasons"].get(reason, 0) + count
+                )
+            combined_summary["arms"][arm] = summary
+    for summary in combined_models.values():
+        summary["invalid_condition_reasons"] = dict(sorted(summary["invalid_condition_reasons"].items()))
+
+    source_provenance: dict[str, Any] = {}
+    for arm, artifact in (("baseline", baseline), ("candidate", candidate)):
+        selection = artifact.get("selection")
+        source_provenance[arm] = {
+            "source_revision": artifact.get("source_revision"),
+            "artifact_versions": artifact.get("artifact_versions"),
+            "execution_environment": artifact.get("execution_environment"),
+            "protocol_revision": artifact.get("protocol_revision"),
+            "run_manifest_hash": artifact.get("run_manifest_hash"),
+            "artifact_semantic_sha256": artifact.get("artifact_hash"),
+            "selection": {
+                "authorization": selection.get("authorization"),
+                "selection_sha256": selection.get("selection_sha256"),
+            }
+            if isinstance(selection, dict)
+            else None,
+        }
     return {
         "classification": "diagnostic_only",
         "adoption_eligible": False,
         "rescored_from_recorded_evidence": True,
+        "provenance": {
+            "hash_scheme": "canonical_json_sha256",
+            "sources": source_provenance,
+            "verifier": {
+                "package": "akb-mcp-catalog-benchmark",
+                "version": _catalog_benchmark_version(),
+            },
+        },
+        "model_summaries": {
+            "baseline": totals["baseline"]["model_summaries"],
+            "candidate": totals["candidate"]["model_summaries"],
+            "combined": combined_models,
+        },
         "arms": totals,
         "combined": combined,
     }
+
+
+def _catalog_benchmark_version() -> str:
+    try:
+        return importlib.metadata.version("akb-mcp-catalog-benchmark")
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+            with project_file.open("rb") as stream:
+                return str(tomllib.load(stream)["project"]["version"])
+        except (KeyError, OSError, tomllib.TOMLDecodeError):
+            return "unknown"
 
 
 def _selected_invalid_condition_reason(task: TaskManifest, outcome: TrialOutcome) -> str | None:

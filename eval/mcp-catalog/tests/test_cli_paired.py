@@ -14,6 +14,7 @@ import mcp_catalog.cli as cli_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.runner import BenchmarkRunFailure
 from mcp_catalog.runtime import RuntimeContractError, RuntimeDescriptor
+from paired_artifact_factory import complete_paired_artifacts
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -76,6 +77,31 @@ def test_run_paired_accepts_the_akb361_amendment_operator() -> None:
     assert args.command == "run-paired"
     assert args.amendment == Path("operator.json")
     assert args.resume is False
+
+
+def test_compare_records_input_and_verifier_provenance(tmp_path: Path) -> None:
+    baseline, candidate = complete_paired_artifacts()
+    baseline_path = tmp_path / "baseline.json"
+    candidate_path = tmp_path / "candidate.json"
+    output_path = tmp_path / "comparison.json"
+    baseline_path.write_text(json.dumps(baseline, ensure_ascii=False), encoding="utf-8")
+    candidate_path.write_text(json.dumps(candidate, ensure_ascii=False), encoding="utf-8")
+
+    status = cli_module.compare(
+        argparse.Namespace(baseline=baseline_path, candidate=candidate_path, output=output_path)
+    )
+
+    assert status == 0
+    comparison = json.loads(output_path.read_text(encoding="utf-8"))
+    provenance = comparison["comparison_provenance"]
+    assert provenance["hash_scheme"] == "sha256_raw_file_bytes"
+    assert provenance["inputs"]["baseline"]["path"] == str(baseline_path.resolve())
+    assert provenance["inputs"]["baseline"]["file_sha256"] == hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+    assert provenance["inputs"]["baseline"]["artifact_semantic_sha256"] == baseline["artifact_hash"]
+    assert provenance["verifier"]["package"] == "akb-mcp-catalog-benchmark"
+    assert provenance["verifier"]["version"] == "0.1.0"
+    assert len(provenance["verifier"]["git_revision"]) == 40
+    assert isinstance(provenance["verifier"]["tracked_worktree_dirty"], bool)
 
 
 @pytest.mark.asyncio

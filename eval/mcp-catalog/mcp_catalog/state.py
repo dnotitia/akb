@@ -71,15 +71,10 @@ def expectation_holds(actual: Any, expectation: StateExpectation) -> bool:
 def _matches_okf_document(actual: Any, expected: Any) -> bool:
     if not isinstance(actual, str) or not isinstance(expected, dict):
         return False
-    match = _OKF_FRONTMATTER.match(actual)
-    if match is None:
+    parsed = _parse_okf_document(actual)
+    if parsed is None:
         return False
-    try:
-        metadata = yaml.safe_load(match.group(1))
-    except yaml.YAMLError:
-        return False
-    if not isinstance(metadata, dict):
-        return False
+    metadata, body = parsed
     resource_uri = expected.get("resource_uri")
     if (
         metadata.get("type") != expected.get("type")
@@ -87,10 +82,48 @@ def _matches_okf_document(actual: Any, expected: Any) -> bool:
         or metadata.get("akb_uri") != resource_uri
     ):
         return False
-    body = actual[match.end():].replace("\r\n", "\n")
+    body = body.replace("\r\n", "\n")
     if not body.startswith("\n") or not body.endswith("\n"):
         return False
     return body[1:-1] == expected.get("body")
+
+
+def _parse_okf_document(actual: str) -> tuple[dict[str, Any], str] | None:
+    match = _OKF_FRONTMATTER.match(actual)
+    if match is None:
+        return None
+    try:
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    return metadata, actual[match.end():]
+
+
+def okf_import_files_match(actual: Any, expected: Any) -> bool:
+    """Compare imported OKF files using the product's parsed document body."""
+
+    if not isinstance(actual, dict) or not isinstance(expected, dict) or set(actual) != set(expected):
+        return False
+    for path, expected_text in expected.items():
+        actual_text = actual.get(path)
+        if not isinstance(path, str) or not isinstance(actual_text, str) or not isinstance(expected_text, str):
+            return False
+        actual_document = _parse_okf_document(actual_text)
+        expected_document = _parse_okf_document(expected_text)
+        if actual_document is None or expected_document is None:
+            return False
+        actual_metadata, actual_body = actual_document
+        expected_metadata, expected_body = expected_document
+        expected_type = expected_metadata.get("type")
+        if not isinstance(expected_type, str) or actual_metadata.get("type") != expected_type:
+            return False
+        if any(actual_metadata.get(key) != value for key, value in expected_metadata.items()):
+            return False
+        if actual_body.strip() != expected_body.strip():
+            return False
+    return True
 
 
 def evaluate_state_contract(
