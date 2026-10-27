@@ -3,7 +3,8 @@
 Document pages use the Reading Studio layout with the shared AKB surface,
 text and teal interaction tokens in both themes. Bottom document tabs own navigation and per-view
 reading positions. A continuous command header spans the document and context columns. Direct
-relations open in an unframed right rail when actual workspace width permits;
+relations open in an unframed right rail when the actual workspace is at least
+50rem wide and 20rem tall;
 otherwise the labelled reference icon opens a sheet. The panel starts closed on
 entry and document-tab navigation. The icon shows the confirmed relation count,
 including zero; loading/error never implies a zero. Its visible word label is omitted;
@@ -22,6 +23,8 @@ Tabs use a 40px bar with 12px labels on fine pointers and a 48px bar with
 44px targets on coarse pointers. Header and tab-bar hairlines have 12px side
 insets; tab separators stop short of the bar edges. Metadata remains below the
 title and is never part of copied Markdown.
+Full-page Preview and Raw share a centered 42rem reading measure; route-backed
+search previews retain their existing 52rem measure.
 
 Unified with the **akb-platform family** (akb-platform + seahorse-mcp-agent-server):
 the Dnotitia palette, Pretendard typography, soft cool-gray surfaces, rounded

@@ -551,6 +551,7 @@ async function openPublication(page: Page, name: "Publish" | "Public link" = "Pu
 async function openDocumentDetails(page: Page, section?: "Properties" | "Version history" | "Related documents") {
   const panel = page.locator('[data-slot="document-context-panel"]');
   if (!await panel.count()) {
+    await expect(page.getByRole("group", { name: "Document reading tools", exact: true })).toBeVisible();
     const direct = page.getByRole("button", { name: "Document details", exact: true });
     if (await direct.count()) await direct.click();
     else {
@@ -1751,7 +1752,7 @@ test("docked details preserve article scroll and remain open during reading", as
   await expect(panel).toHaveAttribute("data-mode", "docked");
   expect(await canvas.evaluate(element => element.scrollTop)).toBe(240);
   const after = (await canvas.boundingBox())!;
-  expect(after.width + (await panel.boundingBox())!.width).toBeCloseTo(before.width, 0);
+  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width).toBeCloseTo(before.width, 0);
   await panel.getByText(title, { exact: true }).click({ clickCount: 3 });
   await expect(panel).toBeVisible();
   await canvas.hover({ position: { x: 40, y: 80 } });
@@ -2271,19 +2272,19 @@ for (const dark of [false, true]) test(`code blocks follow the automatic reading
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     return text.width;
   };
-  expect(await checkEdges()).toBe(832);
+  expect(await checkEdges()).toBe(672);
   const readingBox = (await paragraph.boundingBox())!;
   await page.getByRole("radio", { name: "Raw markdown", exact: true }).click();
   const rawBox = (await page.getByTestId("doc-raw").boundingBox())!;
   expect(rawBox.x).toBeCloseTo(readingBox.x, 0);
-  expect(rawBox.width).toBe(832);
+  expect(rawBox.width).toBe(672);
   await page.getByRole("radio", { name: "Preview", exact: true }).click();
   await page.screenshot({ path: testInfo.outputPath("automatic-code-width.png") });
   await documentActions(page).click();
   await expect(page.getByRole("menuitemradio", { name: /^(Standard|Wide)$/ })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await page.setViewportSize({ width: 1440, height: 1000 });
-  expect(await checkEdges()).toBeLessThanOrEqual(832);
+  expect(await checkEdges()).toBeLessThanOrEqual(672);
   await page.setViewportSize({ width: 375, height: 812 });
   expect(await checkEdges()).toBeLessThan(375);
   const longCode = blocks.last();
@@ -2371,7 +2372,7 @@ for (const dark of [false, true]) for (const entry of ["document", "search", "qu
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       return heading.width;
     };
-    expect(await checkAlignment()).toBe(832);
+    expect(await checkAlignment()).toBe(entry === "document" ? 672 : 832);
     await documentActions(page).click();
     await expect(page.getByRole("menuitemradio", { name: /^(Standard|Wide)$/ })).toHaveCount(0);
     await page.keyboard.press("Escape");
@@ -2388,8 +2389,10 @@ test("short prose has no artificial body height", async ({ page }) => {
   await fixture(page, false, false, "One line of knowledge.", undefined, { summary: "" });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   const body = page.locator(".document-reading-flow");
-  await expect(body).toHaveText("One line of knowledge.");
-  expect((await body.boundingBox())!.height).toBeLessThan(100);
+  const paragraph = body.locator(".ProseMirror > p");
+  await expect(paragraph).toHaveText("One line of knowledge.");
+  expect((await paragraph.boundingBox())!.height).toBeLessThan(40);
+  expect((await body.boundingBox())!.height).toBeLessThan(240);
 });
 
 test("wide tables stay locally scrollable at 200 percent CSS zoom", async ({ page }, testInfo) => {

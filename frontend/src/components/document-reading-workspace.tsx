@@ -73,7 +73,8 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
     if (!frame) return;
     const update = () => {
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-      setNarrow(frame.getBoundingClientRect().width < 50 * rem);
+      const bounds = frame.getBoundingClientRect();
+      setNarrow(bounds.width < 50 * rem || bounds.height < 20 * rem);
     };
     update();
     const observer = new ResizeObserver(update);
