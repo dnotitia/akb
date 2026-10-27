@@ -207,7 +207,7 @@ test("Settings history approval does not bypass or obscure a dirty underlying do
   await expect(preview).toHaveCount(0);
   const document = page.getByRole("region", { name: "Document workspace", exact: true });
   await expect(document).toHaveAttribute("data-presentation", "page");
-  await document.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Edit", exact: true }).click();
   await expect(document.getByRole("textbox", { name: "Document body (markdown)", exact: true })).toBeVisible();
   await document.getByLabel("Document title", { exact: true }).fill("Underlying draft");
   await openSettings(page);

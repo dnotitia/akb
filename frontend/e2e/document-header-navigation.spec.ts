@@ -157,9 +157,9 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
     const controls = [
       tools.getByRole("radio", { name: "Preview", exact: true }),
       tools.getByRole("radio", { name: "Raw markdown", exact: true }),
+      tools.getByRole("button", { name: /^Show document references/ }),
       tools.getByRole("button", { name: "Copy markdown", exact: true }),
       tools.getByRole("button", { name: "Edit", exact: true }),
-      tools.getByRole("button", { name: "Document details", exact: true }),
       tools.getByRole("button", { name: `Actions for ${title}`, exact: true }),
     ];
     let previousRight = 0;
@@ -169,6 +169,12 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
       expect(box.x).toBeGreaterThanOrEqual(previousRight);
       previousRight = box.x + box.width;
     }
+    const detailsActions = tools.getByRole("button", { name: `Actions for ${title}`, exact: true });
+    await detailsActions.click();
+    await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
+    await expect(page.locator('[data-slot="document-context-panel"]')).toBeVisible();
+    await page.getByRole("button", { name: "Close document panel", exact: true }).click();
+    await expect(detailsActions).toBeFocused();
     await page.screenshot({ path: testInfo.outputPath("document-header.png"), animations: "disabled" });
     for (const [name, href] of destinations) {
       await vaultBreadcrumb(page).click();
