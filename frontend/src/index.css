@@ -831,7 +831,15 @@ body::before {
   --tw-prose-invert-th-borders: var(--color-border-strong);
   --tw-prose-invert-td-borders: var(--color-border);
 }
-.prose a {
+/* Reference-shaped text has no link affordance until a destination resolves.
+   Reset typography's anchor defaults too, including its heavier font weight. */
+.prose a:not([href]):not([role="link"][data-markdown-reference-runtime-url]) {
+  color: inherit;
+  font-weight: inherit;
+  text-decoration: inherit;
+  cursor: inherit;
+}
+.prose a:is([href], [role="link"][data-markdown-reference-runtime-url]) {
   color: var(--color-link);
   text-decoration: underline;
   text-decoration-color: color-mix(in srgb, var(--color-link) 40%, transparent);
@@ -839,7 +847,7 @@ body::before {
   text-decoration-thickness: 1px;
   transition: color 150ms, text-decoration-color 150ms;
 }
-.prose a:hover {
+.prose a:is([href], [role="link"][data-markdown-reference-runtime-url]):hover {
   /* teal family — hovering a doc link should not spend the marquee orange */
   color: var(--color-link-hover);
   text-decoration-color: var(--color-link-hover);

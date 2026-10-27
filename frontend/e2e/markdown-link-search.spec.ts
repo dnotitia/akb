@@ -10,8 +10,72 @@ test.describe("shared Markdown link search in the document composer", () => {
     "The reference adapter scenario is selected by AKB_FE_E2E_SCENARIO",
   );
 
+  for (const colorScheme of ["light", "dark"] as const) {
+    test(`keeps plain reference-shaped text neutral in ${colorScheme} readers and editors`, async ({ page, request }) => {
+      await request.post("/__akb_mock__/reset", {
+        data: { scenario: "markdown-reference-adapters" },
+      });
+      const stateResponse = await request.get("/__akb_mock__/fixture/state");
+      const { document } = await stateResponse.json();
+      const revision = await request.post("/__akb_mock__/fixture/remote-revision", {
+        data: {
+          ...document,
+          content: [
+            document.content,
+            "ConnectX-7·cable RTX-4090 @nobody \\EXAMPLE-7",
+            "[External reference](https://example.com/hardware)",
+            "`ConnectX-7`",
+          ].join("\n\n"),
+        },
+      });
+      expect(revision.ok()).toBeTruthy();
+      const { document: updatedDocument } = await revision.json();
+      await page.emulateMedia({ colorScheme });
+      await page.goto("/vault/fixture/doc/notes%2Freferences.md");
+
+      const surface = page.locator(".ProseMirror").filter({ hasText: "ConnectX-7·cable" });
+      const checkPlainText = async () => {
+        for (const value of ["ConnectX-7", "RTX-4090", "@nobody", "EXAMPLE-7"]) {
+          const text = surface.locator(`a[data-markdown-reference-value="${value}"]`);
+          await expect(text).toBeVisible();
+          await expect(text).not.toHaveAttribute("href");
+          await expect(text).not.toHaveAttribute("role", "link");
+          const parent = await text.evaluate(element => {
+            const style = getComputedStyle(element.parentElement!);
+            return { color: style.color, fontWeight: style.fontWeight, cursor: style.cursor };
+          });
+          await expect(text).toHaveCSS("color", parent.color);
+          await expect(text).toHaveCSS("font-weight", parent.fontWeight);
+          await expect(text).toHaveCSS("text-decoration-line", "none");
+          await text.hover();
+          await expect(text).toHaveCSS("color", parent.color);
+          await expect(text).toHaveCSS("text-decoration-line", "none");
+          await expect(text).toHaveCSS("cursor", parent.cursor);
+        }
+        const external = surface.getByRole("link", { name: "External reference", exact: true });
+        await expect(external).toHaveAttribute("href", "https://example.com/hardware");
+        await expect(external).toHaveCSS("text-decoration-line", "underline");
+        await expect(surface.locator("code").filter({ hasText: /^ConnectX-7$/ })).toHaveCount(1);
+      };
+
+      await checkPlainText();
+      await expect(surface.getByRole("link", { name: "Available document", exact: true }))
+        .toHaveAttribute("href", `/vault/fixture/doc/available.md?commit=${updatedDocument.current_commit}`);
+      await expect(surface.getByRole("link", { name: "Available file", exact: true }))
+        .toHaveAttribute("data-markdown-resolution", "available");
+
+      await page.getByRole("group", { name: "Document reading tools" })
+        .getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(page.getByRole("textbox", { name: "Document body (markdown)" })).toBeVisible();
+      await checkPlainText();
+    });
+  }
+
   test("opens an existing image-bearing document from Rendered into Edit", async ({ page, request }) => {
     test.setTimeout(18_000);
+    await request.post("/__akb_mock__/reset", {
+      data: { scenario: "markdown-reference-adapters" },
+    });
     const fixtureResponse = await request.get("/__akb_mock__/fixture/state");
     expect(fixtureResponse.ok()).toBeTruthy();
     const fixture = await fixtureResponse.json() as { document?: { content?: string } };
@@ -31,7 +95,7 @@ test.describe("shared Markdown link search in the document composer", () => {
     expect(renderedImage.complete).toBe(true);
     expect(renderedImage.naturalWidth).toBeGreaterThan(0);
 
-    await page.getByRole("group", { name: "Document actions" })
+    await page.getByRole("group", { name: "Document reading tools" })
       .getByRole("button", { name: "Edit", exact: true })
       .click({ timeout: 4_000 });
 
@@ -185,7 +249,7 @@ test.describe("shared Markdown link search in the document composer", () => {
     const composer = page.getByRole("dialog", { name: "New document" });
     await expect(composer).toBeVisible();
     await page.locator("#doc-title").fill("At reference E2E proof");
-    const body = page.getByRole("textbox", { name: "Content *" });
+    const body = page.getByRole("textbox", { name: "Content (required)" });
     await expect(body).toBeVisible();
     const createButton = composer.getByRole("button", { name: "Create document" });
     await expect(createButton).toBeDisabled();

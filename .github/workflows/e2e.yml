@@ -138,6 +138,13 @@ jobs:
           CI: "1"
         run: pnpm run test:e2e:mock
 
+      - name: Check Markdown links and plain-text affordance in both themes
+        working-directory: frontend
+        env:
+          CI: "1"
+          AKB_FE_E2E_SCENARIO: markdown-reference-adapters
+        run: pnpm run test:e2e:mock e2e/markdown-link-search.spec.ts
+
   keycloak-theme:
     name: keycloak login theme (real Keycloak)
     runs-on: ubuntu-latest

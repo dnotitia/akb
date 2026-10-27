@@ -1283,6 +1283,12 @@ an `sr-only` summary, never the only signal.
   Preserve the parent and resource title before secondary ancestry.
 - **Document workspace**: the location trail is the sole visible document
   identity. Keep one semantic `h1#doc-title` and preserve authored headings.
+  Prose link color, underline and hover feedback require an actual `href` or
+  a keyboard-operable editor reference with a resolved runtime destination.
+  Unresolved, excluded and unavailable automatic references inherit surrounding
+  text color, weight and cursor in both themes; product names such as
+  `ConnectX-7` must not imply navigation. Explicit Markdown links keep their
+  existing destination and availability feedback.
   One flat command row keeps a quiet Author / Last edited byline on the left, with
   icon-only Preview / Raw selection, Copy markdown, Edit, Document details
   and overflow grouped on the right in that order. Edit and guide editing have named
