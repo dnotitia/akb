@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from mcp_catalog.contracts import CatalogSnapshot, hash_json, load_run_manifest, load_task_corpus, token_estimate
-from mcp_catalog.execution import ToolCallRecord, TrialOutcome
+from mcp_catalog.execution import ToolCallRecord, TrialOutcome, _vault_skill_handshakes_are_valid
 from mcp_catalog.runner import (
     _build_artifact_hash_input,
+    _selected_condition_error_kinds,
+    _selected_diagnostic_summary,
     _selected_invalid_condition_reason,
+    _selected_model_error_kinds,
     compare_artifacts,
     planned_arm_order,
 )
@@ -166,6 +169,125 @@ def test_selected_diagnostics_rescore_recorded_calls_instead_of_trusting_derived
     assert diagnostics["combined"]["efficiency_metrics"]["success_rate"] == 1.0
 
 
+def test_selected_diagnostics_count_invalid_fixture_errors_separately_from_model_errors() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    artifacts = {"baseline": baseline, "candidate": candidate}
+    for arm, artifact in artifacts.items():
+        artifact["selection"] = {
+            "selected_trials": [
+                {
+                    "arm": arm,
+                    "model_class": "primary",
+                    "transport": "stdio",
+                    "task_id": "access-ownership-public-en",
+                    "repeat_index": 1,
+                }
+            ]
+        }
+        row = next(
+            row
+            for run in artifact["runs"].values()
+            for row in run["trials"]
+            if row["task_id"] == "access-ownership-public-en"
+            and row["model_class"] == "primary"
+            and row["transport"] == "stdio"
+            and row["repeat_index"] == 1
+        )
+        calls = [ToolCallRecord.model_validate(call) for call in row["tool_calls"]]
+        if arm == "baseline":
+            row["tool_calls"] = [call.model_dump(mode="json") for call in calls[:-1]]
+            continue
+
+        create, _read_access, update, _transfer, final_read = calls
+        ack = "owner-check-ack"
+        binding = "a" * 64
+        challenge_args = {"level": "none", "vault": "catalog-bench-access"}
+        retry_args = {**challenge_args, "_vault_skill_ack": ack}
+        challenge = update.model_copy(
+            update={
+                "order": 3,
+                "stage_id": "update_access_1",
+                "server_succeeded": False,
+                "server_error_code": "vault_skill_required",
+                "operation_kind": "preparatory",
+                "vault_skill_ack": ack,
+                "vault_skill_binding_sha256": binding,
+            }
+        )
+        owner_search = ToolCallRecord(
+            order=4,
+            tool_name="akb_identity",
+            canonical_operation="akb_identity",
+            logical_operation="list",
+            resource_type="access",
+            operation_kind="preparatory",
+            raw_model_args={"action": "search_users", "query": "fixture-owner"},
+            server_args={"action": "search_users", "query": "fixture-owner"},
+            effective_server_args={"action": "search_users", "query": "fixture-owner"},
+            raw_args_valid=True,
+            server_args_equal_raw=True,
+            tool_exists=True,
+            transport_succeeded=True,
+            server_succeeded=True,
+            result_preview='{"users":[]}',
+        )
+        retry = update.model_copy(
+            update={
+                "order": 5,
+                "stage_id": "update_access_1",
+                "raw_model_args": retry_args,
+                "server_args": retry_args,
+                "effective_server_args": retry_args,
+                "server_succeeded": True,
+                "server_error_code": None,
+                "operation_kind": "material",
+                "vault_skill_ack": None,
+                "vault_skill_retry_ack": ack,
+                "vault_skill_binding_sha256": binding,
+            }
+        )
+        transfer_args = {"new_owner": "fixture-owner", "vault": "catalog-bench-access"}
+        transfer = update.model_copy(
+            update={
+                "order": 6,
+                "tool_name": "akb_transfer_ownership",
+                "canonical_operation": "akb_transfer_ownership",
+                "stage_id": "update_access_2",
+                "raw_model_args": transfer_args,
+                "server_args": transfer_args,
+                "effective_server_args": transfer_args,
+                "server_succeeded": False,
+                "server_error_code": "not_found",
+                "server_error_identity": {},
+                "operation_kind": "material",
+            }
+        )
+        initial_vault_read = final_read.model_copy(
+            update={"order": 2, "stage_id": "read_vault_1", "operation_kind": "material"}
+        )
+        final_vault_read = final_read.model_copy(
+            update={"order": 7, "stage_id": None, "operation_kind": "preparatory"}
+        )
+        row["tool_calls"] = [
+            call.model_dump(mode="json")
+            for call in (create, initial_vault_read, challenge, owner_search, retry, transfer, final_vault_read)
+        ]
+
+    diagnostics = _selected_diagnostic_summary(baseline, candidate)
+
+    candidate_trial = diagnostics["arms"]["candidate"]["rescored_trials"][0]
+    assert candidate_trial["invalid_condition_reason"] == (
+        "fixture user 'fixture-owner' was absent during the ownership transfer"
+    )
+    assert candidate_trial["observed_trial_error"] is True
+    assert candidate_trial["observed_trial_error_kinds"] == ["unexpected_tool_error", "wrong_target_payload"]
+    assert candidate_trial["protocol_handshake_valid"] is True
+    assert candidate_trial["trial_error"] is False
+    assert candidate_trial["condition_error_kinds"] == ["unexpected_tool_error", "wrong_target_payload"]
+    assert diagnostics["combined"]["invalid_condition_error_trials"] == 0
+    assert diagnostics["combined"]["observed_model_error_trials"] == 0
+
+
 def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failures() -> None:
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
     history = next(task for task in tasks if task.id == "history-provenance-en")
@@ -198,6 +320,7 @@ def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failure
                 tool_name="akb_identity",
                 logical_operation="list",
                 resource_type="access",
+                    operation_kind="preparatory",
                 effective_server_args={"action": "search_users", "query": "fixture-owner"},
                 server_succeeded=True,
                 result_preview='{"users":[]}',
@@ -207,7 +330,9 @@ def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failure
                 tool_name="akb_transfer_ownership",
                 logical_operation="update",
                 resource_type="access",
-                server_args={"new_owner": "fixture-owner"},
+                stage_id="update_access_2",
+                server_args={"new_owner": "fixture-owner", "vault": "catalog-bench-access"},
+                effective_server_args={"new_owner": "fixture-owner", "vault": "catalog-bench-access"},
                 server_succeeded=False,
                 server_error_code="not_found",
             ),
@@ -216,6 +341,46 @@ def test_invalid_task_or_fixture_conditions_are_reported_separately_from_failure
     assert _selected_invalid_condition_reason(access, absent_owner) == (
         "fixture user 'fixture-owner' was absent during the ownership transfer"
     )
+
+
+def test_selected_diagnostics_keep_real_errors_in_invalid_history_trials() -> None:
+    history = next(
+        task for task in load_task_corpus(ROOT / "corpus" / "tasks.json")
+        if task.id == "history-provenance-en"
+    )
+    invalid_history = history.model_copy(update={"prompt": "Inspect history and provenance, then verify it."})
+    retry_args = {"vault": "catalog-bench-history", "_vault_skill_ack": "reused-ack"}
+    unbound_retry = ToolCallRecord(
+        order=1,
+        tool_name="akb_update",
+        logical_operation="update",
+        resource_type="document",
+        raw_model_args=retry_args,
+        server_args=retry_args,
+        effective_server_args=retry_args,
+        server_succeeded=True,
+        vault_skill_binding_sha256="b" * 64,
+        vault_skill_retry_ack="reused-ack",
+    )
+    outcome = TrialOutcome(
+        task_id=history.id,
+        category=history.category,
+        locale=history.locale,
+        arm="candidate",
+        model_class="primary",
+        model_id="fixture-model",
+        transport="stdio",
+        tool_calls=[unbound_retry],
+        trial_error=True,
+        trial_error_kinds=["protocol_handshake_invalid"],
+    )
+
+    reason = _selected_invalid_condition_reason(invalid_history, outcome)
+
+    assert reason == "task prompt omitted the exact preregistered revision bodies"
+    assert _vault_skill_handshakes_are_valid(outcome.tool_calls, invalid_history) is False
+    assert _selected_condition_error_kinds(invalid_history, outcome, reason) == []
+    assert _selected_model_error_kinds(invalid_history, outcome, reason) == ["protocol_handshake_invalid"]
 
 
 @pytest.mark.parametrize(

@@ -675,21 +675,138 @@ def test_vault_skill_retry_reuses_the_same_bound_call_and_rejects_bad_ack_retrie
         retry_arguments=changed_payload_arguments,
     )
 
-    assert _vault_skill_handshakes_are_valid(valid.tool_calls) is True
+    assert _vault_skill_handshakes_are_valid(valid.tool_calls, task) is True
     assert valid.protocol_handshake_valid is True
     assert valid.tool_calls[2].stage_id == "create_archive_1"
     assert valid.tool_outcome_match is True
     assert valid.user_outcome_completed is True
     assert valid.success is True
     for invalid in (changed_payload, changed_binding, failed_retry):
-        assert _vault_skill_handshakes_are_valid(invalid.tool_calls) is False
+        assert _vault_skill_handshakes_are_valid(invalid.tool_calls, task) is False
         assert invalid.protocol_handshake_valid is False
         assert invalid.success is False
-    assert _vault_skill_handshakes_are_valid(altered_but_acknowledged.tool_calls) is True
+    assert _vault_skill_handshakes_are_valid(altered_but_acknowledged.tool_calls, task) is True
     assert altered_but_acknowledged.protocol_handshake_valid is True
     assert altered_but_acknowledged.completion_path_matched is False
     assert altered_but_acknowledged.user_outcome_completed is False
     assert altered_but_acknowledged.success is False
+
+
+def test_vault_skill_retry_allows_only_the_registered_readonly_owner_check_between_calls() -> None:
+    task = _tasks()["access-ownership-public-en"]
+    challenge_arguments = {"vault": "catalog-bench-access", "level": "none"}
+    ack = "opaque-owner-ack"
+    binding = _vault_skill_binding_digest("akb_set_public", challenge_arguments, ack)
+
+    def records(
+        *,
+        interstitial: str = "owner_search",
+        retry_change: str | None = None,
+    ) -> list[ToolCallRecord]:
+        challenge = _record(
+            1,
+            {
+                "tool_name": "akb_set_public",
+                "logical_operation": "update",
+                "resource_type": "access",
+                "arguments": challenge_arguments,
+                "succeeded": False,
+                "error_code": "vault_skill_required",
+                "ack_token": ack,
+                "stage_id": "update_access_1",
+                "operation_kind": "preparatory",
+            },
+        ).model_copy(update={"vault_skill_binding_sha256": binding})
+        search = _record(
+            2,
+            {
+                "tool_name": "akb_identity",
+                "logical_operation": "list",
+                "resource_type": "access",
+                "arguments": {"action": "search_users", "query": "fixture-owner"},
+                "operation_kind": "preparatory",
+            },
+        )
+        mutation = _record(
+            2,
+            {
+                "tool_name": "akb_set_public",
+                "logical_operation": "update",
+                "resource_type": "access",
+                "arguments": challenge_arguments,
+                "operation_kind": "material",
+            },
+        )
+        unrelated_read = _record(
+            2,
+            {
+                "tool_name": "akb_identity",
+                "logical_operation": "list",
+                "resource_type": "access",
+                "arguments": {"action": "search_users", "query": "fixture"},
+                "operation_kind": "preparatory",
+            },
+        )
+        failed_search = _record(
+            2,
+            {
+                "tool_name": "akb_identity",
+                "logical_operation": "list",
+                "resource_type": "access",
+                "arguments": {"action": "search_users", "query": "fixture-owner"},
+                "succeeded": False,
+                "error_code": "not_found",
+                "operation_kind": "preparatory",
+            },
+        )
+        interstitial_calls = {
+            "owner_search": [search],
+            "mutation": [mutation],
+            "unrelated_read": [unrelated_read],
+            "failed_search": [failed_search],
+            "repeated_search": [search, search.model_copy(update={"order": 3})],
+            "no_interstitial": [],
+        }[interstitial]
+        retry_arguments = {**challenge_arguments, "_vault_skill_ack": ack}
+        retry_tool = "akb_set_public"
+        retry_ack = ack
+        retry_binding = binding
+        if retry_change == "payload":
+            retry_arguments["level"] = "public"
+        elif retry_change == "target":
+            retry_arguments["vault"] = "another-vault"
+        elif retry_change == "tool":
+            retry_tool = "akb_transfer_ownership"
+        elif retry_change == "ack":
+            retry_ack = "different-ack"
+        retry = _record(
+            len(interstitial_calls) + 2,
+            {
+                "tool_name": retry_tool,
+                "logical_operation": "update",
+                "resource_type": "access",
+                "arguments": retry_arguments,
+                "retry_ack": retry_ack,
+                "stage_id": "update_access_1",
+                "operation_kind": "material",
+            },
+        ).model_copy(update={"vault_skill_binding_sha256": retry_binding})
+        return [challenge, *interstitial_calls, retry]
+
+    assert _vault_skill_handshakes_are_valid(records(), task) is True
+    assert _vault_skill_handshakes_are_valid(records(interstitial="no_interstitial"), task) is True
+    assert _vault_skill_handshakes_are_valid(records(), _tasks()["import-export-en"]) is False
+    for invalid in (
+        records(interstitial="mutation"),
+        records(interstitial="unrelated_read"),
+        records(interstitial="failed_search"),
+        records(interstitial="repeated_search"),
+        records(retry_change="payload"),
+        records(retry_change="target"),
+        records(retry_change="tool"),
+        records(retry_change="ack"),
+    ):
+        assert _vault_skill_handshakes_are_valid(invalid, task) is False
 
 
 def test_collection_relation_oracle_requires_canonical_paths_bodies_and_revision() -> None:

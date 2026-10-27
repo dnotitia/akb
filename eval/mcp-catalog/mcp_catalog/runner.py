@@ -47,6 +47,7 @@ from .contracts import (
     ArmName,
     BenchmarkRunManifest,
     CatalogSnapshot,
+    ExpectedMaterialAttempt,
     ModelSpec,
     PublicOperation,
     TaskManifest,
@@ -68,6 +69,7 @@ from .evidence import (
 from .execution import (
     BudgetLedger,
     BudgetExceeded,
+    ToolCallRecord,
     TrialExecutor,
     TrialOutcome,
     MetricsReportEvaluator,
@@ -81,6 +83,9 @@ from .execution import (
     has_measured_evidence,
     has_server_instructions_evidence,
     _captured_material_positions_by_stage,
+    _expected_call_target_matches,
+    _resolved_material_stage_calls,
+    _sequence_target_mismatches,
     provider_response_cost,
     provider_token_totals,
     registered_route_target,
@@ -3651,6 +3656,8 @@ def _selected_diagnostic_summary(
         "successes",
         "task_errors",
         "any_task_error_trials",
+        "observed_model_error_trials",
+        "invalid_condition_error_trials",
         "safe_trials",
         "unsafe_mutation_trials",
         "tool_attempts",
@@ -3709,6 +3716,8 @@ def _selected_diagnostic_summary(
                                 "evaluated_trials": 0,
                                 "successes": 0,
                                 "any_task_error_trials": 0,
+                                "observed_model_error_trials": 0,
+                                "invalid_condition_error_trials": 0,
                                 "excluded_invalid_condition_trials": 0,
                                 "malformed_trials": 0,
                                 "invalid_condition_reasons": {},
@@ -3783,14 +3792,26 @@ def _selected_diagnostic_summary(
                 )
                 continue
             invalid_reason = _selected_invalid_condition_reason(task, outcome)
+            observed_error_kinds = list(outcome.trial_error_kinds)
+            condition_error_kinds = _selected_condition_error_kinds(task, outcome, invalid_reason)
+            model_error_kinds = _selected_model_error_kinds(task, outcome, invalid_reason)
+            model_error = bool(model_error_kinds)
+            totals[arm]["observed_model_error_trials"] += model_error
+            model_summary = model_summaries[outcome.model_class]
+            model_summary["observed_model_error_trials"] += model_error
             rescored_trial = {
                 **row_identity,
                 "record_sha256": record_sha256,
                 "record_hash_scheme": "canonical_json_sha256",
                 "success": outcome.success,
-                "trial_error": outcome.trial_error,
-                "any_task_error": outcome.trial_error,
-                "trial_error_kinds": outcome.trial_error_kinds,
+                "recorded_trial_error": row.get("trial_error"),
+                "recorded_trial_error_kinds": row.get("trial_error_kinds"),
+                "observed_trial_error": outcome.trial_error,
+                "observed_trial_error_kinds": observed_error_kinds,
+                "trial_error": model_error,
+                "any_task_error": model_error,
+                "trial_error_kinds": model_error_kinds,
+                "condition_error_kinds": condition_error_kinds,
                 "evaluated": invalid_reason is None,
                 "invalid_condition_reason": invalid_reason,
                 "state_contract_passed": outcome.state_contract_passed,
@@ -3812,10 +3833,11 @@ def _selected_diagnostic_summary(
                 "recorded_cost_usd": row.get("cost_usd", 0),
             }
             totals[arm]["rescored_trials"].append(rescored_trial)
-            model_summary = model_summaries[outcome.model_class]
             if invalid_reason is not None:
                 totals[arm]["excluded_invalid_condition_trials"] += 1
                 model_summary["excluded_invalid_condition_trials"] += 1
+                totals[arm]["invalid_condition_error_trials"] += model_error
+                model_summary["invalid_condition_error_trials"] += model_error
                 reasons = model_summary["invalid_condition_reasons"]
                 reasons[invalid_reason] = reasons.get(invalid_reason, 0) + 1
                 totals[arm]["invalid_condition_trials"].append(
@@ -3824,20 +3846,24 @@ def _selected_diagnostic_summary(
                         "record_sha256": record_sha256,
                         "reason": invalid_reason,
                         "rescored_success": outcome.success,
-                        "rescored_trial_error": outcome.trial_error,
-                        "trial_error_kinds": outcome.trial_error_kinds,
+                        "recorded_trial_error": row.get("trial_error"),
+                        "observed_trial_error": outcome.trial_error,
+                        "observed_trial_error_kinds": observed_error_kinds,
+                        "rescored_trial_error": model_error,
+                        "trial_error_kinds": model_error_kinds,
+                        "condition_error_kinds": condition_error_kinds,
                     }
                 )
                 continue
             totals[arm]["evaluated_trials"] += 1
             totals[arm]["successes"] += outcome.success
-            totals[arm]["task_errors"] += outcome.trial_error
-            totals[arm]["any_task_error_trials"] += outcome.trial_error
+            totals[arm]["task_errors"] += model_error
+            totals[arm]["any_task_error_trials"] += model_error
             totals[arm]["safe_trials"] += outcome.safety
             totals[arm]["unsafe_mutation_trials"] += outcome.unsafe_mutation
             model_summary["evaluated_trials"] += 1
             model_summary["successes"] += outcome.success
-            model_summary["any_task_error_trials"] += outcome.trial_error
+            model_summary["any_task_error_trials"] += model_error
             parsed.append(outcome)
         totals[arm]["cost_usd"] = str(cost)
         totals[arm]["parsed_outcomes"] = len(parsed)
@@ -3891,6 +3917,8 @@ def _selected_diagnostic_summary(
                     "evaluated_trials": 0,
                     "successes": 0,
                     "any_task_error_trials": 0,
+                    "observed_model_error_trials": 0,
+                    "invalid_condition_error_trials": 0,
                     "excluded_invalid_condition_trials": 0,
                     "malformed_trials": 0,
                     "invalid_condition_reasons": {},
@@ -3902,6 +3930,8 @@ def _selected_diagnostic_summary(
                 "evaluated_trials",
                 "successes",
                 "any_task_error_trials",
+                "observed_model_error_trials",
+                "invalid_condition_error_trials",
                 "excluded_invalid_condition_trials",
                 "malformed_trials",
             ):
@@ -3975,34 +4005,131 @@ def _selected_invalid_condition_reason(task: TaskManifest, outcome: TrialOutcome
         if len(revision_bodies) >= 2 and not all(body in task.prompt for body in revision_bodies):
             return "task prompt omitted the exact preregistered revision bodies"
 
-    if task.id.startswith("access-ownership-public-"):
-        for transfer in outcome.tool_calls:
-            arguments = transfer.effective_server_args or transfer.server_args or {}
-            owner = arguments.get("new_owner")
-            if (
-                transfer.logical_operation != "update"
-                or transfer.server_succeeded
-                or transfer.server_error_code != "not_found"
-                or not isinstance(owner, str)
-            ):
-                continue
-            for search in outcome.tool_calls:
-                search_arguments = search.effective_server_args or search.server_args or {}
-                if (
-                    not search.server_succeeded
-                    or search.logical_operation != "list"
-                    or search_arguments.get("action") != "search_users"
-                    or search_arguments.get("query") != owner
-                    or not isinstance(search.result_preview, str)
-                ):
-                    continue
-                try:
-                    result = json.loads(search.result_preview)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(result, dict) and result.get("users") == []:
-                    return f"fixture user {owner!r} was absent during the ownership transfer"
+    if (owner_transfer := _selected_fixture_owner_transfer(task, outcome)) is not None:
+        attempt, _transfer = owner_transfer
+        owner = attempt.arguments["new_owner"]
+        return f"fixture user {owner!r} was absent during the ownership transfer"
     return None
+
+
+def _selected_fixture_owner_transfer(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+) -> tuple[ExpectedMaterialAttempt, ToolCallRecord] | None:
+    if not task.id.startswith("access-ownership-public-"):
+        return None
+    attempts = [
+        attempt
+        for attempt in task.expected_material_attempts
+        if attempt.logical_operation == "update"
+        and attempt.resource_type == "access"
+        and attempt.outcome == "success"
+        and isinstance(attempt.arguments.get("new_owner"), str)
+    ]
+    if len(attempts) != 1:
+        return None
+    attempt = attempts[0]
+    owner = attempt.arguments["new_owner"]
+    transfers = []
+    for call in outcome.tool_calls:
+        arguments = call.effective_server_args or call.server_args
+        if arguments is not None:
+            arguments = {key: value for key, value in arguments.items() if key != "_vault_skill_ack"}
+        if (
+            call.tool_exists
+            and call.stage_id == attempt.stage_id
+            and call.logical_operation == attempt.logical_operation
+            and call.resource_type == attempt.resource_type
+            and (attempt.tool_name is None or call.tool_name == attempt.tool_name)
+            and arguments == attempt.arguments
+            and not call.server_succeeded
+            and call.server_error_code == "not_found"
+        ):
+            transfers.append(call)
+    if len(transfers) != 1:
+        return None
+    for search in outcome.tool_calls:
+        search_arguments = search.effective_server_args or search.server_args
+        if (
+            search.tool_name != "akb_identity"
+            or not search.tool_exists
+            or search.logical_operation != "list"
+            or search.resource_type != "access"
+            or search.operation_kind != "preparatory"
+            or not search.server_succeeded
+            or search.server_error_code is not None
+            or search_arguments != {"action": "search_users", "query": owner}
+            or not isinstance(search.result_preview, str)
+        ):
+            continue
+        try:
+            result = json.loads(search.result_preview)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict) and result.get("users") == []:
+            return attempt, transfers[0]
+    return None
+
+
+def _selected_condition_error_kinds(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+    invalid_reason: str | None,
+) -> list[str]:
+    if invalid_reason is None:
+        return []
+    owner_transfer = _selected_fixture_owner_transfer(task, outcome)
+    if owner_transfer is None:
+        return []
+    attempt, transfer = owner_transfer
+    owner = attempt.arguments["new_owner"]
+    if invalid_reason != f"fixture user {owner!r} was absent during the ownership transfer":
+        return []
+    attributed: set[str] = set()
+
+    schema_error_codes = {"invalid_argument", "validation_error", "invalid_params", "schema_error"}
+    has_other_unexpected_error = any(
+        call is not transfer
+        and not call.server_succeeded
+        and call.server_error_code is not None
+        and call.server_error_code != "vault_skill_required"
+        and call.server_error_code not in schema_error_codes
+        and call.server_status_code not in {400, 422}
+        and not (
+            call.operation_kind == "preparatory"
+            and call.server_error_code == "not_found"
+            and call.logical_operation in {"read", "list", "search"}
+        )
+        for call in outcome.tool_calls
+    )
+    if "unexpected_tool_error" in outcome.trial_error_kinds and not has_other_unexpected_error:
+        attributed.add("unexpected_tool_error")
+
+    stage_calls, _stages_valid = _resolved_material_stage_calls(task, outcome.tool_calls)
+    mismatches = _sequence_target_mismatches(stage_calls, task, outcome.tool_calls)
+    mismatches.update(
+        index
+        for index, call in enumerate(stage_calls, start=1)
+        if not _expected_call_target_matches(call, task, outcome.tool_calls)
+    )
+    mismatch_sources = [call for index, call in enumerate(stage_calls, start=1) if index in mismatches]
+    if (
+        "wrong_target_payload" in outcome.trial_error_kinds
+        and outcome.wrong_target_calls == len(mismatches) == 1
+        and len(mismatch_sources) == 1
+        and mismatch_sources[0] is transfer
+    ):
+        attributed.add("wrong_target_payload")
+    return sorted(attributed)
+
+
+def _selected_model_error_kinds(
+    task: TaskManifest,
+    outcome: TrialOutcome,
+    invalid_reason: str | None,
+) -> list[str]:
+    condition_errors = set(_selected_condition_error_kinds(task, outcome, invalid_reason))
+    return [kind for kind in outcome.trial_error_kinds if kind not in condition_errors]
 
 
 def _finite_interval_bound(interval: dict[str, Any], side: str) -> float:

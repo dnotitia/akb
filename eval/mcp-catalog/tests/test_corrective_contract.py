@@ -124,7 +124,7 @@ async def test_vault_skill_ack_pair_has_a_redacted_reproducible_request_binding(
     assert records[0].stage_id == records[1].stage_id == "create_publication_1"
     assert records[0].vault_skill_binding_sha256 == records[1].vault_skill_binding_sha256
     assert records[0].vault_skill_binding_sha256 is not None
-    assert _vault_skill_handshakes_are_valid(records)
+    assert _vault_skill_handshakes_are_valid(records, task)
     serialized = str([record.model_dump(mode="json") for record in records])
     assert "secret-ack" not in serialized
     assert "secret-ack" not in (records[0].error or "")
