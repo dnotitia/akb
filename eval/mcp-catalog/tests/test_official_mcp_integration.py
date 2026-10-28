@@ -31,6 +31,7 @@ from mcp_catalog.catalog import create_toolset
 from mcp_catalog.contracts import OPENROUTER_BASE_URL, PROTOCOL_REVISION, load_run_manifest
 from mcp_catalog.execution import (
     MODEL_INPUT_EVIDENCE,
+    MODEL_TOOL_RECORDER,
     ModelInputEvidence,
     ModelConfigurationError,
     SERVER_INSTRUCTIONS as SERVER_INSTRUCTIONS_CONTEXT,
@@ -137,6 +138,7 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
     run_error: Exception | None = None
     instructions_token = SERVER_INSTRUCTIONS_CONTEXT.set(SERVER_INSTRUCTIONS)
     evidence_token = MODEL_INPUT_EVIDENCE.set(evidence)
+    recorder_token = None
     try:
         async with probe:
             raw_discovery = await probe.session.send_discover(PROTOCOL_REVISION)
@@ -146,6 +148,10 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
         client = Client(server, mode=PROTOCOL_REVISION, prior_discover=discovery, cache=False)
         toolset = create_toolset(client)
         async with toolset:
+            recorder = ToolCallRecorder(operation_map={"read": ["inspect_record"]}, secrets=())
+            listed = await toolset.list_tools()
+            recorder.set_input_schemas({tool.name: tool.input_schema for tool in listed})
+            recorder_token = MODEL_TOOL_RECORDER.set(recorder)
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
             try:
                 result = await agent.run(
@@ -157,6 +163,8 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
             except Exception as exc:
                 run_error = exc
     finally:
+        if recorder_token is not None:
+            MODEL_TOOL_RECORDER.reset(recorder_token)
         MODEL_INPUT_EVIDENCE.reset(evidence_token)
         SERVER_INSTRUCTIONS_CONTEXT.reset(instructions_token)
         await mock_http_client.aclose()
@@ -250,8 +258,10 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
         assert [tool.name for tool in listed] == ["inspect_record"]
 
         seen_instructions: list[str] = []
+        model_schemas: list[dict] = []
 
         def model_function(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            model_schemas.append(_info.function_tools[0].parameters_json_schema)
             seen_instructions.extend(
                 part.content
                 for message in messages
@@ -271,6 +281,7 @@ async def test_official_fastmcp_client_and_pydantic_ai_toolset_cross_the_server_
         result = await agent.run("값을 읽고 결과를 말해 줘.", toolsets=[toolset], infer_name=False)
 
     assert result.output == "완료"
+    assert model_schemas and all(schema == listed[0].input_schema for schema in model_schemas)
     assert any(
         server_instructions.rstrip("\r\n") == observed.rstrip("\r\n")
         for observed in seen_instructions

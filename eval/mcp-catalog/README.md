@@ -166,3 +166,28 @@ bash scripts/check.sh
 
 These checks validate the benchmark contract without invoking provider
 requests or starting the benchmark runtime.
+
+## Selected document-read comparison
+
+The `config/unified-read.json` and `corpus/unified-read-*.json` files register
+six bilingual clusters: overlapping document reads, knowledge workflow,
+outline-only inspection, full-read/history control, read-only authorization,
+and the stdio file workflow. The corpus has 176 trials (88 per arm) across the two
+models, two repeats, and the applicable transports. Both arms receive the
+complete catalog; the candidate maps the former section reader to `akb_get`
+using its `mode` selector. A full read is an acceptable alternative for the
+outline task. The independent state oracles are identical for both arms.
+This selected sample cannot establish noninferiority for the entire corpus.
+The existing BCa, provider, budget, and paired-order contracts remain in force.
+
+Before execution, make a private copy of the manifest and set `source_pins`
+to the exact baseline and candidate Git revisions. The runner rejects an
+unsealed source or a mismatched runtime. Prepare two isolated runtime
+descriptors using the native launcher from each corresponding checkout, with
+`--scenario app-control-plane`. Keep both launchers running. Then pass the
+private pinned manifest to `run-paired` with `--corpus
+corpus/unified-read-tasks.json` and `--coverage
+corpus/unified-read-coverage.json`, plus distinct baseline, candidate,
+comparison, and checkpoint paths. The runner seals both catalogs, source
+identities, corpus, oracle, routes, provider registry, and order before the
+paid smoke. Use a fresh output directory; do not overwrite earlier artifacts.

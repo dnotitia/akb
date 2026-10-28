@@ -68,6 +68,7 @@ MAX_CAPTURED_RESULT_FIELD_BYTES = 2048
 MAX_CAPTURED_RESULT_ENVELOPE_BYTES = 8192
 MAX_CAPTURED_RESULT_FIELDS = 8
 
+MODEL_TOOL_RECORDER: contextvars.ContextVar[Any] = contextvars.ContextVar("mcp_catalog_model_tools", default=None)
 CURRENT_TRIAL: contextvars.ContextVar[TrialContext | None] = contextvars.ContextVar("mcp_catalog_trial", default=None)
 MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvars.ContextVar(
     "mcp_catalog_model_responses",
@@ -205,6 +206,11 @@ class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
 
     async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
+        recorder = MODEL_TOOL_RECORDER.get()
+        if recorder is not None:
+            model_schemas = {tool.name: tool.parameters_json_schema for tool in model_request_parameters.function_tools}
+            if model_schemas != recorder.input_schemas:
+                raise ModelConfigurationError("model tool schemas differ from the sealed MCP catalog")
         instructions = SERVER_INSTRUCTIONS.get()
         evidence = MODEL_INPUT_EVIDENCE.get()
         if evidence is not None:
@@ -1992,6 +1998,17 @@ def _public_route(
         if transport in item.transports
         and getattr(item, arm).tool == tool_name
         and getattr(item, arm).action == (action if isinstance(action, str) else None)
+        and (
+            getattr(item, arm).mode is None
+            or (
+                getattr(item, arm).mode == "full"
+                and arguments.get("mode", "full") == "full"
+            )
+            or (
+                getattr(item, arm).mode == "sections"
+                and arguments.get("mode") in ("sections", "outline")
+            )
+        )
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -2087,6 +2104,11 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
     for call in outcome.tool_calls:
         if not call.tool_exists or call.canonical_operation is None:
             kinds.add("unintended_tool_action")
+        mode_args = call.server_args or decode_raw_args(call.raw_model_args)[0]
+        if isinstance(mode_args, dict) and "mode" in mode_args:
+            modes = {"akb_get": ("full", "sections", "outline"), "akb_drill_down": ("sections", "outline")}
+            if call.tool_name in modes and mode_args["mode"] not in modes[call.tool_name]:
+                kinds.add("wrong_mode")
         if call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task):
             kinds.add("unintended_tool_action")
         if call.operation_kind == "unknown" and call.logical_operation in {
@@ -2222,7 +2244,9 @@ class ToolCallRecorder:
             ):
                 continue
             if (
-                (expected.tool_name is not None and expected.tool_name != name)
+                (expected.tool_name is not None and expected.tool_name != (
+                    route.operation if (route := _public_route(name, arguments, self.public_operations, arm=self.arm, transport=self.transport)) else name
+                ))
                 or expected.logical_operation != logical_operation
                 or not _resource_matches(resource_type, expected.resource_type)
             ):
@@ -2251,7 +2275,7 @@ class ToolCallRecorder:
             arm=self.arm,
             transport=self.transport,
         )
-        logical_operation = logical_operation_for(name, self.operation_map, server_args)
+        logical_operation = logical_operation_for(name, self.operation_map, server_args) if route is not None else "unknown"
         canonical_operation = route.operation if route is not None else None
         operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
         retry_ack = server_args.get("_vault_skill_ack")
@@ -3295,6 +3319,7 @@ class TrialExecutor:
             model_input_evidence: list[ModelInputEvidence] = []
             server_instructions_sha256: str | None = None
             capture_token = MODEL_RESPONSES.set(partial_messages)
+            recorder_token = MODEL_TOOL_RECORDER.set(recorder)
             input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
             instructions_token = SERVER_INSTRUCTIONS.set(None)
             try:
@@ -3352,6 +3377,7 @@ class TrialExecutor:
             finally:
                 SERVER_INSTRUCTIONS.reset(instructions_token)
                 MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
+                MODEL_TOOL_RECORDER.reset(recorder_token)
                 MODEL_RESPONSES.reset(capture_token)
             latency = time.perf_counter() - started
             outcome = outcome_from_run(
@@ -3458,6 +3484,7 @@ async def execute_smoke(
     model_input_evidence: list[ModelInputEvidence] = []
     server_instructions_sha256: str | None = None
     capture_token = MODEL_RESPONSES.set(partial_messages)
+    recorder_token = MODEL_TOOL_RECORDER.set(recorder)
     input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
     instructions_token = SERVER_INSTRUCTIONS.set(None)
     input_secrets_token = MODEL_INPUT_SECRET_VALUES.set(secret_values)
@@ -3516,6 +3543,7 @@ async def execute_smoke(
         MODEL_INPUT_SECRET_VALUES.reset(input_secrets_token)
         SERVER_INSTRUCTIONS.reset(instructions_token)
         MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
+        MODEL_TOOL_RECORDER.reset(recorder_token)
         MODEL_RESPONSES.reset(capture_token)
     outcome = outcome_from_run(
         task=task,
@@ -4085,7 +4113,7 @@ def bind_tool_calls(
                 tool_name=name,
                 canonical_operation=route.operation if route is not None else None,
                 surface_action=(getattr(route, arm).action if route is not None else None),
-                logical_operation=logical_operation_for(name, operation_map, raw_dict),
+                logical_operation=logical_operation_for(name, operation_map, raw_dict) if route is not None else "unknown",
                 resource_type=route.resource_type if route is not None else "unknown",
                 operation_kind=observed.operation_kind if observed else "unknown",
                 tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
@@ -4136,7 +4164,7 @@ def bind_tool_calls(
                 tool_name=observed.tool_name,
                 canonical_operation=route.operation if route is not None else None,
                 surface_action=(getattr(route, arm).action if route is not None else None),
-                logical_operation=logical_operation_for(observed.tool_name, operation_map, observed.server_args),
+                logical_operation=logical_operation_for(observed.tool_name, operation_map, observed.server_args) if route is not None else "unknown",
                 resource_type=route.resource_type if route is not None else "unknown",
                 operation_kind=observed.operation_kind,
                 tool_exists=(
@@ -4232,6 +4260,8 @@ def _material_arguments_include(
     actual: dict[str, Any] | None,
     expected: dict[str, Any],
 ) -> bool:
+    if tool_name == "akb_get" and isinstance(actual, dict) and actual.get("mode", "full") == "full":
+        expected = {key: value for key, value in expected.items() if key not in {"section", "pattern"}}
     if tool_name != "akb_import" or expected.get("format") != "okf" or not isinstance(expected.get("files"), dict):
         return _arguments_include(actual, expected)
     normalized_actual = _normalize_public_location(actual)
@@ -4636,7 +4666,7 @@ def _material_attempt_matches(
     }
     if (
         call.stage_id != expected.stage_id
-        or (expected.tool_name is not None and call.tool_name != expected.tool_name)
+        or (expected.tool_name is not None and (call.canonical_operation or call.tool_name) != expected.tool_name)
         or not _resource_matches(call.resource_type, expected.resource_type)
         or call.logical_operation != expected.logical_operation
         or not _material_arguments_include(call.tool_name, static_arguments, expected.arguments)

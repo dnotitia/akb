@@ -317,3 +317,56 @@ def test_public_catalog_accepts_the_complete_current_main_stdio_surface() -> Non
     snapshot = _public_catalog_for_manifest(manifest, transport="stdio")
 
     validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_unified_read_routes_distinguish_modes():
+    from mcp_catalog.contracts import ArmOperationRoute, PublicOperation
+    from mcp_catalog.execution import _public_route
+
+    routes = [
+        PublicOperation(operation="akb_get", logical_operation="read", resource_type="document", transports=["http"], baseline=ArmOperationRoute(tool="akb_get"), candidate=ArmOperationRoute(tool="akb_get", mode="full")),
+        PublicOperation(operation="akb_drill_down", logical_operation="read", resource_type="document", transports=["http"], baseline=ArmOperationRoute(tool="akb_drill_down"), candidate=ArmOperationRoute(tool="akb_get", mode="sections")),
+    ]
+    assert _public_route("akb_get", {}, routes, arm="candidate", transport="http").operation == "akb_get"
+    assert _public_route("akb_get", {"mode": "sections"}, routes, arm="candidate", transport="http").operation == "akb_drill_down"
+    assert _public_route("akb_get", {"mode": "outline"}, routes, arm="candidate", transport="http").operation == "akb_drill_down"
+    assert _public_route("akb_get", {"mode": None}, routes, arm="candidate", transport="http") is None
+
+
+def test_selected_unified_corpus_and_catalog_routes_are_registered():
+    manifest = load_run_manifest(ROOT / "config" / "unified-read.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "unified-read-tasks.json")
+    coverage = load_tool_coverage(ROOT / "corpus" / "unified-read-coverage.json")
+    manifest.validate_tasks(tasks)
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
+    assert {task.pair_id for task in tasks} == {
+        "knowledge-workflow", "overlapping-document", "outline-only",
+        "history-provenance", "authorization-readonly", "stdio-local",
+    }
+    for arm, transport, expected in (("baseline", "http", 44), ("candidate", "http", 43), ("baseline", "stdio", 50), ("candidate", "stdio", 49)):
+        names = {getattr(operation, arm).tool for operation in manifest.public_operations if transport in operation.transports}
+        tools = [{"name": name, "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["full", "sections", "outline"], "default": "full"}}}} for name in sorted(names)]
+        snapshot = CatalogSnapshot(transport=transport, source_revision="a" * 40, artifact_version="test", tool_count=len(tools), catalog_hash=hash_json(tools), catalog_token_estimate=token_estimate(tools), server_discover={"supportedVersions": ["2026-07-28"], "capabilities": {}, "instructions": "Synthetic."}, tools=tools)
+        assert len(names) == expected
+        validate_public_catalog(snapshot, arm=arm, public_operations=manifest.public_operations)
+
+
+def test_section_goal_accepts_complete_document_as_alternative():
+    from mcp_catalog.execution import _material_arguments_include
+
+    expected = {"uri": "akb://v/doc/a.md", "section": "Status"}
+    assert _material_arguments_include("akb_get", {"uri": "akb://v/doc/a.md"}, expected)
+    assert _material_arguments_include("akb_get", {"uri": "akb://v/doc/a.md", "mode": "full"}, expected)
+    assert not _material_arguments_include("akb_get", {"uri": "akb://v/doc/a.md", "mode": "outline"}, expected)
+    assert not _material_arguments_include("akb_get", {"uri": "akb://v/doc/other.md"}, expected)
+
+
+def test_unified_experiment_source_pins_require_two_full_revisions():
+    manifest = load_run_manifest(ROOT / "config" / "unified-read.json").model_dump(mode="json")
+    manifest["source_pins"] = {"baseline": "a" * 40, "candidate": "b" * 40}
+    parsed = BenchmarkRunManifest.model_validate(manifest)
+    assert parsed.source_pins == manifest["source_pins"]
+    for pins in ({"baseline": "a" * 40}, {"baseline": "bad", "candidate": "b" * 40}):
+        with pytest.raises(ValueError):
+            BenchmarkRunManifest.model_validate({**manifest, "source_pins": pins})

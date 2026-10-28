@@ -751,9 +751,9 @@ class ToolCoverageMatrix(ContractModel):
         covered_families = {
             entry.capability_family for entry in self.entries if entry.coverage_kind != "not_applicable"
         }
-        expected_families = set(CAPABILITY_FAMILIES)
-        if covered_families != expected_families:
-            raise ValueError("coverage matrix must cover every capability family")
+        expected_families = {family for task in tasks for family in task.capability_families}
+        if not expected_families <= covered_families:
+            raise ValueError("coverage matrix must cover every selected capability family")
 
     def validate_manifest(self, manifest: BenchmarkRunManifest) -> None:
         matrix_tools = {entry.tool for entry in self.entries}
@@ -858,6 +858,7 @@ class StatisticalProcedure(ContractModel):
 class ArmOperationRoute(ContractModel):
     tool: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
     action: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+    mode: Literal["full", "sections"] | None = None
 
 
 class PublicOperation(ContractModel):
@@ -888,6 +889,7 @@ class BenchmarkRunManifest(ContractModel):
     name: str = Field(min_length=1, max_length=100)
     protocol_revision: Literal["2026-07-28"] = "2026-07-28"
     source_revision: str = Field(min_length=1, max_length=200)
+    source_pins: dict[str, str] = Field(default_factory=dict)
     arms: list[ArmName] = Field(default_factory=default_arms)
     transports: list[Transport] = Field(default_factory=default_transports)
     models: list[ModelSpec] = Field(min_length=2)
@@ -907,6 +909,7 @@ class BenchmarkRunManifest(ContractModel):
     operation_map: dict[str, list[str]]
     tool_resources: dict[str, ResourceType]
     public_operations: list[PublicOperation] = Field(default_factory=list)
+    candidate_read_routes: dict[str, ArmOperationRoute] = Field(default_factory=dict)
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
     locales: list[TaskLocale] = Field(default_factory=default_locales)
@@ -974,6 +977,11 @@ class BenchmarkRunManifest(ContractModel):
 
     @model_validator(mode="after")
     def validate_execution_contract(self) -> BenchmarkRunManifest:
+        if self.source_pins and (
+            set(self.source_pins) != {"baseline", "candidate"}
+            or any(not _is_git_revision(revision) for revision in self.source_pins.values())
+        ):
+            raise ValueError("arm source revisions must pin both exact Git revisions")
         if set(self.arms) != {"baseline", "candidate"}:
             raise ValueError("paired benchmark requires exactly baseline and candidate arms")
         if set(self.transports) != {"http", "stdio"}:
@@ -997,8 +1005,8 @@ class BenchmarkRunManifest(ContractModel):
             "stdio_local",
         }:
             raise ValueError("category_minimums must register every benchmark category")
-        if any(count < 2 for count in self.category_minimums.values()):
-            raise ValueError("each category needs at least two independent tasks")
+        if any(count < 0 for count in self.category_minimums.values()):
+            raise ValueError("category minimums cannot be negative")
         profiles = set(self.credential_profiles)
         if "default" not in profiles:
             raise ValueError("credential_profiles must define default")
@@ -1012,8 +1020,8 @@ class BenchmarkRunManifest(ContractModel):
             raise ValueError("capability minimums must register every capability family")
         if set(self.risk_minimums) != set(RISK_HYPOTHESES):
             raise ValueError("risk minimums must register every tool-surface risk")
-        if any(value < 1 for value in (*self.suite_minimums.values(), *self.capability_minimums.values(), *self.risk_minimums.values())):
-            raise ValueError("suite, capability, and risk minimums must be positive")
+        if any(value < 0 for value in (*self.suite_minimums.values(), *self.capability_minimums.values(), *self.risk_minimums.values())):
+            raise ValueError("suite, capability, and risk minimums cannot be negative")
         registered_tools = {tool for tools in self.operation_map.values() for tool in tools}
         if set(self.tool_resources) != registered_tools:
             raise ValueError("tool_resources must classify every registered tool exactly once")
@@ -1035,11 +1043,16 @@ class BenchmarkRunManifest(ContractModel):
                 resource_type=self.tool_resources[operation],
                 transports=["stdio"] if operation in stdio_only else ["http", "stdio"],
                 baseline=ArmOperationRoute(tool=operation),
-                candidate=ArmOperationRoute(tool=operation),
+                candidate=self.candidate_read_routes.get(operation, ArmOperationRoute(tool=operation)),
             )
             for logical_operation, tools in self.operation_map.items()
             for operation in tools
         ]
+        if self.candidate_read_routes and self.candidate_read_routes != {
+            "akb_get": ArmOperationRoute(tool="akb_get", mode="full"),
+            "akb_drill_down": ArmOperationRoute(tool="akb_get", mode="sections"),
+        }:
+            raise ValueError("candidate read routes must describe the unified document read")
         derived_by_operation = {item.operation: item for item in derived_operations}
         if len(derived_by_operation) != len(derived_operations):
             raise ValueError("derived public operations must map every canonical operation exactly once")
@@ -1054,12 +1067,16 @@ class BenchmarkRunManifest(ContractModel):
         for arm in ("baseline", "candidate"):
             for transport in ("http", "stdio"):
                 routes = [item for item in self.public_operations if transport in item.transports]
-                physical = [getattr(item, arm).tool for item in routes]
+                physical = [(getattr(item, arm).tool, getattr(item, arm).action, getattr(item, arm).mode) for item in routes]
                 if len(set(physical)) != len(physical):
-                    raise ValueError(f"{arm} {transport} public surface maps multiple operations to one tool")
+                    raise ValueError(f"{arm} {transport} public routes are ambiguous")
+                for tool in {item[0] for item in physical}:
+                    modes = [mode for name, action, mode in physical if name == tool and action is None]
+                    if len(modes) > 1 and set(modes) != {"full", "sections"}:
+                        raise ValueError(f"{arm} {transport} public modes are ambiguous")
                 for item in routes:
                     route = getattr(item, arm)
-                    if route.action is None and route.tool != item.operation:
+                    if route.action is None and route.mode is None and route.tool != item.operation:
                         raise ValueError(f"{arm} direct public route for {item.operation} must retain its canonical tool name")
                     if route.action is not None and route.tool == item.operation:
                         raise ValueError(f"{arm} grouped public route for {item.operation} requires an action selector")
@@ -1153,10 +1170,6 @@ class BenchmarkRunManifest(ContractModel):
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        if len(self.pair_categories) != 20 or len(tasks) != 40:
-            raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
-        if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:
-            raise ValueError("the preregistered benchmark plan must contain exactly 608 trials")
 
     def _validate_locale_pairs(self, tasks: list[TaskManifest]) -> None:
         if len(tasks) != sum(self.locale_counts.values()):
@@ -1281,10 +1294,9 @@ def validate_public_catalog(
         for tool in snapshot.tools
         if isinstance(tool.get("name"), str)
     }
-    expected_count = len(routes)
+    expected_count = len(expected_names)
     if (
-        len(expected_names) != expected_count
-        or snapshot.tool_count != expected_count
+        snapshot.tool_count != expected_count
         or actual_names != expected_names
     ):
         raise ValueError(
@@ -1298,9 +1310,22 @@ def validate_public_catalog(
     }
     for item in required:
         route = getattr(item, arm)
+        tool = by_name.get(route.tool, {})
+        if route.mode is not None:
+            schema = tool.get("inputSchema", tool.get("input_schema", {}))
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            mode_schema = properties.get("mode") if isinstance(properties, dict) else None
+            modes = mode_schema.get("enum") if isinstance(mode_schema, dict) else None
+            needed = {"full"} if route.mode == "full" else {"sections", "outline"}
+            if (
+                not isinstance(modes, list)
+                or not all(isinstance(mode, str) for mode in modes)
+                or not needed <= set(modes)
+                or (route.mode == "full" and isinstance(mode_schema, dict) and mode_schema.get("default") != "full")
+            ):
+                raise ValueError(f"{arm} catalog mode {route.tool}:{route.mode} is missing")
         if route.action is None:
             continue
-        tool = by_name.get(route.tool, {})
         schema = tool.get("inputSchema", tool.get("input_schema", {}))
         if not isinstance(schema, dict) or not _input_schema_exposes_action(schema, route.action):
             raise ValueError(
